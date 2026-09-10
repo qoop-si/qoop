@@ -512,6 +512,23 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
         "the tab bar still carries the closed terminal: {:?}",
         ui.tab_bar()
     );
+    // And what is left is usable. Asserting only that a tab went away is also satisfied by
+    // a bar with nothing on it, and by a client that moved its focus without subscribing to
+    // where it moved: measured before this, closing left the pane blank and the interface
+    // looked hung.
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "closing left nothing focused: {:?}",
+        ui.tab_bar()
+    );
+    ui.painted.clear();
+    ui.type_in(b"echo AFTER_THE_CLOSE\n");
+    assert!(
+        ui.wait_for("AFTER_THE_CLOSE", Duration::from_secs(15))
+            .is_some(),
+        "the terminal left after a close does not answer:\n{}",
+        ui.painted
+    );
 }
 
 /// G12.3: the child is sized to the pane, not to the window.
@@ -670,13 +687,13 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     );
 }
 
-/// G12.8: the tab bar and the left column are both clickable.
+/// G12.8: the tab bar is clickable, and a panel title is not a target.
 ///
 /// Sent as the terminal sends it, which is the extended report `CSI < button ; col ; row M`
 /// for a press and the same with `m` for the release. Acting on both would switch twice for
 /// one click, so only the press is a command, and that is asserted here by sending both.
 #[test]
-fn g12_8_a_click_on_a_tab_or_on_an_agent_moves_to_that_terminal() {
+fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.command(b'c');
@@ -697,11 +714,21 @@ fn g12_8_a_click_on_a_tab_or_on_an_agent_moves_to_that_terminal() {
         ui.tab_bar()
     );
 
-    // A title names no terminal, so a click on it moves to none.
+    // A title names no terminal, so a click on it moves to none. Asserted from terminal 2,
+    // which is not the one a one row slip in the panel's arithmetic would land on: with the
+    // focus already on terminal 1, reading the spaces title as the first space row picks
+    // the space that is already on screen, `focus` finds nothing to do, and the gate passes
+    // through the bug.
+    let second = ui
+        .tab_column(2)
+        .unwrap_or_else(|| panic!("terminal 2 has no tab: {:?}", ui.tab_bar()));
+    ui.click(second, qoro_tui::screen::TABS as u16);
+    assert!(ui.wait_for_tab(2, Duration::from_secs(10)));
     ui.click(5, SPACES_TITLE_ROW as u16);
-    let _ = ui.wait_for("never appears", Duration::from_millis(600));
-    assert!(
-        ui.focused_tab() == Some(1),
+    let _ = ui.wait_for("never appears", Duration::from_secs(2));
+    assert_eq!(
+        ui.focused_tab(),
+        Some(2),
         "a click on a title moved the focus: {:?}",
         ui.tab_bar()
     );
@@ -983,4 +1010,129 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
         );
         ui.command(b's');
     }
+}
+
+/// G12.13: clicking an agent in another space brings that space with it.
+///
+/// The reason the agents panel crosses spaces at all. Without the space following the
+/// terminal, the click moves the keyboard into a space the tab bar is not showing: the
+/// focused terminal has no tab on screen, and the bar offers only the terminals of the space
+/// the person just left. Nothing gated that, so the whole block could be deleted and every
+/// other gate would stay green.
+#[test]
+fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    // A stand in agent in a second space, so there is a row in the panel to click. A shell
+    // is not one: the panel lists agents.
+    let dir = ui._dir.path().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\nprintf 'Do you want to proceed?\\n'\nprintf '  1. Yes\\n  2. No\\n'\nsleep 30\n",
+    )
+    .expect("write");
+    std::fs::set_permissions(
+        &agent,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+
+    ui.command(b'w');
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second space never came up: {:?}",
+        ui.tab_bar()
+    );
+    ui.type_in(format!("{}\n", agent.display()).as_bytes());
+    assert!(
+        ui.wait_for_panel(
+            FIRST_AGENT_ROW + 2,
+            |line| line.contains("claude"),
+            Duration::from_secs(20)
+        )
+        .is_some(),
+        "the agent is not on the panel: {:?}\n{}",
+        ui.panel_line(FIRST_AGENT_ROW + 2),
+        ui.painted
+    );
+
+    // Back to the first space, where the agent's own tab is not on the bar and its row in
+    // the panel still is.
+    ui.command(b's');
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(15)),
+        "ctrl-a s did not go back: {:?}",
+        ui.tab_bar()
+    );
+    let row = (FIRST_AGENT_ROW..FIRST_AGENT_ROW + 6)
+        .find(|row| {
+            ui.panel_line(*row)
+                .is_some_and(|line| line.trim_end().ends_with("2"))
+        })
+        .unwrap_or_else(|| panic!("the agent has no row: {}", ui.painted));
+
+    ui.click(5, row as u16);
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the click did not move the keyboard to the agent: {:?}",
+        ui.tab_bar()
+    );
+    // The bar is the other space's now, and the panel says which space that is.
+    assert!(
+        ui.tab_bar().is_some_and(|bar| !bar.contains(" 1 ")),
+        "the tab bar stayed in the space that was left: {:?}",
+        ui.tab_bar()
+    );
+    assert!(
+        ui.panel_line(FIRST_SPACE_ROW + 1)
+            .is_some_and(|line| line.contains('\u{25cf}')),
+        "the spaces panel still marks the space that was left: {:?}",
+        ui.panel_line(FIRST_SPACE_ROW + 1)
+    );
+}
+
+/// G12.14: a digit picks the tab at that position in this space, and not in the daemon.
+///
+/// `ctrl-a 2` counts along the bar a person is reading, which is one space's worth of
+/// terminals. Counting the daemon's whole list instead jumps into another space, and off by
+/// one picks the neighbour: both are one character in the client and neither was gated.
+#[test]
+fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    // A space of its own with three terminals in it, so that a client counting the daemon's
+    // whole list lands somewhere visibly different from one counting this bar.
+    ui.command(b'w');
+    assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
+    ui.command(b'c');
+    assert!(ui.wait_for_tab(3, Duration::from_secs(15)));
+    ui.command(b'c');
+    assert!(ui.wait_for_tab(4, Duration::from_secs(15)));
+
+    // The first tab of this space is terminal 2, not terminal 1.
+    ui.command(b'1');
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(10)),
+        "ctrl-a 1 did not pick this space's first tab: {:?}",
+        ui.tab_bar()
+    );
+    ui.command(b'3');
+    assert!(
+        ui.wait_for_tab(4, Duration::from_secs(10)),
+        "ctrl-a 3 did not pick this space's third tab: {:?}",
+        ui.tab_bar()
+    );
+    // A digit past the end does nothing rather than something arbitrary.
+    ui.command(b'9');
+    let _ = ui.wait_for("never appears", Duration::from_secs(2));
+    assert_eq!(
+        ui.focused_tab(),
+        Some(4),
+        "a digit past the last tab moved the focus: {:?}",
+        ui.tab_bar()
+    );
 }
