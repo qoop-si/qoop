@@ -117,17 +117,26 @@ fn label(row: &AgentRow) -> String {
 /// Cut or pad to exactly `width` characters, counting characters so that a cut never lands
 /// inside a multi byte character and produces a replacement glyph or a panic.
 fn fit(text: &str, width: usize) -> String {
-    let mut out: String = text.chars().take(width).collect();
-    for _ in out.chars().count()..width {
-        out.push(' ');
-    }
-    out
+    // Columns, not characters. A program with a wide character in its name would otherwise
+    // draw past the index and over the rule, which is the same arithmetic error the pane
+    // had: see `crate::width`.
+    crate::width::fit(text, width)
 }
 
 /// Cut to at most `width` characters without padding, for the piece that is already flush
 /// against the right edge.
 fn fit_end(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = crate::width::columns(c);
+        if used + w > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -160,7 +169,7 @@ mod tests {
     fn every_line_is_exactly_the_index_width() {
         let rows = [row(1, "claude", "working"), row(2, "codex", "blocked")];
         for line in render(&rows, 1, 6) {
-            assert_eq!(line.chars().count(), WIDTH, "{line:?}");
+            assert_eq!(crate::width::width(&line), WIDTH, "{line:?}");
         }
     }
 
@@ -208,9 +217,11 @@ mod tests {
     #[test]
     fn an_emoji_name_is_truncated_between_glyphs() {
         let lines = render(&[row(1, &"🌍".repeat(20), "idle")], 1, 1);
-        assert_eq!(lines[0].chars().count(), WIDTH);
-        assert_eq!(lines[0].matches('🌍').count(), 12);
+        // Columns and not characters: an emoji is one character and two columns, and a row
+        // measured in characters is twice as wide as the column it was drawn into.
+        assert_eq!(crate::width::width(&lines[0]), WIDTH);
         assert!(!lines[0].contains('\u{fffd}'));
+        assert!(lines[0].contains('🌍'));
     }
 
     #[test]

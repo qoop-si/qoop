@@ -8,5 +8,6 @@ pub mod index;
 pub mod keys;
 pub mod run;
 pub mod screen;
+pub mod width;
 
 pub use run::run;

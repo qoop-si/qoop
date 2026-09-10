@@ -655,6 +655,7 @@ dependencies = [
  "qoro-runtime",
  "tempfile",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

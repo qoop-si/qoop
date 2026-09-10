@@ -8,7 +8,7 @@
 use qoro_runtime::control::AgentRow;
 use qoro_runtime::daemon::SnapshotWire;
 
-use crate::index;
+use crate::{index, width};
 
 /// What the screen shows, which is an index, one terminal, and a line saying what the keys
 /// do.
@@ -57,7 +57,6 @@ pub fn paint(frame: &Frame) -> String {
     out.push_str("\x1b[?25l");
 
     let index_lines = index::render(frame.rows, frame.focused, pane_rows as usize);
-    let blank = " ".repeat(pane_cols as usize);
     for row in 0..pane_rows as usize {
         out.push_str(&at(row + 1, 1));
         out.push_str(index_lines.get(row).map(String::as_str).unwrap_or(""));
@@ -69,7 +68,7 @@ pub fn paint(frame: &Frame) -> String {
             .and_then(|s| s.lines.get(row))
             .map(String::as_str)
             .unwrap_or("");
-        out.push_str(&fit(line, pane_cols as usize, &blank));
+        out.push_str(&width::fit(line, pane_cols as usize));
     }
 
     out.push_str(&at(frame.lines as usize, 1));
@@ -77,41 +76,30 @@ pub fn paint(frame: &Frame) -> String {
     let status = frame.message.map(str::to_string).unwrap_or_else(|| {
         "ctrl-a n next  ctrl-a c new  ctrl-a x close  ctrl-a d detach".to_string()
     });
-    out.push_str(&fit(
-        &status,
-        frame.cols as usize,
-        &" ".repeat(frame.cols as usize),
-    ));
+    out.push_str(&width::fit(&status, frame.cols as usize));
     out.push_str("\x1b[0m");
 
     // The cursor goes where the child put it, offset into the pane, so that what the user
     // types appears where they are looking.
     if let Some(snapshot) = frame.snapshot {
         let (row, col) = snapshot.cursor;
+        // The cursor's column is a cell, and cells and columns are the same number only
+        // until a wide character appears on that row. Measured in cells up to the cursor,
+        // then painted in columns.
+        let cells: String = frame
+            .snapshot
+            .and_then(|s| s.lines.get(row))
+            .map(|line| line.chars().take(col).collect())
+            .unwrap_or_default();
+        let col = width::width(&width::fit(
+            &cells,
+            width::width(&cells).min(pane_cols as usize),
+        ));
         let row = row.min(pane_rows as usize - 1) + 1;
         let col = col.min(pane_cols as usize - 1) + index::WIDTH + 2;
         out.push_str(&at(row, col));
         out.push_str("\x1b[?25h");
     }
-    out
-}
-
-/// A line padded or cut to exactly `width` columns.
-///
-/// Counted in characters and not bytes, because a cut inside a multi byte character puts
-/// a replacement glyph on the screen, and this program has already had that bug once in
-/// its parser.
-fn fit(line: &str, width: usize, blank: &str) -> String {
-    let count = line.chars().count();
-    if count == width {
-        return line.to_string();
-    }
-    if count > width {
-        return line.chars().take(width).collect();
-    }
-    let mut out = String::with_capacity(width);
-    out.push_str(line);
-    out.push_str(&blank[..width - count]);
     out
 }
 
