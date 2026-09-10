@@ -47,6 +47,19 @@ impl State {
         }
     }
 
+    /// The terminal drawn on one screen row of the index, if any.
+    ///
+    /// The index scrolls to keep the focused row visible, so the row a person clicked is
+    /// not the row's position in the list. Asking the index itself is the only way to get
+    /// this right; computing it here would be a second copy of the scrolling arithmetic.
+    fn at_row(&self, row: u16) -> Option<u32> {
+        let (_, pane_rows) = screen::pane_size(self.cols, self.lines);
+        let body = (pane_rows as usize).saturating_sub(screen::HEADER);
+        // The title names nothing, so a click on it picks nothing.
+        let within = (row as usize).checked_sub(screen::HEADER)?;
+        crate::index::terminal_at(&self.rows, self.focused, body, within)
+    }
+
     /// The terminal after the focused one, wrapping. The index is the order the daemon
     /// reports, so this is the order a person sees.
     fn neighbour(&self, forward: bool) -> Option<u32> {
@@ -152,8 +165,14 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     .await?;
 
     let mut out = io::stdout();
-    // The alternate screen, so that detaching gives the user their scrollback back.
-    out.write_all(b"\x1b[?1049h")?;
+    // The alternate screen, so that detaching gives the user their scrollback back, and
+    // mouse reporting, so a click on the index picks a terminal.
+    //
+    // `1000` is press and release only, not motion: tracking every movement would be a
+    // report per pixel row for a feature that only needs to know where a press landed.
+    // `1006` asks for those reports in the extended form, because the original one cannot
+    // express a column past 223 and this interface is regularly wider than that.
+    out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h")?;
     out.flush()?;
     let mut dirty = true;
 
@@ -210,6 +229,35 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                 )?).await?;
                             }
                             Action::Detach => return Ok(()),
+                            Action::Click { row, col } => {
+                                // A click in the index picks the row under the pointer. A
+                                // click anywhere else belongs to the program in the pane,
+                                // which is not forwarded yet: a terminal application that
+                                // wants the mouse asks for it, and passing a click to one
+                                // that did not would type its report at a prompt.
+                                if col as usize <= crate::index::WIDTH
+                                    && let Some(picked) = state.at_row(row)
+                                    && picked != state.focused
+                                {
+                                    wr.write_all(&switch(
+                                        state.focused, picked, &mut control_seq,
+                                    )?).await?;
+                                    state.focused = picked;
+                                    state.snapshot = None;
+                                    state.message = None;
+                                    let (pane_cols, pane_rows) =
+                                        screen::pane_size(state.cols, state.lines);
+                                    wr.write_all(&client::encode_command_to(
+                                        picked,
+                                        &ClientWire::Resize {
+                                            cols: pane_cols,
+                                            rows: pane_rows,
+                                        },
+                                        seqs.entry(picked).or_default(),
+                                    )?).await?;
+                                    dirty = true;
+                                }
+                            }
                             Action::Redraw => dirty = true,
                             Action::Next | Action::Previous => {
                                 let forward = matches!(action, Action::Next);
@@ -329,7 +377,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     }
     .await;
 
-    let _ = out.write_all(b"\x1b[?1049l");
+    // Off in the reverse order, and before leaving the alternate screen: a terminal left
+    // in mouse reporting mode sends escape sequences into whatever the person runs next.
+    let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
 }

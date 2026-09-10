@@ -147,6 +147,7 @@ impl AgentRegistry {
                 leader: None,
             },
         );
+        self.announce_new(stream);
     }
 
     pub fn forget(&self, stream: u32) {
@@ -157,6 +158,17 @@ impl AgentRegistry {
             self.watch.unwatch(pid);
             self.by_pid.lock().unwrap().remove(&pid.0);
         }
+        // A terminal that is gone is a change like any other. Closing one answers as soon
+        // as the request is accepted, but the terminal itself lives until its teardown
+        // finishes, which takes as long as the escalation in ADR-014 allows: measured, an
+        // index still listed a closed terminal fifteen seconds later, because the client
+        // had asked once, at the moment of the answer, and nothing told it to ask again.
+        self.announce(stream);
+    }
+
+    /// A terminal that now exists is a change too, for the same reason.
+    fn announce_new(&self, stream: u32) {
+        self.announce(stream);
     }
 
     /// Every terminal being tracked.

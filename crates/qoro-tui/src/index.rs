@@ -74,20 +74,42 @@ pub fn render(rows: &[AgentRow], focused: u32, height: usize) -> Vec<String> {
         .collect()
 }
 
+/// The first row of the list that is on screen.
+///
+/// Scrolls only as far as it takes to bring the focused row back into view, and never past
+/// the end, so the list stays still while the focus moves inside the window.
+fn scrolled_to(rows: &[AgentRow], focused: u32, height: usize) -> usize {
+    match rows.iter().position(|r| r.terminal == focused) {
+        Some(i) => i
+            .saturating_sub(height - 1)
+            .min(rows.len().saturating_sub(height)),
+        None => 0,
+    }
+}
+
+/// Which terminal the index drew on one screen row, counted from one.
+///
+/// The same scrolling arithmetic `render_lines` uses, so a click lands on the row a person
+/// is looking at even when the list is longer than the window.
+pub fn terminal_at(
+    rows: &[AgentRow],
+    focused: u32,
+    height: usize,
+    screen_row: usize,
+) -> Option<u32> {
+    if height == 0 || screen_row == 0 {
+        return None;
+    }
+    let first = scrolled_to(rows, focused, height);
+    rows.get(first + screen_row - 1).map(|r| r.terminal)
+}
+
 /// The index, with each row's colour.
 pub fn render_lines(rows: &[AgentRow], focused: u32, height: usize) -> Vec<Line> {
     if height == 0 {
         return Vec::new();
     }
-    let focus_at = rows.iter().position(|r| r.terminal == focused);
-    // Scroll only as far as it takes to bring the focused row back into view, and never
-    // past the end, so the list stays still while the focus moves inside the window.
-    let first = match focus_at {
-        Some(i) => i
-            .saturating_sub(height - 1)
-            .min(rows.len().saturating_sub(height)),
-        None => 0,
-    };
+    let first = scrolled_to(rows, focused, height);
     let blank = " ".repeat(WIDTH);
     (0..height)
         .map(|line| match rows.get(first + line) {
@@ -101,6 +123,15 @@ pub fn render_lines(rows: &[AgentRow], focused: u32, height: usize) -> Vec<Line>
             },
         })
         .collect()
+}
+
+/// The column's own title, which the screen draws above the rows.
+///
+/// A person opening this for the first time sees a column of names with no label, and the
+/// first question is what they are looking at. That question cost a message from the person
+/// this was built for, so the answer is on screen.
+pub fn header(count: usize) -> String {
+    fit(&format!("terminals ({count})"), WIDTH)
 }
 
 /// One row: number, name, state, padded to the full width.

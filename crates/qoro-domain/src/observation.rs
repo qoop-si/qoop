@@ -131,6 +131,12 @@ impl AgentBelief {
         // arbitrary winner this rule exists to avoid.
         let gap = obs.source as i32 - self.source as i32;
         if obs.state != self.state
+            // Two sources, not one changing its mind. A source that says something
+            // different from what it said a moment ago is reporting a change, which is the
+            // ordinary case: an agent that was working is now waiting. Counting that as a
+            // disagreement made every second screen reading `Uncertain`, and a real agent
+            // sat there labelled as a contradiction with nothing to contradict.
+            && obs.source != self.source
             && gap.abs() <= COMPARABLE_STRENGTH
             && !obs.visible_blocker
             && self.state != AgentRuntimeState::Unknown
@@ -202,6 +208,58 @@ impl AgentBelief {
             self.state,
             AgentRuntimeState::Blocked | AgentRuntimeState::Failed | AgentRuntimeState::Done
         )
+    }
+}
+
+#[cfg(test)]
+mod one_source_changing_its_mind {
+    use super::*;
+
+    fn screen(state: AgentRuntimeState, sequence: u64) -> AgentObservation {
+        AgentObservation {
+            agent_id: crate::AgentId::new("a"),
+            terminal_id: crate::TerminalId::new("1"),
+            sampled_generation: GenerationId::FIRST,
+            state,
+            source: ObservationSource::ScreenHeuristic,
+            confidence: Confidence::Medium,
+            sequence,
+            visible_blocker: false,
+        }
+    }
+
+    #[test]
+    fn a_second_reading_from_the_same_source_replaces_the_first() {
+        let belief = AgentBelief {
+            generation: GenerationId::FIRST,
+            state: AgentRuntimeState::Working,
+            source: ObservationSource::ScreenHeuristic,
+            sequence: 1,
+            visible_blocker: false,
+            candidates: Vec::new(),
+        };
+        // The screen said working and now says blocked, which is an agent that reached a
+        // question rather than two sources disagreeing about the same moment.
+        let after = belief
+            .accept(&screen(AgentRuntimeState::Blocked, 2))
+            .expect("a source may change its mind");
+        assert_eq!(after.state, AgentRuntimeState::Blocked);
+    }
+
+    #[test]
+    fn two_different_sources_of_the_same_strength_are_still_uncertain() {
+        let belief = AgentBelief {
+            generation: GenerationId::FIRST,
+            state: AgentRuntimeState::Working,
+            source: ObservationSource::ProcessIdentity,
+            sequence: 1,
+            visible_blocker: false,
+            candidates: Vec::new(),
+        };
+        assert_eq!(
+            belief.evaluate(&screen(AgentRuntimeState::Idle, 2)),
+            ObservationVerdict::Uncertain
+        );
     }
 }
 

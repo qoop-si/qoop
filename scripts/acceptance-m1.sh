@@ -51,11 +51,38 @@ echo "runtime dir: $RT"
 tmux new-session -d -s "$S" -x 90 -y 26
 tmux send-keys -t "$S" "export QORO_RUNTIME_DIR=$RT; clear" Enter
 sleep 1
-tmux send-keys -t "$S" "$QORO 2>$RT/client.log" Enter
+# A subshell writes its own pid and then replaces itself with the client, so the pid in the
+# file is the client's, and the shell that owns the tmux session is left alone: replacing
+# that one would end the session the moment the client detached. Reading it is the only way to be sure which process this run
+# started: a pattern like `pgrep -f release/qoro` matches every one on the machine, and it
+# once matched a demo session left running in another terminal, after which this script
+# reported four failed gates about somebody else's process.
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>$RT/client.log" Enter
 # Waited for, not slept for. A fixed three seconds was long enough on a quiet machine and
 # not on a busy one, and when it was not, `pgrep` answered nothing and every step after it
 # failed for a reason that had nothing to do with the product: `expected 1 ptmx, saw 51` is
 # what a `lsof` on an empty pid prints. Measured, one run in six under load.
+# The pid this run's client wrote for itself, once it is both written and alive.
+started(){
+    local deadline=$((SECONDS + 30)) pid=""
+    while [ $SECONDS -lt $deadline ]; do
+        pid=$(cat "$RT/client.pid" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "$pid"; return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
+starts_child(){
+    local parent=$1 deadline=$((SECONDS + 30)) pid=""
+    while [ $SECONDS -lt $deadline ]; do
+        pid=$(pgrep -P "$parent" | head -1)
+        [ -n "$pid" ] && { echo "$pid"; return 0; }
+        sleep 0.2
+    done
+    return 1
+}
+
 starts(){
     local pattern=$1 deadline=$((SECONDS + 30)) pid=""
     while [ $SECONDS -lt $deadline ]; do
@@ -66,8 +93,12 @@ starts(){
     return 1
 }
 
-CPID=$(starts "release/qoro$") || { echo "the client never started" >&2; exit 3; }
-DPID=$(starts "release/qoro daemon") || { echo "the daemon never started" >&2; exit 3; }
+# This run's client, found by the runtime directory it was given, and this run's daemon,
+# found as that client's child. `pgrep -f "release/qoro daemon"` matched any daemon on the
+# machine: measured, a demo session left running in another terminal, and the script then
+# reported four failed gates about somebody else's process.
+CPID=$(started) || { echo "the client never started" >&2; exit 3; }
+DPID=$(starts_child "$CPID") || { echo "the daemon never started" >&2; exit 3; }
 echo "client=$CPID daemon=$DPID"
 
 echo "--- 1. a real shell answers a real command"
@@ -91,19 +122,21 @@ sleep 2
 kill -0 "$CHILD" 2>/dev/null && ok "shell $CHILD alive after detach" || no "shell died on detach"
 
 echo "--- 5. reattach and prove it is the SAME shell, not a new one"
-tmux send-keys -t "$S" "$QORO 2>>$RT/client.log" Enter
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>>$RT/client.log" Enter
 sleep 3
 tmux send-keys -t "$S" 'echo STATE_IS_$QORO_STATE' Enter
 appears "STATE_IS_kept" && ok "same shell: it still has its variable" || { no "state lost, so it is a different shell"; tmux capture-pane -t "$S" -p | head -6 | sed 's/^/      /'; }
 
 echo "--- 6. SIGKILL the client; the shell must survive (invariant I1)"
-CPID2=$(pgrep -f "release/qoro$" | head -1)
+# This run's client again, and never any other: killing by a pattern that matches every
+# release binary on the machine kills somebody else's session.
+CPID2=$(started) || { echo "the reattached client never started" >&2; exit 3; }
 kill -9 "$CPID2" 2>/dev/null
 sleep 1
 kill -0 "$CHILD" 2>/dev/null && ok "shell survived a SIGKILLed client" || no "a client kill took the shell"
 
 echo "--- 7. reattach once more after the kill and check the shell still answers"
-tmux send-keys -t "$S" "$QORO 2>>$RT/client.log" Enter
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>>$RT/client.log" Enter
 sleep 3
 tmux send-keys -t "$S" 'echo AFTER_KILL_$QORO_STATE' Enter
 appears "AFTER_KILL_kept" && ok "the shell is still the same one" || no "the shell did not survive the kill intact"

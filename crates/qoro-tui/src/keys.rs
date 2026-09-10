@@ -35,6 +35,12 @@ pub enum Action {
     Close,
     /// ctrl-a d, and also a bare ctrl-q.
     Detach,
+    /// A mouse press, in one based screen coordinates.
+    ///
+    /// Reported rather than acted on here, because what a click means depends on where the
+    /// interface drew things and this decoder does not know that. It knows what the
+    /// terminal said.
+    Click { row: u16, col: u16 },
     /// ctrl-a l
     Redraw,
 }
@@ -44,6 +50,35 @@ pub enum Action {
 pub struct Keys {
     /// The last byte of the previous read was the prefix, so the next byte is a command.
     after_prefix: bool,
+    /// The start of a mouse report that the read ended in the middle of.
+    pending_mouse: Vec<u8>,
+}
+
+/// Where the next mouse report starts, if there is one in these bytes.
+fn find_mouse(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(3).position(|w| w == b"\x1b[<")
+}
+
+/// The reply to `CSI ? 1006 h`, which is how a terminal reports a mouse press with
+/// coordinates that are not limited to 223 columns.
+///
+/// `\x1b[<button;col;rowM` for a press and `m` for a release. Only the press is turned into
+/// an action: acting on both would switch twice for one click.
+fn mouse(bytes: &[u8]) -> Option<(usize, Option<Action>)> {
+    if !bytes.starts_with(b"\x1b[<") {
+        return None;
+    }
+    let end = bytes.iter().position(|b| *b == b'M' || *b == b'm')?;
+    let body = std::str::from_utf8(&bytes[3..end]).ok()?;
+    let mut parts = body.split(';');
+    let button: u16 = parts.next()?.parse().ok()?;
+    let col: u16 = parts.next()?.parse().ok()?;
+    let row: u16 = parts.next()?.parse().ok()?;
+    let press = bytes[end] == b'M';
+    // The low two bits are the button and 64 marks a wheel event, which is not a press on
+    // anything and would scroll the index if it were treated as one.
+    let action = (press && button & 0b1100_0011 == 0).then_some(Action::Click { row, col });
+    Some((end + 1, action))
 }
 
 impl Keys {
@@ -57,7 +92,40 @@ impl Keys {
         let mut actions = Vec::new();
         let mut pending = Vec::new();
 
-        for &byte in bytes {
+        // A mouse report is a sequence, so it is taken off the front before the loop that
+        // works a byte at a time. Carried across reads for the same reason the prefix is:
+        // a report can be split, and half of one passed through to a shell would type
+        // `[<0;5;3M` at a prompt.
+        let mut bytes = bytes;
+        let mut carried;
+        if !self.pending_mouse.is_empty() {
+            carried = std::mem::take(&mut self.pending_mouse);
+            carried.extend_from_slice(bytes);
+            bytes = &carried[..];
+        }
+        let mut rest = bytes;
+        while let Some(at) = find_mouse(rest) {
+            let (before, from) = rest.split_at(at);
+            pending.extend_from_slice(before);
+            match mouse(from) {
+                Some((used, action)) => {
+                    flush(&mut pending, &mut actions);
+                    if let Some(action) = action {
+                        actions.push(action);
+                    }
+                    rest = &from[used..];
+                }
+                None => {
+                    // The start of a report and not the whole of it. Held rather than
+                    // passed on, and the rest of this read has already been taken.
+                    self.pending_mouse = from.to_vec();
+                    rest = &[];
+                }
+            }
+        }
+        let bytes: Vec<u8> = pending.drain(..).chain(rest.iter().copied()).collect();
+
+        for &byte in &bytes {
             if self.after_prefix {
                 self.after_prefix = false;
                 let command = match byte {

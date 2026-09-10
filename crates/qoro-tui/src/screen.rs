@@ -37,6 +37,9 @@ pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
     )
 }
 
+/// Rows the index spends on its own title.
+pub const HEADER: usize = 1;
+
 /// The escape sequence that puts the cursor at a one-based row and column.
 fn at(row: usize, col: usize) -> String {
     format!("\x1b[{row};{col}H")
@@ -56,13 +59,22 @@ pub fn paint(frame: &Frame) -> String {
     // people notice most.
     out.push_str("\x1b[?25l");
 
-    let index_lines = index::render_lines(frame.rows, frame.focused, pane_rows as usize);
+    // One row of the index says what the column is. Below it, the terminals.
+    let index_lines = index::render_lines(
+        frame.rows,
+        frame.focused,
+        (pane_rows as usize).saturating_sub(HEADER),
+    );
     for row in 0..pane_rows as usize {
         out.push_str(&at(row + 1, 1));
         // The state's colour, on the whole row. A person scanning an index is looking for
         // the one row that needs them, and a coloured word inside an otherwise grey line is
         // a word they have to find first.
-        if let Some(line) = index_lines.get(row) {
+        if row < HEADER {
+            out.push_str("\x1b[2m");
+            out.push_str(&index::header(frame.rows.len()));
+            out.push_str("\x1b[0m");
+        } else if let Some(line) = index_lines.get(row - HEADER) {
             match line.colour {
                 Some(colour) => {
                     out.push_str(&format!("\x1b[{}m", 30 + colour.min(7)));

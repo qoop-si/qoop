@@ -72,6 +72,11 @@ fn strip_escapes(text: &str) -> String {
     out
 }
 
+/// The screen row the first terminal is drawn on. Row one is the column's own title, and
+/// taking that from the interface rather than writing `2` is what stops this test from
+/// disagreeing with the layout the next time the layout changes.
+const FIRST_ROW: usize = qoro_tui::screen::HEADER + 1;
+
 /// The interface's own idea of how wide the index is, so this test cannot drift from it.
 fn index_width() -> usize {
     qoro_tui::index::WIDTH
@@ -313,7 +318,7 @@ fn g12_1_the_interface_paints_an_index_a_terminal_and_a_status_line() {
         "the index has no row for terminal 1:\n{}",
         ui.painted
     );
-    let row = ui.index_line(1).unwrap_or_default();
+    let row = ui.index_line(FIRST_ROW).unwrap_or_default();
     let program: String = row
         .chars()
         .skip(3)
@@ -377,19 +382,19 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
         ui.daemon_log()
     );
 
-    // And closing takes a row out of the index.
+    // And closing takes a row out of the index. Waited for rather than slept for: on a
+    // machine running the rest of this suite, two seconds was sometimes not enough and the
+    // gate reported a feature that works as broken.
     ui.command(b'x');
-    std::thread::sleep(Duration::from_secs(2));
-    ui.painted.clear();
-    ui.command(b'l');
     assert!(
-        ui.wait_for("ctrl-a d detach", Duration::from_secs(10))
-            .is_some()
-    );
-    let second = ui.index_line(2).unwrap_or_default();
-    assert!(
-        second.trim().is_empty(),
-        "the index still has a second row after one terminal was closed: {second:?}"
+        ui.wait_for_index(
+            FIRST_ROW + 1,
+            |line| line.trim().is_empty(),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the index still has a second row after one terminal was closed: {:?}",
+        ui.index_line(FIRST_ROW + 1)
     );
 }
 
@@ -427,7 +432,11 @@ fn g12_4_the_index_follows_the_foreground_process() {
     ui.painted.clear();
     ui.type_in(b"sleep 12\n");
     let took = ui
-        .wait_for_index(1, |line| line.contains("sleep"), Duration::from_secs(5))
+        .wait_for_index(
+            FIRST_ROW,
+            |line| line.contains("sleep"),
+            Duration::from_secs(5),
+        )
         .unwrap_or_else(|| {
             panic!(
                 "the index never showed the running command:\n{}",
@@ -443,11 +452,15 @@ fn g12_4_the_index_follows_the_foreground_process() {
     );
 
     ui.type_in(&[0x03]);
-    let back = ui.wait_for_index(1, |line| !line.contains("sleep"), Duration::from_secs(12));
+    let back = ui.wait_for_index(
+        FIRST_ROW,
+        |line| !line.contains("sleep"),
+        Duration::from_secs(12),
+    );
     assert!(
         back.is_some(),
         "the index still shows the interrupted command: {:?}, pane row 1 is {:?}",
-        ui.index_line(1),
+        ui.index_line(FIRST_ROW),
         ui.pane_line(1)
     );
 }
@@ -519,17 +532,25 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
 
     // The name a person would say, not the interpreter that is running it.
     assert!(
-        ui.wait_for_index(1, |line| line.contains("claude"), Duration::from_secs(15))
-            .is_some(),
+        ui.wait_for_index(
+            FIRST_ROW,
+            |line| line.contains("claude"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
         "the index does not name the agent: {:?}",
-        ui.index_line(1)
+        ui.index_line(FIRST_ROW)
     );
     // What it is doing, read off its own screen.
     assert!(
-        ui.wait_for_index(1, |line| line.contains("blocked"), Duration::from_secs(15))
-            .is_some(),
+        ui.wait_for_index(
+            FIRST_ROW,
+            |line| line.contains("blocked"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
         "the index does not say the agent is blocked: {:?}",
-        ui.index_line(1)
+        ui.index_line(FIRST_ROW)
     );
     // And said out loud, so a person who is looking at another terminal still finds out.
     assert!(
@@ -540,5 +561,58 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
     assert!(
         ui.painted.contains("\x1b[33m"),
         "the blocked row is not coloured"
+    );
+}
+
+/// G12.8: the index is clickable.
+///
+/// Sent as the terminal sends it, which is the extended report `CSI < button ; col ; row M`
+/// for a press and the same with `m` for the release. Acting on both would switch twice for
+/// one click, so only the press is a command, and that is asserted here by sending both.
+#[test]
+fn g12_8_a_click_on_the_index_moves_to_that_terminal() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+    ui.command(b'c');
+    assert!(
+        ui.wait_for(">2 ", Duration::from_secs(15)).is_some(),
+        "the second terminal never appeared"
+    );
+
+    // Row one is the column's title and row two is the first terminal.
+    ui.type_in(b"\x1b[<0;5;2M");
+    ui.type_in(b"\x1b[<0;5;2m");
+    assert!(
+        ui.wait_for_index(2, |line| line.starts_with(">1"), Duration::from_secs(10))
+            .is_some(),
+        "a click on the first row did not move to the first terminal: {:?}",
+        ui.index_line(2)
+    );
+
+    // The title names no terminal, so a click on it moves to none.
+    ui.type_in(b"\x1b[<0;5;1M");
+    ui.type_in(b"\x1b[<0;5;1m");
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = ui.wait_for("never appears", Duration::from_millis(300));
+    assert!(
+        ui.index_line(2).is_some_and(|line| line.starts_with(">1")),
+        "a click on the title moved the focus: {:?}",
+        ui.index_line(2)
+    );
+
+    // Split across two reads, which is what a terminal does when the report straddles a
+    // read boundary. Half of one passed through would type `[<0;5;3M` at a shell.
+    ui.type_in(b"\x1b[<0;5");
+    std::thread::sleep(Duration::from_millis(100));
+    ui.type_in(b";3M\x1b[<0;5;3m");
+    assert!(
+        ui.wait_for_index(3, |line| line.starts_with(">2"), Duration::from_secs(10))
+            .is_some(),
+        "a split mouse report did not arrive whole: {:?}",
+        ui.index_line(3)
+    );
+    assert!(
+        !ui.saw("[<0;5"),
+        "part of a mouse report reached the terminal"
     );
 }
