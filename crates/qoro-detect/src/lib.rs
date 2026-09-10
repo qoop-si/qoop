@@ -768,6 +768,66 @@ contains = "do you want to proceed"
         assert!(v.visible_working);
     }
 
+    /// The line a real Codex draws for the first half minute of a session, copied off the
+    /// screen. It is Codex holding the turn and it does not contain the word "Working",
+    /// which is what the rule used to be anchored on.
+    #[test]
+    fn the_codex_manifest_reads_any_interrupt_hint_as_working() {
+        let v = verdict(
+            "codex",
+            &["• Starting MCP servers (6/7): yargi-mcp (14s · esc to interrupt)"],
+        )
+        .expect("codex is working");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert!(v.visible_working);
+    }
+
+    /// The composer, which is on screen only while Codex is waiting for a person, copied
+    /// off a real session that had just finished starting up.
+    #[test]
+    fn the_codex_manifest_reads_its_composer_as_idle() {
+        for composer in ["› Ask Codex to do anything", "› write me a test"] {
+            let v = verdict("codex", &[composer, "  gpt-6-astra medium · ~/coding/qoro"])
+                .unwrap_or_else(|| panic!("codex is idle: {composer}"));
+            assert_eq!(v.state, AgentRuntimeState::Idle, "{composer}");
+            assert!(v.visible_idle);
+        }
+    }
+
+    /// The two cannot both be on screen, and when the transcript happens to carry a line
+    /// that looks like a composer, the status line has to win.
+    #[test]
+    fn a_codex_that_is_working_is_not_also_idle() {
+        let v = verdict(
+            "codex",
+            &[
+                "› an earlier prompt still in the transcript",
+                "• Working (2m 14s · esc to interrupt)",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+    }
+
+    /// Copied off a real session: Codex draws its update notice as a numbered menu, over
+    /// the row the composer normally has and with the same marker on it. Read as a composer
+    /// it reports idle, which is a person being asked a question and told nobody is waiting.
+    #[test]
+    fn a_numbered_menu_is_a_person_being_asked_and_not_an_idle_composer() {
+        let v = verdict(
+            "codex",
+            &[
+                "  \u{2728} Update available! 0.153.4 -> 0.154.0",
+                "\u{203A} 1. Update now (runs `sh -c 'curl -fsSL https://example.com/i.sh | sh'`)",
+                "  2. Skip",
+                "  3. Skip until next version",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert!(v.visible_blocker);
+    }
+
     #[test]
     fn the_codex_manifest_reads_an_approval_request_as_a_visible_blocker() {
         let v = verdict("codex", &["Allow command?", "  Yes  No"]).expect("an approval request");
