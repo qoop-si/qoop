@@ -827,3 +827,47 @@ mod identity_chain {
         assert!(program.agent);
     }
 }
+
+#[cfg(test)]
+mod real_agents {
+    use super::*;
+
+    /// Whatever coding agents happen to be running on this machine, named.
+    ///
+    /// Not an assertion about a particular one: a machine with none running is a machine
+    /// with nothing to check, and a test that demanded one would fail on a clean CI box.
+    /// What it does assert is that nothing this identification path produces is a runtime
+    /// name, because that is the failure it exists to prevent and it is invisible until a
+    /// real install has the shape that causes it.
+    #[test]
+    fn nothing_running_on_this_machine_is_identified_as_its_runtime() {
+        let mut seen = Vec::new();
+        for pid in scan_all_pids().into_iter().take(400) {
+            let pid = Pid(pid);
+            let Some(executable) = program_of(pid) else {
+                continue;
+            };
+            let argv = argv_of(pid);
+            let program = qoro_domain::program::identify(&executable, &argv);
+            if program.agent {
+                seen.push((program.name.clone(), executable.clone()));
+            }
+            // Only when there is something to unwrap. A person sitting in a bare `node`
+            // repl is a process whose name really is `node`, and a test that called that a
+            // failure would be asserting that the repl cannot exist.
+            let base = executable.rsplit('/').next().unwrap_or(&executable);
+            let is_runtime = matches!(base, "node" | "bun" | "deno") || base.starts_with("python");
+            let has_script = argv
+                .iter()
+                .skip(1)
+                .any(|a| !a.starts_with('-') && !a.is_empty());
+            if is_runtime && has_script {
+                assert_ne!(
+                    program.name, base,
+                    "{executable} with argv {argv:?} was identified as its own runtime"
+                );
+            }
+        }
+        eprintln!("agents identified on this machine: {seen:?}");
+    }
+}
