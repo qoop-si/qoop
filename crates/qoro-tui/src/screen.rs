@@ -6,7 +6,7 @@
 //! so a test can read a frame instead of looking at one.
 
 use qoro_runtime::control::AgentRow;
-use qoro_runtime::daemon::SnapshotWire;
+use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
 use crate::{index, width};
 
@@ -56,10 +56,22 @@ pub fn paint(frame: &Frame) -> String {
     // people notice most.
     out.push_str("\x1b[?25l");
 
-    let index_lines = index::render(frame.rows, frame.focused, pane_rows as usize);
+    let index_lines = index::render_lines(frame.rows, frame.focused, pane_rows as usize);
     for row in 0..pane_rows as usize {
         out.push_str(&at(row + 1, 1));
-        out.push_str(index_lines.get(row).map(String::as_str).unwrap_or(""));
+        // The state's colour, on the whole row. A person scanning an index is looking for
+        // the one row that needs them, and a coloured word inside an otherwise grey line is
+        // a word they have to find first.
+        if let Some(line) = index_lines.get(row) {
+            match line.colour {
+                Some(colour) => {
+                    out.push_str(&format!("\x1b[{}m", 30 + colour.min(7)));
+                    out.push_str(&line.text);
+                    out.push_str("\x1b[0m");
+                }
+                None => out.push_str(&line.text),
+            }
+        }
         // The rule between the index and the terminal, drawn every row so that a terminal
         // line long enough to reach it cannot swallow it.
         out.push('\u{2502}');
@@ -68,7 +80,12 @@ pub fn paint(frame: &Frame) -> String {
             .and_then(|s| s.lines.get(row))
             .map(String::as_str)
             .unwrap_or("");
-        out.push_str(&width::fit(line, pane_cols as usize));
+        let spans = frame
+            .snapshot
+            .and_then(|s| s.styles.get(row))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        out.push_str(&paint_row(line, spans, pane_cols as usize));
     }
 
     out.push_str(&at(frame.lines as usize, 1));
@@ -103,6 +120,103 @@ pub fn paint(frame: &Frame) -> String {
     out
 }
 
+/// One row of the terminal, with its colour.
+///
+/// The runs are in the grid's columns and the text is painted in the screen's, and those
+/// two are the same number only until a wide character appears on the row. So the row is
+/// walked once, in cells, and each cell is emitted with the style the run says it has: a
+/// style change writes one escape sequence and nothing else does.
+fn paint_row(line: &str, spans: &[SpanWire], cols: usize) -> String {
+    if spans.is_empty() {
+        return width::fit(line, cols);
+    }
+    let mut out = String::with_capacity(cols * 2);
+    let mut used = 0;
+    let mut current: Option<&SpanWire> = None;
+    // The grid puts a spacer after a wide character; it is a cell for the run arithmetic
+    // and not a column for the screen, so it is counted and not painted.
+    let mut skip_spacer = false;
+    for (cell, c) in line.chars().enumerate() {
+        if skip_spacer && c == ' ' {
+            skip_spacer = false;
+            continue;
+        }
+        skip_spacer = width::columns(c) == 2;
+        let w = width::columns(c);
+        if used + w > cols {
+            break;
+        }
+        let span = spans
+            .iter()
+            .find(|s| cell >= s.at && cell < s.at + s.len)
+            .filter(|s| !is_plain(s));
+        if span.map(|s| s as *const _) != current.map(|s| s as *const _) {
+            out.push_str("\x1b[0m");
+            if let Some(span) = span {
+                out.push_str(&sgr(span));
+            }
+            current = span;
+        }
+        out.push(c);
+        used += w;
+    }
+    if current.is_some() {
+        out.push_str("\x1b[0m");
+    }
+    for _ in used..cols {
+        out.push(' ');
+    }
+    out
+}
+
+fn is_plain(s: &SpanWire) -> bool {
+    s.fg.is_none() && s.bg.is_none() && s.attrs == 0
+}
+
+/// The escape sequence for one run's style.
+fn sgr(span: &SpanWire) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (bit, code) in [
+        (attrs::BOLD, "1"),
+        (attrs::DIM, "2"),
+        (attrs::ITALIC, "3"),
+        (attrs::UNDERLINE, "4"),
+        (attrs::INVERSE, "7"),
+        (attrs::STRIKE, "9"),
+    ] {
+        if span.attrs & bit != 0 {
+            parts.push(code.to_string());
+        }
+    }
+    if let Some(fg) = span.fg {
+        parts.push(colour(fg, true));
+    }
+    if let Some(bg) = span.bg {
+        parts.push(colour(bg, false));
+    }
+    format!("\x1b[{}m", parts.join(";"))
+}
+
+/// A colour, written the way every terminal since xterm reads it.
+///
+/// The first sixteen palette entries get their own short codes rather than `38;5;n`,
+/// because those are the ones a person has themed and some terminals treat the two spellings
+/// differently.
+fn colour(c: ColourWire, foreground: bool) -> String {
+    match c {
+        ColourWire::Indexed { i } if i < 8 => {
+            format!("{}", if foreground { 30 + i } else { 40 + i })
+        }
+        ColourWire::Indexed { i } if i < 16 => {
+            format!("{}", if foreground { 82 + i } else { 92 + i })
+        }
+        ColourWire::Indexed { i } => format!("{};5;{i}", if foreground { 38 } else { 48 }),
+        ColourWire::Rgb { r, g, b } => {
+            format!("{};2;{r};{g};{b}", if foreground { 38 } else { 48 })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +237,7 @@ mod tests {
             rows: lines.len(),
             cursor: (0, 0),
             lines: lines.iter().map(|l| l.to_string()).collect(),
+            styles: Vec::new(),
         }
     }
 
@@ -186,6 +301,80 @@ mod tests {
             message: Some("starting a terminal"),
         });
         assert!(painted.contains("starting a terminal"));
+    }
+
+    #[test]
+    fn a_coloured_run_reaches_the_screen_and_is_closed_after_it() {
+        let mut snapshot = snapshot(&["red then plain"]);
+        snapshot.styles = vec![vec![SpanWire {
+            at: 0,
+            len: 3,
+            fg: Some(ColourWire::Indexed { i: 1 }),
+            bg: None,
+            attrs: attrs::BOLD,
+        }]];
+        let rows = [row(1, "sh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 40,
+            lines: 3,
+            message: None,
+        });
+        // Bold and red on, the text, and then off again: a run that is not closed leaks its
+        // colour into the rest of the screen, which is the whole pane and then the status
+        // line.
+        assert!(painted.contains("\x1b[1;31mred"), "{painted:?}");
+        assert!(painted.contains("\x1b[0m"), "{painted:?}");
+        assert!(painted.contains("then plain"));
+    }
+
+    #[test]
+    fn an_unstyled_row_carries_no_escape_of_its_own() {
+        // The common case, and the one that must not pay for the feature: a plain row is
+        // the same bytes it was before colour existed.
+        let snapshot = snapshot(&["plain"]);
+        let rows = [row(1, "sh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 40,
+            lines: 2,
+            message: None,
+        });
+        // Only the pane's own bytes on the first row: the status line legitimately uses
+        // reverse video and resets it, and splitting on the divider alone would catch that.
+        let after_divider = painted.split('\u{2502}').nth(1).unwrap_or_default();
+        let pane = after_divider.split('\x1b').next().unwrap_or_default();
+        assert!(pane.starts_with("plain"), "{pane:?}");
+        assert!(!pane.contains('\x1b'), "{pane:?}");
+    }
+
+    #[test]
+    fn a_colour_run_lines_up_with_a_wide_character() {
+        // The run is in cells and the paint is in columns. A style that started on the
+        // spacer of a wide character would colour the wrong glyph.
+        let mut snapshot = snapshot(&["中 X"]);
+        snapshot.styles = vec![vec![SpanWire {
+            at: 2,
+            len: 1,
+            fg: Some(ColourWire::Indexed { i: 2 }),
+            bg: None,
+            attrs: 0,
+        }]];
+        let rows = [row(1, "sh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 30,
+            lines: 2,
+            message: None,
+        });
+        // `X` is at cell 2, so it is the green one, and the character before it is not.
+        assert!(painted.contains("\x1b[32mX"), "{painted:?}");
     }
 
     #[test]

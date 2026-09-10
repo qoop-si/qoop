@@ -1,0 +1,252 @@
+# Claude Code (Anthropic).
+#
+# Claude Code is closed source, but its executable carries its interface as plain strings.
+# The strings below are from the 2.1.284 npm package (@anthropic-ai/claude-code), read with
+# `strings` and never run. Two rules also lean on screens recorded from qoro's own Claude
+# sessions (the captures in this crate's tests): `selection_prompt`'s hint as a session
+# draws it, and `draft_after_turn`'s turn summary (`✻ Crunched for 16m 31s · done 6:31 PM`)
+# and the notices stacked over the composer.
+#
+# The layout these rules lean on, from the same strings: the composer sits between two
+# full-width `─` rules with the footer under the lower one, and every dialog (a permission,
+# a plan, a question, folder trust) replaces it under a single `─` rule of its own. So what
+# is under the last rule is either the footer or the live dialog, and an answer that quotes
+# a dialog sits above the composer where no dialog rule reads it.
+
+id = "claude"
+version = "1"
+min_engine_version = 2
+
+# The transcript viewer (ctrl+o) with a permission dialog pending behind it: its bottom bar
+# starts `dialog waiting · Showing detailed transcript`.
+[[rules]]
+id = "transcript_dialog_waiting"
+state = "blocked"
+priority = 450
+region = "bottom_non_empty_lines(2)"
+visible_blocker = true
+line_regex = '^\s*dialog waiting · Showing detailed transcript'
+
+# The transcript viewer itself: its bottom bar starts `Showing detailed transcript`. It
+# shows the past, and the last reading stands.
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(2)"
+skip_state_update = true
+line_regex = '^\s*Showing detailed transcript( · |\s*$)'
+
+# The model picker (/model): `Select model` over its description
+# `Switch between Claude models. ...`, in the composer's place under its own rule.
+[[rules]]
+id = "model_picker"
+state = "unknown"
+priority = 400
+region = "after_last_horizontal_rule"
+skip_state_update = true
+all = [
+  { line_regex = '^\s*Select model\s*$' },
+  { line_regex = '^\s*Switch between Claude models\.' },
+]
+
+# The footers of menus the person opened (/permissions, /agents and others).
+[[rules]]
+id = "menu_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(3)"
+skip_state_update = true
+line_regex = '^\s*(↑/↓ to navigate · Enter to select · ←/→ to switch · Esc to cancel|Enter to approve · r to retry · ↑/↓ to navigate · Esc to cancel|Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear|↑/↓ to select · Enter to view · Esc to close|↑/↓ to scroll · Esc to back)\s*$'
+
+# The folder trust dialog at startup: `Accessing workspace:`, the path, the safety
+# paragraph, then `No, exit` and `Yes, I trust this folder` (or
+# `No, continue without these permissions`), in the dialog frame.
+[[rules]]
+id = "trust_folder"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\s*Accessing workspace:' },
+  { contains = "Yes, I trust this folder" },
+]
+
+# Sign-in: `Select login method:` over `Claude account with subscription · ...`. Where it is
+# drawn relative to a rule is not sourced, so it is read from the bottom rows, and the
+# composer box (a pointer row between two rules) under the same words means they were
+# quoted: the login screen comes before any composer.
+[[rules]]
+id = "login_method"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\s*Select login method:' },
+  { line_regex = '^\s*([❯>] +)?(\d+\. )?Claude account with subscription' },
+]
+not = [{ regex = '(?m)^─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^\n]*\n)*?─{3,}' }]
+
+# Plan approval: the title `Ready to code?`, the plan, then numbered options ending in
+# `No, keep planning`.
+[[rules]]
+id = "plan_approval"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*Ready to code\?' },
+  { line_regex = '^\s*([❯>] +)?\d+\. (Yes|No)\b' },
+]
+
+# Entering or leaving plan mode at Claude's request: `Enter plan mode?` with
+# `Claude Code wants to enter plan mode`, or `Exit plan mode?` with
+# `Claude wants to exit plan mode`.
+[[rules]]
+id = "plan_mode_request"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+any = [
+  { all = [
+    { line_regex = '^\s*Enter plan mode\?' },
+    { contains = "Claude Code wants to enter plan mode" },
+  ] },
+  { all = [
+    { line_regex = '^\s*Exit plan mode\?' },
+    { contains = "Claude wants to exit plan mode" },
+  ] },
+]
+
+# The review screen after Claude's questions (AskUserQuestion): `Ready to submit your
+# answers?` with `Submit answers`. The questions themselves end on the selection hint and
+# are read by `selection_prompt`.
+[[rules]]
+id = "question_dialog"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*Ready to submit your answers\?' },
+  { contains = "Submit answers" },
+]
+
+# A choice Claude put to the person (its questions among them): options with `❯` on the
+# selected one, over the hint `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
+# (several questions, claude.json), `Enter to select · ↑/↓ to navigate · Esc to cancel` (one
+# question, a recorded session) or `Enter to select · Esc to cancel` (a recorded session). Read under the last rule, so the hint
+# quoted in an answer, with the composer and its footer under it, is not.
+[[rules]]
+id = "selection_prompt"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+line_regex = '^\s*Enter to select · (.* · )?Esc to cancel\s*$'
+
+# Every other permission dialog (Bash, edits, fetch, network, skills, MCP tools): a numbered
+# list with the pointer `❯` (`>` without the glyph) on the selected row and a `No` row
+# (`No`, `No, and tell Claude what to do differently (esc)`, `No (recommended)`).
+[[rules]]
+id = "permission_dialog"
+state = "blocked"
+priority = 300
+region = "after_last_horizontal_rule"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*[❯>] +\d+\. ' },
+  { line_regex = '^\s*([❯>] +)?\d+\. No\b' },
+]
+
+# The spinner row above the composer: one frame of `· ✢ ✳ ✶ ✻ ✽` (or `*`), then text
+# ending in `…` and an optional `(<elapsed> · ↓ <n> tokens · thinking)` suffix. The text is
+# a verb from the spinner list (some with an apostrophe, a hyphen or an accent:
+# `Beboppin'`, `Topsy-turvying`, `Flambéing`), a person's own spinner verbs, or the active
+# todo's wording (`Running the test suite`). A finished turn's summary has no `…`. The retry variants start `Waiting for API response`
+# or end `· attempt <n> · esc to interrupt`.
+[[rules]]
+id = "spinner_row"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(20)"
+visible_working = true
+any = [
+  { line_regex = '^[·✢✳✶✻✽*] \S[^\n]*…( \(.*\))?\s*$' },
+  { line_regex = '^\S Waiting for API response( · |\s*$)' },
+  { line_regex = ' · attempt \d+ · esc to interrupt\s*$' },
+]
+
+# The footer under the composer while busy carries `esc to interrupt`, or
+# `enter to interrupt and send` when something is typed.
+[[rules]]
+id = "footer_interrupt"
+state = "working"
+priority = 200
+region = "after_last_horizontal_rule"
+visible_working = true
+line_regex = '\b(esc to interrupt|enter to interrupt and send)\b'
+
+# The window title while busy starts with `◐` or `◑`, alternating. At rest it starts with
+# `✳`, which is not read: under a multiplexer the busy title can be a static `✳` too.
+[[rules]]
+id = "title_busy"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^[◐◑] '
+
+# The empty composer between its two rules: the pointer `❯` (`>` without the glyph, `!` in
+# shell mode) alone or with the `Try "..."` placeholder. A turn in progress over an empty
+# composer carries `esc to interrupt` in the footer, which outranks this.
+[[rules]]
+id = "composer_empty"
+state = "idle"
+priority = 100
+region = "prompt_box_body"
+visible_idle = true
+line_regex = '^([❯>!]\s*|❯ Try ".*)$'
+
+# A draft in the composer, right under the end of a turn: the turn's summary
+# (`✻ Crunched for 16m 31s · done 6:31 PM`, from real sessions) or
+# `⎿  Interrupted · What should Claude do instead?`, with only indented notices
+# (`You've used 75% of your weekly limit`) between it and the composer's top rule. A prompt
+# just sent sits between an older summary and the composer, unindented, and breaks the chain.
+[[rules]]
+id = "draft_after_turn"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(12)"
+visible_idle = true
+regex = '(?m)^(?:[·✢✳✶✻✽*] \S+ for [^\n]*|\s*⎿\s+Interrupted · What should Claude do instead\?)\s*\n(?:\s{4,}\S[^\n]*\n)*─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^─\n][^\n]*\n)*─{3,}'
+
+# Any other draft. Real sessions draw a draft under a streaming answer with no spinner and
+# no interrupt hint for most frames, so a draft alone is no sign that the turn is over:
+# this reads it as work still going, and only as weak evidence, never visible.
+[[rules]]
+id = "composer_draft"
+state = "working"
+priority = 90
+region = "prompt_box_body"
+line_regex = '^[❯>!] +\S'
+
+# The footer under an empty composer: `? for shortcuts`.
+[[rules]]
+id = "footer_shortcuts"
+state = "idle"
+priority = 100
+region = "after_last_horizontal_rule"
+visible_idle = true
+line_regex = '^\s*\? for shortcuts'
+
+# From the strings: `claude --resume <id>` and `claude --continue`.
+[resume]
+session = ["claude", "--resume", "{session}"]
+latest = ["claude", "--continue"]

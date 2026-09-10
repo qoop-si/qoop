@@ -178,3 +178,36 @@ async fn g3_4_a_shell_that_replaces_itself_is_detected_without_a_fork() {
         "an exec did not mint a generation"
     );
 }
+
+/// G3.9: the screen says what the agent is doing, and the daemon believes it.
+///
+/// The rules are pure and tested in `qoro-detect`. What this asserts is the wiring: that a
+/// real terminal's real screen reaches them, that the verdict survives the precedence rule
+/// in ADR-008, and that it lands where a client reads it. Every one of those was broken
+/// when this was first written, and each broke silently: an empty state column looks
+/// exactly like an agent nobody has anything to say about.
+#[tokio::test]
+async fn g3_9_a_shell_at_its_own_prompt_is_read_as_idle() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let mut c = d.attach("screen").await;
+
+    c.input_to(terminal, b"echo READY_$((6*7))\n").await;
+    assert!(c.wait_for_text_on(terminal, "READY_42", PATIENCE).await);
+
+    let deadline = Instant::now() + PATIENCE;
+    let mut state = qoro_domain::AgentRuntimeState::Unknown;
+    while Instant::now() < deadline {
+        state = d.agent(terminal).expect("an agent record").belief.state;
+        if state == qoro_domain::AgentRuntimeState::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        state,
+        qoro_domain::AgentRuntimeState::Idle,
+        "a shell sitting at its own prompt is not read as idle, so the screen rules reach \
+         nothing"
+    );
+}

@@ -1590,6 +1590,54 @@ pub struct SnapshotWire {
     pub rows: usize,
     pub cursor: (usize, usize),
     pub lines: Vec<String>,
+    /// How each row is coloured, as runs of columns.
+    ///
+    /// Defaulted on the wire, so a client built before this existed reads a snapshot from a
+    /// daemon that sends it and draws the text without the colour, which is ADR-010's rule
+    /// about a newer daemon saying more than an older client understands. Skipped when
+    /// nothing is styled, which is most of a screen and all of a shell prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<Vec<SpanWire>>,
+}
+
+/// A run of columns that share a style, as it crosses the socket.
+///
+/// Flat and short field names, because there is one of these per colour change per row per
+/// frame, and a snapshot of a build log is mostly this.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpanWire {
+    pub at: usize,
+    pub len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<ColourWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<ColourWire>,
+    /// Bold, italic, underline, inverse, dim and strikethrough, in that order, as a small
+    /// bit set: six booleans would be six fields on every run.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attrs: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
+}
+
+/// A colour, kept in the terminal's own vocabulary rather than resolved to rgb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "k", rename_all = "snake_case")]
+pub enum ColourWire {
+    Indexed { i: u8 },
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+/// The attribute bits, named once so the client and the daemon cannot disagree.
+pub mod attrs {
+    pub const BOLD: u8 = 1;
+    pub const ITALIC: u8 = 2;
+    pub const UNDERLINE: u8 = 4;
+    pub const INVERSE: u8 = 8;
+    pub const DIM: u8 = 16;
+    pub const STRIKE: u8 = 32;
 }
 
 impl From<&Snapshot> for SnapshotWire {
@@ -1599,7 +1647,47 @@ impl From<&Snapshot> for SnapshotWire {
             rows: s.rows,
             cursor: s.cursor,
             lines: s.lines.clone(),
+            styles: s
+                .styles
+                .iter()
+                .map(|row| row.iter().map(SpanWire::from).collect())
+                .collect(),
         }
+    }
+}
+
+impl From<&qoro_terminal::Span> for SpanWire {
+    fn from(s: &qoro_terminal::Span) -> Self {
+        let st = &s.style;
+        let mut bits = 0;
+        for (on, bit) in [
+            (st.bold, attrs::BOLD),
+            (st.italic, attrs::ITALIC),
+            (st.underline, attrs::UNDERLINE),
+            (st.inverse, attrs::INVERSE),
+            (st.dim, attrs::DIM),
+            (st.strike, attrs::STRIKE),
+        ] {
+            if on {
+                bits |= bit;
+            }
+        }
+        Self {
+            at: s.at,
+            len: s.len,
+            fg: colour_wire(st.fg),
+            bg: colour_wire(st.bg),
+            attrs: bits,
+        }
+    }
+}
+
+/// `None` for the terminal's own default, which is the common case and is not worth a field.
+fn colour_wire(c: qoro_terminal::Colour) -> Option<ColourWire> {
+    match c {
+        qoro_terminal::Colour::Default => None,
+        qoro_terminal::Colour::Indexed(i) => Some(ColourWire::Indexed { i }),
+        qoro_terminal::Colour::Rgb(r, g, b) => Some(ColourWire::Rgb { r, g, b }),
     }
 }
 
@@ -1664,6 +1752,7 @@ pub fn open_terminal(
         rows: 24,
         cursor: (0, 0),
         lines: vec![String::new(); 24],
+        styles: Vec::new(),
     }));
     let token = crate::agents::mint_token(stream);
     let terminal_id = TerminalId::new(stream.to_string());
@@ -2090,6 +2179,9 @@ async fn terminal_task(
     let mut containment = Containment::new();
     containment.absorb(qoro_pty::sys::enumerate_tty(tty_dev));
     let mut last_scan = std::time::Instant::now();
+    // When to read the screen for what the agent is doing. `None` while nothing has
+    // happened, which is what keeps an idle terminal at no wakeups at all.
+    let mut detect_at: Option<tokio::time::Instant> = None;
     let mut pending_input: Option<std::time::Instant> = None;
     // How far this terminal's history has reached, so the log can say where to read from.
     let mut history_to = 0u64;
@@ -2261,10 +2353,58 @@ async fn terminal_task(
                             if updates.receiver_count() > 0 {
                                 let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                             }
+
+                            // The screen is read once the output stops, not while it is
+                            // arriving. A floor was the first version and it read the
+                            // wrong screen: the last read of a burst is the one with the
+                            // prompt on it, and that is exactly the read a floor skips,
+                            // after which nothing else ever happens to trigger a look.
+                            // Measured: a shell sitting at its own prompt stayed `Unknown`
+                            // for the life of the process.
+                            //
+                            // While nothing is pending this arm is disabled, so an idle
+                            // terminal still costs nothing.
+                            detect_at = Some(tokio::time::Instant::now() + DETECT_SETTLE);
                             if trace && let Some(at) = pending_input.take() {
                                 eprintln!("trace: input to snapshot {:?}", at.elapsed());
                             }
                         }
+                    }
+                }
+                _ = async {
+                    match detect_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        // Disabled: `select!` polls this arm only when the guard holds, and
+                        // the guard is what makes an idle terminal cost nothing.
+                        None => std::future::pending().await,
+                    }
+                }, if detect_at.is_some() => {
+                    detect_at = None;
+                    // Whether or not anyone is subscribed, deliberately: an agent blocked
+                    // in a terminal nobody is looking at is exactly what this notices.
+                    if let Some(program) = agents.program_of(stream)
+                        && let Some(manifest) = qoro_detect::rules_for(&program)
+                        && let Some(verdict) = manifest.evaluate(&engine.visible_text())
+                        && agents.observe_screen(stream, &verdict)
+                    {
+                        // Recorded when it changed, not on every look. The log is what a
+                        // client that was not connected reads to find out what happened
+                        // while it was away, and a row per evaluation would bury that in
+                        // repetitions of the same fact.
+                        events.observe(
+                            qoro_events::Stream::Terminal(stream),
+                            qoro_events::Body::Observation {
+                                terminal: stream,
+                                state: format!("{:?}", verdict.state),
+                                source: "ScreenHeuristic".into(),
+                                confidence: "Medium".into(),
+                                sampled_generation: 0,
+                                // The rule's name, never the screen it matched: a screen is
+                                // somebody's source code and their client's name.
+                                evidence: verdict.rule.clone(),
+                                redacted: false,
+                            },
+                        );
                     }
                 }
                 writable = afd.writable(), if want_write => {
@@ -2416,6 +2556,16 @@ impl ContainmentScanner {
 /// and it was too coarse to be real: a scripted session that starts a background job and
 /// exits takes about 110 milliseconds end to end, so the scan never ran once.
 pub const CONTAINMENT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long a terminal has to be quiet before its screen is read for what the agent is
+/// doing.
+///
+/// Armed by output and disarmed by the read, so a terminal that says nothing schedules
+/// nothing: an idle workspace costs no wakeups at all. More output pushes the deadline out,
+/// which is what makes a burst one evaluation rather than one per read, and what makes the
+/// screen that gets read the settled one with the prompt on it rather than a screen halfway
+/// through being drawn.
+pub const DETECT_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
 
 #[allow(clippy::too_many_arguments)]
 async fn tear_down(

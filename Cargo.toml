@@ -19,6 +19,7 @@ members = [
     "crates/qoro-testkit",
     "crates/qoro-attention",
     "crates/qoro-bench",
+    "crates/qoro-detect",
     "spikes/spike-runtime",
 ]
 

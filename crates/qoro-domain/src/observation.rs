@@ -140,6 +140,17 @@ impl AgentBelief {
         if obs.source >= self.source {
             return ObservationVerdict::Accept;
         }
+        // An unknown state is not a claim, so it cannot outrank one.
+        //
+        // A terminal starts with a belief whose source is the process table and whose state
+        // is `Unknown`: we know which program is there and nothing about what it is doing.
+        // Ranked literally, that placeholder outranks every screen observation forever, so
+        // a terminal's state column stayed empty for the life of the process. Measured
+        // exactly that on a shell sitting at its own prompt. The rank is about two sources
+        // that both say something, which is what the rest of this function is for.
+        if self.state == AgentRuntimeState::Unknown {
+            return ObservationVerdict::Accept;
+        }
         // Weaker source. The one exception: a screen observation that positively saw a
         // blocking modal, and is newer than what it is overriding. A hook can lag or
         // under-report a modal; the live screen cannot lie about one being on screen.
@@ -191,6 +202,55 @@ impl AgentBelief {
             self.state,
             AgentRuntimeState::Blocked | AgentRuntimeState::Failed | AgentRuntimeState::Done
         )
+    }
+}
+
+#[cfg(test)]
+mod unknown_is_not_a_claim {
+    use super::*;
+
+    fn screen(state: AgentRuntimeState, sequence: u64) -> AgentObservation {
+        AgentObservation {
+            agent_id: crate::AgentId::new("a"),
+            terminal_id: crate::TerminalId::new("1"),
+            sampled_generation: GenerationId::FIRST,
+            state,
+            source: ObservationSource::ScreenHeuristic,
+            confidence: Confidence::Medium,
+            sequence,
+            visible_blocker: false,
+        }
+    }
+
+    #[test]
+    fn a_screen_is_accepted_over_a_placeholder_from_a_stronger_source() {
+        let belief = AgentBelief {
+            generation: GenerationId::FIRST,
+            state: AgentRuntimeState::Unknown,
+            source: ObservationSource::ProcessIdentity,
+            sequence: 0,
+            visible_blocker: false,
+            candidates: Vec::new(),
+        };
+        let after = belief
+            .accept(&screen(AgentRuntimeState::Idle, 1))
+            .expect("a placeholder does not outrank an observation");
+        assert_eq!(after.state, AgentRuntimeState::Idle);
+    }
+
+    #[test]
+    fn a_screen_still_does_not_outrank_a_stronger_source_that_said_something() {
+        let belief = AgentBelief {
+            generation: GenerationId::FIRST,
+            state: AgentRuntimeState::Working,
+            source: ObservationSource::Hook,
+            sequence: 5,
+            visible_blocker: false,
+            candidates: Vec::new(),
+        };
+        // The rule this fix must not weaken: a hook that reported working is not overruled
+        // by a screen that has not caught up.
+        assert!(belief.accept(&screen(AgentRuntimeState::Idle, 9)).is_err());
     }
 }
 

@@ -24,6 +24,7 @@ struct Interface {
     /// `ensure_daemon` gives that to `/dev/null`.
     daemon: Child,
     master: OwnedFd,
+    #[allow(dead_code)]
     _dir: tempfile::TempDir,
     /// Everything it has painted so far. The screen is a stream here, not a grid: a test
     /// asks whether something was ever drawn, and the last frame alone would lose an
@@ -47,6 +48,29 @@ impl Drop for Interface {
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
+
+/// What the row says, with the colour taken out.
+///
+/// A test that reads a screen has to read it the way a terminal does, and a terminal does
+/// not count an escape sequence as a column.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // A control sequence runs to its final byte, which is the first one in the
+        // alphabetic range.
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
+}
 
 /// The interface's own idea of how wide the index is, so this test cannot drift from it.
 fn index_width() -> usize {
@@ -216,7 +240,14 @@ impl Interface {
     fn index_line(&self, row: usize) -> Option<String> {
         let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
-        Some(self.painted[start..].chars().take(index_width()).collect())
+        // Escapes stripped before counting: the index colours a row by its state, so the
+        // twenty characters after the cursor move are not twenty columns of index.
+        Some(
+            strip_escapes(&self.painted[start..])
+                .chars()
+                .take(index_width())
+                .collect(),
+        )
     }
 
     /// The terminal's own column of one screen row, as painted most recently.
@@ -224,7 +255,7 @@ impl Interface {
         let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
         Some(
-            self.painted[start..]
+            strip_escapes(&self.painted[start..])
                 .chars()
                 .skip(index_width() + 1)
                 .take(30)
@@ -455,5 +486,59 @@ fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
         ui.saw("\x1b[?1049l"),
         "the interface did not leave the alternate screen:\n{:?}",
         ui.painted
+    );
+}
+
+/// G12.7: an agent that needs a person is visible without looking at its terminal.
+///
+/// The whole product in one assertion. A stand in agent, because a real one cannot be
+/// installed by a test, and it is a shell script on purpose: that is the shape that broke
+/// the identity chain, where the executable is the interpreter and the agent's own name is
+/// only in the argv.
+#[test]
+fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+
+    let dir = ui._dir.path().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\nprintf 'Do you want to proceed with this edit?\\n'\n\
+         printf '  1. Yes\\n  2. No\\n'\nsleep 30\n",
+    )
+    .expect("write");
+    std::fs::set_permissions(
+        &agent,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+
+    ui.type_in(format!("{}\n", agent.display()).as_bytes());
+
+    // The name a person would say, not the interpreter that is running it.
+    assert!(
+        ui.wait_for_index(1, |line| line.contains("claude"), Duration::from_secs(15))
+            .is_some(),
+        "the index does not name the agent: {:?}",
+        ui.index_line(1)
+    );
+    // What it is doing, read off its own screen.
+    assert!(
+        ui.wait_for_index(1, |line| line.contains("blocked"), Duration::from_secs(15))
+            .is_some(),
+        "the index does not say the agent is blocked: {:?}",
+        ui.index_line(1)
+    );
+    // And said out loud, so a person who is looking at another terminal still finds out.
+    assert!(
+        ui.saw("is blocked"),
+        "the interface never said anything about it"
+    );
+    // Coloured, because a column of identical grey rows is a column nobody scans.
+    assert!(
+        ui.painted.contains("\x1b[33m"),
+        "the blocked row is not coloured"
     );
 }

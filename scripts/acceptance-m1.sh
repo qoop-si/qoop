@@ -52,10 +52,22 @@ tmux new-session -d -s "$S" -x 90 -y 26
 tmux send-keys -t "$S" "export QORO_RUNTIME_DIR=$RT; clear" Enter
 sleep 1
 tmux send-keys -t "$S" "$QORO 2>$RT/client.log" Enter
-sleep 3
+# Waited for, not slept for. A fixed three seconds was long enough on a quiet machine and
+# not on a busy one, and when it was not, `pgrep` answered nothing and every step after it
+# failed for a reason that had nothing to do with the product: `expected 1 ptmx, saw 51` is
+# what a `lsof` on an empty pid prints. Measured, one run in six under load.
+starts(){
+    local pattern=$1 deadline=$((SECONDS + 30)) pid=""
+    while [ $SECONDS -lt $deadline ]; do
+        pid=$(pgrep -f "$pattern" | head -1)
+        [ -n "$pid" ] && { echo "$pid"; return 0; }
+        sleep 0.2
+    done
+    return 1
+}
 
-CPID=$(pgrep -f "release/qoro$" | head -1)
-DPID=$(pgrep -f "release/qoro daemon" | head -1)
+CPID=$(starts "release/qoro$") || { echo "the client never started" >&2; exit 3; }
+DPID=$(starts "release/qoro daemon") || { echo "the daemon never started" >&2; exit 3; }
 echo "client=$CPID daemon=$DPID"
 
 echo "--- 1. a real shell answers a real command"

@@ -285,6 +285,112 @@ pub fn program_of(pid: Pid) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+#[cfg(test)]
+mod argv_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_process_reports_the_arguments_it_was_started_with() {
+        // A real process with arguments nobody could guess, read back through the same
+        // path the daemon uses. A unit test with a fixture would prove the parser and not
+        // the syscall, and the syscall is the part that differs by platform.
+        let marker = "qoro-argv-marker";
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("sleep 5 # {marker}")])
+            .spawn()
+            .expect("spawn");
+        let argv = argv_of(Pid(child.id() as i32));
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            argv.iter().any(|a| a.contains(marker)),
+            "argv did not carry the arguments: {argv:?}"
+        );
+        assert!(argv.first().is_some_and(|a| a.contains("sh")), "{argv:?}");
+    }
+
+    #[test]
+    fn a_process_that_is_gone_answers_nothing_rather_than_failing() {
+        // Pid 1 is not ours to read on a mac, and a pid that never existed is not readable
+        // anywhere. Both are "we cannot tell", which the caller already handles.
+        let _ = argv_of(Pid(i32::MAX));
+    }
+}
+
+/// A process's argument vector, for telling an agent from the runtime that started it.
+///
+/// The executable path alone is not enough: an agent installed as a node package runs as
+/// `node /path/to/cli.js`, and a person looking at `node` in an index learns nothing. The
+/// caller decides what the argv means (`qoro_domain::program`); this only fetches it.
+///
+/// Empty when the process is gone or is not ours to read, which is the same answer as "we
+/// cannot tell" and is what the caller already handles.
+#[cfg(target_os = "macos")]
+pub fn argv_of(pid: Pid) -> Vec<String> {
+    // `KERN_PROCARGS2` answers with a small header and then a run of NUL terminated
+    // strings: an `argc`, the executable path, padding, and then `argc` arguments. There is
+    // no other unprivileged way to read another process's argv on macOS.
+    let mut size: usize = 0;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.0];
+    // SAFETY: a sizing call with a null buffer, which is how sysctl reports the length it
+    // needs. Every pointer is either null or a live local.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 || size > 4 * 1024 * 1024 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: buf is live and `size` is the length sysctl just asked for.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return Vec::new();
+    }
+    buf.truncate(size);
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let mut rest = &buf[4..];
+    // The executable path, then the padding that aligns what follows.
+    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    rest = &rest[end..];
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+    rest.split(|b| *b == 0)
+        .take(argc)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// A process's argument vector. See the macOS version for what this is for.
+#[cfg(not(target_os = "macos"))]
+pub fn argv_of(pid: Pid) -> Vec<String> {
+    std::fs::read(format!("/proc/{}/cmdline", pid.0))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The process group in the foreground of a terminal, and the leader of that group.
 ///
 /// One `ioctl`, measured in microseconds, so it is cheap enough to ask on every read.
@@ -682,5 +788,42 @@ mod tests {
             !still_alive(me, start.wrapping_add(1)),
             "a mismatched start time must not match"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_chain {
+    use super::*;
+
+    #[test]
+    fn a_shebang_script_is_named_by_itself_and_not_by_its_interpreter() {
+        // The whole chain as the daemon runs it: the executable the kernel reports, the
+        // argv it was given, and the name a person would say. A stand in agent, because a
+        // real one cannot be installed by a test.
+        let dir = std::env::temp_dir().join(format!("qoro-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let script = dir.join("claude");
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").expect("write");
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        let mut child = std::process::Command::new(&script).spawn().expect("spawn");
+        let pid = Pid(child.id() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let executable = program_of(pid).unwrap_or_default();
+        let argv = argv_of(pid);
+        let program = qoro_domain::program::identify(&executable, &argv);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            program.name, "claude",
+            "executable {executable:?} argv {argv:?} identified as {program:?}"
+        );
+        assert!(program.agent);
     }
 }

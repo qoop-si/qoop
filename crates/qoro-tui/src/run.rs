@@ -27,6 +27,12 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
+    /// What each terminal's state was at the last index, so a change into one that wants a
+    /// person can be noticed. Without it the interface would have to compare a row against
+    /// itself, which is a comparison that is always equal.
+    was: std::collections::BTreeMap<u32, String>,
+    /// Set when something started needing a person, cleared when the bell has rung.
+    ring: bool,
 }
 
 impl State {
@@ -91,6 +97,8 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         lines,
         message: Some("connecting".to_string()),
         pending_focus: None,
+        was: std::collections::BTreeMap::new(),
+        ring: false,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -152,7 +160,13 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     let outcome: io::Result<()> = async {
         loop {
             if dirty {
-                let painted = screen::paint(&state.frame());
+                let mut painted = screen::paint(&state.frame());
+                if state.ring {
+                    // After the frame, so the terminal has the new colour on screen when
+                    // the person looks up.
+                    painted.push('\x07');
+                    state.ring = false;
+                }
                 out.write_all(painted.as_bytes())?;
                 out.flush()?;
                 dirty = false;
@@ -350,6 +364,22 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if state.focused == 0 {
                 state.focused = agents.first().map(|r| r.terminal).unwrap_or(0);
             }
+            // A terminal that has just started needing a person. The bell is the local
+            // notification: it is what the person's own terminal emulator turns into a
+            // badge or a bounce, and it is the one channel that works with no account, no
+            // daemon of somebody else's, and no network.
+            for row in &agents {
+                let before = state.was.get(&row.terminal);
+                let wants_someone = matches!(row.state.as_str(), "blocked" | "failed" | "done");
+                if wants_someone && before.is_some_and(|b| b != &row.state) {
+                    state.ring = true;
+                    state.message = Some(format!("terminal {} is {}", row.terminal, row.state));
+                }
+            }
+            state.was = agents
+                .iter()
+                .map(|r| (r.terminal, r.state.clone()))
+                .collect();
             state.rows = agents;
             *dirty = true;
         }

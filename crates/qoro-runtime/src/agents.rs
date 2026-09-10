@@ -164,6 +164,18 @@ impl AgentRegistry {
         self.terminals.lock().unwrap().keys().copied().collect()
     }
 
+    /// The program in a terminal, when it can be read.
+    ///
+    /// Its own accessor rather than a field read through `agent()`, because the read loop
+    /// asks on every screen evaluation and cloning the whole record for a name is the kind
+    /// of cost that only shows up at a hundred terminals.
+    pub fn program_of(&self, stream: u32) -> Option<String> {
+        match &self.terminals.lock().unwrap().get(&stream)?.identity {
+            AgentIdentity::Known { program, .. } => Some(program.clone()),
+            _ => None,
+        }
+    }
+
     pub fn agent(&self, stream: u32) -> Option<TerminalAgent> {
         self.terminals.lock().unwrap().get(&stream).cloned()
     }
@@ -249,6 +261,49 @@ impl AgentRegistry {
     }
 
     /// Whether an observation claiming to be from this terminal is admitted.
+    /// Record what a terminal's screen says about the agent in it.
+    ///
+    /// The screen is the weakest source in ADR-008's order and it goes through the same
+    /// acceptance rule as every other one: a hook that said `working` a moment ago is not
+    /// overruled by a screen that has not caught up, and a screen that positively saw a
+    /// blocking prompt is the one case that may overrule a stronger source. None of that
+    /// is decided here, which is the point: there is one acceptance rule and this is a
+    /// caller of it.
+    ///
+    /// Answers whether anything changed, so a caller can avoid announcing a non event.
+    pub fn observe_screen(&self, stream: u32, verdict: &qoro_detect::Verdict) -> bool {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return false;
+        };
+        let generation = agent.belief.generation;
+        let observation = qoro_domain::AgentObservation {
+            agent_id: qoro_domain::AgentId::new(stream.to_string()),
+            terminal_id: agent.capability.terminal.clone(),
+            sampled_generation: generation,
+            state: verdict.state,
+            source: qoro_domain::ObservationSource::ScreenHeuristic,
+            confidence: qoro_domain::Confidence::Medium,
+            // One per terminal per generation, so two screens in a row cannot arrive out of
+            // order with each other.
+            sequence: agent.belief.sequence.saturating_add(1),
+            visible_blocker: verdict.visible_blocker,
+        };
+        let before = agent.belief.state;
+        // `accept` is the one that consumes the belief and returns the new one, so an
+        // observation cannot be applied without going through the acceptance rule first.
+        let Ok(next) = agent.belief.clone().accept(&observation) else {
+            return false;
+        };
+        agent.belief = next;
+        let changed = agent.belief.state != before;
+        drop(terminals);
+        if changed {
+            self.announce(stream);
+        }
+        changed
+    }
+
     pub fn admit(
         &self,
         stream: u32,
@@ -267,15 +322,22 @@ impl AgentRegistry {
 fn identity_of(pid: Pid, generation: GenerationId) -> AgentIdentity {
     match qoro_pty::sys::program_of(pid) {
         None => AgentIdentity::None,
-        Some(program) => match boundary_for(&program) {
+        Some(path) => match boundary_for(&path) {
             Some(boundary) => AgentIdentity::Unavailable {
                 boundary,
                 generation,
             },
-            None => AgentIdentity::Known {
-                program,
-                generation,
-            },
+            None => {
+                // The name a person would say, not the executable that happens to be
+                // running it. An agent installed as a node package runs as `node
+                // /path/cli.js`, and an index that says `node` has told nobody anything.
+                // `qoro_domain::program` decides; the argv is only fetched here.
+                let argv = qoro_pty::sys::argv_of(pid);
+                AgentIdentity::Known {
+                    program: qoro_domain::program::identify(&path, &argv).name,
+                    generation,
+                }
+            }
         },
     }
 }

@@ -1,0 +1,23 @@
+# Any program with no manifest of its own.
+#
+# One rule, and it claims one thing: a shell that has finished whatever it was running and
+# drawn its prompt again is idle. Nothing else is knowable about a program this engine has
+# never seen, and a guess here would be a guess about every program at once.
+
+id = "generic"
+version = "1"
+
+# The bottom line of the screen is a prompt waiting for input. A prompt sigil with nothing
+# after it means the last command has returned; a line with a command after the sigil, or
+# any other output, is not a match, so a running command leaves this manifest silent.
+#
+# A line of program output that happens to end in one of these characters reads as a false
+# idle. That is a known cost of having no manifest: this is the weakest evidence any source
+# produces, and the precedence rules treat it that way.
+[[rules]]
+id = "shell_prompt_idle"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(1)"
+visible_idle = true
+line_regex = '[$#%>]\s*$'

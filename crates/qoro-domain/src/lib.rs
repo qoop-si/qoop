@@ -14,6 +14,7 @@ pub mod identity;
 pub mod ids;
 pub mod launch;
 pub mod observation;
+pub mod program;
 pub mod sizing;
 pub mod terminal;
 pub mod viewport;

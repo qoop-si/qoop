@@ -23,7 +23,10 @@ use alacritty_terminal::vte::ansi::Processor;
 use bytes::Bytes;
 
 use crate::control_string::ControlStringFilter;
-use crate::engine::{Damage, LineDamage, Snapshot, TerminalEffect, TerminalEngine, TerminalModes};
+use crate::engine::{
+    Colour, Damage, LineDamage, Snapshot, Span, Style, TerminalEffect, TerminalEngine,
+    TerminalModes,
+};
 
 /// The engine allocates scrollback in 1000 row chunks, so this is the cheapest non-zero
 /// setting. See ADR-003 for the measurements.
@@ -82,13 +85,45 @@ impl AlacrittyEngine {
         }
     }
 
-    fn row_text(&self, line: i32) -> String {
+    /// One row's colour, as runs of columns that look the same.
+    ///
+    /// Runs and not cells: a line of output changes colour once or twice, and sending
+    /// eighty styles for eighty columns would make a snapshot an order of magnitude bigger
+    /// for nothing. A row with no colour at all returns an empty list, which is most rows
+    /// and costs nothing to send.
+    ///
+    /// Trailing plain cells are dropped for the same reason `row_text` trims: the rest of
+    /// the line is the terminal's default and saying so is not information.
+    /// One row, as the text a person reads and the runs that colour it.
+    ///
+    /// Runs and not cells: a line of output changes colour once or twice, and sending
+    /// eighty styles for eighty columns would make a snapshot an order of magnitude bigger
+    /// for nothing. A row with no colour at all returns an empty list, which is most rows
+    /// and costs nothing to send.
+    ///
+    /// Trailing plain cells are dropped for the same reason the text is trimmed: the rest
+    /// of the line is the terminal's default, and saying so is not information.
+    fn row(&self, line: i32) -> (String, Vec<Span>) {
         let grid = self.term.grid();
-        let mut s = String::with_capacity(grid.columns());
+        let mut text = String::with_capacity(grid.columns());
+        let mut spans: Vec<Span> = Vec::new();
         for col in 0..grid.columns() {
-            s.push(grid[Point::new(Line(line), Column(col))].c);
+            let cell = &grid[Point::new(Line(line), Column(col))];
+            text.push(cell.c);
+            let style = style_of(cell);
+            match spans.last_mut() {
+                Some(last) if last.style == style && last.at + last.len == col => last.len += 1,
+                _ => spans.push(Span {
+                    at: col,
+                    len: 1,
+                    style,
+                }),
+            }
         }
-        s.trim_end().to_string()
+        while spans.last().is_some_and(|s| s.style.is_plain()) {
+            spans.pop();
+        }
+        (text.trim_end().to_string(), spans)
     }
 
     /// Capture rows that have entered the history ring since the last feed.
@@ -127,7 +162,9 @@ impl AlacrittyEngine {
         }
         for i in (0..history).rev() {
             // History rows sit at negative line numbers, oldest most negative.
-            self.scrolled_off.push(self.row_text(-(i as i32) - 1));
+            // History keeps the text alone: what goes to disk as scrollback is rows of
+            // text, and colour there would be a second format nobody reads back.
+            self.scrolled_off.push(self.row(-(i as i32) - 1).0);
         }
         if history >= SCROLLBACK_ROWS {
             // The ring was full when we looked, so rows may have been evicted before we
@@ -175,6 +212,42 @@ fn incomplete_utf8_tail(buf: &[u8]) -> usize {
         }
     }
     0
+}
+
+/// One cell's style, in this crate's vocabulary rather than the engine's.
+///
+/// The engine's named colours are the sixteen ansi ones plus a handful of roles.
+/// Foreground and background become `Default` because that is what they mean: whatever the
+/// person's own terminal uses. Everything else keeps its palette index, so a client with a
+/// different theme draws its own colours rather than this machine's.
+fn style_of(cell: &alacritty_terminal::term::cell::Cell) -> Style {
+    use alacritty_terminal::term::cell::Flags;
+    Style {
+        fg: colour_of(cell.fg),
+        bg: colour_of(cell.bg),
+        bold: cell.flags.contains(Flags::BOLD),
+        italic: cell.flags.contains(Flags::ITALIC),
+        underline: cell.flags.intersects(
+            Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE,
+        ),
+        inverse: cell.flags.contains(Flags::INVERSE),
+        dim: cell.flags.contains(Flags::DIM),
+        strike: cell.flags.contains(Flags::STRIKEOUT),
+    }
+}
+
+fn colour_of(c: alacritty_terminal::vte::ansi::Color) -> Colour {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    match c {
+        Color::Named(NamedColor::Foreground | NamedColor::Background) => Colour::Default,
+        Color::Named(named) => Colour::Indexed(named as u8),
+        Color::Indexed(i) => Colour::Indexed(i),
+        Color::Spec(rgb) => Colour::Rgb(rgb.r, rgb.g, rgb.b),
+    }
 }
 
 impl TerminalEngine for AlacrittyEngine {
@@ -256,12 +329,27 @@ impl TerminalEngine for AlacrittyEngine {
         let grid = self.term.grid();
         let rows = grid.screen_lines();
         let cursor = grid.cursor.point;
+        // One walk of the grid for both, because they are the same walk: reading the row
+        // twice doubled the cost of a snapshot, and a snapshot is what a streaming terminal
+        // produces on every read.
+        let (mut lines, mut styles) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+        for line in 0..rows {
+            let (text, spans) = self.row(line as i32);
+            lines.push(text);
+            styles.push(spans);
+        }
         Snapshot {
             cols: grid.columns(),
             rows,
             cursor: (cursor.line.0.max(0) as usize, cursor.column.0),
-            lines: (0..rows).map(|l| self.row_text(l as i32)).collect(),
+            lines,
+            styles,
         }
+    }
+
+    fn visible_text(&self) -> Vec<String> {
+        let rows = self.term.grid().screen_lines();
+        (0..rows).map(|l| self.row(l as i32).0).collect()
     }
 
     fn modes(&self) -> TerminalModes {

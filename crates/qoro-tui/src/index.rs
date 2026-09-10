@@ -40,7 +40,42 @@ const FOCUS_MARKER: char = '>';
 /// `focused` need not appear in `rows`. The daemon's answer and the client's idea of the
 /// focused terminal are two messages that can cross, and a client that panicked on the
 /// overlap would die exactly when a terminal exited.
+/// One painted index row: its text, and the colour the state gives it.
+///
+/// The colour is here and not in the painter because the state is here: a painter that had
+/// to parse the state back out of the text it was handed would be reading a string this
+/// module just finished writing.
+pub struct Line {
+    pub text: String,
+    /// An ansi palette index, or `None` for a row with nothing to say.
+    pub colour: Option<u8>,
+}
+
+/// The colour a state earns.
+///
+/// Deliberately few: a person scanning an index is looking for the one row that needs them,
+/// and a column where every row is a different colour is a column with no signal in it.
+/// Blocked and failed are the two that mean "come here", so they are the two that are warm.
+pub fn colour_for(state: &str) -> Option<u8> {
+    match state {
+        "blocked" => Some(3),
+        "failed" => Some(1),
+        "working" => Some(6),
+        "done" => Some(2),
+        "starting" => Some(4),
+        _ => None,
+    }
+}
+
 pub fn render(rows: &[AgentRow], focused: u32, height: usize) -> Vec<String> {
+    render_lines(rows, focused, height)
+        .into_iter()
+        .map(|l| l.text)
+        .collect()
+}
+
+/// The index, with each row's colour.
+pub fn render_lines(rows: &[AgentRow], focused: u32, height: usize) -> Vec<Line> {
     if height == 0 {
         return Vec::new();
     }
@@ -56,8 +91,14 @@ pub fn render(rows: &[AgentRow], focused: u32, height: usize) -> Vec<String> {
     let blank = " ".repeat(WIDTH);
     (0..height)
         .map(|line| match rows.get(first + line) {
-            Some(row) => render_row(row, row.terminal == focused),
-            None => blank.clone(),
+            Some(row) => Line {
+                text: render_row(row, row.terminal == focused),
+                colour: colour_for(&row.state),
+            },
+            None => Line {
+                text: blank.clone(),
+                colour: None,
+            },
         })
         .collect()
 }

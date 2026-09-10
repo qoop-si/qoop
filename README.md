@@ -12,17 +12,21 @@ no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you 
 the same one.
 
 ```
- 1 zsh              │~/my-project $ cargo test
->2 claude   working │
- 3 sh               │
+ 1 zsh          idle│~/my-project $ cargo test
+>2 claude    blocked│
+ 3 sh          idle │
                     │
-ctrl-a n next  ctrl-a c new  ctrl-a x close  ctrl-a d detach
+terminal 2 is blocked
 ```
 
-The index says which terminal each agent is in and what it is doing, and it changes when the
-process does, including for a command that prints nothing at all. `ctrl-a` then a key moves
-between terminals, makes one or closes one. Nothing polls: eight terminals open and nobody
-typing costs 105 microseconds of client CPU a minute.
+The index says which terminal each agent is in and what it is doing. An agent waiting for an
+answer turns its row yellow and rings the bell, so you find out without looking. The name is
+the one you would say, not the runtime underneath it: an agent installed as a node package
+reads as itself, not as `node`.
+
+`ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches.
+Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a
+minute, and the state is read off a terminal's screen only once it stops changing.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
 [ADR-021](docs/adr/ADR-021-windows.md) says what one would have to include.

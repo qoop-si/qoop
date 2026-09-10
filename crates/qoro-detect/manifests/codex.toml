@@ -1,0 +1,162 @@
+# Codex CLI (OpenAI), the Rust terminal interface.
+#
+# Every string below is from openai/codex at 551bd409 (2026-10-06): the code in
+# `codex-rs/tui` and the snapshot fixtures beside it, which hold the rendered terminal
+# buffer. Codex draws inline by default, so the transcript sits above the live pane.
+
+id = "codex"
+version = "1"
+
+# The transcript pager (`/ T R A N S C R I P T` across its first row,
+# `pager_overlay/transcript.rs`). What it shows is the past, so the last reading stands.
+[[rules]]
+id = "transcript_pager"
+state = "unknown"
+priority = 400
+region = "top_non_empty_lines(1)"
+skip_state_update = true
+line_regex = '^[/ ]*/ T R A N S C R I P T'
+
+# A picker the person opened (model, approval mode). It ends on the hint
+# `Press enter to confirm or esc to go back` (`chatwidget/tests/app_server.rs`), which no
+# approval uses: nothing is waiting on a person, and the last reading stands.
+[[rules]]
+id = "picker_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(12)"
+skip_state_update = true
+regex = '(?m)^\s*Press enter to confirm or esc to go back[^\n]*\z'
+
+# Every approval overlay (run a command, network access, file edits, grant permissions,
+# an MCP server) replaces the composer and ends on the dim hint
+# `Press enter to confirm or esc to cancel`, with the selected option row `› 1. ...` above
+# it (`bottom_pane/approval_overlay.rs`, `approval_modal_exec.snap`). The hint must be the
+# last line on screen: the same words quoted in an answer have the composer under them.
+# The title is not required, because a diff preview can push it out of the region.
+[[rules]]
+id = "approval_overlay"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(12)"
+visible_blocker = true
+regex = '(?m)^\s*Press enter to confirm or esc to cancel[^\n]*\z'
+line_regex = '^› \d+\. '
+
+# The window title while an overlay needs the person: `[ ! ] Action Required`, blinking
+# with `[ . ] Action Required` (`chatwidget/status_surfaces.rs`). Codex sets it itself, and
+# a title cannot be quoted in an answer.
+[[rules]]
+id = "title_action_required"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^\[ [!.] \] Action Required'
+
+# The trust screen on first run in a folder: the heading `Folder access`, then the options
+# and the hint `enter continue · esc quit` (`enter continue and create sandbox · esc quit`
+# with the Windows sandbox, `enter continue · esc back` in the restricted variant)
+# (`onboarding/trust_directory.rs`). The hint is the screen's last line; the same words
+# quoted in an answer have the composer and its footer under them.
+[[rules]]
+id = "trust_folder"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\s*Folder access\s*$' },
+  { regex = '(?m)^\s*enter continue( and create sandbox)? · esc (quit|back)\s*\z' },
+]
+
+# Any other numbered menu in the composer's place, as the update prompt draws it in a real
+# session (`  ✨ Update available! ...`, `› 1. Update now (...)`, `  2. Skip`): the selected
+# row `› 1. ...` and at least one more numbered row, the last of them the screen's last
+# line. One numbered line is ordinary output and a list without the marker is an answer. A
+# numbered draft in the composer looks the same, but has the composer's footer under it
+# (`? for shortcuts`, `context left`, `tab to queue message`, the model and directory), and
+# rows quoted in an answer have the composer row (`› ` and text that is not a number) too.
+[[rules]]
+id = "numbered_menu"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(6)"
+visible_blocker = true
+all = [
+  { line_regex = '^› \d+\. ' },
+  { line_regex = '^\s+\d+\. \S' },
+  { regex = '(?m)^(› |\s+)\d+\. [^\n]*\z' },
+]
+not = [
+  { line_regex = '^› \D' },
+  { line_regex = '(\? for shortcuts|context left|tab to queue message|esc to interrupt\))' },
+]
+
+# The status line above the composer while a turn runs: a header (`Working`, or the
+# current reasoning heading) then `(<elapsed> • esc to interrupt)`, with an optional
+# ` · <message>` tail (`status_indicator_widget.rs`). Real sessions draw the separator as
+# `·` (`(11s · esc to interrupt)`), so either is read. The header changes, the timer and
+# the interrupt hint do not. The line starts at the first column (the glyph, or the header
+# when the glyph is hidden) and ends at the hint or its tail, so the same words inside an
+# answer, indented, do not count; nor does a screen whose footer is the idle
+# `? for shortcuts`.
+[[rules]]
+id = "status_interrupt"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = '^\S.*\([^()•·]+ [•·] [^()]+ to interrupt\)( · .*)?\s*$'
+not = [{ line_regex = '^\s*\? for shortcuts' }]
+
+
+# The footer under the composer while a turn runs: `tab to queue message`
+# (`chatwidget_exec_and_status_layout_vt100_snapshot.snap`).
+[[rules]]
+id = "footer_queue_message"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(1)"
+visible_working = true
+line_regex = '^\s*tab to queue message'
+
+# The window title while a turn is active starts with a braille spinner frame
+# (`chatwidget/status_surfaces.rs`, frames 100 ms apart).
+[[rules]]
+id = "title_spinner"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'
+
+# The composer: a row starting `› ` then the placeholder (`Ask Codex to do anything`, or
+# `Ask a follow-up question` in a side conversation, `chatwidget.rs`) or the typed text,
+# over its footer. A numbered option carries the same marker (`› 1. Update now`) and is
+# never the composer.
+[[rules]]
+id = "composer"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+line_regex = '^› '
+not = [{ line_regex = '^› \d+\. ' }]
+
+# The footer under an idle composer: `  ? for shortcuts` on the left
+# (`chat_composer__tests__empty.snap`). A running turn shows `tab to queue message` there.
+[[rules]]
+id = "footer_shortcuts"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(1)"
+visible_idle = true
+line_regex = '^\s*\? for shortcuts'
+
+# From `codex-rs/cli/src/main.rs`: `codex resume <SESSION_ID>` and `codex resume --last`,
+# the newest session in this directory.
+[resume]
+session = ["codex", "resume", "{session}"]
+latest = ["codex", "resume", "--last"]
