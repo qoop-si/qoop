@@ -278,7 +278,10 @@ impl Interface {
         )
     }
 
-    /// The terminal whose tab is bracketed, which is the one with the keyboard.
+    /// Which tab is bracketed, counted along the bar, which is the one with the keyboard.
+    ///
+    /// A place on the bar and not a terminal number: the bar is numbered the way it is
+    /// pressed, and terminal numbers are handed out across every space.
     ///
     /// Read off the bar rather than asked of the interface: what is being tested is what a
     /// person can see, and an interface that believes it moved the focus and did not paint
@@ -295,6 +298,7 @@ impl Interface {
     }
 
     /// Read until that terminal's tab is the focused one.
+    /// Read until that tab, counted along the bar, is the focused one.
     fn wait_for_tab(&mut self, want: u32, within: Duration) -> bool {
         self.wait_for_tabs(|_| false, Duration::ZERO);
         let start = Instant::now();
@@ -318,6 +322,31 @@ impl Interface {
             .find(&format!("[{terminal} "))
             .or_else(|| bar.find(&format!(" {terminal} ")))?;
         Some(at as u16 + 2)
+    }
+
+    /// One row of the left column exactly as it was written, escapes and all.
+    ///
+    /// The colour is the thing being asserted, so it cannot be stripped, and it has to be
+    /// this row's colour: searching the whole painted stream for a yellow also finds a
+    /// yellow the child process printed into the pane, which is a gate that passes when the
+    /// wrong row is coloured or when nothing in the interface is.
+    fn raw_panel_line(&self, row: usize) -> Option<&str> {
+        let at = format!("\x1b[{row};1H");
+        let start = self.painted.rfind(&at)? + at.len();
+        let rest = &self.painted[start..];
+        Some(match rest.find("\x1b[") {
+            // Up to the next escape, unless that escape is this row's own colour.
+            Some(0) => &rest[..rest[2..].find("\x1b[").map(|n| n + 2).unwrap_or(rest.len())],
+            Some(n) => &rest[..n],
+            None => rest,
+        })
+    }
+
+    /// Read until the nth space, counted down the spaces panel from one, is the focused one.
+    fn wait_for_space(&mut self, nth: usize, within: Duration) -> bool {
+        let row = FIRST_SPACE_ROW + nth - 1;
+        self.wait_for_panel(row, |line| line.contains('\u{25cf}'), within)
+            .is_some()
     }
 
     /// Read until the tab bar says what is wanted.
@@ -506,10 +535,10 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
     ui.command(b'x');
     assert!(
         ui.wait_for_tabs(
-            |bar| !bar.contains("1 ") && !bar.contains("[1"),
+            |bar| !bar.contains(" 2 ") && !bar.contains("[2"),
             Duration::from_secs(15)
         ),
-        "the tab bar still carries the closed terminal: {:?}",
+        "the tab bar still carries a second tab after one terminal was closed: {:?}",
         ui.tab_bar()
     );
     // And what is left is usable. Asserting only that a tab went away is also satisfied by
@@ -517,7 +546,7 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
     // where it moved: measured before this, closing left the pane blank and the interface
     // looked hung.
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
+        ui.wait_for_tab(1, Duration::from_secs(15)),
         "closing left nothing focused: {:?}",
         ui.tab_bar()
     );
@@ -680,10 +709,14 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
         ui.saw("is blocked"),
         "the interface never said anything about it"
     );
-    // Coloured, because a column of identical grey rows is a column nobody scans.
+    // Coloured, because a column of identical grey rows is a column nobody scans. This
+    // row's own bytes: the pane beside it carries whatever the child printed, yellow
+    // included, so a search of the whole screen answers a different question.
     assert!(
-        ui.painted.contains("\x1b[33m"),
-        "the blocked row is not coloured"
+        ui.raw_panel_line(FIRST_AGENT_ROW + 1)
+            .is_some_and(|line| line.starts_with("\x1b[33m")),
+        "the blocked row is not coloured: {:?}",
+        ui.raw_panel_line(FIRST_AGENT_ROW + 1)
     );
 }
 
@@ -783,10 +816,10 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
         ui.daemon_log()
     );
 
-    // Its own tab bar: the terminal of the first space is not in this space.
+    // Its own tab bar: one tab, which is this space's, and not the other space's as well.
     assert!(
         ui.wait_for_tabs(
-            |bar| bar.contains("[2") && !bar.contains(" 1 "),
+            |bar| bar.contains("[1") && !bar.contains(" 2 "),
             Duration::from_secs(15)
         ),
         "the new space shows the other space's tabs: {:?}",
@@ -812,9 +845,36 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // The keyboard reaches the other space too, so the pointer is not the only way in.
     ui.command(b's');
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW + 1,
+            |line| line.contains('\u{25cf}'),
+            Duration::from_secs(15)
+        )
+        .is_some(),
         "ctrl-a s did not move to the next space: {:?}",
-        ui.tab_bar()
+        ui.panel_line(FIRST_SPACE_ROW + 1)
+    );
+    // And backwards, which wraps. From the second of two spaces that is the first one, and
+    // its terminal still has the history it had.
+    ui.painted.clear();
+    ui.command(b'S');
+    assert!(
+        ui.wait_for("IN_THE_FIRST_SPACE", Duration::from_secs(15))
+            .is_some(),
+        "ctrl-a S did not go back to the first space:\n{}",
+        ui.painted
+    );
+    // Backwards again, which wraps the other way, off the front of the list.
+    ui.command(b'S');
+    assert!(
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW + 1,
+            |line| line.contains('\u{25cf}'),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "ctrl-a S from the first space did not wrap to the last: {:?}",
+        ui.panel_line(FIRST_SPACE_ROW + 1)
     );
 }
 
@@ -901,11 +961,21 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     // A second space with a terminal in it, then close that terminal, which is the only way
     // to reach a space that is empty and stays empty.
     ui.command(b'w');
+    // On the second space, and not merely on a bar whose first tab is focused: every space
+    // has a tab one, so waiting for that alone is satisfied before the space even exists.
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
-        "the new space never came up with a terminal: {:?}, daemon said: {}",
-        ui.tab_bar(),
+        ui.wait_for_space(2, Duration::from_secs(15)),
+        "the second space never came up: {:?}, daemon said: {}",
+        ui.panel_line(FIRST_SPACE_ROW + 1),
         ui.daemon_log()
+    );
+    assert!(
+        ui.wait_for_tabs(
+            |bar| bar.contains("[1") && !bar.contains(" 2 "),
+            Duration::from_secs(15)
+        ),
+        "the new space came up with no terminal of its own: {:?}",
+        ui.tab_bar()
     );
     ui.command(b'x');
     assert!(
@@ -930,9 +1000,9 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     // and not merely refuse to move it.
     ui.command(b's');
     assert!(
-        ui.wait_for_tab(1, Duration::from_secs(15)),
+        ui.wait_for_space(1, Duration::from_secs(15)),
         "ctrl-a s did not go back to the first space: {:?}",
-        ui.tab_bar()
+        ui.panel_line(FIRST_SPACE_ROW)
     );
     ui.command(b's');
     assert!(
@@ -1042,10 +1112,11 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
 
     ui.command(b'w');
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
-        "the second space never came up: {:?}",
-        ui.tab_bar()
+        ui.wait_for_space(2, Duration::from_secs(15)),
+        "the second space never came up: {}",
+        ui.daemon_log()
     );
+    assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
     ui.type_in(format!("{}\n", agent.display()).as_bytes());
     assert!(
         ui.wait_for_panel(
@@ -1063,26 +1134,28 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     // the panel still is.
     ui.command(b's');
     assert!(
-        ui.wait_for_tab(1, Duration::from_secs(15)),
+        ui.wait_for_space(1, Duration::from_secs(15)),
         "ctrl-a s did not go back: {:?}",
-        ui.tab_bar()
+        ui.panel_line(FIRST_SPACE_ROW)
     );
+    // The agent's own first line, found by the detail line under it, which is the one that
+    // names the program.
     let row = (FIRST_AGENT_ROW..FIRST_AGENT_ROW + 6)
         .find(|row| {
-            ui.panel_line(*row)
-                .is_some_and(|line| line.trim_end().ends_with("2"))
+            ui.panel_line(row + 1)
+                .is_some_and(|line| line.contains("claude"))
         })
         .unwrap_or_else(|| panic!("the agent has no row: {}", ui.painted));
 
     ui.click(5, row as u16);
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
+        ui.wait_for_tabs(|bar| bar.contains("claude"), Duration::from_secs(15)),
         "the click did not move the keyboard to the agent: {:?}",
         ui.tab_bar()
     );
     // The bar is the other space's now, and the panel says which space that is.
     assert!(
-        ui.tab_bar().is_some_and(|bar| !bar.contains(" 1 ")),
+        ui.tab_bar().is_some_and(|bar| !bar.contains(" 2 ")),
         "the tab bar stayed in the space that was left: {:?}",
         ui.tab_bar()
     );
@@ -1107,31 +1180,52 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
     // A space of its own with three terminals in it, so that a client counting the daemon's
     // whole list lands somewhere visibly different from one counting this bar.
     ui.command(b'w');
+    assert!(
+        ui.wait_for_space(2, Duration::from_secs(15)),
+        "the second space never came up: {}",
+        ui.daemon_log()
+    );
+    assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
+    ui.command(b'c');
     assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
     ui.command(b'c');
     assert!(ui.wait_for_tab(3, Duration::from_secs(15)));
-    ui.command(b'c');
-    assert!(ui.wait_for_tab(4, Duration::from_secs(15)));
+    // Three tabs here, and a fourth terminal on the daemon that belongs to another space.
+    ui.type_in(b"echo THE_THIRD_TAB\n");
+    assert!(
+        ui.wait_for("THE_THIRD_TAB", Duration::from_secs(10))
+            .is_some()
+    );
 
-    // The first tab of this space is terminal 2, not terminal 1.
     ui.command(b'1');
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(10)),
+        ui.wait_for_tab(1, Duration::from_secs(10)),
         "ctrl-a 1 did not pick this space's first tab: {:?}",
         ui.tab_bar()
     );
+    // And it is this space's first tab, not the daemon's: the terminal in the other space
+    // still has its own screen, and none of it is here.
+    let _ = ui.wait_for("never appears", Duration::from_secs(1));
+    assert!(
+        ui.tab_bar().is_some_and(|bar| !bar.contains(" 4 ")),
+        "ctrl-a 1 counted the daemon's terminals rather than this bar: {:?}",
+        ui.tab_bar()
+    );
+    ui.painted.clear();
     ui.command(b'3');
     assert!(
-        ui.wait_for_tab(4, Duration::from_secs(10)),
-        "ctrl-a 3 did not pick this space's third tab: {:?}",
-        ui.tab_bar()
+        ui.wait_for("THE_THIRD_TAB", Duration::from_secs(10))
+            .is_some(),
+        "ctrl-a 3 did not pick this space's third tab: {:?}\n{}",
+        ui.tab_bar(),
+        ui.painted
     );
     // A digit past the end does nothing rather than something arbitrary.
     ui.command(b'9');
     let _ = ui.wait_for("never appears", Duration::from_secs(2));
     assert_eq!(
         ui.focused_tab(),
-        Some(4),
+        Some(3),
         "a digit past the last tab moved the focus: {:?}",
         ui.tab_bar()
     );

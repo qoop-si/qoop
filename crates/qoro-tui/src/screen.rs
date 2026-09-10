@@ -128,7 +128,11 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         Vec::new()
     };
-    for row in 0..pane_rows as usize {
+    // Never over the status line. `pane_rows` is at least one so that a child always has a
+    // row to be told about, which in a window of two lines is a row the status line is
+    // already on.
+    let drawn = (pane_rows as usize).min((frame.lines as usize).saturating_sub(TABS + STATUS));
+    for row in 0..drawn {
         out.push_str(&at(row + 1 + TABS, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
         // for the one row that needs them, and a coloured word inside an otherwise grey
@@ -183,8 +187,12 @@ pub fn paint(frame: &Frame) -> String {
         let row = row.min(pane_rows as usize - 1) + 1 + TABS;
         let col = col.min(pane_cols as usize - 1) + left(frame.cols) + 1;
         out.push_str(&at(row, col));
-        out.push_str("\x1b[?25h");
     }
+    // Always back on, even with no snapshot yet. It is turned off at the top of every frame
+    // so the repaint does not walk a visible cursor across the screen, and leaving it off
+    // when there is nothing to place it against meant a terminal that had produced no output
+    // yet, which is every terminal for its first moments, had no cursor at all.
+    out.push_str("\x1b[?25h");
     out
 }
 
@@ -469,7 +477,7 @@ mod tests {
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 40,
-            lines: 2,
+            lines: 5,
             message: None,
         });
         // Only the pane's own bytes on the first row: the status line legitimately uses
@@ -500,7 +508,7 @@ mod tests {
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 30,
-            lines: 2,
+            lines: 5,
             message: None,
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
@@ -580,6 +588,52 @@ mod tests {
                     width::width(drawn)
                 );
             }
+        }
+    }
+
+    /// A terminal that has produced nothing yet is every terminal for its first moments,
+    /// and it still has to have a cursor: the frame turns the cursor off before painting.
+    #[test]
+    fn the_cursor_comes_back_on_even_before_the_first_snapshot() {
+        let rows = [row(1, "sh", "starting")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 40,
+            lines: 5,
+            message: None,
+        });
+        assert!(painted.contains("\x1b[?25l"));
+        assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_pane_row_is_never_painted_over_the_status_line() {
+        let rows = [row(1, "sh", "idle")];
+        let snapshot = snapshot(&["PANE_CONTENT"]);
+        for lines in [2u16, 3, 4] {
+            let painted = paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                space: Some(1),
+                focused: 1,
+                snapshot: Some(&snapshot),
+                cols: 60,
+                lines,
+                message: Some("STATUS_LINE"),
+            });
+            // The status line owns the last row, so nothing else may address it.
+            let status_row = at(lines as usize, 1);
+            let after = painted.rsplit(&status_row).next().unwrap_or_default();
+            assert!(after.contains("STATUS_LINE"), "{lines} lines: {painted:?}");
+            assert_eq!(
+                painted.matches(&status_row).count(),
+                1,
+                "{lines} lines: something else drew on the status row: {painted:?}"
+            );
         }
     }
 

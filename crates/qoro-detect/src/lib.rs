@@ -826,6 +826,45 @@ contains = "do you want to proceed"
         .expect("a verdict");
         assert_eq!(v.state, AgentRuntimeState::Blocked);
         assert!(v.visible_blocker);
+        // Which rule, and not only which state. The composer rule excludes numbered lines
+        // too, and asserting the state alone leaves that exclusion dead: the menu rule
+        // outranks it today, so the exclusion could be deleted with every test still green,
+        // and the next person to lower a priority or narrow a region gets the wrong answer
+        // back with nothing to catch it.
+        assert_eq!(v.rule, "numbered_select");
+    }
+
+    /// One numbered option carrying the composer's own marker: too few lines for the menu
+    /// rule to fire, so the composer rule answers alone and its exclusion is the only thing
+    /// standing between a question and the word `idle`.
+    #[test]
+    fn the_composer_rule_alone_does_not_read_a_numbered_option_as_a_prompt() {
+        let v = verdict("codex", &["\u{203A} 1. Update now"]);
+        assert!(
+            !v.as_ref()
+                .is_some_and(|v| v.state == AgentRuntimeState::Idle),
+            "a numbered option read as an idle composer: {v:?}"
+        );
+    }
+
+    /// One numbered line is ordinary model output. Two is somebody being asked to choose.
+    /// Without the second, a running agent reads as waiting, and `visible_blocker` makes
+    /// that reading outrank everything weaker under ADR-008.
+    #[test]
+    fn one_numbered_line_in_ordinary_output_is_not_a_menu() {
+        let v = verdict(
+            "codex",
+            &[
+                "\u{2022} Thinking",
+                "1. first do this",
+                "then carry on with the rest of it",
+            ],
+        );
+        assert!(
+            !v.as_ref()
+                .is_some_and(|v| v.state == AgentRuntimeState::Blocked),
+            "a single numbered line read as a question: {v:?}"
+        );
     }
 
     #[test]

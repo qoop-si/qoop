@@ -76,8 +76,9 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, O
     let budget = cols.saturating_sub(crate::width::width(NEW));
     let mut used = 0;
     let mut out = Vec::with_capacity(terminals.len() + 1);
-    for row in &terminals[scrolled(terminals, focused, budget)..] {
-        let text = tab(row, row.terminal == focused);
+    let first = scrolled(terminals, focused, budget);
+    for (at, row) in terminals.iter().enumerate().skip(first) {
+        let text = tab(row, at + 1, row.terminal == focused);
         let wide = crate::width::width(&text);
         if used + wide > budget {
             break;
@@ -98,10 +99,14 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
     let Some(at) = terminals.iter().position(|r| r.terminal == focused) else {
         return 0;
     };
-    let width_of = |row: &AgentRow| crate::width::width(&tab(row, row.terminal == focused));
     let mut first = 0;
     while first < at {
-        let fits = terminals[first..=at].iter().map(width_of).sum::<usize>() <= budget;
+        let fits = terminals[first..=at]
+            .iter()
+            .enumerate()
+            .map(|(i, row)| crate::width::width(&tab(row, first + i + 1, row.terminal == focused)))
+            .sum::<usize>()
+            <= budget;
         if fits {
             break;
         }
@@ -114,20 +119,24 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
 ///
 /// The brackets take the place of the spaces rather than adding to them, so every tab keeps
 /// the same width whether or not it is focused.
-fn tab(row: &AgentRow, focused: bool) -> String {
+fn tab(row: &AgentRow, position: usize, focused: bool) -> String {
     let (open, close) = if focused { ('[', ']') } else { (' ', ' ') };
-    format!("{open}{}{close}", label(row))
+    format!("{open}{}{close}", label(row, position))
 }
 
-/// What a tab is called: the terminal's number, and the program in it when there is one.
+/// What a tab is called: its place on this bar, and the program in it when there is one.
 ///
-/// The number is always there because the program is not distinguishing. A space with three
+/// A number is always there because the program is not distinguishing. A space with three
 /// shells in it draws three tabs reading `sh`, and a person clicking between them cannot
-/// tell which one they are on or which one they were on. Measured: the gate that switches
-/// between two shells could not say which tab it had landed on, because both of them said
-/// the same word. The number is also what the agents panel shows for the same terminal, so
-/// the two halves of the screen name the same thing the same way.
-fn label(row: &AgentRow) -> String {
+/// tell which one they are on or which one they were on.
+///
+/// Its place, and not the terminal's own number, because the number on a tab is the number
+/// a person presses. Terminal numbers are handed out across the whole daemon, so a second
+/// space opens with terminals 5 and 6 in it: a bar reading `5 claude  6 codex` invites
+/// `ctrl-a 5`, which is a tab that does not exist here, while the tab that key does reach
+/// is labelled with a number nobody typed. Places also stay within one digit, which the
+/// terminal numbers stop doing after the ninth terminal of the day.
+fn label(row: &AgentRow, position: usize) -> String {
     match &row.program {
         Some(program) => {
             let name = program
@@ -135,9 +144,9 @@ fn label(row: &AgentRow) -> String {
                 .next()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(program);
-            clip(&format!("{} {name}", row.terminal))
+            clip(&format!("{position} {name}"))
         }
-        None => row.terminal.to_string(),
+        None => position.to_string(),
     }
 }
 
@@ -281,13 +290,13 @@ mod tests {
             let text = render(&rows, 3, cols).text;
             for col in 0..cols {
                 let got = hit(&rows, 3, cols, col);
-                let want = rows.iter().find(|r| {
+                let want = rows.iter().enumerate().find(|(at, r)| {
                     // Where the label of this terminal was drawn, found in the painted bar
                     // rather than recomputed, so the test is not a copy of the code.
                     let name = if r.terminal == 3 {
-                        format!("[{}]", label(r))
+                        format!("[{}]", label(r, at + 1))
                     } else {
-                        format!(" {} ", label(r))
+                        format!(" {} ", label(r, at + 1))
                     };
                     match text.find(&name) {
                         Some(byte) => {
@@ -297,7 +306,7 @@ mod tests {
                         None => false,
                     }
                 });
-                assert_eq!(got, want.map(|r| r.terminal), "column {col} of {cols}");
+                assert_eq!(got, want.map(|(_, r)| r.terminal), "column {col} of {cols}");
             }
             assert_eq!(hit(&rows, 3, cols, cols), None, "past the right edge");
         }

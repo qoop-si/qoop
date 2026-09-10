@@ -254,7 +254,7 @@ fn agents_panel(
                             " {} {} {JOIN} {}",
                             mark(agent.terminal == focused),
                             space_name(spaces, agent.workspace),
-                            agent.terminal
+                            position(agents, agent)
                         )),
                         colour: colour_for(&agent.state),
                     },
@@ -320,6 +320,20 @@ fn label(agent: &AgentRow) -> String {
     }
 }
 
+/// Which tab this agent is, counted along its own space's bar.
+///
+/// The same number the tab bar draws and the same number `ctrl-a <n>` presses, so the two
+/// halves of the screen name the same terminal the same way. The terminal's own number is a
+/// stream this daemon handed out across every space, which is not a number anybody can act
+/// on and not one that means anything on a bar.
+fn position(agents: &[AgentRow], agent: &AgentRow) -> usize {
+    1 + agents
+        .iter()
+        .take_while(|a| a.terminal != agent.terminal)
+        .filter(|a| a.workspace == agent.workspace)
+        .count()
+}
+
 /// The name of the space an agent belongs to.
 ///
 /// Falls back to the number when the space is not in the list. The two lists arrive in two
@@ -378,14 +392,33 @@ fn fit(text: &str) -> String {
 /// Columns and not characters: a program or a space named with a full width glyph would
 /// otherwise draw past the column and over the terminal beside it, which is the arithmetic
 /// error [`crate::width`] exists to stop repeating.
+///
+/// Not [`crate::width::fit`], which also drops the space a grid puts after a full width
+/// character to hold its second column. These rows are text this module composed, so a
+/// space in one is a space somebody meant: measured, an agent whose name was two full width
+/// characters had a pad space eaten and its state stopped a column short of the right edge,
+/// and a space with a wide name lost the space in front of the separator.
 fn fit_to(text: &str, cols: usize) -> String {
-    crate::width::fit(text, cols)
+    let mut out = String::with_capacity(cols);
+    let mut used = 0;
+    for c in text.chars() {
+        let wide = crate::width::columns(c);
+        if used + wide > cols {
+            break;
+        }
+        out.push(c);
+        used += wide;
+    }
+    for _ in used..cols {
+        out.push(' ');
+    }
+    out
 }
 
 /// Cut to at most `cols` columns without padding, for the piece that is already flush
 /// against the right edge.
 fn clip(text: &str, cols: usize) -> String {
-    crate::width::fit(text, cols).trim_end().to_string()
+    fit_to(text, cols).trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -480,7 +513,12 @@ mod tests {
             .collect();
         assert_eq!(marked.len(), 2, "{marked:?}");
         assert!(marked.iter().any(|t| t.contains("personal")), "{marked:?}");
-        assert!(marked.iter().any(|t| t.ends_with("3")), "{marked:?}");
+        // Terminal 3 is the first tab of the space it is in, so that is the number it
+        // carries here and the number a person presses to reach it.
+        assert!(
+            marked.iter().any(|t| t.ends_with(&format!("{JOIN} 1"))),
+            "{marked:?}"
+        );
     }
 
     #[test]
@@ -607,7 +645,10 @@ mod tests {
                     let name = lines[head].text.trim_end().to_string();
                     agents
                         .iter()
-                        .find(|a| name.ends_with(&format!("{JOIN} {}", a.terminal)))
+                        .find(|a| {
+                            name.ends_with(&format!("{JOIN} {}", position(&agents, a)))
+                                && name.contains(&space_name(&spaces, a.workspace))
+                        })
                         .map(|a| Hit::Terminal(a.terminal))
                 };
                 assert_eq!(got, want, "row {row} of {height}: {text:?}");
@@ -632,7 +673,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.text.contains(&format!("77 {JOIN} 4"))),
+                .any(|l| l.text.contains(&format!("77 {JOIN} 1"))),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -678,6 +719,33 @@ mod tests {
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
         assert!(!lines.iter().any(|l| l.text.contains(UNKNOWN)));
+    }
+
+    /// The panel composes its own rows, so every space in one was put there deliberately.
+    /// Cutting them with the grid's rule, where a space after a full width character is a
+    /// spacer the engine added, eats padding this module meant and slides the right hand
+    /// column one place left.
+    #[test]
+    fn a_wide_name_does_not_cost_the_row_a_space_the_panel_put_there() {
+        let agents = vec![agent(1, 1, "\u{4e2d}\u{4e2d}", "idle")];
+        let lines = render(&[space(1, "\u{4e2d}\u{6587}")], &agents, 1, 1, 8);
+        let head = lines
+            .iter()
+            .find(|l| l.text.contains(JOIN))
+            .unwrap_or_else(|| panic!("no agent line"));
+        // The space in front of the separator is one this module wrote.
+        assert!(
+            head.text.contains(&format!("\u{4e2d}\u{6587} {JOIN}")),
+            "{:?}",
+            head.text
+        );
+        let detail = lines
+            .iter()
+            .find(|l| l.text.contains("idle"))
+            .unwrap_or_else(|| panic!("no detail line"));
+        // And the state is still flush against the right edge.
+        assert!(detail.text.ends_with("idle"), "{:?}", detail.text);
+        assert_eq!(crate::width::width(&detail.text), WIDTH);
     }
 
     #[test]
