@@ -40,9 +40,27 @@ pub enum Action {
     /// Reported rather than acted on here, because what a click means depends on where the
     /// interface drew things and this decoder does not know that. It knows what the
     /// terminal said.
-    Click { row: u16, col: u16 },
+    Click {
+        row: u16,
+        col: u16,
+    },
     /// ctrl-a l
     Redraw,
+    /// ctrl-a s, and ctrl-a S for the other direction.
+    ///
+    /// A space and not a terminal: the two lists on the left are navigated separately
+    /// because they answer separate questions, and one pair of keys for both would make
+    /// "next" mean whichever list the interface last thought was interesting.
+    NextSpace,
+    PreviousSpace,
+    /// ctrl-a w, a new space.
+    CreateSpace,
+    /// ctrl-a 1 through ctrl-a 9, the nth tab of the current space, counted from one.
+    ///
+    /// Counted from one because that is what is written on the tab. Zero is not a command:
+    /// there is no tab zero to go to, and silently sending it somewhere would be worse than
+    /// doing nothing.
+    Tab(usize),
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
@@ -141,8 +159,11 @@ impl Keys {
                     b'x' => Action::Close,
                     b'd' => Action::Detach,
                     b'l' => Action::Redraw,
-                    // Anything else, an uppercase letter included, is a mistyped command
-                    // and is dropped. Passing it through would send it to a shell, where a
+                    b's' => Action::NextSpace,
+                    b'S' => Action::PreviousSpace,
+                    b'w' => Action::CreateSpace,
+                    b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
+                    // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
                 };
@@ -293,5 +314,28 @@ mod tests {
         assert_eq!(keys.feed(b"\x01"), vec![]);
         assert_eq!(keys.feed(b""), vec![]);
         assert_eq!(keys.feed(b"n"), vec![Action::Next]);
+    }
+
+    #[test]
+    fn the_space_keys_are_separate_from_the_terminal_keys() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01s"), vec![Action::NextSpace]);
+        assert_eq!(keys.feed(b"\x01S"), vec![Action::PreviousSpace]);
+        assert_eq!(keys.feed(b"\x01w"), vec![Action::CreateSpace]);
+        // And the terminal keys still mean terminals.
+        assert_eq!(keys.feed(b"\x01n"), vec![Action::Next]);
+        assert_eq!(keys.feed(b"\x01c"), vec![Action::Create]);
+    }
+
+    #[test]
+    fn a_digit_picks_the_tab_that_carries_that_number() {
+        let mut keys = Keys::default();
+        for n in 1..=9usize {
+            let typed = [0x01, b'0' + n as u8];
+            assert_eq!(keys.feed(&typed), vec![Action::Tab(n)], "ctrl-a {n}");
+        }
+        // Zero is not a tab, so it does nothing rather than something arbitrary, and it
+        // must not reach the shell either.
+        assert_eq!(keys.feed(b"\x010"), vec![]);
     }
 }

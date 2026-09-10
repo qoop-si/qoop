@@ -28,6 +28,7 @@ async fn two_terminals_are_two_shells_addressed_separately() {
             &ControlRequest::CreateTerminal {
                 id: "r1".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -68,6 +69,7 @@ async fn g2_5_closing_a_terminal_does_not_disturb_the_others() {
             &ControlRequest::CreateTerminal {
                 id: "r1".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -121,6 +123,7 @@ async fn a_command_for_a_closed_terminal_never_reaches_another_one() {
             &ControlRequest::CreateTerminal {
                 id: "r1".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -173,6 +176,7 @@ async fn listing_terminals_reports_the_registry() {
         &ControlRequest::CreateTerminal {
             id: "r1".into(),
             cwd: None,
+            workspace: None,
         },
         PATIENCE,
     )
@@ -241,6 +245,7 @@ async fn a_created_terminal_starts_where_the_client_asked() {
             &ControlRequest::CreateTerminal {
                 id: "r1".into(),
                 cwd: Some(asked.to_string_lossy().into_owned()),
+                workspace: None,
             },
             PATIENCE,
         )
@@ -282,6 +287,7 @@ async fn a_working_directory_that_cannot_be_used_is_refused_in_words() {
                 &ControlRequest::CreateTerminal {
                     id: id.into(),
                     cwd: Some(cwd.into()),
+                    workspace: None,
                 },
                 PATIENCE,
             )
@@ -335,6 +341,7 @@ async fn terminal_metadata_survives_a_restart() {
                 &ControlRequest::CreateTerminal {
                     id: "r1".into(),
                     cwd: Some(asked.to_string_lossy().into_owned()),
+                    workspace: None,
                 },
                 PATIENCE,
             )
@@ -750,6 +757,7 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
             &ControlRequest::CreateTerminal {
                 id: "while-hung".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -825,6 +833,7 @@ async fn g2_13_a_hundred_terminals_quiesce_within_the_stated_bound() {
                 &ControlRequest::CreateTerminal {
                     id: format!("t{i}"),
                     cwd: None,
+                    workspace: None,
                 },
                 Duration::from_secs(30),
             )
@@ -900,5 +909,114 @@ async fn g2_13_a_hundred_terminals_quiesce_within_the_stated_bound() {
         took <= BOUND * 4,
         "a hundred simultaneous changes took {took:?} against a bound of {BOUND:?} each, \
          which is a settle herd rather than a settle"
+    );
+}
+
+/// G2.16: a daemon holds more than one workspace, and a terminal belongs to exactly one of
+/// them.
+///
+/// The panel on the left of the interface is a list of spaces and a list of the agents in
+/// them, and both are answers the daemon gives. Without this gate the daemon could report
+/// one workspace forever and every screen would still look right, because a client with one
+/// space to draw cannot tell a real grouping from a hardcoded number.
+///
+/// So: make a second workspace, put a terminal in it, and read the membership back from the
+/// answers a client actually gets.
+#[tokio::test]
+async fn g2_16_a_terminal_belongs_to_the_workspace_it_was_made_in() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("spaces").await;
+
+    // The daemon starts with one workspace and the terminal it opened at boot in it.
+    let first = match c
+        .control(
+            &ControlRequest::ListWorkspaces { id: "w0".into() },
+            PATIENCE,
+        )
+        .await
+        .expect("a workspace list")
+    {
+        ControlResponse::Workspaces { workspaces, .. } => workspaces,
+        other => panic!("expected a workspace list, got {other:?}"),
+    };
+    assert_eq!(first.len(), 1, "a fresh daemon should hold one workspace");
+    assert_eq!(first[0].terminals, 1, "{first:?}");
+
+    let made = match c
+        .control(
+            &ControlRequest::CreateWorkspace {
+                id: "w1".into(),
+                name: "second".into(),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a created workspace")
+    {
+        ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+        other => panic!("expected a created workspace, got {other:?}"),
+    };
+    assert_ne!(made, first[0].id, "the new workspace reused an id");
+
+    // A terminal asked for in that workspace has to land in it, and nowhere else.
+    let moved = terminal_of(
+        &c.control(
+            &ControlRequest::CreateTerminal {
+                id: "t1".into(),
+                cwd: None,
+                workspace: Some(made),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a created terminal"),
+    );
+
+    let after = match c
+        .control(
+            &ControlRequest::ListWorkspaces { id: "w2".into() },
+            PATIENCE,
+        )
+        .await
+        .expect("a workspace list")
+    {
+        ControlResponse::Workspaces { workspaces, .. } => workspaces,
+        other => panic!("expected a workspace list, got {other:?}"),
+    };
+    assert_eq!(after.len(), 2, "{after:?}");
+    let second = after
+        .iter()
+        .find(|w| w.id == made)
+        .unwrap_or_else(|| panic!("the new workspace is not in the list: {after:?}"));
+    assert_eq!(second.name, "second");
+    assert_eq!(
+        second.terminals, 1,
+        "the terminal did not count against the workspace it was made in: {after:?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .find(|w| w.id == first[0].id)
+            .map(|w| w.terminals),
+        Some(1),
+        "making a terminal elsewhere changed the first workspace: {after:?}"
+    );
+
+    // And the agent index, which is what the panel draws, says the same thing.
+    let agents = match c
+        .control(&ControlRequest::ListAgents { id: "a1".into() }, PATIENCE)
+        .await
+        .expect("an agent list")
+    {
+        ControlResponse::Agents { agents, .. } => agents,
+        other => panic!("expected an agent list, got {other:?}"),
+    };
+    assert_eq!(
+        agents
+            .iter()
+            .find(|a| a.terminal == moved)
+            .map(|a| a.workspace),
+        Some(made),
+        "the index puts the terminal in the wrong workspace: {agents:?}"
     );
 }

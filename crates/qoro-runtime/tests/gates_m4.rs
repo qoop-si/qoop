@@ -27,6 +27,7 @@ async fn g4_1_a_projection_replays_byte_for_byte_twice() {
             &ControlRequest::CreateTerminal {
                 id: format!("mk{i}"),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -88,6 +89,7 @@ async fn g4_6_a_replayed_command_applies_once_and_returns_the_original_answer() 
             &ControlRequest::CreateTerminal {
                 id: "same-key".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -106,6 +108,7 @@ async fn g4_6_a_replayed_command_applies_once_and_returns_the_original_answer() 
             &ControlRequest::CreateTerminal {
                 id: "same-key".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )
@@ -153,6 +156,7 @@ async fn g4_4_a_failing_store_does_not_stop_a_terminal() {
             &ControlRequest::CreateTerminal {
                 id: "while-degraded".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )

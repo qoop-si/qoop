@@ -175,6 +175,7 @@ async fn fill(socket: &std::path::Path, count: usize) -> (TestClient, Vec<u32>) 
                 &ControlRequest::CreateTerminal {
                     id: format!("t{i}"),
                     cwd: None,
+                    workspace: None,
                 },
                 Duration::from_secs(20),
             )

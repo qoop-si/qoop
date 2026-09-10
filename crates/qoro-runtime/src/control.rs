@@ -21,6 +21,10 @@ pub enum ControlRequest {
     CreateTerminal {
         id: String,
         cwd: Option<String>,
+        /// Which workspace to put it in. `None` means the one the daemon opened, which is
+        /// what a client that does not know about workspaces means.
+        #[serde(default)]
+        workspace: Option<i64>,
     },
     /// End a terminal and everything it contains, per ADR-014.
     CloseTerminal {
@@ -29,6 +33,16 @@ pub enum ControlRequest {
     },
     ListTerminals {
         id: String,
+    },
+    /// The workspaces this daemon holds, for a client that shows more than one.
+    ListWorkspaces {
+        id: String,
+    },
+    /// Start a workspace. Terminals are created in one, and a client that shows several
+    /// needs a way to make the next one.
+    CreateWorkspace {
+        id: String,
+        name: String,
     },
     /// The index a client draws: one row per terminal, with who is in it.
     ///
@@ -72,6 +86,8 @@ impl ControlRequest {
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
+            | Self::ListWorkspaces { id }
+            | Self::CreateWorkspace { id, .. }
             | Self::Subscribe { id, .. }
             | Self::Unsubscribe { id, .. }
             | Self::RequestOwnership { id, .. }
@@ -99,6 +115,14 @@ pub enum ControlResponse {
         id: String,
         agents: Vec<AgentRow>,
     },
+    Workspaces {
+        id: String,
+        workspaces: Vec<WorkspaceRow>,
+    },
+    WorkspaceCreated {
+        id: String,
+        workspace: i64,
+    },
     Subscribed {
         id: String,
         terminals: Vec<TerminalStream>,
@@ -122,6 +146,16 @@ pub enum ControlResponse {
     },
 }
 
+/// One workspace, as a client lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRow {
+    pub id: i64,
+    pub name: String,
+    /// How many terminals are open in it, so a client can show a workspace as busy or
+    /// empty without asking about every terminal in it.
+    pub terminals: usize,
+}
+
 /// One terminal, as an index shows it.
 ///
 /// Strings on the wire and not the domain's own enums, deliberately. ADR-010 freezes the
@@ -131,6 +165,9 @@ pub enum ControlResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRow {
     pub terminal: TerminalStream,
+    /// The workspace it belongs to, so a client can group by one without asking twice.
+    #[serde(default)]
+    pub workspace: i64,
     /// The foreground program, when it can be read.
     pub program: Option<String>,
     /// What stands in the way, when it cannot. Never the wrapper's name as the program:
@@ -138,6 +175,15 @@ pub struct AgentRow {
     pub behind: Option<String>,
     /// `starting`, `idle`, `working`, `blocked`, `done`, `failed`, `uncertain`, `unknown`.
     pub state: String,
+    /// True when the program in this terminal is a coding agent rather than a shell or an
+    /// ordinary command.
+    ///
+    /// Sent rather than worked out by the client, because the answer is a table of known
+    /// agents that the daemon already consults and a client guessing from the name would be
+    /// a second, quietly different copy of it. Defaulted, so a client from an older build
+    /// reading a newer daemon sees "not an agent" rather than failing to parse the row.
+    #[serde(default)]
+    pub agent: bool,
     /// Bumped when the process in the terminal is replaced, so a client can tell a new
     /// agent from a new state.
     pub generation: Option<u64>,
@@ -150,6 +196,8 @@ impl ControlResponse {
             | Self::TerminalClosed { id, .. }
             | Self::Terminals { id, .. }
             | Self::Agents { id, .. }
+            | Self::Workspaces { id, .. }
+            | Self::WorkspaceCreated { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
@@ -167,6 +215,7 @@ mod tests {
         let request = ControlRequest::CreateTerminal {
             id: "r1".into(),
             cwd: None,
+            workspace: None,
         };
         let response = ControlResponse::TerminalCreated {
             id: request.request_id().to_string(),
@@ -181,6 +230,7 @@ mod tests {
             ControlRequest::CreateTerminal {
                 id: "a".into(),
                 cwd: Some("/tmp".into()),
+                workspace: Some(2),
             },
             ControlRequest::CloseTerminal {
                 id: "b".into(),

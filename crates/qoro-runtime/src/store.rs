@@ -82,6 +82,11 @@ impl StoreHandle {
         .await
     }
 
+    /// Every workspace this daemon holds.
+    pub async fn workspaces(&self) -> Result<Vec<qoro_store::WorkspaceRow>, HandleError> {
+        self.run(move |s| s.workspaces()).await
+    }
+
     pub async fn create_workspace(&self, name: String) -> Result<i64, HandleError> {
         self.run(move |s| s.create_workspace(&name, now())).await
     }

@@ -22,6 +22,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         ControlRequest::CreateTerminal {
             id: "x1".into(),
             cwd: None,
+            workspace: None,
         },
         ControlRequest::CloseTerminal {
             id: "x2".into(),
@@ -46,6 +47,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             to: "somebody".into(),
         },
         ControlRequest::ListAgents { id: "x8".into() },
+        ControlRequest::ListWorkspaces { id: "x9".into() },
+        ControlRequest::CreateWorkspace {
+            id: "x10".into(),
+            name: "another".into(),
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -54,6 +60,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::CloseTerminal { .. }
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
+            | ControlRequest::ListWorkspaces { .. }
+            | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }
@@ -133,6 +141,7 @@ async fn closing_someone_elses_terminal_ends_it_without_writing_to_it() {
             &ControlRequest::CreateTerminal {
                 id: "mk".into(),
                 cwd: None,
+                workspace: None,
             },
             PATIENCE,
         )

@@ -117,6 +117,7 @@ async fn a_terminals_child_is_launched_with_that_terminals_token() {
     // And a second terminal gets a different one, or the token proves nothing.
     let other = qoro_runtime::daemon::open_terminal(
         d.terminals_arc(),
+        1,
         std::path::Path::new("/bin/sh"),
         None,
         d.warnings_arc(),

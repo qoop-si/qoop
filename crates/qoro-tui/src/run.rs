@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::keys::{Action, Keys};
 use crate::screen::{self, Frame};
+use crate::{sidebar, tabs};
 
 /// Everything the screen is drawn from.
 struct State {
@@ -27,18 +28,25 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
+    /// The workspaces this daemon holds, and which one is on screen.
+    spaces: Vec<qoro_runtime::control::WorkspaceRow>,
+    space: Option<i64>,
     /// What each terminal's state was at the last index, so a change into one that wants a
     /// person can be noticed. Without it the interface would have to compare a row against
     /// itself, which is a comparison that is always equal.
     was: std::collections::BTreeMap<u32, String>,
     /// Set when something started needing a person, cleared when the bell has rung.
     ring: bool,
+    /// A space that has just been made and has nothing in it yet.
+    wants_terminal_in: Option<i64>,
 }
 
 impl State {
     fn frame(&self) -> Frame<'_> {
         Frame {
             rows: &self.rows,
+            spaces: &self.spaces,
+            space: self.space,
             focused: self.focused,
             snapshot: self.snapshot.as_ref(),
             cols: self.cols,
@@ -47,38 +55,94 @@ impl State {
         }
     }
 
-    /// The terminal drawn on one screen row of the index, if any.
-    ///
-    /// The index scrolls to keep the focused row visible, so the row a person clicked is
-    /// not the row's position in the list. Asking the index itself is the only way to get
-    /// this right; computing it here would be a second copy of the scrolling arithmetic.
-    fn at_row(&self, row: u16) -> Option<u32> {
-        let (_, pane_rows) = screen::pane_size(self.cols, self.lines);
-        let body = (pane_rows as usize).saturating_sub(screen::HEADER);
-        // The title names nothing, so a click on it picks nothing.
-        let within = (row as usize).checked_sub(screen::HEADER)?;
-        crate::index::terminal_at(&self.rows, self.focused, body, within)
+    /// The tabs of the space on screen, in the order the daemon reports them.
+    fn tabs(&self) -> Vec<AgentRow> {
+        screen::in_space(&self.rows, self.space)
     }
 
-    /// The terminal after the focused one, wrapping. The index is the order the daemon
-    /// reports, so this is the order a person sees.
-    fn neighbour(&self, forward: bool) -> Option<u32> {
-        if self.rows.is_empty() {
+    /// What a click at a one based screen position means.
+    ///
+    /// Asked of the same modules that drew the row, because both of them scroll to keep
+    /// the focused entry visible: the row a person clicked is not the entry's position in
+    /// the list, and computing it here would be a second copy of that arithmetic that
+    /// starts out right and drifts.
+    fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
+        let (_, pane_rows) = screen::pane_size(self.cols, self.lines);
+        if (row as usize) <= screen::TABS {
+            return tabs::hit(
+                &self.tabs(),
+                self.focused,
+                self.cols as usize,
+                (col as usize).saturating_sub(1),
+            )
+            .map(Clicked::Terminal);
+        }
+        if col as usize > sidebar::WIDTH {
+            // The pane. A terminal application that wants the mouse asks for it, and
+            // passing a click to one that did not would type its report at a prompt.
             return None;
         }
-        let at = self
-            .rows
+        let within = (row as usize) - 1 - screen::TABS;
+        match sidebar::hit(
+            &self.spaces,
+            &self.rows,
+            self.space.unwrap_or_default(),
+            self.focused,
+            pane_rows as usize,
+            within,
+        )? {
+            sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
+            sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
+        }
+    }
+
+    /// The tab after the focused one, wrapping, within the space on screen.
+    ///
+    /// Within the space, because the tab bar is what "next" refers to. Wrapping across
+    /// every terminal on the daemon would move a person into a space they were not looking
+    /// at, and the tab bar would change under them without their having asked.
+    fn neighbour(&self, forward: bool) -> Option<u32> {
+        let tabs = self.tabs();
+        if tabs.is_empty() {
+            return None;
+        }
+        let at = tabs
             .iter()
             .position(|r| r.terminal == self.focused)
             .unwrap_or(0);
-        let n = self.rows.len();
+        let n = tabs.len();
         let next = if forward {
             (at + 1) % n
         } else {
             (at + n - 1) % n
         };
-        Some(self.rows[next].terminal)
+        Some(tabs[next].terminal)
     }
+
+    /// The space after the focused one, wrapping.
+    fn next_space(&self, forward: bool) -> Option<i64> {
+        if self.spaces.is_empty() {
+            return None;
+        }
+        let at = self
+            .spaces
+            .iter()
+            .position(|w| Some(w.id) == self.space)
+            .unwrap_or(0);
+        let n = self.spaces.len();
+        let next = if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        };
+        Some(self.spaces[next].id)
+    }
+}
+
+/// What the interface drew where a person clicked.
+enum Clicked {
+    Space(i64),
+    Terminal(u32),
 }
 
 /// Run the interface until the user detaches or the daemon goes away.
@@ -110,8 +174,11 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         lines,
         message: Some("connecting".to_string()),
         pending_focus: None,
+        spaces: Vec::new(),
+        space: None,
         was: std::collections::BTreeMap::new(),
         ring: false,
+        wants_terminal_in: None,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -150,6 +217,13 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     wr.write_all(&ask(
         &mut request,
         ControlRequest::ListAgents { id: "index".into() },
+    )?)
+    .await?;
+    wr.write_all(&ask(
+        &mut request,
+        ControlRequest::ListWorkspaces {
+            id: "spaces".into(),
+        },
     )?)
     .await?;
 
@@ -230,58 +304,78 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                             }
                             Action::Detach => return Ok(()),
                             Action::Click { row, col } => {
-                                // A click in the index picks the row under the pointer. A
-                                // click anywhere else belongs to the program in the pane,
-                                // which is not forwarded yet: a terminal application that
-                                // wants the mouse asks for it, and passing a click to one
-                                // that did not would type its report at a prompt.
-                                if col as usize <= crate::index::WIDTH
-                                    && let Some(picked) = state.at_row(row)
-                                    && picked != state.focused
-                                {
-                                    wr.write_all(&switch(
-                                        state.focused, picked, &mut control_seq,
-                                    )?).await?;
-                                    state.focused = picked;
-                                    state.snapshot = None;
-                                    state.message = None;
-                                    let (pane_cols, pane_rows) =
-                                        screen::pane_size(state.cols, state.lines);
-                                    wr.write_all(&client::encode_command_to(
-                                        picked,
-                                        &ClientWire::Resize {
-                                            cols: pane_cols,
-                                            rows: pane_rows,
-                                        },
-                                        seqs.entry(picked).or_default(),
-                                    )?).await?;
-                                    dirty = true;
+                                match state.clicked(row, col) {
+                                    Some(Clicked::Terminal(picked)) => {
+                                        if let Some(bytes) = focus(
+                                            &mut state, picked, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                            dirty = true;
+                                        }
+                                    }
+                                    Some(Clicked::Space(space)) => {
+                                        if let Some(bytes) = enter_space(
+                                            &mut state, space, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                        }
+                                        dirty = true;
+                                    }
+                                    None => {}
                                 }
                             }
                             Action::Redraw => dirty = true,
                             Action::Next | Action::Previous => {
                                 let forward = matches!(action, Action::Next);
                                 if let Some(next) = state.neighbour(forward)
-                                    && next != state.focused
+                                    && let Some(bytes) = focus(
+                                        &mut state, next, &mut control_seq, &mut seqs,
+                                    )?
                                 {
-                                    wr.write_all(&switch(
-                                        state.focused, next, &mut control_seq,
-                                    )?).await?;
-                                    state.focused = next;
-                                    state.snapshot = None;
-                                    state.message = None;
-                                    let (pane_cols, pane_rows) =
-                                        screen::pane_size(state.cols, state.lines);
-                                    wr.write_all(&client::encode_command_to(
-                                        next,
-                                        &ClientWire::Resize {
-                                            cols: pane_cols,
-                                            rows: pane_rows,
-                                        },
-                                        seqs.entry(next).or_default(),
-                                    )?).await?;
+                                    wr.write_all(&bytes).await?;
                                     dirty = true;
                                 }
+                            }
+                            Action::Tab(n) => {
+                                // Counted from one, because that is the position on the bar
+                                // a person is reading off. A number past the end does
+                                // nothing: there is no tab there to go to.
+                                if let Some(picked) =
+                                    state.tabs().get(n - 1).map(|r| r.terminal)
+                                    && let Some(bytes) = focus(
+                                        &mut state, picked, &mut control_seq, &mut seqs,
+                                    )?
+                                {
+                                    wr.write_all(&bytes).await?;
+                                    dirty = true;
+                                }
+                            }
+                            Action::NextSpace | Action::PreviousSpace => {
+                                let forward = matches!(action, Action::NextSpace);
+                                if let Some(space) = state.next_space(forward) {
+                                    if let Some(bytes) = enter_space(
+                                        &mut state, space, &mut control_seq, &mut seqs,
+                                    )? {
+                                        wr.write_all(&bytes).await?;
+                                    }
+                                    dirty = true;
+                                }
+                            }
+                            Action::CreateSpace => {
+                                request += 1;
+                                wr.write_all(&client::encode_control_seq(
+                                    &ControlRequest::CreateWorkspace {
+                                        id: format!("space-{request}"),
+                                        // Numbered rather than asked for. A prompt is a
+                                        // second input mode this interface does not have
+                                        // yet, and a space with a name a person did not
+                                        // choose is still a space they can work in.
+                                        name: format!("space {}", state.spaces.len() + 1),
+                                    },
+                                    &mut control_seq,
+                                )?).await?;
+                                state.message = Some("starting a space".to_string());
+                                dirty = true;
                             }
                             Action::Create => {
                                 request += 1;
@@ -289,6 +383,8 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     &ControlRequest::CreateTerminal {
                                         id: format!("new-{request}"),
                                         cwd: None,
+                                        // The space the person is looking at.
+                                        workspace: state.space,
                                     },
                                     &mut control_seq,
                                 )?).await?;
@@ -341,6 +437,7 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     response,
                                     ControlResponse::TerminalCreated { .. }
                                         | ControlResponse::TerminalClosed { .. }
+                                        | ControlResponse::WorkspaceCreated { .. }
                                 );
                                 apply(&mut state, response, &mut dirty);
                             }
@@ -349,25 +446,32 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
-                    if let Some(next) = state.pending_focus.take()
-                        && next != state.focused
-                    {
-                        wr.write_all(&switch(state.focused, next, &mut control_seq)?)
-                            .await?;
-                        state.focused = next;
-                        state.snapshot = None;
-                        let (pane_cols, pane_rows) = screen::pane_size(state.cols, state.lines);
-                        wr.write_all(&client::encode_command_to(
-                            next,
-                            &ClientWire::Resize { cols: pane_cols, rows: pane_rows },
-                            seqs.entry(next).or_default(),
+                    if let Some(space) = state.wants_terminal_in.take() {
+                        request += 1;
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::CreateTerminal {
+                                id: format!("new-{request}"),
+                                cwd: None,
+                                workspace: Some(space),
+                            },
+                            &mut control_seq,
                         )?).await?;
+                    }
+                    if let Some(next) = state.pending_focus.take()
+                        && let Some(bytes) =
+                            focus(&mut state, next, &mut control_seq, &mut seqs)?
+                    {
+                        wr.write_all(&bytes).await?;
                         dirty = true;
                     }
                     if refresh {
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::ListAgents { id: format!("index-{request}") },
+                            &mut control_seq,
+                        )?).await?;
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::ListWorkspaces { id: format!("spaces-{request}") },
                             &mut control_seq,
                         )?).await?;
                     }
@@ -382,6 +486,75 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
+}
+
+/// Move the keyboard to another terminal: unsubscribe, subscribe, and size it to the pane,
+/// all in one write.
+///
+/// `None` when there is nothing to do, so a click on the tab a person is already on does
+/// not throw away the screen they are looking at and ask the daemon to redraw it.
+///
+/// One helper and not the same nine lines at each of the four places that move the focus.
+/// Those four drifted apart once already: a click cleared the message and a key binding did
+/// not, so the same move left different text on the status line depending on how it was
+/// made.
+fn focus(
+    state: &mut State,
+    to: u32,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    if to == 0 || to == state.focused {
+        return Ok(None);
+    }
+    let mut out = switch(state.focused, to, control_seq)?;
+    let (pane_cols, pane_rows) = screen::pane_size(state.cols, state.lines);
+    out.extend_from_slice(&client::encode_command_to(
+        to,
+        &ClientWire::Resize {
+            cols: pane_cols,
+            rows: pane_rows,
+        },
+        seqs.entry(to).or_default(),
+    )?);
+    state.focused = to;
+    // Dropped rather than kept: it belongs to the terminal being left, and painting it
+    // under the new tab would show a person the wrong screen until the first render
+    // arrives.
+    state.snapshot = None;
+    state.message = None;
+    // The space follows the terminal. A click in the agents panel can land on an agent in
+    // another space, which is the point of that panel crossing spaces, and leaving the bar
+    // on the old space would show tabs that do not contain the focused one.
+    state.space = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == to)
+        .map(|r| r.workspace)
+        .or(state.space);
+    Ok(Some(out))
+}
+
+/// Put a space on screen, and the keyboard in one of its terminals.
+///
+/// A space with nothing in it is still entered. It is how a person gets somewhere to press
+/// `ctrl-a c`, and refusing to go there would make an empty space unreachable, which is the
+/// one state every new space starts in.
+fn enter_space(
+    state: &mut State,
+    space: i64,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    state.space = Some(space);
+    match state.tabs().first().map(|r| r.terminal) {
+        Some(first) => focus(state, first, control_seq, seqs),
+        None => {
+            state.snapshot = None;
+            state.message = Some("this space is empty, ctrl-a c starts a terminal".to_string());
+            Ok(None)
+        }
+    }
 }
 
 /// Stop watching one terminal and start watching another, in one write.
@@ -410,6 +583,22 @@ fn switch(from: u32, to: u32, control_seq: &mut u32) -> io::Result<BytesMut> {
 /// Fold one answer into what is on screen.
 fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
     match response {
+        ControlResponse::Workspaces { workspaces, .. } => {
+            if state.space.is_none() {
+                state.space = workspaces.first().map(|w| w.id);
+            }
+            state.spaces = workspaces;
+            *dirty = true;
+        }
+        ControlResponse::WorkspaceCreated { workspace, .. } => {
+            state.space = Some(workspace);
+            state.snapshot = None;
+            // Asked for here rather than by the caller, because a space with no terminal in
+            // it shows an empty pane and a bar with only a `+` on it, and the first thing
+            // anybody does in a new space is start a terminal.
+            state.wants_terminal_in = Some(workspace);
+            *dirty = true;
+        }
         ControlResponse::Agents { agents, .. } => {
             if state.focused == 0 {
                 state.focused = agents.first().map(|r| r.terminal).unwrap_or(0);

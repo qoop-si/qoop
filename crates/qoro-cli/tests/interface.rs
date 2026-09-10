@@ -72,14 +72,25 @@ fn strip_escapes(text: &str) -> String {
     out
 }
 
-/// The screen row the first terminal is drawn on. Row one is the column's own title, and
-/// taking that from the interface rather than writing `2` is what stops this test from
-/// disagreeing with the layout the next time the layout changes.
-const FIRST_ROW: usize = qoro_tui::screen::HEADER + 1;
+/// The screen row the spaces panel's title is drawn on. Taken from the interface rather
+/// than written as `2`, so this test cannot disagree with the layout the next time the
+/// layout changes.
+const SPACES_TITLE_ROW: usize = qoro_tui::screen::TABS + 1;
 
-/// The interface's own idea of how wide the index is, so this test cannot drift from it.
+/// The screen row the first space is drawn on, directly under that title.
+const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
+
+/// The first line of the first agent.
+///
+/// The spaces panel takes its title and one row per space, and a fresh daemon holds one
+/// space, so the agents title is two rows down and the first agent is one row after that.
+/// A test that starts a second space works this out for itself rather than using this.
+const FIRST_AGENT_ROW: usize = FIRST_SPACE_ROW + 2;
+
+/// The interface's own idea of how wide the left column is, so this test cannot drift from
+/// it.
 fn index_width() -> usize {
-    qoro_tui::index::WIDTH
+    qoro_tui::sidebar::WIDTH
 }
 
 impl Interface {
@@ -242,7 +253,7 @@ impl Interface {
     /// program in a terminal is whatever the operating system calls it: `/bin/sh` is bash
     /// on this machine and dash on another, and a test that hardcodes one of them is a
     /// test about the machine.
-    fn index_line(&self, row: usize) -> Option<String> {
+    fn panel_line(&self, row: usize) -> Option<String> {
         let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
         // Escapes stripped before counting: the index colours a row by its state, so the
@@ -253,6 +264,72 @@ impl Interface {
                 .take(index_width())
                 .collect(),
         )
+    }
+
+    /// The tab bar, as painted most recently.
+    fn tab_bar(&self) -> Option<String> {
+        let at = format!("\x1b[{};1H", qoro_tui::screen::TABS);
+        let start = self.painted.rfind(&at)? + at.len();
+        Some(
+            strip_escapes(&self.painted[start..])
+                .chars()
+                .take(COLS as usize)
+                .collect(),
+        )
+    }
+
+    /// The terminal whose tab is bracketed, which is the one with the keyboard.
+    ///
+    /// Read off the bar rather than asked of the interface: what is being tested is what a
+    /// person can see, and an interface that believes it moved the focus and did not paint
+    /// it is exactly the failure this is for.
+    fn focused_tab(&self) -> Option<u32> {
+        let bar = self.tab_bar()?;
+        let open = bar.find('[')?;
+        bar[open + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Read until that terminal's tab is the focused one.
+    fn wait_for_tab(&mut self, want: u32, within: Duration) -> bool {
+        self.wait_for_tabs(|_| false, Duration::ZERO);
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self.focused_tab() == Some(want) {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
+    }
+
+    /// The one based screen column of the middle of a terminal's tab, read off the bar.
+    ///
+    /// Read rather than computed: the labels are as wide as the program names, so a column
+    /// worked out here would be a copy of the bar's own layout arithmetic and would drift
+    /// from it the first time a label changed.
+    fn tab_column(&self, terminal: u32) -> Option<u16> {
+        let bar = self.tab_bar()?;
+        let at = bar
+            .find(&format!("[{terminal} "))
+            .or_else(|| bar.find(&format!(" {terminal} ")))?;
+        Some(at as u16 + 2)
+    }
+
+    /// Read until the tab bar says what is wanted.
+    fn wait_for_tabs(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self.tab_bar().is_some_and(|bar| want(&bar)) {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
     }
 
     /// The terminal's own column of one screen row, as painted most recently.
@@ -274,7 +351,7 @@ impl Interface {
     /// noticed the process is gone, so the first frame after an interrupt still shows the
     /// command. Waiting for the row itself is what makes this a question about the index
     /// rather than about which frame happened to arrive first.
-    fn wait_for_index(
+    fn wait_for_panel(
         &mut self,
         row: usize,
         want: impl Fn(&str) -> bool,
@@ -282,12 +359,18 @@ impl Interface {
     ) -> Option<Duration> {
         let start = Instant::now();
         while start.elapsed() < within {
-            if self.index_line(row).is_some_and(|line| want(&line)) {
+            if self.panel_line(row).is_some_and(|line| want(&line)) {
                 return Some(start.elapsed());
             }
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
         }
         None
+    }
+
+    /// A press and its release at a one based screen position, as a terminal reports them.
+    fn click(&mut self, col: u16, row: u16) {
+        self.type_in(format!("\x1b[<0;{col};{row}M").as_bytes());
+        self.type_in(format!("\x1b[<0;{col};{row}m").as_bytes());
     }
 
     /// The prefix key, then a command key. Two writes, because that is how a keyboard
@@ -299,37 +382,71 @@ impl Interface {
     }
 }
 
-/// G12.1: the interface opens, and the index, the terminal and the keys are all on screen.
+/// G12.1: the interface opens, and the spaces, the agents, the tabs, the terminal and the
+/// keys are all on screen.
 #[test]
-fn g12_1_the_interface_paints_an_index_a_terminal_and_a_status_line() {
+fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() {
     let mut ui = Interface::start();
     assert!(
-        ui.wait_for("ctrl-a d detach", Duration::from_secs(20))
-            .is_some(),
+        ui.wait_for("d detach", Duration::from_secs(20)).is_some(),
         "the status line never appeared:\n{}",
         ui.painted
     );
-    // The index: a terminal number and the program in it. `sh` because the shell is
-    // pinned. Waited for rather than checked: the first frame is painted before the answer
-    // to `ListAgents` arrives, and asserting on whatever happened to be buffered is how a
-    // test reports a race as a failure.
+    // Both panels of the left column, each with its own title, and the daemon's own space
+    // named under the first of them. Waited for rather than checked: the first frame is
+    // painted before the answers to `ListAgents` and `ListWorkspaces` arrive, and asserting
+    // on whatever happened to be buffered is how a test reports a race as a failure.
     assert!(
-        ui.wait_for(">1 ", Duration::from_secs(15)).is_some(),
-        "the index has no row for terminal 1:\n{}",
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW,
+            |line| line.contains("default"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the spaces panel does not name the daemon's own space: {:?}\n{}",
+        ui.panel_line(FIRST_SPACE_ROW),
         ui.painted
     );
-    let row = ui.index_line(FIRST_ROW).unwrap_or_default();
-    let program: String = row
+    assert_eq!(
+        ui.panel_line(SPACES_TITLE_ROW)
+            .map(|l| l.trim_end().to_string()),
+        Some(" spaces".to_string())
+    );
+    assert_eq!(
+        ui.panel_line(FIRST_AGENT_ROW - 1)
+            .map(|l| l.trim_end().to_string()),
+        Some(" agents".to_string()),
+        "the agents panel has no title: {:?}",
+        ui.panel_line(FIRST_AGENT_ROW - 1)
+    );
+    // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
+    // answers "who needs me", and a shell is only ever the first of those, so the panel is
+    // empty here and G12.7 is where it fills.
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(15)),
+        "the tab bar does not carry the open terminal: {:?}\n{}",
+        ui.tab_bar(),
+        ui.painted
+    );
+    let bar = ui.tab_bar().unwrap_or_default();
+    assert!(bar.contains('+'), "the tab bar has no new tab: {bar:?}");
+    let program: String = bar[bar.find("[1 ").map(|at| at + 3).unwrap_or_default()..]
         .chars()
-        .skip(3)
-        .take_while(|c| !c.is_whitespace())
+        .take_while(|c| *c != ']')
         .collect();
     assert!(
         program
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
             && !program.is_empty(),
-        "the index row names no program: {row:?}"
+        "the tab names no program: {bar:?}"
+    );
+    assert_eq!(
+        ui.panel_line(FIRST_AGENT_ROW)
+            .map(|l| l.trim_end().to_string()),
+        Some(String::new()),
+        "a plain shell is listed as an agent: {:?}",
+        ui.panel_line(FIRST_AGENT_ROW)
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
     ui.type_in(b"echo INTERFACE_$((6*7))\n");
@@ -348,7 +465,7 @@ fn g12_1_the_interface_paints_an_index_a_terminal_and_a_status_line() {
 #[test]
 fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.type_in(b"echo FIRST_TERMINAL\n");
     assert!(
         ui.wait_for("FIRST_TERMINAL", Duration::from_secs(10))
@@ -357,8 +474,9 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
 
     ui.command(b'c');
     assert!(
-        ui.wait_for(">2 ", Duration::from_secs(15)).is_some(),
-        "creating a terminal did not add a row to the index, daemon said: {}",
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "creating a terminal did not put a focused tab on the bar ({:?}), daemon said: {}",
+        ui.tab_bar(),
         ui.daemon_log()
     );
     // The new one is focused, and what is typed reaches it rather than the one it came
@@ -387,14 +505,12 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
     // gate reported a feature that works as broken.
     ui.command(b'x');
     assert!(
-        ui.wait_for_index(
-            FIRST_ROW + 1,
-            |line| line.trim().is_empty(),
+        ui.wait_for_tabs(
+            |bar| !bar.contains("1 ") && !bar.contains("[1"),
             Duration::from_secs(15)
-        )
-        .is_some(),
-        "the index still has a second row after one terminal was closed: {:?}",
-        ui.index_line(FIRST_ROW + 1)
+        ),
+        "the tab bar still carries the closed terminal: {:?}",
+        ui.tab_bar()
     );
 }
 
@@ -406,10 +522,7 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
 #[test]
 fn g12_3_the_child_is_sized_to_the_pane_and_not_to_the_window() {
     let mut ui = Interface::start();
-    assert!(
-        ui.wait_for("ctrl-a d detach", Duration::from_secs(20))
-            .is_some()
-    );
+    assert!(ui.wait_for("d detach", Duration::from_secs(20)).is_some());
     ui.type_in(b"stty size\n");
     let (want_cols, want_rows) = qoro_tui::screen::pane_size(COLS, ROWS);
     let expected = format!("{want_rows} {want_cols}");
@@ -420,47 +533,37 @@ fn g12_3_the_child_is_sized_to_the_pane_and_not_to_the_window() {
     );
 }
 
-/// G12.4: the index follows the process in the terminal, and does it without polling.
+/// G12.4: the interface follows the process in the terminal, and does it without polling.
 ///
 /// The command chosen prints nothing at all, which is the case that matters: a change the
 /// interface could only learn by asking. The daemon pushes it.
 #[test]
-fn g12_4_the_index_follows_the_foreground_process() {
+fn g12_4_the_interface_follows_the_foreground_process() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     ui.painted.clear();
     ui.type_in(b"sleep 12\n");
-    let took = ui
-        .wait_for_index(
-            FIRST_ROW,
-            |line| line.contains("sleep"),
-            Duration::from_secs(5),
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "the index never showed the running command:\n{}",
-                ui.painted
-            )
-        });
+    let started = Instant::now();
+    assert!(
+        ui.wait_for_tabs(|bar| bar.contains("sleep"), Duration::from_secs(5)),
+        "the tab never showed the running command:\n{}",
+        ui.painted
+    );
+    let took = started.elapsed();
     // ADR-009's settle schedule is 5, 25 and 70 milliseconds, and the gate allows that plus
     // 100. Two seconds is the honest ceiling for a value measured through a pty on a
     // machine that is also running the rest of this suite.
     assert!(
         took < Duration::from_secs(2),
-        "the index took {took:?} to notice the process"
+        "the interface took {took:?} to notice the process"
     );
 
     ui.type_in(&[0x03]);
-    let back = ui.wait_for_index(
-        FIRST_ROW,
-        |line| !line.contains("sleep"),
-        Duration::from_secs(12),
-    );
     assert!(
-        back.is_some(),
-        "the index still shows the interrupted command: {:?}, pane row 1 is {:?}",
-        ui.index_line(FIRST_ROW),
+        ui.wait_for_tabs(|bar| !bar.contains("sleep"), Duration::from_secs(12)),
+        "the tab still shows the interrupted command: {:?}, pane row 1 is {:?}",
+        ui.tab_bar(),
         ui.pane_line(1)
     );
 }
@@ -469,10 +572,7 @@ fn g12_4_the_index_follows_the_foreground_process() {
 #[test]
 fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
     let mut ui = Interface::start();
-    assert!(
-        ui.wait_for("ctrl-a d detach", Duration::from_secs(20))
-            .is_some()
-    );
+    assert!(ui.wait_for("d detach", Duration::from_secs(20)).is_some());
     ui.type_in(b"echo BEFORE_DETACH\n");
     assert!(
         ui.wait_for("BEFORE_DETACH", Duration::from_secs(10))
@@ -509,9 +609,9 @@ fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
 /// the identity chain, where the executable is the interpreter and the agent's own name is
 /// only in the argv.
 #[test]
-fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
+fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui._dir.path().join("bin");
     std::fs::create_dir_all(&dir).expect("dir");
@@ -532,25 +632,31 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
 
     // The name a person would say, not the interpreter that is running it.
     assert!(
-        ui.wait_for_index(
-            FIRST_ROW,
+        ui.wait_for_panel(
+            FIRST_AGENT_ROW + 1,
             |line| line.contains("claude"),
             Duration::from_secs(15)
         )
         .is_some(),
-        "the index does not name the agent: {:?}",
-        ui.index_line(FIRST_ROW)
+        "the agents panel does not name the agent: {:?}",
+        ui.panel_line(FIRST_AGENT_ROW + 1)
     );
     // What it is doing, read off its own screen.
     assert!(
-        ui.wait_for_index(
-            FIRST_ROW,
+        ui.wait_for_panel(
+            FIRST_AGENT_ROW + 1,
             |line| line.contains("blocked"),
             Duration::from_secs(15)
         )
         .is_some(),
-        "the index does not say the agent is blocked: {:?}",
-        ui.index_line(FIRST_ROW)
+        "the agents panel does not say the agent is blocked: {:?}",
+        ui.panel_line(FIRST_AGENT_ROW + 1)
+    );
+    // And the tab is named after it too, so a person can find it without reading the panel.
+    assert!(
+        ui.tab_bar().is_some_and(|bar| bar.contains("claude")),
+        "the tab bar does not name the agent: {:?}",
+        ui.tab_bar()
     );
     // And said out loud, so a person who is looking at another terminal still finds out.
     assert!(
@@ -564,55 +670,123 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_index() {
     );
 }
 
-/// G12.8: the index is clickable.
+/// G12.8: the tab bar and the left column are both clickable.
 ///
 /// Sent as the terminal sends it, which is the extended report `CSI < button ; col ; row M`
 /// for a press and the same with `m` for the release. Acting on both would switch twice for
 /// one click, so only the press is a command, and that is asserted here by sending both.
 #[test]
-fn g12_8_a_click_on_the_index_moves_to_that_terminal() {
+fn g12_8_a_click_on_a_tab_or_on_an_agent_moves_to_that_terminal() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for(">1 ", Duration::from_secs(20)).is_some());
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.command(b'c');
     assert!(
-        ui.wait_for(">2 ", Duration::from_secs(15)).is_some(),
-        "the second terminal never appeared"
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second terminal never appeared: {:?}",
+        ui.tab_bar()
     );
 
-    // Row one is the column's title and row two is the first terminal.
-    ui.type_in(b"\x1b[<0;5;2M");
-    ui.type_in(b"\x1b[<0;5;2m");
+    // The first terminal's own tab.
+    let first = ui
+        .tab_column(1)
+        .unwrap_or_else(|| panic!("terminal 1 has no tab: {:?}", ui.tab_bar()));
+    ui.click(first, qoro_tui::screen::TABS as u16);
     assert!(
-        ui.wait_for_index(2, |line| line.starts_with(">1"), Duration::from_secs(10))
-            .is_some(),
-        "a click on the first row did not move to the first terminal: {:?}",
-        ui.index_line(2)
+        ui.wait_for_tab(1, Duration::from_secs(10)),
+        "a click on the first tab did not move to it: {:?}",
+        ui.tab_bar()
     );
 
-    // The title names no terminal, so a click on it moves to none.
-    ui.type_in(b"\x1b[<0;5;1M");
-    ui.type_in(b"\x1b[<0;5;1m");
-    std::thread::sleep(Duration::from_millis(500));
-    let _ = ui.wait_for("never appears", Duration::from_millis(300));
+    // A title names no terminal, so a click on it moves to none.
+    ui.click(5, SPACES_TITLE_ROW as u16);
+    let _ = ui.wait_for("never appears", Duration::from_millis(600));
     assert!(
-        ui.index_line(2).is_some_and(|line| line.starts_with(">1")),
-        "a click on the title moved the focus: {:?}",
-        ui.index_line(2)
+        ui.focused_tab() == Some(1),
+        "a click on a title moved the focus: {:?}",
+        ui.tab_bar()
     );
 
-    // Split across two reads, which is what a terminal does when the report straddles a
-    // read boundary. Half of one passed through would type `[<0;5;3M` at a shell.
-    ui.type_in(b"\x1b[<0;5");
+    // And the tab bar itself, split across two reads, which is what a terminal does when
+    // the report straddles a read boundary. Half of one passed through would type
+    // `[<0;11;1M` at a shell.
+    let col = ui
+        .tab_column(2)
+        .unwrap_or_else(|| panic!("terminal 2 has no tab: {:?}", ui.tab_bar()));
+    ui.type_in(format!("\x1b[<0;{col}").as_bytes());
     std::thread::sleep(Duration::from_millis(100));
-    ui.type_in(b";3M\x1b[<0;5;3m");
+    ui.type_in(format!(";1M\x1b[<0;{col};1m").as_bytes());
     assert!(
-        ui.wait_for_index(3, |line| line.starts_with(">2"), Duration::from_secs(10))
-            .is_some(),
-        "a split mouse report did not arrive whole: {:?}",
-        ui.index_line(3)
+        ui.wait_for_tab(2, Duration::from_secs(10)),
+        "a split mouse report on the tab bar did not arrive whole: {:?}",
+        ui.tab_bar()
     );
     assert!(
-        !ui.saw("[<0;5"),
+        !ui.saw(&format!("[<0;{col}")),
         "part of a mouse report reached the terminal"
+    );
+}
+
+/// G12.9: a space is a place, and both the keyboard and the pointer get to it.
+///
+/// The gate the whole left column exists for. Without it a daemon could hold one workspace
+/// forever and every screen would still look right, because a person with one space cannot
+/// tell a real grouping from a number that never changes.
+#[test]
+fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.type_in(b"echo IN_THE_FIRST_SPACE\n");
+    assert!(
+        ui.wait_for("IN_THE_FIRST_SPACE", Duration::from_secs(10))
+            .is_some()
+    );
+
+    // A new space, which starts with a terminal in it: a space with nothing in it shows an
+    // empty pane and a bar with only a `+` on it, and nobody wants to land there.
+    ui.command(b'w');
+    assert!(
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW + 1,
+            |line| line.contains("space 2"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the new space is not in the spaces panel: {:?}, daemon said: {}",
+        ui.panel_line(FIRST_SPACE_ROW + 1),
+        ui.daemon_log()
+    );
+
+    // Its own tab bar: the terminal of the first space is not in this space.
+    assert!(
+        ui.wait_for_tabs(
+            |bar| bar.contains("[2") && !bar.contains(" 1 "),
+            Duration::from_secs(15)
+        ),
+        "the new space shows the other space's tabs: {:?}",
+        ui.tab_bar()
+    );
+
+    // And back, by clicking the first space, which brings back that space's terminal with
+    // the history it had.
+    ui.painted.clear();
+    ui.click(5, FIRST_SPACE_ROW as u16);
+    assert!(
+        ui.wait_for("IN_THE_FIRST_SPACE", Duration::from_secs(15))
+            .is_some(),
+        "clicking the first space did not bring its terminal back:\n{}",
+        ui.painted
+    );
+    assert!(
+        ui.focused_tab() == Some(1),
+        "the tab bar did not follow the space: {:?}",
+        ui.tab_bar()
+    );
+
+    // The keyboard reaches the other space too, so the pointer is not the only way in.
+    ui.command(b's');
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "ctrl-a s did not move to the next space: {:?}",
+        ui.tab_bar()
     );
 }

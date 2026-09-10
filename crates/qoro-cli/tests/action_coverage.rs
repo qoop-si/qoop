@@ -69,6 +69,7 @@ fn actions() -> Vec<Action> {
                 Method::Control(ControlRequest::CreateTerminal {
                     id: "a".into(),
                     cwd: None,
+                    workspace: None,
                 })
             },
         },
@@ -88,6 +89,19 @@ fn actions() -> Vec<Action> {
         Action {
             name: "show the index of terminals and who is in them",
             method: || Method::Control(ControlRequest::ListAgents { id: "a".into() }),
+        },
+        Action {
+            name: "show the workspaces",
+            method: || Method::Control(ControlRequest::ListWorkspaces { id: "a".into() }),
+        },
+        Action {
+            name: "start a workspace",
+            method: || {
+                Method::Control(ControlRequest::CreateWorkspace {
+                    id: "a".into(),
+                    name: "new".into(),
+                })
+            },
         },
         Action {
             name: "ask for the geometry",
@@ -151,6 +165,7 @@ fn every_control_method_is_reachable_from_some_action() {
         ControlRequest::CreateTerminal {
             id: String::new(),
             cwd: None,
+            workspace: None,
         },
         ControlRequest::CloseTerminal {
             id: String::new(),
@@ -158,6 +173,11 @@ fn every_control_method_is_reachable_from_some_action() {
         },
         ControlRequest::ListTerminals { id: String::new() },
         ControlRequest::ListAgents { id: String::new() },
+        ControlRequest::ListWorkspaces { id: String::new() },
+        ControlRequest::CreateWorkspace {
+            id: String::new(),
+            name: String::new(),
+        },
         ControlRequest::Subscribe {
             id: String::new(),
             terminals: Vec::new(),
@@ -182,6 +202,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::CloseTerminal { .. }
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
+            | ControlRequest::ListWorkspaces { .. }
+            | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

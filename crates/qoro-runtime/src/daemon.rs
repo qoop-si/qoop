@@ -268,6 +268,10 @@ impl Connection {
 /// terminal task and is deliberately not reachable from here.
 #[derive(Clone)]
 pub struct TerminalHandle {
+    /// The workspace this terminal was created in. Held here rather than looked up in the
+    /// store on every index, because an index is drawn far more often than a terminal is
+    /// created.
+    pub workspace: i64,
     pub id: TerminalId,
     /// The token this terminal's child was launched with. Held so that a later observation
     /// can be checked against it without asking the child.
@@ -288,6 +292,11 @@ pub struct TerminalRegistry {
 impl TerminalRegistry {
     pub fn get(&self, stream: u32) -> Option<TerminalHandle> {
         self.inner.lock().unwrap().get(&stream).cloned()
+    }
+
+    /// The workspace a terminal belongs to, for an index that groups by one.
+    pub fn workspace_of(&self, stream: u32) -> Option<i64> {
+        self.inner.lock().unwrap().get(&stream).map(|h| h.workspace)
     }
 
     pub fn streams(&self) -> Vec<u32> {
@@ -398,6 +407,7 @@ impl Daemon {
         scanner.refresh().await;
         open_terminal(
             &terminals,
+            workspace,
             shell,
             None,
             warnings.clone(),
@@ -1286,7 +1296,15 @@ async fn handle_control(
     }
 
     match request {
-        ControlRequest::CreateTerminal { cwd, .. } => {
+        ControlRequest::CreateTerminal {
+            cwd,
+            workspace: wanted,
+            ..
+        } => {
+            // The workspace the client asked for, or the one the daemon opened. A client
+            // that does not know about workspaces sends nothing and lands in the default,
+            // which is what it already believed was happening.
+            let workspace = wanted.unwrap_or(workspace);
             // A requested working directory is validated here rather than trusted. It has
             // to be absolute, because a relative path would resolve against whatever
             // directory the daemon happens to be in, and it has to exist, because a shell
@@ -1345,6 +1363,7 @@ async fn handle_control(
             }
             match open_terminal(
                 terminals,
+                workspace,
                 shell,
                 cwd.as_deref(),
                 warnings.clone(),
@@ -1441,6 +1460,39 @@ async fn handle_control(
             id,
             terminals: terminals.streams(),
         },
+        ControlRequest::ListWorkspaces { .. } => {
+            // Counted from the terminals that are open now rather than from the store: the
+            // store knows which terminals were ever created in a workspace, and a client
+            // drawing a list wants to know which ones are alive.
+            let live = terminals.streams();
+            match store.workspaces().await {
+                Ok(rows) => ControlResponse::Workspaces {
+                    id,
+                    workspaces: rows
+                        .into_iter()
+                        .map(|row| crate::control::WorkspaceRow {
+                            id: row.id,
+                            name: row.name,
+                            terminals: live
+                                .iter()
+                                .filter(|s| terminals.workspace_of(**s) == Some(row.id))
+                                .count(),
+                        })
+                        .collect(),
+                },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the workspaces could not be read: {e}"),
+                },
+            }
+        }
+        ControlRequest::CreateWorkspace { name, .. } => match store.create_workspace(name).await {
+            Ok(workspace) => ControlResponse::WorkspaceCreated { id, workspace },
+            Err(e) => ControlResponse::Failed {
+                id,
+                reason: format!("the workspace could not be created: {e}"),
+            },
+        },
         ControlRequest::ListAgents { .. } => {
             // Read from the registry rather than by walking the process table here: the
             // registry is what the process watcher and the observation precedence in
@@ -1468,6 +1520,14 @@ async fn handle_control(
                         .to_string();
                     crate::control::AgentRow {
                         terminal,
+                        workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
+                        // Asked of the same table that resolved the name in the first
+                        // place. The wrappers have already been seen through by the time
+                        // the name is stored, so there is nothing left here to unwrap and
+                        // no argv to pass.
+                        agent: program
+                            .as_deref()
+                            .is_some_and(|p| qoro_domain::program::identify(p, &[]).agent),
                         program,
                         behind,
                         state,
@@ -1737,6 +1797,7 @@ fn is_canonical(master: std::os::fd::RawFd) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn open_terminal(
     terminals: &Arc<TerminalRegistry>,
+    workspace: i64,
     shell: &Path,
     cwd: Option<&Path>,
     warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
@@ -1758,6 +1819,7 @@ pub fn open_terminal(
     let terminal_id = TerminalId::new(stream.to_string());
     agents.register(stream, terminal_id.clone(), token.clone());
     let handle = TerminalHandle {
+        workspace,
         id: terminal_id,
         token: token.clone(),
         commands,

@@ -5,15 +5,20 @@
 //! reconciled with the one the daemon already sends. Everything here is text in, text out,
 //! so a test can read a frame instead of looking at one.
 
-use qoro_runtime::control::AgentRow;
+use qoro_runtime::control::{AgentRow, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
-use crate::{index, width};
+use crate::{sidebar, tabs, width};
 
-/// What the screen shows, which is an index, one terminal, and a line saying what the keys
-/// do.
+/// What the screen shows: the tab bar across the top, the spaces and agents down the left,
+/// one terminal filling the rest, and a line saying what the keys do.
 pub struct Frame<'a> {
+    /// Every terminal the daemon reports, across every space. The panel on the left is a
+    /// list across spaces on purpose, so it takes the whole thing.
     pub rows: &'a [AgentRow],
+    pub spaces: &'a [WorkspaceRow],
+    /// The space whose tabs are on the bar. `None` before the daemon has answered.
+    pub space: Option<i64>,
     pub focused: u32,
     /// The focused terminal's last snapshot. `None` before the first one arrives, which is
     /// a real state: a terminal that has produced nothing yet has nothing to draw.
@@ -24,21 +29,40 @@ pub struct Frame<'a> {
     pub message: Option<&'a str>,
 }
 
-/// The columns and rows left for the terminal once the index and the status line have
-/// taken theirs.
+/// Rows the tab bar takes, at the top of the screen.
+pub const TABS: usize = 1;
+
+/// Rows the status line takes, at the bottom.
+pub const STATUS: usize = 1;
+
+/// The columns and rows left for the terminal once the tab bar, the left column and the
+/// status line have taken theirs.
 ///
 /// Public because it is also what the client tells the daemon to size the child to, and a
 /// second copy of that arithmetic in the caller is how a pane and its child end up
 /// disagreeing about how wide they are.
 pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
     (
-        cols.saturating_sub(index::WIDTH as u16 + 1).max(1),
-        lines.saturating_sub(1).max(1),
+        cols.saturating_sub(sidebar::WIDTH as u16 + 1).max(1),
+        lines.saturating_sub((TABS + STATUS) as u16).max(1),
     )
 }
 
-/// Rows the index spends on its own title.
-pub const HEADER: usize = 1;
+/// The terminals of one space, in the order the daemon reports them.
+///
+/// The tab bar is per space and the panel on the left is not, so this filter lives here
+/// rather than in either of them: both a click and a repaint have to agree on which
+/// terminals the bar is carrying, and two copies of the filter is how they stop agreeing.
+///
+/// A `None` space is every terminal, which is the honest answer before the daemon has said
+/// what spaces exist: showing nothing at that moment would read as a daemon with no
+/// terminals in it.
+pub fn in_space(rows: &[AgentRow], space: Option<i64>) -> Vec<AgentRow> {
+    rows.iter()
+        .filter(|r| space.is_none_or(|s| r.workspace == s))
+        .cloned()
+        .collect()
+}
 
 /// The escape sequence that puts the cursor at a one-based row and column.
 fn at(row: usize, col: usize) -> String {
@@ -59,22 +83,33 @@ pub fn paint(frame: &Frame) -> String {
     // people notice most.
     out.push_str("\x1b[?25l");
 
-    // One row of the index says what the column is. Below it, the terminals.
-    let index_lines = index::render_lines(
+    // The tab bar spans the whole width, above both columns. Above and not beside, because
+    // it belongs to the space and the space is what the column on the left selects.
+    out.push_str(&at(1, 1));
+    out.push_str("\x1b[2m");
+    out.push_str(
+        &tabs::render(
+            &in_space(frame.rows, frame.space),
+            frame.focused,
+            frame.cols as usize,
+        )
+        .text,
+    );
+    out.push_str("\x1b[0m");
+
+    let panel = sidebar::render(
+        frame.spaces,
         frame.rows,
+        frame.space.unwrap_or_default(),
         frame.focused,
-        (pane_rows as usize).saturating_sub(HEADER),
+        pane_rows as usize,
     );
     for row in 0..pane_rows as usize {
-        out.push_str(&at(row + 1, 1));
-        // The state's colour, on the whole row. A person scanning an index is looking for
-        // the one row that needs them, and a coloured word inside an otherwise grey line is
-        // a word they have to find first.
-        if row < HEADER {
-            out.push_str("\x1b[2m");
-            out.push_str(&index::header(frame.rows.len()));
-            out.push_str("\x1b[0m");
-        } else if let Some(line) = index_lines.get(row - HEADER) {
+        out.push_str(&at(row + 1 + TABS, 1));
+        // The state's colour, on the whole row. A person scanning this column is looking
+        // for the one row that needs them, and a coloured word inside an otherwise grey
+        // line is a word they have to find first.
+        if let Some(line) = panel.get(row) {
             match line.colour {
                 Some(colour) => {
                     out.push_str(&format!("\x1b[{}m", 30 + colour.min(7)));
@@ -84,7 +119,7 @@ pub fn paint(frame: &Frame) -> String {
                 None => out.push_str(&line.text),
             }
         }
-        // The rule between the index and the terminal, drawn every row so that a terminal
+        // The rule between the column and the terminal, drawn every row so that a terminal
         // line long enough to reach it cannot swallow it.
         out.push('\u{2502}');
         let line = frame
@@ -102,8 +137,11 @@ pub fn paint(frame: &Frame) -> String {
 
     out.push_str(&at(frame.lines as usize, 1));
     out.push_str("\x1b[7m");
+    // The prefix once, then the letters. Spelled out for every key it took 96 columns, and
+    // a person on an eighty column window was told about the first three commands and not
+    // about the one that gets them out.
     let status = frame.message.map(str::to_string).unwrap_or_else(|| {
-        "ctrl-a n next  ctrl-a c new  ctrl-a x close  ctrl-a d detach".to_string()
+        "ctrl-a: n tab  c new  x close  s space  w new space  d detach".to_string()
     });
     out.push_str(&width::fit(&status, frame.cols as usize));
     out.push_str("\x1b[0m");
@@ -124,8 +162,8 @@ pub fn paint(frame: &Frame) -> String {
             &cells,
             width::width(&cells).min(pane_cols as usize),
         ));
-        let row = row.min(pane_rows as usize - 1) + 1;
-        let col = col.min(pane_cols as usize - 1) + index::WIDTH + 2;
+        let row = row.min(pane_rows as usize - 1) + 1 + TABS;
+        let col = col.min(pane_cols as usize - 1) + sidebar::WIDTH + 2;
         out.push_str(&at(row, col));
         out.push_str("\x1b[?25h");
     }
@@ -233,9 +271,19 @@ fn colour(c: ColourWire, foreground: bool) -> String {
 mod tests {
     use super::*;
 
+    fn spaces() -> Vec<WorkspaceRow> {
+        vec![WorkspaceRow {
+            id: 1,
+            name: "app".to_string(),
+            terminals: 1,
+        }]
+    }
+
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
             terminal,
+            workspace: 1,
+            agent: true,
             program: Some(program.to_string()),
             behind: None,
             state: state.to_string(),
@@ -255,7 +303,7 @@ mod tests {
 
     #[test]
     fn the_pane_is_what_is_left_after_the_index_and_the_status_line() {
-        assert_eq!(pane_size(80, 24), (80 - index::WIDTH as u16 - 1, 23));
+        assert_eq!(pane_size(80, 24), (80 - sidebar::WIDTH as u16 - 1, 22));
     }
 
     #[test]
@@ -266,11 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn the_terminals_output_and_the_index_are_both_in_the_frame() {
+    fn the_terminals_output_the_tabs_and_both_panels_are_in_the_frame() {
         let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
             cols: 80,
@@ -278,8 +328,15 @@ mod tests {
             message: None,
         });
         assert!(painted.contains("hello from the shell"));
-        assert!(painted.contains("claude"));
-        assert!(painted.contains("ctrl-a d detach"));
+        // Once on the tab and once in the agents panel: the bar says what is open in this
+        // space and the panel says what it is doing.
+        assert!(painted.matches("claude").count() >= 2, "{painted:?}");
+        assert!(painted.contains("d detach"));
+        assert!(painted.contains("spaces"), "no spaces panel: {painted:?}");
+        assert!(
+            painted.contains("app"),
+            "the space is not named: {painted:?}"
+        );
     }
 
     #[test]
@@ -289,6 +346,8 @@ mod tests {
         let snapshot = snapshot(&[&long]);
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 40,
@@ -306,6 +365,8 @@ mod tests {
         let rows = [row(1, "zsh", "starting")];
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: None,
             cols: 40,
@@ -328,6 +389,8 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 40,
@@ -350,6 +413,8 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 40,
@@ -379,6 +444,8 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 30,
@@ -397,6 +464,8 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
             rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 40,
