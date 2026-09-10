@@ -26,6 +26,21 @@ PASS=0; FAIL=0
 ok(){ echo "    PASS: $1"; PASS=$((PASS+1)); }
 no(){ echo "    FAIL: $1"; FAIL=$((FAIL+1)); }
 
+# Wait for text to appear on the pane rather than sleeping a fixed time before looking.
+#
+# The fixed sleeps this replaces were long enough on a quiet machine and not on a busy one:
+# this script failed its last step exactly once, right after a full test run, and passed
+# five times in a row on its own. A sleep tuned to a quiet machine is a test that reports
+# the machine.
+appears(){
+    local needle=$1 deadline=$((SECONDS + ${2:-15}))
+    while [ $SECONDS -lt $deadline ]; do
+        tmux capture-pane -t "$S" -p | grep -q "$needle" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 cleanup(){ tmux kill-session -t "$S" 2>/dev/null; [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null; rm -rf "$RT"; }
 trap cleanup EXIT
 
@@ -45,8 +60,7 @@ echo "client=$CPID daemon=$DPID"
 
 echo "--- 1. a real shell answers a real command"
 tmux send-keys -t "$S" 'echo QORO_WORKS_$((6*7))' Enter
-sleep 2
-tmux capture-pane -t "$S" -p | grep -q "QORO_WORKS_42" && ok "the shell computed 6*7" || { no "no marker"; tmux capture-pane -t "$S" -p | head -5 | sed 's/^/      /'; }
+appears "QORO_WORKS_42" && ok "the shell computed 6*7" || { no "no marker"; tmux capture-pane -t "$S" -p | head -5 | sed 's/^/      /'; }
 
 echo "--- 2. the daemon holds exactly one pty master, read from the OS"
 M=$(lsof -p "$DPID" -Fn 2>/dev/null | grep -c "ptmx")
@@ -68,8 +82,7 @@ echo "--- 5. reattach and prove it is the SAME shell, not a new one"
 tmux send-keys -t "$S" "$QORO 2>>$RT/client.log" Enter
 sleep 3
 tmux send-keys -t "$S" 'echo STATE_IS_$QORO_STATE' Enter
-sleep 2
-tmux capture-pane -t "$S" -p | grep -q "STATE_IS_kept" && ok "same shell: it still has its variable" || { no "state lost, so it is a different shell"; tmux capture-pane -t "$S" -p | head -6 | sed 's/^/      /'; }
+appears "STATE_IS_kept" && ok "same shell: it still has its variable" || { no "state lost, so it is a different shell"; tmux capture-pane -t "$S" -p | head -6 | sed 's/^/      /'; }
 
 echo "--- 6. SIGKILL the client; the shell must survive (invariant I1)"
 CPID2=$(pgrep -f "release/qoro$" | head -1)
@@ -81,8 +94,7 @@ echo "--- 7. reattach once more after the kill and check the shell still answers
 tmux send-keys -t "$S" "$QORO 2>>$RT/client.log" Enter
 sleep 3
 tmux send-keys -t "$S" 'echo AFTER_KILL_$QORO_STATE' Enter
-sleep 2
-tmux capture-pane -t "$S" -p | grep -q "AFTER_KILL_kept" && ok "the shell is still the same one" || no "the shell did not survive the kill intact"
+appears "AFTER_KILL_kept" && ok "the shell is still the same one" || no "the shell did not survive the kill intact"
 
 echo
 echo "passed $PASS, failed $FAIL"
