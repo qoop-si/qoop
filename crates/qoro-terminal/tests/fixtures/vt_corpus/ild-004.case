@@ -1,0 +1,9 @@
+id: ild-004
+name: DCH deletes characters at the cursor, shifting the rest of the line left and blanking the end
+citation: xterm ctlseqs, CSI Ps P DCH
+cols: 6
+rows: 1
+input: ABCDEF\x1b[1;3H\x1b[2P
+cursor: 0,2
+lines:
+> ABEF

@@ -1,0 +1,14 @@
+id: stb-005
+name: CSI r with no parameters resets the scrolling region to the full screen
+citation: xterm ctlseqs, CSI Ps ; Ps r DECSTBM: omitted parameters mean the full screen
+cols: 6
+rows: 6
+input: LINE_0\x0d\x0aLINE_1\x0d\x0aLINE_2\x0d\x0aLINE_3\x0d\x0aLINE_4\x0d\x0aLINE_5\x1b[2;4r\x1b[r\x1b[6;1H\x0a
+cursor: 5,0
+lines:
+> LINE_1
+> LINE_2
+> LINE_3
+> LINE_4
+> LINE_5
+> 

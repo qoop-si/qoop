@@ -1,0 +1,14 @@
+id: stb-003
+name: a line feed below the scrolling region moves the cursor without scrolling the region
+citation: DEC STD 070 / xterm ctlseqs, CSI Ps ; Ps r DECSTBM: scrolling only occurs at the region's own margins
+cols: 6
+rows: 6
+input: LINE_0\x0d\x0aLINE_1\x0d\x0aLINE_2\x0d\x0aLINE_3\x0d\x0aLINE_4\x0d\x0aLINE_5\x1b[2;4r\x1b[5;1H\x0a
+cursor: 5,0
+lines:
+> LINE_0
+> LINE_1
+> LINE_2
+> LINE_3
+> LINE_4
+> LINE_5

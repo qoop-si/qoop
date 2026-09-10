@@ -1,0 +1,12 @@
+id: cur-004
+name: CUB clamps at the left column
+citation: xterm ctlseqs, CSI Ps D CUB
+cols: 10
+rows: 4
+input: \x1b[5C\x1b[99D
+cursor: 0,0
+lines:
+> 
+> 
+> 
+> 

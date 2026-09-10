@@ -1,0 +1,9 @@
+id: tab-002
+name: HTS sets a custom stop that CHT then honours ahead of the default stops
+citation: xterm ctlseqs, ESC H HTS and CSI Ps I CHT
+cols: 20
+rows: 1
+input: \x1b[1;6H\x1bH\x1b[1;1H\x1b[1I
+cursor: 0,5
+lines:
+> 

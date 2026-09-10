@@ -1,0 +1,12 @@
+id: cur-006
+name: CUP with omitted parameters defaults to row 1 column 1
+citation: xterm ctlseqs, CSI Ps ; Ps H CUP (default parameter 1)
+cols: 10
+rows: 4
+input: \x1b[5;5H\x1b[H
+cursor: 0,0
+lines:
+> 
+> 
+> 
+> 

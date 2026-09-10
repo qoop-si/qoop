@@ -1,0 +1,10 @@
+id: uni-003
+name: a wide character that does not fit in the remaining columns wraps whole to the next line
+citation: Unicode Standard Annex #11 / xterm ctlseqs: a wide character never splits across the line boundary
+cols: 5
+rows: 2
+input: ABCD中
+cursor: 1,2
+lines:
+> ABCD
+> 中

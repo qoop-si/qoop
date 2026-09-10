@@ -1,0 +1,9 @@
+id: sgr-002
+name: an SGR sequence with several parameters is consumed as one control function
+citation: xterm ctlseqs, CSI Pm m SGR: `;`-separated parameters form a single control function
+cols: 10
+rows: 1
+input: X\x1b[1;31;4mY
+cursor: 0,2
+lines:
+> XY

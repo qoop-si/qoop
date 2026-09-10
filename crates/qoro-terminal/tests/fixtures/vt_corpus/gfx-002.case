@@ -1,0 +1,10 @@
+id: gfx-002
+name: an unsupported Sixel DCS sequence is discarded without disturbing surrounding text
+citation: DEC STD 070 / xterm ctlseqs, DCS Sixel Graphics (ESC P q ... ESC \\), unsupported by this engine
+cols: 10
+rows: 2
+input: left\x0d\x0a\x1bPq#0;2;0;0;0#0!20~-\x1b\\right
+cursor: 1,5
+lines:
+> left
+> right

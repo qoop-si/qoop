@@ -1,0 +1,624 @@
+//! The `alacritty_terminal` adapter.
+//!
+//! This is the only file in the workspace that names the concrete engine. ADR-003 chose it
+//! for milestones 1 and 2 with a re-evaluation gate at M2, and the seam is what makes that
+//! gate real.
+//!
+//! Two measured constraints are encoded here rather than left to a future reader:
+//!
+//! * `scrolling_history` must be set explicitly. The engine's default is 10 000, which is a
+//!   46 MiB per terminal configuration.
+//! * The engine allocates scrollback in fixed 1000 row chunks, so any value below 1000
+//!   costs exactly the same as 1000. 1000 is therefore the cheapest non-zero setting and
+//!   anything smaller is a false economy.
+
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::vte::ansi::Processor;
+use bytes::Bytes;
+
+use crate::control_string::ControlStringFilter;
+use crate::engine::{Damage, LineDamage, Snapshot, TerminalEffect, TerminalEngine, TerminalModes};
+
+/// The engine allocates scrollback in 1000 row chunks, so this is the cheapest non-zero
+/// setting. See ADR-003 for the measurements.
+pub const SCROLLBACK_ROWS: usize = 1000;
+
+/// Collects the engine's outbound events so they can be returned as effects rather than
+/// dropped. Dropping them is how an application waiting for a cursor position report hangs.
+#[derive(Clone)]
+struct Collector(Sender<Event>);
+
+impl EventListener for Collector {
+    fn send_event(&self, event: Event) {
+        // A full or disconnected channel here would mean the caller stopped draining, which
+        // cannot happen: `feed` drains it before returning.
+        let _ = self.0.send(event);
+    }
+}
+
+pub struct AlacrittyEngine {
+    term: Term<Collector>,
+    parser: Processor,
+    events: Receiver<Event>,
+    /// Rows that have left the visible region since the last drain, oldest first.
+    scrolled_off: Vec<String>,
+    evicted_unobserved: u64,
+    filter: ControlStringFilter,
+    /// Reused across feeds so that bounding the stream does not allocate on every read.
+    filtered: Vec<u8>,
+    /// A character that a read cut in half, held until the rest of it arrives.
+    ///
+    /// At most three bytes, because no UTF-8 sequence is longer than four. See `feed` for
+    /// why the parser is never allowed to see one of these.
+    partial_char: Vec<u8>,
+}
+
+impl AlacrittyEngine {
+    pub fn new(cols: u16, rows: u16) -> Self {
+        let (tx, rx) = channel();
+        let config = Config {
+            scrolling_history: SCROLLBACK_ROWS,
+            ..Config::default()
+        };
+        Self {
+            term: Term::new(
+                config,
+                &TermSize::new(cols as usize, rows as usize),
+                Collector(tx),
+            ),
+            parser: Processor::new(),
+            events: rx,
+            filter: ControlStringFilter::default(),
+            filtered: Vec::new(),
+            partial_char: Vec::new(),
+            scrolled_off: Vec::new(),
+            evicted_unobserved: 0,
+        }
+    }
+
+    fn row_text(&self, line: i32) -> String {
+        let grid = self.term.grid();
+        let mut s = String::with_capacity(grid.columns());
+        for col in 0..grid.columns() {
+            s.push(grid[Point::new(Line(line), Column(col))].c);
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Capture rows that have entered the history ring since the last feed.
+    ///
+    /// This is the half of the spill that works today. While the ring is filling, rows only
+    /// arrive, so everything between the previous history size and the current one is new
+    /// and is captured exactly.
+    ///
+    /// Once the ring saturates the engine starts evicting, and it emits no event when it
+    /// does, so there is nothing to observe after the fact. Capturing those rows needs a
+    /// mechanism this adapter does not have yet, and the honest options are recorded in
+    /// ADR-003. Rather than pretend, saturation increments `evicted_unobserved`, which is a
+    /// counted gap and is asserted by gate G2.7 in milestone 2, where scrollback spill is
+    /// in scope. Milestone 1 has no disk history at all, so nothing here is load bearing
+    /// yet, and a placeholder that silently produced empty rows would have been worse than
+    /// a counter that says what is missing.
+    /// Take everything that has scrolled into the engine's history, then empty it.
+    ///
+    /// The ring is a staging buffer, not a scrollback. It was used as one at first, with a
+    /// cumulative watermark against `history_size()`, and that is only correct until the
+    /// ring fills: after 1000 rows the size stops growing, the delta is permanently zero,
+    /// and every row after that is evicted without ever being seen. Measured: 4000 lines
+    /// in, 1000 rows out, and every other test green.
+    ///
+    /// Draining it here makes the count exact instead of cumulative, and it is what the
+    /// design already calls for: scrollback lives on disk as rows, not in the engine as
+    /// cells. ADR-003 measured the same configuration at 524 KiB per terminal against
+    /// 5710 KiB with the ring kept full.
+    fn capture_new_history(&mut self) {
+        let history = {
+            let grid = self.term.grid();
+            grid.total_lines() - grid.screen_lines()
+        };
+        if history == 0 {
+            return;
+        }
+        for i in (0..history).rev() {
+            // History rows sit at negative line numbers, oldest most negative.
+            self.scrolled_off.push(self.row_text(-(i as i32) - 1));
+        }
+        if history >= SCROLLBACK_ROWS {
+            // The ring was full when we looked, so rows may have been evicted before we
+            // got here. Only a scroll control sequence can do that now, since a slice is
+            // bounded to fewer bytes than the ring holds rows, and no slice size can bound
+            // `CSI 5000 S`. Counted rather than prevented.
+            self.evicted_unobserved += 1;
+        }
+        self.term.grid_mut().clear_history();
+    }
+
+    /// How many feeds happened while the ring was already saturated, and therefore may have
+    /// evicted rows this adapter could not observe. Reported, never silently zero.
+    pub fn evicted_unobserved(&self) -> u64 {
+        self.evicted_unobserved
+    }
+}
+
+/// How many bytes at the end of `buf` are the start of a character that has not arrived.
+///
+/// Zero unless the tail really could still become a character: a lead byte with too few
+/// continuation bytes after it. A lead byte followed by something that is not a
+/// continuation byte is already invalid and is not held back, and neither is a sequence
+/// that is already complete.
+fn incomplete_utf8_tail(buf: &[u8]) -> usize {
+    // At most the last three bytes can be an incomplete sequence, since four is the longest
+    // sequence there is.
+    let start = buf.len().saturating_sub(3);
+    for at in start..buf.len() {
+        let need = match buf[at] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => continue,
+        };
+        let have = buf.len() - at;
+        if have >= need {
+            // Complete, or invalid in a way more bytes cannot repair.
+            continue;
+        }
+        // Every byte after the lead must be a continuation byte, or this is already
+        // invalid and waiting would only delay the replacement character.
+        if buf[at + 1..].iter().all(|b| b & 0xc0 == 0x80) {
+            return have;
+        }
+    }
+    0
+}
+
+impl TerminalEngine for AlacrittyEngine {
+    fn feed(&mut self, bytes: &[u8]) -> (Damage, Vec<TerminalEffect>) {
+        self.term.reset_damage();
+        // The parser's own control-string buffer is unbounded, so the bound goes in front
+        // of it. See `control_string` for the measurement that made this necessary.
+        self.filtered.clear();
+        // Whatever the last read cut in half goes back on the front, so the parser sees
+        // characters and never halves of them.
+        self.filtered.append(&mut self.partial_char);
+        self.filter.feed(bytes, &mut self.filtered);
+
+        // A character split across two reads is held back rather than handed over.
+        //
+        // `vte` 0.15.0 resumes a split character by copying up to four bytes into its
+        // partial buffer, and if that window also holds a complete second character
+        // followed by an invalid byte it prints the first and drops the rest. Its own
+        // source says so: "Since we only care about the first character, we just ignore
+        // the rest" (`vte-0.15.0/src/lib.rs`, `advance_partial_utf8`). Measured, before
+        // this: feeding `[0xc3, 0xa9, 0x20, 0x80]` in one call leaves the cursor at column
+        // 2, and feeding `[0xc3]` then the rest leaves it at column 1, with the space gone
+        // for good. A pty read landing on that boundary silently loses a character, and no
+        // version bump fixes it because both crates are already at their latest published
+        // version.
+        //
+        // So the parser is never given a split character to resume: the incomplete tail is
+        // carried to the next read, which is also what makes the split-boundary property in
+        // gate G1.4 hold for these bytes rather than having to exclude them. Only a
+        // sequence that could still become a character is held; an already invalid one is
+        // passed straight through, so the parser draws its replacement character now rather
+        // than waiting for bytes that would not help. The bound is three bytes, and the one
+        // thing it gives up is a stream that ends mid character: those bytes are dropped
+        // instead of becoming a replacement character, which is a screen that ends one
+        // glyph short on a terminal that is closing.
+        let keep = incomplete_utf8_tail(&self.filtered);
+        let hand_over = self.filtered.len() - keep;
+        self.partial_char
+            .extend_from_slice(&self.filtered[hand_over..]);
+        self.parser
+            .advance(&mut self.term, &self.filtered[..hand_over]);
+
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(iter) => Damage::Lines(
+                iter.map(|d| LineDamage {
+                    line: d.line,
+                    left: d.left,
+                    right: d.right,
+                })
+                .collect(),
+            ),
+        };
+        self.term.reset_damage();
+        self.capture_new_history();
+
+        let mut effects = Vec::new();
+        while let Ok(ev) = self.events.try_recv() {
+            match ev {
+                Event::PtyWrite(s) => effects.push(TerminalEffect::Reply(Bytes::from(s))),
+                Event::Title(t) => effects.push(TerminalEffect::Title(t)),
+                Event::ResetTitle => effects.push(TerminalEffect::Title(String::new())),
+                Event::Bell => effects.push(TerminalEffect::Bell),
+                Event::ClipboardStore(_, s) => {
+                    effects.push(TerminalEffect::ClipboardWrite(Bytes::from(s)))
+                }
+                _ => {}
+            }
+        }
+        (damage, effects)
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.term
+            .resize(TermSize::new(cols as usize, rows as usize));
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cursor = grid.cursor.point;
+        Snapshot {
+            cols: grid.columns(),
+            rows,
+            cursor: (cursor.line.0.max(0) as usize, cursor.column.0),
+            lines: (0..rows).map(|l| self.row_text(l as i32)).collect(),
+        }
+    }
+
+    fn modes(&self) -> TerminalModes {
+        let m = *self.term.mode();
+        TerminalModes {
+            alt_screen: m.contains(TermMode::ALT_SCREEN),
+            bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
+            mouse_reporting: m.intersects(TermMode::MOUSE_MODE),
+            application_cursor: m.contains(TermMode::APP_CURSOR),
+        }
+    }
+
+    fn take_scrolled_off(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.scrolled_off)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> AlacrittyEngine {
+        AlacrittyEngine::new(80, 24)
+    }
+
+    /// The byte sequence and the split that lose a character in the pinned parser.
+    ///
+    /// Deterministic on purpose. The split-boundary property test in
+    /// `tests/split_equivalence.rs` covers this shape in principle, but measured, with the
+    /// hold back removed it still passed six runs of ten thousand cases: the trigger needs
+    /// a split inside a character, a complete character after it, and an invalid byte after
+    /// that, all within four bytes, which the generator reaches too rarely to rely on. This
+    /// test reaches it every time.
+    #[test]
+    fn a_character_split_across_two_reads_does_not_lose_the_one_after_it() {
+        // e-acute, a space, and a byte that cannot start a character.
+        let bytes = [0xc3u8, 0xa9, 0x20, 0x80];
+
+        let mut whole = engine();
+        whole.feed(&bytes);
+
+        let mut split = engine();
+        split.feed(&bytes[..1]);
+        split.feed(&bytes[1..]);
+
+        assert_eq!(
+            split.snapshot(),
+            whole.snapshot(),
+            "a read that ended inside the first character lost what came after it"
+        );
+    }
+
+    /// A character arriving one byte at a time is drawn once, and drawn whole.
+    #[test]
+    fn a_character_arriving_a_byte_at_a_time_is_drawn_once_it_is_complete() {
+        // A three byte character, then a four byte one.
+        let bytes = "\u{4e2d}\u{1f600}".as_bytes().to_vec();
+        let mut split = engine();
+        for byte in &bytes {
+            split.feed(&[*byte]);
+        }
+        let mut whole = engine();
+        whole.feed(&bytes);
+        assert_eq!(split.snapshot(), whole.snapshot());
+    }
+
+    /// An invalid sequence is not held back waiting for bytes that cannot repair it.
+    #[test]
+    fn an_invalid_sequence_is_handed_over_rather_than_held() {
+        // A lead byte that promises two more, followed by an ASCII byte instead.
+        let mut engine = engine();
+        engine.feed(&[0xe0, b'A']);
+        // Nothing further is fed: if the pair were held back, the screen would be empty.
+        assert!(
+            !engine.snapshot().lines[0].is_empty(),
+            "an invalid sequence was held back, so the screen shows nothing until more \
+             bytes arrive that cannot help it"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_tail_is_only_what_could_still_become_a_character() {
+        // Complete sequences hold nothing back.
+        assert_eq!(incomplete_utf8_tail(b"abc"), 0);
+        assert_eq!(incomplete_utf8_tail("\u{e9}".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_tail("\u{4e2d}".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_tail("\u{1f600}".as_bytes()), 0);
+        // Incomplete ones hold back exactly what has arrived.
+        assert_eq!(incomplete_utf8_tail(&[0xc3]), 1);
+        assert_eq!(incomplete_utf8_tail(&[b'x', 0xe4, 0xb8]), 2);
+        assert_eq!(incomplete_utf8_tail(&[0xf0, 0x9f, 0x98]), 3);
+        // Already invalid, so waiting would only delay the replacement character.
+        assert_eq!(incomplete_utf8_tail(&[0xc3, b'A']), 0);
+        assert_eq!(incomplete_utf8_tail(&[0xff]), 0);
+        assert_eq!(incomplete_utf8_tail(&[0x80]), 0);
+    }
+
+    /// The engine's answer to the same question: a cancelled control string must leave the
+    /// terminal usable, not blank from that point on.
+    #[test]
+    fn text_after_a_cancelled_control_string_still_renders() {
+        let mut e = engine();
+        e.feed(b"\x1b]0;title\x18");
+        e.feed(b"ordinary text");
+        assert!(
+            e.snapshot().lines[0].contains("ordinary text"),
+            "the screen is {:?}",
+            e.snapshot().lines[0]
+        );
+    }
+
+    /// The three byte prefix that bypassed the bound: `ESC [ 1 ESC ]` leaves the parser in
+    /// an OSC while a scanner without an anywhere transition for ESC thinks it is at
+    /// ground.
+    #[test]
+    fn an_escape_inside_a_csi_cannot_open_an_unbounded_control_string() {
+        const FED: usize = 4 * 1024 * 1024;
+        let mut e = engine();
+        e.feed(b"\x1b[1\x1b]0;");
+        let slice = vec![b'A'; 64 * 1024];
+        for _ in 0..(FED / slice.len()) {
+            e.feed(&slice);
+        }
+        let (_, effects) = e.feed(b"\x07");
+        let retained: usize = effects
+            .iter()
+            .map(|f| match f {
+                TerminalEffect::Title(t) => t.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            retained < FED / 8,
+            "the parser retained {retained} bytes after a three byte prefix"
+        );
+    }
+
+    /// G1.22, the half the runtime gate cannot see: an unterminated control string must not
+    /// accumulate. The runtime gate proves the parser recovers; this proves it did not buy
+    /// that recovery by holding every byte it was given.
+    ///
+    /// The assertion is on the title the parser hands back after the terminator, because
+    /// that is the only externally visible measure of what it retained. Feeding four
+    /// megabytes and getting four megabytes back would mean the bound does not exist.
+    #[test]
+    fn an_unterminated_control_string_is_bounded() {
+        const FED: usize = 4 * 1024 * 1024;
+        let mut e = engine();
+        e.feed(b"\x1b]0;");
+        // In slices, the way it arrives from a pty, so that a bound that only holds for a
+        // single large write would not pass.
+        let slice = vec![b'A'; 64 * 1024];
+        for _ in 0..(FED / slice.len()) {
+            e.feed(&slice);
+        }
+        let (_, effects) = e.feed(b"\x07");
+        let retained: usize = effects
+            .iter()
+            .map(|f| match f {
+                TerminalEffect::Title(t) => t.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            retained < FED / 8,
+            "the parser retained {retained} bytes of a {FED} byte control string"
+        );
+        // And it is still a working terminal afterwards.
+        e.feed(b"hello");
+        assert!(e.snapshot().lines[0].contains("hello"));
+    }
+
+    #[test]
+    fn plain_text_reaches_the_snapshot() {
+        let mut e = engine();
+        e.feed(b"hello qoro\r\nsecond\r\n");
+        let s = e.snapshot();
+        assert_eq!(s.lines[0], "hello qoro");
+        assert_eq!(s.lines[1], "second");
+        assert_eq!(s.cols, 80);
+        assert_eq!(s.rows, 24);
+    }
+
+    #[test]
+    fn a_cursor_position_request_produces_a_reply_effect() {
+        // The hang this prevents: an application emits DSR and blocks until it is answered.
+        // An adapter that dropped the engine's outbound event would pass every other test.
+        let mut e = engine();
+        let (_, effects) = e.feed(b"\x1b[6n");
+        let reply = effects
+            .iter()
+            .find_map(|x| match x {
+                TerminalEffect::Reply(b) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("a cursor position request must produce a reply");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.starts_with("\x1b["), "unexpected reply {text:?}");
+        assert!(text.ends_with('R'), "unexpected reply {text:?}");
+    }
+
+    #[test]
+    fn a_title_sequence_produces_a_title_effect() {
+        let mut e = engine();
+        let (_, effects) = e.feed(b"\x1b]0;my title\x07");
+        assert!(effects.contains(&TerminalEffect::Title("my title".into())));
+    }
+
+    #[test]
+    fn damage_is_line_precise_rather_than_a_full_repaint() {
+        let mut e = engine();
+        e.feed(b"filler\r\n");
+        let (damage, _) = e.feed(b"\x1b[5;10Hx");
+        match damage {
+            Damage::Lines(lines) => {
+                assert!(
+                    lines.iter().any(|d| d.line == 4),
+                    "row 5 must be damaged: {lines:?}"
+                );
+                assert!(
+                    lines.len() <= 3,
+                    "a single cell write must not damage the screen: {lines:?}"
+                );
+            }
+            Damage::Full => panic!("a single cell write must not report a full repaint"),
+        }
+    }
+
+    #[test]
+    fn a_quiet_feed_reports_no_content_damage() {
+        let mut e = engine();
+        e.feed(b"something\r\n");
+        let (damage, effects) = e.feed(b"");
+        assert!(effects.is_empty());
+        // The engine folds cursor damage in, so "quiet" means no content lines, not an
+        // empty set. The renderer has to know that, so the test states it.
+        if let Damage::Lines(lines) = damage {
+            assert!(lines.len() <= 2, "quiet feed damaged {lines:?}");
+        }
+    }
+
+    #[test]
+    fn alt_screen_and_bracketed_paste_modes_are_visible() {
+        let mut e = engine();
+        assert!(!e.modes().alt_screen);
+        e.feed(b"\x1b[?1049h");
+        assert!(e.modes().alt_screen, "alt screen must be reported");
+        e.feed(b"\x1b[?2004h");
+        assert!(e.modes().bracketed_paste);
+        e.feed(b"\x1b[?1049l");
+        assert!(!e.modes().alt_screen);
+    }
+
+    #[test]
+    fn resize_changes_the_snapshot_dimensions() {
+        let mut e = engine();
+        e.resize(132, 43);
+        let s = e.snapshot();
+        assert_eq!((s.cols, s.rows), (132, 43));
+    }
+
+    #[test]
+    fn the_staging_ring_is_configured_explicitly_and_is_emptied() {
+        // The engine's default is 10 000 rows, which is a 46 MiB per terminal
+        // configuration. The constructor overrides it, and the adapter empties it after
+        // every feed, so what is left behind is nothing rather than a full ring.
+        let mut e = engine();
+        assert_eq!(SCROLLBACK_ROWS, 1_000);
+        for i in 0..2000 {
+            e.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let left = e.term.grid().total_lines() - e.term.grid().screen_lines();
+        assert_eq!(
+            left, 0,
+            "the ring still holds {left} rows, so it is being used as a scrollback"
+        );
+    }
+
+    #[test]
+    fn rows_entering_the_history_ring_are_captured_in_order() {
+        let mut e = engine();
+        for i in 0..40 {
+            e.feed(format!("row {i}\r\n").as_bytes());
+        }
+        let spilled = e.take_scrolled_off();
+        assert!(
+            !spilled.is_empty(),
+            "rows scrolled off but none were captured"
+        );
+        assert_eq!(spilled[0], "row 0", "the oldest row must come first");
+        // Draining is destructive, so a second call returns nothing new.
+        assert!(e.take_scrolled_off().is_empty());
+    }
+
+    #[test]
+    fn every_scrolled_row_is_handed_over_however_many_there_are() {
+        // The ring is drained after every feed, so the number of rows a caller sees is the
+        // number that scrolled, not the number the ring happens to hold. Feeding more than
+        // the ring capacity used to lose everything past it.
+        let mut e = engine();
+        let total = SCROLLBACK_ROWS * 4;
+        let mut seen = Vec::new();
+        for i in 0..total {
+            e.feed(format!("row {i}\r\n").as_bytes());
+            seen.extend(e.take_scrolled_off());
+        }
+        // The first rows scroll off only once the screen is full, so the count is the
+        // total minus a screen.
+        assert!(
+            seen.len() >= total - 24,
+            "only {} of {total} rows were handed over",
+            seen.len()
+        );
+        assert_eq!(seen[0].trim(), "row 0");
+        for (i, row) in seen.iter().enumerate() {
+            assert_eq!(row.trim(), format!("row {i}"), "row {i} is out of order");
+        }
+        assert_eq!(
+            e.evicted_unobserved(),
+            0,
+            "ordinary output should never saturate the staging ring"
+        );
+    }
+
+    #[test]
+    fn a_feed_that_scrolls_more_than_the_ring_holds_is_counted_rather_than_silently_lost() {
+        // The engine cannot report what it has already evicted, so the adapter says when it
+        // was in that state. The caller's job is to feed in slices small enough that this
+        // never happens; the counter is what tells it when that is not true.
+        //
+        // A scroll control sequence turns out not to be a way in: measured, `CSI 5000 S`
+        // moves at most one screen into history, because a scroll larger than the region is
+        // clamped. The way in is a single large feed.
+        let mut e = engine();
+        let burst: String = std::iter::repeat_n("x\r\n", SCROLLBACK_ROWS * 3).collect();
+        e.feed(burst.as_bytes());
+        let seen = e.take_scrolled_off().len();
+        assert_eq!(
+            seen, SCROLLBACK_ROWS,
+            "the ring held more than its capacity"
+        );
+        assert!(
+            e.evicted_unobserved() > 0,
+            "rows were evicted before they could be seen and nothing said so"
+        );
+    }
+
+    #[test]
+    fn unsupported_graphics_leave_adjacent_text_intact() {
+        // An unsupported image protocol must never take
+        // neighbouring output with it.
+        let mut e = engine();
+        e.feed(b"before\r\n");
+        e.feed(b"\x1b_Gf=100,a=T;iVBORw0KGgoAAAANS\x1b\\");
+        e.feed(b"after\r\n");
+        let lines = e.snapshot().lines;
+        assert!(lines.iter().any(|l| l == "before"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "after"), "{lines:?}");
+    }
+}

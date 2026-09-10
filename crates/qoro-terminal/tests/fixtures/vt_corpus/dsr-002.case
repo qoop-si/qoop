@@ -1,0 +1,13 @@
+id: dsr-002
+name: DSR 5 (status report) replies that the terminal is OK
+citation: xterm ctlseqs, CSI Ps n DSR (Ps=5 Status Report)
+cols: 10
+rows: 4
+input: \x1b[5n
+cursor: 0,0
+reply_contains: \x1b[0n
+lines:
+> 
+> 
+> 
+> 

@@ -1,0 +1,12 @@
+id: sav-002
+name: CSI s and CSI u save and restore the cursor the same way as DECSC/DECRC
+citation: xterm ctlseqs, CSI s / CSI u
+cols: 10
+rows: 4
+input: \x1b[3;5H\x1b[s\x1b[1;1H\x1b[u
+cursor: 2,4
+lines:
+> 
+> 
+> 
+> 

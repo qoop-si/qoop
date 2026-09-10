@@ -1,0 +1,12 @@
+id: era-007
+name: ED 1 (erase above) at the second screen row must still clear row 1 completely
+citation: xterm ctlseqs, CSI Ps J ED (Ps=1 Erase Above): erase from screen start through cursor, inclusive
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[2;3H\x1b[1J
+cursor: 1,2
+lines:
+> 
+>    AAA
+> AAAAAA
+> AAAAAA

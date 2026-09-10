@@ -1,0 +1,9 @@
+id: uni-002
+name: a combining mark after a base character does not advance the cursor an extra cell
+citation: Unicode Standard: a combining character has terminal width 0 and attaches to the preceding cell
+cols: 10
+rows: 1
+input: éX
+cursor: 0,2
+lines:
+> eX

@@ -1,0 +1,14 @@
+id: dom-003
+name: resetting origin mode returns CUP addressing to the whole screen regardless of the active region
+citation: xterm ctlseqs, CSI ? 6 l DECOM (reset)
+cols: 6
+rows: 6
+input: \x1b[2;4r\x1b[?6h\x1b[?6l\x1b[1;1H
+cursor: 0,0
+lines:
+> 
+> 
+> 
+> 
+> 
+> 

@@ -1,0 +1,12 @@
+id: era-005
+name: EL 1 (erase to left) clears the start of the line through the cursor, inclusive
+citation: xterm ctlseqs, CSI Ps K EL (Ps=1 Erase to Left)
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[1;4H\x1b[1K
+cursor: 0,3
+lines:
+>     AA
+> AAAAAA
+> AAAAAA
+> AAAAAA

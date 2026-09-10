@@ -1,0 +1,12 @@
+id: era-004
+name: EL 0 (erase to right, default) clears from the cursor to the end of the line only
+citation: xterm ctlseqs, CSI Ps K EL (Ps=0 Erase to Right, default)
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[1;4H\x1b[K
+cursor: 0,3
+lines:
+> AAA
+> AAAAAA
+> AAAAAA
+> AAAAAA

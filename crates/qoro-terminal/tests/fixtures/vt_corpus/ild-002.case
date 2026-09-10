@@ -1,0 +1,12 @@
+id: ild-002
+name: DL deletes a line at the cursor, pulling later lines up and blanking the bottom
+citation: xterm ctlseqs, CSI Ps M DL
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aBBBBBB\x0d\x0aCCCCCC\x0d\x0aDDDDDD\x1b[2;1H\x1b[1M
+cursor: 1,0
+lines:
+> AAAAAA
+> CCCCCC
+> DDDDDD
+> 

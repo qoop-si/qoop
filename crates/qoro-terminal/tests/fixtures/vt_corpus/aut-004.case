@@ -1,0 +1,11 @@
+id: aut-004
+name: re-setting DECAWM after resetting it restores ordinary wrap-on-overflow behaviour
+citation: xterm ctlseqs, CSI ? 7 h / CSI ? 7 l DECAWM
+cols: 5
+rows: 3
+input: \x1b[?7l\x1b[?7hABCDEF
+cursor: 1,1
+lines:
+> ABCDE
+> F
+> 

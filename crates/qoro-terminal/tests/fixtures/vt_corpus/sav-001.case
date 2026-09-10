@@ -1,0 +1,12 @@
+id: sav-001
+name: ESC 7 (DECSC) saves the cursor position and ESC 8 (DECRC) restores it
+citation: xterm ctlseqs, ESC 7 DECSC / ESC 8 DECRC
+cols: 10
+rows: 4
+input: \x1b[2;3H\x1b7\x1b[4;8H\x1b8
+cursor: 1,2
+lines:
+> 
+> 
+> 
+> 

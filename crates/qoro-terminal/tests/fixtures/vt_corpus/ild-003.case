@@ -1,0 +1,9 @@
+id: ild-003
+name: ICH inserts blank characters at the cursor, shifting the rest of the line right and off the edge
+citation: xterm ctlseqs, CSI Ps @ ICH
+cols: 6
+rows: 1
+input: ABCDEF\x1b[1;3H\x1b[2@
+cursor: 0,2
+lines:
+> AB  CD

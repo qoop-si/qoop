@@ -1,0 +1,9 @@
+id: tab-005
+name: CBT moves backward to the previous default tab stop
+citation: xterm ctlseqs, CSI Ps Z CBT
+cols: 20
+rows: 1
+input: \x1b[1;18H\x1b[1Z
+cursor: 0,16
+lines:
+> 

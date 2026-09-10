@@ -1,0 +1,9 @@
+id: tab-004
+name: TBC 3 clears every tab stop, so CHT advances all the way to the right margin
+citation: xterm ctlseqs, CSI Ps g TBC (Ps=3: clear all)
+cols: 20
+rows: 1
+input: \x1b[3g\x1b[1I
+cursor: 0,19
+lines:
+> 

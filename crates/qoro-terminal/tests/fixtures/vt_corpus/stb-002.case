@@ -1,0 +1,14 @@
+id: stb-002
+name: reverse index (ESC M) at the top margin scrolls only the region down by one line
+citation: xterm ctlseqs, ESC M RI, confined by CSI Ps ; Ps r DECSTBM
+cols: 6
+rows: 6
+input: LINE_0\x0d\x0aLINE_1\x0d\x0aLINE_2\x0d\x0aLINE_3\x0d\x0aLINE_4\x0d\x0aLINE_5\x1b[2;4r\x1b[2;1H\x1bM
+cursor: 1,0
+lines:
+> LINE_0
+> 
+> LINE_1
+> LINE_2
+> LINE_4
+> LINE_5

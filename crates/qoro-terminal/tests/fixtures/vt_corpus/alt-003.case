@@ -1,0 +1,12 @@
+id: alt-003
+name: the alternate screen is cleared every time it is entered, so a prior alt session leaves nothing behind
+citation: xterm ctlseqs, CSI ? 1049 h: clearing the Alternate Screen Buffer first
+cols: 8
+rows: 3
+input: \x1b[?1049hFIRST\x1b[?1049l\x1b[?1049h
+cursor: 0,0
+alt_screen: true
+lines:
+> 
+> 
+> 

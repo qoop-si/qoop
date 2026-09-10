@@ -1,0 +1,12 @@
+id: ild-001
+name: IL inserts a blank line at the cursor, pushing later lines down and off the page
+citation: xterm ctlseqs, CSI Ps L IL
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aBBBBBB\x0d\x0aCCCCCC\x0d\x0aDDDDDD\x1b[2;1H\x1b[1L
+cursor: 1,0
+lines:
+> AAAAAA
+> 
+> BBBBBB
+> CCCCCC

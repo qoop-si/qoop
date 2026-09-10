@@ -1,0 +1,10 @@
+id: cs-003
+name: the DEC Special Graphics set remaps more than one character, 'a' becomes a shaded block glyph
+citation: xterm ctlseqs, ESC ( 0: DEC Special Character and Line Drawing Set
+cols: 10
+rows: 2
+input: \x1b(0a
+cursor: 0,1
+lines:
+> ▒
+> 

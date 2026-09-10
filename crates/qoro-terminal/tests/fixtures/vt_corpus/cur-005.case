@@ -1,0 +1,12 @@
+id: cur-005
+name: CUP clamps an out-of-range row and column to the bottom right cell
+citation: xterm ctlseqs, CSI Ps ; Ps H CUP
+cols: 10
+rows: 4
+input: \x1b[99;99H
+cursor: 3,9
+lines:
+> 
+> 
+> 
+> 

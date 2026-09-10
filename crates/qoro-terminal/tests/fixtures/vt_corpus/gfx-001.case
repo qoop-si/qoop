@@ -1,0 +1,10 @@
+id: gfx-001
+name: an unsupported Kitty graphics APC sequence is discarded without disturbing surrounding text
+citation: Kitty graphics protocol (APC ESC _ G ... ESC \\), unsupported by this engine and discarded whole
+cols: 10
+rows: 2
+input: before\x0d\x0a\x1b_Gf=100,a=T;iVBORw0KGgoAAAANS\x1b\\after
+cursor: 1,5
+lines:
+> before
+> after

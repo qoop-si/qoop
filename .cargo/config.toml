@@ -1,0 +1,3 @@
+# Shared build directory keeps disk use bounded across worktrees on this machine.
+[build]
+incremental = false

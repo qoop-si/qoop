@@ -1,0 +1,12 @@
+id: cur-003
+name: CUF clamps at the right column
+citation: xterm ctlseqs, CSI Ps C CUF
+cols: 10
+rows: 4
+input: \x1b[99C
+cursor: 0,9
+lines:
+> 
+> 
+> 
+> 

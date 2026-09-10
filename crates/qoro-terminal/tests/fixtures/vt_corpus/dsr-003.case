@@ -1,0 +1,13 @@
+id: dsr-003
+name: primary Device Attributes replies in the CSI ? ... c form
+citation: xterm ctlseqs, CSI Ps c DA (Ps omitted: Primary Device Attributes)
+cols: 10
+rows: 4
+input: \x1b[c
+cursor: 0,0
+reply_contains: \x1b[?
+lines:
+> 
+> 
+> 
+> 

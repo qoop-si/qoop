@@ -1,0 +1,12 @@
+id: cur-007
+name: HVP addresses the cursor exactly like CUP
+citation: xterm ctlseqs, CSI Ps ; Ps f HVP
+cols: 10
+rows: 4
+input: \x1b[3;4f
+cursor: 2,3
+lines:
+> 
+> 
+> 
+> 

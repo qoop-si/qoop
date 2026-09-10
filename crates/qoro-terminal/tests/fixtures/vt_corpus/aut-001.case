@@ -1,0 +1,11 @@
+id: aut-001
+name: autowrap (default on) wraps to the next line once a character would exceed the line width
+citation: xterm ctlseqs, CSI ? 7 h DECAWM (set, default)
+cols: 5
+rows: 3
+input: ABCDEF
+cursor: 1,1
+lines:
+> ABCDE
+> F
+> 

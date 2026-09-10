@@ -1,0 +1,9 @@
+id: ild-005
+name: ICH clamps the insert count to the columns remaining in the line
+citation: xterm ctlseqs, CSI Ps @ ICH (clamped to line width)
+cols: 6
+rows: 1
+input: ABCDEF\x1b[1;5H\x1b[9@
+cursor: 0,4
+lines:
+> ABCD

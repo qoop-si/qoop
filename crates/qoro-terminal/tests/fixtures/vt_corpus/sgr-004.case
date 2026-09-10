@@ -1,0 +1,9 @@
+id: sgr-004
+name: SGR with an omitted parameter defaults to 0 (full reset), and is still non-printing
+citation: xterm ctlseqs, CSI Pm m SGR: an omitted parameter defaults to 0
+cols: 10
+rows: 1
+input: A\x1b[mB
+cursor: 0,2
+lines:
+> AB

@@ -1,0 +1,10 @@
+id: cs-001
+name: designating G0 as DEC Special Graphics remaps 'q' to a horizontal line glyph
+citation: xterm ctlseqs, ESC ( 0: DEC Special Character and Line Drawing Set
+cols: 10
+rows: 2
+input: \x1b(0q
+cursor: 0,1
+lines:
+> ─
+> 

@@ -1,0 +1,12 @@
+id: era-002
+name: ED 1 (erase above) clears the start of the screen through the cursor, inclusive
+citation: xterm ctlseqs, CSI Ps J ED (Ps=1 Erase Above)
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[3;3H\x1b[1J
+cursor: 2,2
+lines:
+> 
+> 
+>    AAA
+> AAAAAA

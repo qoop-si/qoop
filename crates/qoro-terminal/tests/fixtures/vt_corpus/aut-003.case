@@ -1,0 +1,11 @@
+id: aut-003
+name: with autowrap reset, a character past the last column overwrites the last cell instead of wrapping
+citation: xterm ctlseqs, CSI ? 7 l DECAWM (reset)
+cols: 5
+rows: 3
+input: \x1b[?7lABCDEF
+cursor: 0,4
+lines:
+> ABCDF
+> 
+> 

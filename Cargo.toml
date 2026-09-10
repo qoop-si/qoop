@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/qoro-domain",
+    "crates/qoro-events",
+    "crates/qoro-move",
+    "crates/qoro-plugin",
+    "crates/qoro-proto",
+    "crates/qoro-remote",
+    "crates/qoro-pty",
+    "crates/qoro-runtime",
+    "crates/qoro-setup",
+    "crates/qoro-store",
+    "crates/qoro-support",
+    "crates/qoro-terminal",
+    "crates/qoro-cli",
+    "crates/qoro-collab",
+    "crates/qoro-testkit",
+    "crates/qoro-attention",
+    "crates/qoro-bench",
+    "spikes/spike-runtime",
+]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.98"
+
+[workspace.dependencies]
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+proptest = "1"
+libc = "0.2"
+tempfile = "3"
+
+[profile.release]
+debug = 1

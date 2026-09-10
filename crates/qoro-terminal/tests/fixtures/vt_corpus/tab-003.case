@@ -1,0 +1,9 @@
+id: tab-003
+name: TBC 0 clears only the tab stop at the cursor column
+citation: xterm ctlseqs, CSI Ps g TBC (Ps=0, default: clear current column)
+cols: 20
+rows: 1
+input: \x1b[1;9H\x1b[0g\x1b[1;1H\x1b[1I
+cursor: 0,16
+lines:
+> 

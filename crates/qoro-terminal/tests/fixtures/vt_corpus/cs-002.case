@@ -1,0 +1,10 @@
+id: cs-002
+name: designating G0 back to US-ASCII restores literal characters
+citation: xterm ctlseqs, ESC ( B: designate G0 as US-ASCII
+cols: 10
+rows: 2
+input: \x1b(0q\x1b(Bq
+cursor: 0,2
+lines:
+> ─q
+> 

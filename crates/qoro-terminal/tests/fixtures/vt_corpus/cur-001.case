@@ -1,0 +1,12 @@
+id: cur-001
+name: CUU clamps at the top row instead of going negative
+citation: xterm ctlseqs, CSI Ps A CUU
+cols: 10
+rows: 4
+input: \x1b[99A
+cursor: 0,0
+lines:
+> 
+> 
+> 
+> 

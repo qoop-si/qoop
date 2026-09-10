@@ -1,0 +1,44 @@
+^DProcesses: 897 total, 10 running, 1 stuck, 886 sleeping, 5328 threads 
+2026/09/10 11:32:20
+Load Avg: 10.28, 10.58, 10.68 
+CPU usage: 15.7% user, 67.99% sys, 16.92% idle 
+SharedLibs: 733M resident, 154M data, 110M linkedit.
+MemRegions: 574613 total, 8457M resident, 241M private, 2174M shared.
+PhysMem: 23G used (4137M wired, 5760M compressor), 163M unused.
+VM: 401T vsize, 6144M framework vsize, 24435182(0) swapins, 28910947(0) swapouts.
+Networks: packets: 132975196/142G in, 85679405/77G out.
+Disks: 537273037/18T read, 54766009/1567G written.
+
+PID    COMMAND          %CPU TIME     #TH #WQ #PORTS MEM   PURG CMPRS PGRP  PPID STATE    BOOSTS %CPU_ME %CPU_OTHRS UID FAULTS COW MSGSENT MSGRECV SYSBSD SYSMACH CSW   PAGEINS IDLEW POWER INSTRS CYCLES JETPRI USER          #MREGS RPRVT VPRVT VSIZE KPRVT KSHRD
+99948  ASPCarryLog      0.0  00:00.05 2   1   45     2800K 0B   2512K 99948 1    sleeping *0[1]  0.00000 0.00000    0   1273   106 159     79      786    336     197   17      0     0.0   0      0      0      root          N/A    N/A   N/A   N/A   N/A   N/A  
+99947  avatarsd         0.0  00:00.19 2   1   74     7601K 0B   6528K 99947 1    sleeping *0[9]  0.00000 0.00000    501 3688   254 405     210     5968   1327    1548  451     0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99943  SiriSuggestionsB 0.0  00:00.07 2   1   43     5056K 0B   4624K 99943 1    sleeping  0[0]  0.00000 0.00000    501 1287   140 207     74      771    372     767   23      0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99940  contactsdonation 0.0  00:00.44 2   1   115    6768K 0B   4864K 99940 1    sleeping *0[24] 0.00000 0.00000    501 6412   153 1603    270     16274  3420    3411  31      0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99938  sociallayerd     0.0  00:00.11 2   1   64     4416K 0B   2896K 99938 1    sleeping *0[8]  0.00000 0.00000    501 3842   126 384     231     4619   823     949   11      0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99937  CloudTelemetrySe 0.0  00:00.08 2   1   40     3744K 0B   2048K 99937 1    sleeping  0[0]  0.00000 0.00000    501 3226   112 184     70      1695   356     994   3       0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99936  SafariBookmarksS 0.0  00:00.60 3   2   89     6993K 0B   4944K 99936 1    sleeping *0[1]  0.00000 0.00000    501 8629   148 675     377     38015  2182    19909 331     0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99933  swtransparencyd  0.0  00:00.10 2   1   60     4608K 0B   2832K 99933 1    sleeping *0[1]  0.00000 0.00000    501 3632   137 241     85      4655   526     1339  168     0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+99932  ANEStorageMainta 0.0  00:00.01 2   1   24     1952K 0B   1728K 99932 1    sleeping  0[0]  0.00000 0.00000    296 640    92  141     59      475    256     188   2       0     0.0   0      0      0      _neuralengine N/A    N/A   N/A   N/A   N/A   N/A  
+99930  CloudTelemetrySe 0.0  00:00.07 2   1   40     3760K 0B   2080K 99930 1    sleeping  0[0]  0.00000 0.00000    501 3303   112 186     71      1677   356     870   3       0     0.0   0      0      0      us            N/A    N/A   N/A   N/A   N/A   N/A  
+Processes: 897 total, 11 running, 886 sleeping, 5327 threads 
+2026/09/10 11:32:21
+Load Avg: 10.28, 10.58, 10.68 
+CPU usage: 12.32% user, 63.25% sys, 24.42% idle 
+SharedLibs: 733M resident, 154M data, 110M linkedit.
+MemRegions: 30 total, 448K resident, 241M private, 2174M shared.
+PhysMem: 23G used (4127M wired, 5760M compressor), 161M unused.
+VM: 401T vsize, 6144M framework vsize, 24435182(0) swapins, 28910947(0) swapouts.
+Networks: packets: 132975271/142G in, 85679481/77G out.
+Disks: 537273039/18T read, 54766010/1567G written.
+
+PID    COMMAND          %CPU TIME     #TH    #WQ  #PORTS MEM   PURG CMPRS PGRP  PPID STATE    BOOSTS    %CPU_ME %CPU_OTHRS UID FAULTS    COW   MSGSENT     MSGRECV     SYSBSD     SYSMACH    CSW        PAGEINS IDLEW    POWER INSTRS      CYCLES     JETPRI USER          #MREGS RPRVT VPRVT VSIZE KPRVT KSHRD
+84867  mediaanalysisd   85.6 04:26:48 41/1   19/3 1039+  486M+ 16K  53M   84867 1    running  *8+[737]  0.00963 58.65140   501 32779485+ 492   30482178+   16345963+   77875690+  55023384+  55081571+  270485  95       85.6  10616997407 3553694793 40     us            N/A    N/A   N/A   N/A   N/A   N/A  
+98940  zsh              72.6 05:34:07 1/1    0    8      2256K 0B   1936K 98940 1    running  *0[1]     0.00000 0.00000    501 301       121   531         6           2147483647 17         6678922+   0       0        72.6  1885045780  3082434861 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+98335  zsh              72.6 05:34:08 1/1    0    8      2320K 0B   2016K 98335 1    running  *0[1]     0.00000 0.00000    501 308       95    568         6           2147483647 17         6681754+   0       0        72.6  1884730550  3082183063 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+98943  zsh              72.6 05:34:08 1/1    0    8      2336K 0B   2016K 98943 1    running  *0[1]     0.00000 0.00000    501 304       113   585         6           2147483647 17         6668833+   0       0        72.6  1883506105  3081642388 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+98990  zsh              72.6 05:34:09 1/1    0    8      2240K 0B   1936K 98990 1    running  *0[1]     0.00000 0.00000    501 299       119   514         6           2147483647 17         6677718+   0       0        72.6  1887734230  3081576440 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+98947  zsh              72.6 05:34:08 1/1    0    8      2288K 0B   1984K 98947 1    running  *0[1]     0.00000 0.00000    501 305       116   569         6           2147483647 17         6679862+   0       0        72.6  1883631545  3081017007 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+99033  zsh              72.6 05:34:08 1/1    0    8      2288K 0B   1984K 99033 1    running  *0[1]     0.00000 0.00000    501 308       126   572         6           2147483647 17         6671639+   0       0        72.6  1884061341  3080894235 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+98987  zsh              72.5 05:34:09 1/1    0    8      2320K 0B   2016K 98987 1    running  *0[1]     0.00000 0.00000    501 313       128   577         6           2147483647 17         6674685+   0       0        72.5  1882899235  3080150949 180    us            N/A    N/A   N/A   N/A   N/A   N/A  
+1232   iTerm2           22.8 17:41:13 9/1    6    455    826M  0B   111M  1232  1    running  *1[13669] 0.26165 0.00000    501 44041775+ 27348 221835244+  77589873+   357340946+ 547546877+ 204641484+ 238107  2064020  22.8  4197581045  967307304  100    us            N/A    N/A   N/A   N/A   N/A   N/A  
+0      kernel_task      13.1 20:18:27 706/12 0    0      131M  0B   0B    0     0    running   0[0]     0.00000 0.00000    0   2848928   14732 1876327422+ 1426884564+ 0          0          2147483647 0       56036751 0.0   651225042   539079993  0      root          N/A    N/A   N/A   N/A   N/A   N/A  

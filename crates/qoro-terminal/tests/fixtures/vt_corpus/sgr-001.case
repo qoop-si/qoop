@@ -1,0 +1,9 @@
+id: sgr-001
+name: a bare SGR reset between two words is absorbed and never appears in the grid
+citation: xterm ctlseqs, CSI Pm m SGR (non-printing control function)
+cols: 10
+rows: 1
+input: AB\x1b[0mCD
+cursor: 0,4
+lines:
+> ABCD

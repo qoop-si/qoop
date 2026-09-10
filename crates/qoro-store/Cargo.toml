@@ -1,0 +1,15 @@
+[package]
+name = "qoro-store"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+qoro-domain = { path = "../qoro-domain" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

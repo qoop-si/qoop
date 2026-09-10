@@ -1,0 +1,13 @@
+id: dsr-001
+name: DSR 6 (CPR) replies with the 1-based cursor row and column
+citation: xterm ctlseqs, CSI Ps n DSR (Ps=6 Report Cursor Position)
+cols: 10
+rows: 4
+input: \x1b[3;5H\x1b[6n
+cursor: 2,4
+reply_contains: \x1b[3;5R
+lines:
+> 
+> 
+> 
+> 

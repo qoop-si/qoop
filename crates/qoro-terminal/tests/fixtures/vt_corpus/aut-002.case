@@ -1,0 +1,11 @@
+id: aut-002
+name: pending wrap: writing exactly the line width leaves the cursor on the same row at the last column
+citation: DEC STD 070 / xterm ctlseqs: deferred autowrap does not move the cursor until another character arrives
+cols: 5
+rows: 3
+input: ABCDE
+cursor: 0,4
+lines:
+> ABCDE
+> 
+> 

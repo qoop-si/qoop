@@ -1,0 +1,12 @@
+id: cur-002
+name: CUD clamps at the bottom row
+citation: xterm ctlseqs, CSI Ps B CUD
+cols: 10
+rows: 4
+input: \x1b[99B
+cursor: 3,0
+lines:
+> 
+> 
+> 
+> 

@@ -1,0 +1,27 @@
+[package]
+name = "qoro-runtime"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+qoro-events = { path = "../qoro-events" }
+qoro-store = { path = "../qoro-store" }
+bytes = { workspace = true }
+libc = "0.2"
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+qoro-domain = { path = "../qoro-domain" }
+qoro-proto = { path = "../qoro-proto" }
+qoro-pty = { path = "../qoro-pty" }
+qoro-terminal = { path = "../qoro-terminal" }
+
+[dev-dependencies]
+libc = { workspace = true }
+qoro-store = { path = "../qoro-store" }
+tempfile = "3"
+qoro-testkit = { path = "../qoro-testkit" }

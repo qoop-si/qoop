@@ -1,0 +1,12 @@
+id: sav-003
+name: the terminal keeps a single saved cursor slot, so a second save replaces the first
+citation: DEC STD 070 terminal state model: one saved cursor register, not a stack; xterm ctlseqs CSI s
+cols: 10
+rows: 4
+input: \x1b[2;2H\x1b[s\x1b[4;4H\x1b[s\x1b[1;1H\x1b[u
+cursor: 3,3
+lines:
+> 
+> 
+> 
+> 

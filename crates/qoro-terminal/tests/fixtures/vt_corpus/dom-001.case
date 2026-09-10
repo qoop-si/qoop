@@ -1,0 +1,14 @@
+id: dom-001
+name: with origin mode set, CUP addresses the cursor relative to the top margin of the region
+citation: xterm ctlseqs, CSI ? 6 h DECOM
+cols: 6
+rows: 6
+input: \x1b[2;4r\x1b[?6h\x1b[1;1H
+cursor: 1,0
+lines:
+> 
+> 
+> 
+> 
+> 
+> 

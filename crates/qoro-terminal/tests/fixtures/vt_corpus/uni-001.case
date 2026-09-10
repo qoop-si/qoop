@@ -1,0 +1,9 @@
+id: uni-001
+name: a wide CJK character occupies two cells, so the following character starts two columns over
+citation: Unicode Standard Annex #11 (East Asian Width): a Wide character occupies two terminal columns
+cols: 10
+rows: 1
+input: 中X
+cursor: 0,3
+lines:
+> 中 X

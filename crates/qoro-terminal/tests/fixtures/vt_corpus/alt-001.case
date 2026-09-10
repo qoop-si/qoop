@@ -1,0 +1,12 @@
+id: alt-001
+name: entering the alternate screen carries the cursor position over rather than homing it
+citation: xterm ctlseqs, CSI ? 1049 h: save cursor as in DECSC, then switch to the Alternate Screen Buffer
+cols: 8
+rows: 3
+input: AB\x1b[?1049h
+cursor: 0,2
+alt_screen: true
+lines:
+> 
+> 
+> 

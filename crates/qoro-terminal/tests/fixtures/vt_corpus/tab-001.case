@@ -1,0 +1,9 @@
+id: tab-001
+name: a plain tab from column 0 moves to the default stop at column 8 without erasing what it passes over
+citation: xterm ctlseqs, HT: default tab stops are set every 8 columns; cursor movement does not erase cell content
+cols: 20
+rows: 1
+input: ....................\x1b[1;1H\x09X
+cursor: 0,9
+lines:
+> ........X...........

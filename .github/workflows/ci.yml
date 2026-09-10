@@ -1,0 +1,147 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Executable versions of the M0 exit gates. These were previously asserted as met in the
+  # plan without anyone running them, and a review found two ADRs failing G0.1.
+  docs-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: G0.1 and G0.2, ADR structure and evidence references
+        run: python3 scripts/check-adrs.py
+      # The gate and corpus checkers are not here, and that is deliberate rather than an
+      # omission: both read planning documents that are not part of this repository, so in a
+      # fresh clone they would either fail or pass without checking anything. They run where
+      # those documents live.
+      - name: G0.7 no em dash or hyphen used as a dash in shipped prose
+        run: python3 scripts/check-prose.py
+      - name: G1.23 every unsafe use has a SAFETY comment
+        run: python3 scripts/check-unsafe.py
+
+  # ADR-016 and ADR-017 name these as their Reproduce commands, so they run.
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ADR-017 replay determinism
+        run: ./scripts/replay-check.sh
+      - name: ADR-016 support bundles carry no secrets
+        run: ./scripts/bundle-check.sh
+      - name: ADR-018 a plugin is a process with per object capabilities
+        run: ./scripts/plugin-check.sh
+      - name: ADR-020 exactly one side of a move is authoritative
+        run: ./scripts/move-check.sh
+      - name: ADR-021 nothing claims Windows
+        run: ./scripts/platform-check.sh
+
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --all
+
+  # The idle gates are wall-clock measurements of real processes, so they are their own job:
+  # they take about two and a half minutes and they must not run in parallel with anything
+  # that competes for a core, or the numbers are about the runner rather than about us.
+  idle-budgets:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: G1.8, G1.9 and G1.20 idle CPU from two independent OS sources
+        run: cargo test -p qoro-cli --test idle_cpu -- --test-threads=1 --nocapture
+
+  # The end to end acceptance a person would perform, driven through tmux against the real
+  # binary. It is separate from `cargo test` because it asserts things about a terminal
+  # session rather than about a library.
+  acceptance:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install tmux
+      - run: ./scripts/acceptance-m1.sh
+
+  # The scale gates are wall-clock measurements against a real daemon process, so they get
+  # their own job and are not run in parallel with anything that competes for a core. They
+  # are `#[ignore]` by default for the same reason, and named here so that "run them
+  # deliberately" has somewhere it actually happens.
+  scale:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # G2.3, G2.12 and the throughput scenarios are skipped here and run locally, and the
+      # reason is the runner rather than the gate. They put twenty terminals at a megabyte a
+      # second each on the machine, which is twenty megabytes a second of parsing plus twenty
+      # producer processes: on a hosted runner with a few shared cores that measures the
+      # runner's contention, and a latency gate that reports the runner is a gate that gets
+      # marked continue-on-error and then ignored. The gates that remain here are the idle
+      # and attach ones, which are about what the daemon does when nothing is competing.
+      - name: G2.1, G2.2, G2.6 and G2.11
+        run: |
+          cargo test --release -p qoro-cli --test scale_m2 -- --ignored --nocapture \
+            --test-threads=1 --skip g2_3 --skip g2_12 --skip one_streaming \
+            --skip twenty_quiet
+
+  # ADR-002 and ADR-009 rest on platform behaviour that was only measured on macOS.
+  # These spikes are the portability gate: if Linux disagrees, the ADRs are wrong and
+  # the build must fail rather than the assumption quietly surviving.
+  platform-spikes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p spike-runtime
+      - name: pty reactor spike
+        run: ./target/release/spike-pty
+      - name: terminal engine spike
+        run: ./target/release/spike-term
+      - name: process and idle spike
+        run: ./target/release/spike-proc
+      - name: teardown and platform-behaviour spike
+        run: ./target/release/spike-teardown
+      - name: per-terminal memory spike
+        run: ./target/release/spike-mem
+      # G0.4: the generated spike-results document must come from a real run and must
+      # still say what it said. A byte-for-byte diff cannot work, because the transcripts
+      # embed pids, durations and throughput that change every run; the checker normalises
+      # those and asserts the structural invariants separately.
+      # macOS only, and deliberately so. The document records a macOS run and asserts
+      # macOS-only facts, most obviously that kqueue EVFILT_PROC reports an exec, which
+      # ADR-009 says has no unprivileged Linux equivalent. Running it on Linux would be red
+      # by construction, which is how a gate gets marked continue-on-error and then ignored.
+      # The spikes themselves still run on both, which is the portability gate.
+      - name: G0.4 spike transcripts are generated, not typed
+        if: runner.os == 'macOS'
+        run: SKIP_BUILD=1 python3 scripts/check-transcripts.py

@@ -1,0 +1,12 @@
+id: era-006
+name: EL 2 (erase entire line) leaves the cursor column unchanged
+citation: xterm ctlseqs, CSI Ps K EL (Ps=2 Erase All)
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[1;4H\x1b[2K
+cursor: 0,3
+lines:
+> 
+> AAAAAA
+> AAAAAA
+> AAAAAA

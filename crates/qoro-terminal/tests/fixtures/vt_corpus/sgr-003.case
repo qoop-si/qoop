@@ -1,0 +1,9 @@
+id: sgr-003
+name: an out-of-range SGR parameter is ignored rather than corrupting the character stream
+citation: xterm ctlseqs, CSI Pm m SGR: unsupported parameter values are ignored
+cols: 10
+rows: 1
+input: A\x1b[255mB
+cursor: 0,2
+lines:
+> AB

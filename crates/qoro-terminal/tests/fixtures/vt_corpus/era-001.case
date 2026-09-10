@@ -1,0 +1,12 @@
+id: era-001
+name: ED 0 (erase below) clears from the cursor to the end of the screen
+citation: xterm ctlseqs, CSI Ps J ED (Ps=0 Erase Below, default)
+cols: 6
+rows: 4
+input: AAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x0d\x0aAAAAAA\x1b[2;4H\x1b[J
+cursor: 1,3
+lines:
+> AAAAAA
+> AAA
+> 
+> 

@@ -1,0 +1,14 @@
+id: dom-002
+name: with origin mode set, CUP clamps to the bottom margin of the region, not the bottom of the screen
+citation: xterm ctlseqs, CSI ? 6 h DECOM: cursor movement is bounded by the scrolling region
+cols: 6
+rows: 6
+input: \x1b[2;4r\x1b[?6h\x1b[99;1H
+cursor: 3,0
+lines:
+> 
+> 
+> 
+> 
+> 
+> 

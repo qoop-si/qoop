@@ -1,0 +1,4 @@
+label	send	expected_code	expected_mods	expected_kind
+Up	code:126:none	Up	none	press
+Up+shift	code:126:shift	Up	shift	press
+Up+ctrl	code:126:ctrl	Up	ctrl	press

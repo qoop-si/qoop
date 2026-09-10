@@ -1,0 +1,9 @@
+[0] openpty default FD_CLOEXEC: master=false, slave=false (both false means every spawn leaks every other terminal's fds unless we set it)
+[1] fd inheritance: without CLOEXEC the child sees ["/dev/ptmx", "/dev/ttys023", "/dev/ttys029"]; with CLOEXEC it sees ["/dev/ttys031"] -> PASS
+[2] silent exec transition: pgrp Some(96274) -> Some(96274), bytes emitted after the command line: 14
+    note: pgrp is unchanged by exec, so a tcgetpgrp comparison alone cannot see it
+[3] kqueue EVFILT_PROC on an unprivileged child: exec=true fork=false -> PASS
+[4] OS-measured idle cost over 3.001074709s: 21µs of CPU (poll rc=0, revents=0x0, drained 16 prompt bytes) -> PASS
+
+SPIKE-PROC: ALL PASS
+exit=0

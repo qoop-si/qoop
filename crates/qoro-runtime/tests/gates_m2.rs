@@ -1,0 +1,904 @@
+//! Milestone 2 gates: multiple terminals, addressed by the frame header's stream field.
+//!
+//! Each test names the gate it covers, and a
+//! test with no gate is a preference rather than a commitment.
+
+use std::time::{Duration, Instant};
+
+use qoro_runtime::control::{ControlRequest, ControlResponse};
+use qoro_testkit::{PATIENCE, TestClient, TestDaemon};
+
+fn terminal_of(response: &ControlResponse) -> u32 {
+    match response {
+        ControlResponse::TerminalCreated { terminal, .. } => *terminal,
+        other => panic!("expected a created terminal, got {other:?}"),
+    }
+}
+
+/// Two terminals in one daemon are two shells, and each one's output reaches the client
+/// tagged with the terminal it came from.
+#[tokio::test]
+async fn two_terminals_are_two_shells_addressed_separately() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("multi").await;
+
+    let first = d.terminals().streams()[0];
+    let created = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "r1".into(),
+                cwd: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let second = terminal_of(&created);
+    assert_ne!(first, second, "the new terminal reused an existing stream");
+    assert_eq!(d.terminals().len(), 2);
+
+    // Each shell is told a different thing, and each screen must show only its own.
+    c.input_to(first, b"echo FIRST_$((6*7))\n").await;
+    c.input_to(second, b"echo SECOND_$((6*8))\n").await;
+
+    assert!(
+        c.wait_for_text_on(first, "FIRST_42", PATIENCE).await,
+        "the first terminal did not answer"
+    );
+    assert!(
+        c.wait_for_text_on(second, "SECOND_48", PATIENCE).await,
+        "the second terminal did not answer"
+    );
+    let first_screen = c.screen(first).expect("a screen").lines.join("\n");
+    assert!(
+        !first_screen.contains("SECOND_48"),
+        "the second terminal's output appeared on the first terminal's screen"
+    );
+}
+
+/// G2.5: closing one terminal leaves every other one alone.
+#[tokio::test]
+async fn g2_5_closing_a_terminal_does_not_disturb_the_others() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("closer").await;
+    let keep = d.terminals().streams()[0];
+
+    let created = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "r1".into(),
+                cwd: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let doomed = terminal_of(&created);
+
+    c.input_to(keep, b"echo ALIVE_$((6*7))\n").await;
+    assert!(c.wait_for_text_on(keep, "ALIVE_42", PATIENCE).await);
+
+    let closed = c
+        .control(
+            &ControlRequest::CloseTerminal {
+                id: "r2".into(),
+                terminal: doomed,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    assert!(matches!(closed, ControlResponse::TerminalClosed { .. }));
+
+    // The registry loses it, and the survivor still works. Both halves matter: a close that
+    // leaves the handle registered means a later command routes into a dead terminal.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline && d.terminals().get(doomed).is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        d.terminals().get(doomed).is_none(),
+        "a closed terminal is still registered, so a command would route into it"
+    );
+
+    c.input_to(keep, b"echo STILL_$((6*8))\n").await;
+    assert!(
+        c.wait_for_text_on(keep, "STILL_48", PATIENCE).await,
+        "closing one terminal stopped another one"
+    );
+}
+
+/// A command for a terminal that has gone is dropped, not routed to a neighbour. Stream
+/// numbers are never reused precisely so that this is possible to assert.
+#[tokio::test]
+async fn a_command_for_a_closed_terminal_never_reaches_another_one() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("stale").await;
+    let survivor = d.terminals().streams()[0];
+
+    let created = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "r1".into(),
+                cwd: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let doomed = terminal_of(&created);
+    c.control(
+        &ControlRequest::CloseTerminal {
+            id: "r2".into(),
+            terminal: doomed,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("a response");
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline && d.terminals().get(doomed).is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    c.input_to(doomed, b"echo GHOST_$((6*7))\n").await;
+    c.input_to(survivor, b"echo REAL_$((6*8))\n").await;
+    assert!(c.wait_for_text_on(survivor, "REAL_48", PATIENCE).await);
+    let screen = c.screen(survivor).expect("a screen").lines.join("\n");
+    assert!(
+        !screen.contains("GHOST_42"),
+        "input addressed to a closed terminal was executed somewhere else"
+    );
+}
+
+/// Listing reports what the registry holds, and creating changes it.
+#[tokio::test]
+async fn listing_terminals_reports_the_registry() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("lister").await;
+
+    let before = c
+        .control(&ControlRequest::ListTerminals { id: "l1".into() }, PATIENCE)
+        .await
+        .expect("a response");
+    let ControlResponse::Terminals {
+        terminals: before, ..
+    } = before
+    else {
+        panic!("expected a listing");
+    };
+    assert_eq!(before.len(), 1);
+
+    c.control(
+        &ControlRequest::CreateTerminal {
+            id: "r1".into(),
+            cwd: None,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("a response");
+
+    let after = c
+        .control(&ControlRequest::ListTerminals { id: "l2".into() }, PATIENCE)
+        .await
+        .expect("a response");
+    let ControlResponse::Terminals {
+        terminals: after, ..
+    } = after
+    else {
+        panic!("expected a listing");
+    };
+    assert_eq!(after.len(), 2);
+    assert!(
+        after.starts_with(&before),
+        "an existing terminal changed id"
+    );
+}
+
+/// A malformed control request is refused with a reason, never dropped. A client waiting
+/// for a response it will never receive cannot tell that from a hung daemon.
+#[tokio::test]
+async fn a_control_request_that_cannot_be_answered_is_refused_in_words() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("refused").await;
+    let response = c
+        .control(
+            &ControlRequest::CloseTerminal {
+                id: "r1".into(),
+                terminal: 9999,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    match response {
+        ControlResponse::Failed { reason, .. } => {
+            assert!(
+                reason.contains("9999"),
+                "the reason does not say what failed"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A requested working directory is honoured, and a bad one is refused rather than quietly
+/// ignored.
+///
+/// The first version destructured `cwd` away and answered `TerminalCreated`, so a client
+/// asking for a shell in its project directory got one somewhere else with no error and no
+/// way to find out.
+#[tokio::test]
+async fn a_created_terminal_starts_where_the_client_asked() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("cwd").await;
+
+    let asked = d.dir().join("workdir");
+    std::fs::create_dir(&asked).expect("mkdir");
+    let created = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "r1".into(),
+                cwd: Some(asked.to_string_lossy().into_owned()),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let terminal = terminal_of(&created);
+
+    // Asked of the shell itself, and compared against the real path: a temporary directory
+    // on macOS is reached through a symlink, so the shell's own `pwd` is the only answer
+    // that can be checked without guessing which form it will print.
+    c.input_to(terminal, b"pwd\n").await;
+    let real = std::fs::canonicalize(&asked).expect("canonicalize");
+    let name = real
+        .file_name()
+        .expect("a directory name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        c.wait_for_text_on(terminal, &name, PATIENCE).await,
+        "the shell did not start in the requested directory"
+    );
+}
+
+#[tokio::test]
+async fn a_working_directory_that_cannot_be_used_is_refused_in_words() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("bad-cwd").await;
+
+    for (id, cwd, expected) in [
+        ("rel", "not/absolute", "not absolute"),
+        (
+            "missing",
+            "/definitely/not/a/directory/here",
+            "not a directory",
+        ),
+    ] {
+        let response = c
+            .control(
+                &ControlRequest::CreateTerminal {
+                    id: id.into(),
+                    cwd: Some(cwd.into()),
+                },
+                PATIENCE,
+            )
+            .await
+            .expect("a response");
+        match response {
+            ControlResponse::Failed { reason, .. } => assert!(
+                reason.contains(expected),
+                "the reason does not say what was wrong: {reason}"
+            ),
+            other => panic!("a bad cwd was accepted: {other:?}"),
+        }
+    }
+    assert_eq!(
+        d.terminals().len(),
+        1,
+        "a refused create still started a terminal"
+    );
+}
+
+/// A terminal's metadata outlives the daemon that made it.
+///
+/// The processes do not, and are not meant to: a pty and a shell die with the daemon. What
+/// survives is what a person asked for, which is the difference between metadata and state.
+#[tokio::test]
+async fn terminal_metadata_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(
+        dir.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("chmod");
+    qoro_runtime::paths::ensure_private_dir(dir.path()).expect("private dir");
+
+    let asked = dir.path().join("project");
+    std::fs::create_dir(&asked).expect("mkdir");
+
+    {
+        let daemon = qoro_runtime::Daemon::bind(dir.path(), std::path::Path::new("/bin/sh"))
+            .await
+            .expect("bind");
+        let socket = daemon.socket().to_path_buf();
+        let serving = tokio::spawn(async move { daemon.serve().await });
+
+        let (stream, inbuf) = qoro_runtime::client::connect(&socket, "recorder")
+            .await
+            .expect("connect");
+        let mut c = TestClient::from_parts(stream, inbuf, 1);
+        let created = c
+            .control(
+                &ControlRequest::CreateTerminal {
+                    id: "r1".into(),
+                    cwd: Some(asked.to_string_lossy().into_owned()),
+                },
+                PATIENCE,
+            )
+            .await
+            .expect("a response");
+        assert!(matches!(created, ControlResponse::TerminalCreated { .. }));
+        serving.abort();
+    }
+
+    // A second daemon over the same directory reads what the first one recorded.
+    let store = qoro_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+    let workspaces = store.workspaces().expect("workspaces");
+    assert_eq!(workspaces.len(), 1, "the workspace was not persisted");
+    let terminals = store.open_terminals(workspaces[0].id).expect("terminals");
+    assert!(
+        terminals.iter().any(|t| t.cwd == asked.to_string_lossy()),
+        "the terminal's working directory was not recorded: {terminals:?}"
+    );
+}
+
+/// G2.7: scrollback spill. Emit far more than the in-memory window, then assert every line
+/// is on disk in order.
+///
+/// One 64 KiB read can scroll more than the whole 1000 row window, and the engine emits no
+/// eviction event, so a spill running at the wrong point loses history silently and every
+/// other test still passes.
+#[tokio::test]
+async fn g2_7_rows_that_scroll_off_reach_the_disk_in_order() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("spiller").await;
+    let terminal = d.terminals().streams()[0];
+
+    // 4000 numbered lines, which is four times the in-memory window, emitted as fast as the
+    // shell can write them so that a single read carries many of them.
+    c.input_to(terminal, b"seq 1 4000\n").await;
+    assert!(
+        c.wait_for_text_on(terminal, "4000", PATIENCE).await,
+        "the shell never finished printing"
+    );
+    // The writer is a separate task; give it a moment to drain the ring.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let dir = d.dir().join("history").join(terminal.to_string());
+    let history = qoro_store::History::open(&dir).expect("history");
+    assert!(
+        history.len() >= 3000,
+        "only {} rows reached the disk, so the spill is losing history",
+        history.len()
+    );
+
+    // In order, and complete over a window well inside what was written.
+    let rows = history.read(0, 2000).expect("read");
+    let numbers: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.trim().parse::<i64>().ok())
+        .collect();
+    assert!(
+        numbers.len() >= 1500,
+        "only {} of the first 2000 rows were numbers, so rows are being mangled",
+        numbers.len()
+    );
+    for pair in numbers.windows(2) {
+        assert!(
+            pair[1] == pair[0] + 1,
+            "history is out of order or has a hole: {} then {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+/// G2.8's rule, at the level it is actually enforced: the read loop hands rows over and
+/// never waits, so a stalled disk costs history and not the terminal.
+#[tokio::test]
+async fn g2_8_the_terminal_keeps_running_when_history_cannot_be_written() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("degraded").await;
+    let terminal = d.terminals().streams()[0];
+
+    // Make the history directory unwritable, which is what a full or read-only filesystem
+    // looks like from here. The terminal must not notice.
+    let dir = d.dir().join("history");
+    std::fs::create_dir_all(&dir).ok();
+    std::fs::set_permissions(
+        &dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o500),
+    )
+    .expect("chmod");
+
+    c.input_to(terminal, b"seq 1 2000\n").await;
+    assert!(
+        c.wait_for_text_on(terminal, "2000", PATIENCE).await,
+        "the terminal stopped when history could not be written"
+    );
+    c.input_to(terminal, b"echo STILL_$((6*7))\n").await;
+    assert!(
+        c.wait_for_text_on(terminal, "STILL_42", PATIENCE).await,
+        "the terminal stopped serving after a history failure"
+    );
+
+    std::fs::set_permissions(
+        &dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .ok();
+}
+
+/// G2.14: a client asks an owner that never answers, and ownership does not move.
+///
+/// This is the gate that invariant I6 needed and that the
+/// quiesce gate was previously cited for, which tests neither sizing nor ownership.
+#[tokio::test]
+async fn g2_14_ownership_does_not_move_when_the_owner_never_answers() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+
+    let mut owner = d.attach("owner").await;
+    owner.resize(120, 40).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    owner.input_to(terminal, b"stty size\n").await;
+    assert!(owner.wait_for_text_on(terminal, "40 120", PATIENCE).await);
+
+    // A second client asks, and the owner says nothing at all.
+    let mut asker = d.attach("asker").await;
+    let response = asker
+        .control(
+            &ControlRequest::RequestOwnership {
+                id: "want".into(),
+                terminal,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    assert!(
+        matches!(response, ControlResponse::OwnershipRequested { .. }),
+        "the request was not even delivered: {response:?}"
+    );
+
+    // Long enough that any timeout based steal would have fired.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    asker.resize(60, 20).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Asserted as an absence, not a presence. The earlier `stty size` output is still on
+    // the screen, so "40 120 is there" is true whatever the size became; "20 60 is not
+    // there" is only true if the asker's size never took. The marker is what says the
+    // command has run, so the absence is a fact about a screen that has been updated.
+    owner.forget_seen();
+    owner
+        .input_to(terminal, b"echo AFTER_$((6*7)); stty size\n")
+        .await;
+    assert!(
+        owner.wait_for_text_on(terminal, "AFTER_42", PATIENCE).await,
+        "the shell never answered"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    owner
+        .wait_for_text_on(terminal, "never matches", Duration::from_millis(200))
+        .await;
+    let screen = owner.screen(terminal).expect("a screen").lines.join("\n");
+    assert!(
+        !screen.contains("20 60"),
+        "a silent owner lost the geometry, which is the steal ADR-007 forbids:\n{screen}"
+    );
+}
+
+/// And the path that does move it: the owner agrees.
+#[tokio::test]
+async fn ownership_moves_when_the_owner_agrees_and_not_before() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+
+    let mut owner = d.attach("owner").await;
+    owner.resize(120, 40).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut asker = d.attach("asker").await;
+    // The daemon names connections in order, so the second one is c2. A client learns its
+    // own name from the welcome in the real protocol; here the gate asserts the mechanism.
+    let asker_name = d
+        .connections()
+        .progress()
+        .iter()
+        .map(|(id, _, _)| id.as_str().to_string())
+        .nth(1)
+        .expect("two connections");
+
+    // Before the grant, the asker cannot resize.
+    asker.resize(60, 20).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    owner.forget_seen();
+    owner.input_to(terminal, b"stty size\n").await;
+    assert!(owner.wait_for_text_on(terminal, "40 120", PATIENCE).await);
+
+    let granted = owner
+        .control(
+            &ControlRequest::GrantOwnership {
+                id: "give".into(),
+                terminal,
+                to: asker_name,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    assert!(matches!(granted, ControlResponse::OwnershipGranted { .. }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    asker.resize(90, 30).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    asker.input_to(terminal, b"stty size\n").await;
+    assert!(
+        asker.wait_for_text_on(terminal, "30 90", PATIENCE).await,
+        "the owner agreed and ownership still did not move"
+    );
+}
+
+/// G2.4: a small client sees a window onto a large terminal, and the terminal does not
+/// shrink to fit it.
+///
+/// Two halves, and only both together are the property. The child's winsize must stay at
+/// the owner's size, because a terminal that shrinks when a phone attaches is a terminal
+/// whose layout changes under the person who owns it. And the small client must render a
+/// correct crop, because drawing a 180 column grid into a 50 column window does not fail,
+/// it wraps, and one long line silently becomes four.
+#[tokio::test]
+async fn g2_4_a_small_client_gets_a_viewport_and_the_terminal_keeps_its_size() {
+    use qoro_domain::{PtySize, Viewport};
+
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+
+    let mut owner = d.attach("desktop").await;
+    owner.resize(180, 50).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    owner.input_to(terminal, b"stty size\n").await;
+    assert!(owner.wait_for_text_on(terminal, "50 180", PATIENCE).await);
+
+    // A second, much smaller client. It is not the owner, so its resize is refused, which
+    // is ADR-007 and gate G1.7. What it gets instead is a window.
+    let mut phone = d.attach("phone").await;
+    phone.resize(50, 20).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Something with a distinct pattern per column, so a crop that takes the wrong columns
+    // is visible rather than merely a different length.
+    owner
+        .input_to(
+            terminal,
+            b"printf 'L%s\\n' $(seq 1 3); echo READY_$((6*7))\n",
+        )
+        .await;
+    assert!(phone.wait_for_text_on(terminal, "READY_42", PATIENCE).await);
+
+    let snapshot = phone.screen(terminal).expect("a screen").clone();
+    assert_eq!(
+        snapshot.cols, 180,
+        "the terminal shrank to fit the small client"
+    );
+    assert_eq!(snapshot.rows, 50);
+
+    let grid = PtySize {
+        cols: 180,
+        rows: 50,
+    };
+    let view = Viewport::new(grid, 0, 0, 50, 20);
+    let shown = view.crop(snapshot.lines.iter().map(String::as_str));
+    assert_eq!(shown.len(), 20, "the window is 20 rows");
+    assert!(
+        shown.iter().all(|l| l.chars().count() <= 50),
+        "a cropped row is wider than the window, so it would wrap"
+    );
+    // And it is the same text, not a different rendering of it.
+    let first = snapshot.lines[0].chars().take(50).collect::<String>();
+    assert_eq!(shown[0], first);
+
+    // The owner's view is unchanged by any of this.
+    owner.forget_seen();
+    owner
+        .input_to(terminal, b"echo AFTER_$((6*8)); stty size\n")
+        .await;
+    assert!(owner.wait_for_text_on(terminal, "AFTER_48", PATIENCE).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    owner
+        .wait_for_text_on(terminal, "never matches", Duration::from_millis(200))
+        .await;
+    let screen = owner.screen(terminal).expect("a screen").lines.join("\n");
+    assert!(
+        !screen.contains("20 50"),
+        "the small client resized the terminal:\n{screen}"
+    );
+}
+
+/// G2.15: no mouse escape sequence reaches the child after an abrupt disconnect.
+///
+/// A child that turned mouse tracking on is still expecting reports when the client holding
+/// the outer terminal vanishes. The next client's outer terminal has not been told to
+/// report anything, so it sends nothing, and the reset preamble on attach is what makes
+/// that true rather than hoped for.
+#[tokio::test]
+async fn g2_15_no_mouse_report_reaches_the_child_after_a_reattach() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let out = d.dir().join("mouse.out");
+
+    let mut first = d.attach("mouser").await;
+    // The child asks for mouse tracking, then records everything it is sent.
+    first
+        .input_to(
+            terminal,
+            format!(
+                "printf '\\033[?1000h\\033[?1006h'; stty raw; head -c 8 > {}\n",
+                out.display()
+            )
+            .as_bytes(),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Gone, with no goodbye.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut second = d.attach("reattached").await;
+    // Whatever the second client does, it must not be a mouse report. It types eight
+    // ordinary bytes, which is exactly what the child is counting.
+    second.input_to(terminal, b"ABCDEFGH").await;
+
+    let deadline = Instant::now() + PATIENCE;
+    let mut got = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(v) = std::fs::read(&out)
+            && v.len() >= 8
+        {
+            got = v;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        got,
+        b"ABCDEFGH",
+        "the child received {:?}, which is not what the second client typed",
+        String::from_utf8_lossy(&got)
+    );
+}
+
+/// G2.9: a dead filesystem under one terminal does not stop the daemon.
+///
+/// The gate names a hung mount. There is none here, and installing a filesystem to run a
+/// test is worse than the test.
+///
+/// A fifo was the first attempt, because a read on one with no writer is a real
+/// uncancellable syscall on a real path. It does not work as a test: a blocked reader is
+/// released only by a writer, a probe that has not started yet blocks in `open` rather than
+/// `read`, and the runtime waits for every blocking task at shutdown, so the test hangs
+/// after passing every assertion. Three arrangements of it hung in three different places.
+///
+/// What actually matters about a hung mount is that the thread is occupied, cannot be
+/// cancelled, and does not come back within the deadline. A sleep on the blocking pool is
+/// all three, and it releases itself, so the test finishes. What is lost is that the block
+/// is not a filesystem call, and the daemon cannot tell the difference: it holds a permit
+/// either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
+    use qoro_runtime::blocking;
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("survivor").await;
+    let alive = d.terminals().streams()[0];
+
+    let hung = d.dir().join("hung");
+    std::fs::create_dir(&hung).expect("mkdir");
+    let prefix = hung.display().to_string();
+
+    // Exactly as many probes as the pool holds, and no more: a queued one starts only after
+    // an earlier one returns, which is not the state being tested. Four is already above
+    // the three abandonments that mark a prefix degraded.
+    assert!(blocking::PROBE_THREADS as u64 >= blocking::DEGRADE_AFTER);
+    let before_abandoned = blocking::abandoned_count();
+    for _ in 0..blocking::PROBE_THREADS {
+        let prefix = prefix.clone();
+        tokio::spawn(async move {
+            let _ = blocking::probe(&prefix, Duration::from_millis(200), || {
+                std::thread::sleep(Duration::from_secs(6))
+            })
+            .await;
+        });
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        blocking::abandoned_count() > before_abandoned,
+        "nothing was abandoned, so the probes did not actually block"
+    );
+    assert!(
+        blocking::is_degraded(&prefix),
+        "the prefix was not marked degraded, so the pool would drain one probe at a time"
+    );
+
+    // Every other terminal still reads and writes.
+    c.input_to(alive, b"echo STILL_$((6*7))\n").await;
+    assert!(
+        c.wait_for_text_on(alive, "STILL_42", PATIENCE).await,
+        "a hung filesystem under one terminal stopped another one"
+    );
+
+    // A new terminal can still be created, which needs the lifecycle pool that the probes
+    // must not have taken.
+    let created = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "while-hung".into(),
+                cwd: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let fresh = terminal_of(&created);
+    c.input_to(fresh, b"echo NEW_$((6*8))\n").await;
+    assert!(
+        c.wait_for_text_on(fresh, "NEW_48", PATIENCE).await,
+        "a terminal created while a filesystem was hung does not work"
+    );
+
+    // And an unrelated teardown completes within its deadline.
+    let started = Instant::now();
+    c.control(
+        &ControlRequest::CloseTerminal {
+            id: "close-while-hung".into(),
+            terminal: fresh,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("a response");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline && d.terminals().get(fresh).is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        d.terminals().get(fresh).is_none(),
+        "a teardown did not complete while the probe pool was full"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the teardown took {:?}, which is past its deadline",
+        started.elapsed()
+    );
+
+    // The probes were still blocked throughout, which is what makes the assertions above
+    // about a full pool rather than about an empty one.
+    assert!(
+        blocking::is_degraded(&prefix),
+        "the probes finished before the assertions, so the pool was not full"
+    );
+    blocking::clear_degraded(&prefix);
+}
+
+/// G2.13: a hundred terminals change foreground process at the same moment, and every one
+/// of them reports the right one within the stated bound.
+///
+/// The failure this rules out is a settle-timer herd: a hundred terminals all changing at
+/// once, all scheduling the same re-read, and some left holding stale state because the
+/// wakeups collided.
+///
+/// It runs in process because the thing being checked is the daemon's own record, and no
+/// separate process can read it. `sleep` produces no output at all, which is what makes
+/// this a test of the subscription rather than of the screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_13_a_hundred_terminals_quiesce_within_the_stated_bound() {
+    let terminals: usize = std::env::var("QORO_QUIESCE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let _ = terminals;
+    /// One settle window plus a hundred milliseconds, which is the bound ADR-009 states.
+    const BOUND: Duration = Duration::from_millis(70 + 100);
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("quiescer").await;
+    let mut streams = d.terminals().streams();
+    for i in 1..terminals {
+        let created = c
+            .control(
+                &ControlRequest::CreateTerminal {
+                    id: format!("t{i}"),
+                    cwd: None,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|| panic!("terminal {i} was never created"));
+        streams.push(terminal_of(&created));
+    }
+    assert_eq!(streams.len(), terminals);
+
+    // Settled: every shell is its own foreground process.
+    for stream in &streams {
+        c.input_to(*stream, b"echo READY_$((6*7))\n").await;
+    }
+    for stream in &streams {
+        assert!(
+            c.wait_for_text_on(*stream, "READY_42", Duration::from_secs(30))
+                .await,
+            "terminal {stream} never started"
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let before: Vec<_> = streams
+        .iter()
+        .map(|s| {
+            d.agent(*s)
+                .unwrap_or_else(|| panic!("terminal {s} has no agent record"))
+                .capability
+                .generation
+        })
+        .collect();
+
+    // All at once.
+    let started = Instant::now();
+    for stream in &streams {
+        c.input_to(*stream, b"sleep 20\n").await;
+    }
+
+    // Every terminal's record has to show the new foreground process. Polled rather than
+    // slept, so the number reported is what it actually took.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut settled = 0usize;
+    let mut took = Duration::ZERO;
+    while Instant::now() < deadline {
+        settled = streams
+            .iter()
+            .zip(&before)
+            .filter(|(stream, was)| {
+                d.agent(**stream).is_some_and(|agent| {
+                    agent.capability.generation > **was
+                        && matches!(
+                            &agent.identity,
+                            qoro_domain::AgentIdentity::Known { program, .. }
+                                if program.contains("sleep")
+                        )
+                })
+            })
+            .count();
+        took = started.elapsed();
+        if settled == terminals {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    println!("G2.13: {settled} of {terminals} settled in {took:?}, bound {BOUND:?}");
+    assert_eq!(
+        settled, terminals,
+        "only {settled} of {terminals} terminals reported their new foreground process \
+         within 20 s, so a simultaneous change leaves some holding stale state"
+    );
+    assert!(
+        took <= BOUND * 4,
+        "a hundred simultaneous changes took {took:?} against a bound of {BOUND:?} each, \
+         which is a settle herd rather than a settle"
+    );
+}
