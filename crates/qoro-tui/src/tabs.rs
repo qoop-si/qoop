@@ -64,13 +64,19 @@ pub fn hit(terminals: &[AgentRow], focused: u32, cols: usize, col: usize) -> Opt
 /// tab starts, and the same running total written out twice is how a click opens the tab
 /// next to the one a person aimed at.
 ///
-/// Tabs are cut from the right: the ones a person opened first keep their place, so the bar
+/// Tabs are cut from the right, and the bar only scrolls when the focused tab would be one
+/// of the ones cut. The ones a person opened first keep their place until then, so the bar
 /// does not reshuffle under the pointer as terminals come and go.
+///
+/// Scrolling is not decoration. Measured with twelve terminals in an eighty column window:
+/// with the focus on the twelfth, the bar was byte for byte the bar of a client with nothing
+/// focused. No brackets anywhere, no way to click back to it, and nothing on screen saying
+/// which terminal the keyboard was in.
 fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, Option<u32>)> {
     let budget = cols.saturating_sub(crate::width::width(NEW));
     let mut used = 0;
     let mut out = Vec::with_capacity(terminals.len() + 1);
-    for row in terminals {
+    for row in &terminals[scrolled(terminals, focused, budget)..] {
         let text = tab(row, row.terminal == focused);
         let wide = crate::width::width(&text);
         if used + wide > budget {
@@ -81,6 +87,27 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, O
     }
     out.push((NEW.to_string(), None));
     out
+}
+
+/// The first tab the bar draws.
+///
+/// Zero until the focused tab does not fit, then the least it takes to bring it back. Least,
+/// so the bar moves by one tab when the focus moves by one tab rather than jumping the
+/// focused tab to the left edge, which is a whole bar of new labels for one keystroke.
+fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
+    let Some(at) = terminals.iter().position(|r| r.terminal == focused) else {
+        return 0;
+    };
+    let width_of = |row: &AgentRow| crate::width::width(&tab(row, row.terminal == focused));
+    let mut first = 0;
+    while first < at {
+        let fits = terminals[first..=at].iter().map(width_of).sum::<usize>() <= budget;
+        if fits {
+            break;
+        }
+        first += 1;
+    }
+    first
 }
 
 /// One tab: its label, with a space on each side, or brackets when it has the keyboard.
@@ -274,6 +301,43 @@ mod tests {
             }
             assert_eq!(hit(&rows, 3, cols, cols), None, "past the right edge");
         }
+    }
+
+    /// The bar has to answer "which terminal has the keyboard" at every focus, or it is a
+    /// bar that answers it only for the terminals somebody happened to open first.
+    #[test]
+    fn the_focused_tab_is_on_the_bar_however_many_tabs_there_are() {
+        let many: Vec<AgentRow> = (1..=12).map(|n| agent(n, "claude")).collect();
+        for cols in [20usize, 40, 80, 200] {
+            for focused in 1..=12u32 {
+                let line = render(&many, focused, cols);
+                let clickable: Vec<u32> = (0..cols)
+                    .filter_map(|col| hit(&many, focused, cols, col))
+                    .collect();
+                assert!(
+                    line.text.contains('['),
+                    "{cols} columns, focus {focused}: nothing is marked: {:?}",
+                    line.text
+                );
+                assert!(
+                    clickable.contains(&focused),
+                    "{cols} columns, focus {focused}: the focused tab cannot be clicked: {:?}",
+                    line.text
+                );
+            }
+        }
+    }
+
+    /// One keystroke must not repaint the whole bar with labels a person has not seen.
+    #[test]
+    fn the_bar_scrolls_by_one_tab_and_not_by_a_barful() {
+        let many: Vec<AgentRow> = (1..=12).map(|n| agent(n, "claude")).collect();
+        let at_seven = render(&many, 7, 40).text;
+        let at_eight = render(&many, 8, 40).text;
+        // Terminal 7 is still on the bar after moving to 8, so the person's eye keeps its
+        // place. A bar that jumped the focused tab to the left edge would have dropped it.
+        assert!(at_seven.contains("7 claude"), "{at_seven:?}");
+        assert!(at_eight.contains("7 claude"), "{at_eight:?}");
     }
 
     #[test]

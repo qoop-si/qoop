@@ -166,7 +166,11 @@ pub struct WorkspaceRow {
 pub struct AgentRow {
     pub terminal: TerminalStream,
     /// The workspace it belongs to, so a client can group by one without asking twice.
-    #[serde(default)]
+    /// No default. Zero is not a workspace, the store counts from one, and a row that
+    /// arrived without this field would be filtered into a group that cannot exist: the tab
+    /// bar would come up empty with terminals running in it, and the panel would name the
+    /// space `0`. A missing field is a daemon that does not speak this protocol, which is
+    /// worth failing on rather than drawing.
     pub workspace: i64,
     /// The foreground program, when it can be read.
     pub program: Option<String>,

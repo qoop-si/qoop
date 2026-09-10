@@ -89,9 +89,11 @@ impl State {
             )
             .map(Clicked::Terminal);
         }
-        if col as usize > sidebar::WIDTH {
-            // The pane. A terminal application that wants the mouse asks for it, and
-            // passing a click to one that did not would type its report at a prompt.
+        // The pane, or a window too narrow to have a left column at all. A terminal
+        // application that wants the mouse asks for it, and passing a click to one that did
+        // not would type its report at a prompt.
+        let left = screen::left(self.cols);
+        if left == 0 || col as usize >= left {
             return None;
         }
         let within = (row as usize) - 1 - screen::TABS;
@@ -437,6 +439,12 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     }
                     inbuf.extend_from_slice(&read[..n]);
                     let mut refresh = false;
+                    // Separate from the index on purpose. A space list is one SQLite query
+                    // behind the daemon's shared store lock, run inline in the connection's
+                    // read loop, and asking for one every time an agent changed state put a
+                    // query behind every keystroke on a busy daemon. The spaces themselves
+                    // only change when a terminal or a workspace does.
+                    let mut refresh_spaces = false;
                     for message in connection.drain(&mut inbuf)? {
                         match message {
                             Incoming::Render { terminal, snapshot } => {
@@ -475,6 +483,12 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                         | ControlResponse::TerminalClosed { .. }
                                         | ControlResponse::WorkspaceCreated { .. }
                                 );
+                                refresh_spaces |= matches!(
+                                    response,
+                                    ControlResponse::TerminalCreated { .. }
+                                        | ControlResponse::TerminalClosed { .. }
+                                        | ControlResponse::WorkspaceCreated { .. }
+                                );
                                 apply(&mut state, response, &mut dirty);
                             }
                         }
@@ -506,6 +520,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                             &ControlRequest::ListAgents { id: format!("index-{request}") },
                             &mut control_seq,
                         )?).await?;
+                    }
+                    if refresh_spaces {
+                        request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::ListWorkspaces { id: format!("spaces-{request}") },
                             &mut control_seq,

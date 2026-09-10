@@ -43,9 +43,28 @@ pub const STATUS: usize = 1;
 /// disagreeing about how wide they are.
 pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
     (
-        cols.saturating_sub(sidebar::WIDTH as u16 + 1).max(1),
+        cols.saturating_sub(left(cols) as u16).max(1),
         lines.saturating_sub((TABS + STATUS) as u16).max(1),
     )
+}
+
+/// The columns spent before the pane starts: the left column and the rule beside it, or
+/// nothing at all when the window is too narrow to hold both.
+///
+/// Dropped rather than squeezed. The left column is a fixed width and the rule is one more,
+/// so a window of twenty three columns or fewer had every row painted wider than the
+/// terminal: each line wrapped, the screen slid up, and every position this module writes
+/// addressed the wrong row, which also puts every click on the wrong thing. Measured at 10,
+/// 20 and 23 columns, all of which painted 24. A narrow window is a real one: two panes
+/// side by side in a tmux split is how it happens.
+pub fn left(cols: u16) -> usize {
+    // One column for the pane, or there is nothing to show and the left column is the whole
+    // point of nothing.
+    if (cols as usize) > sidebar::WIDTH + 2 {
+        sidebar::WIDTH + 1
+    } else {
+        0
+    }
 }
 
 /// The terminals of one space, in the order the daemon reports them.
@@ -97,13 +116,18 @@ pub fn paint(frame: &Frame) -> String {
     );
     out.push_str("\x1b[0m");
 
-    let panel = sidebar::render(
-        frame.spaces,
-        frame.rows,
-        frame.space.unwrap_or_default(),
-        frame.focused,
-        pane_rows as usize,
-    );
+    let wide_enough = left(frame.cols) > 0;
+    let panel = if wide_enough {
+        sidebar::render(
+            frame.spaces,
+            frame.rows,
+            frame.space.unwrap_or_default(),
+            frame.focused,
+            pane_rows as usize,
+        )
+    } else {
+        Vec::new()
+    };
     for row in 0..pane_rows as usize {
         out.push_str(&at(row + 1 + TABS, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -121,7 +145,9 @@ pub fn paint(frame: &Frame) -> String {
         }
         // The rule between the column and the terminal, drawn every row so that a terminal
         // line long enough to reach it cannot swallow it.
-        out.push('\u{2502}');
+        if wide_enough {
+            out.push('\u{2502}');
+        }
         let line = frame
             .snapshot
             .and_then(|s| s.lines.get(row))
@@ -149,25 +175,50 @@ pub fn paint(frame: &Frame) -> String {
     // The cursor goes where the child put it, offset into the pane, so that what the user
     // types appears where they are looking.
     if let Some(snapshot) = frame.snapshot {
-        let (row, col) = snapshot.cursor;
-        // The cursor's column is a cell, and cells and columns are the same number only
-        // until a wide character appears on that row. Measured in cells up to the cursor,
-        // then painted in columns.
-        let cells: String = frame
-            .snapshot
-            .and_then(|s| s.lines.get(row))
-            .map(|line| line.chars().take(col).collect())
-            .unwrap_or_default();
-        let col = width::width(&width::fit(
-            &cells,
-            width::width(&cells).min(pane_cols as usize),
-        ));
+        let (row, cell) = snapshot.cursor;
+        let col = cursor_column(
+            snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
+            cell,
+        );
         let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-        let col = col.min(pane_cols as usize - 1) + sidebar::WIDTH + 2;
+        let col = col.min(pane_cols as usize - 1) + left(frame.cols) + 1;
         out.push_str(&at(row, col));
         out.push_str("\x1b[?25h");
     }
     out
+}
+
+/// The screen column the cursor sits at, counted from zero, given the row it is on and the
+/// grid cell it is in.
+///
+/// Two conversions, and the old arithmetic got both of them backwards.
+///
+/// A snapshot row arrives right trimmed, so a cursor to the right of the last printed
+/// character is in a cell the string does not contain. Taking that many characters returned
+/// fewer, and the cursor landed left of where the person was typing: measured against a
+/// `sh` prompt, which prints `"$ "` and arrives as `"$"`, the cursor sat on top of the `$`
+/// on every line anybody typed. The cells past the end are spaces the engine dropped, and
+/// each of them is one column.
+///
+/// The other way, the grid's spacer after a wide character is a cell and not a column, so
+/// counting it moved the cursor one column right for every wide character on the row.
+fn cursor_column(line: &str, cell: usize) -> usize {
+    let mut cells = 0;
+    let mut cols = 0;
+    let mut spacer = false;
+    for c in line.chars() {
+        if cells == cell {
+            break;
+        }
+        cells += 1;
+        if spacer && c == ' ' {
+            spacer = false;
+            continue;
+        }
+        spacer = width::columns(c) == 2;
+        cols += width::columns(c);
+    }
+    cols + (cell - cells)
 }
 
 /// One row of the terminal, with its colour.
@@ -454,6 +505,82 @@ mod tests {
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
         assert!(painted.contains("\x1b[32mX"), "{painted:?}");
+    }
+
+    /// Where the cursor goes is where the person is looking, and both conversions it needs
+    /// were wrong in opposite directions.
+    #[test]
+    fn the_cursor_column_counts_columns_and_not_cells() {
+        // A right trimmed row: the shell printed `"$ "` and the snapshot carries `"$"`, so
+        // the cursor is in a cell the string does not have. It is one column past the `$`.
+        assert_eq!(cursor_column("$", 2), 2);
+        assert_eq!(cursor_column("", 0), 0);
+        assert_eq!(cursor_column("", 7), 7);
+        // Plain text, where cells and columns are the same number.
+        assert_eq!(cursor_column("abc", 3), 3);
+        assert_eq!(cursor_column("abc", 1), 1);
+        // A wide character is two columns in one cell, and the grid's spacer after it is a
+        // cell that is no columns at all.
+        assert_eq!(cursor_column("\u{4e2d} X", 3), 3);
+        assert_eq!(cursor_column("\u{4e2d} X", 1), 2);
+        assert_eq!(cursor_column("\u{4e2d} \u{4e2d} ", 4), 4);
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_column_the_shell_is_typing_at() {
+        let mut snapshot = snapshot(&["$"]);
+        snapshot.cursor = (0, 2);
+        let rows = [row(1, "sh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+        });
+        // One row down for the tab bar, and the pane starts after the column and its rule.
+        let want = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
+        assert!(
+            painted.ends_with(&format!("{want}\x1b[?25h")),
+            "{painted:?}"
+        );
+    }
+
+    /// A window too narrow for the left column is a real one: two panes side by side in a
+    /// tmux split. Painting the column anyway made every row wider than the terminal, so
+    /// every row wrapped, the screen slid, and every position written after that addressed
+    /// the wrong row.
+    #[test]
+    fn a_window_too_narrow_for_the_left_column_paints_no_wider_than_it_is() {
+        let rows = [row(1, "sh", "idle")];
+        let snapshot = snapshot(&["x".repeat(200).as_str()]);
+        for cols in [1u16, 5, 10, 20, 23, 24, 25, 40] {
+            let painted = paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                space: Some(1),
+                focused: 1,
+                snapshot: Some(&snapshot),
+                cols,
+                lines: 6,
+                message: None,
+            });
+            // Every positioned run, measured as a terminal measures it.
+            for run in painted.split("\x1b[").skip(1) {
+                let Some(text) = run.strip_suffix("").and_then(|r| r.split_once('H')) else {
+                    continue;
+                };
+                let drawn = text.1.split('\x1b').next().unwrap_or_default();
+                assert!(
+                    width::width(drawn) <= cols as usize,
+                    "{cols} columns, painted {} of them: {drawn:?}",
+                    width::width(drawn)
+                );
+            }
+        }
     }
 
     #[test]
