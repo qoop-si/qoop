@@ -77,6 +77,9 @@ const INDENT: usize = 5;
 /// A row showing only its state does not say whose state it is.
 const MIN_NAME: usize = 3;
 
+/// The state a terminal has when nothing has been able to say what it is doing.
+const UNKNOWN: &str = "unknown";
+
 /// What to call an agent whose identity the daemon could not read.
 ///
 /// Not `shell`. A row only reaches this panel because an agent is registered against it,
@@ -281,7 +284,17 @@ fn agents_panel(
 /// name having to be cut to the same length first.
 fn detail(agent: &AgentRow) -> String {
     let body = WIDTH.saturating_sub(INDENT);
-    let state = clip(&agent.state, body.saturating_sub(MIN_NAME + 1));
+    // An unknown state is drawn as nothing. It is a claim about nothing, so a column of the
+    // word `unknown` trains the eye to skip the one column that matters when an agent
+    // really is blocked, and it spends seven of the seventeen columns this line has on
+    // saying so. Measured: a terminal behind a wrapper rendered as `behind do  unknown`,
+    // where the two words that were cut are the only ones that identified it.
+    let shown = if agent.state == UNKNOWN {
+        ""
+    } else {
+        &agent.state
+    };
+    let state = clip(shown, body.saturating_sub(MIN_NAME + 1));
     let name = fit_to(
         &label(agent),
         body.saturating_sub(crate::width::width(&state) + 1),
@@ -643,6 +656,28 @@ mod tests {
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
         assert!(!lines.iter().any(|l| l.text.contains("     docker")));
+    }
+
+    /// A terminal behind a wrapper is the case with the longest name and the least to say
+    /// about its state, so it is the one the word `unknown` used to push off the row.
+    #[test]
+    fn an_unknown_state_is_drawn_as_nothing_and_leaves_the_name_the_whole_row() {
+        let agents = vec![AgentRow {
+            terminal: 5,
+            workspace: 1,
+            agent: true,
+            program: None,
+            behind: Some("docker".to_string()),
+            state: UNKNOWN.to_string(),
+            generation: None,
+        }];
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
+        assert!(
+            lines.iter().any(|l| l.text.contains("behind docker")),
+            "{:?}",
+            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        assert!(!lines.iter().any(|l| l.text.contains(UNKNOWN)));
     }
 
     #[test]

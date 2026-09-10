@@ -37,8 +37,20 @@ struct State {
     was: std::collections::BTreeMap<u32, String>,
     /// Set when something started needing a person, cleared when the bell has rung.
     ring: bool,
-    /// A space that has just been made and has nothing in it yet.
-    wants_terminal_in: Option<i64>,
+    /// Spaces that have just been made and have nothing in them yet.
+    ///
+    /// A queue and not one slot. Two answers can land in the same read, and a slot kept the
+    /// second and dropped the first, which left a space nobody could put a terminal in
+    /// except by finding it and pressing `ctrl-a c`.
+    wants_terminal_in: Vec<i64>,
+    /// Whether this client has ever had a terminal on screen.
+    adopted: bool,
+    /// Spaces asked for and not yet answered for.
+    ///
+    /// Only the naming needs this, and the naming needs it badly: two presses of `ctrl-a w`
+    /// before either answer came back both counted the same list and both produced
+    /// `space 2`, so the panel showed two rows with one name on them.
+    creating: usize,
 }
 
 impl State {
@@ -178,7 +190,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         space: None,
         was: std::collections::BTreeMap::new(),
         ring: false,
-        wants_terminal_in: None,
+        wants_terminal_in: Vec::new(),
+        adopted: false,
+        creating: 0,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -295,12 +309,19 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     for action in keys.feed(&bytes) {
                         match action {
                             Action::Input(bytes) => {
+                                // Nothing focused is a real state: a space with no
+                                // terminals in it. Typing into stream zero addresses a
+                                // terminal that does not exist, and typing into the one
+                                // that was focused before addresses a terminal in a space
+                                // the person has left and cannot see.
                                 let focused = state.focused;
-                                wr.write_all(&client::encode_command_to(
-                                    focused,
-                                    &ClientWire::Input { bytes },
-                                    seqs.entry(focused).or_default(),
-                                )?).await?;
+                                if focused != 0 {
+                                    wr.write_all(&client::encode_command_to(
+                                        focused,
+                                        &ClientWire::Input { bytes },
+                                        seqs.entry(focused).or_default(),
+                                    )?).await?;
+                                }
                             }
                             Action::Detach => return Ok(()),
                             Action::Click { row, col } => {
@@ -370,10 +391,14 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                         // second input mode this interface does not have
                                         // yet, and a space with a name a person did not
                                         // choose is still a space they can work in.
-                                        name: format!("space {}", state.spaces.len() + 1),
+                                        name: format!(
+                                            "space {}",
+                                            state.spaces.len() + state.creating + 1
+                                        ),
                                     },
                                     &mut control_seq,
                                 )?).await?;
+                                state.creating += 1;
                                 state.message = Some("starting a space".to_string());
                                 dirty = true;
                             }
@@ -391,6 +416,7 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                 state.message = Some("starting a terminal".to_string());
                                 dirty = true;
                             }
+                            Action::Close if state.focused == 0 => {}
                             Action::Close => {
                                 request += 1;
                                 wr.write_all(&client::encode_control_seq(
@@ -414,7 +440,17 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     for message in connection.drain(&mut inbuf)? {
                         match message {
                             Incoming::Render { terminal, snapshot } => {
-                                if terminal == state.focused || state.focused == 0 {
+                                // The very first render adopts its terminal, which is how
+                                // the interface has something on screen before any answer
+                                // has arrived. Once. After that, nothing focused means
+                                // nothing focused: a render arriving from a subscription
+                                // this client has just dropped would otherwise paint
+                                // another space's terminal under this space's tab bar, and
+                                // silently put the keyboard back in it.
+                                if terminal == state.focused
+                                    || (state.focused == 0 && !state.adopted)
+                                {
+                                    state.adopted = true;
                                     state.focused = terminal;
                                     state.snapshot = Some(snapshot);
                                     state.message = None;
@@ -446,7 +482,7 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
-                    if let Some(space) = state.wants_terminal_in.take() {
+                    for space in std::mem::take(&mut state.wants_terminal_in) {
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::CreateTerminal {
@@ -549,12 +585,34 @@ fn enter_space(
     state.space = Some(space);
     match state.tabs().first().map(|r| r.terminal) {
         Some(first) => focus(state, first, control_seq, seqs),
-        None => {
-            state.snapshot = None;
-            state.message = Some("this space is empty, ctrl-a c starts a terminal".to_string());
-            Ok(None)
-        }
+        None => unfocus(
+            state,
+            "this space is empty, ctrl-a c starts a terminal",
+            control_seq,
+        ),
     }
+}
+
+/// Take the keyboard out of every terminal, because this space has none to put it in.
+///
+/// The unsubscribe is the point. Leaving the old terminal focused kept every keystroke
+/// going to a terminal in a space the person had left and was not looking at, kept its
+/// output painting under this space's tab bar, and left `ctrl-a x` closing it. Nothing on
+/// screen said any of that was happening.
+fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
+    let was = std::mem::replace(&mut state.focused, 0);
+    state.snapshot = None;
+    state.message = Some(why.to_string());
+    if was == 0 {
+        return Ok(None);
+    }
+    Ok(Some(client::encode_control_seq(
+        &ControlRequest::Unsubscribe {
+            id: format!("hide-{was}"),
+            terminals: vec![was],
+        },
+        control_seq,
+    )?))
 }
 
 /// Stop watching one terminal and start watching another, in one write.
@@ -563,13 +621,19 @@ fn enter_space(
 /// client that receives renders for a terminal nobody is looking at, and hidden output not
 /// costing anything is the whole point of the subscription.
 fn switch(from: u32, to: u32, control_seq: &mut u32) -> io::Result<BytesMut> {
-    let mut out = client::encode_control_seq(
-        &ControlRequest::Unsubscribe {
-            id: format!("hide-{from}"),
-            terminals: vec![from],
-        },
-        control_seq,
-    )?;
+    // Zero is not a terminal, it is this client having nothing on screen, so there is
+    // nothing to stop watching.
+    let mut out = if from == 0 {
+        BytesMut::new()
+    } else {
+        client::encode_control_seq(
+            &ControlRequest::Unsubscribe {
+                id: format!("hide-{from}"),
+                terminals: vec![from],
+            },
+            control_seq,
+        )?
+    };
     out.extend_from_slice(&client::encode_control_seq(
         &ControlRequest::Subscribe {
             id: format!("show-{to}"),
@@ -591,17 +655,29 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::WorkspaceCreated { workspace, .. } => {
+            state.creating = state.creating.saturating_sub(1);
             state.space = Some(workspace);
             state.snapshot = None;
             // Asked for here rather than by the caller, because a space with no terminal in
             // it shows an empty pane and a bar with only a `+` on it, and the first thing
             // anybody does in a new space is start a terminal.
-            state.wants_terminal_in = Some(workspace);
+            state.wants_terminal_in.push(workspace);
             *dirty = true;
         }
         ControlResponse::Agents { agents, .. } => {
-            if state.focused == 0 {
-                state.focused = agents.first().map(|r| r.terminal).unwrap_or(0);
+            if state.focused == 0 && !state.adopted {
+                // Only before this client has ever had a terminal. The daemon subscribes a
+                // fresh client to what is already open, so this is the bootstrap and no
+                // subscription of our own is needed. Later, nothing focused is a space with
+                // nothing in it, and reaching into another space's terminal here is how a
+                // person ends up typing somewhere they cannot see.
+                if let Some(first) = agents
+                    .iter()
+                    .find(|r| state.space.is_none_or(|s| r.workspace == s))
+                {
+                    state.adopted = true;
+                    state.focused = first.terminal;
+                }
             }
             // A terminal that has just started needing a person. The bell is the local
             // notification: it is what the person's own terminal emulator turns into a
@@ -632,12 +708,23 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
         ControlResponse::TerminalClosed { terminal, .. } => {
             if terminal == state.focused {
                 state.snapshot = None;
-                state.focused = state
+                // From this space, and through the subscription path, which is why it is a
+                // pending focus rather than an assignment. Picking any terminal from
+                // `rows` put the keyboard in another space without moving the tab bar
+                // there, and assigning it directly left the client unsubscribed, so the
+                // pane stayed empty until something else happened to move the focus.
+                state.focused = 0;
+                state.pending_focus = state
                     .rows
                     .iter()
-                    .map(|r| r.terminal)
-                    .find(|t| *t != terminal)
-                    .unwrap_or(0);
+                    .find(|r| {
+                        r.terminal != terminal && state.space.is_none_or(|s| r.workspace == s)
+                    })
+                    .map(|r| r.terminal);
+                if state.pending_focus.is_none() {
+                    state.message =
+                        Some("this space is empty, ctrl-a c starts a terminal".to_string());
+                }
             }
             *dirty = true;
         }

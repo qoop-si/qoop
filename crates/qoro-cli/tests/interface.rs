@@ -790,3 +790,197 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
         ui.tab_bar()
     );
 }
+
+/// G12.10: a terminal this daemon cannot read into is still on the panel, named after the
+/// thing standing in the way.
+///
+/// The case the whole panel exists for, and the one that was invisible. An agent started
+/// with `docker run` has no name this daemon can read, so the row can never say what is in
+/// there. A panel that listed only what it could name left that terminal off the screen
+/// entirely, which is the one terminal nobody can check by looking.
+///
+/// A stand in named `docker`, because the boundary is decided by the program's name and a
+/// real container runtime cannot be a dependency of a test.
+#[test]
+fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    let dir = ui._dir.path().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    // A real executable and not a shell script, and compiled rather than copied. The
+    // boundary is decided from the executable the process is actually running: a script
+    // named `docker` is executed by `/bin/sh`, so the daemon sees through it to the
+    // script's own name instead, which is the right answer for a wrapper script and not the
+    // case under test. A copy of a system binary is not an option either, since the copy
+    // loses its signature and this machine kills it on sight (measured: exit 137).
+    let source = dir.join("docker.rs");
+    std::fs::write(
+        &source,
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
+    )
+    .expect("write");
+    let wrapper = dir.join("docker");
+    let built = Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&wrapper)
+        .output()
+        .expect("run rustc");
+    assert!(
+        built.status.success(),
+        "the stand in did not build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    ui.type_in(format!("{}\n", wrapper.display()).as_bytes());
+    assert!(
+        ui.wait_for_panel(
+            FIRST_AGENT_ROW + 1,
+            |line| line.contains("behind docker"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the panel does not carry the terminal behind the wrapper: {:?}\n{}",
+        ui.panel_line(FIRST_AGENT_ROW + 1),
+        ui.painted
+    );
+    // The wrapper's own name is never printed where a program's name goes: a person shown
+    // `docker` there would conclude their agent is called docker.
+    assert!(
+        !ui.panel_line(FIRST_AGENT_ROW + 1)
+            .is_some_and(|line| line.trim_start().starts_with("docker")),
+        "the wrapper is named as the program: {:?}",
+        ui.panel_line(FIRST_AGENT_ROW + 1)
+    );
+}
+
+/// G12.11: a space with nothing in it takes the keyboard out of the terminal it left.
+///
+/// Entering a space is a claim about where the keyboard is. Without this, moving to an
+/// empty space left every keystroke going to a terminal in the space that was just left,
+/// left that terminal's output painting under this space's tab bar, and left `ctrl-a x`
+/// closing it. Nothing on screen said any of that was happening.
+#[test]
+fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.type_in(b"echo BEFORE_THE_MOVE\n");
+    assert!(
+        ui.wait_for("BEFORE_THE_MOVE", Duration::from_secs(10))
+            .is_some()
+    );
+
+    // A second space with a terminal in it, then close that terminal, which is the only way
+    // to reach a space that is empty and stays empty.
+    ui.command(b'w');
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the new space never came up with a terminal: {:?}, daemon said: {}",
+        ui.tab_bar(),
+        ui.daemon_log()
+    );
+    ui.command(b'x');
+    assert!(
+        ui.wait_for("this space is empty", Duration::from_secs(15))
+            .is_some(),
+        "an empty space does not say so:\n{}",
+        ui.painted
+    );
+
+    // Now type. Not one byte of it may reach the terminal in the other space.
+    ui.painted.clear();
+    ui.type_in(b"echo LEAKED_INTO_THE_OTHER_SPACE\n");
+    let _ = ui.wait_for("never appears", Duration::from_secs(2));
+    assert!(
+        !ui.saw("LEAKED_INTO_THE_OTHER_SPACE"),
+        "a keystroke reached a terminal in a space that was left:\n{}",
+        ui.painted
+    );
+
+    // Leave the empty space and come back to it, which is the other way in: entering a
+    // space that has nothing in it has to take the keyboard out of the terminal it left,
+    // and not merely refuse to move it.
+    ui.command(b's');
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(15)),
+        "ctrl-a s did not go back to the first space: {:?}",
+        ui.tab_bar()
+    );
+    ui.command(b's');
+    assert!(
+        ui.wait_for("this space is empty", Duration::from_secs(15))
+            .is_some(),
+        "ctrl-a s did not return to the empty space:\n{}",
+        ui.painted
+    );
+    ui.painted.clear();
+    ui.type_in(b"echo LEAKED_ON_THE_WAY_BACK\n");
+    let _ = ui.wait_for("never appears", Duration::from_secs(2));
+    assert!(
+        !ui.saw("LEAKED_ON_THE_WAY_BACK"),
+        "entering an empty space left the keyboard in the space it came from:\n{}",
+        ui.painted
+    );
+
+    // And the way out is still there: a terminal started here belongs to this space.
+    ui.command(b'c');
+    assert!(
+        ui.wait_for_tabs(|bar| bar.contains('['), Duration::from_secs(15)),
+        "ctrl-a c in an empty space did not start a terminal: {:?}",
+        ui.tab_bar()
+    );
+    ui.type_in(b"echo BACK_IN_BUSINESS\n");
+    assert!(
+        ui.wait_for("BACK_IN_BUSINESS", Duration::from_secs(10))
+            .is_some(),
+        "the new terminal does not take the keyboard:\n{}",
+        ui.painted
+    );
+}
+
+/// G12.12: two spaces made in the same breath get two names and two terminals.
+///
+/// The name is counted off the list of spaces the client has, and neither request has been
+/// answered yet when the second one is sent, so both counted the same list and both came out
+/// as `space 2`: two rows in the panel with one name on them, and no way to tell which is
+/// which.
+///
+/// What this gate does not reach is the other half of the same moment, both answers landing
+/// in one read. They are folded one at a time and acted on once, after the read is drained,
+/// so a single slot would keep the second and drop the first. That is held by construction
+/// instead, with a queue: it could not be provoked from the outside here, the two answers
+/// arriving in separate reads every time, and a gate that cannot go red is not a gate.
+#[test]
+fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    // One write, so both requests leave the client together and the daemon's two answers
+    // arrive in the same read. That is the case the client used to drop half of: the
+    // answers are folded one at a time and acted on once, after the whole read is drained.
+    ui.type_in(b"\x01w\x01w");
+
+    assert!(
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW + 2,
+            |line| line.contains("space 3"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the second space never appeared: {:?}, daemon said: {}",
+        ui.panel_line(FIRST_SPACE_ROW + 2),
+        ui.daemon_log()
+    );
+
+    // Every space, walked from where the interface left off, has to have a tab in it.
+    for step in 0..3 {
+        assert!(
+            ui.wait_for_tabs(|bar| bar.contains('['), Duration::from_secs(15)),
+            "a space came up with no terminal in it after {step} moves: {:?}\n{}",
+            ui.tab_bar(),
+            ui.painted
+        );
+        ui.command(b's');
+    }
+}

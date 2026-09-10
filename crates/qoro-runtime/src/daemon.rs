@@ -1525,9 +1525,20 @@ async fn handle_control(
                         // place. The wrappers have already been seen through by the time
                         // the name is stored, so there is nothing left here to unwrap and
                         // no argv to pass.
+                        //
+                        // A terminal behind a namespace counts too, and it is the case that
+                        // matters most: an agent started with `docker run` is one this
+                        // daemon cannot read at all, so it can never be named, and a panel
+                        // that listed only what it could name would leave the one terminal
+                        // nobody can see into off the screen entirely. The row says
+                        // `behind docker` rather than claiming a program, so it promises
+                        // only what is known. The cost is a row for a `docker ps` that is
+                        // not an agent, which is a row too many rather than a terminal
+                        // missing.
                         agent: program
                             .as_deref()
-                            .is_some_and(|p| qoro_domain::program::identify(p, &[]).agent),
+                            .is_some_and(|p| qoro_domain::program::identify(p, &[]).agent)
+                            || behind.is_some(),
                         program,
                         behind,
                         state,
