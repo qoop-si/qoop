@@ -1,0 +1,15 @@
+[package]
+name = "qoro-tui"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qoro-proto = { path = "../qoro-proto" }
+qoro-runtime = { path = "../qoro-runtime" }
+bytes = { workspace = true }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

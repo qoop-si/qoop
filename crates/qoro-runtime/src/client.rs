@@ -397,6 +397,94 @@ impl RenderStream {
     }
 }
 
+/// One thing the daemon said.
+///
+/// A client that draws an index needs both lanes: the renders it subscribes to and the
+/// answers to the questions it asked. Decoding them in two places means two reassemblers
+/// fed from one socket, and the one that is not currently reading silently drops the
+/// other's frames, which is a bug that only appears when both lanes are busy.
+#[derive(Debug)]
+pub enum Incoming {
+    Render {
+        terminal: u32,
+        snapshot: SnapshotWire,
+    },
+    Control(crate::control::ControlResponse),
+    /// Something changed that nobody asked about. A client that ignores these still works,
+    /// it just finds out later.
+    Event(crate::control::EventMessage),
+}
+
+/// Both lanes of the connection, decoded together.
+///
+/// Two reassemblers and not one, because a chunk sequence is identified by its stream and
+/// the control channel numbers its own from zero: a control message and a terminal message
+/// could otherwise be spliced into each other.
+#[derive(Default)]
+pub struct Connection {
+    renders: RenderStream,
+    control: Reassembler,
+    events: Reassembler,
+}
+
+impl Connection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many renders have arrived, which is what an acknowledgement reports.
+    pub fn renders(&mut self) -> &mut RenderStream {
+        &mut self.renders
+    }
+
+    pub fn drain(&mut self, inbuf: &mut BytesMut) -> io::Result<Vec<Incoming>> {
+        let mut out = Vec::new();
+        while let Some(frame) = Frame::decode(inbuf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        {
+            let channel = frame.channel;
+            let terminal = frame.stream;
+            let target = match channel {
+                Channel::Terminal => &mut self.renders.reassembler,
+                Channel::Control => &mut self.control,
+                Channel::Event => &mut self.events,
+                _ => continue,
+            };
+            let message = target
+                .push(frame, std::time::Instant::now())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let Some(message) = message else { continue };
+            match channel {
+                Channel::Terminal => {
+                    if let Ok(snapshot) = serde_json::from_slice::<SnapshotWire>(&message.body) {
+                        self.renders.received += 1;
+                        out.push(Incoming::Render { terminal, snapshot });
+                    }
+                }
+                Channel::Control => {
+                    if let Ok(response) =
+                        serde_json::from_slice::<crate::control::ControlResponse>(&message.body)
+                    {
+                        out.push(Incoming::Control(response));
+                    }
+                }
+                Channel::Event => {
+                    // An event this build does not know about is ignored rather than
+                    // treated as a protocol error: ADR-010's rule is that a newer daemon
+                    // may say more than an older client understands.
+                    if let Ok(event) =
+                        serde_json::from_slice::<crate::control::EventMessage>(&message.body)
+                    {
+                        out.push(Incoming::Event(event));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Encode a control request, chunked like any other message.
 ///
 /// The control channel carries requests a client is waiting on, so it gets its own stream

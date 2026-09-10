@@ -12,6 +12,7 @@
 //! make this gate pass forever, and a gate that cannot fail is worse than no gate: it is a
 //! claim in the plan with nothing behind it.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -262,6 +263,42 @@ fn g1_20_an_idle_attached_client_costs_almost_nothing() {
     assert!(
         used <= CLIENT_BUDGET,
         "an idle attached client used {used:?} of CPU in 60 s, budget {CLIENT_BUDGET:?}"
+    );
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// G12.5: the interface costs nothing while nothing happens, with a workspace open.
+///
+/// One terminal is the easy case and it is already G1.20. This one has eight, because the
+/// interface draws an index of all of them and subscribes to one: an implementation that
+/// subscribed to every terminal, or that redrew the index on a timer, would pass at one
+/// and fail here. It is also the shape of a real workspace.
+#[test]
+fn g12_5_the_interface_with_eight_terminals_costs_almost_nothing_while_idle() {
+    let daemon = start_daemon();
+    let mut client = attach(&daemon.socket);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Seven more, from the keyboard, which is the only way a person makes one.
+    let mut stdin = client.stdin.take().expect("the client's stdin");
+    for _ in 0..7 {
+        stdin.write_all(&[0x01]).expect("prefix");
+        stdin.flush().expect("flush");
+        std::thread::sleep(Duration::from_millis(80));
+        stdin.write_all(b"c").expect("create");
+        stdin.flush().expect("flush");
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    // Long enough for eight shells to print their prompts and go quiet.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let pid = client_pid(client.id());
+    let used = measure(pid, Duration::from_secs(60), "G12.5 interface");
+    assert!(
+        used <= CLIENT_BUDGET,
+        "an idle interface with eight terminals used {used:?} of CPU in 60 s, budget \
+         {CLIENT_BUDGET:?}"
     );
     let _ = client.kill();
     let _ = client.wait();

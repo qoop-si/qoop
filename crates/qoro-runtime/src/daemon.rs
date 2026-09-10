@@ -950,6 +950,40 @@ async fn serve_client(
         subscribe(&terminals, &subscriptions, &renders, first);
     }
 
+    // News for this connection, on its own channel. One task per connection rather than a
+    // branch inside the writer: the writer's loop is the render hot path, and a lagging
+    // broadcast receiver there would make a slow client's problem into everyone's.
+    let event_tx = control_tx.clone();
+    let mut changes = agents.subscribe();
+    let events_task = tokio::spawn(async move {
+        loop {
+            let terminal = match changes.recv().await {
+                Ok(terminal) => terminal,
+                // Lagged means this connection missed some. The right answer is to say so
+                // once rather than to replay: the message is "look again", and looking
+                // again once covers everything that was missed.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let body = match serde_json::to_vec(&crate::control::EventMessage::AgentChanged {
+                terminal,
+            }) {
+                Ok(body) => body,
+                Err(_) => return,
+            };
+            let mut out = BytesMut::new();
+            if Frame::new(Channel::Event, 0, Bytes::from(body))
+                .encode(&mut out)
+                .is_err()
+            {
+                return;
+            }
+            if event_tx.send(out).await.is_err() {
+                return;
+            }
+        }
+    });
+
     let writer_renders = renders.clone();
     let writer = tokio::spawn(async move {
         // One sequence per stream, because the reassembler requires consecutive numbers
@@ -1130,6 +1164,7 @@ async fn serve_client(
 
     // One exit. Aborting the writer is what drops the write half and closes the socket, so
     // it has to happen however the loop ended.
+    events_task.abort();
     renders.close();
     for (_, task) in std::mem::take(&mut *subscriptions.lock().unwrap()) {
         task.abort();
@@ -1955,6 +1990,9 @@ async fn settle_loop(agents: Arc<crate::agents::AgentRegistry>, queue: Arc<Settl
             streams.sort_unstable();
             streams.dedup();
             for stream in &streams {
+                // The registry announces the ones that moved. `refresh_foreground` answers
+                // `None` for a terminal whose leader is what it was, so a settle step that
+                // finds nothing tells nobody.
                 agents.refresh_foreground(*stream);
             }
         }

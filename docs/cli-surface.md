@@ -4,8 +4,8 @@ Owned by `qoro-cli` and grown with it from milestone 1 onward, so that the enume
 exists before a gate needs it rather than being invented when one does.
 
 Gate G9.1 reads this file: with the control-plane host blackholed, every subcommand here
-produces the same result as when it is reachable. Three rows are listed but not run by it:
-`qoro` and `qoro daemon` do not return, and `qoro relay` starts a daemon and then prints
+produces the same result as when it is reachable. Four rows are listed but not run by it:
+`qoro`, `qoro attach` and `qoro daemon` do not return, and `qoro relay` starts a daemon and then prints
 whatever that daemon says to a client rather than a result of its own. They are still
 required to be here, and the gate asserts that this table and `qoro --help` name the same
 set, which is what stopped `relay` from staying undocumented after milestone 6 added it.
@@ -17,7 +17,8 @@ a claim nobody has to keep.
 
 | Command | What it does | Needs the network |
 |---|---|---|
-| `qoro` | attach to a terminal, starting the daemon if there is not one | no |
+| `qoro` | open the interface, starting the daemon if there is not one | no |
+| `qoro attach` | attach to one terminal, with no interface around it | no |
 | `qoro daemon` | run the daemon in the foreground | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |

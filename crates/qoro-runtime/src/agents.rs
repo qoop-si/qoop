@@ -57,12 +57,36 @@ pub struct TerminalAgent {
 
 pub struct AgentRegistry {
     watch: ProcWatch,
+    /// Terminals whose agent has moved, for anyone drawing an index.
+    ///
+    /// Here rather than at the call sites, and the reason is a bug that shipped for an
+    /// afternoon: the notification was sent from the two places that looked like the only
+    /// ones, the process watcher and the settle loop, and the third was the read loop's own
+    /// `note_foreground`. Interrupting a command therefore updated the registry and told
+    /// nobody, so an index showed a command that had already finished. A registry that
+    /// announces its own changes cannot have a path that forgets to.
+    changes: tokio::sync::broadcast::Sender<u32>,
     /// Which terminal a watched pid belongs to.
     by_pid: Mutex<HashMap<i32, u32>>,
     terminals: Mutex<BTreeMap<u32, TerminalAgent>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
+}
+
+impl AgentRegistry {
+    /// Watch for terminals whose agent has moved.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<u32> {
+        self.changes.subscribe()
+    }
+
+    /// Say that a terminal's agent is not what it was.
+    ///
+    /// Private, and called from every path that changes one. A send with no receivers is
+    /// not an error: nobody is drawing an index.
+    fn announce(&self, stream: u32) {
+        let _ = self.changes.send(stream);
+    }
 }
 
 fn fresh_belief(generation: GenerationId) -> AgentBelief {
@@ -83,6 +107,7 @@ impl AgentRegistry {
             by_pid: Mutex::new(HashMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
+            changes: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -172,6 +197,10 @@ impl AgentRegistry {
             }
         };
         agent.leader = leader;
+        // Dropped before announcing: a subscriber that reacts by asking what is there would
+        // otherwise be asking while this lock is still held.
+        drop(terminals);
+        self.announce(stream);
         Some(generation)
     }
 
@@ -212,6 +241,9 @@ impl AgentRegistry {
                 agent.identity = identity_of(pid, generation);
             }
             changed.push(stream);
+        }
+        for stream in &changed {
+            self.announce(*stream);
         }
         changed
     }

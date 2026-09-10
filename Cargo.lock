@@ -477,10 +477,12 @@ dependencies = [
  "bytes",
  "libc",
  "qoro-proto",
+ "qoro-pty",
  "qoro-runtime",
  "qoro-setup",
  "qoro-store",
  "qoro-testkit",
+ "qoro-tui",
  "serde_json",
  "tempfile",
  "tokio",
@@ -640,6 +642,17 @@ dependencies = [
  "qoro-proto",
  "qoro-runtime",
  "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "qoro-tui"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "qoro-proto",
+ "qoro-runtime",
  "tempfile",
  "tokio",
 ]

@@ -203,3 +203,19 @@ mod tests {
         assert!(serde_json::from_slice::<ControlRequest>(bad).is_err());
     }
 }
+
+/// What the daemon says without being asked.
+///
+/// On its own channel, because a notification is not an answer: a client waiting for the
+/// response to its own request must not have to filter somebody else's news out of the
+/// same lane, and a client that ignores events entirely still works.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum EventMessage {
+    /// The process in this terminal, or what is believed about it, is not what it was.
+    ///
+    /// Deliberately not the new state: a notification that carries state is a second source
+    /// of truth that can arrive out of order with the first. This says where to look, and
+    /// `ListAgents` says what is there.
+    AgentChanged { terminal: TerminalStream },
+}

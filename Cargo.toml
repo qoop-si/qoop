@@ -14,6 +14,7 @@ members = [
     "crates/qoro-support",
     "crates/qoro-terminal",
     "crates/qoro-cli",
+    "crates/qoro-tui",
     "crates/qoro-collab",
     "crates/qoro-testkit",
     "crates/qoro-attention",

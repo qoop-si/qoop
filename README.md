@@ -7,8 +7,22 @@ cd my-project
 qoro
 ```
 
-That reaches a real shell. No account, no wizard, no manifest. Press ctrl-q and the shell
-keeps running; run `qoro` again and you are back in the same one.
+That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
+no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you are back in
+the same one.
+
+```
+ 1 zsh              │~/my-project $ cargo test
+>2 claude   working │
+ 3 sh               │
+                    │
+ctrl-a n next  ctrl-a c new  ctrl-a x close  ctrl-a d detach
+```
+
+The index says which terminal each agent is in and what it is doing, and it changes when the
+process does, including for a command that prints nothing at all. `ctrl-a` then a key moves
+between terminals, makes one or closes one. Nothing polls: eight terminals open and nobody
+typing costs 105 microseconds of client CPU a minute.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
 [ADR-021](docs/adr/ADR-021-windows.md) says what one would have to include.

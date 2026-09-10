@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 qoro-setup = { path = "../qoro-setup" }
 qoro-runtime = { path = "../qoro-runtime" }
+qoro-tui = { path = "../qoro-tui" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 bytes = { workspace = true }
 serde_json = { workspace = true }
@@ -20,6 +21,7 @@ qoro-proto = { path = "../qoro-proto" }
 
 [dev-dependencies]
 bytes = { workspace = true }
+qoro-pty = { path = "../qoro-pty" }
 qoro-proto = { path = "../qoro-proto" }
 serde_json = { workspace = true }
 qoro-store = { path = "../qoro-store" }

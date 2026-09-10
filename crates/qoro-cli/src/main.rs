@@ -49,6 +49,7 @@ fn main() -> std::io::Result<()> {
             );
             Ok(())
         }
+        Some("attach") => run_attach(),
         Some("relay") => run_relay(),
         Some("setup") => run_setup(&args),
         Some("--version" | "-V") => {
@@ -61,6 +62,7 @@ fn main() -> std::io::Result<()> {
                  \n\
                  usage:\n\
                  \x20 qoro            attach to a terminal, starting the daemon if needed\n\
+                 \x20 qoro attach     attach to one terminal, with no interface around it\n\
                  \x20 qoro daemon     run the daemon in the foreground\n\
                  \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
@@ -124,6 +126,18 @@ fn run_client() -> std::io::Result<()> {
     // and exits without touching it.
     ensure_daemon(&socket)?;
 
+    let rt = tokio::runtime::Runtime::new()?;
+    // The interface, not the bare attach. `qoro attach` is still there for the one terminal
+    // case and for anything driving this program from a script, because a full screen
+    // interface is the wrong thing to hand a pipe.
+    rt.block_on(qoro_tui::run(&socket))
+}
+
+/// Attach to one terminal, with no interface around it.
+fn run_attach() -> std::io::Result<()> {
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    ensure_daemon(&socket)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(attach(&socket))
 }

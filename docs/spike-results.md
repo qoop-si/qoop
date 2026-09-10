@@ -19,10 +19,10 @@ of the milestone 1 exit criteria, not a later nicety.
 ## spike-pty: is the async reactor a viable PTY driver? (ADR-002)
 
 ```text
-[1] async read/write on PTY master: PASS (83 bytes in 9.089167ms)
-[2] tcgetpgrp on master: PASS (Some(96254))
+[1] async read/write on PTY master: PASS (83 bytes in 7.774917ms)
+[2] tcgetpgrp on master: PASS (Some(26918))
 [3] resize observed by child (stty size): PASS
-[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.00103475s)
+[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.002931167s)
 [5] child exit status propagates: PASS (Some(7), 14 trailing bytes)
 SPIKE-PTY: ALL PASS
 exit=0
@@ -57,7 +57,7 @@ The one-task-per-terminal advantage is asserted, not measured, until gate G2.1.
 [3] bounded scrollback: PASS (history=1000, screen=24, total=1024)
 [4] damage tracking: PASS (quiet lines=[0, 23], after write to row 5 lines=[4, 23])
 [5] resize to 132x40: PASS (cols=132, lines=40, last non-empty Some("line 2999"))
-[6] parse throughput: 125 MiB/s (1.00 MiB in 8.011959ms)
+[6] parse throughput: 129 MiB/s (1.00 MiB in 7.747208ms)
 
 SPIKE-TERM: ALL PASS
 exit=0
@@ -80,11 +80,11 @@ the check 5 resize assertion verifies dimensions only, not content preservation.
 
 ```text
 [0] openpty default FD_CLOEXEC: master=false, slave=false (both false means every spawn leaks every other terminal's fds unless we set it)
-[1] fd inheritance: without CLOEXEC the child sees ["/dev/ptmx", "/dev/ttys023", "/dev/ttys029"]; with CLOEXEC it sees ["/dev/ttys031"] -> PASS
-[2] silent exec transition: pgrp Some(96274) -> Some(96274), bytes emitted after the command line: 14
+[1] fd inheritance: without CLOEXEC the child sees ["/dev/ptmx", "/dev/ttys029", "/dev/ttys030"]; with CLOEXEC it sees ["/dev/ttys032"] -> PASS
+[2] silent exec transition: pgrp Some(26929) -> Some(26929), bytes emitted after the command line: 14
     note: pgrp is unchanged by exec, so a tcgetpgrp comparison alone cannot see it
 [3] kqueue EVFILT_PROC on an unprivileged child: exec=true fork=false -> PASS
-[4] OS-measured idle cost over 3.001074709s: 21µs of CPU (poll rc=0, revents=0x0, drained 16 prompt bytes) -> PASS
+[4] OS-measured idle cost over 3.002026083s: 21µs of CPU (poll rc=0, revents=0x0, drained 16 prompt bytes) -> PASS
 
 SPIKE-PROC: ALL PASS
 exit=0
@@ -143,10 +143,10 @@ A reviewer's measurement is a lead, not a fact. Each claim below was reproduced 
 scratch here before any ADR was changed.
 
 ```text
-[A1] shell /bin/bash: leader pid=96282 pgid=96282 sid=96282 | job pid=96283 pgid=96283 sid=96282
+[A1] shell /bin/bash: leader pid=26936 pgid=26936 sid=26936 | job pid=26937 pgid=26937 sid=26936
      job is in the leader's session: true; job has its own process group: true; it ignores SIGHUP
-[A2a] controlling-tty enumeration BEFORE teardown (dev=268435479): 2 members, job found=true
-     after HUP/TERM/KILL on -96282: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
+[A2a] controlling-tty enumeration BEFORE teardown (dev=268435485): 2 members, job found=true
+     after HUP/TERM/KILL on -26936: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
 [A2b] enumeration AFTER the leader died: 0 members, job found=false
       the controlling terminal is disassociated when the session leader dies, so the containment set must be a union across rounds and can never shrink
 [A2] union of enumerations: 2 members, 2 distinct groups, job found=true
@@ -157,7 +157,7 @@ scratch here before any ADR was changed.
 [C] master after child exit, 5 rounds: ["rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0"]
     read()==0 in 5/5 rounds, EIO in 0/5 -> CLAIM C CONFIRMED: end of stream is not WouldBlock, so an AsyncFd loop that only handles WouldBlock spins forever
 [D] 1 MiB paste with NO newline into a canonical-mode child: wrote 1048576 bytes (EAGAIN 0) -> child received 0 bytes -> CLAIM D CONFIRMED: the line discipline discards it while write() reports success
-    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 628) -> child received 1048576 (100.0%)
+    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 525) -> child received 1048576 (100.0%)
     -> the daemon's own byte-bounded queue is not what fails; the tty line discipline is
 
 SPIKE-TEARDOWN: COMPLETE
@@ -256,7 +256,7 @@ engine: alacritty_terminal 0.26, 100 terminals per measurement, current RSS (not
 one configuration per process so no row inherits another's high-water mark
  80x24  scrolling_history=1000  never scrolled                         102 KiB per terminal (history_size=0)
  80x24  scrolling_history=1000  filled                                2143 KiB per terminal (history_size=1000)
-200x50  scrolling_history=1000  filled                                5710 KiB per terminal (history_size=1000)
+200x50  scrolling_history=1000  filled                                5711 KiB per terminal (history_size=1000)
 200x50  scrolling_history=200   one line scrolled, 200 line budget     523 KiB per terminal (history_size=0)
 200x50  scrolling_history=200   filled to a 200 line budget           5710 KiB per terminal (history_size=200)
 200x50  scrolling_history=1001  filled, 1001 lines                   10883 KiB per terminal (history_size=1001)
