@@ -1230,3 +1230,68 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
         ui.tab_bar()
     );
 }
+
+/// G12.15: a shell that exits on its own takes its tab with it, and the keyboard goes to
+/// what is left.
+///
+/// `exit` is how a person closes a terminal, and it never goes through this client: the
+/// daemon notices the child is gone and the only sign of it is that the index has one fewer
+/// row. Measured before this gate: the tab came off the bar and the focus stayed on a
+/// terminal that no longer existed, with its dead screen still painted and every keystroke
+/// after it going nowhere. Nothing on screen said so and no key got out of it.
+///
+/// And the last one ends the interface. With no terminals left it is a way in to nothing,
+/// and a person who does not know `ctrl-q` is stuck in it.
+#[test]
+fn g12_15_a_shell_that_exits_takes_its_tab_and_hands_the_keyboard_on() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.command(b'c');
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second terminal never appeared: {:?}",
+        ui.tab_bar()
+    );
+
+    ui.type_in(b"exit\n");
+    assert!(
+        ui.wait_for_tabs(
+            |bar| !bar.contains(" 2 ") && !bar.contains("[2"),
+            Duration::from_secs(20)
+        ),
+        "the tab of the shell that exited is still on the bar: {:?}",
+        ui.tab_bar()
+    );
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(15)),
+        "nothing has the keyboard after a shell exited: {:?}",
+        ui.tab_bar()
+    );
+    // And it is really the keyboard, not just a bracket: the terminal that is left answers.
+    ui.painted.clear();
+    ui.type_in(b"echo AFTER_THE_EXIT\n");
+    assert!(
+        ui.wait_for("AFTER_THE_EXIT", Duration::from_secs(15))
+            .is_some(),
+        "the terminal left after an exit does not answer:\n{}",
+        ui.painted
+    );
+
+    // The last one ends the interface, and it ends it the way detaching does: the outer
+    // terminal gets its screen back.
+    ui.type_in(b"exit\n");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && ui.child.try_wait().ok().flatten().is_none() {
+        let _ = ui.wait_for("never appears", Duration::from_millis(200));
+    }
+    let status = ui
+        .child
+        .try_wait()
+        .expect("wait")
+        .unwrap_or_else(|| panic!("the interface is still running with no terminals in it"));
+    assert!(status.success(), "the interface exited with {status}");
+    assert!(
+        ui.saw("\x1b[?1049l"),
+        "the interface did not leave the alternate screen"
+    );
+}

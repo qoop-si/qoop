@@ -45,6 +45,8 @@ struct State {
     wants_terminal_in: Vec<i64>,
     /// Whether this client has ever had a terminal on screen.
     adopted: bool,
+    /// Set when there is nothing left to be an interface to.
+    done: bool,
     /// Spaces asked for and not yet answered for.
     ///
     /// Only the naming needs this, and the naming needs it badly: two presses of `ctrl-a w`
@@ -195,6 +197,7 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         wants_terminal_in: Vec::new(),
         adopted: false,
         creating: 0,
+        done: false,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -514,6 +517,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                         wr.write_all(&bytes).await?;
                         dirty = true;
                     }
+                    if state.done {
+                        return Ok(());
+                    }
                     if refresh {
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
@@ -696,6 +702,30 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     state.focused = first.terminal;
                 }
             }
+            // A terminal can go away without this client having asked: its shell exited, or
+            // somebody closed it from another client. The daemon says so by changing what
+            // the index holds and in no other way, so this is the only place that can catch
+            // the keyboard up with it. Measured before this: typing `exit` took the tab off
+            // the bar and left the focus on a terminal that no longer existed, with the dead
+            // screen still painted and every keystroke going nowhere.
+            if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
+                state.focused = 0;
+                state.snapshot = None;
+                state.pending_focus = agents
+                    .iter()
+                    .find(|r| state.space.is_none_or(|s| r.workspace == s))
+                    .map(|r| r.terminal);
+                if state.pending_focus.is_none() {
+                    state.message =
+                        Some("this space is empty, ctrl-a c starts a terminal".to_string());
+                }
+            }
+            // Nothing left anywhere. The interface is a way into terminals, so with none of
+            // them it is a screen a person has to know a key to escape from. Ending is what
+            // every multiplexer does when its last window closes, and the daemon stays: it
+            // is the client that goes.
+            state.done = state.adopted && agents.is_empty();
+
             // A terminal that has just started needing a person. The bell is the local
             // notification: it is what the person's own terminal emulator turns into a
             // badge or a bounce, and it is the one channel that works with no account, no
