@@ -287,6 +287,12 @@ pub struct TerminalHandle {
     /// be a row in a table nothing can ever point at again.
     pub name: Option<String>,
     pub id: TerminalId,
+    /// How many rows of this terminal have gone behind the screen and been written down.
+    ///
+    /// Stamped onto every snapshot, so a client that is reading back through them can keep
+    /// its place while the terminal keeps printing. Read from here rather than asked for,
+    /// because asking would be a round trip per frame.
+    pub history: Arc<std::sync::atomic::AtomicU64>,
     /// The token this terminal's child was launched with. Held so that a later observation
     /// can be checked against it without asking the child.
     pub token: qoro_domain::CapabilityToken,
@@ -1090,6 +1096,7 @@ async fn serve_client(
     });
 
     let writer_renders = renders.clone();
+    let writer_terminals = terminals.clone();
     let writer = tokio::spawn(async move {
         // One sequence per stream, because the reassembler requires consecutive numbers
         // within a chunk sequence and streams are reassembled independently.
@@ -1105,7 +1112,14 @@ async fn serve_client(
 
             let mut rendered = 0usize;
             for (stream, snapshot) in writer_renders.take() {
-                let body = match serde_json::to_vec(&SnapshotWire::from(&snapshot)) {
+                let mut wire = SnapshotWire::from(&snapshot);
+                // What is behind this terminal's screen, as of now. The renderer has the
+                // stream, and the registry has the count.
+                wire.behind = writer_terminals
+                    .get(stream)
+                    .map(|h| h.history.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let body = match serde_json::to_vec(&wire) {
                     Ok(b) => b,
                     Err(_) => return,
                 };
@@ -1581,6 +1595,49 @@ async fn handle_control(
                 reason: format!("no terminal {terminal}"),
             },
         },
+        ControlRequest::Scrollback {
+            terminal, up, rows, ..
+        } => {
+            let Some(dir) = history_dir.as_ref().map(|d| d.join(terminal.to_string())) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "this daemon keeps no history".to_string(),
+                };
+            };
+            // Capped, because the count comes from a client and a client that asks for a
+            // hundred million rows would be asking the daemon to allocate them.
+            let rows = rows.min(MAX_SCROLLBACK_ROWS);
+            // On the blocking pool with a deadline, like every other read of a disk
+            // (ADR-011): a hung filesystem under the history must not hang the daemon.
+            let read = tokio::time::timeout(
+                crate::store::STORE_DEADLINE,
+                tokio::task::spawn_blocking(move || {
+                    let history = qoro_store::History::open(&dir)?;
+                    let total = history.len();
+                    let from = total.saturating_sub(up as u64);
+                    let lines = history.read(from, rows)?;
+                    Ok::<_, qoro_store::StoreError>((total, from, lines))
+                }),
+            )
+            .await;
+            match read {
+                Ok(Ok(Ok((total, from, lines)))) => ControlResponse::Scrollback {
+                    id,
+                    terminal,
+                    from,
+                    total,
+                    lines,
+                },
+                Ok(Ok(Err(e))) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the scrollback could not be read: {e}"),
+                },
+                _ => ControlResponse::Failed {
+                    id,
+                    reason: "the scrollback did not answer in time".to_string(),
+                },
+            }
+        }
         ControlRequest::Shutdown { .. } => {
             // Set before anything is closed. Every terminal is about to end, and a
             // terminal ending after this is the daemon going rather than a person closing
@@ -1941,6 +1998,13 @@ pub struct SnapshotWire {
     /// gets a screen it understands and one fewer thing it can do.
     #[serde(default)]
     pub modes: ModesWire,
+    /// How many rows have gone behind this terminal's screen and been written down.
+    ///
+    /// What lets a client reading back through them hold its place while the terminal
+    /// keeps printing: without it the view is a distance from a bottom that keeps moving,
+    /// and a person reading is dragged along by the output they are trying to read past.
+    #[serde(default)]
+    pub behind: u64,
 }
 
 /// What the program in a terminal has asked its terminal to be, as it crosses the socket.
@@ -2017,6 +2081,7 @@ impl From<&Snapshot> for SnapshotWire {
                 .iter()
                 .map(|row| row.iter().map(SpanWire::from).collect())
                 .collect(),
+            behind: 0,
             modes: ModesWire {
                 alt_screen: s.modes.alt_screen,
                 mouse_reporting: s.modes.mouse_reporting,
@@ -2131,9 +2196,11 @@ pub fn open_terminal(
     let token = crate::agents::mint_token(stream);
     let terminal_id = TerminalId::new(stream.to_string());
     agents.register(stream, terminal_id.clone(), token.clone());
+    let behind = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let handle = TerminalHandle {
         name,
         workspace,
+        history: behind.clone(),
         id: terminal_id,
         token: token.clone(),
         commands,
@@ -2143,7 +2210,7 @@ pub fn open_terminal(
     let registry = terminals.clone();
     let spill = crate::spill::SpillRing::new();
     if let Some(dir) = history_dir {
-        spawn_history_writer(dir.join(stream.to_string()), spill.clone());
+        spawn_history_writer(dir.join(stream.to_string()), spill.clone(), behind.clone());
     }
     let forgetting = agents.clone();
     spawn_terminal(
@@ -2331,6 +2398,12 @@ pub(crate) fn unparsable(error: &str) -> String {
     format!("malformed control request: {error}")
 }
 
+/// The most rows one scrollback request may ask for.
+///
+/// A window's worth and then some. The count is a number from a client, and a client is
+/// not to be trusted with how much memory the daemon allocates.
+const MAX_SCROLLBACK_ROWS: usize = 500;
+
 /// How long a shutdown waits for its terminals to end before going anyway.
 ///
 /// Long enough for a shell to run its own exit, short enough that a person who typed
@@ -2344,7 +2417,11 @@ const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3)
 /// One task per terminal, on the async runtime, going to the blocking pool only when it
 /// actually writes. Not one blocking task per terminal: that would make the thread count
 /// grow with the terminal count, which is exactly what gate G2.1 forbids.
-fn spawn_history_writer(dir: PathBuf, spill: crate::spill::SpillRing) {
+fn spawn_history_writer(
+    dir: PathBuf,
+    spill: crate::spill::SpillRing,
+    rows_behind: Arc<std::sync::atomic::AtomicU64>,
+) {
     tokio::spawn(async move {
         // The open is a blocking call too, and a hundred of them at once is a hundred
         // threads.
@@ -2424,6 +2501,11 @@ fn spawn_history_writer(dir: PathBuf, spill: crate::spill::SpillRing) {
                 Ok((h, Ok(truncated))) => {
                     history = h;
                     unflushed = true;
+                    // How many rows are behind the screen now. Published here because this
+                    // is the one place that knows, and read by every snapshot, so a client
+                    // scrolled back can hold its place while the terminal keeps printing
+                    // rather than being dragged along by it.
+                    rows_behind.store(history.len(), std::sync::atomic::Ordering::Relaxed);
                     if truncated > 0 {
                         eprintln!(
                             "qorod: history for {} truncated {truncated} bytes of an \

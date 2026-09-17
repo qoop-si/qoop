@@ -264,3 +264,107 @@ fn a_shutdown_request_is_part_of_the_protocol_and_carries_an_id() {
         "the method is named on the wire, or no other client can call it"
     );
 }
+
+/// G13.8: what has scrolled past can be read back, counted from the newest row.
+///
+/// Against a real daemon and a real shell, because the point of the request is what is on
+/// the disk: the engine keeps a thousand rows of cells and the disk keeps rows of text
+/// (ADR-003), and a person scrolling back is reading the second.
+#[tokio::test]
+async fn g13_8_what_scrolled_past_is_read_back_from_the_newest_row() {
+    let d = qoro_testkit::TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let mut client = d.attach("reader").await;
+
+    // More output than a screen holds, so some of it is behind the screen rather than on
+    // it. Numbered, so which rows came back is not a matter of opinion.
+    client
+        .input_to(terminal, b"for i in $(seq 1 200); do echo row-$i; done\n")
+        .await;
+    assert!(
+        client
+            .wait_for_text_on(terminal, "row-200", qoro_testkit::PATIENCE)
+            .await
+    );
+    // The history is written by a task of its own, so it is waited for rather than
+    // assumed: a read that arrives first is a read of an empty file.
+    let mut answer = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let asked = client
+            .control(
+                &ControlRequest::Scrollback {
+                    id: "back".into(),
+                    terminal,
+                    up: 20,
+                    rows: 20,
+                },
+                qoro_testkit::PATIENCE,
+            )
+            .await;
+        if let Some(qoro_runtime::control::ControlResponse::Scrollback { total, .. }) = &asked
+            && *total > 100
+        {
+            answer = asked;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some(qoro_runtime::control::ControlResponse::Scrollback {
+        from,
+        total,
+        lines,
+        terminal: answered,
+        ..
+    }) = answer
+    else {
+        panic!("the daemon never answered with the rows that went past");
+    };
+    assert_eq!(answered, terminal);
+    assert_eq!(
+        lines.len(),
+        20,
+        "twenty rows asked for, {} back",
+        lines.len()
+    );
+    assert_eq!(
+        from,
+        total - 20,
+        "counted back from the newest row, so the answer says which rows these are"
+    );
+    // Consecutive, in order, and actually the rows that went past.
+    let numbers: Vec<i64> = lines
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("row-")?.parse().ok())
+        .collect();
+    assert_eq!(numbers.len(), 20, "the rows came back changed: {lines:?}");
+    for pair in numbers.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "the rows came back out of order or with gaps: {numbers:?}"
+        );
+    }
+
+    // Asking for more than there is answers what there is, rather than failing.
+    let all = client
+        .control(
+            &ControlRequest::Scrollback {
+                id: "everything".into(),
+                terminal,
+                up: 10_000,
+                rows: 10_000,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    let Some(qoro_runtime::control::ControlResponse::Scrollback { from, lines, .. }) = all else {
+        panic!("a request past the oldest row is not a failure");
+    };
+    assert_eq!(from, 0, "past the oldest row is the oldest row");
+    assert!(
+        lines.len() <= 500,
+        "a client asked for ten thousand rows and the daemon allocated them: {}",
+        lines.len()
+    );
+}

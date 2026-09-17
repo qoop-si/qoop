@@ -45,6 +45,23 @@ pub enum ControlRequest {
         name: Option<String>,
     },
     /// Give a workspace a different name.
+    /// Rows of a terminal's scrollback, so a person can read what has gone past.
+    ///
+    /// Read from what was written to disk rather than from the engine, which is what
+    /// ADR-003 decided: the engine keeps a thousand rows of cells and the disk keeps rows
+    /// of text, and a person scrolling back wants the second.
+    Scrollback {
+        id: String,
+        terminal: u32,
+        /// How far back the first row wanted is, counted from the newest row written.
+        ///
+        /// Counted from the newest and not from the oldest, because a client asking to
+        /// see what just went past knows how far back it wants to look and does not know
+        /// how much there is: asking from the oldest end would need a round trip to find
+        /// out how many rows exist before the first useful question could be asked.
+        up: usize,
+        rows: usize,
+    },
     /// End this daemon, and with it every terminal it owns.
     ///
     /// A request rather than a signal, so the daemon tears its terminals down the way
@@ -150,6 +167,7 @@ impl ControlRequest {
             | Self::RenameTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
             | Self::Shutdown { id, .. }
+            | Self::Scrollback { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -193,6 +211,17 @@ pub enum ControlResponse {
         workspace: i64,
     },
     /// A terminal or a workspace now carries a different name.
+    /// Rows of scrollback, and how many there are in total.
+    ///
+    /// The total is what lets a client turn a wheel into a position: without it a client
+    /// would have to discover the end of the history by asking past it.
+    Scrollback {
+        id: String,
+        terminal: u32,
+        from: u64,
+        total: u64,
+        lines: Vec<String>,
+    },
     /// The daemon heard, and is going. The count is what it is ending.
     Stopping {
         id: String,
@@ -301,6 +330,7 @@ impl ControlResponse {
             | Self::WorkspaceCreated { id, .. }
             | Self::Renamed { id, .. }
             | Self::Stopping { id, .. }
+            | Self::Scrollback { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }

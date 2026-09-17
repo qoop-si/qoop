@@ -19,6 +19,47 @@ use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
 use crate::{sidebar, tabs};
 
+/// What to ask for, given where the person has scrolled to.
+///
+/// A window's worth, plus the same again above it, so an unhurried scroll finds the next
+/// rows already here rather than waiting for a round trip at every notch.
+fn behind_request(terminal: u32, scroll: usize, pane_rows: usize) -> ControlRequest {
+    // The window needs the rows from `scroll` back to `scroll` minus a screen. Asked for
+    // with a screen of margin at each end, so an unhurried scroll finds the next rows
+    // already here rather than waiting for a round trip at every notch.
+    ControlRequest::Scrollback {
+        id: "behind".to_string(),
+        terminal,
+        up: scroll + pane_rows,
+        rows: pane_rows * 3,
+    }
+}
+
+/// What a client has been told about the rows behind the screen.
+///
+/// A window's worth at a time, fetched as the person scrolls into it, because the whole
+/// history of a terminal that has been running a week is not something to hold in a
+/// client in order to draw twenty rows of it.
+#[derive(Clone, Debug, Default)]
+pub struct Behind {
+    /// Which terminal these rows belong to. A client that kept another terminal's rows
+    /// would paint them under this one's tab bar.
+    pub terminal: u32,
+    /// The index of `lines[0]`, counted from the oldest row ever written.
+    pub from: u64,
+    pub lines: Vec<String>,
+    /// How many rows there are behind the screen in total.
+    pub total: u64,
+}
+
+impl Behind {
+    /// One row of the history, by its own index, if this client has it.
+    pub fn row(&self, at: u64) -> Option<&str> {
+        let offset = at.checked_sub(self.from)? as usize;
+        self.lines.get(offset).map(String::as_str)
+    }
+}
+
 /// How many rows one notch of the wheel moves, where the interface decides rather than
 /// the program. Three is what a terminal sends and what a hand expects.
 const WHEEL_ROWS: usize = 3;
@@ -128,6 +169,19 @@ struct State {
     palette: Option<Palette>,
     /// The start of a palette key sequence the read ended in the middle of.
     palette_pending: Vec<u8>,
+    /// The row the top of the pane is pinned to, when the pane is not at the bottom.
+    ///
+    /// An absolute row number and not a distance, because a distance from the bottom is a
+    /// distance from something that moves: a person scrolled back to read while an agent
+    /// prints would be dragged down the screen by the output they are reading past. Pinned
+    /// to a row, the text under their eyes stays still.
+    ///
+    /// `None` is the live screen, which is where every key press puts it back: typing is
+    /// talking to the program, and the program is at the bottom.
+    anchor: Option<u64>,
+    /// The rows behind the screen, as far back as they have been asked for, and how many
+    /// there are in total.
+    behind: Behind,
     /// Text being selected with the mouse, or selected and still shown.
     ///
     /// Kept after the button comes up rather than cleared, because a person who has just
@@ -154,6 +208,10 @@ impl State {
             collapsed: self.collapsed,
             reading: self.reading,
             selection: self.selection,
+            scroll: self.scrolled_rows(),
+            anchor: self.anchor.unwrap_or_default(),
+            rows_back: self.rows_back(),
+            behind: &self.behind,
         }
     }
 
@@ -182,6 +240,39 @@ impl State {
         }
         let within = (row as usize).checked_sub(screen::TABS + 1)?;
         (within < pane_rows as usize).then_some((within, col as usize - first_col))
+    }
+
+    /// How many of the pane's rows come from behind the screen.
+    ///
+    /// Derived rather than stored: what is fixed is the row the top of the pane is pinned
+    /// to, and how much of the pane that fills changes by itself as the terminal prints.
+    fn scrolled_rows(&self) -> usize {
+        let (_, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let Some(anchor) = self.anchor else {
+            return 0;
+        };
+        self.live_behind()
+            .saturating_sub(anchor)
+            .min(pane_rows as u64) as usize
+    }
+
+    /// How far back from the newest row the top of the pane is.
+    fn rows_back(&self) -> u64 {
+        self.anchor
+            .map(|anchor| self.live_behind().saturating_sub(anchor))
+            .unwrap_or(0)
+    }
+
+    /// How many rows are behind this terminal's screen, as of the last thing it said.
+    ///
+    /// From the snapshot rather than from the last scrollback answer, because the snapshot
+    /// is what arrives on every frame: a count that only moved when rows were asked for
+    /// would be stale exactly while the terminal is busy.
+    fn live_behind(&self) -> u64 {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.behind)
+            .unwrap_or(self.behind.total)
     }
 
     /// Whether the program in the focused terminal has asked for the mouse.
@@ -617,6 +708,8 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         palette: None,
         palette_pending: Vec::new(),
         selection: None,
+        anchor: None,
+        behind: Behind::default(),
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -888,6 +981,13 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
+                                // Typing is talking to the program, and the program is at
+                                // the bottom. A key pressed while scrolled back would
+                                // answer into a view of an hour ago, and the person would
+                                // not see what they typed.
+                                if state.anchor.take().is_some() {
+                                    dirty = true;
+                                }
                                 // Nothing focused is a real state: a space with no
                                 // terminals in it. Typing into stream zero addresses a
                                 // terminal that does not exist, and typing into the one
@@ -1008,13 +1108,30 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     // Copied when the button comes up, with no key to
                                     // press: a selection that has to be confirmed is a
                                     // selection a person makes twice.
-                                    let text = state
-                                        .snapshot
-                                        .as_ref()
-                                        .map(|s| {
-                                            selection.text(&s.lines, s.cols)
+                                    // Read from the window as it is drawn, not from the
+                                    // live screen: scrolled back, the rows under the
+                                    // pointer are rows that went past, and copying the
+                                    // live screen instead would hand the person text they
+                                    // never saw.
+                                    let (pane_cols, pane_rows) = screen::pane_size_for(
+                                        state.cols,
+                                        state.lines,
+                                        state.collapsed,
+                                    );
+                                    let window: Vec<String> = (0..pane_rows as usize)
+                                        .map(|row| {
+                                            screen::window_row(
+                                                state.snapshot.as_ref(),
+                                                &state.behind,
+                                                state.scrolled_rows(),
+                                                state.anchor.unwrap_or_default(),
+                                                row,
+                                            )
+                                            .0
+                                            .to_string()
                                         })
-                                        .unwrap_or_default();
+                                        .collect();
+                                    let text = selection.text(&window, pane_cols as usize);
                                     if !text.is_empty() {
                                         let mut out = std::io::stdout();
                                         crate::selection::copy(&text, &mut out)?;
@@ -1069,13 +1186,51 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                         bytes.extend_from_slice(key);
                                     }
                                     send_to_pane(&mut state, &mut seqs, &mut wr, bytes).await?;
+                                } else {
+                                    // A shell on the ordinary screen. Arrow keys here
+                                    // would walk the command history, so the wheel moves
+                                    // this client's own view back through what has
+                                    // scrolled past instead.
+                                    let (_, pane_rows) = screen::pane_size_for(
+                                        state.cols,
+                                        state.lines,
+                                        state.collapsed,
+                                    );
+                                    // The row the top of the pane is pinned to. Moving
+                                    // the wheel moves the pin, and everything else about
+                                    // the view follows from where it is.
+                                    let total = state.live_behind();
+                                    let at = state.anchor.unwrap_or(total);
+                                    let step = WHEEL_ROWS as u64;
+                                    let next = if up {
+                                        at.saturating_sub(step)
+                                    } else {
+                                        (at + step).min(total)
+                                    };
+                                    // Back at the newest row is not scrolled at all, and
+                                    // is recorded as such: it is the state a key press
+                                    // returns to and the state the pane is drawn in.
+                                    let next = (next < total).then_some(next);
+                                    if next != state.anchor {
+                                        state.anchor = next;
+                                        dirty = true;
+                                    }
+                                    // Asked for whether or not the pin moved: the first
+                                    // wheel of all is the one that discovers what is
+                                    // there to be read.
+                                    if state.focused != 0 {
+                                        let want = behind_request(
+                                            state.focused,
+                                            state.rows_back() as usize,
+                                            pane_rows as usize,
+                                        );
+                                        wr.write_all(&client::encode_control_seq(
+                                            &want,
+                                            &mut control_seq,
+                                        )?)
+                                        .await?;
+                                    }
                                 }
-                                // Otherwise it is a shell on the ordinary screen, where
-                                // the wheel would scroll back through output this client
-                                // does not hold. Nothing, rather than arrow keys: in a
-                                // shell those walk the command history, and a person
-                                // scrolling to read would find their prompt filled with
-                                // last week's commands.
                             }
                             Action::Redraw => dirty = true,
                             Action::Next | Action::Previous => {
@@ -1490,6 +1645,11 @@ fn focus(
     if to == 0 || to == state.focused {
         return Ok(None);
     }
+    // Another terminal's screen, and another terminal's history. Both are dropped rather
+    // than carried, or the new tab opens scrolled into rows that are not its own.
+    state.anchor = None;
+    state.behind = Behind::default();
+    state.selection = None;
     let mut out = switch(state.focused, to, control_seq)?;
     let (pane_cols, pane_rows) = screen::pane_size(state.cols, state.lines);
     out.extend_from_slice(&client::encode_command_to(
@@ -1594,6 +1754,36 @@ fn switch(from: u32, to: u32, control_seq: &mut u32) -> io::Result<BytesMut> {
 /// Fold one answer into what is on screen.
 fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
     match response {
+        ControlResponse::Scrollback {
+            terminal,
+            from,
+            total,
+            lines,
+            ..
+        } => {
+            // Answers for a terminal this client has since left are dropped rather than
+            // kept: painting them would put another terminal's output under this one's
+            // tab bar.
+            if terminal == state.focused {
+                state.behind = Behind {
+                    terminal,
+                    from,
+                    lines,
+                    total,
+                };
+                // What there is may be less than what was asked for, so the view is
+                // pulled back to what exists rather than showing blank rows above the
+                // oldest line.
+                // What there is may be less than what was asked for, so the pin is pulled
+                // to the oldest row that exists rather than showing blank rows above it.
+                if let Some(anchor) = state.anchor
+                    && anchor < from
+                {
+                    state.anchor = Some(from);
+                }
+                *dirty = true;
+            }
+        }
         ControlResponse::Workspaces { workspaces, .. } => {
             if state.space.is_none() {
                 state.space = workspaces.first().map(|w| w.id);
@@ -1763,6 +1953,8 @@ mod tests {
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
             selection: None,
+            anchor: None,
+            behind: Behind::default(),
         }
     }
 
@@ -1846,5 +2038,144 @@ mod tests {
             PaletteOutcome::Updated
         ));
         assert!(state.palette.is_some());
+    }
+
+    /// What is asked for has to cover what the window will read, or the rows come back
+    /// blank: the first version asked for a range on the wrong side of the window and
+    /// every scrolled row was empty.
+    #[test]
+    fn the_rows_asked_for_cover_the_rows_the_window_will_read() {
+        let pane_rows = 20usize;
+        for scroll in [1usize, 3, 19, 20, 21, 100, 999] {
+            let ControlRequest::Scrollback { up, rows, .. } = behind_request(1, scroll, pane_rows)
+            else {
+                panic!("a scrollback request");
+            };
+            // What the painter reads, in rows back from the newest: the top of the window
+            // is `scroll` back, and it reads down from there for as much of the window as
+            // is history rather than screen.
+            let newest_needed = scroll.saturating_sub(pane_rows.min(scroll)) + 1;
+            let oldest_needed = scroll;
+            // What the request covers, in the same terms.
+            let covers_oldest = up;
+            let covers_newest = up.saturating_sub(rows) + 1;
+            assert!(
+                covers_oldest >= oldest_needed,
+                "at {scroll} back the request stops short of the top of the window: \
+                 covers {covers_oldest} back, needs {oldest_needed}"
+            );
+            assert!(
+                covers_newest <= newest_needed,
+                "at {scroll} back the request stops short of the bottom of the window: \
+                 covers down to {covers_newest} back, needs {newest_needed}"
+            );
+            // And it is bounded: a request that grew with how far back a person has
+            // scrolled would ask the daemon to read the whole history to draw twenty rows.
+            assert!(
+                rows <= pane_rows * 4,
+                "{rows} rows for a {pane_rows} row window"
+            );
+        }
+    }
+
+    /// A row of the history is found by its own number, and one that was never fetched is
+    /// absent rather than another row.
+    #[test]
+    fn the_rows_behind_are_addressed_by_their_own_number() {
+        let behind = Behind {
+            terminal: 1,
+            from: 90,
+            lines: vec!["a".into(), "b".into(), "c".into()],
+            total: 93,
+        };
+        assert_eq!(behind.row(90), Some("a"));
+        assert_eq!(behind.row(92), Some("c"));
+        assert_eq!(behind.row(89), None, "a row from before what was fetched");
+        assert_eq!(behind.row(93), None, "a row from after it");
+        assert_eq!(Behind::default().row(0), None);
+    }
+
+    /// The view is pinned to a row, so output arriving does not drag a reader down the
+    /// screen.
+    ///
+    /// The first version kept a distance from the bottom instead, which is a distance from
+    /// something that moves: while an agent printed, every new row shifted the text under
+    /// the person's eyes by one.
+    #[test]
+    fn a_reader_holds_their_place_while_the_terminal_keeps_printing() {
+        let mut state = bare_state();
+        state.cols = 80;
+        state.lines = 26;
+        let (_, pane_rows) = crate::screen::pane_size_for(state.cols, state.lines, false);
+        let pane_rows = pane_rows as u64;
+
+        // A hundred rows behind the screen, and the person pins the pane ten back.
+        state.snapshot = Some(snapshot_with_behind(100));
+        state.anchor = Some(90);
+        assert_eq!(state.rows_back(), 10);
+        assert_eq!(state.scrolled_rows(), 10);
+
+        // Twenty more rows are printed while they read. The pin does not move, so the same
+        // rows are still under their eyes; what changes is how much of the pane they fill.
+        state.snapshot = Some(snapshot_with_behind(120));
+        assert_eq!(state.anchor, Some(90), "the pin moved");
+        assert_eq!(state.rows_back(), 30);
+        assert_eq!(
+            state.scrolled_rows(),
+            30.min(pane_rows) as usize,
+            "the rows read from behind the screen did not follow the output"
+        );
+
+        // Enough output and the whole pane is rows that went past, and no more than that.
+        state.snapshot = Some(snapshot_with_behind(10_000));
+        assert_eq!(state.scrolled_rows(), pane_rows as usize);
+
+        // At the bottom there is no pin and nothing is read from behind at all.
+        state.anchor = None;
+        assert_eq!(state.scrolled_rows(), 0);
+        assert_eq!(state.rows_back(), 0);
+    }
+
+    /// A state with nothing in it, for the arithmetic above.
+    fn bare_state() -> State {
+        State {
+            rows: Vec::new(),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            pending_focus: None,
+            spaces: Vec::new(),
+            space: None,
+            was: Default::default(),
+            ring: false,
+            wants_terminal_in: Vec::new(),
+            adopted: true,
+            done: false,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            creating: 0,
+            fold: sidebar::Fold::default(),
+            palette: None,
+            palette_pending: Vec::new(),
+            selection: None,
+            anchor: None,
+            behind: Behind::default(),
+        }
+    }
+
+    fn snapshot_with_behind(behind: u64) -> SnapshotWire {
+        SnapshotWire {
+            cols: 80,
+            rows: 24,
+            cursor: (0, 0),
+            lines: Vec::new(),
+            styles: Vec::new(),
+            modes: Default::default(),
+            behind,
+        }
     }
 }

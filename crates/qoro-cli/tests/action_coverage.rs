@@ -159,6 +159,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "read what has scrolled past",
+            method: || {
+                Method::Control(ControlRequest::Scrollback {
+                    id: "a".into(),
+                    terminal: 1,
+                    up: 40,
+                    rows: 40,
+                })
+            },
+        },
+        Action {
             name: "end this session",
             method: || Method::Control(ControlRequest::Shutdown { id: "a".into() }),
         },
@@ -264,6 +275,12 @@ fn every_control_method_is_reachable_from_some_action() {
         },
         ControlRequest::ReloadAgentManifests { id: String::new() },
         ControlRequest::Shutdown { id: String::new() },
+        ControlRequest::Scrollback {
+            id: String::new(),
+            terminal: 0,
+            up: 0,
+            rows: 0,
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -296,6 +313,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
+            | ControlRequest::Scrollback { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

@@ -43,6 +43,18 @@ pub struct Frame<'a> {
     pub reading: Option<crate::run::Reading>,
     /// What the mouse has selected in the pane, so it can be shown as selected.
     pub selection: Option<crate::selection::Selection>,
+    /// How many of the pane's rows come from behind the screen.
+    pub scroll: usize,
+    /// The row the top of the pane is pinned to, when it is not at the bottom.
+    pub anchor: u64,
+    /// How far back from the newest row that pin is.
+    ///
+    /// Passed in rather than worked out here, because it is a distance to the newest row
+    /// the terminal has written and the painter knows only what this client has fetched:
+    /// computing it from that stopped counting the moment the terminal printed again.
+    pub rows_back: u64,
+    /// The rows behind the screen this client has been given.
+    pub behind: &'a crate::run::Behind,
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
@@ -267,16 +279,17 @@ pub fn paint(frame: &Frame) -> String {
         if pane_row >= pane_rows as usize {
             continue;
         }
-        let line = frame
-            .snapshot
-            .and_then(|s| s.lines.get(pane_row))
-            .map(String::as_str)
-            .unwrap_or("");
-        let spans = frame
-            .snapshot
-            .and_then(|s| s.styles.get(pane_row))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        // Scrolled back, the window is the tail of what has gone past followed by the top
+        // of the live screen, so a person reading upwards sees one continuous terminal
+        // rather than two. The rows behind it are text alone: what was written to disk is
+        // rows, and colour there would be a second format nobody reads back.
+        let (line, spans) = window_row(
+            frame.snapshot,
+            frame.behind,
+            frame.scroll,
+            frame.anchor,
+            pane_row,
+        );
         let selected = frame
             .selection
             .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
@@ -298,6 +311,22 @@ pub fn paint(frame: &Frame) -> String {
     // is. Never empty: a blank row is a row that has to be explained.
     let (notice, notice_role) = match (frame.message, triage(frame.rows, frame.spaces)) {
         (Some(message), _) => (message.to_string(), waiting(frame.rows)),
+        // Being somewhere other than the bottom wins over what needs a person, because it
+        // is the one thing on this row that explains what the pane is showing: a screen
+        // that is not moving while an agent works looks broken until it says why.
+        _ if frame.scroll > 0 => {
+            // How far back the top of the pane is, which is not how much of the pane is
+            // history: scrolled far enough, the whole pane is history and the distance
+            // keeps growing behind it.
+            let back = frame.rows_back.max(1);
+            (
+                format!(
+                    "{back} {} back, type to come down",
+                    if back == 1 { "row" } else { "rows" }
+                ),
+                None,
+            )
+        }
         (None, Some(next)) => (next, waiting(frame.rows)),
         (None, None) => (here(frame), None),
     };
@@ -804,7 +833,8 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                 // terminal's own selection with it, so it owes them this line.
                 " drag          select, and copy when you let go".to_string(),
                 " shift-drag    the same, over an agent that took the mouse".to_string(),
-                " wheel         scroll the program in the pane".to_string(),
+                " wheel         scroll: the program's own, or back through what went past"
+                    .to_string(),
             ])
             .collect(),
         crate::run::Reading::Settings => vec![
@@ -899,6 +929,41 @@ fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
 /// two are the same number only until a wide character appears on the row. So the row is
 /// walked once, in cells, and each cell is emitted with the style the run says it has: a
 /// style change writes one escape sequence and nothing else does.
+/// One row of the pane, wherever it comes from.
+///
+/// The window is one buffer: every row ever written, then the rows on the screen now.
+/// Scrolled back by `s`, the first `s` rows of the pane come from behind the screen and the
+/// rest are the screen itself, shifted down by `s`, so reading upwards crosses no seam.
+///
+/// One function, because the painter and the copier both have to answer this the same way:
+/// a selection made over rows that went past has to copy those rows and not whatever is at
+/// the same position on the live screen.
+pub fn window_row<'a>(
+    snapshot: Option<&'a SnapshotWire>,
+    behind: &'a crate::run::Behind,
+    scroll: usize,
+    anchor: u64,
+    pane_row: usize,
+) -> (&'a str, &'a [SpanWire]) {
+    if pane_row < scroll {
+        let at = anchor + pane_row as u64;
+        // Rows behind the screen are text alone: what was written to disk is rows, and
+        // colour there would be a second format nobody reads back.
+        return (behind.row(at).unwrap_or(""), &[]);
+    }
+    let row = pane_row - scroll;
+    (
+        snapshot
+            .and_then(|s| s.lines.get(row))
+            .map(String::as_str)
+            .unwrap_or(""),
+        snapshot
+            .and_then(|s| s.styles.get(row))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    )
+}
+
 fn paint_row(
     line: &str,
     spans: &[SpanWire],
@@ -1035,6 +1100,7 @@ mod tests {
     fn snapshot(lines: &[&str]) -> SnapshotWire {
         SnapshotWire {
             modes: Default::default(),
+            behind: 0,
             cols: 40,
             rows: lines.len(),
             cursor: (0, 0),
@@ -1076,6 +1142,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("hello from the shell"));
         // Once on the tab and once in the agents panel: the bar says what is open in this
@@ -1110,6 +1185,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         let (pane_cols, _) = pane_size(40, 5);
         // Exactly the pane's width of it, and not one column more.
@@ -1136,6 +1220,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("starting a terminal"));
     }
@@ -1170,6 +1263,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         // Bold and red on, the text, and then off again: a run that is not closed leaks its
         // colour into the rest of the screen, which is the whole pane and then the status
@@ -1201,6 +1303,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         // The row the shell printed, found by what it printed and then read as bytes. The
         // chrome around it resets after every piece it paints, so the pane's own run
@@ -1246,6 +1357,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
         assert!(painted.contains("\x1b[32mX"), "{painted:?}");
@@ -1291,6 +1411,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         // One row down for the tab bar, and the pane starts after the column and its rule.
         let want = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
@@ -1325,6 +1454,10 @@ mod tests {
                 collapsed: false,
                 reading: None,
                 selection: None,
+                scroll: 0,
+                anchor: 0,
+                rows_back: 0,
+                behind: &crate::run::Behind::default(),
             });
             // Every positioned run, measured as a terminal measures it.
             for run in painted.split("\x1b[").skip(1) {
@@ -1362,6 +1495,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("\x1b[?25l"));
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
@@ -1389,6 +1531,10 @@ mod tests {
                 collapsed: false,
                 reading: None,
                 selection: None,
+                scroll: 0,
+                anchor: 0,
+                rows_back: 0,
+                behind: &crate::run::Behind::default(),
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
@@ -1423,6 +1569,10 @@ mod tests {
                 collapsed: false,
                 reading: None,
                 selection: None,
+                scroll: 0,
+                anchor: 0,
+                rows_back: 0,
+                behind: &crate::run::Behind::default(),
             });
             // The two status rows own the bottom of the screen, so nothing else may
             // address either of them: the notice is the row above the keys.
@@ -1475,6 +1625,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         let ink = theme::fg(theme::space_of(1));
         let raised = theme::selected_in(theme::space_of(1));
@@ -1519,6 +1678,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(!painted.contains('\u{fffd}'), "a name was cut in half");
         // Every panel row still ends where the rule begins.
@@ -1588,6 +1756,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(!painted.contains('\u{fffd}'));
     }
@@ -1626,6 +1803,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(
             painted.contains("next: app/codex is blocked"),
@@ -1654,6 +1840,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("d detach"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
@@ -1679,6 +1874,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("starting a terminal"), "{painted:?}");
     }
@@ -1705,6 +1909,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         // Read as a terminal shows it: the row is painted in pieces now, since the space
         // wears its own colour and the state wears its own.
@@ -1760,6 +1973,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         let w = palette_width(80);
         let left = (80usize.saturating_sub(w)) / 2;
@@ -1820,6 +2042,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         let shown = strip(&painted);
         assert!(shown.contains("> working"), "{shown:?}");
@@ -1868,6 +2099,15 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
         });
         assert!(painted.contains("1 finished"), "{painted:?}");
         assert!(painted.contains("4 idle"), "{painted:?}");
@@ -1897,6 +2137,10 @@ mod tests {
             collapsed: false,
             reading: None,
             selection: Some(selection),
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &crate::run::Behind::default(),
         });
         // The five columns under the drag are reversed, and the escape is written once at
         // each edge of them rather than around every character.
@@ -1946,6 +2190,10 @@ mod tests {
                 collapsed: false,
                 reading: None,
                 selection,
+                scroll: 0,
+                anchor: 0,
+                rows_back: 0,
+                behind: &crate::run::Behind::default(),
             })
         };
         assert_eq!(
@@ -1953,5 +2201,127 @@ mod tests {
             build(Some(crate::selection::Selection::start(0, 3))),
             "a click that selected nothing changed the screen"
         );
+    }
+
+    /// Scrolled back, the window is one continuous terminal: what went past above, what is
+    /// on the screen below, with no seam and nothing repeated.
+    #[test]
+    fn a_scrolled_window_joins_what_went_past_to_what_is_on_the_screen() {
+        let snapshot = snapshot(&["live 0", "live 1", "live 2", "live 3"]);
+        let rows = [row(1, "sh", "idle")];
+        // A hundred rows written, of which this client holds the newest ten.
+        let behind = crate::run::Behind {
+            terminal: 1,
+            from: 90,
+            lines: (90..100).map(|i| format!("gone {i}")).collect(),
+            total: 100,
+        };
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 60,
+            lines: 7,
+            message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 2,
+            // Pinned to the second to last row written, so the pane shows the last two
+            // rows that went past and then the screen from its top.
+            anchor: 98,
+            rows_back: 2,
+            behind: &behind,
+        });
+        // Two rows back: the last two rows written, then the screen from its top.
+        assert!(painted.contains("gone 98"), "{painted:?}");
+        assert!(painted.contains("gone 99"), "{painted:?}");
+        assert!(painted.contains("live 0"), "{painted:?}");
+        assert!(painted.contains("live 1"), "{painted:?}");
+        // And the bottom of the screen has gone off the window, which is what being
+        // scrolled back means.
+        assert!(
+            !painted.contains("live 3"),
+            "the window kept the newest row while claiming to be above it: {painted:?}"
+        );
+        // The row above what it holds is blank rather than wrong, and never another row.
+        assert!(!painted.contains("gone 89"), "{painted:?}");
+        // A person is told where they are, on the row that says what just happened.
+        assert!(painted.contains("2 rows back"), "{painted:?}");
+    }
+
+    /// At the bottom, nothing about the history is read at all.
+    #[test]
+    fn a_window_at_the_bottom_is_the_live_screen_and_says_nothing_about_scrolling() {
+        let snapshot = snapshot(&["live 0", "live 1"]);
+        let rows = [row(1, "sh", "idle")];
+        let behind = crate::run::Behind {
+            terminal: 1,
+            from: 0,
+            lines: vec!["gone".to_string()],
+            total: 1,
+        };
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 60,
+            lines: 6,
+            message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            behind: &behind,
+        });
+        assert!(painted.contains("live 0") && painted.contains("live 1"));
+        assert!(!painted.contains("gone"), "{painted:?}");
+        assert!(!painted.contains("rows back"), "{painted:?}");
+    }
+
+    /// The row a copy reads is the row that was drawn, scrolled back or not.
+    ///
+    /// The two used to be separate: the painter drew the window and the copier read the
+    /// live screen, so a selection made over rows that had gone past put whatever happened
+    /// to be at the same position on the screen onto the clipboard.
+    #[test]
+    fn the_row_a_copy_reads_is_the_row_that_was_drawn() {
+        let snapshot = snapshot(&["live 0", "live 1", "live 2"]);
+        let behind = crate::run::Behind {
+            terminal: 1,
+            from: 50,
+            lines: (50..60).map(|i| format!("gone {i}")).collect(),
+            total: 60,
+        };
+        // At the bottom, every row is the live screen.
+        for row in 0..3 {
+            assert_eq!(
+                window_row(Some(&snapshot), &behind, 0, 0, row).0,
+                format!("live {row}")
+            );
+        }
+        // Pinned to row 58 with two of the pane's rows behind the screen: the top two are
+        // rows 58 and 59, and the rest is the screen from its top.
+        assert_eq!(window_row(Some(&snapshot), &behind, 2, 58, 0).0, "gone 58");
+        assert_eq!(window_row(Some(&snapshot), &behind, 2, 58, 1).0, "gone 59");
+        assert_eq!(window_row(Some(&snapshot), &behind, 2, 58, 2).0, "live 0");
+        // A row older than what was fetched is blank rather than another row.
+        assert_eq!(window_row(Some(&snapshot), &behind, 2, 10, 0).0, "");
+        // And rows behind the screen carry no colour, because none was written down.
+        assert!(window_row(Some(&snapshot), &behind, 2, 58, 0).1.is_empty());
     }
 }

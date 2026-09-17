@@ -77,6 +77,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             name: "webshop".into(),
         },
         ControlRequest::Shutdown { id: "x15".into() },
+        ControlRequest::Scrollback {
+            id: "x16".into(),
+            terminal,
+            up: 10,
+            rows: 10,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -95,6 +101,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
+            | ControlRequest::Scrollback { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }
