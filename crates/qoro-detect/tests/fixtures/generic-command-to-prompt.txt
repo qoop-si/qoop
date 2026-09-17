@@ -1,0 +1,20 @@
+# SYNTHESIZED transition, not a recording: a shell command running (the
+# generic manifest stays silent) -> the prompt back (idle). No working state
+# exists for unknown programs; the only expectation is one idle publish.
+agent: generic
+@@ 0
+$ cargo test
+   Compiling qoro
+@@ 50
+$ cargo test
+   Compiling qoro
+@@ 100
+$ cargo test
+    Finished test profile
+@@ 150
+$ cargo test
+    Finished test profile
+@@ 200
+user@host ~/coding/qoro %
+@@ 250
+user@host ~/coding/qoro %

@@ -38,8 +38,11 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["gemini"],
     &["cursor", "cursor-agent"],
     &["aider"],
-    &["opencode"],
-    &["amp"],
+    // `opencode2` is the OpenCode 2 binary, from its own v2 documentation.
+    // `open-code` is a spelling observed in the wild.
+    &["opencode", "opencode2", "open-code"],
+    // `amp-local` is a spelling observed in the wild, carried for the same reason.
+    &["amp", "amp-local"],
     &["goose"],
 ];
 
@@ -148,10 +151,31 @@ fn from_path(path: &str) -> Program {
 ///
 /// Case is folded for the lookup only. An unknown program keeps the spelling it was
 /// launched under, because that is a person's own script and its name is theirs.
+///
+/// A Windows script suffix (`.exe`, `.cmd`, `.bat`, `.ps1`) is stripped before the
+/// lookup, so each agent has one name
+/// to match: on Windows the Cursor agent runs as `cursor-agent.cmd`, and the
+/// same stripping maps `opencode2.exe` to `opencode2`. `.js` is deliberately not
+/// stripped: a node script named by its file goes through the package-name channel
+/// above instead.
 fn canonical_agent(name: &str) -> Option<&'static str> {
+    let stripped;
+    let mut candidate = name;
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if candidate.len() > suffix.len()
+            && candidate[candidate.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            stripped = &candidate[..candidate.len() - suffix.len()];
+            candidate = stripped;
+            break;
+        }
+    }
     AGENT_ALIASES
         .iter()
-        .find(|row| row.iter().any(|alias| alias.eq_ignore_ascii_case(name)))
+        .find(|row| {
+            row.iter()
+                .any(|alias| alias.eq_ignore_ascii_case(candidate))
+        })
         .and_then(|row| row.first().copied())
 }
 
@@ -255,11 +279,43 @@ mod tests {
 
     #[test]
     fn an_alias_resolves_to_the_canonical_spelling() {
-        for (launched, shown) in [("claude-code", "claude"), ("cursor-agent", "cursor")] {
+        for (launched, shown) in [
+            ("claude-code", "claude"),
+            ("cursor-agent", "cursor"),
+            ("opencode2", "opencode"),
+            ("open-code", "opencode"),
+            ("amp-local", "amp"),
+        ] {
             let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
             assert_eq!(program.name, shown, "{launched} should be shown as {shown}");
             assert!(program.agent);
         }
+    }
+
+    #[test]
+    fn a_windows_script_suffix_is_stripped_before_the_lookup() {
+        // Suffixes are stripped before matching: the Cursor agent runs as `cursor-agent.cmd` on Windows, and the same
+        // file name resolves here too. Paths stay Unix-style: this crate never
+        // sees a backslash separator on its platforms.
+        for (launched, shown) in [
+            ("cursor-agent.cmd", "cursor"),
+            ("CURSOR-AGENT.CMD", "cursor"),
+            ("opencode2.exe", "opencode"),
+            ("claude-code.bat", "claude"),
+            ("codex.ps1", "codex"),
+        ] {
+            let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
+            assert_eq!(program.name, shown, "{launched} should be shown as {shown}");
+            assert!(program.agent);
+        }
+    }
+
+    #[test]
+    fn a_js_suffix_is_not_stripped_into_an_agent() {
+        // `.js` goes through the package-name channel, not suffix stripping:
+        // a script file that happens to share a stem with an agent is not one.
+        let program = identify("/tmp/claude.js", &[]);
+        assert!(!program.agent);
     }
 
     #[test]

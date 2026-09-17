@@ -1,0 +1,32 @@
+# SYNTHESIZED transition, not a recording: amp status footer -> quiet screen,
+# with the OSC title track carrying spinner then plain title. The screen tail
+# matches nothing; the title decides idle.
+agent: amp
+@@ 0 ## ⠋ thinking
+╰ alice thinking ─
+@@ 50
+╰ alice thinking ─
+@@ 100
+╰ alice thinking ─
+@@ 150
+╰ alice thinking ─
+@@ 200
+╰ alice thinking ─
+@@ 250
+╰ alice thinking ─
+@@ 300
+@@ 350
+╰ alice thinking ─
+@@ 400
+╰ alice thinking ─
+@@ 550 ## myproject - amp - thread
+@@ 600
+@@ 650
+@@ 750 ## ⠋ thinking
+╰ alice thinking ─
+@@ 800
+╰ alice thinking ─
+@@ 950 ## myproject - amp - thread
+@@ 1000
+@@ 1050
+@@ 1450

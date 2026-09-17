@@ -1,0 +1,160 @@
+# Cursor CLI (Anysphere), installed as `cursor-agent` and `agent`.
+#
+# Cursor CLI is closed source but ships readable bundled JavaScript. Every string below is
+# from agent-cli-package 2026.10.01-e373342 (downloads.cursor.com), mostly the interface
+# chunk `9969.index.js`.
+
+id = "cursor"
+version = "1"
+
+# Pickers the person opened: the model list (`Available models`), the session picker
+# (`Press Ctrl-D, q or ESC to cancel`), background job output (`... · esc to go back`),
+# and pager footers whose hints are joined with ` • ` and end on an `Esc to ...` hint.
+[[rules]]
+id = "pager_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(4)"
+skip_state_update = true
+any = [
+  { line_regex = '^\W*Press Ctrl-D, q or ESC to cancel' },
+  { line_regex = '^\W*Shell · .+  ·  esc to go back\s*$' },
+  { line_regex = '^\W*(Enter to (select|confirm|edit|save|use)|d to delete|k to kill|Tab to (switch sections|edit))( • .+)? • Esc to (close|go back|cancel)\s*\W*$' },
+]
+
+# An approval: the question (`Run this command?`, `Run this MCP tool?`,
+# `Write to this file?`, `Delete this file?`, `Read this file?`, `Allow this web search?`,
+# `Allow this web fetch?`), the selected option as `→ <label> (<key>)`, and the prompt
+# under it reading `Waiting for decision (y/n/p)...`. That prompt is what an answer quoting
+# the dialog does not have under it.
+[[rules]]
+id = "decision_surface"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*(Run this command( outside the sandbox)?|Run this MCP tool|Write to this file|Delete this file|Read this file|Allow this web search|Allow this web fetch)\?' },
+  { line_regex = '^[│┃\s]*→ .+ \([^()]+\)\s*\W*$' },
+  { contains = "Waiting for decision (y/n/p)..." },
+]
+
+# Plan approval: `Ready to build?` (or `Ready to proceed?`) over the rows
+# `1. Yes, build locally`, `2. Yes, build in cloud`, `3. No, propose changes`. The idle
+# placeholders rule it out.
+[[rules]]
+id = "plan_approval"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*Ready to (build|proceed)\?' },
+  { line_regex = '^[│┃\s]*(→ )?\d\. (Yes, build locally|Yes, build in cloud|No, propose changes)' },
+]
+not = [
+  { contains = "Plan, search, build anything" },
+  { contains = "Add a follow-up" },
+]
+
+# The prompt while the agent waits on an answer: `Approve mode switch (y/n)`,
+# `Answer questions (Enter to select/next, Esc to skip)`, the reason after skipping
+# (`Tell the agent what to do instead (Enter to send, ...)`) and a plan revision
+# (`Describe how to revise the plan (Enter to submit, Esc to cancel)`), and the sudo
+# prompt's `Press Enter to submit, Escape to cancel`. They take the idle placeholder's
+# place, so its presence rules them out.
+[[rules]]
+id = "waiting_prompt"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(6)"
+visible_blocker = true
+line_regex = '^\W*(Approve mode switch \(y/n\)|Answer questions \(Enter to select/next, Esc to skip\)|Tell the agent what to do instead \(Enter to send|Describe how to revise the plan \(Enter to submit|Press Enter to submit, Escape to cancel)'
+not = [
+  { contains = "Plan, search, build anything" },
+  { contains = "Add a follow-up" },
+]
+
+# The window title while it waits on the person: `<chat> - ❓ Waiting for you` or
+# `<chat> - 🔐 Waiting for confirmation` (`9577.index.js`, `terminal-title-status.ts`). The
+# status is the title's last ` - ` part (only a worktree suffix ` (<name>)` follows it), so
+# the same words inside the chat name do not count.
+[[rules]]
+id = "title_waiting"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = ' - (\S+ )?Waiting for (you|confirmation)( \([^()]*\))?\s*$'
+
+# Workspace trust at startup: `Workspace Trust Required`, then
+# `Do you trust the contents of this directory?` and `Trust this workspace`.
+# Cursor draws inline: the prompt's placeholder under the same words means they were quoted.
+[[rules]]
+id = "workspace_trust"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Workspace Trust Required' },
+  { line_regex = '^\W*Do you trust the contents of this directory\?' },
+]
+not = [
+  { contains = "Plan, search, build anything" },
+  { contains = "Add a follow-up" },
+]
+
+# The generating row: a two-column braille spinner (`⠀⠞`, `⠠⠜`, `⠰⠰`, `⠘⠤`, `⠘⠆`, `⠘⠣`,
+# `⠰⠳`, `⠠⠛`) then a label (`Thinking`, `Working`, `Composing`, `Reconnecting`, ...).
+[[rules]]
+id = "generating_row"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '^\s*(⠀⠞|⠠⠜|⠰⠰|⠘⠤|⠘⠆|⠘⠣|⠰⠳|⠠⠛) \S'
+
+# The prompt while processing carries the right-aligned hint `ctrl+c to stop`.
+[[rules]]
+id = "ctrl_c_to_stop"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = '\sctrl\+c to stop\s*\W*$'
+
+# The window title while working: `<chat> - ⏳ Working ...`, `🧭 Planning`,
+# `⌨️ Running shell command`, `🔄 Reconnecting`, `📂 Loading conversation`.
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = ' - (\S+ )?(Working( [.·]+)?|Planning|Running shell command|Reconnecting|Loading conversation)( \([^()]*\))?\s*$'
+
+# The empty prompt: `→ ` then `Plan, search, build anything` on the first turn, later
+# `Add a follow-up`.
+[[rules]]
+id = "prompt_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*(Plan, search, build anything|Add a follow-up)'
+
+# The window title at rest: `<chat> - ✅ Ready`.
+[[rules]]
+id = "title_ready"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+line_regex = ' - (\S+ )?Ready( \([^()]*\))?\s*$'
+
+# From the entry point's options: `--resume <chatId>` and `--continue`.
+[resume]
+session = ["cursor-agent", "--resume", "{session}"]
+latest = ["cursor-agent", "--continue"]

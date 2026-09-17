@@ -24,6 +24,22 @@ pub enum Region {
     TopNonEmptyLines(usize),
     /// Everything after the last line that looks like a shell prompt.
     AfterLastPromptMarker,
+    /// The latest OSC 0/2 window title the child set, as one line.
+    ///
+    /// Read from a side channel rather than the screen: titles are never drawn
+    /// as text, and matching them against scrollback would read history as the
+    /// present. There is deliberately no `osc_progress` sibling: nothing
+    /// produces OSC 9 in this engine, and a region that can never match is a
+    /// rule that never fires and never complains. It stays an unknown region
+    /// until a producer exists.
+    OscTitle,
+}
+
+/// What the screen-adjacent side channels hold, for regions that do not read
+/// the screen at all.
+pub struct OscContext<'a> {
+    /// The latest window title, or empty when none was set.
+    pub title: &'a str,
 }
 
 impl Region {
@@ -46,13 +62,24 @@ impl Region {
             ("bottom_non_empty_lines", Some(n)) => Some(Self::BottomNonEmptyLines(n)),
             ("top_non_empty_lines", Some(n)) => Some(Self::TopNonEmptyLines(n)),
             ("after_last_prompt_marker", None) => Some(Self::AfterLastPromptMarker),
+            ("osc_title", None) => Some(Self::OscTitle),
             _ => None,
         }
     }
 
     /// Materialise this region out of the (already capped) screen.
-    pub fn view<'a>(self, screen: &'a [String]) -> RegionView<'a> {
+    pub fn view<'a>(self, screen: &'a [String], osc: &OscContext<'a>) -> RegionView<'a> {
         let lines: Vec<&'a str> = match self {
+            // The side channel, never the screen: a title is not drawn as text,
+            // and an empty title is no lines rather than a blank one, so a
+            // `contains` leaf cannot match what was never set.
+            Self::OscTitle => {
+                if osc.title.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![osc.title]
+                }
+            }
             Self::WholeScreen => screen.iter().map(String::as_str).collect(),
             Self::BottomLines(n) => screen[screen.len().saturating_sub(n)..]
                 .iter()
@@ -134,31 +161,59 @@ mod tests {
         lines.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn no_osc() -> OscContext<'static> {
+        OscContext { title: "" }
+    }
+
     #[test]
     fn an_unknown_region_name_does_not_parse() {
         assert_eq!(Region::parse("prompt_box_body"), None);
+        assert_eq!(Region::parse("osc_progress"), None);
         assert_eq!(Region::parse("bottom_lines"), None);
         assert_eq!(Region::parse("bottom_lines(x)"), None);
         assert_eq!(Region::parse("whole_screen(3)"), None);
+        assert_eq!(Region::parse("osc_title(3)"), None);
+    }
+
+    #[test]
+    fn osc_title_parses_and_reads_the_side_channel_instead_of_the_screen() {
+        assert_eq!(Region::parse("osc_title"), Some(Region::OscTitle));
+        let s = screen(&["Plugin confirmation needed", "other lines"]);
+        let osc = OscContext {
+            title: "working title",
+        };
+        assert_eq!(Region::OscTitle.view(&s, &osc).lines, vec!["working title"]);
+    }
+
+    #[test]
+    fn an_unset_title_is_no_lines_so_no_contains_leaf_can_match_it() {
+        let s = screen(&["anything"]);
+        assert!(Region::OscTitle.view(&s, &no_osc()).lines.is_empty());
     }
 
     #[test]
     fn whole_screen_is_every_line() {
         let s = screen(&["a", "", "b"]);
-        assert_eq!(Region::WholeScreen.view(&s).lines, vec!["a", "", "b"]);
+        assert_eq!(
+            Region::WholeScreen.view(&s, &no_osc()).lines,
+            vec!["a", "", "b"]
+        );
     }
 
     #[test]
     fn bottom_lines_keeps_the_blank_padding() {
         let s = screen(&["a", "b", "", ""]);
-        assert_eq!(Region::BottomLines(3).view(&s).lines, vec!["b", "", ""]);
+        assert_eq!(
+            Region::BottomLines(3).view(&s, &no_osc()).lines,
+            vec!["b", "", ""]
+        );
     }
 
     #[test]
     fn bottom_non_empty_lines_skips_the_padding_and_keeps_screen_order() {
         let s = screen(&["a", "b", "", "c", "   ", ""]);
         assert_eq!(
-            Region::BottomNonEmptyLines(2).view(&s).lines,
+            Region::BottomNonEmptyLines(2).view(&s, &no_osc()).lines,
             vec!["b", "c"]
         );
     }
@@ -166,7 +221,10 @@ mod tests {
     #[test]
     fn top_non_empty_lines_skips_leading_blanks() {
         let s = screen(&["", "a", "", "b", "c"]);
-        assert_eq!(Region::TopNonEmptyLines(2).view(&s).lines, vec!["a", "b"]);
+        assert_eq!(
+            Region::TopNonEmptyLines(2).view(&s, &no_osc()).lines,
+            vec!["a", "b"]
+        );
     }
 
     #[test]
@@ -178,7 +236,7 @@ mod tests {
             "Allow command?",
         ]);
         assert_eq!(
-            Region::AfterLastPromptMarker.view(&s).lines,
+            Region::AfterLastPromptMarker.view(&s, &no_osc()).lines,
             vec!["Allow command?"]
         );
     }
@@ -190,7 +248,7 @@ mod tests {
         // than reading a little too much.
         let s = screen(&["Allow command?", "  1. Yes"]);
         assert_eq!(
-            Region::AfterLastPromptMarker.view(&s).lines,
+            Region::AfterLastPromptMarker.view(&s, &no_osc()).lines,
             vec!["Allow command?", "  1. Yes"]
         );
     }
@@ -199,7 +257,7 @@ mod tests {
     fn a_region_view_carries_a_lowercased_copy_for_contains() {
         let s = screen(&["Do You Want To Proceed?"]);
         assert_eq!(
-            Region::WholeScreen.view(&s).lower,
+            Region::WholeScreen.view(&s, &no_osc()).lower,
             "do you want to proceed?"
         );
     }

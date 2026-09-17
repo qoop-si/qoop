@@ -1,0 +1,48 @@
+# SYNTHESIZED transition, not a recording: codex status line -> composer.
+# Same timing skeleton as the claude fixture: burst, on-grid tear (300),
+# pause-and-resume (550-650), stable composer from 950.
+agent: codex
+@@ 0
+• Working (2m 14s · esc to interrupt)
+@@ 50
+• Working (2m 15s · esc to interrupt)
+@@ 100
+• Working (2m 15s · esc to interrupt)
+@@ 150
+• Working (2m 16s · esc to interrupt)
+@@ 200
+• Working (2m 16s · esc to interrupt)
+@@ 250
+• Working (2m 17s · esc to interrupt)
+@@ 300
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 350
+• Working (2m 17s · esc to interrupt)
+@@ 400
+• Working (2m 18s · esc to interrupt)
+@@ 550
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 600
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 650
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 750
+• Working (2m 23s · esc to interrupt)
+@@ 800
+• Working (2m 24s · esc to interrupt)
+@@ 950
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 1000
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 1050
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro
+@@ 1450
+› Ask Codex to do anything
+  gpt-6-astra medium · ~/coding/qoro

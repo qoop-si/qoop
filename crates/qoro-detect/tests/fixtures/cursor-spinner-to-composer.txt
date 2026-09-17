@@ -1,0 +1,40 @@
+# SYNTHESIZED transition, not a recording: cursor spinner -> typed composer.
+# cursor has no idle rule, so the tail frames match nothing: no phantom idle,
+# zero flaps expected under both policies.
+agent: cursor
+@@ 0
+⠋ Thinking
+@@ 50
+⠙ Thinking
+@@ 100
+⠹ Thinking
+@@ 150
+⠸ Thinking
+@@ 200
+⠼ Thinking
+@@ 250
+⠴ Thinking
+@@ 300
+> refactor the parser
+@@ 350
+⠦ Thinking
+@@ 400
+⠧ Thinking
+@@ 550
+> refactor the parser
+@@ 600
+> refactor the parser
+@@ 650
+> refactor the parser
+@@ 750
+⠇ Thinking
+@@ 800
+⠏ Thinking
+@@ 950
+> refactor the parser
+@@ 1000
+> refactor the parser
+@@ 1050
+> refactor the parser
+@@ 1450
+> refactor the parser

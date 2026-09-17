@@ -23,13 +23,14 @@
 mod region;
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use regex::Regex;
 use serde::Deserialize;
 
 use qoro_domain::AgentRuntimeState;
 
+pub use region::OscContext;
 pub use region::Region;
 use region::RegionView;
 
@@ -53,6 +54,41 @@ pub struct Manifest {
     /// it rather than to the engine.
     pub version: String,
     rules: Vec<Rule>,
+    resume: Option<Resume>,
+}
+
+/// The two command lines that carry a conversation across a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resume {
+    /// Carry on one exact conversation. `{session}` stands for the agent's own id for it.
+    /// Empty when the agent has no way to name a conversation from the command line.
+    pub session: Vec<String>,
+    /// Carry on the newest conversation in the directory, for when no id was ever learnt.
+    /// Empty when the agent cannot do that either, and then a restored tab is just a shell.
+    pub latest: Vec<String>,
+}
+
+/// What `{session}` is replaced with.
+const SESSION_PLACEHOLDER: &str = "{session}";
+
+impl Resume {
+    /// The command line to run, given what is known about the conversation.
+    ///
+    /// An id is used when the agent can take one and one was learnt. Otherwise the newest
+    /// conversation in the directory, which is right far more often than it sounds: a tab
+    /// is opened in a directory and the agent in it is the one that was working there.
+    pub fn argv(&self, session: Option<&str>) -> Option<Vec<String>> {
+        match session {
+            Some(id) if !self.session.is_empty() => Some(
+                self.session
+                    .iter()
+                    .map(|arg| arg.replace(SESSION_PLACEHOLDER, id))
+                    .collect(),
+            ),
+            _ if !self.latest.is_empty() => Some(self.latest.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// What the screen says, when it says anything.
@@ -92,17 +128,26 @@ pub enum ManifestError {
     },
     /// A rule asks for a region this engine does not have.
     UnknownRegion { rule: String, region: String },
+    /// A manifest that needs a newer engine than this one.
+    EngineTooNew { id: String, min_engine_version: u32 },
     /// A rule declares a state that is not an `AgentRuntimeState`.
     UnknownState { rule: String, state: String },
     /// A rule has no leaf test and no gate, so it would match every screen. Almost always a
     /// misspelled key, and at a high priority it would mask every rule below it.
     EmptyRule { rule: String },
+    /// A resume command line that cannot do what its key says. Caught at parse time
+    /// because the alternative is finding out at the one moment it matters, which is a
+    /// person reopening their work and getting somebody else's conversation.
+    BadResume { id: String, reason: String },
 }
 
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(message) => write!(f, "manifest is not valid: {message}"),
+            Self::BadResume { id, reason } => {
+                write!(f, "manifest {id}: the [resume] table {reason}")
+            }
             Self::BadRegex {
                 rule,
                 pattern,
@@ -114,6 +159,13 @@ impl fmt::Display for ManifestError {
             Self::UnknownRegion { rule, region } => {
                 write!(f, "rule {rule}: unknown region {region:?}")
             }
+            Self::EngineTooNew {
+                id,
+                min_engine_version,
+            } => write!(
+                f,
+                "manifest {id}: needs engine version {min_engine_version}, this is engine {ENGINE_VERSION}"
+            ),
             Self::UnknownState { rule, state } => {
                 write!(f, "rule {rule}: unknown state {state:?}")
             }
@@ -202,8 +254,30 @@ impl Gate {
 struct RawManifest {
     id: String,
     version: String,
+    /// The oldest engine that understands this file. Older engines refuse it
+    /// outright rather than misreading rules written for newer semantics.
+    #[serde(default)]
+    min_engine_version: Option<u32>,
     #[serde(default)]
     rules: Vec<RawRule>,
+    #[serde(default)]
+    resume: Option<RawResume>,
+}
+
+/// How to put a person back into the conversation this agent was having.
+///
+/// Every line is the agent's own command line, spelled out in full, because the flags
+/// differ per agent and change between releases: `claude --resume <id>` against `codex
+/// resume <id>` against `opencode --session <id>`. A person whose agent changed its flag,
+/// or who runs it through a wrapper of their own, edits this file rather than waiting for
+/// a release.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResume {
+    #[serde(default)]
+    session: Vec<String>,
+    #[serde(default)]
+    latest: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -279,6 +353,50 @@ fn compile_all(gates: Vec<RawGate>, rule: &str) -> Result<Vec<Gate>, ManifestErr
     gates.into_iter().map(|g| g.compile(rule)).collect()
 }
 
+/// Check a resume table says what it claims to say.
+///
+/// Both mistakes here are silent and expensive. A `session` line with no `{session}` in it
+/// runs the same command for every conversation, so every restored tab lands in whichever
+/// one the agent picks. A `latest` line with a `{session}` in it would carry the
+/// placeholder through as a literal argument.
+fn compile_resume(id: &str, raw: RawResume) -> Result<Resume, ManifestError> {
+    let bad = |reason: &str| ManifestError::BadResume {
+        id: id.to_string(),
+        reason: reason.to_string(),
+    };
+    let mentions = |argv: &[String]| argv.iter().any(|a| a.contains(SESSION_PLACEHOLDER));
+    if !raw.session.is_empty() && !mentions(&raw.session) {
+        return Err(bad(
+            "has a session line that never mentions {session}, so it would resume whichever \
+             conversation the agent picks rather than the one this tab was having",
+        ));
+    }
+    if mentions(&raw.latest) {
+        return Err(bad(
+            "has a latest line mentioning {session}, which is the line used when no session \
+             id is known; the placeholder would be passed through as a literal argument",
+        ));
+    }
+    for argv in [&raw.session, &raw.latest] {
+        if argv.iter().any(|a| a.trim().is_empty()) {
+            return Err(bad("has an empty argument, which no agent takes"));
+        }
+    }
+    Ok(Resume {
+        session: raw.session,
+        latest: raw.latest,
+    })
+}
+
+/// The command line that carries `program`'s conversation across a restart.
+///
+/// A user override wins over the bundled table, which is the whole point of the table
+/// being in the manifest: an agent that changes its flag, or one run through a wrapper,
+/// is a file the person edits rather than a release they wait for.
+pub fn resume_argv(program: &str, session: Option<&str>) -> Option<Vec<String>> {
+    for_program(program)?.resume()?.argv(session)
+}
+
 fn parse_state(state: &str, rule: &str) -> Result<AgentRuntimeState, ManifestError> {
     match state {
         "starting" => Ok(AgentRuntimeState::Starting),
@@ -307,6 +425,12 @@ impl Manifest {
     pub fn parse(toml_text: &str) -> Result<Self, ManifestError> {
         let raw: RawManifest =
             toml::from_str(toml_text).map_err(|e| ManifestError::Toml(e.to_string()))?;
+        if raw.min_engine_version.unwrap_or(0) > ENGINE_VERSION {
+            return Err(ManifestError::EngineTooNew {
+                id: raw.id,
+                min_engine_version: raw.min_engine_version.unwrap_or(0),
+            });
+        }
         let mut rules = Vec::with_capacity(raw.rules.len());
         for r in raw.rules {
             let region = Region::parse(&r.region).ok_or_else(|| ManifestError::UnknownRegion {
@@ -338,11 +462,18 @@ impl Manifest {
                 gate,
             });
         }
+        let resume = raw.resume.map(|r| compile_resume(&raw.id, r)).transpose()?;
         Ok(Self {
             id: raw.id,
             version: raw.version,
             rules,
+            resume,
         })
+    }
+
+    /// How to carry this agent's conversation across a restart, if it can be.
+    pub fn resume(&self) -> Option<&Resume> {
+        self.resume.as_ref()
     }
 
     /// The highest priority rule that matches, or `None` when the screen says nothing.
@@ -351,6 +482,14 @@ impl Manifest {
     /// tie break and a person editing one can predict the outcome. `None` also comes back
     /// when the winning rule sets `skip_state_update`: see that field in the manifests.
     pub fn evaluate(&self, screen: &[String]) -> Option<Verdict> {
+        self.evaluate_with_osc(screen, &OscContext { title: "" })
+    }
+
+    /// The same, with the OSC side channel attached.
+    ///
+    /// The split exists so screen-only callers keep working unchanged: with an
+    /// empty title this behaves exactly like [`Manifest::evaluate`].
+    pub fn evaluate_with_osc(&self, screen: &[String], osc: &OscContext<'_>) -> Option<Verdict> {
         let capped = &screen[screen.len().saturating_sub(MAX_REGION_LINES)..];
         let mut best: Option<&Rule> = None;
         for rule in &self.rules {
@@ -359,7 +498,7 @@ impl Manifest {
             if best.is_some_and(|b| b.priority >= rule.priority) {
                 continue;
             }
-            if rule.gate.matches(&rule.region.view(capped)) {
+            if rule.gate.matches(&rule.region.view(capped, osc)) {
                 best = Some(rule);
             }
         }
@@ -377,14 +516,48 @@ impl Manifest {
     }
 }
 
+/// The engine's own manifest version.
+///
+/// A manifest carrying a larger `min_engine_version` is refused at parse time
+/// rather than misread: rules written for newer semantics failing open as
+/// wrong states would be worse than no rules at all.
+pub const ENGINE_VERSION: u32 = 1;
+
 /// The manifests compiled into the binary, as source text.
 const SOURCES: &[&str] = &[
     include_str!("../manifests/claude.toml"),
     include_str!("../manifests/codex.toml"),
+    include_str!("../manifests/opencode.toml"),
+    include_str!("../manifests/cursor.toml"),
+    include_str!("../manifests/gemini.toml"),
+    include_str!("../manifests/amp.toml"),
     include_str!("../manifests/generic.toml"),
 ];
 
 static BUILTIN: OnceLock<Vec<Manifest>> = OnceLock::new();
+
+/// The bundled manifests, keyed by lowercase id.
+///
+/// Parsed once from the same compiled-in sources as [`builtin`]: the parse
+/// cannot fail in a shipped binary, and `every_builtin_manifest_parses` fails
+/// the build if one of them is broken.
+static BUNDLED: std::sync::LazyLock<std::collections::HashMap<String, std::sync::Arc<Manifest>>> =
+    std::sync::LazyLock::new(|| {
+        SOURCES
+            .iter()
+            .map(|src| {
+                let manifest = Manifest::parse(src).expect("a bundled manifest must parse");
+                (manifest.id.to_lowercase(), std::sync::Arc::new(manifest))
+            })
+            .collect()
+    });
+
+/// User overrides, keyed by lowercase manifest id. A daemon-side reload
+/// replaces entries one file at a time: a bad file keeps the previous rules
+/// for its agent and is reported, never loaded half way.
+static OVERRIDES: std::sync::LazyLock<
+    RwLock<std::collections::HashMap<String, std::sync::Arc<Manifest>>>,
+> = std::sync::LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
 
 /// Every manifest compiled into the binary, parsed once.
 ///
@@ -402,21 +575,91 @@ pub fn builtin() -> &'static [Manifest] {
 
 /// The manifest for a program name, if there is one.
 ///
-/// The comparison is case insensitive because the name arrives from a process table. There
-/// is no fuzzy matching: an unrecognised program gets `None`, and the caller decides whether
-/// to fall back to the `generic` manifest.
-pub fn for_program(name: &str) -> Option<&'static Manifest> {
-    builtin().iter().find(|m| m.id.eq_ignore_ascii_case(name))
+/// A user override wins over the bundled manifest with the same id. The
+/// comparison is case insensitive because the name arrives from a process
+/// table. There is no fuzzy matching: an unrecognised program gets `None`,
+/// and the caller decides whether to fall back to the `generic` manifest.
+pub fn for_program(name: &str) -> Option<std::sync::Arc<Manifest>> {
+    let key = name.to_lowercase();
+    if let Ok(overrides) = OVERRIDES.read()
+        && let Some(hit) = overrides.get(&key)
+    {
+        return Some(hit.clone());
+    }
+    BUNDLED.get(&key).cloned()
 }
 
 /// The rules to use for a program, falling back to the generic ones.
 ///
 /// The fallback is the whole reason a terminal running a plain shell says anything at all.
 /// Without it the caller asks for a manifest named `bash`, is told there is none, and the
-/// state column stays empty for every terminal that is not one of the three agents this
+/// state column stays empty for every terminal that is not one of the agents this
 /// build happens to know: measured, exactly that, on a shell sitting at its own prompt.
-pub fn rules_for(name: &str) -> Option<&'static Manifest> {
+pub fn rules_for(name: &str) -> Option<std::sync::Arc<Manifest>> {
     for_program(name).or_else(|| for_program("generic"))
+}
+
+/// What a reload of the override directory did, per file.
+///
+/// A file that fails to parse keeps the previous rules for its agent: the
+/// table is never half loaded, and the error names the file and the reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// Manifest ids now serving override rules, in filename order.
+    pub loaded: Vec<String>,
+    /// `(file stem, reason)` for every file that was skipped.
+    pub errors: Vec<(String, String)>,
+}
+
+/// Re-read user override manifests from a directory.
+///
+/// Each `<agent>.toml` must declare `id = "<agent>"` matching its filename:
+/// a mismatch is an error, not a silent rename. Files that fail to read or
+/// parse are reported and leave the previous rules in place; files that parse
+/// replace the entry for their id, including ids no bundled manifest has.
+/// A missing directory is an empty success, not an error.
+pub fn reload_overrides(dir: &std::path::Path) -> ReloadOutcome {
+    let mut outcome = ReloadOutcome::default();
+    let entries = match std::fs::read_dir(dir) {
+        Err(_) => return outcome,
+        Ok(entries) => entries,
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    files.sort();
+    let Ok(mut overrides) = OVERRIDES.write() else {
+        return outcome;
+    };
+    for path in files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let text = match std::fs::read_to_string(&path) {
+            Err(e) => {
+                outcome.errors.push((stem, format!("could not read: {e}")));
+                continue;
+            }
+            Ok(text) => text,
+        };
+        match Manifest::parse(&text) {
+            Err(e) => outcome.errors.push((stem, e.to_string())),
+            Ok(manifest) if manifest.id != stem => outcome.errors.push((
+                stem.clone(),
+                format!("declares id {:?}, expected {stem:?}", manifest.id),
+            )),
+            Ok(manifest) => {
+                let id = manifest.id.clone();
+                overrides.insert(id.to_lowercase(), std::sync::Arc::new(manifest));
+                outcome.loaded.push(id);
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -669,23 +912,52 @@ contains = "do you want to proceed"
     #[test]
     fn every_builtin_manifest_parses() {
         let ids: Vec<&str> = builtin().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["claude", "codex", "generic"]);
+        assert_eq!(
+            ids,
+            vec![
+                "claude", "codex", "opencode", "cursor", "gemini", "amp", "generic"
+            ]
+        );
     }
 
     #[test]
     fn for_program_is_case_insensitive_and_unknown_programs_have_no_manifest() {
-        assert_eq!(for_program("CLAUDE").map(|m| m.id.as_str()), Some("claude"));
         assert_eq!(
-            for_program("generic").map(|m| m.id.as_str()),
-            Some("generic")
+            for_program("CLAUDE").map(|m| m.id.clone()),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            for_program("generic").map(|m| m.id.clone()),
+            Some("generic".to_string())
         );
         assert!(for_program("vim").is_none());
     }
 
+    /// A verdict from the manifests as they stand, taken while no override test is
+    /// swapping them out.
+    ///
+    /// The override table is one process global and cargo runs these tests in parallel
+    /// threads, so without this an override installed by one test answered another test's
+    /// question: measured, roughly one run in three failed on whichever claude test
+    /// happened to overlap. Holding it here rather than in each test keeps the guarantee
+    /// where the shared state is read.
     fn verdict(program: &str, lines: &[&str]) -> Option<Verdict> {
+        let _held = OVERRIDE_TEST_LOCK.read().unwrap();
+        verdict_unlocked(program, lines)
+    }
+
+    /// The same, for a caller that already holds the lock.
+    fn verdict_unlocked(program: &str, lines: &[&str]) -> Option<Verdict> {
         for_program(program)
             .expect("the manifest is compiled in")
             .evaluate(&screen(lines))
+    }
+
+    fn verdict_with_title(program: &str, lines: &[&str], title: &str) -> Option<Verdict> {
+        let _held = OVERRIDE_TEST_LOCK.read().unwrap();
+        for_program(program)
+            .expect("the manifest is compiled in")
+            .evaluate_with_osc(&screen(lines), &OscContext { title })
     }
 
     #[test]
@@ -727,6 +999,27 @@ contains = "do you want to proceed"
         )
         .expect("the resting render is the same prompt");
         assert_eq!(v.state, AgentRuntimeState::Blocked);
+    }
+
+    /// A question menu is a person being asked to choose, even when the options
+    /// are not yes or no. Copied off a real session where the model asked what
+    /// to do next and the panel kept saying working.
+    #[test]
+    fn the_claude_manifest_reads_a_question_menu_as_a_visible_blocker() {
+        let v = verdict(
+            "claude",
+            &[
+                "Elde ~1700 satir commit edilmemis isi var. Bununla ne yapalim?",
+                "  1. Once durumu oku ve anlat",
+                "  2. Kontrolleri calistir",
+                "❯ 3. Palette isini bitir",
+                "  4. Bu is degil, baska konu",
+                "Enter to select · ↑/↓ to navigate · Esc to cancel",
+            ],
+        )
+        .expect("a question menu is a blocker");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert!(v.visible_blocker);
     }
 
     #[test]
@@ -867,6 +1160,29 @@ contains = "do you want to proceed"
         );
     }
 
+    /// Copied off a real session, bottom rows and all: Codex draws its status line and then
+    /// keeps drawing under it, so the line that says the turn is happening is the fourth
+    /// non empty row from the bottom and not the first.
+    #[test]
+    fn the_codex_working_line_is_seen_under_its_rule_composer_and_footer() {
+        let v = verdict(
+            "codex",
+            &[
+                "  59",
+                "  60",
+                "\u{2022} Working (11s \u{b7} esc to interrupt)",
+                "",
+                &"\u{2500}".repeat(60),
+                "\u{203A} Ask Codex to do anything",
+                "",
+                "  gpt-5.6-sol high \u{b7} ~/coding/qoro \u{b7} Count 1 to 40 slowly",
+            ],
+        )
+        .expect("codex is working");
+        assert_eq!(v.state, AgentRuntimeState::Working, "{v:?}");
+        assert_eq!(v.rule, "working_status_line");
+    }
+
     #[test]
     fn the_codex_manifest_reads_an_approval_request_as_a_visible_blocker() {
         let v = verdict("codex", &["Allow command?", "  Yes  No"]).expect("an approval request");
@@ -910,6 +1226,400 @@ contains = "do you want to proceed"
     #[test]
     fn the_generic_manifest_claims_nothing_while_a_command_is_running() {
         assert_eq!(verdict("generic", &["$ cargo test", "   Compiling"]), None);
+    }
+
+    #[test]
+    fn the_opencode_manifest_reads_a_permission_dialog_as_a_visible_blocker() {
+        let v = verdict("opencode", &["△ Permission required"])
+            .expect("a permission dialog is a blocker");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "permission_required");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_opencode_manifest_reads_an_interrupt_hint_as_working() {
+        let v = verdict("opencode", &["esc to interrupt"]).expect("an interrupt hint");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "interrupt_hint_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_opencode_manifest_reads_a_progress_bar_as_working() {
+        let v = verdict("opencode", &["■■■■■■"]).expect("a progress bar is working");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "progress_bar_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_cursor_manifest_reads_a_file_write_approval_as_a_visible_blocker() {
+        let v = verdict(
+            "cursor",
+            &[
+                "write to this file?",
+                "proceed (y)",
+                "reject & propose changes",
+            ],
+        )
+        .expect("a file-write approval is a blocker");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "write_file_approval");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_cursor_manifest_reads_a_stop_hint_as_working() {
+        let v = verdict("cursor", &["ctrl+c to stop"]).expect("a stop hint");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "stop_hint_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_cursor_manifest_reads_a_spinner_as_working() {
+        let v = verdict("cursor", &["⠋ Thinking"]).expect("a spinner is working");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "spinner_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_gemini_manifest_reads_an_apply_box_as_a_visible_blocker() {
+        let v = verdict("gemini", &["│ Apply this change"]).expect("an apply box");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "apply_or_allow_change");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_gemini_manifest_reads_a_yes_gated_confirmation_as_a_visible_blocker() {
+        let v = verdict("gemini", &["yes", "waiting for user confirmation"])
+            .expect("a yes-gated confirmation");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "apply_or_allow_change");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_gemini_manifest_reads_a_cancel_hint_as_working() {
+        let v = verdict("gemini", &["esc to cancel"]).expect("a cancel hint");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "esc_cancel_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_an_approval_footer_as_a_visible_blocker() {
+        let v = verdict("amp", &["waiting for approval"]).expect("an approval footer");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "approval_footer");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_a_status_footer_as_working() {
+        let v = verdict("amp", &["╰ alice thinking ─"]).expect("a status footer");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "status_footer_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_a_cancel_hint_as_working() {
+        let v = verdict("amp", &["esc to cancel"]).expect("a cancel hint");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "esc_cancel_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_a_confirmation_title_as_a_visible_blocker() {
+        let v = verdict_with_title("amp", &[""], "Plugin confirmation needed")
+            .expect("a confirmation title");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert_eq!(v.rule, "osc_title_plugin_confirmation_blocked");
+        assert!(v.visible_blocker);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_a_spinner_title_as_working() {
+        let v = verdict_with_title("amp", &[""], "⠋ thinking").expect("a spinner title is working");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert_eq!(v.rule, "osc_title_working");
+        assert!(v.visible_working);
+    }
+
+    #[test]
+    fn the_amp_manifest_reads_a_plain_title_as_idle() {
+        let v = verdict_with_title("amp", &[""], "myproject - amp - thread")
+            .expect("a plain title is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle);
+        assert_eq!(v.rule, "osc_title_idle");
+        assert!(v.visible_idle);
+    }
+
+    #[test]
+    fn a_spinner_title_is_not_idle_and_a_confirmation_title_outranks_it() {
+        // The idle rule excludes both, and the blocked rule outranks the idle
+        // one when a title carries both markers.
+        let v = verdict_with_title("amp", &[""], "⠋ myproject - amp - thread").expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        let v = verdict_with_title("amp", &[""], "myproject - amp - Plugin confirmation needed")
+            .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
+    }
+
+    #[test]
+    fn without_a_title_the_osc_rules_are_silent() {
+        // An empty title is no lines, so no `contains` leaf can match it, and
+        // the screen-only entry point never sees a title at all.
+        assert_eq!(verdict_with_title("amp", &[""], ""), None);
+        assert_eq!(
+            for_program("amp")
+                .expect("the manifest is compiled in")
+                .evaluate(&screen(&["Plugin confirmation needed on screen"])),
+            None,
+            "a title rule must not read screen text"
+        );
+    }
+
+    #[test]
+    fn agents_without_a_shipped_manifest_fall_back_to_generic() {
+        // Phase A5 capture gate: aider and goose have no verified markers, so no
+        // stub file is shipped and both resolve to the generic rules.
+        for name in ["aider", "goose"] {
+            assert!(for_program(name).is_none(), "{name} has no manifest");
+            assert_eq!(
+                rules_for(name).map(|m| m.id.clone()),
+                Some("generic".to_string()),
+                "{name} falls back to generic"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_needing_a_newer_engine_is_refused_naming_itself() {
+        let err = Manifest::parse(
+            "id = \"future\"\nversion = \"9\"\nmin_engine_version = 999\n\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = \"x\"\n",
+        )
+        .expect_err("a newer engine's rules must not load here");
+        assert_eq!(
+            err,
+            ManifestError::EngineTooNew {
+                id: "future".to_string(),
+                min_engine_version: 999,
+            }
+        );
+        assert!(err.to_string().contains("future"));
+        // This engine's own version always loads.
+        assert!(
+            Manifest::parse("id = \"t\"\nversion = \"1\"\nmin_engine_version = 1\n\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = \"x\"\n")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_bundled_resume_table_names_its_own_agent_and_says_what_it_can_do() {
+        // Every bundled manifest that offers a resume has to offer one that works: a
+        // command line starting with a program name, and a session line that puts the id
+        // somewhere. Read over the bundled set rather than over a list, so a manifest added
+        // later is covered by having been added.
+        let mut offered = 0;
+        for manifest in builtin() {
+            let Some(resume) = manifest.resume() else {
+                continue;
+            };
+            offered += 1;
+            assert!(
+                !resume.session.is_empty() || !resume.latest.is_empty(),
+                "{}: a [resume] table that offers neither line is the same as no table",
+                manifest.id
+            );
+            for argv in [&resume.session, &resume.latest] {
+                if argv.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !argv[0].starts_with('-'),
+                    "{}: {argv:?} starts with a flag rather than a program",
+                    manifest.id
+                );
+            }
+            if !resume.session.is_empty() {
+                let built = resume.argv(Some("abc-123")).expect("a session line");
+                assert!(
+                    built.iter().any(|a| a.contains("abc-123")),
+                    "{}: the id never reached the command line: {built:?}",
+                    manifest.id
+                );
+                assert!(
+                    !built.iter().any(|a| a.contains(SESSION_PLACEHOLDER)),
+                    "{}: the placeholder survived substitution: {built:?}",
+                    manifest.id
+                );
+            }
+        }
+        assert!(
+            offered >= 3,
+            "only {offered} agents can be carried across a restart, which proves little"
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_falls_back_to_the_newest_conversation_rather_than_to_nothing() {
+        let resume = Manifest::parse(
+            "id = \"x\"\nversion = \"1\"\n[resume]\n\
+             session = [\"x\", \"--resume\", \"{session}\"]\nlatest = [\"x\", \"-c\"]\n",
+        )
+        .expect("parse")
+        .resume()
+        .cloned()
+        .expect("a table");
+        assert_eq!(
+            resume.argv(Some("id-7")),
+            Some(vec!["x".into(), "--resume".into(), "id-7".into()])
+        );
+        assert_eq!(resume.argv(None), Some(vec!["x".into(), "-c".into()]));
+
+        // An agent that can only be resumed by id, with no id in hand, has nothing to run.
+        let only_by_id = Manifest::parse(
+            "id = \"y\"\nversion = \"1\"\n[resume]\nsession = [\"y\", \"{session}\"]\n",
+        )
+        .expect("parse")
+        .resume()
+        .cloned()
+        .expect("a table");
+        assert_eq!(only_by_id.argv(None), None);
+    }
+
+    #[test]
+    fn a_resume_table_that_cannot_do_what_it_says_is_refused_at_parse_time() {
+        // A session line with no placeholder runs one command for every conversation.
+        let err = Manifest::parse(
+            "id = \"x\"\nversion = \"1\"\n[resume]\nsession = [\"x\", \"--resume\"]\n",
+        )
+        .expect_err("a session line that cannot name a session");
+        assert!(matches!(err, ManifestError::BadResume { .. }), "{err}");
+        assert!(err.to_string().contains("{session}"), "{err}");
+
+        // A latest line with one would pass the placeholder through as an argument.
+        let err = Manifest::parse(
+            "id = \"x\"\nversion = \"1\"\n[resume]\nlatest = [\"x\", \"{session}\"]\n",
+        )
+        .expect_err("a latest line that needs a session");
+        assert!(matches!(err, ManifestError::BadResume { .. }), "{err}");
+
+        let err =
+            Manifest::parse("id = \"x\"\nversion = \"1\"\n[resume]\nlatest = [\"x\", \" \"]\n")
+                .expect_err("an empty argument");
+        assert!(matches!(err, ManifestError::BadResume { .. }), "{err}");
+
+        // And a manifest with no table at all is not an error, it is an agent that cannot
+        // be carried across a restart.
+        let none = Manifest::parse("id = \"x\"\nversion = \"1\"\n").expect("parse");
+        assert!(none.resume().is_none());
+    }
+
+    #[test]
+    fn an_override_changes_the_command_a_restore_runs() {
+        with_clean_overrides(|| {
+            let before = resume_argv("claude", None).expect("a bundled table");
+            assert_eq!(before[0], "claude");
+
+            let dir = tempfile::tempdir().expect("a directory");
+            write_override(
+                dir.path(),
+                "claude.toml",
+                "id = \"claude\"\nversion = \"9\"\n[resume]\n\
+                 session = [\"my-claude\", \"--pick\", \"{session}\"]\n\
+                 latest = [\"my-claude\", \"--newest\"]\n",
+            );
+            let outcome = reload_overrides(dir.path());
+            assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+            assert_eq!(
+                resume_argv("claude", None),
+                Some(vec!["my-claude".into(), "--newest".into()]),
+                "an override has to win, or the table is not configurable"
+            );
+            assert_eq!(
+                resume_argv("claude", Some("k9")),
+                Some(vec!["my-claude".into(), "--pick".into(), "k9".into()])
+            );
+            assert_eq!(resume_argv("no-such-agent", None), None);
+        });
+    }
+
+    /// Override tests share one process-global table with every other test in this
+    /// binary, so a test that installs one takes this exclusively and every test that
+    /// reads a manifest takes it shared. A leaked or overlapping override quietly reroutes
+    /// somebody else's manifests, which is a failure in a test that never mentioned
+    /// overrides.
+    static OVERRIDE_TEST_LOCK: RwLock<()> = RwLock::new(());
+
+    fn with_clean_overrides<T>(run: impl FnOnce() -> T) -> T {
+        let _held = OVERRIDE_TEST_LOCK.write().unwrap();
+        OVERRIDES.write().unwrap().clear();
+        let out = run();
+        OVERRIDES.write().unwrap().clear();
+        out
+    }
+
+    fn write_override(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).expect("write the override file");
+    }
+
+    #[test]
+    fn a_good_override_changes_a_verdict_and_a_bad_one_keeps_the_old_rules() {
+        with_clean_overrides(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Sanity: bundled claude reads the spinner as working.
+            let spinner = ["\u{23f5} Cogitating… (12s · esc to interrupt)", ""];
+            let before = verdict_unlocked("claude", &spinner).expect("bundled verdict");
+            assert_eq!(before.state, AgentRuntimeState::Working);
+
+            // A good override replaces the verdict for its agent only.
+            write_override(
+                dir.path(),
+                "claude.toml",
+                "id = \"claude\"\nversion = \"test\"\n\n[[rules]]\nid = \"always_idle\"\nstate = \"idle\"\npriority = 5000\ncontains = \"Cogitating\"\n",
+            );
+            let outcome = reload_overrides(dir.path());
+            assert_eq!(outcome.loaded, vec!["claude".to_string()]);
+            assert!(outcome.errors.is_empty());
+            let after = verdict_unlocked("claude", &spinner).expect("override verdict");
+            assert_eq!(after.rule, "always_idle");
+            assert_eq!(after.state, AgentRuntimeState::Idle);
+
+            // A bad file is reported and the previous rules keep serving.
+            write_override(dir.path(), "claude.toml", "id = \"claude\"\n[[rules\n");
+            let outcome = reload_overrides(dir.path());
+            assert!(outcome.loaded.is_empty());
+            assert_eq!(outcome.errors.len(), 1);
+            assert_eq!(outcome.errors[0].0, "claude");
+            let kept = verdict_unlocked("claude", &spinner).expect("kept verdict");
+            assert_eq!(kept.rule, "always_idle", "a bad file keeps the old rules");
+
+            // A filename that does not match its id is an error, not a rename.
+            write_override(
+                dir.path(),
+                "codex.toml",
+                "id = \"claude\"\nversion = \"test\"\n\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = \"x\"\n",
+            );
+            let outcome = reload_overrides(dir.path());
+            assert!(outcome.errors.iter().any(|(f, _)| f == "codex"));
+        });
+    }
+
+    #[test]
+    fn reloading_a_missing_directory_is_an_empty_success() {
+        with_clean_overrides(|| {
+            let outcome = reload_overrides(std::path::Path::new("/nonexistent-qoro-dir"));
+            assert!(outcome.loaded.is_empty());
+            assert!(outcome.errors.is_empty());
+        });
     }
 }
 

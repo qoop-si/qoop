@@ -1,0 +1,134 @@
+# Gemini CLI (Google).
+#
+# Every string below is from google-gemini/gemini-cli at fb972b2f (2026-10-06): the Ink
+# components in `packages/cli/src/ui` and their vitest snapshots, and the window title in
+# `packages/cli/src/utils/windowTitle.ts`. The screen is drawn inline, inside boxes whose
+# side border is `│`, so line patterns allow that border before the text.
+
+id = "gemini"
+version = "1"
+
+# Dialogs the person opened, which say nothing about the agent: the model picker
+# (`Select Model`, `(Press Esc to close)`, `ModelDialog.tsx`), the rewind confirmation
+# (`RewindConfirmation.tsx`) and the API key dialog (`ApiAuthDialog.tsx`).
+[[rules]]
+id = "dialog_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(30)"
+skip_state_update = true
+any = [
+  { all = [
+    { line_regex = '^[│\s]*Select Model' },
+    { contains = "(Press Esc to close)" },
+  ] },
+  { line_regex = '^[│\s]*Use arrow keys to navigate, Enter to confirm, Esc to cancel\.' },
+  { line_regex = '^[│\s]*\(Press Enter to submit, Esc to cancel, Ctrl\+C to clear stored key\)' },
+]
+
+# A tool confirmation: the question (`Allow execution of [Shell]?`, `Apply this change?`,
+# `Do you want to proceed?`, `Allow execution of MCP tool "t" from server "s"?`), then a
+# radio list whose selected row is `● 1. Allow once` and whose last option always ends
+# `(esc)` (`ToolConfirmationMessage.tsx`, `ToolConfirmationMessage.test.tsx.snap`). All
+# three must be there, and the composer's placeholder must not: the same words quoted in
+# an answer have the composer under them.
+[[rules]]
+id = "tool_confirmation"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^[│\s]*(Allow execution of (\[[^\]]+\]|MCP tool ".*" from server ".*")|Apply this change|Do you want to proceed)\?\s*│?\s*$' },
+  { line_regex = '^[│\s]*● \d+\. ' },
+  { line_regex = '^[│\s]*(● )?\d+\. .*\(esc\)\s*│?\s*$' },
+]
+not = [{ contains = "Type your message or @path/to/file" }]
+
+# The window title while a confirmation waits: `✋  Action Required (<folder>)`
+# (`windowTitle.ts`, with `ui.dynamicWindowTitle` on).
+[[rules]]
+id = "title_action_required"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^✋\s+Action Required'
+
+# The folder trust dialog at startup: `Do you trust the files in this folder?` over the
+# option `Trust folder (<dir>)` (`FolderTrustDialog.tsx`). Gemini draws inline, so after
+# startup the screen holds transcript; the composer's prompt row (`> `, `! `, `* `)
+# under the same words means they were quoted.
+[[rules]]
+id = "trust_folder"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^[│\s]*Do you trust the files in this folder\?' },
+  { line_regex = '^[│\s]*(● )?(\d+\. )?Trust folder \(' },
+]
+not = [{ line_regex = '^[│\s]*[>!*] ' }]
+
+# The sign-in dialog at startup: `Get started` over
+# `How would you like to authenticate for this project?` (`auth/AuthDialog.tsx`). The
+# composer's prompt row rules it out, as for the trust dialog.
+[[rules]]
+id = "auth_dialog"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^[│\s]*(\? )?Get started' },
+  { line_regex = '^[│\s]*How would you like to authenticate for this project\?' },
+]
+not = [{ line_regex = '^[│\s]*[>!*] ' }]
+
+# The loading line above the composer: a phrase, then `(esc to cancel, 5s)`, the time
+# turning into a duration after a minute (`LoadingIndicator.tsx` and its snapshot).
+[[rules]]
+id = "esc_to_cancel"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '\(esc to cancel, [^()]+\)\s*│?\s*$'
+
+# The window title while working: `✦  <subject or Working…> (<folder>)`, or
+# `⏲  Working… (<folder>)` when nothing was printed for a while (`windowTitle.ts`).
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^[✦⏲]\s+'
+
+# The composer: the prompt glyph (`>`, `!` in shell mode, `*` in YOLO mode) then the
+# placeholder `  Type your message or @path/to/file` (`InputPrompt.tsx`).
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^[│\s]*[>!*] +Type your message or @path/to/file'
+
+# The window title at rest: `◇  Ready (<folder>)` (`windowTitle.ts`).
+[[rules]]
+id = "title_ready"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+line_regex = '^◇\s+Ready'
+
+# From `packages/cli/src/config/config.ts` and `docs/cli/session-management.md`:
+# `--resume <id>` takes a session id, `--resume latest` the newest one.
+[resume]
+session = ["gemini", "--resume", "{session}"]
+latest = ["gemini", "--resume", "latest"]

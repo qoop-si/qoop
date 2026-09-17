@@ -1,0 +1,41 @@
+# SYNTHESIZED transition, not a recording: opencode interrupt hint -> typed
+# composer. opencode has no idle rule (its idle face was never captured), so
+# the tail frames match nothing: the honest expectation is no phantom idle,
+# zero flaps under both policies.
+agent: opencode
+@@ 0
+esc to interrupt
+@@ 50
+esc to interrupt
+@@ 100
+esc to interrupt
+@@ 150
+esc to interrupt
+@@ 200
+esc to interrupt
+@@ 250
+esc to interrupt
+@@ 300
+> tell me a joke
+@@ 350
+esc to interrupt
+@@ 400
+esc to interrupt
+@@ 550
+> tell me a joke
+@@ 600
+> tell me a joke
+@@ 650
+> tell me a joke
+@@ 750
+esc to interrupt
+@@ 800
+esc to interrupt
+@@ 950
+> tell me a joke
+@@ 1000
+> tell me a joke
+@@ 1050
+> tell me a joke
+@@ 1450
+> tell me a joke

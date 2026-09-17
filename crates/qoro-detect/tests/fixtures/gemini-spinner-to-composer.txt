@@ -1,0 +1,40 @@
+# SYNTHESIZED transition, not a recording: gemini cancel hint -> typed composer.
+# gemini has no idle rule, so the tail frames match nothing: no phantom idle,
+# zero flaps expected under both policies.
+agent: gemini
+@@ 0
+esc to cancel
+@@ 50
+esc to cancel
+@@ 100
+esc to cancel
+@@ 150
+esc to cancel
+@@ 200
+esc to cancel
+@@ 250
+esc to cancel
+@@ 300
+> explain this function
+@@ 350
+esc to cancel
+@@ 400
+esc to cancel
+@@ 550
+> explain this function
+@@ 600
+> explain this function
+@@ 650
+> explain this function
+@@ 750
+esc to cancel
+@@ 800
+esc to cancel
+@@ 950
+> explain this function
+@@ 1000
+> explain this function
+@@ 1050
+> explain this function
+@@ 1450
+> explain this function
