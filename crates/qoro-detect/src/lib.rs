@@ -531,6 +531,15 @@ const SOURCES: &[&str] = &[
     include_str!("../manifests/cursor.toml"),
     include_str!("../manifests/gemini.toml"),
     include_str!("../manifests/amp.toml"),
+    // Manifests that say only how to carry a conversation across a restart. No rules yet,
+    // for lack of a verified capture of each screen, so these agents are read by the
+    // generic rules and resumed by their own.
+    include_str!("../manifests/aider.toml"),
+    include_str!("../manifests/goose.toml"),
+    include_str!("../manifests/droid.toml"),
+    include_str!("../manifests/qwen.toml"),
+    include_str!("../manifests/grok.toml"),
+    include_str!("../manifests/copilot.toml"),
     include_str!("../manifests/generic.toml"),
 ];
 
@@ -596,7 +605,12 @@ pub fn for_program(name: &str) -> Option<std::sync::Arc<Manifest>> {
 /// state column stays empty for every terminal that is not one of the agents this
 /// build happens to know: measured, exactly that, on a shell sitting at its own prompt.
 pub fn rules_for(name: &str) -> Option<std::sync::Arc<Manifest>> {
-    for_program(name).or_else(|| for_program("generic"))
+    // A manifest with no rules in it is not a claim about the screen. Some agents have a
+    // manifest only to say how to carry their conversation across a restart, and one of
+    // those shadowing the generic rules would leave that agent read by nothing at all.
+    for_program(name)
+        .filter(|m| !m.rules.is_empty())
+        .or_else(|| for_program("generic"))
 }
 
 /// What a reload of the override directory did, per file.
@@ -915,7 +929,8 @@ contains = "do you want to proceed"
         assert_eq!(
             ids,
             vec![
-                "claude", "codex", "opencode", "cursor", "gemini", "amp", "generic"
+                "claude", "codex", "opencode", "cursor", "gemini", "amp", "aider", "goose",
+                "droid", "qwen", "grok", "copilot", "generic"
             ]
         );
     }
@@ -1387,16 +1402,33 @@ contains = "do you want to proceed"
 
     #[test]
     fn agents_without_a_shipped_manifest_fall_back_to_generic() {
-        // Phase A5 capture gate: aider and goose have no verified markers, so no
-        // stub file is shipped and both resolve to the generic rules.
-        for name in ["aider", "goose"] {
-            assert!(for_program(name).is_none(), "{name} has no manifest");
+        // The capture gate is unchanged: no agent gets rules without a verified capture of
+        // its screen. Some of them now ship a manifest anyway, because how to carry a
+        // conversation across a restart is a different question from how to read a screen
+        // and is answered from an agent's own published flags. A manifest with no rules in
+        // it must not shadow the generic ones.
+        for name in ["aider", "goose", "droid", "qwen", "grok", "copilot"] {
+            let manifest = for_program(name).unwrap_or_else(|| panic!("{name} has a manifest"));
+            assert!(
+                manifest.rules.is_empty(),
+                "{name} has rules that no capture justifies"
+            );
+            assert!(
+                manifest.resume().is_some(),
+                "{name} has a manifest that says nothing at all"
+            );
             assert_eq!(
                 rules_for(name).map(|m| m.id.clone()),
                 Some("generic".to_string()),
-                "{name} falls back to generic"
+                "{name} is read by its own empty rules rather than the generic ones"
             );
         }
+        // And a program with no manifest at all still falls back.
+        assert!(for_program("crush").is_none());
+        assert_eq!(
+            rules_for("crush").map(|m| m.id.clone()),
+            Some("generic".to_string())
+        );
     }
 
     #[test]

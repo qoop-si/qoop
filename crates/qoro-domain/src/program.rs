@@ -44,6 +44,14 @@ const AGENT_ALIASES: &[&[&str]] = &[
     // `amp-local` is a spelling observed in the wild, carried for the same reason.
     &["amp", "amp-local"],
     &["goose"],
+    // Agents with no bundled screen rules yet, listed here so that what is running in a
+    // terminal is named correctly and so that a restart knows whose conversation to carry
+    // on. Being in this table is what makes a program an agent; it says nothing about how
+    // well its screen is read.
+    &["droid"],
+    &["qwen"],
+    &["grok"],
+    &["copilot"],
 ];
 
 /// Flags whose argument is source text rather than a path.

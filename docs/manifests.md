@@ -11,8 +11,13 @@ rebuilding.
 `crates/qoro-detect/manifests/`: `claude`, `codex`, `opencode`, `cursor`,
 `gemini`, `amp`, plus `generic` for everything without its own manifest
 (a bare shell prompt reads as idle; anything else reads as nothing).
-`aider` and `goose` have no bundled manifest for lack of verified captures
-and stay on `generic` until one exists.
+
+`aider`, `goose`, `droid`, `qwen`, `grok` and `copilot` ship a manifest that
+carries only a `[resume]` table and no rules. How to carry a conversation
+across a restart is a different question from how to read a screen: the first
+is answered by an agent's own published flags, the second needs a verified
+capture, and there is none for these yet. A manifest with no rules does not
+shadow the generic ones, so they are read exactly as they were before.
 
 ## The rule schema
 
@@ -71,11 +76,16 @@ was having, and a `latest` line that does mention it would pass the placeholder 
 an argument. Both are parse errors naming the manifest.
 
 The bundled lines for `claude`, `codex`, `opencode` and `gemini` were read from those
-binaries' own `--help` on a real install. The lines for `cursor` and `amp` come from their
-published CLI documentation and are not verified against an installed binary. `gemini` has
+binaries' own `--help` on a real install. The lines for `cursor`, `amp`, `aider`, `goose`,
+`droid`, `qwen`, `grok` and `copilot` come from each project's published CLI documentation
+and are not verified against an installed binary. `gemini` has
 no `session` line because its resume takes a position in a list rather than a name, and a
-position moves as soon as another conversation is saved. `amp` has no `latest` line because
-nothing documented continues its newest thread without naming it.
+position moves as soon as another conversation is saved. `aider` has none either, because it
+has no session ids at all: its conversation is a file in the project.
+
+Charm Crush has no table and no manifest. Its own complete flag reference has nothing that
+resumes a conversation from the command line: switching is done in its own interface. There
+is nothing to write down, so nothing is written down.
 
 Nothing else about the tab is re-run. The command a tab was running is recorded and
 deliberately not repeated on restore: a tab that was halfway through a deploy, a migration

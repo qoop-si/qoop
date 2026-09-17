@@ -1,0 +1,15 @@
+# Aider.
+#
+# No detection rules: no verified capture of its screen exists yet, so it is read by the
+# generic rules like anything else without one. What is here is how to carry its
+# conversation across a restart.
+
+id = "aider"
+version = "1"
+
+# From Aider's own options reference: there is no session id to name. The conversation is a
+# file in the project (`--chat-history-file`, `.aider.chat.history.md` by default), and
+# `--restore-chat-history` is how it is picked up again. So there is no session line, and
+# the latest line is the only one it can keep.
+[resume]
+latest = ["aider", "--restore-chat-history"]

@@ -1,0 +1,14 @@
+# Goose.
+#
+# No detection rules yet, so it is read by the generic ones. What is here is how to carry
+# its conversation across a restart.
+
+id = "goose"
+version = "1"
+
+# From Goose's own session documentation: `goose session -r` resumes the most recent, and a
+# particular one is named with `--session-id`. Its ids are not UUIDs, they are dated
+# (`20251108_1`), which changes nothing here: the id is whatever the agent gave us.
+[resume]
+session = ["goose", "session", "--resume", "--session-id", "{session}"]
+latest = ["goose", "session", "-r"]

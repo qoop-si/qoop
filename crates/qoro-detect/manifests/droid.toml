@@ -1,0 +1,125 @@
+# Droid CLI (Factory).
+#
+# Droid is closed source. Every string below is from its 0.234.0 release binary
+# (downloads.factory.ai), whose English interface catalog is stored as plain text. Borders
+# and glyphs are mostly not recoverable from it, and its window title (`⛬ <title>`) is not
+# known to change with state, so nothing here reads it.
+
+id = "droid"
+version = "1"
+
+# Pickers the person opened (model, sessions, settings) and the approval details screen,
+# by their hint lines.
+[[rules]]
+id = "picker_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(4)"
+skip_state_update = true
+line_regex = '^\W*(Use arrow keys to navigate, Enter to select, Esc or Q to go back|Use ↑↓ to navigate, Tab/Enter to select, Esc to cancel|Esc / Alt/Option\+E to return)\s*\W*$'
+
+# A tool confirmation: the option rows `Yes, allow` (or `Yes, allow all`) and
+# `No, cancel` (or `No, cancel all`, prefixed `✕ ` when selected), while the spinner label
+# reads `Waiting for tool confirmation...`. The help hint under the idle input
+# (`Press ? for help`) under the same words means they were quoted.
+[[rules]]
+id = "tool_confirmation"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*Yes, allow( all)?\s*\W*$' },
+  { line_regex = '^\W*(✕ )?No, cancel( all)?\s*\W*$' },
+  { contains = "Waiting for tool confirmation..." },
+]
+not = [{ line_regex = '^\W*Press \? for help' }]
+
+# Droid Shield, after a secret was found: `Droid-Shield approval required` with the option
+# `Proceed & report false positive`, without the idle input's help hint under them.
+[[rules]]
+id = "droid_shield"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*Droid-Shield approval required' },
+  { line_regex = '^\W*(✕ )?Proceed & report false positive' },
+]
+not = [{ line_regex = '^\W*Press \? for help' }]
+
+# A question to the person: the label `ASK USER` and a help line ending `ESC stop agent`
+# (or `Enter Submit answer • ↑ back to options • ESC stop agent`).
+[[rules]]
+id = "ask_user"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*ASK USER\b' },
+  { line_regex = '^\W*(↑/↓ Navigate|Enter Submit answer) • .+ • ESC stop agent\s*\W*$' },
+]
+not = [{ line_regex = '^\W*Press \? for help' }]
+
+
+# Folder trust at startup: `Trust this folder?`, the options `1. Trust this folder` and
+# `2. Exit without trusting`, and `Enter to confirm · Esc to exit`.
+# The help hint under the input (`Press ? for help`) under the same words means they were
+# quoted.
+[[rules]]
+id = "folder_trust"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Trust this folder\?' },
+  { line_regex = '^\W*Enter to confirm · Esc to exit' },
+]
+not = [{ line_regex = '^\W*Press \? for help' }]
+
+# Sign-in: `Login with Factory account` and `Continue with API key`.
+[[rules]]
+id = "login"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Login with Factory account' },
+  { line_regex = '^\W*Continue with API key' },
+]
+not = [{ line_regex = '^\W*Press \? for help' }]
+
+# The spinner label by session status: `Thinking...`, `Streaming...`, `Invoking tools...`,
+# `Executing...`, `Compressing history...` and the others, or the hint
+# `Enter to steer · Ctrl+Enter to queue` in the input while a run is active.
+[[rules]]
+id = "spinner_label"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+any = [
+  { line_regex = '^\W*(Thinking|Compressing history|Streaming|Invoking tools|Executing|Rewinding conversation|Cancelling tools|Starting new session|Reviewing changes)\.\.\.\s*$' },
+  { line_regex = '\bEnter to steer · Ctrl\+Enter to queue' },
+]
+
+# The help hint under the input: `Press ? for help`.
+[[rules]]
+id = "help_hint"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*Press \? for help\s*\W*$'
+
+# From the options: `--resume <sessionId>`, and `--resume --last` for the most recent
+# session in this folder.
+[resume]
+session = ["droid", "--resume", "{session}"]
+latest = ["droid", "--resume", "--last"]

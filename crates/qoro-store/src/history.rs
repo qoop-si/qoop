@@ -260,13 +260,56 @@ fn read_row(file: &mut BufReader<File>) -> Result<Option<String>, StoreError> {
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
+/// How many rows a segment holds.
+///
+/// Counted through the index rather than by reading the segment. The index already records
+/// a byte offset every `INDEX_EVERY` rows, so the count is the entries it holds plus a scan
+/// of the rows after the last one, which is at most `INDEX_EVERY` of them.
+///
+/// It was a full scan of every row, and that is a scan this is asked for far more often
+/// than it looks: `open` does it per segment, and `read` does it again for every segment
+/// before the one it wants. With scrollback being read a notch of a wheel at a time, a
+/// terminal that has been running a week was rescanning its whole history on every notch,
+/// against a five second deadline.
+///
+/// A missing or empty index gives the old behaviour rather than a wrong answer, and so does
+/// an index written ahead of the data a crash lost: the scan starts from the last offset
+/// the index knows and counts whatever is actually there.
 fn count_rows(path: &Path) -> Result<u64, StoreError> {
+    let (covered, offset) = index_tail(&path.with_extension("idx"));
     let mut file = BufReader::new(File::open(path).map_err(io)?);
-    let mut rows = 0u64;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+    }
+    let mut rows = covered;
     while read_row(&mut file)?.is_some() {
         rows += 1;
     }
     Ok(rows)
+}
+
+/// The last offset an index records, and how many rows come before it.
+///
+/// `(0, 0)` when there is no index to read, which is a full scan and the right answer.
+fn index_tail(idx: &Path) -> (u64, u64) {
+    let Ok(meta) = std::fs::metadata(idx) else {
+        return (0, 0);
+    };
+    let entries = meta.len() / 8;
+    if entries == 0 {
+        return (0, 0);
+    }
+    let Ok(mut file) = File::open(idx) else {
+        return (0, 0);
+    };
+    let mut buf = [0u8; 8];
+    if file.seek(SeekFrom::Start((entries - 1) * 8)).is_err() || file.read_exact(&mut buf).is_err()
+    {
+        return (0, 0);
+    }
+    // Entry `i` is the offset of row `i * INDEX_EVERY`, so the last entry has that many
+    // rows before it.
+    ((entries - 1) * INDEX_EVERY, u64::from_le_bytes(buf))
 }
 
 fn segment_ordinal(path: &Path) -> Option<u64> {
@@ -348,5 +391,51 @@ mod tests {
         h.flush().unwrap();
         assert_eq!(truncated, 500);
         assert_eq!(h.read(0, 1).unwrap()[0].len(), MAX_ROW_BYTES);
+    }
+
+    /// Counting a segment is a seek and a short scan, not a read of every row.
+    ///
+    /// Asserted as an answer and as a cost. The answer is what every other test already
+    /// depends on; the cost is the point of the change, and a count that is correct while
+    /// still reading the whole file would pass an answer-only test.
+    #[test]
+    fn a_segment_is_counted_through_its_index_rather_than_by_reading_it() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let mut history = History::open(dir.path()).expect("open");
+        // Several index entries' worth, so the index is the thing being read.
+        let rows: Vec<String> = (0..INDEX_EVERY * 4 + 7)
+            .map(|i| format!("row {i}"))
+            .collect();
+        history.append(&rows).expect("append");
+        history.flush().expect("flush");
+        let segment = dir.path().join("000000000000.seg");
+
+        assert_eq!(
+            count_rows(&segment).expect("count"),
+            rows.len() as u64,
+            "the count is wrong, which is worse than the count being slow"
+        );
+
+        // The index says where to start, and it starts near the end.
+        let (covered, offset) = index_tail(&segment.with_extension("idx"));
+        assert_eq!(covered, INDEX_EVERY * 4);
+        assert!(
+            offset > 0,
+            "the index gave no offset, so this is still a full scan"
+        );
+        let size = std::fs::metadata(&segment).expect("size").len();
+        assert!(
+            offset > size / 2,
+            "the scan starts at {offset} of {size} bytes, which is not a short scan"
+        );
+
+        // Reopening finds the same next ordinal, which is what `open` uses the count for.
+        let reopened = History::open(dir.path()).expect("reopen");
+        assert_eq!(reopened.len(), rows.len() as u64);
+
+        // And a segment with no index at all is still counted correctly, which is what a
+        // crash between the two writes leaves behind.
+        std::fs::remove_file(segment.with_extension("idx")).expect("remove the index");
+        assert_eq!(count_rows(&segment).expect("count"), rows.len() as u64);
     }
 }

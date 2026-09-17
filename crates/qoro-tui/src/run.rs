@@ -23,15 +23,23 @@ use crate::{sidebar, tabs};
 ///
 /// A window's worth, plus the same again above it, so an unhurried scroll finds the next
 /// rows already here rather than waiting for a round trip at every notch.
-fn behind_request(terminal: u32, scroll: usize, pane_rows: usize) -> ControlRequest {
-    // The window needs the rows from `scroll` back to `scroll` minus a screen. Asked for
-    // with a screen of margin at each end, so an unhurried scroll finds the next rows
-    // already here rather than waiting for a round trip at every notch.
+fn behind_request(terminal: u32, rows_back: usize, pane_rows: usize) -> ControlRequest {
+    // At most a pane's worth of the window is ever read from behind the screen, so that is
+    // what has to be covered. A margin above it is prefetch, so an unhurried scroll finds
+    // the next rows already here rather than waiting for a round trip at every notch.
+    //
+    // The margin is whatever is left inside what the daemon will answer with. It has to be
+    // this way round: the daemon keeps the oldest end of what it is asked for, so a request
+    // larger than that ceiling loses its newest rows, which are exactly the ones next to
+    // the screen.
+    let margin = qoro_runtime::daemon::MAX_SCROLLBACK_ROWS
+        .saturating_sub(pane_rows)
+        .min(pane_rows);
     ControlRequest::Scrollback {
         id: "behind".to_string(),
         terminal,
-        up: scroll + pane_rows,
-        rows: pane_rows * 3,
+        up: rows_back + margin,
+        rows: pane_rows + margin,
     }
 }
 
@@ -823,6 +831,19 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                         &ClientWire::Resize { cols: pane_cols, rows: pane_rows },
                         seqs.entry(focused).or_default(),
                     )?).await?;
+                    // A taller window reads further back, and what was fetched for the
+                    // shorter one stops at the row the shorter one needed: without asking
+                    // again, growing the window while scrolled back fills the new rows at
+                    // the top with blanks until the person turns the wheel.
+                    if state.anchor.is_some() && focused != 0 {
+                        let want = behind_request(
+                            focused,
+                            state.rows_back() as usize,
+                            pane_rows as usize,
+                        );
+                        wr.write_all(&client::encode_control_seq(&want, &mut control_seq)?)
+                            .await?;
+                    }
                     dirty = true;
                 }
                 typed = stdin_rx.recv() => {
@@ -1774,13 +1795,13 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 // What there is may be less than what was asked for, so the view is
                 // pulled back to what exists rather than showing blank rows above the
                 // oldest line.
-                // What there is may be less than what was asked for, so the pin is pulled
-                // to the oldest row that exists rather than showing blank rows above it.
-                if let Some(anchor) = state.anchor
-                    && anchor < from
-                {
-                    state.anchor = Some(from);
-                }
+                // The pin is deliberately not moved to meet the answer. `from` is where
+                // this answer happens to start, not the oldest row there is, and a person
+                // turning the wheel quickly has several requests out at once: pulling the
+                // pin up to a shallow answer's `from` made the view jump forward and then
+                // back as the deeper answer landed. A row the client does not hold is
+                // drawn blank for a frame instead, and the next answer fills it.
+                let _ = from;
                 *dirty = true;
             }
         }
@@ -2045,8 +2066,12 @@ mod tests {
     /// every scrolled row was empty.
     #[test]
     fn the_rows_asked_for_cover_the_rows_the_window_will_read() {
-        let pane_rows = 20usize;
-        for scroll in [1usize, 3, 19, 20, 21, 100, 999] {
+        // A small window, and one tall enough that a margin no longer fits inside what the
+        // daemon will answer with: a 4K screen at a small font is three hundred rows.
+        for (pane_rows, scroll) in [20usize, 300]
+            .into_iter()
+            .flat_map(|rows| [1usize, 3, 19, 20, 21, 100, 999].map(move |s| (rows, s)))
+        {
             let ControlRequest::Scrollback { up, rows, .. } = behind_request(1, scroll, pane_rows)
             else {
                 panic!("a scrollback request");
@@ -2069,11 +2094,12 @@ mod tests {
                 "at {scroll} back the request stops short of the bottom of the window: \
                  covers down to {covers_newest} back, needs {newest_needed}"
             );
-            // And it is bounded: a request that grew with how far back a person has
-            // scrolled would ask the daemon to read the whole history to draw twenty rows.
+            // And it is bounded by what the daemon will answer with. Past that ceiling
+            // the daemon keeps the oldest end of the range, so the rows next to the
+            // screen, which are the ones the window actually needs, are the ones dropped.
             assert!(
-                rows <= pane_rows * 4,
-                "{rows} rows for a {pane_rows} row window"
+                rows <= qoro_runtime::daemon::MAX_SCROLLBACK_ROWS,
+                "{rows} rows asked for at a {pane_rows} row window, past the ceiling"
             );
         }
     }

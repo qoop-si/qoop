@@ -1598,6 +1598,15 @@ async fn handle_control(
         ControlRequest::Scrollback {
             terminal, up, rows, ..
         } => {
+            // A terminal that does not exist is a refusal, not an empty answer. Opening a
+            // history creates the directory it is given, so answering `{total: 0}` for an
+            // id nobody has would quietly leave an empty directory per bad request.
+            if terminals.get(terminal).is_none() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no terminal {terminal}"),
+                };
+            }
             let Some(dir) = history_dir.as_ref().map(|d| d.join(terminal.to_string())) else {
                 return ControlResponse::Failed {
                     id,
@@ -2400,9 +2409,13 @@ pub(crate) fn unparsable(error: &str) -> String {
 
 /// The most rows one scrollback request may ask for.
 ///
+/// Public because a client has to ask for a range that fits inside it: the truncation here
+/// keeps the oldest end of what was asked for, so a client that asked for more than this
+/// would lose the newest rows, which are the ones next to the screen.
+///
 /// A window's worth and then some. The count is a number from a client, and a client is
 /// not to be trusted with how much memory the daemon allocates.
-const MAX_SCROLLBACK_ROWS: usize = 500;
+pub const MAX_SCROLLBACK_ROWS: usize = 500;
 
 /// How long a shutdown waits for its terminals to end before going anyway.
 ///

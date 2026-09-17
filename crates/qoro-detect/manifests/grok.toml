@@ -1,0 +1,105 @@
+# `grok`: two different programs install an executable by this name, and nothing in the
+# process table tells them apart, so this file reads both where their screens differ.
+#
+# Grok Build (xAI): xai-org/grok-build at 2bdd1d6a, the full-screen Rust interface in
+# `xai-grok-pager`. Its composer placeholder is `Build anything`.
+#
+# grok-cli (superagent-ai, npm grok-dev 1.1.7): superagent-ai/grok-cli at fb97af83,
+# `src/ui/app.tsx`. Its composer placeholder is `Message Grok...`.
+#
+# Grok Build's permission view is docked above its composer, so on screen it cannot be told
+# from the same rows quoted in an answer; it is read from the window title instead.
+
+id = "grok"
+version = "1"
+
+# Grok Build: the window title starts `⚠ Action Required` only while a permission is
+# pending (`notifications/title.rs`).
+[[rules]]
+id = "title_action_required"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^⚠ Action Required'
+
+# Grok Build: the folder trust question on the welcome screen,
+# `Do you trust the contents of this directory?`, over
+# `Grok Build may run or modify contents in this directory,` (`views/welcome/mod.rs`).
+# The composer's placeholder under the same words means they were quoted.
+[[rules]]
+id = "trust_directory"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Do you trust the contents of this directory\?' },
+  { line_regex = '^\W*Grok Build may run or modify contents in this directory,' },
+]
+not = [{ line_regex = '^\W*(Build anything|Message Grok\.\.\.)\s*\W*$' }]
+
+# grok-cli: the payment approval panel, drawn with a left border `┃`: `Payment required`
+# and the hint row `↑↓ select   enter confirm   esc reject`. The border is what an answer
+# quoting the words does not draw.
+[[rules]]
+id = "payment_approval"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*┃\s*Payment required' },
+  { line_regex = '^\s*┃\s*↑↓ select\s+enter confirm\s+esc reject' },
+]
+
+# Grok Build: the turn status row, `⠧ Run command 0.2s   1m20s ⇣12k [stop]`: a braille
+# frame, the activity, timers, and the cancel button `[stop]` (`views/turn_status.rs`).
+[[rules]]
+id = "turn_status"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = '^\s*[⠋⠙⠹⠸⠼⠴⠦⠧] .*\[stop\]\s*$'
+
+# Grok Build: the window title while busy starts with a braille frame, as in
+# `⠋ - Thinking - my session - grok`.
+[[rules]]
+id = "title_spinner"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^[⠋⠙⠹⠸⠼⠴⠦⠧] - '
+
+# grok-cli: the prompt while a turn runs, `Queue a follow-up... (esc to interrupt)`, or the
+# shimmer `Planning next moves` before any output.
+[[rules]]
+id = "grok_cli_working"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+any = [
+  { line_regex = 'Queue a follow-up\.\.\. \(esc to interrupt\)' },
+  { line_regex = '^\W*Planning next moves' },
+]
+
+# The empty composer: `Build anything` after `❯ ` in Grok Build's box, or `Message Grok...`
+# in grok-cli's.
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*(Build anything|Message Grok\.\.\.)\s*\W*$'
+
+# Grok Build's resume flags (`app/cli.rs`): `--resume <id>` and `--continue`. grok-cli takes
+# `--session <id>` and `--session latest` instead, which one table cannot also say; a
+# restored grok-cli tab gets an error from it rather than another conversation.
+[resume]
+session = ["grok", "--resume", "{session}"]
+latest = ["grok", "--continue"]
