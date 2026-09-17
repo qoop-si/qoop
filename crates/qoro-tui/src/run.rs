@@ -15,8 +15,69 @@ use qoro_runtime::daemon::{ClientWire, SnapshotWire};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::keys::{Action, Keys};
+use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
 use crate::{sidebar, tabs};
+
+/// How many rows one notch of the wheel moves, where the interface decides rather than
+/// the program. Three is what a terminal sends and what a hand expects.
+const WHEEL_ROWS: usize = 3;
+
+/// What to say when something has been copied.
+fn copied(text: &str) -> String {
+    let lines = text.lines().count();
+    if lines > 1 {
+        return format!("copied {lines} lines");
+    }
+    let one = text.trim();
+    // Shown, so a person can see they got the right thing, and cut so a long line does not
+    // push the rest of the notice off the row.
+    if crate::width::width(one) > 40 {
+        format!(
+            "copied {}\u{2026}",
+            crate::selection::in_columns(one, 0..39)
+        )
+    } else {
+        format!("copied {one}")
+    }
+}
+
+/// One mouse report in the form a program that asked for the mouse expects.
+///
+/// SGR (`CSI ? 1006`), which every program that asks for the mouse these days understands
+/// and which is the form this interface itself reads from the terminal above it. The
+/// coordinates are the pane's own, one based, because the program believes its pane is the
+/// whole screen.
+fn mouse_report(button: u16, row: usize, col: usize, press: bool) -> Option<Vec<u8>> {
+    Some(
+        format!(
+            "\x1b[<{button};{};{}{}",
+            col + 1,
+            row + 1,
+            if press { 'M' } else { 'm' }
+        )
+        .into_bytes(),
+    )
+}
+
+/// Send bytes to the focused terminal, if there is one.
+async fn send_to_pane(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    bytes: Vec<u8>,
+) -> std::io::Result<()> {
+    let focused = state.focused;
+    if focused == 0 {
+        return Ok(());
+    }
+    let frame = client::encode_command_to(
+        focused,
+        &ClientWire::Input { bytes },
+        seqs.entry(focused).or_default(),
+    )?;
+    wr.write_all(&frame).await
+}
 
 /// Everything the screen is drawn from.
 struct State {
@@ -47,12 +108,32 @@ struct State {
     adopted: bool,
     /// Set when there is nothing left to be an interface to.
     done: bool,
+    /// The open naming box, when a person is being asked what to call something.
+    prompt: Option<Prompt>,
+    /// The open menu, and which of its items is selected.
+    menu: Option<usize>,
+    /// Whether the left column is folded away to a strip.
+    collapsed: bool,
+    /// An overlay showing something read only: the keys, or what this daemon is set to.
+    reading: Option<Reading>,
     /// Spaces asked for and not yet answered for.
     ///
     /// Only the naming needs this, and the naming needs it badly: two presses of `ctrl-a w`
     /// before either answer came back both counted the same list and both produced
     /// `space 2`, so the panel showed two rows with one name on them.
     creating: usize,
+    /// Which idle groups of the agents panel are expanded.
+    fold: sidebar::Fold,
+    /// The open search palette, or `None` when the terminal has the keyboard.
+    palette: Option<Palette>,
+    /// The start of a palette key sequence the read ended in the middle of.
+    palette_pending: Vec<u8>,
+    /// Text being selected with the mouse, or selected and still shown.
+    ///
+    /// Kept after the button comes up rather than cleared, because a person who has just
+    /// copied something looks at it to check they got the right thing. The next press in
+    /// the pane clears it.
+    selection: Option<crate::selection::Selection>,
 }
 
 impl State {
@@ -66,6 +147,13 @@ impl State {
             cols: self.cols,
             lines: self.lines,
             message: self.message.as_deref(),
+            fold: self.fold,
+            palette: self.palette.as_ref(),
+            prompt: self.prompt.as_ref(),
+            menu: self.menu,
+            collapsed: self.collapsed,
+            reading: self.reading,
+            selection: self.selection,
         }
     }
 
@@ -80,35 +168,118 @@ impl State {
     /// the focused entry visible: the row a person clicked is not the entry's position in
     /// the list, and computing it here would be a second copy of that arithmetic that
     /// starts out right and drifts.
-    fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
-        let (_, pane_rows) = screen::pane_size(self.cols, self.lines);
-        if (row as usize) <= screen::TABS {
-            return tabs::hit(
-                &self.tabs(),
-                self.focused,
-                self.cols as usize,
-                (col as usize).saturating_sub(1),
-            )
-            .map(Clicked::Terminal);
-        }
-        // The pane, or a window too narrow to have a left column at all. A terminal
-        // application that wants the mouse asks for it, and passing a click to one that did
-        // not would type its report at a prompt.
-        let left = screen::left(self.cols);
-        if left == 0 || col as usize >= left {
+    /// Where in the pane a screen position is, if it is in the pane at all.
+    ///
+    /// Zero based, which is what the snapshot's rows and the selection both count in. The
+    /// pane starts under the tab bar and to the right of the column, and the two status
+    /// rows at the foot are not it.
+    fn in_pane(&self, row: u16, col: u16) -> Option<(usize, usize)> {
+        let (pane_cols, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let left = screen::left_for(self.cols, self.collapsed);
+        let first_col = left + 1;
+        if (col as usize) < first_col || (col as usize) >= first_col + pane_cols as usize {
             return None;
         }
-        let within = (row as usize) - 1 - screen::TABS;
-        match sidebar::hit(
-            &self.spaces,
-            &self.rows,
-            self.space.unwrap_or_default(),
-            self.focused,
-            pane_rows as usize,
-            within,
-        )? {
+        let within = (row as usize).checked_sub(screen::TABS + 1)?;
+        (within < pane_rows as usize).then_some((within, col as usize - first_col))
+    }
+
+    /// Whether the program in the focused terminal has asked for the mouse.
+    ///
+    /// When it has, the mouse is its own: a drag is a drag in its own interface, and
+    /// taking that away to draw a selection would break scrolling and clicking inside
+    /// every agent. Shift is how a person says otherwise, which is what every terminal
+    /// emulator already trains them to do.
+    fn pane_wants_mouse(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.modes.mouse_reporting)
+    }
+
+    /// Whether the program is on the alternate screen, where a wheel is a scroll of its
+    /// own view rather than of the scrollback behind it.
+    fn pane_is_full_screen(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| s.modes.alt_screen)
+    }
+
+    /// Whether the program wants its arrows spelled `SS3 A` rather than `CSI A`.
+    fn pane_application_cursor(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.modes.application_cursor)
+    }
+
+    fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
+        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let left = screen::left_for(self.cols, self.collapsed);
+        // Right of the column, which is the pane and the bar above it.
+        if left == 0 || col as usize > left {
+            if (row as usize) != screen::TABS {
+                // The pane. A terminal application that wants the mouse asks for it, and
+                // passing a click to one that did not would type its report at a prompt.
+                return None;
+            }
+            // The bar starts where the pane starts, so the column it was clicked at is
+            // counted from there and not from the edge of the screen.
+            return match tabs::hit(
+                &self.tabs(),
+                self.focused,
+                pane_cols as usize,
+                (col as usize).saturating_sub(left + 1),
+            ) {
+                Some(tabs::Hit::Terminal(terminal)) => Some(Clicked::Terminal(terminal)),
+                Some(tabs::Hit::New) => Some(Clicked::NewTerminal),
+                None => None,
+            };
+        }
+        // The column, which starts at the top row and runs down to the status line.
+        let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+        let column_rows = (self.lines as usize).saturating_sub(screen::STATUS);
+        let hit = if self.collapsed {
+            sidebar::rows_collapsed(
+                &self.spaces,
+                &self.rows,
+                self.space.unwrap_or_default(),
+                self.focused,
+                column_rows,
+            )
+            .into_iter()
+            .nth(within)
+            .and_then(|(_, hit)| hit)
+        } else {
+            sidebar::hit_folded(
+                &self.spaces,
+                &self.rows,
+                self.space.unwrap_or_default(),
+                self.focused,
+                column_rows,
+                &self.fold,
+                within,
+            )
+        };
+        // The row between the panels answers by which half was clicked, so the column has
+        // to ask a second question the row itself cannot answer.
+        let hit = hit.or_else(|| {
+            let rows = sidebar::rows_folded(
+                &self.spaces,
+                &self.rows,
+                self.space.unwrap_or_default(),
+                self.focused,
+                column_rows,
+                &self.fold,
+            );
+            let is_footer = rows
+                .get(within)
+                .is_some_and(|(line, _)| line.text.contains("menu"));
+            (is_footer && !self.collapsed).then(|| sidebar::footer_hit(col as usize))?
+        });
+        match hit? {
             sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
             sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
+            sidebar::Hit::Fold(group) => Some(Clicked::Fold(group)),
+            sidebar::Hit::New => Some(Clicked::NewTerminal),
+            sidebar::Hit::Menu => Some(Clicked::Menu),
+            sidebar::Hit::Collapse => Some(Clicked::Collapse),
         }
     }
 
@@ -155,10 +326,250 @@ impl State {
     }
 }
 
+/// What one read of stdin meant while the menu owns the keyboard.
+enum MenuOutcome {
+    Moved,
+    Closed,
+    Chose(usize),
+    Passthrough(Vec<u8>),
+}
+
+/// Decide what one read of stdin meant while the menu is open.
+///
+/// Up and down move, enter chooses, esc closes, and the first letter of a row jumps to it.
+/// A prefix or a bare detach closes the menu and hands the bytes on, so `ctrl-a d` still
+/// detaches out of it.
+fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
+            // An arrow, or a mouse report to swallow whole.
+            match bytes.get(at + 2) {
+                Some(b'A') => {
+                    state.menu = Some(selected.saturating_sub(1));
+                    return MenuOutcome::Moved;
+                }
+                Some(b'B') => {
+                    state.menu = Some((selected + 1).min(MENU.len() - 1));
+                    return MenuOutcome::Moved;
+                }
+                _ => match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
+                    Some(end) => {
+                        at += end + 1;
+                        continue;
+                    }
+                    None => break,
+                },
+            }
+        }
+        at += 1;
+        match byte {
+            b'\r' | b'\n' => {
+                state.menu = None;
+                return MenuOutcome::Chose(selected);
+            }
+            0x1b => {
+                state.menu = None;
+                return MenuOutcome::Closed;
+            }
+            0x01 | 0x11 => {
+                state.menu = None;
+                return MenuOutcome::Passthrough(bytes[at - 1..].to_vec());
+            }
+            letter => {
+                if let Some(found) = MENU
+                    .iter()
+                    .position(|(name, _)| name.as_bytes().first() == Some(&letter))
+                {
+                    state.menu = Some(found);
+                    return MenuOutcome::Moved;
+                }
+            }
+        }
+    }
+    MenuOutcome::Moved
+}
+
+/// What the menu offers.
+///
+/// Everything here does something today. A menu row that opened nothing would be the one
+/// place in the interface that lies about what the product can do, and a person who found
+/// one would be right to stop trusting the rest.
+pub const MENU: &[(&str, &str)] = &[
+    ("keybinds", "every key, and what it does"),
+    ("settings", "what this daemon is set to"),
+    ("reload manifests", "re-read the agent detection overrides"),
+    ("detach", "leave, and keep everything running"),
+];
+
+/// A read only overlay opened from the menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    Keybinds,
+    Settings,
+}
+
+/// A person being asked what to call the thing they just asked for.
+///
+/// Asked and not assumed. A space called `space 3` and a tab called `zsh` are both names
+/// nobody chose, and a fleet of them is a list a person reads by counting rather than by
+/// recognising. Empty is a real answer: it means "you name it", and the default is used.
+pub struct Prompt {
+    pub what: Naming,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Naming {
+    Space,
+    Terminal,
+    /// Rename what already exists, which is the common case: a name given at creation is a
+    /// guess, and the terminal somebody opened to "look at something" is the one they are
+    /// still in an hour later doing the thing it should have been called after.
+    RenameSpace(i64),
+    RenameTerminal(u32),
+}
+
+impl Naming {
+    /// What the box says it is asking for.
+    pub fn asks(self) -> &'static str {
+        match self {
+            Naming::Space => "name the new space",
+            Naming::Terminal => "name the new terminal",
+            Naming::RenameSpace(_) => "rename this space",
+            Naming::RenameTerminal(_) => "rename this tab",
+        }
+    }
+
+    /// What an empty answer means here, which is not the same thing in all four cases.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Naming::Space | Naming::Terminal => {
+                "enter to make it, esc to stop, empty for a default name"
+            }
+            Naming::RenameTerminal(_) => {
+                "enter to rename, esc to stop, empty for the program's own name"
+            }
+            // A space with no name is a space nobody can point at, so there is nothing for
+            // empty to mean and it is a cancel.
+            Naming::RenameSpace(_) => "enter to rename, esc to stop",
+        }
+    }
+}
+
+/// What one read of stdin meant while the naming box owns the keyboard.
+enum PromptOutcome {
+    /// Nothing to send, and the box is still open.
+    Typing,
+    /// Closed with nothing done.
+    Closed,
+    /// Confirmed, with what was typed, and whatever was typed after the enter.
+    ///
+    /// A read is however many bytes happened to arrive, so the key that opens the next
+    /// thing can land in the same one as the enter that closed this box. Dropped, those
+    /// keystrokes vanished with nothing on screen to say so: measured, a second `ctrl-a w`
+    /// typed straight after confirming the first never opened a box at all.
+    Confirm(Naming, Option<String>, Vec<u8>),
+    /// Closed, and these bytes belong to the key decoder rather than to the box.
+    Passthrough(Vec<u8>),
+}
+
+/// Decide what one read of stdin meant while the naming box owns the keyboard.
+///
+/// Typing goes into the name, `enter` confirms it, `esc` is out, and backspace rubs out.
+/// A prefix or a bare detach closes the box and hands the bytes on from there, so
+/// `ctrl-a d` still detaches out of it, which is the same rule the palette follows.
+fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
+    let Some(prompt) = state.prompt.as_mut() else {
+        return PromptOutcome::Passthrough(bytes.to_vec());
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = &bytes[at];
+        // An escape sequence, which here is never a name. A mouse report is the one that
+        // matters: the box is opened by a click on the `+`, and the release of that very
+        // click arrives a moment later. Read byte by byte its leading escape is a cancel,
+        // so the box opened and shut again before anybody could type into it, which looked
+        // like the button doing nothing at all.
+        if *byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
+            match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
+                Some(end) => {
+                    at += end + 1;
+                    continue;
+                }
+                // Split across the read. Held rather than passed on, so half a report
+                // cannot land in a name.
+                None => break,
+            }
+        }
+        at += 1;
+        let at = at - 1;
+        match byte {
+            // Enter.
+            b'\r' | b'\n' => {
+                let what = prompt.what;
+                let text = prompt.text.trim().to_string();
+                state.prompt = None;
+                return PromptOutcome::Confirm(
+                    what,
+                    (!text.is_empty()).then_some(text),
+                    bytes[at + 1..].to_vec(),
+                );
+            }
+            // Escape, which here is a cancel and never the start of a sequence: the box
+            // holds no arrow keys, and waiting for a next read that may never come would
+            // swallow the one key that closes it.
+            0x1b => {
+                state.prompt = None;
+                return PromptOutcome::Closed;
+            }
+            // Backspace, both spellings a terminal sends.
+            0x7f | 0x08 => {
+                prompt.text.pop();
+            }
+            // The prefix, or a bare detach: not this box's keys.
+            0x01 | 0x11 => {
+                state.prompt = None;
+                return PromptOutcome::Passthrough(bytes[at..].to_vec());
+            }
+            byte if (byte.is_ascii_graphic() || *byte == b' ')
+                && crate::width::width(&prompt.text) < NAME_LIMIT =>
+            {
+                prompt.text.push(*byte as char);
+            }
+            // Anything else, a control byte or half a character, is not a name.
+            _ => {}
+        }
+    }
+    PromptOutcome::Typing
+}
+
+/// The most columns a name may take, which is the column it has to fit in.
+const NAME_LIMIT: usize = crate::sidebar::WIDTH - 6;
+
 /// What the interface drew where a person clicked.
 enum Clicked {
+    Menu,
+    Collapse,
     Space(i64),
     Terminal(u32),
+    NewTerminal,
+    Fold(sidebar::Group),
+}
+
+/// What one read of stdin meant while the palette owns the keyboard.
+#[derive(Debug)]
+enum PaletteOutcome {
+    /// The query or the selection moved: repaint.
+    Updated,
+    /// The palette closed with nothing picked: repaint.
+    Closed,
+    /// The palette closed with something picked: go there.
+    Confirm(palette::Item),
+    /// The palette closed and these bytes are ordinary input after all: feed
+    /// them to the key decoder as though the palette had never been open.
+    Passthrough(Vec<u8>),
 }
 
 /// Run the interface until the user detaches or the daemon goes away.
@@ -194,10 +605,18 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         space: None,
         was: std::collections::BTreeMap::new(),
         ring: false,
+        prompt: None,
+        menu: None,
+        collapsed: false,
+        reading: None,
         wants_terminal_in: Vec::new(),
         adopted: false,
         creating: 0,
         done: false,
+        fold: sidebar::Fold::default(),
+        palette: None,
+        palette_pending: Vec::new(),
+        selection: None,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -261,11 +680,15 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
     // The alternate screen, so that detaching gives the user their scrollback back, and
     // mouse reporting, so a click on the index picks a terminal.
     //
-    // `1000` is press and release only, not motion: tracking every movement would be a
-    // report per pixel row for a feature that only needs to know where a press landed.
+    // `1002` is press, release and motion while a button is held. Not `1003`, which
+    // reports the pointer moving over an idle screen: that is a report per row crossed for
+    // nothing, and this interface costs no wakeups while nothing happens. Not `1000`
+    // either, which is what this used to be and which has no motion at all: without motion
+    // a drag is a press and a release in two different places, and a person dragging
+    // across a line of an answer selects nothing.
     // `1006` asks for those reports in the extended form, because the original one cannot
     // express a column past 223 and this interface is regularly wider than that.
-    out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h")?;
+    out.write_all(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h")?;
     out.flush()?;
     let mut dirty = true;
 
@@ -311,7 +734,158 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                 }
                 typed = stdin_rx.recv() => {
                     let Some(bytes) = typed else { return Ok(()) };
-                    for action in keys.feed(&bytes) {
+                    // The palette owns the keyboard while it is open: typing filters,
+                    // enter goes, esc is back. A prefix or a detach inside it closes
+                    // the palette and the bytes from there on are ordinary input, so
+                    // `ctrl-a d` still detaches.
+                    let mut feed: Option<Vec<u8>> = None;
+                    if state.palette.is_some() {
+                        match palette_key(&mut state, &bytes) {
+                            PaletteOutcome::Updated | PaletteOutcome::Closed => {
+                                dirty = true;
+                            }
+                            PaletteOutcome::Confirm(item) => {
+                                match item {
+                                    palette::Item::Terminal(picked) => {
+                                        if let Some(out) = focus(
+                                            &mut state, picked, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&out).await?;
+                                        }
+                                    }
+                                    palette::Item::Space(space) => {
+                                        if let Some(out) = enter_space(
+                                            &mut state, space, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&out).await?;
+                                        }
+                                    }
+                                    palette::Item::NewTerminal => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Terminal,
+                                            text: String::new(),
+                                        });
+                                    }
+                                    palette::Item::NewSpace => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Space,
+                                            text: String::new(),
+                                        });
+                                    }
+                                }
+                                dirty = true;
+                            }
+                            PaletteOutcome::Passthrough(rest) => {
+                                feed = Some(rest);
+                            }
+                        }
+                    } else if let Some(selected) = state.menu {
+                        // The menu owns the keyboard while it is open, the way the palette
+                        // and the naming box do, and hands a prefix back for the same
+                        // reason.
+                        match menu_key(&mut state, selected, &bytes) {
+                            MenuOutcome::Moved | MenuOutcome::Closed => dirty = true,
+                            MenuOutcome::Chose(item) => {
+                                match MENU[item].0 {
+                                    "keybinds" => state.reading = Some(Reading::Keybinds),
+                                    "settings" => state.reading = Some(Reading::Settings),
+                                    "reload manifests" => {
+                                        request += 1;
+                                        wr.write_all(&client::encode_control_seq(
+                                            &ControlRequest::ReloadAgentManifests {
+                                                id: format!("reload-{request}"),
+                                            },
+                                            &mut control_seq,
+                                        )?).await?;
+                                    }
+                                    "detach" => return Ok(()),
+                                    _ => {}
+                                }
+                                dirty = true;
+                            }
+                            MenuOutcome::Passthrough(rest) => feed = Some(rest),
+                        }
+                    } else if state.reading.is_some() {
+                        // Anything at all closes a thing that is only being read.
+                        state.reading = None;
+                        dirty = true;
+                    } else if state.prompt.is_some() {
+                        // The naming box owns the keyboard the same way the palette does,
+                        // and hands a prefix or a detach back for the same reason.
+                        match prompt_key(&mut state, &bytes) {
+                            PromptOutcome::Typing | PromptOutcome::Closed => dirty = true,
+                            PromptOutcome::Confirm(what, name, rest) => {
+                                if !rest.is_empty() {
+                                    feed = Some(rest);
+                                }
+                                request += 1;
+                                let ask = match what {
+                                    Naming::RenameTerminal(terminal) => {
+                                        ControlRequest::RenameTerminal {
+                                            id: format!("rename-{request}"),
+                                            terminal,
+                                            // Empty hands the tab back to its program's
+                                            // name, which is the only way to undo a name
+                                            // without inventing a second key for it.
+                                            name,
+                                        }
+                                    }
+                                    Naming::RenameSpace(workspace) => {
+                                        match name {
+                                            Some(name) => ControlRequest::RenameWorkspace {
+                                                id: format!("rename-{request}"),
+                                                workspace,
+                                                name,
+                                            },
+                                            // A space with no name is a space nobody can
+                                            // point at, so an empty answer is a cancel.
+                                            None => {
+                                                dirty = true;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Naming::Terminal => ControlRequest::CreateTerminal {
+                                        id: format!("new-{request}"),
+                                        cwd: None,
+                                        // The space the person is looking at.
+                                        workspace: state.space,
+                                        name,
+                                    },
+                                    Naming::Space => ControlRequest::CreateWorkspace {
+                                        id: format!("space-{request}"),
+                                        // Empty means "you name it", which is the numbered
+                                        // name this counted before anybody was asked.
+                                        name: name.unwrap_or_else(|| {
+                                            format!(
+                                                "space {}",
+                                                state.spaces.len() + state.creating + 1
+                                            )
+                                        }),
+                                    },
+                                };
+                                if matches!(what, Naming::Space) {
+                                    state.creating += 1;
+                                }
+                                wr.write_all(&client::encode_control_seq(
+                                    &ask, &mut control_seq,
+                                )?).await?;
+                                state.message = Some(match what {
+                                    Naming::Terminal => "starting a terminal".to_string(),
+                                    Naming::Space => "starting a space".to_string(),
+                                    Naming::RenameSpace(_) | Naming::RenameTerminal(_) => {
+                                        "renamed".to_string()
+                                    }
+                                });
+                                dirty = true;
+                            }
+                            PromptOutcome::Passthrough(rest) => feed = Some(rest),
+                        }
+                    } else {
+                        feed = Some(bytes);
+                    }
+                    if let Some(input) = feed {
+                    for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
                                 // Nothing focused is a real state: a space with no
@@ -329,7 +903,32 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                 }
                             }
                             Action::Detach => return Ok(()),
-                            Action::Click { row, col } => {
+                            Action::Click { row, col, shift } => {
+                                // In the pane, and the program in it has not taken the
+                                // mouse, or the person said this one is theirs: a press
+                                // starts a selection rather than reaching anything.
+                                if let Some((pane_row, pane_col)) = state.in_pane(row, col) {
+                                    if state.pane_wants_mouse() && !shift {
+                                        if let Some(bytes) =
+                                            mouse_report(0, pane_row, pane_col, true)
+                                        {
+                                            send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
+                                                .await?;
+                                        }
+                                    } else {
+                                        state.selection =
+                                            Some(crate::selection::Selection::start(
+                                                pane_row, pane_col,
+                                            ));
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
+                                // A press anywhere else puts down whatever was selected:
+                                // the selection belongs to the pane it was made in.
+                                if state.selection.take().is_some() {
+                                    dirty = true;
+                                }
                                 match state.clicked(row, col) {
                                     Some(Clicked::Terminal(picked)) => {
                                         if let Some(bytes) = focus(
@@ -339,6 +938,13 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                             dirty = true;
                                         }
                                     }
+                                    Some(Clicked::NewTerminal) => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Terminal,
+                                            text: String::new(),
+                                        });
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Space(space)) => {
                                         if let Some(bytes) = enter_space(
                                             &mut state, space, &mut control_seq, &mut seqs,
@@ -347,8 +953,129 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                         }
                                         dirty = true;
                                     }
+                                    Some(Clicked::Fold(group)) => {
+                                        state.fold.open(group);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Menu) => {
+                                        state.menu = Some(0);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Collapse) => {
+                                        state.collapsed = !state.collapsed;
+                                        // The pane's width changed with the column, and a
+                                        // child that is not told reflows its output against
+                                        // a width it no longer has.
+                                        let (cols, rows) = screen::pane_size_for(
+                                            state.cols,
+                                            state.lines,
+                                            state.collapsed,
+                                        );
+                                        let focused = state.focused;
+                                        if focused != 0 {
+                                            wr.write_all(&client::encode_command_to(
+                                                focused,
+                                                &ClientWire::Resize { cols, rows },
+                                                seqs.entry(focused).or_default(),
+                                            )?).await?;
+                                        }
+                                        dirty = true;
+                                    }
                                     None => {}
                                 }
+                            }
+                            Action::Drag { row, col, shift } => {
+                                let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
+                                    continue;
+                                };
+                                if let Some(selection) = state.selection.as_mut() {
+                                    selection.extend(pane_row, pane_col);
+                                    dirty = true;
+                                } else if state.pane_wants_mouse() && !shift {
+                                    // 32 is the motion flag on the left button, which is
+                                    // what a program tracking a drag is listening for.
+                                    if let Some(bytes) =
+                                        mouse_report(32, pane_row, pane_col, true)
+                                    {
+                                        send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
+                                            .await?;
+                                    }
+                                }
+                            }
+                            Action::Release { row, col, shift } => {
+                                let inside = state.in_pane(row, col);
+                                if let Some(selection) = state.selection {
+                                    // Copied when the button comes up, with no key to
+                                    // press: a selection that has to be confirmed is a
+                                    // selection a person makes twice.
+                                    let text = state
+                                        .snapshot
+                                        .as_ref()
+                                        .map(|s| {
+                                            selection.text(&s.lines, s.cols)
+                                        })
+                                        .unwrap_or_default();
+                                    if !text.is_empty() {
+                                        let mut out = std::io::stdout();
+                                        crate::selection::copy(&text, &mut out)?;
+                                        state.message = Some(copied(&text));
+                                        dirty = true;
+                                    } else {
+                                        // A click, not a drag. Nothing was selected, so
+                                        // nothing stays highlighted.
+                                        state.selection = None;
+                                    }
+                                } else if let Some((pane_row, pane_col)) = inside
+                                    && state.pane_wants_mouse()
+                                    && !shift
+                                    && let Some(bytes) =
+                                        mouse_report(0, pane_row, pane_col, false)
+                                {
+                                    send_to_pane(&mut state, &mut seqs, &mut wr, bytes).await?;
+                                }
+                            }
+                            Action::Wheel { row, col, up, shift } => {
+                                let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
+                                    continue;
+                                };
+                                if state.pane_wants_mouse() && !shift {
+                                    // 64 up, 65 down: the program scrolls its own view,
+                                    // which is the only view of it that exists.
+                                    let button = if up { 64 } else { 65 };
+                                    if let Some(bytes) =
+                                        mouse_report(button, pane_row, pane_col, true)
+                                    {
+                                        send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
+                                            .await?;
+                                    }
+                                } else if state.pane_is_full_screen() {
+                                    // A full screen program that did not ask for the
+                                    // mouse still has a list in it to move through, and
+                                    // the arrow keys are what every terminal sends one on
+                                    // a wheel. Three rows a notch, which is what a
+                                    // terminal does and what a person's hand expects.
+                                    // The spelling depends on what the program asked
+                                    // for: in application cursor mode an arrow is `SS3 A`
+                                    // and `CSI A` is not recognised at all. Measured
+                                    // against a real `less`, which ignores the second.
+                                    let key: &[u8] = match (state.pane_application_cursor(), up) {
+                                        (true, true) => b"\x1bOA",
+                                        (true, false) => b"\x1bOB",
+                                        (false, true) => b"\x1b[A",
+                                        (false, false) => b"\x1b[B",
+                                    };
+                                    let mut bytes = Vec::with_capacity(key.len() * WHEEL_ROWS);
+                                    for _ in 0..WHEEL_ROWS {
+                                        bytes.extend_from_slice(key);
+                                    }
+                                    send_to_pane(&mut state, &mut seqs, &mut wr, bytes).await?;
+                                }
+                                // Otherwise it is a shell on the ordinary screen, where
+                                // the wheel would scroll back through output this client
+                                // does not hold. Nothing, rather than arrow keys: in a
+                                // shell those walk the command history, and a person
+                                // scrolling to read would find their prompt filled with
+                                // last week's commands.
                             }
                             Action::Redraw => dirty = true,
                             Action::Next | Action::Previous => {
@@ -387,40 +1114,77 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     dirty = true;
                                 }
                             }
-                            Action::CreateSpace => {
-                                request += 1;
-                                wr.write_all(&client::encode_control_seq(
-                                    &ControlRequest::CreateWorkspace {
-                                        id: format!("space-{request}"),
-                                        // Numbered rather than asked for. A prompt is a
-                                        // second input mode this interface does not have
-                                        // yet, and a space with a name a person did not
-                                        // choose is still a space they can work in.
-                                        name: format!(
-                                            "space {}",
-                                            state.spaces.len() + state.creating + 1
-                                        ),
-                                    },
-                                    &mut control_seq,
-                                )?).await?;
-                                state.creating += 1;
-                                state.message = Some("starting a space".to_string());
-                                dirty = true;
-                            }
                             Action::Create => {
-                                request += 1;
-                                wr.write_all(&client::encode_control_seq(
-                                    &ControlRequest::CreateTerminal {
-                                        id: format!("new-{request}"),
-                                        cwd: None,
-                                        // The space the person is looking at.
-                                        workspace: state.space,
-                                    },
-                                    &mut control_seq,
-                                )?).await?;
-                                state.message = Some("starting a terminal".to_string());
+                                state.prompt = Some(Prompt {
+                                    what: Naming::Terminal,
+                                    text: String::new(),
+                                });
                                 dirty = true;
                             }
+                            Action::CreateSpace => {
+                                state.prompt = Some(Prompt {
+                                    what: Naming::Space,
+                                    text: String::new(),
+                                });
+                                dirty = true;
+                            }
+                            // Prefilled with the name it has, because a rename is usually
+                            // an edit and starting from empty makes the common case retype
+                            // what was already right.
+                            Action::Rename if state.focused != 0 => {
+                                let current = state
+                                    .rows
+                                    .iter()
+                                    .find(|r| r.terminal == state.focused)
+                                    .and_then(|r| r.name.clone())
+                                    .unwrap_or_default();
+                                state.prompt = Some(Prompt {
+                                    what: Naming::RenameTerminal(state.focused),
+                                    text: current,
+                                });
+                                dirty = true;
+                            }
+                            Action::Rename => {}
+                            Action::Menu => {
+                                state.menu = Some(0);
+                                dirty = true;
+                            }
+                            Action::Collapse => {
+                                state.collapsed = !state.collapsed;
+                                // The pane's width changed with the column, and a child
+                                // that is not told reflows its output against a width it no
+                                // longer has.
+                                let (cols, rows) = screen::pane_size_for(
+                                    state.cols,
+                                    state.lines,
+                                    state.collapsed,
+                                );
+                                let focused = state.focused;
+                                if focused != 0 {
+                                    wr.write_all(&client::encode_command_to(
+                                        focused,
+                                        &ClientWire::Resize { cols, rows },
+                                        seqs.entry(focused).or_default(),
+                                    )?).await?;
+                                }
+                                dirty = true;
+                            }
+                            Action::RenameSpace => {
+                                if let Some(space) = state.space {
+                                    let current = state
+                                        .spaces
+                                        .iter()
+                                        .find(|s| s.id == space)
+                                        .map(|s| s.name.clone())
+                                        .unwrap_or_default();
+                                    state.prompt = Some(Prompt {
+                                        what: Naming::RenameSpace(space),
+                                        text: current,
+                                    });
+                                    dirty = true;
+                                }
+                            }
+
                             Action::Close if state.focused == 0 => {}
                             Action::Close => {
                                 request += 1;
@@ -432,7 +1196,16 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     &mut control_seq,
                                 )?).await?;
                             }
+                            Action::Palette => {
+                                state.palette = Some(Palette::open());
+                                dirty = true;
+                            }
+                            Action::FoldAll => {
+                                state.fold.toggle_all();
+                                dirty = true;
+                            }
                         }
+                    }
                     }
                 }
                 n = rd.read(&mut read) => {
@@ -485,12 +1258,16 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                     ControlResponse::TerminalCreated { .. }
                                         | ControlResponse::TerminalClosed { .. }
                                         | ControlResponse::WorkspaceCreated { .. }
+                                        | ControlResponse::Renamed { .. }
                                 );
                                 refresh_spaces |= matches!(
                                     response,
                                     ControlResponse::TerminalCreated { .. }
                                         | ControlResponse::TerminalClosed { .. }
                                         | ControlResponse::WorkspaceCreated { .. }
+                                        // A renamed space is a changed space list, and
+                                        // nothing else will say so.
+                                        | ControlResponse::Renamed { .. }
                                 );
                                 apply(&mut state, response, &mut dirty);
                             }
@@ -506,6 +1283,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                                 id: format!("new-{request}"),
                                 cwd: None,
                                 workspace: Some(space),
+                                // The terminal a new space comes up with, which nobody
+                                // was asked about: they named the space.
+                                name: None,
                             },
                             &mut control_seq,
                         )?).await?;
@@ -542,7 +1322,7 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
 
     // Off in the reverse order, and before leaving the alternate screen: a terminal left
     // in mouse reporting mode sends escape sequences into whatever the person runs next.
-    let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l");
+    let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
 }
@@ -550,6 +1330,150 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
 /// Move the keyboard to another terminal: unsubscribe, subscribe, and size it to the pane,
 /// all in one write.
 ///
+/// Decide what one read of stdin meant while the palette owns the keyboard.
+///
+/// Typing filters, `enter` picks the selected row, `esc` is back, `up` and `down`
+/// move, backspace rubs out. A mouse report is swallowed: clicks do nothing while
+/// the palette is open rather than reaching a terminal nobody is looking at. A
+/// prefix or a bare detach closes the palette and hands the bytes from there on
+/// back to the key decoder, so `ctrl-a d` still detaches.
+///
+/// Closes the palette itself on [`PaletteOutcome::Closed`],
+/// [`PaletteOutcome::Confirm`] and [`PaletteOutcome::Passthrough`], so the caller
+/// never has to remember to.
+///
+/// A trailing escape is a cancel rather than the start of a split sequence. Arrow
+/// keys arrive atomically in practice, and holding a lone `esc` for a next read
+/// that may never come would swallow the one key that closes the palette.
+fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
+    let mut buf = std::mem::take(&mut state.palette_pending);
+    buf.extend_from_slice(bytes);
+    let Some(palette) = state.palette.as_mut() else {
+        return PaletteOutcome::Closed;
+    };
+    let close = |state: &mut State| {
+        state.palette = None;
+        state.palette_pending.clear();
+    };
+    let mut i = 0;
+    while i < buf.len() {
+        match buf[i] {
+            0x1b => match buf.get(i + 1) {
+                Some(b'[') => match buf.get(i + 2) {
+                    Some(b'A') => {
+                        let count = palette.items(&state.rows, &state.spaces).len();
+                        palette.move_by(-1, count);
+                        i += 3;
+                    }
+                    Some(b'B') => {
+                        let count = palette.items(&state.rows, &state.spaces).len();
+                        palette.move_by(1, count);
+                        i += 3;
+                    }
+                    Some(b'<') => {
+                        // A mouse report, swallowed whole. Split across the read, it
+                        // is stashed like the key decoder stashes its own.
+                        if let Some(end) = buf[i..].iter().position(|b| *b == b'M' || *b == b'm') {
+                            i += end + 1;
+                        } else {
+                            state.palette_pending = buf[i..].to_vec();
+                            break;
+                        }
+                    }
+                    // Any other sequence (arrows with modifiers, function keys):
+                    // nothing to do with it here, and it must not reach a shell.
+                    Some(_) => i += 3,
+                    // Split mid sequence: hold it for the next read.
+                    None => {
+                        state.palette_pending = buf[i..].to_vec();
+                        break;
+                    }
+                },
+                // `esc` then anything else, or a lone `esc`: back out.
+                Some(_) | None => {
+                    close(state);
+                    return PaletteOutcome::Closed;
+                }
+            },
+            b'\r' | b'\n' => {
+                if let Some(item) = palette.picked(&state.rows, &state.spaces) {
+                    close(state);
+                    return PaletteOutcome::Confirm(item);
+                }
+                // Nothing matches: stay open rather than going nowhere.
+                i += 1;
+            }
+            0x7f | 0x08 => {
+                palette.backspace();
+                i += 1;
+            }
+            0x01 => {
+                // `ctrl-a space` toggles the palette shut. Any other command after
+                // the prefix, and a prefix split across the read, belong to the
+                // key decoder.
+                if buf.get(i + 1) == Some(&b' ') {
+                    close(state);
+                    return PaletteOutcome::Closed;
+                } else if i + 1 >= buf.len() {
+                    state.palette_pending = buf[i..].to_vec();
+                    break;
+                } else {
+                    close(state);
+                    return PaletteOutcome::Passthrough(buf[i..].to_vec());
+                }
+            }
+            0x11 => {
+                close(state);
+                return PaletteOutcome::Passthrough(buf[i..].to_vec());
+            }
+            0x20..=0x7e => {
+                palette.push(buf[i] as char);
+                i += 1;
+            }
+            b if b >= 0x80 => {
+                let mut j = i;
+                while j < buf.len() && buf[j] >= 0x80 {
+                    j += 1;
+                }
+                match std::str::from_utf8(&buf[i..j]) {
+                    Ok(text) => {
+                        for c in text.chars() {
+                            palette.push(c);
+                        }
+                        i = j;
+                    }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        if valid > 0
+                            && let Ok(text) = std::str::from_utf8(&buf[i..i + valid])
+                        {
+                            for c in text.chars() {
+                                palette.push(c);
+                            }
+                        }
+                        match error.error_len() {
+                            // Invalid bytes: dropped, like a mistyped command.
+                            Some(len) => i += valid + len,
+                            // Cut mid character: held for the next read.
+                            None => {
+                                state.palette_pending = buf[i + valid..].to_vec();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Any other control byte: swallowed. Passing it through would send it
+            // to a shell, where a slip of the finger could run something.
+            _ => i += 1,
+        }
+    }
+    // Consumed either way, and a repaint either way: the query, the selection or
+    // nothing at all moved, and replaying bytes at a shell is how a keystroke
+    // appears where nobody sent it.
+    PaletteOutcome::Updated
+}
+
 /// `None` when there is nothing to do, so a click on the tab a person is already on does
 /// not throw away the screen they are looking at and ask the daemon to redraw it.
 ///
@@ -782,5 +1706,145 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qoro_runtime::control::WorkspaceRow;
+
+    fn space(id: i64, name: &str) -> WorkspaceRow {
+        WorkspaceRow {
+            id,
+            name: name.to_string(),
+            terminals: 1,
+        }
+    }
+
+    fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
+        AgentRow {
+            terminal,
+            name: None,
+            workspace,
+            agent: true,
+            program: Some(program.to_string()),
+            behind: None,
+            state: state.to_string(),
+            generation: None,
+        }
+    }
+
+    fn state() -> State {
+        State {
+            rows: vec![
+                agent(1, 1, "codex", "blocked"),
+                agent(2, 2, "claude", "working"),
+            ],
+            focused: 2,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            pending_focus: None,
+            spaces: vec![space(1, "app"), space(2, "webshop")],
+            space: Some(2),
+            was: std::collections::BTreeMap::new(),
+            ring: false,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            wants_terminal_in: Vec::new(),
+            adopted: true,
+            creating: 0,
+            done: false,
+            fold: sidebar::Fold::default(),
+            palette: Some(Palette::open()),
+            palette_pending: Vec::new(),
+            selection: None,
+        }
+    }
+
+    #[test]
+    fn typing_filters_and_enter_picks_the_top_match() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"blocked"),
+            PaletteOutcome::Updated
+        ));
+        assert_eq!(
+            state.palette.as_ref().map(|p| p.query.as_str()),
+            Some("blocked")
+        );
+        assert!(matches!(
+            palette_key(&mut state, b"\r"),
+            PaletteOutcome::Confirm(palette::Item::Terminal(1))
+        ));
+        assert_eq!(state.palette, None, "confirming leaves the palette");
+    }
+
+    #[test]
+    fn esc_closes_and_backspace_rubs_out() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"mar"),
+            PaletteOutcome::Updated
+        ));
+        assert!(matches!(
+            palette_key(&mut state, &[0x7f]),
+            PaletteOutcome::Updated
+        ));
+        assert_eq!(state.palette.as_ref().map(|p| p.query.as_str()), Some("ma"));
+        assert!(matches!(
+            palette_key(&mut state, b"\x1b"),
+            PaletteOutcome::Closed
+        ));
+        assert_eq!(state.palette, None);
+    }
+
+    #[test]
+    fn arrows_move_the_selection() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"\x1b[B"),
+            PaletteOutcome::Updated
+        ));
+        assert_eq!(state.palette.as_ref().map(|p| p.selected), Some(1));
+        assert!(matches!(
+            palette_key(&mut state, b"\x1b[A"),
+            PaletteOutcome::Updated
+        ));
+        assert_eq!(state.palette.as_ref().map(|p| p.selected), Some(0));
+    }
+
+    #[test]
+    fn a_prefix_hands_control_back_to_the_key_decoder() {
+        let mut state = state();
+        match palette_key(&mut state, b"\x01d") {
+            PaletteOutcome::Passthrough(rest) => assert_eq!(rest, b"\x01d"),
+            other => panic!("a detach closed nothing: {other:?}"),
+        }
+        assert_eq!(state.palette, None);
+    }
+
+    #[test]
+    fn ctrl_a_space_toggles_the_palette_shut() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"\x01 "),
+            PaletteOutcome::Closed
+        ));
+        assert_eq!(state.palette, None);
+    }
+
+    #[test]
+    fn enter_with_no_match_stays_open() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"zzz-no-such-thing\r"),
+            PaletteOutcome::Updated
+        ));
+        assert!(state.palette.is_some());
     }
 }

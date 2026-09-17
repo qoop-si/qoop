@@ -43,6 +43,33 @@ pub enum Action {
     Click {
         row: u16,
         col: u16,
+        /// Shift was held. The universal way to say "this one is mine, not the
+        /// program's": every terminal emulator gives a person their own selection back
+        /// this way when the program in front of them has taken the mouse.
+        shift: bool,
+    },
+    /// The pointer moved with the button held. What a selection follows.
+    Drag {
+        row: u16,
+        col: u16,
+        shift: bool,
+    },
+    /// The button came up. What ends a selection, and what copies it.
+    Release {
+        row: u16,
+        col: u16,
+        shift: bool,
+    },
+    /// The wheel turned, in one based screen coordinates.
+    ///
+    /// Reported rather than acted on, like a press: whether a wheel belongs to the program
+    /// in the pane or to the interface depends on what that program asked for, which this
+    /// decoder does not know.
+    Wheel {
+        row: u16,
+        col: u16,
+        up: bool,
+        shift: bool,
     },
     /// ctrl-a l
     Redraw,
@@ -55,12 +82,27 @@ pub enum Action {
     PreviousSpace,
     /// ctrl-a w, a new space.
     CreateSpace,
+    /// ctrl-a r, rename the tab; ctrl-a R, rename the space.
+    ///
+    /// A name given at creation is a guess: the terminal a person opened to "look at
+    /// something" is the one they are still in an hour later, doing the thing it should
+    /// have been called after.
+    Rename,
+    RenameSpace,
+    /// ctrl-a b, fold the left column away and back.
+    Collapse,
+    /// ctrl-a m, the menu.
+    Menu,
     /// ctrl-a 1 through ctrl-a 9, the nth tab of the current space, counted from one.
     ///
     /// Counted from one because that is what is written on the tab. Zero is not a command:
     /// there is no tab zero to go to, and silently sending it somewhere would be worse than
     /// doing nothing.
     Tab(usize),
+    /// ctrl-a space: the search palette over spaces, agents, tabs and actions.
+    Palette,
+    /// ctrl-a f: fold the idle groups away, or bring them all back.
+    FoldAll,
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
@@ -93,9 +135,35 @@ fn mouse(bytes: &[u8]) -> Option<(usize, Option<Action>)> {
     let col: u16 = parts.next()?.parse().ok()?;
     let row: u16 = parts.next()?.parse().ok()?;
     let press = bytes[end] == b'M';
-    // The low two bits are the button and 64 marks a wheel event, which is not a press on
-    // anything and would scroll the index if it were treated as one.
-    let action = (press && button & 0b1100_0011 == 0).then_some(Action::Click { row, col });
+    // The button field is a set of flags around a two bit button number: 4 shift, 8 meta,
+    // 16 control, 32 the pointer moving with a button held, 64 the wheel.
+    let wheel = button & 64 != 0;
+    let motion = button & 32 != 0;
+    let shift = button & 4 != 0;
+    let plain = button & 0b0000_0011;
+    let action = if wheel {
+        // 64 is up and 65 is down; the sideways wheel (66, 67) is not a scroll of anything
+        // this draws and is dropped rather than read as a vertical one.
+        match plain {
+            0 | 1 => Some(Action::Wheel {
+                row,
+                col,
+                up: plain == 0,
+                shift,
+            }),
+            _ => None,
+        }
+    } else if plain != 0 {
+        // A button other than the left one. Nothing here uses them, and treating one as a
+        // left click would move the focus on a middle click paste.
+        None
+    } else if motion {
+        press.then_some(Action::Drag { row, col, shift })
+    } else if press {
+        Some(Action::Click { row, col, shift })
+    } else {
+        Some(Action::Release { row, col, shift })
+    };
     Some((end + 1, action))
 }
 
@@ -162,7 +230,15 @@ impl Keys {
                     b's' => Action::NextSpace,
                     b'S' => Action::PreviousSpace,
                     b'w' => Action::CreateSpace,
+                    b'r' => Action::Rename,
+                    b'b' => Action::Collapse,
+                    b'm' => Action::Menu,
+                    b'R' => Action::RenameSpace,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
+                    // The space bar: the palette is the front door, so it gets the
+                    // biggest key.
+                    b' ' => Action::Palette,
+                    b'f' => Action::FoldAll,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -328,6 +404,20 @@ mod tests {
     }
 
     #[test]
+    fn space_opens_the_palette_and_f_folds_the_idle_groups() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01 "), vec![Action::Palette]);
+        assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
+    }
+
+    #[test]
+    fn the_rename_keys_are_separate_for_a_tab_and_for_a_space() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01r"), vec![Action::Rename]);
+        assert_eq!(keys.feed(b"\x01R"), vec![Action::RenameSpace]);
+    }
+
+    #[test]
     fn a_digit_picks_the_tab_that_carries_that_number() {
         let mut keys = Keys::default();
         for n in 1..=9usize {
@@ -337,5 +427,92 @@ mod tests {
         // Zero is not a tab, so it does nothing rather than something arbitrary, and it
         // must not reach the shell either.
         assert_eq!(keys.feed(b"\x010"), vec![]);
+    }
+
+    /// Every shape of mouse report this interface asks the terminal for.
+    ///
+    /// Written out as the bytes a terminal actually sends, because the decoder's job is to
+    /// read those and a test that built its input from the decoder's own idea of them
+    /// would agree with any mistake in it.
+    #[test]
+    fn the_mouse_decoder_tells_a_press_a_drag_a_release_and_a_wheel_apart() {
+        let mut keys = Keys::default();
+        // Left button down at column 10, row 5.
+        assert_eq!(
+            keys.feed(b"\x1b[<0;10;5M"),
+            vec![Action::Click {
+                row: 5,
+                col: 10,
+                shift: false
+            }]
+        );
+        // The same button, moving: 32 is the motion flag.
+        assert_eq!(
+            keys.feed(b"\x1b[<32;12;7M"),
+            vec![Action::Drag {
+                row: 7,
+                col: 12,
+                shift: false
+            }]
+        );
+        // Up again, which a terminal marks with a lowercase terminator.
+        assert_eq!(
+            keys.feed(b"\x1b[<0;12;7m"),
+            vec![Action::Release {
+                row: 7,
+                col: 12,
+                shift: false
+            }]
+        );
+        // The wheel: 64 up, 65 down.
+        assert_eq!(
+            keys.feed(b"\x1b[<64;3;3M"),
+            vec![Action::Wheel {
+                row: 3,
+                col: 3,
+                up: true,
+                shift: false
+            }]
+        );
+        assert_eq!(
+            keys.feed(b"\x1b[<65;3;3M"),
+            vec![Action::Wheel {
+                row: 3,
+                col: 3,
+                up: false,
+                shift: false
+            }]
+        );
+        // Shift is bit 4, and it is what says a drag belongs to the person rather than to
+        // the program that took the mouse.
+        assert_eq!(
+            keys.feed(b"\x1b[<36;12;7M"),
+            vec![Action::Drag {
+                row: 7,
+                col: 12,
+                shift: true
+            }]
+        );
+        // A button this interface has nothing for is dropped rather than read as the left
+        // one: a middle click paste would otherwise move the focus.
+        assert_eq!(keys.feed(b"\x1b[<1;4;4M"), vec![]);
+        assert_eq!(keys.feed(b"\x1b[<2;4;4M"), vec![]);
+        // And the sideways wheel scrolls nothing here, rather than scrolling vertically.
+        assert_eq!(keys.feed(b"\x1b[<66;4;4M"), vec![]);
+    }
+
+    /// A mouse report split across two reads is still one report, and never typed.
+    #[test]
+    fn half_a_drag_report_is_carried_rather_than_passed_through_as_text() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x1b[<32;12"), vec![]);
+        assert_eq!(
+            keys.feed(b";7M"),
+            vec![Action::Drag {
+                row: 7,
+                col: 12,
+                shift: false
+            }]
+        );
     }
 }

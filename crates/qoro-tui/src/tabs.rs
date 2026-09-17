@@ -32,6 +32,46 @@ const MAX_LABEL: usize = 12;
 /// One line, so one colour, and therefore no colour: a bar carries several terminals in
 /// several states and a single hint for all of them would be a hint about none of them. The
 /// caller paints the focused tab from the brackets it can see in the text.
+/// How one piece of the bar is painted.
+///
+/// Three, not a colour per state. A tab bar carries several terminals in several states
+/// and colouring each one turns the bar into a row of confetti: what a person needs from
+/// it is which tab has the keyboard, and the panel on the left is where states live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
+    /// The tab with the keyboard.
+    Focused,
+    /// Every other tab.
+    Other,
+    /// The new tab button and the padding past the last tab.
+    Quiet,
+}
+
+/// The bar as pieces to paint, left to right, each with how it is painted.
+///
+/// The painter needs the pieces and not one string, because the focused tab is a pill: a
+/// background that starts and stops, which one string with one colour cannot express. The
+/// same segments [`render`] and [`hit`] use, so all three agree by construction.
+pub fn painted(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, Ink)> {
+    let mut used = 0;
+    let mut out: Vec<(String, Ink)> = segments(terminals, focused, cols)
+        .into_iter()
+        .map(|(text, hit)| {
+            used += crate::width::width(&text);
+            let ink = match hit {
+                Some(Hit::Terminal(terminal)) if terminal == focused => Ink::Focused,
+                Some(Hit::Terminal(_)) => Ink::Other,
+                Some(Hit::New) | None => Ink::Quiet,
+            };
+            (text, ink)
+        })
+        .collect();
+    if used < cols {
+        out.push((" ".repeat(cols - used), Ink::Quiet));
+    }
+    out
+}
+
 pub fn render(terminals: &[AgentRow], focused: u32, cols: usize) -> Line {
     let bar: String = segments(terminals, focused, cols)
         .into_iter()
@@ -40,14 +80,27 @@ pub fn render(terminals: &[AgentRow], focused: u32, cols: usize) -> Line {
     Line {
         text: exactly(&bar, cols),
         colour: None,
+        accent: None,
     }
+}
+
+/// What a click on the tab bar means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// The tab drawn at that column.
+    Terminal(u32),
+    /// The `+` that makes a new terminal.
+    New,
 }
 
 /// Which terminal the tab bar drew at one column, for a click.
 ///
-/// `None` on the `+` and on the padding past the last tab, so a click on empty bar does
+/// `None` on the padding past the last tab, so a click on empty bar does
 /// nothing rather than reaching the nearest terminal.
-pub fn hit(terminals: &[AgentRow], focused: u32, cols: usize, col: usize) -> Option<u32> {
+pub fn hit(terminals: &[AgentRow], focused: u32, cols: usize, col: usize) -> Option<Hit> {
+    if col >= cols {
+        return None;
+    }
     let mut used = 0;
     for (text, terminal) in segments(terminals, focused, cols) {
         used += crate::width::width(&text);
@@ -72,7 +125,7 @@ pub fn hit(terminals: &[AgentRow], focused: u32, cols: usize, col: usize) -> Opt
 /// with the focus on the twelfth, the bar was byte for byte the bar of a client with nothing
 /// focused. No brackets anywhere, no way to click back to it, and nothing on screen saying
 /// which terminal the keyboard was in.
-fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, Option<u32>)> {
+fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, Option<Hit>)> {
     let budget = cols.saturating_sub(crate::width::width(NEW));
     let mut used = 0;
     let mut out = Vec::with_capacity(terminals.len() + 1);
@@ -84,9 +137,9 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<(String, O
             break;
         }
         used += wide;
-        out.push((text, Some(row.terminal)));
+        out.push((text, Some(Hit::Terminal(row.terminal))));
     }
-    out.push((NEW.to_string(), None));
+    out.push((NEW.to_string(), Some(Hit::New)));
     out
 }
 
@@ -124,6 +177,20 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> String {
     format!("{open}{}{close}", label(row, position))
 }
 
+/// The state dot a tab carries, so the bar answers "what is it doing" without
+/// leaving the top line. Same glyphs as the agents panel: `*` working, `!`
+/// blocked, `x` failed, `+` done, `o` idle, `.` for anything unobserved.
+fn dot(state: &str) -> char {
+    match state {
+        "working" | "starting" => '*',
+        "blocked" => '!',
+        "failed" => 'x',
+        "done" => '+',
+        "idle" => 'o',
+        _ => '.',
+    }
+}
+
 /// What a tab is called: its place on this bar, and the program in it when there is one.
 ///
 /// A number is always there because the program is not distinguishing. A space with three
@@ -137,6 +204,20 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> String {
 /// is labelled with a number nobody typed. Places also stay within one digit, which the
 /// terminal numbers stop doing after the ninth terminal of the day.
 fn label(row: &AgentRow, position: usize) -> String {
+    // The dot only when there is a state to show. A terminal nothing has said anything
+    // about carried a `.`, so a fresh window drew a row of tabs each ending in a full
+    // stop: four marks that mean "no information", competing with the three that mean
+    // something. Silence is drawn as silence.
+    let mark = match dot(&row.state) {
+        UNOBSERVED => String::new(),
+        state => format!(" {state}"),
+    };
+    // A name a person chose outlives the program: a tab called `release` stays `release`
+    // while it runs a shell, then cargo, then an agent, and a bar of chosen names is a bar
+    // somebody can read without looking at what happens to be running in each one.
+    if let Some(name) = &row.name {
+        return clip(&format!("{position} {name}{mark}"));
+    }
     match &row.program {
         Some(program) => {
             let name = program
@@ -144,11 +225,14 @@ fn label(row: &AgentRow, position: usize) -> String {
                 .next()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(program);
-            clip(&format!("{position} {name}"))
+            clip(&format!("{position} {name}{mark}"))
         }
-        None => position.to_string(),
+        None => clip(&format!("{position}{mark}")),
     }
 }
+
+/// What [`dot`] answers for a terminal nothing has observed.
+const UNOBSERVED: char = '.';
 
 /// Cut a label to at most [`MAX_LABEL`] columns.
 fn clip(text: &str) -> String {
@@ -185,6 +269,7 @@ mod tests {
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
             terminal,
+            name: None,
             workspace: 1,
             agent: true,
             program: Some(program.to_string()),
@@ -197,6 +282,7 @@ mod tests {
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
             terminal,
+            name: None,
             workspace: 1,
             // The bar carries a plain shell too: it answers "what did I open", not "who
             // needs me".
@@ -238,14 +324,29 @@ mod tests {
     #[test]
     fn a_tab_is_named_after_its_program_and_a_bare_terminal_after_its_number() {
         let line = render(&sample(), 9, 40);
-        assert_eq!(line.text.trim_end(), " 1  2 tue  3 private  4 pet  +");
+        assert_eq!(line.text.trim_end(), " 1  2 tue o  3 private o  4 pet o  +");
+    }
+
+    /// A name somebody chose beats the name of whatever happens to be running, because the
+    /// program changes under it and the name is how they find the tab again.
+    #[test]
+    fn a_named_tab_is_called_what_it_was_named() {
+        let mut rows = sample();
+        rows[1].name = Some("release".to_string());
+        let line = render(&rows, 9, 60);
+        assert!(line.text.contains("2 release"), "{:?}", line.text);
+        assert!(!line.text.contains("2 tue"), "{:?}", line.text);
+        // And the state still rides along, since the name says nothing about that.
+        rows[1].state = "blocked".to_string();
+        let line = render(&rows, 9, 60);
+        assert!(line.text.contains("2 release !"), "{:?}", line.text);
     }
 
     #[test]
     fn the_focused_tab_is_marked_in_plain_text() {
         let line = render(&sample(), 3, 40);
-        assert!(line.text.contains("[3 private]"), "{:?}", line.text);
-        assert!(!line.text.contains("[2 tue]"));
+        assert!(line.text.contains("[3 private o]"), "{:?}", line.text);
+        assert!(!line.text.contains("[2 tue o]"));
     }
 
     #[test]
@@ -269,10 +370,10 @@ mod tests {
 
     #[test]
     fn tabs_past_the_right_edge_are_dropped_and_the_ones_before_them_are_not() {
-        let line = render(&sample(), 1, 16);
-        // Room for `[1]`, ` 2 tue ` and ` + `, and not for `private`.
-        assert_eq!(line.text, "[1] 2 tue  +    ");
-        assert!(!line.text.contains("private"));
+        let line = render(&sample(), 1, 12);
+        // Room for `[1]`, ` + `, and nothing else.
+        assert_eq!(line.text, "[1] +       ");
+        assert!(!line.text.contains("tue"));
     }
 
     #[test]
@@ -306,7 +407,17 @@ mod tests {
                         None => false,
                     }
                 });
-                assert_eq!(got, want.map(|(_, r)| r.terminal), "column {col} of {cols}");
+                match want.map(|(_, r)| r.terminal) {
+                    Some(terminal) => {
+                        assert_eq!(got, Some(Hit::Terminal(terminal)), "column {col} of {cols}")
+                    }
+                    // Off a tab is the new button or the padding past it, never a
+                    // terminal next to the one aimed at.
+                    None => assert!(
+                        got.is_none_or(|h| h == Hit::New),
+                        "column {col} of {cols} reached a terminal it did not aim at: {got:?}"
+                    ),
+                }
             }
             assert_eq!(hit(&rows, 3, cols, cols), None, "past the right edge");
         }
@@ -321,7 +432,10 @@ mod tests {
             for focused in 1..=12u32 {
                 let line = render(&many, focused, cols);
                 let clickable: Vec<u32> = (0..cols)
-                    .filter_map(|col| hit(&many, focused, cols, col))
+                    .filter_map(|col| match hit(&many, focused, cols, col) {
+                        Some(Hit::Terminal(terminal)) => Some(terminal),
+                        _ => None,
+                    })
                     .collect();
                 assert!(
                     line.text.contains('['),
@@ -350,11 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_the_new_tab_button_or_on_the_padding_is_not_a_terminal() {
+    fn a_click_on_the_new_tab_button_makes_a_terminal_and_on_padding_does_nothing() {
         let rows = sample();
         let text = render(&rows, 1, 40).text;
         let plus = text.find('+').unwrap_or_else(|| panic!("{text:?}"));
-        assert_eq!(hit(&rows, 1, 40, plus), None);
+        let plus_col = crate::width::width(&text[..plus]) + 1;
+        assert_eq!(hit(&rows, 1, 40, plus_col), Some(Hit::New));
         assert_eq!(hit(&rows, 1, 40, 39), None);
     }
 
@@ -362,6 +477,6 @@ mod tests {
     fn an_empty_space_still_offers_a_way_to_make_a_terminal() {
         let line = render(&[], 1, 10);
         assert_eq!(line.text, " +        ");
-        assert_eq!(hit(&[], 1, 10, 1), None);
+        assert_eq!(hit(&[], 1, 10, 1), Some(Hit::New));
     }
 }

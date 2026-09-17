@@ -6,10 +6,13 @@
 //! that drives them is small enough to read in one sitting.
 
 pub mod keys;
+pub mod palette;
 pub mod run;
 pub mod screen;
+pub mod selection;
 pub mod sidebar;
 pub mod tabs;
+pub mod theme;
 pub mod width;
 
 pub use run::run;

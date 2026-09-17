@@ -8,7 +8,8 @@
 use qoro_runtime::control::{AgentRow, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
-use crate::{sidebar, tabs, width};
+use crate::palette::Palette;
+use crate::{sidebar, tabs, theme, width};
 
 /// What the screen shows: the tab bar across the top, the spaces and agents down the left,
 /// one terminal filling the rest, and a line saying what the keys do.
@@ -27,13 +28,40 @@ pub struct Frame<'a> {
     pub lines: u16,
     /// Shown instead of the key list, when there is something to say.
     pub message: Option<&'a str>,
+    /// Which idle groups of the agents panel are expanded.
+    pub fold: sidebar::Fold,
+    /// The open search palette, drawn over the terminal when present.
+    pub palette: Option<&'a Palette>,
+    /// The open naming box, drawn over everything when a person is being asked what to
+    /// call the thing they just asked for.
+    pub prompt: Option<&'a crate::run::Prompt>,
+    /// The open menu, and which of its rows is selected.
+    pub menu: Option<usize>,
+    /// Whether the left column is folded away to a strip.
+    pub collapsed: bool,
+    /// A read only overlay opened from the menu.
+    pub reading: Option<crate::run::Reading>,
+    /// What the mouse has selected in the pane, so it can be shown as selected.
+    pub selection: Option<crate::selection::Selection>,
 }
 
-/// Rows the tab bar takes, at the top of the screen.
+/// Every command the prefix takes, for a window wide enough to read them all.
+const EVERY_KEY: &str =
+    "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  d detach";
+
+/// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
 
-/// Rows the status line takes, at the bottom.
-pub const STATUS: usize = 1;
+/// The screen row the left column starts on.
+///
+/// One, the very top. The tab bar sits over the pane and not over the whole width: the
+/// tabs belong to the space, the space is what the column on the left selects, and a bar
+/// spanning both puts the thing being selected under the thing selecting it. It also cost
+/// the column a row for no reason, since the bar has nothing to say about it.
+pub const SIDEBAR_TOP: usize = 1;
+
+/// Rows the status lines take, at the bottom: the notice, then the keys.
+pub const STATUS: usize = 2;
 
 /// The columns and rows left for the terminal once the tab bar, the left column and the
 /// status line have taken theirs.
@@ -42,8 +70,13 @@ pub const STATUS: usize = 1;
 /// second copy of that arithmetic in the caller is how a pane and its child end up
 /// disagreeing about how wide they are.
 pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
+    pane_size_for(cols, lines, false)
+}
+
+/// The same, for a column that may be folded away to a strip.
+pub fn pane_size_for(cols: u16, lines: u16, collapsed: bool) -> (u16, u16) {
     (
-        cols.saturating_sub(left(cols) as u16).max(1),
+        cols.saturating_sub(left_for(cols, collapsed) as u16).max(1),
         lines.saturating_sub((TABS + STATUS) as u16).max(1),
     )
 }
@@ -58,10 +91,24 @@ pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
 /// 20 and 23 columns, all of which painted 24. A narrow window is a real one: two panes
 /// side by side in a tmux split is how it happens.
 pub fn left(cols: u16) -> usize {
+    left_for(cols, false)
+}
+
+/// The same, for a column that may be folded away to a strip.
+///
+/// Folded, it keeps the one thing a glance needs: a state mark and a number per row. The
+/// names come back with the column, and the terminal gets twenty six columns back in the
+/// meantime.
+pub fn left_for(cols: u16, collapsed: bool) -> usize {
+    let width = if collapsed {
+        sidebar::COLLAPSED
+    } else {
+        sidebar::WIDTH
+    };
     // One column for the pane, or there is nothing to show and the left column is the whole
     // point of nothing.
-    if (cols as usize) > sidebar::WIDTH + 2 {
-        sidebar::WIDTH + 1
+    if (cols as usize) > width + 2 {
+        width + 1
     } else {
         0
     }
@@ -95,97 +142,237 @@ fn at(row: usize, col: usize) -> String {
 /// getting a diff wrong is a screen that is quietly out of date. When a frame is expensive
 /// enough to matter, the daemon has already coalesced it.
 pub fn paint(frame: &Frame) -> String {
-    let (pane_cols, pane_rows) = pane_size(frame.cols, frame.lines);
+    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed);
     let mut out = String::with_capacity(frame.cols as usize * frame.lines as usize + 256);
 
     // Hidden while painting: a cursor walking the screen during a repaint is the flicker
     // people notice most.
     out.push_str("\x1b[?25l");
 
-    // The tab bar spans the whole width, above both columns. Above and not beside, because
-    // it belongs to the space and the space is what the column on the left selects.
-    out.push_str(&at(1, 1));
-    out.push_str("\x1b[2m");
-    out.push_str(
-        &tabs::render(
-            &in_space(frame.rows, frame.space),
-            frame.focused,
-            frame.cols as usize,
-        )
-        .text,
-    );
-    out.push_str("\x1b[0m");
+    let wide_enough = left_for(frame.cols, frame.collapsed) > 0;
 
-    let wide_enough = left(frame.cols) > 0;
-    let panel = if wide_enough {
-        sidebar::render(
+    // The tab bar, over the pane and only over the pane. It starts where the pane starts,
+    // past the column and its rule.
+    out.push_str(&at(1, left_for(frame.cols, frame.collapsed) + 1));
+    for (piece, style) in tabs::painted(
+        &in_space(frame.rows, frame.space),
+        frame.focused,
+        pane_cols as usize,
+    ) {
+        out.push_str(&match style {
+            tabs::Ink::Focused => theme::tab_on(),
+            tabs::Ink::Other => theme::tab_off(),
+            tabs::Ink::Quiet => theme::fg(theme::Role::Faint),
+        });
+        out.push_str(&piece);
+    }
+    out.push_str(theme::RESET);
+
+    // The column runs the whole height, from the top row to the status line. It is taller
+    // than the pane by the tab bar's row, which is the row the bar no longer takes from it.
+    let column_rows = (frame.lines as usize).saturating_sub(STATUS);
+    let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
+        sidebar::rows_collapsed(
             frame.spaces,
             frame.rows,
             frame.space.unwrap_or_default(),
             frame.focused,
-            pane_rows as usize,
+            column_rows,
+        )
+    } else if wide_enough {
+        sidebar::rows_folded(
+            frame.spaces,
+            frame.rows,
+            frame.space.unwrap_or_default(),
+            frame.focused,
+            column_rows,
+            &frame.fold,
         )
     } else {
         Vec::new()
     };
-    // Never over the status line. `pane_rows` is at least one so that a child always has a
-    // row to be told about, which in a window of two lines is a row the status line is
-    // already on.
-    let drawn = (pane_rows as usize).min((frame.lines as usize).saturating_sub(TABS + STATUS));
-    for row in 0..drawn {
-        out.push_str(&at(row + 1 + TABS, 1));
+    for row in 0..column_rows {
+        out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
         // for the one row that needs them, and a coloured word inside an otherwise grey
         // line is a word they have to find first.
-        if let Some(line) = panel.get(row) {
-            match line.colour {
-                Some(colour) => {
-                    out.push_str(&format!("\x1b[{}m", 30 + colour.min(7)));
-                    out.push_str(&line.text);
-                    out.push_str("\x1b[0m");
+        //
+        // The keyboard's own rows also carry reverse video, which is what the designs
+        // draw as a selected background. The marker character stays: attributes do not
+        // survive a screenshot or a pipe into a file.
+        if let Some((line, hit)) = panel.get(row) {
+            let selected = match hit {
+                Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
+                Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
+                Some(sidebar::Hit::Fold(_) | sidebar::Hit::New | sidebar::Hit::Menu)
+                | Some(sidebar::Hit::Collapse)
+                | None => false,
+            };
+            let base = match (selected, line.colour) {
+                (true, Some(role)) => theme::selected_in(role),
+                (true, None) => theme::selected(),
+                (false, Some(role)) => theme::fg(role),
+                (false, None) => theme::fg(theme::Role::Text),
+            };
+            out.push_str(&base);
+            match line.accent {
+                // One run inside the row in a colour of its own, which is the name of the
+                // space the row belongs to. Painted by cutting the row at its edges rather
+                // than by drawing over it, so the row is still written once and left to
+                // right, and a wide character in a name cannot be split.
+                Some((at, len, role)) if len > 0 && at + len <= width::width(&line.text) => {
+                    let cut = |from: usize, to: usize| {
+                        line.text
+                            .chars()
+                            .scan(0usize, |col, c| {
+                                let start = *col;
+                                *col += width::columns(c);
+                                Some((start, c))
+                            })
+                            .filter(|(start, _)| *start >= from && *start < to)
+                            .map(|(_, c)| c)
+                            .collect::<String>()
+                    };
+                    out.push_str(&cut(0, at));
+                    out.push_str(&if selected {
+                        theme::selected_in(role)
+                    } else {
+                        theme::fg(role)
+                    });
+                    out.push_str(&cut(at, at + len));
+                    out.push_str(&base);
+                    out.push_str(&cut(at + len, width::width(&line.text)));
                 }
-                None => out.push_str(&line.text),
+                _ => out.push_str(&line.text),
             }
+            out.push_str(theme::RESET);
         }
         // The rule between the column and the terminal, drawn every row so that a terminal
         // line long enough to reach it cannot swallow it.
         if wide_enough {
-            out.push('\u{2502}');
+            out.push_str(&theme::fg(theme::Role::Rule));
+            // The panel separator runs into this column, so the two meet in a join rather
+            // than a horizontal line stopping one column short of a vertical one.
+            let joins = panel
+                .get(row)
+                .is_some_and(|(line, _)| line.colour == Some(theme::Role::Rule));
+            out.push(if joins { '\u{2524}' } else { '\u{2502}' });
+            out.push_str(theme::RESET);
+        }
+        // The pane starts under the tab bar, so the column's first row has the bar beside
+        // it and every row after that has a row of the terminal.
+        let Some(pane_row) = row.checked_sub(TABS) else {
+            continue;
+        };
+        if pane_row >= pane_rows as usize {
+            continue;
         }
         let line = frame
             .snapshot
-            .and_then(|s| s.lines.get(row))
+            .and_then(|s| s.lines.get(pane_row))
             .map(String::as_str)
             .unwrap_or("");
         let spans = frame
             .snapshot
-            .and_then(|s| s.styles.get(row))
+            .and_then(|s| s.styles.get(pane_row))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        out.push_str(&paint_row(line, spans, pane_cols as usize));
+        let selected = frame
+            .selection
+            .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
+        out.push_str(&paint_row(line, spans, pane_cols as usize, selected));
     }
 
+    // Two lines, not one. The keys never change and the notice always does, and one row
+    // carrying both meant the key list vanished exactly when something went wrong: a person
+    // who has just been told a terminal is blocked is the same person who then cannot see
+    // which key gets them there. They also read differently, one being a reference and the
+    // other an event, and a row that is sometimes one and sometimes the other is a row
+    // nobody learns the shape of.
+    //
+    // Both rows always exist, whether or not there is anything to say, because the pane is
+    // a real pty: a row that came and went would resize the child and reflow its output
+    // every time an agent changed state.
+    out.push_str(&at(frame.lines as usize - 1, 1));
+    // A transient message wins, then the single next thing to do, then where the keyboard
+    // is. Never empty: a blank row is a row that has to be explained.
+    let (notice, notice_role) = match (frame.message, triage(frame.rows, frame.spaces)) {
+        (Some(message), _) => (message.to_string(), waiting(frame.rows)),
+        (None, Some(next)) => (next, waiting(frame.rows)),
+        (None, None) => (here(frame), None),
+    };
+    out.push_str(&match notice_role {
+        Some(role) => theme::status_in(role),
+        None => theme::status(),
+    });
+    out.push_str(&width::fit(&notice, frame.cols as usize));
+    out.push_str(theme::RESET);
+
     out.push_str(&at(frame.lines as usize, 1));
-    out.push_str("\x1b[7m");
+    // Raised, not reverse. A full width bar of reverse video is the brightest thing on the
+    // screen, and the key list is the least urgent thing on it.
+    out.push_str(&theme::status());
     // The prefix once, then the letters. Spelled out for every key it took 96 columns, and
     // a person on an eighty column window was told about the first three commands and not
     // about the one that gets them out.
-    let status = frame.message.map(str::to_string).unwrap_or_else(|| {
-        "ctrl-a: n tab  c new  x close  s space  w new space  d detach".to_string()
-    });
-    out.push_str(&width::fit(&status, frame.cols as usize));
-    out.push_str("\x1b[0m");
+    //
+    // A mode names its own keys, because in a mode the others do not work.
+    let keys = if frame.prompt.is_some() {
+        "enter to make it  esc to stop"
+    } else if frame.palette.is_some() {
+        "ctrl-a space find  enter go  esc back"
+    } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
+        // Every key when there is room for every key. On a narrower window the list is cut
+        // from the right, which takes the way out first: the one thing a person stuck in
+        // here has to be able to read.
+        EVERY_KEY
+    } else {
+        "ctrl-a: n tab  c new  r rename  space find  d detach"
+    };
+    out.push_str(&width::fit(keys, frame.cols as usize));
+    out.push_str(theme::RESET);
+
+    // The palette floats over the terminal, so it is painted last: every row it takes
+    // overwrites what the pane and the column drew under it.
+    if let Some(palette) = frame.palette {
+        paint_palette(frame, palette, &mut out);
+    }
+    if let Some(prompt) = frame.prompt {
+        paint_prompt(frame, prompt, &mut out);
+    }
+    if let Some(selected) = frame.menu {
+        paint_menu(frame, selected, &mut out);
+    }
+    if let Some(reading) = frame.reading {
+        paint_reading(frame, reading, &mut out);
+    }
 
     // The cursor goes where the child put it, offset into the pane, so that what the user
-    // types appears where they are looking.
-    if let Some(snapshot) = frame.snapshot {
+    // types appears where they are looking. With the palette open it sits at the end of
+    // the query instead, because that is where typing goes.
+    if let Some(prompt) = frame.prompt {
+        let w = palette_width(frame.cols);
+        let left = (frame.cols as usize).saturating_sub(w) / 2;
+        let top = ((frame.lines as usize) / 3).max(TABS + 1);
+        let col = (left + 4 + width::width(&prompt.text)).min(left + w.saturating_sub(1));
+        out.push_str(&at(top + 1, col + 1));
+    } else if let Some(palette) = frame.palette {
+        // At the end of the query, inside the box, wherever the box ended up.
+        let w = palette_width(frame.cols);
+        let left = (frame.cols as usize).saturating_sub(w) / 2;
+        let rows = palette.items(frame.rows, frame.spaces).len().max(1);
+        let row = palette_query_row(frame.lines, rows + count_headers(frame, palette));
+        // Past the border and the prompt marker, at the end of what has been typed.
+        let col = (left + 4 + width::width(&palette.query)).min(left + w.saturating_sub(2));
+        out.push_str(&at(row + 1, col + 1));
+    } else if let Some(snapshot) = frame.snapshot {
         let (row, cell) = snapshot.cursor;
         let col = cursor_column(
             snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
             cell,
         );
         let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-        let col = col.min(pane_cols as usize - 1) + left(frame.cols) + 1;
+        let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
         out.push_str(&at(row, col));
     }
     // Always back on, even with no snapshot yet. It is turned off at the top of every frame
@@ -194,6 +381,272 @@ pub fn paint(frame: &Frame) -> String {
     // yet, which is every terminal for its first moments, had no cursor at all.
     out.push_str("\x1b[?25h");
     out
+}
+
+/// The single next thing to do, when something is waiting.
+///
+/// Blocked first, then failed: the first of either in daemon order. `None` when
+/// nothing waits, and then the status line carries the key list instead, which is
+/// how a person finds out they are done.
+fn triage(rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Option<String> {
+    let row = rows
+        .iter()
+        .find(|r| r.state == "blocked")
+        .or_else(|| rows.iter().find(|r| r.state == "failed"))?;
+    let space = spaces
+        .iter()
+        .find(|s| s.id == row.workspace)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| row.workspace.to_string());
+    Some(format!(
+        "next: {space}/{} is {}  ^a space",
+        palette_label(row),
+        row.state
+    ))
+}
+
+/// Where the keyboard is, for the notice row when nothing is waiting.
+///
+/// Said rather than left blank. The row exists whether or not there is news, so the calm
+/// case gets the one thing worth restating: which space, which tab, and what it is doing.
+fn here(frame: &Frame) -> String {
+    let space = frame
+        .spaces
+        .iter()
+        .find(|s| Some(s.id) == frame.space)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    match frame.rows.iter().find(|r| r.terminal == frame.focused) {
+        Some(row) => {
+            let state = if row.state == "unknown" {
+                String::new()
+            } else {
+                format!(", {}", row.state)
+            };
+            format!("{space} / {}{state}", palette_label(row))
+        }
+        None => format!("{space} / nothing open"),
+    }
+}
+
+/// The state of the thing the status line is about to name, when something waits.
+///
+/// The same order [`triage`] picks in, so the colour and the words are about one terminal.
+fn waiting(rows: &[AgentRow]) -> Option<theme::Role> {
+    rows.iter()
+        .find(|r| r.state == "blocked")
+        .or_else(|| rows.iter().find(|r| r.state == "failed"))
+        .map(|r| theme::of(&r.state))
+}
+
+/// What a terminal is called outside the tab bar: its program's last segment, the
+/// wrapper standing in the way, or its number when there is nothing else.
+///
+/// The tab bar, the sidebar and the palette each spell this in their own module;
+/// this one is the status line's, kept beside its only caller.
+fn palette_label(row: &AgentRow) -> String {
+    match (&row.program, &row.behind) {
+        (Some(program), _) => program
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(program)
+            .to_string(),
+        (None, Some(wrapper)) => format!("behind {wrapper}"),
+        (None, None) => format!("term {}", row.terminal),
+    }
+}
+
+/// How wide the palette box is: most of the window on a narrow one, a centred
+/// card on a wide one.
+fn palette_width(cols: u16) -> usize {
+    let cols = cols as usize;
+    cols.min(60).max(cols.min(20))
+}
+
+/// The open palette, painted over the pane and the column.
+///
+/// One query line, then section headers and rows, scrolled to keep the selection
+/// on screen. Every line is padded to the box width so nothing underneath shows
+/// through. The selected row is reverse video rather than bracketed, like the
+/// status line.
+fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
+    let cols = frame.cols as usize;
+    let lines = frame.lines as usize;
+    if cols < 10 || lines < TABS + STATUS + 2 {
+        return;
+    }
+    let entries = palette.items(frame.rows, frame.spaces);
+    let w = palette_width(frame.cols);
+    let left = cols.saturating_sub(w) / 2;
+    // What each row is, so the painter can put the same colours on it that the column puts
+    // on the same things: a header, a row and which entry it came from.
+    enum Kind<'a> {
+        Header(&'a str),
+        Row(&'a crate::palette::Entry),
+        Empty,
+    }
+    let mut display: Vec<(Kind<'_>, bool)> = Vec::new();
+    let mut section = "";
+    for (at, entry) in entries.iter().enumerate() {
+        if entry.section != section {
+            section = entry.section;
+            display.push((Kind::Header(section), false));
+        }
+        display.push((Kind::Row(entry), at == palette.selected));
+    }
+    if display.is_empty() {
+        display.push((Kind::Empty, false));
+    }
+    // The query line and a border above and below it, and the entries take what is left.
+    let chrome = 3;
+    let budget = (lines.saturating_sub(TABS + STATUS + chrome))
+        .max(1)
+        .min(display.len());
+    let first = if display.len() <= budget {
+        0
+    } else {
+        let selected_at = display
+            .iter()
+            .position(|(_, selected)| *selected)
+            .unwrap_or(0);
+        selected_at
+            .saturating_sub(budget.saturating_sub(1))
+            .min(display.len() - budget)
+    };
+    // Centred down the screen as well as across it. Pinned near the top it sat in the
+    // corner of a window three times its height, which reads as something that failed to
+    // open rather than something waiting to be typed into.
+    let height = budget + chrome;
+    let top = (lines.saturating_sub(height)) / 2;
+    let inner = w.saturating_sub(2);
+
+    // The frame, so the box has edges: a floating list with no border is a list that has
+    // fallen into whatever is behind it.
+    let border = theme::fg(theme::Role::Rule);
+    let line_at = |row: usize, out: &mut String| -> bool {
+        if row >= lines {
+            return false;
+        }
+        out.push_str(&at(row + 1, left + 1));
+        true
+    };
+    let mut row = top;
+    if line_at(row, out) {
+        out.push_str(&border);
+        out.push('\u{256d}');
+        for _ in 0..inner {
+            out.push('\u{2500}');
+        }
+        out.push('\u{256e}');
+        out.push_str(theme::RESET);
+    }
+    row += 1;
+    // The query, with the prompt in the colour the pane's own prompts are not, so the box
+    // says where typing goes.
+    if line_at(row, out) {
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(&theme::fg(theme::Role::Faint));
+        out.push_str(" > ");
+        out.push_str(&theme::fg(theme::Role::Focused));
+        out.push_str(&width::fit(&palette.query, inner.saturating_sub(3)));
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(theme::RESET);
+    }
+    row += 1;
+    for (kind, selected) in display.iter().skip(first).take(budget) {
+        if !line_at(row, out) {
+            break;
+        }
+        row += 1;
+        out.push_str(&border);
+        out.push('\u{2502}');
+        match kind {
+            Kind::Header(name) => {
+                out.push_str(&theme::fg(theme::Role::Title));
+                out.push_str(&width::fit(&format!(" {name}"), inner));
+            }
+            Kind::Empty => {
+                out.push_str(&theme::fg(theme::Role::Faint));
+                out.push_str(&width::fit(" no match", inner));
+            }
+            Kind::Row(entry) => {
+                // The same three colours the column uses, for the same three things: the
+                // space in its own, the state in its own, and everything else plain. A row
+                // that arrives here grey is a row a person has to read to place.
+                let base = if *selected {
+                    theme::selected()
+                } else {
+                    theme::fg(theme::Role::Text)
+                };
+                let state_ink = entry.state.as_deref().map(theme::of);
+                let space_ink = entry.space.map(theme::space_of);
+                let sub = entry.sub.clone();
+                let head = entry.text.clone();
+                let room = inner.saturating_sub(width::width(&sub) + 2);
+                let head = width::fit(&head, room);
+                out.push_str(&base);
+                out.push(' ');
+                match (space_ink, entry.space_len) {
+                    (Some(ink), len) if len > 0 && len <= width::width(&head) => {
+                        out.push_str(&if *selected {
+                            theme::selected_in(ink)
+                        } else {
+                            theme::fg(ink)
+                        });
+                        out.push_str(&width::fit(&head, len));
+                        out.push_str(&base);
+                        out.push_str(&head.chars().skip(len).collect::<String>());
+                    }
+                    _ => out.push_str(&head),
+                }
+                out.push(' ');
+                out.push_str(&match (state_ink, *selected) {
+                    (Some(ink), true) => theme::selected_in(ink),
+                    (Some(ink), false) => theme::fg(ink),
+                    (None, true) => theme::selected(),
+                    (None, false) => theme::fg(theme::Role::Faint),
+                });
+                out.push_str(&sub);
+                out.push_str(&base);
+            }
+        }
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(theme::RESET);
+    }
+    if line_at(row, out) {
+        out.push_str(&border);
+        out.push('\u{2570}');
+        for _ in 0..inner {
+            out.push('\u{2500}');
+        }
+        out.push('\u{256f}');
+        out.push_str(theme::RESET);
+    }
+}
+
+/// How many section headers the palette will draw, which take rows like anything else.
+fn count_headers(frame: &Frame, palette: &Palette) -> usize {
+    let entries = palette.items(frame.rows, frame.spaces);
+    let mut sections = 0;
+    let mut section = "";
+    for entry in &entries {
+        if entry.section != section {
+            section = entry.section;
+            sections += 1;
+        }
+    }
+    sections
+}
+
+/// Where the palette's query line is drawn, so the cursor can be put at the end of it.
+fn palette_query_row(lines: u16, rows: usize) -> usize {
+    let lines = lines as usize;
+    let budget = (lines.saturating_sub(TABS + STATUS + 3)).max(1).min(rows);
+    (lines.saturating_sub(budget + 3)) / 2 + 1
 }
 
 /// The screen column the cursor sits at, counted from zero, given the row it is on and the
@@ -229,14 +682,230 @@ fn cursor_column(line: &str, cell: usize) -> usize {
     cols + (cell - cells)
 }
 
+/// The naming box, painted over the middle of the screen.
+///
+/// Three rows: what is being asked, what has been typed, and how to get out. In the middle
+/// of the pane rather than in the column, because it is a question about something that is
+/// about to exist and has no row of its own to sit in yet.
+fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
+    let cols = frame.cols as usize;
+    let lines = frame.lines as usize;
+    if cols < 20 || lines < TABS + STATUS + 3 {
+        return;
+    }
+    let w = palette_width(frame.cols);
+    let left = cols.saturating_sub(w) / 2;
+    let top = (lines / 3).max(TABS + 1);
+    let rows = [
+        (
+            theme::fg(theme::Role::Title),
+            format!(" {}", prompt.what.asks()),
+        ),
+        (theme::selected(), format!(" > {}", prompt.text)),
+        (
+            theme::fg(theme::Role::Faint),
+            format!(" {}", prompt.what.hint()),
+        ),
+    ];
+    for (i, (ink, text)) in rows.iter().enumerate() {
+        if top + i >= lines {
+            break;
+        }
+        out.push_str(&at(top + i, left + 1));
+        out.push_str(ink);
+        out.push_str(&width::fit(text, w));
+        out.push_str(theme::RESET);
+    }
+}
+
+/// The menu, painted over the column it was opened from.
+///
+/// Small and beside its own label rather than centred like the palette: it is a short list
+/// of things this interface can do, opened from a word at the foot of the column, and a box
+/// that jumped to the middle of the screen for four rows would read as something bigger
+/// than it is.
+fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
+    let lines = frame.lines as usize;
+    let widest = crate::run::MENU
+        .iter()
+        .map(|(name, _)| width::width(name))
+        .max()
+        .unwrap_or(0);
+    let w = (widest + 4).min(frame.cols as usize);
+    if lines < crate::run::MENU.len() + 2 {
+        return;
+    }
+    let left = left_for(frame.cols, frame.collapsed).saturating_sub(w + 1);
+    // Above the row it was opened from, so the label stays visible under it.
+    let top = (lines.saturating_sub(STATUS + crate::run::MENU.len() + 3)).max(TABS);
+    let border = theme::fg(theme::Role::Rule);
+    let edge = |out: &mut String, row: usize, open: char, fill: char, close: char| {
+        out.push_str(&at(row + 1, left + 1));
+        out.push_str(&border);
+        out.push(open);
+        for _ in 0..w.saturating_sub(2) {
+            out.push(fill);
+        }
+        out.push(close);
+        out.push_str(theme::RESET);
+    };
+    edge(out, top, '\u{256d}', '\u{2500}', '\u{256e}');
+    for (i, (name, _)) in crate::run::MENU.iter().enumerate() {
+        let row = top + 1 + i;
+        if row + 1 >= lines {
+            break;
+        }
+        out.push_str(&at(row + 1, left + 1));
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(&if i == selected {
+            theme::selected()
+        } else {
+            theme::fg(theme::Role::Text)
+        });
+        out.push_str(&width::fit(&format!(" {name}"), w.saturating_sub(2)));
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(theme::RESET);
+    }
+    edge(
+        out,
+        top + 1 + crate::run::MENU.len(),
+        '\u{2570}',
+        '\u{2500}',
+        '\u{256f}',
+    );
+}
+
+/// A read only overlay: the keys, or what this daemon is set to.
+///
+/// Every line of it is a real value read from the interface itself rather than a screen
+/// somebody drew once: a settings page that says what the program wishes were true is worse
+/// than no settings page.
+fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) {
+    let lines: Vec<String> = match reading {
+        crate::run::Reading::Keybinds => EVERY_KEY
+            .trim_start_matches("ctrl-a: ")
+            .split("  ")
+            .map(|entry| match entry.split_once(' ') {
+                Some((key, what)) => format!(" ctrl-a {key:<7}{what}"),
+                None => format!(" {entry}"),
+            })
+            .chain([
+                " ctrl-a R      rename this space".to_string(),
+                " ctrl-a 1..9   the nth tab of this space".to_string(),
+                " ctrl-a p      previous tab".to_string(),
+                " ctrl-a S      previous space".to_string(),
+                " ctrl-a f      fold the idle groups".to_string(),
+                " ctrl-a l      repaint".to_string(),
+                " ctrl-q        detach".to_string(),
+                // The mouse is not a key, and it is the part of this a person is least
+                // likely to guess: an interface that takes the mouse has taken their
+                // terminal's own selection with it, so it owes them this line.
+                " drag          select, and copy when you let go".to_string(),
+                " shift-drag    the same, over an agent that took the mouse".to_string(),
+                " wheel         scroll the program in the pane".to_string(),
+            ])
+            .collect(),
+        crate::run::Reading::Settings => vec![
+            format!(" window          {} by {}", frame.cols, frame.lines),
+            format!(
+                " left column     {} columns{}",
+                if frame.collapsed {
+                    sidebar::COLLAPSED
+                } else {
+                    sidebar::WIDTH
+                },
+                if frame.collapsed { ", folded" } else { "" }
+            ),
+            format!(" spaces          {}", frame.spaces.len()),
+            format!(" terminals       {}", frame.rows.len()),
+            format!(
+                " agents          {}",
+                frame.rows.iter().filter(|r| r.agent).count()
+            ),
+            format!(
+                " waiting         {}",
+                frame
+                    .rows
+                    .iter()
+                    .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
+                    .count()
+            ),
+        ],
+    };
+    let title = match reading {
+        crate::run::Reading::Keybinds => " keybinds",
+        crate::run::Reading::Settings => " settings",
+    };
+    paint_box(frame, title, &lines, out);
+}
+
+/// A bordered box in the middle of the screen, with a title and some rows.
+fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
+    let cols = frame.cols as usize;
+    let lines = frame.lines as usize;
+    let widest = rows
+        .iter()
+        .chain(std::iter::once(&title.to_string()))
+        .map(|r| width::width(r))
+        .max()
+        .unwrap_or(0);
+    let w = (widest + 3).min(cols);
+    if lines < rows.len() + 4 || w < 6 {
+        return;
+    }
+    let left = cols.saturating_sub(w) / 2;
+    let top = lines.saturating_sub(rows.len() + 3) / 2;
+    let border = theme::fg(theme::Role::Rule);
+    let inner = w - 2;
+    let mut row = top;
+    let edge = |out: &mut String, row: usize, open: char, close: char| {
+        out.push_str(&at(row + 1, left + 1));
+        out.push_str(&border);
+        out.push(open);
+        for _ in 0..inner {
+            out.push('\u{2500}');
+        }
+        out.push(close);
+        out.push_str(theme::RESET);
+    };
+    edge(out, row, '\u{256d}', '\u{256e}');
+    row += 1;
+    for (i, text) in std::iter::once(title.to_string())
+        .chain(rows.iter().cloned())
+        .enumerate()
+    {
+        out.push_str(&at(row + 1, left + 1));
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(&theme::fg(if i == 0 {
+            theme::Role::Title
+        } else {
+            theme::Role::Text
+        }));
+        out.push_str(&width::fit(&text, inner));
+        out.push_str(&border);
+        out.push('\u{2502}');
+        out.push_str(theme::RESET);
+        row += 1;
+    }
+    edge(out, row, '\u{2570}', '\u{256f}');
+}
+
 /// One row of the terminal, with its colour.
 ///
 /// The runs are in the grid's columns and the text is painted in the screen's, and those
 /// two are the same number only until a wide character appears on the row. So the row is
 /// walked once, in cells, and each cell is emitted with the style the run says it has: a
 /// style change writes one escape sequence and nothing else does.
-fn paint_row(line: &str, spans: &[SpanWire], cols: usize) -> String {
-    if spans.is_empty() {
+fn paint_row(
+    line: &str,
+    spans: &[SpanWire],
+    cols: usize,
+    selected: Option<std::ops::Range<usize>>,
+) -> String {
+    if spans.is_empty() && selected.is_none() {
         return width::fit(line, cols);
     }
     let mut out = String::with_capacity(cols * 2);
@@ -245,6 +914,9 @@ fn paint_row(line: &str, spans: &[SpanWire], cols: usize) -> String {
     // The grid puts a spacer after a wide character; it is a cell for the run arithmetic
     // and not a column for the screen, so it is counted and not painted.
     let mut skip_spacer = false;
+    // Whether the cell just painted was part of the selection, so the escape is written
+    // once at each edge of it rather than before every character.
+    let mut reversed = false;
     for (cell, c) in line.chars().enumerate() {
         if skip_spacer && c == ' ' {
             skip_spacer = false;
@@ -259,17 +931,26 @@ fn paint_row(line: &str, spans: &[SpanWire], cols: usize) -> String {
             .iter()
             .find(|s| cell >= s.at && cell < s.at + s.len)
             .filter(|s| !is_plain(s));
-        if span.map(|s| s as *const _) != current.map(|s| s as *const _) {
+        // Reverse video for the selection, and reverse deliberately: a background colour
+        // would have to win against whatever the program painted underneath, and on a dark
+        // answer in a light theme it loses. Reverse is what every terminal marks a
+        // selection with, so it is also what a person already recognises.
+        let mark = selected.as_ref().is_some_and(|r| r.contains(&used));
+        if span.map(|s| s as *const _) != current.map(|s| s as *const _) || mark != reversed {
             out.push_str("\x1b[0m");
             if let Some(span) = span {
                 out.push_str(&sgr(span));
             }
+            if mark {
+                out.push_str("\x1b[7m");
+            }
             current = span;
+            reversed = mark;
         }
         out.push(c);
         used += w;
     }
-    if current.is_some() {
+    if current.is_some() || reversed {
         out.push_str("\x1b[0m");
     }
     for _ in used..cols {
@@ -341,6 +1022,7 @@ mod tests {
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
             terminal,
+            name: None,
             workspace: 1,
             agent: true,
             program: Some(program.to_string()),
@@ -352,6 +1034,7 @@ mod tests {
 
     fn snapshot(lines: &[&str]) -> SnapshotWire {
         SnapshotWire {
+            modes: Default::default(),
             cols: 40,
             rows: lines.len(),
             cursor: (0, 0),
@@ -362,7 +1045,8 @@ mod tests {
 
     #[test]
     fn the_pane_is_what_is_left_after_the_index_and_the_status_line() {
-        assert_eq!(pane_size(80, 24), (80 - sidebar::WIDTH as u16 - 1, 22));
+        // Two rows at the bottom now: the notice and the keys.
+        assert_eq!(pane_size(80, 24), (80 - sidebar::WIDTH as u16 - 1, 21));
     }
 
     #[test]
@@ -385,6 +1069,13 @@ mod tests {
             cols: 80,
             lines: 24,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         assert!(painted.contains("hello from the shell"));
         // Once on the tab and once in the agents panel: the bar says what is open in this
@@ -412,6 +1103,13 @@ mod tests {
             cols: 40,
             lines: 5,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         let (pane_cols, _) = pane_size(40, 5);
         // Exactly the pane's width of it, and not one column more.
@@ -431,6 +1129,13 @@ mod tests {
             cols: 40,
             lines: 5,
             message: Some("starting a terminal"),
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         assert!(painted.contains("starting a terminal"));
     }
@@ -452,9 +1157,19 @@ mod tests {
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
-            cols: 40,
-            lines: 3,
+            // Wide enough that the whole run fits beside the column, since what is being
+            // read is where the colour stops and not where the pane does, and tall enough
+            // for a pane under the tab bar and over the two status rows.
+            cols: 60,
+            lines: 5,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         // Bold and red on, the text, and then off again: a run that is not closed leaks its
         // colour into the rest of the screen, which is the whole pane and then the status
@@ -479,12 +1194,26 @@ mod tests {
             cols: 40,
             lines: 5,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
-        // Only the pane's own bytes on the first row: the status line legitimately uses
-        // reverse video and resets it, and splitting on the divider alone would catch that.
-        let after_divider = painted.split('\u{2502}').nth(1).unwrap_or_default();
-        let pane = after_divider.split('\x1b').next().unwrap_or_default();
-        assert!(pane.starts_with("plain"), "{pane:?}");
+        // The row the shell printed, found by what it printed and then read as bytes. The
+        // chrome around it resets after every piece it paints, so the pane's own run
+        // starts at one of those resets; which rule glyph precedes it depends on whether
+        // the panel drew a separator on that row, and that is not what is being tested.
+        let (pane_cols, _) = pane_size(40, 5);
+        let pane = painted
+            .split(theme::RESET)
+            .map(|after| after.split('\x1b').next().unwrap_or_default())
+            .find(|piece| piece.starts_with("plain"))
+            .unwrap_or_else(|| panic!("the pane never drew its row: {painted:?}"));
+        // The whole row and nothing else in it, and not one escape of its own.
+        assert_eq!(width::width(pane), pane_cols as usize, "{pane:?}");
         assert!(!pane.contains('\x1b'), "{pane:?}");
     }
 
@@ -510,6 +1239,13 @@ mod tests {
             cols: 30,
             lines: 5,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
         assert!(painted.contains("\x1b[32mX"), "{painted:?}");
@@ -548,6 +1284,13 @@ mod tests {
             cols: 80,
             lines: 24,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         // One row down for the tab bar, and the pane starts after the column and its rule.
         let want = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
@@ -575,6 +1318,13 @@ mod tests {
                 cols,
                 lines: 6,
                 message: None,
+                fold: sidebar::Fold::all_open(),
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
             });
             // Every positioned run, measured as a terminal measures it.
             for run in painted.split("\x1b[").skip(1) {
@@ -605,16 +1355,58 @@ mod tests {
             cols: 40,
             lines: 5,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         assert!(painted.contains("\x1b[?25l"));
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
+    }
+
+    /// The way out is the one key a person stuck in here has to be able to read, so it is
+    /// never the one the cut takes.
+    #[test]
+    fn the_key_list_always_keeps_the_way_out() {
+        let rows = [row(1, "sh", "idle")];
+        for cols in [40u16, 60, 80, 100, 200] {
+            let painted = paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols,
+                lines: 24,
+                message: None,
+                fold: sidebar::Fold::all_open(),
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+            });
+            let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
+            assert!(
+                keys.contains("d detach") || cols < 52,
+                "{cols} columns: no way out on the key row: {keys:?}"
+            );
+            assert!(
+                width::width(&keys) <= cols as usize,
+                "{cols} columns: the key row is wider than the window: {keys:?}"
+            );
+        }
     }
 
     #[test]
     fn a_pane_row_is_never_painted_over_the_status_line() {
         let rows = [row(1, "sh", "idle")];
         let snapshot = snapshot(&["PANE_CONTENT"]);
-        for lines in [2u16, 3, 4] {
+        for lines in [3u16, 4, 5] {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
@@ -624,17 +1416,154 @@ mod tests {
                 cols: 60,
                 lines,
                 message: Some("STATUS_LINE"),
+                fold: sidebar::Fold::all_open(),
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
             });
-            // The status line owns the last row, so nothing else may address it.
-            let status_row = at(lines as usize, 1);
-            let after = painted.rsplit(&status_row).next().unwrap_or_default();
+            // The two status rows own the bottom of the screen, so nothing else may
+            // address either of them: the notice is the row above the keys.
+            let notice_row = at(lines as usize - 1, 1);
+            let keys_row = at(lines as usize, 1);
+            let after = painted
+                .split(&notice_row)
+                .nth(1)
+                .unwrap_or_default()
+                .split(&keys_row)
+                .next()
+                .unwrap_or_default();
             assert!(after.contains("STATUS_LINE"), "{lines} lines: {painted:?}");
-            assert_eq!(
-                painted.matches(&status_row).count(),
-                1,
-                "{lines} lines: something else drew on the status row: {painted:?}"
+            assert!(
+                painted
+                    .rsplit(&keys_row)
+                    .next()
+                    .unwrap_or_default()
+                    .contains("ctrl-a:"),
+                "{lines} lines: the keys are not on the last row: {painted:?}"
+            );
+            for row in [&notice_row, &keys_row] {
+                assert_eq!(
+                    painted.matches(row).count(),
+                    1,
+                    "{lines} lines: something else drew on a status row: {painted:?}"
+                );
+            }
+        }
+    }
+
+    /// A space's colour has to reach the agents panel, or it says nothing that the word
+    /// beside it did not already say.
+    #[test]
+    fn a_space_wears_one_colour_in_both_panels() {
+        let rows = [row(1, "claude", "working")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        let ink = theme::fg(theme::space_of(1));
+        let raised = theme::selected_in(theme::space_of(1));
+        // Once in the spaces panel, once beside the agent that lives there. Either form,
+        // because the row may also have the keyboard.
+        let worn = painted.matches(ink.as_str()).count() + painted.matches(raised.as_str()).count();
+        assert!(
+            worn >= 2,
+            "the space colour appears {worn} times: {painted:?}"
+        );
+        // And the state the agent is in is still its own colour, not the space's.
+        assert!(
+            painted.contains(&theme::fg(theme::Role::Working))
+                || painted.contains(&theme::selected_in(theme::Role::Working)),
+            "the state lost its colour to the space: {painted:?}"
+        );
+    }
+
+    /// The run is measured in columns, so a name with a wide character in it must not be
+    /// cut in half or leave the rest of the row shifted.
+    #[test]
+    fn an_accented_row_is_still_exactly_the_column_wide() {
+        let wide = vec![WorkspaceRow {
+            id: 1,
+            name: "\u{4e2d}\u{6587}".to_string(),
+            terminals: 1,
+        }];
+        let rows = [row(1, "claude", "working")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &wide,
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        assert!(!painted.contains('\u{fffd}'), "a name was cut in half");
+        // Every panel row still ends where the rule begins.
+        for row in 1..22 {
+            let at = at(row, 1);
+            let Some(start) = painted.find(&at) else {
+                continue;
+            };
+            // Cut in columns, which is what the column is measured in: taking that many
+            // characters overshoots the moment one of them is two columns wide, which is
+            // the case under test.
+            let painted_row = strip(&painted[start + at.len()..]);
+            let line = width::fit(&painted_row, sidebar::WIDTH);
+            assert_eq!(width::width(&line), sidebar::WIDTH, "row {row}: {line:?}");
+            // The rule sits in the very next column, so the row ended exactly there.
+            assert!(
+                painted_row
+                    .chars()
+                    .scan(0usize, |col, c| {
+                        let start = *col;
+                        *col += width::columns(c);
+                        Some((start, c))
+                    })
+                    .any(|(at, c)| at == sidebar::WIDTH && (c == '\u{2502}' || c == '\u{2524}')),
+                "row {row} does not end at the rule: {painted_row:?}"
             );
         }
+    }
+
+    /// Escapes out, so a test can measure what a terminal would show.
+    fn strip(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -652,7 +1581,377 @@ mod tests {
             cols: 40,
             lines: 3,
             message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
         });
         assert!(!painted.contains('\u{fffd}'));
+    }
+
+    fn blocked_row(terminal: u32, program: &str) -> AgentRow {
+        AgentRow {
+            terminal,
+            name: None,
+            workspace: 1,
+            agent: true,
+            program: Some(program.to_string()),
+            behind: None,
+            state: "blocked".to_string(),
+            generation: Some(1),
+        }
+    }
+
+    /// Triage: one line saying what to do next, while something waits.
+    #[test]
+    fn a_blocked_agent_puts_the_next_action_on_the_status_line() {
+        let rows = [blocked_row(1, "codex")];
+        let snapshot = snapshot(&["waiting"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        assert!(
+            painted.contains("next: app/codex is blocked"),
+            "{painted:?}"
+        );
+        assert!(painted.contains("^a space"), "{painted:?}");
+    }
+
+    #[test]
+    fn with_nothing_waiting_the_status_line_carries_the_keys() {
+        let rows = [row(1, "zsh", "idle")];
+        let snapshot = snapshot(&["quiet"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        assert!(painted.contains("d detach"), "{painted:?}");
+        assert!(!painted.contains("next:"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_transient_message_wins_over_the_next_action() {
+        let rows = [blocked_row(1, "codex")];
+        let snapshot = snapshot(&["waiting"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: Some("starting a terminal"),
+            fold: sidebar::Fold::default_closed(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        assert!(painted.contains("starting a terminal"), "{painted:?}");
+    }
+
+    /// The palette floats over the terminal with what needs a person first.
+    #[test]
+    fn an_open_palette_lists_what_needs_you_over_the_pane() {
+        let rows = [blocked_row(1, "codex"), row(2, "claude", "working")];
+        let snapshot = snapshot(&["terminal output"]);
+        let palette = Palette::open();
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: Some(&palette),
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        // Read as a terminal shows it: the row is painted in pieces now, since the space
+        // wears its own colour and the state wears its own.
+        let shown = strip(&painted);
+        assert!(shown.contains("> "), "{shown:?}");
+        assert!(shown.contains("needs you"), "{shown:?}");
+        assert!(shown.contains("app codex"), "{shown:?}");
+        assert!(shown.contains("enter go"), "{shown:?}");
+        // A box with edges, drawn in the middle of the window rather than in a corner of
+        // it, which is what an unopened thing looks like.
+        assert!(
+            shown.contains('\u{256d}') && shown.contains('\u{256f}'),
+            "{shown:?}"
+        );
+        let w = palette_width(80);
+        let left = (80usize.saturating_sub(w)) / 2;
+        let rows = palette.items(&rows, &spaces()).len();
+        let top = palette_query_row(24, rows + 4);
+        assert!(top > 1, "the box is pinned to the top: {shown:?}");
+        // The cursor sits at the end of the query, inside the box, where typing goes.
+        assert!(painted.contains(&at(top + 1, left + 4 + 1)), "{painted:?}");
+    }
+
+    /// The palette is painted over a pane whose program left the terminal in some
+    /// colour and some attribute. Every line of the box has to say what it is
+    /// rather than inherit that, and cover the full width of the box, or it is a
+    /// box only in the sense that its text lands in the right cells.
+    #[test]
+    fn every_palette_line_resets_the_style_and_covers_the_box() {
+        let rows = [blocked_row(1, "codex"), row(2, "claude", "working")];
+        let mut snapshot = snapshot(&["output in a colour the program chose"]);
+        snapshot.styles = vec![vec![SpanWire {
+            at: 0,
+            len: 36,
+            fg: Some(ColourWire::Indexed { i: 5 }),
+            bg: None,
+            attrs: attrs::BOLD,
+        }]];
+        let palette = Palette::open();
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: Some(&palette),
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        let w = palette_width(80);
+        let left = (80usize.saturating_sub(w)) / 2;
+        // Every row the box drew, found by the position it was drawn at.
+        let mut found = 0;
+        for row in TABS + 1..24 {
+            let Some(cut) = painted.find(&at(row, left + 1)) else {
+                continue;
+            };
+            found += 1;
+            let rest = &painted[cut + at(row, left + 1).len()..];
+            assert!(
+                rest.starts_with("\x1b[0;") || rest.starts_with("\x1b[0m"),
+                "row {row} of the palette inherits the pane's style: {:?}",
+                &rest[..rest.len().min(40)]
+            );
+            // Every row covers the whole box. Measured across the row's pieces, because a
+            // row is painted in several now: the border, the space in its own colour, the
+            // state in its own, and the rest.
+            let painted_row = strip(rest);
+            let text = width::fit(&painted_row, w);
+            assert_eq!(
+                width::width(&text),
+                w,
+                "row {row} of the palette does not cover the box: {text:?}"
+            );
+            assert!(
+                text.starts_with('\u{2502}')
+                    || text.starts_with('\u{256d}')
+                    || text.starts_with('\u{2570}'),
+                "row {row} of the palette has no edge: {text:?}"
+            );
+        }
+        assert!(found >= 3, "the palette drew {found} rows");
+    }
+
+    #[test]
+    fn a_palette_query_filters_what_is_on_screen() {
+        let rows = [blocked_row(1, "codex"), row(2, "claude", "working")];
+        let snapshot = snapshot(&["terminal output"]);
+        let mut palette = Palette::open();
+        for c in "working".chars() {
+            palette.push(c);
+        }
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: Some(&palette),
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        let shown = strip(&painted);
+        assert!(shown.contains("> working"), "{shown:?}");
+        assert!(!shown.contains("app codex"), "{shown:?}");
+    }
+
+    /// Folding reaches the screen: nine agents become three actionable rows.
+    #[test]
+    fn a_folded_panel_fits_nine_agents_without_scrolling() {
+        let spaces = vec![WorkspaceRow {
+            id: 1,
+            name: "app".to_string(),
+            terminals: 9,
+        }];
+        let states = [
+            "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",
+        ];
+        let rows: Vec<AgentRow> = states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| AgentRow {
+                terminal: i as u32 + 1,
+                name: None,
+                workspace: 1,
+                agent: true,
+                program: Some("claude".to_string()),
+                behind: None,
+                state: state.to_string(),
+                generation: Some(1),
+            })
+            .collect();
+        let snapshot = snapshot(&["output"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces,
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            fold: sidebar::Fold::default_closed(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+        });
+        assert!(painted.contains("1 finished"), "{painted:?}");
+        assert!(painted.contains("4 idle"), "{painted:?}");
+        assert!(painted.contains("agents 4 of 9"), "{painted:?}");
+    }
+
+    /// A selection is drawn as selected, and only where it is.
+    #[test]
+    fn the_selected_part_of_a_row_is_marked_and_the_rest_is_not() {
+        let snapshot = snapshot(&["the quick brown fox", "another line"]);
+        let rows = [row(1, "sh", "idle")];
+        let mut selection = crate::selection::Selection::start(0, 4);
+        selection.extend(0, 8);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 60,
+            lines: 6,
+            message: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: Some(selection),
+        });
+        // The five columns under the drag are reversed, and the escape is written once at
+        // each edge of them rather than around every character.
+        assert!(
+            painted.contains("\x1b[7mquick"),
+            "the selected word is not marked: {painted:?}"
+        );
+        assert_eq!(
+            painted.matches("\x1b[7m").count(),
+            1,
+            "the reverse was written more than once: {painted:?}"
+        );
+        let after = painted
+            .split("\x1b[7mquick")
+            .nth(1)
+            .expect("the rest of the screen");
+        assert!(
+            after.starts_with("\x1b[0m"),
+            "the reverse was never turned off, so the rest of the screen wears it: \
+             {after:?}"
+        );
+        assert!(
+            !after.contains(" brown fox\x1b[7m"),
+            "the row after the selection is marked too: {after:?}"
+        );
+    }
+
+    /// Without a selection nothing changes about how a row is painted.
+    #[test]
+    fn a_click_that_selected_nothing_leaves_the_screen_exactly_as_it_was() {
+        let snapshot = snapshot(&["plain text"]);
+        let rows = [row(1, "sh", "idle")];
+        let build = |selection| {
+            paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                space: Some(1),
+                focused: 1,
+                snapshot: Some(&snapshot),
+                cols: 60,
+                lines: 6,
+                message: None,
+                fold: sidebar::Fold::all_open(),
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection,
+            })
+        };
+        assert_eq!(
+            build(None),
+            build(Some(crate::selection::Selection::start(0, 3))),
+            "a click that selected nothing changed the screen"
+        );
     }
 }
