@@ -23,6 +23,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x1".into(),
             cwd: None,
             workspace: None,
+            name: None,
         },
         ControlRequest::CloseTerminal {
             id: "x2".into(),
@@ -52,6 +53,30 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x10".into(),
             name: "another".into(),
         },
+        // A forged token: refused, but answered. The report carries a state for
+        // the index, never bytes for the child.
+        ControlRequest::ReportAgentState {
+            id: "x11".into(),
+            terminal,
+            token: "forged".into(),
+            state: "working".into(),
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: true,
+            clock: 0,
+        },
+        ControlRequest::ReloadAgentManifests { id: "x12".into() },
+        ControlRequest::RenameTerminal {
+            id: "x13".into(),
+            terminal,
+            name: Some("release".into()),
+        },
+        ControlRequest::RenameWorkspace {
+            id: "x14".into(),
+            workspace: 1,
+            name: "webshop".into(),
+        },
+        ControlRequest::Shutdown { id: "x15".into() },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -62,9 +87,14 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
+            | ControlRequest::RenameTerminal { .. }
+            | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }
+            | ControlRequest::ReportAgentState { .. }
+            | ControlRequest::ReloadAgentManifests { .. }
+            | ControlRequest::Shutdown { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }
@@ -94,6 +124,14 @@ async fn g7_1_no_control_method_writes_to_a_terminal() {
         // terminal, on purpose, and it is not a write: the second test below pins what it
         // does. Every other method is attempted against somebody else's terminal.
         if matches!(request, ControlRequest::CloseTerminal { .. }) {
+            continue;
+        }
+        // Shutdown is the second exclusion and it is excluded for the same reason as the
+        // first, one step further: it ends every terminal, which is what it is for. It is
+        // still not a write, it takes no bytes, and it would end this test's daemon along
+        // with the victim, which would prove nothing about writes and lose the assertion
+        // below.
+        if matches!(request, ControlRequest::Shutdown { .. }) {
             continue;
         }
         // Every one of them is answered, and none of them carries bytes for a child.
@@ -142,6 +180,7 @@ async fn closing_someone_elses_terminal_ends_it_without_writing_to_it() {
                 id: "mk".into(),
                 cwd: None,
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )

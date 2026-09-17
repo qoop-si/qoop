@@ -23,6 +23,22 @@ struct Machine {
     name: &'static str,
 }
 
+/// A machine's daemon outlives the relay that started it, which is the point of a daemon
+/// and a leak in a test: `relay` starts one if there is not one, and killing the relay
+/// leaves it holding a shell in a directory this test is about to delete. Measured after a
+/// suite run: thirty two daemons still alive, each in a temporary directory that no longer
+/// existed, so nothing could ever reach them again.
+impl Drop for Machine {
+    fn drop(&mut self) {
+        let _ = Command::new(qoro())
+            .arg("stop")
+            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 impl Machine {
     fn new(name: &'static str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -61,6 +77,25 @@ impl Machine {
         }
         format!("{hash:016x}")
     }
+}
+
+/// Each machine's state hash, once each has stopped changing on its own.
+///
+/// Two equal readings a beat apart, which is what "settled" can mean from the outside. The
+/// deadline is a failure rather than a silent continue: a machine still writing after it is
+/// up is a thing worth seeing, not a thing worth averaging over.
+fn quiet(machines: &[Machine]) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last: Vec<String> = machines.iter().map(Machine::state_hash).collect();
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(300));
+        let now: Vec<String> = machines.iter().map(Machine::state_hash).collect();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    panic!("a machine kept writing to its runtime directory after it was up");
 }
 
 fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
@@ -213,7 +248,14 @@ fn g6_6_three_machines_in_one_index_and_a_disconnect_touches_one() {
     }
     assert_eq!(index, vec!["local", "remote-a", "remote-b"]);
 
-    let before: Vec<String> = machines.iter().map(Machine::state_hash).collect();
+    // A baseline taken once each machine has stopped writing on its own.
+    //
+    // A daemon settles after it starts: it records where its first terminal is as soon as
+    // that terminal's shell draws a prompt, which is a write that has nothing to do with
+    // any other machine. Taken without waiting, the baseline lands in the middle of that
+    // and the assertion below reads an ordinary startup write as a disconnect touching an
+    // unrelated machine.
+    let before = quiet(&machines);
 
     // One machine's connection dies abruptly, with no goodbye.
     stop(&mut relays[1]);
@@ -235,11 +277,17 @@ fn g6_6_three_machines_in_one_index_and_a_disconnect_touches_one() {
     }
     let after: Vec<String> = machines.iter().map(Machine::state_hash).collect();
     for i in [0usize, 2] {
-        assert_eq!(
-            before[i], after[i],
-            "{}'s state changed when a different machine disconnected",
-            machines[i].name
-        );
+        if before[i] != after[i] {
+            let mut entries = Vec::new();
+            collect(machines[i].dir.path(), machines[i].dir.path(), &mut entries);
+            let names: Vec<(String, usize)> =
+                entries.iter().map(|(n, b)| (n.clone(), b.len())).collect();
+            panic!(
+                "{}'s state changed when a different machine disconnected; it now holds \
+                 {names:?}",
+                machines[i].name
+            );
+        }
     }
 
     for mut relay in relays {

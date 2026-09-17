@@ -41,6 +41,38 @@ otherwise.
 - If isolation evidence later demands per-workspace processes, the change is contained
   because runtimes already own their state and communicate only over channels.
 
+## Amendment, 2026-09-17: named sessions, one daemon each
+
+The decision above stands for what it decided, and is narrowed here by evidence the
+original had not seen.
+
+What the decision got right is still right: workspaces are not a reason to run more
+processes, and the isolation section below is unchanged, because more daemons of the same
+uid are not a security boundary either.
+
+What it did not have is a product requirement it turned out to block. A person running
+several projects at once wants to stop one of them: end its processes, get the machine
+back, and open it again later with the same tabs. Stopping is the operation that decides
+the topology. Inside one daemon, stopping one session means tearing down a subset of its
+terminals while it keeps serving, which is a partial teardown with no natural boundary and
+a new class of half-stopped state. As one process per session it is the process ending, and
+the operating system does the rest, which is a mechanism that already works and cannot be
+half done.
+
+So: a session is a named directory under the runtime directory, holding one daemon's
+socket, database, history and event log, and the unnamed default is one of them rather than
+a special case. `qoro --session <name>` picks one, `qoro ls` lists them, `qoro stop [name]`
+ends one.
+
+The path duplication the Context warns about is the real risk and is answered directly:
+every session path is built by `paths::session_dir`, and there is no second place that
+joins a session name onto a directory. A name is refused rather than sanitised if it could
+be anything other than one directory under that one.
+
+The consequences below are narrowed accordingly: a daemon crash affects every workspace in
+its session rather than every workspace on the machine, which is strictly better, and one
+process registry, one event stream and one listener are now per session.
+
 ## Rollback
 Splitting into multiple daemons later requires a registry and a router. The ownership
 boundaries chosen now are exactly what would make that possible.

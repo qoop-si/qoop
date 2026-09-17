@@ -70,6 +70,7 @@ fn actions() -> Vec<Action> {
                     id: "a".into(),
                     cwd: None,
                     workspace: None,
+                    name: None,
                 })
             },
         },
@@ -93,6 +94,26 @@ fn actions() -> Vec<Action> {
         Action {
             name: "show the workspaces",
             method: || Method::Control(ControlRequest::ListWorkspaces { id: "a".into() }),
+        },
+        Action {
+            name: "rename a terminal",
+            method: || {
+                Method::Control(ControlRequest::RenameTerminal {
+                    id: "a".into(),
+                    terminal: 1,
+                    name: Some("release".into()),
+                })
+            },
+        },
+        Action {
+            name: "rename a workspace",
+            method: || {
+                Method::Control(ControlRequest::RenameWorkspace {
+                    id: "a".into(),
+                    workspace: 1,
+                    name: "webshop".into(),
+                })
+            },
         },
         Action {
             name: "start a workspace",
@@ -123,8 +144,48 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "report the agent's state from its hooks",
+            method: || {
+                Method::Control(ControlRequest::ReportAgentState {
+                    id: "a".into(),
+                    terminal: 1,
+                    token: "t".into(),
+                    state: "working".into(),
+                    visible_blocker: false,
+                    visible_idle: false,
+                    visible_working: true,
+                    clock: 0,
+                })
+            },
+        },
+        Action {
+            name: "end this session",
+            method: || Method::Control(ControlRequest::Shutdown { id: "a".into() }),
+        },
+        Action {
+            name: "re-read agent-detection overrides",
+            method: || Method::Control(ControlRequest::ReloadAgentManifests { id: "a".into() }),
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
+        },
+        Action {
+            name: "type into another terminal from a script",
+            method: || Method::Terminal("Input"),
+        },
+        Action {
+            name: "read another terminal's screen from a script",
+            method: || {
+                Method::Control(ControlRequest::Subscribe {
+                    id: "a".into(),
+                    terminals: vec![1],
+                })
+            },
+        },
+        Action {
+            name: "resolve a prompt target against the index",
+            method: || Method::Control(ControlRequest::ListAgents { id: "a".into() }),
         },
         Action {
             name: "resize the focused terminal",
@@ -166,6 +227,7 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             cwd: None,
             workspace: None,
+            name: None,
         },
         ControlRequest::CloseTerminal {
             id: String::new(),
@@ -190,10 +252,32 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             terminal: 0,
         },
+        ControlRequest::ReportAgentState {
+            id: String::new(),
+            terminal: 0,
+            token: String::new(),
+            state: String::new(),
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            clock: 0,
+        },
+        ControlRequest::ReloadAgentManifests { id: String::new() },
+        ControlRequest::Shutdown { id: String::new() },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
             to: String::new(),
+        },
+        ControlRequest::RenameTerminal {
+            id: String::new(),
+            terminal: 0,
+            name: None,
+        },
+        ControlRequest::RenameWorkspace {
+            id: String::new(),
+            workspace: 0,
+            name: String::new(),
         },
     ];
     for request in &all {
@@ -204,9 +288,14 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
+            | ControlRequest::RenameTerminal { .. }
+            | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }
+            | ControlRequest::ReportAgentState { .. }
+            | ControlRequest::ReloadAgentManifests { .. }
+            | ControlRequest::Shutdown { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

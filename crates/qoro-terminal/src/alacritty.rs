@@ -51,6 +51,8 @@ pub struct AlacrittyEngine {
     events: Receiver<Event>,
     /// Rows that have left the visible region since the last drain, oldest first.
     scrolled_off: Vec<String>,
+    /// The latest OSC 0/2 title, retained for agent detection.
+    title: String,
     evicted_unobserved: u64,
     filter: ControlStringFilter,
     /// Reused across feeds so that bounding the stream does not allocate on every read.
@@ -81,6 +83,7 @@ impl AlacrittyEngine {
             filtered: Vec::new(),
             partial_char: Vec::new(),
             scrolled_off: Vec::new(),
+            title: String::new(),
             evicted_unobserved: 0,
         }
     }
@@ -308,8 +311,16 @@ impl TerminalEngine for AlacrittyEngine {
         while let Ok(ev) = self.events.try_recv() {
             match ev {
                 Event::PtyWrite(s) => effects.push(TerminalEffect::Reply(Bytes::from(s))),
-                Event::Title(t) => effects.push(TerminalEffect::Title(t)),
-                Event::ResetTitle => effects.push(TerminalEffect::Title(String::new())),
+                Event::Title(t) => {
+                    // Retained as well as reported: detection reads the latest
+                    // title long after the effect was drained.
+                    self.title = t.clone();
+                    effects.push(TerminalEffect::Title(t));
+                }
+                Event::ResetTitle => {
+                    self.title.clear();
+                    effects.push(TerminalEffect::Title(String::new()));
+                }
                 Event::Bell => effects.push(TerminalEffect::Bell),
                 Event::ClipboardStore(_, s) => {
                     effects.push(TerminalEffect::ClipboardWrite(Bytes::from(s)))
@@ -344,12 +355,21 @@ impl TerminalEngine for AlacrittyEngine {
             cursor: (cursor.line.0.max(0) as usize, cursor.column.0),
             lines,
             styles,
+            modes: self.modes(),
         }
     }
 
     fn visible_text(&self) -> Vec<String> {
         let rows = self.term.grid().screen_lines();
         (0..rows).map(|l| self.row(l as i32).0).collect()
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn clear_title(&mut self) {
+        self.title.clear();
     }
 
     fn modes(&self) -> TerminalModes {
@@ -559,6 +579,24 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_title_is_retained_for_detection_until_cleared() {
+        let mut e = engine();
+        assert_eq!(e.title(), "");
+        e.feed(b"\x1b]0;first\x07");
+        assert_eq!(e.title(), "first");
+        e.feed(b"plain output\r\n");
+        assert_eq!(e.title(), "first", "screen output must not move the title");
+        e.feed(b"\x1b]2;second\x07");
+        assert_eq!(
+            e.title(),
+            "second",
+            "OSC 2 replaces OSC 0 like any title set"
+        );
+        e.clear_title();
+        assert_eq!(e.title(), "");
+    }
+
+    #[test]
     fn damage_is_line_precise_rather_than_a_full_repaint() {
         let mut e = engine();
         e.feed(b"filler\r\n");
@@ -708,5 +746,31 @@ mod tests {
         let lines = e.snapshot().lines;
         assert!(lines.iter().any(|l| l == "before"), "{lines:?}");
         assert!(lines.iter().any(|l| l == "after"), "{lines:?}");
+    }
+
+    /// What a client needs in order to know whose the mouse is, read off the snapshot.
+    ///
+    /// Asked of the snapshot and not of `modes()`, because the snapshot is the only thing
+    /// that crosses to a client: a mode the engine knows and the snapshot does not is a
+    /// mode no client can act on.
+    #[test]
+    fn the_snapshot_carries_the_modes_a_client_acts_on() {
+        let mut e = AlacrittyEngine::new(80, 24);
+        assert!(!e.snapshot().modes.alt_screen);
+        assert!(!e.snapshot().modes.mouse_reporting);
+        e.feed(b"\x1b[?1049h");
+        assert!(
+            e.snapshot().modes.alt_screen,
+            "a full screen program is invisible to a client"
+        );
+        e.feed(b"\x1b[?1000h");
+        assert!(
+            e.snapshot().modes.mouse_reporting,
+            "a program that took the mouse is invisible to a client, so its scrolling and \
+             its clicking are taken away from it"
+        );
+        e.feed(b"\x1b[?1000l\x1b[?1049l");
+        assert!(!e.snapshot().modes.alt_screen);
+        assert!(!e.snapshot().modes.mouse_reporting);
     }
 }

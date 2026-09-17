@@ -91,14 +91,40 @@ impl StoreHandle {
         self.run(move |s| s.create_workspace(&name, now())).await
     }
 
+    pub async fn rename_workspace(&self, id: i64, name: String) -> Result<usize, HandleError> {
+        self.run(move |s| s.rename_workspace(id, &name)).await
+    }
+
     pub async fn create_terminal(
         &self,
+        id: i64,
         workspace: i64,
         cwd: String,
         argv: String,
     ) -> Result<i64, HandleError> {
-        self.run(move |s| s.create_terminal(workspace, &cwd, &argv, now()))
+        self.run(move |s| s.create_terminal(id, workspace, &cwd, &argv, now()))
             .await
+    }
+
+    /// Record where a terminal actually is, so a restart opens it there.
+    pub async fn set_cwd(&self, id: i64, cwd: String) -> Result<(), HandleError> {
+        self.run(move |s| s.set_cwd(id, &cwd)).await
+    }
+
+    /// Record which agent a terminal is running, and its own id for the conversation.
+    pub async fn set_agent(
+        &self,
+        id: i64,
+        agent: Option<String>,
+        agent_session: Option<String>,
+    ) -> Result<(), HandleError> {
+        self.run(move |s| s.set_agent(id, agent.as_deref(), agent_session.as_deref()))
+            .await
+    }
+
+    /// Give a terminal the name a person typed, so a restart brings the name back too.
+    pub async fn set_title(&self, id: i64, title: String) -> Result<(), HandleError> {
+        self.run(move |s| s.set_title(id, &title)).await
     }
 
     pub async fn close_terminal(&self, id: i64) -> Result<bool, HandleError> {
@@ -122,7 +148,7 @@ mod tests {
             .await
             .expect("workspace");
         let t = handle
-            .create_terminal(ws, "/tmp".into(), "/bin/sh".into())
+            .create_terminal(1, ws, "/tmp".into(), "/bin/sh".into())
             .await
             .expect("terminal");
         // Read back through a separate call, which is what "durable" has to mean from the
@@ -136,7 +162,7 @@ mod tests {
     async fn a_terminal_in_a_missing_workspace_is_refused_rather_than_silently_dropped() {
         let handle = StoreHandle::new(Store::in_memory().expect("open"));
         let err = handle
-            .create_terminal(404, "/tmp".into(), "/bin/sh".into())
+            .create_terminal(1, 404, "/tmp".into(), "/bin/sh".into())
             .await
             .expect_err("a missing workspace is not a create");
         assert!(matches!(

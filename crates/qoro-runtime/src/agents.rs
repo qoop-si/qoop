@@ -84,8 +84,37 @@ impl AgentRegistry {
     ///
     /// Private, and called from every path that changes one. A send with no receivers is
     /// not an error: nobody is drawing an index.
-    fn announce(&self, stream: u32) {
+    /// Tell every watcher that this terminal's row has changed.
+    ///
+    /// Public because a name is part of the row and nothing in here knows when one is
+    /// given: the index is what draws it, so a rename nobody announces is a rename nobody
+    /// sees until the next unrelated change.
+    pub fn announce(&self, stream: u32) {
         let _ = self.changes.send(stream);
+    }
+
+    /// Re-announce a terminal without touching its belief.
+    ///
+    /// The slow-tick recovery for a missed index refresh (Phase D1): a panel
+    /// that missed one `AgentChanged` event converges on the next one. This
+    /// goes around `accept()` on purpose, so it cannot change the belief and
+    /// cannot be filtered by the changed-state gate: it is a repeat, not news.
+    /// The daemon arms it only while a `visible_blocker` holds.
+    pub fn reannounce(&self, stream: u32) {
+        self.announce(stream);
+    }
+
+    /// Whether this terminal's belief currently holds a visible blocker.
+    ///
+    /// A copied bool rather than a cloned record: the detect loop asks on
+    /// every evaluation and cloning the whole record for one flag is the kind
+    /// of cost that only shows up at a hundred terminals.
+    pub fn belief_visible_blocker(&self, stream: u32) -> bool {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .is_some_and(|a| a.belief.visible_blocker)
     }
 }
 
@@ -97,6 +126,32 @@ fn fresh_belief(generation: GenerationId) -> AgentBelief {
         sequence: 0,
         visible_blocker: false,
         candidates: Vec::new(),
+    }
+}
+
+/// Settle a terminal whose foreground process just exited.
+///
+/// The identity is gone with the process. The belief is reset and becomes Idle
+/// through the acceptance rule rather than around it: a bare screen Idle
+/// offered to the previous Hook-held blocker would be `Outranked` and the dead
+/// terminal would stick on `blocked` forever. Reset first, then synthesize, is
+/// the composition the test below pins.
+fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
+    agent.identity = AgentIdentity::None;
+    agent.leader = None;
+    agent.belief = fresh_belief(agent.capability.generation);
+    let idle = qoro_domain::AgentObservation {
+        agent_id: qoro_domain::AgentId::new(stream.to_string()),
+        terminal_id: agent.capability.terminal.clone(),
+        sampled_generation: agent.belief.generation,
+        state: AgentRuntimeState::Idle,
+        source: ObservationSource::ProcessIdentity,
+        confidence: qoro_domain::Confidence::High,
+        sequence: agent.belief.sequence.saturating_add(1),
+        visible_blocker: false,
+    };
+    if let Ok(next) = agent.belief.clone().accept(&idle) {
+        agent.belief = next;
     }
 }
 
@@ -201,7 +256,52 @@ impl AgentRegistry {
         let mut terminals = self.terminals.lock().unwrap();
         let agent = terminals.get_mut(&stream)?;
         if agent.leader == leader {
-            return None;
+            // The same leader, but not necessarily the same answer. A wrapper leads the
+            // group and starts the agent a moment later, and the fork that starts it is not
+            // a foreground change, so nothing else would ever look again: measured, an
+            // opencode behind a tunnelling script stayed `opencode-vpn` for the life of the
+            // session and never appeared on the agents panel at all.
+            //
+            // Only while the reading is not an agent, and for as long as that lasts. There
+            // is no deadline here on purpose: the wrapper measured on a real machine sets
+            // up a tunnel before it starts opencode, which took twenty five seconds, and
+            // any window short enough to be cheap would have closed first.
+            //
+            // The probe's own backoff is what bounds the cost instead. It runs at fifty
+            // milliseconds right after something changes and doubles up to a minute while
+            // nothing does, so a shell sitting at its prompt costs one group read a minute,
+            // and that read finds a group of one and stops.
+            let provisional = matches!(&agent.identity, AgentIdentity::Known { program, .. }
+                if !qoro_domain::program::identify(program, &[]).agent);
+            if !provisional || leader.is_none() {
+                return None;
+            }
+            let pid = leader?;
+            // Looked at with the generation it already has, because most of these look
+            // again and find the same thing: minting one per probe would advance the
+            // generation of every terminal running a wrapper several times a second, and a
+            // generation is how everything else knows something actually changed.
+            let current = agent.identity.generation().unwrap_or(GenerationId::FIRST);
+            let program = match identity_of(pid, current) {
+                AgentIdentity::Known { program, .. }
+                    if qoro_domain::program::identify(&program, &[]).agent =>
+                {
+                    program
+                }
+                _ => return None,
+            };
+            // A different program is in this terminal than the one we had been reading, so
+            // what was believed about the old one does not carry over, and that is a new
+            // generation by definition.
+            let generation = agent.capability.advance();
+            agent.belief = fresh_belief(generation);
+            agent.identity = AgentIdentity::Known {
+                program,
+                generation,
+            };
+            drop(terminals);
+            self.announce(stream);
+            return Some(generation);
         }
         if let Some(old) = agent.leader.take() {
             self.watch.unwatch(old);
@@ -256,9 +356,8 @@ impl AgentRegistry {
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
             if exited {
-                agent.identity = AgentIdentity::None;
-                agent.leader = None;
                 self.by_pid.lock().unwrap().remove(&pid.0);
+                settle_exit(agent, stream);
             } else {
                 // The same pid, a different program. This is the case a pid keyed identity
                 // gets wrong, and it is the common one: a shell that becomes an agent.
@@ -302,13 +401,17 @@ impl AgentRegistry {
             visible_blocker: verdict.visible_blocker,
         };
         let before = agent.belief.state;
+        let before_blocker = agent.belief.visible_blocker;
         // `accept` is the one that consumes the belief and returns the new one, so an
         // observation cannot be applied without going through the acceptance rule first.
         let Ok(next) = agent.belief.clone().accept(&observation) else {
             return false;
         };
         agent.belief = next;
-        let changed = agent.belief.state != before;
+        // Published when anything observable changed: the state or the visible
+        // blocker. A soak of identical evaluations publishes nothing.
+        let changed =
+            agent.belief.state != before || agent.belief.visible_blocker != before_blocker;
         drop(terminals);
         if changed {
             self.announce(stream);
@@ -329,28 +432,115 @@ impl AgentRegistry {
         };
         agent.capability.admit(terminal, token, sampled)
     }
+
+    /// Record what a hook or plugin inside the terminal reports about the agent.
+    ///
+    /// The claim goes through the existing `admit()` check first: a report with
+    /// the wrong token is a forgery and never becomes an observation. The wire
+    /// clock is advisory only and is not even a parameter here, which is what
+    /// makes "the wall time leaked into the sequence" inexpressible: the
+    /// sequence is assigned from the same per-terminal counter the screen path
+    /// uses, so a hook's huge nanos can never dwarf a later screen reading.
+    /// Sampled under the current generation, because a hook cannot know the
+    /// generation and anything older would be refused as stale anyway.
+    ///
+    /// Answers whether anything changed, or why the report was refused.
+    pub fn observe_hook(
+        &self,
+        stream: u32,
+        terminal: &TerminalId,
+        token: &CapabilityToken,
+        state: AgentRuntimeState,
+        visible_blocker: bool,
+    ) -> Result<bool, ClaimRefusal> {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return Err(ClaimRefusal::WrongTerminal);
+        };
+        let generation = agent.belief.generation;
+        agent.capability.admit(terminal, Some(token), generation)?;
+        let observation = qoro_domain::AgentObservation {
+            agent_id: qoro_domain::AgentId::new(stream.to_string()),
+            terminal_id: agent.capability.terminal.clone(),
+            sampled_generation: generation,
+            state,
+            source: qoro_domain::ObservationSource::Hook,
+            confidence: qoro_domain::Confidence::High,
+            sequence: agent.belief.sequence.saturating_add(1),
+            visible_blocker,
+        };
+        let before = agent.belief.state;
+        let before_blocker = agent.belief.visible_blocker;
+        let Ok(next) = agent.belief.clone().accept(&observation) else {
+            return Ok(false);
+        };
+        agent.belief = next;
+        let changed =
+            agent.belief.state != before || agent.belief.visible_blocker != before_blocker;
+        drop(terminals);
+        if changed {
+            self.announce(stream);
+        }
+        Ok(changed)
+    }
 }
 
 fn identity_of(pid: Pid, generation: GenerationId) -> AgentIdentity {
-    match qoro_pty::sys::program_of(pid) {
-        None => AgentIdentity::None,
+    // The leader of the foreground group first, since it is the process a person started
+    // and the answer in every ordinary case.
+    let leader = match qoro_pty::sys::program_of(pid) {
+        None => return AgentIdentity::None,
         Some(path) => match boundary_for(&path) {
-            Some(boundary) => AgentIdentity::Unavailable {
-                boundary,
-                generation,
-            },
+            Some(boundary) => {
+                return AgentIdentity::Unavailable {
+                    boundary,
+                    generation,
+                };
+            }
             None => {
                 // The name a person would say, not the executable that happens to be
                 // running it. An agent installed as a node package runs as `node
                 // /path/cli.js`, and an index that says `node` has told nobody anything.
                 // `qoro_domain::program` decides; the argv is only fetched here.
                 let argv = qoro_pty::sys::argv_of(pid);
-                AgentIdentity::Known {
-                    program: qoro_domain::program::identify(&path, &argv).name,
-                    generation,
-                }
+                qoro_domain::program::identify(&path, &argv)
             }
         },
+    };
+    // An agent started through a wrapper is not the leader: the wrapper is. Both are in the
+    // foreground group, because starting one job puts the whole job in one group, so the
+    // agent is in there somewhere. Measured on a real machine: opencode launched through a
+    // shell script that tunnels it read as `opencode-vpn`, which is not an agent by any
+    // table, and the agents panel left the terminal out of the list entirely.
+    //
+    // Only a known agent is promoted. Everything else the group happens to contain, the
+    // `rg` an agent is running this second included, is not an answer to "what is in this
+    // terminal", and a rule that took the deepest child would report exactly that.
+    if !leader.agent {
+        let members = qoro_pty::sys::group_members(qoro_pty::Pgid(pid.0));
+        if let Some(found) = members
+            .into_iter()
+            .filter(|member| member.0 != pid.0)
+            .filter_map(|member| {
+                let path = qoro_pty::sys::program_of(member)?;
+                if boundary_for(&path).is_some() {
+                    return None;
+                }
+                let argv = qoro_pty::sys::argv_of(member);
+                let program = qoro_domain::program::identify(&path, &argv);
+                program.agent.then_some(program)
+            })
+            .next()
+        {
+            return AgentIdentity::Known {
+                program: found.name,
+                generation,
+            };
+        }
+    }
+    AgentIdentity::Known {
+        program: leader.name,
+        generation,
     }
 }
 
@@ -436,5 +626,247 @@ mod tests {
             a, b,
             "a token that is the same for two terminals proves nothing"
         );
+    }
+
+    fn screen_verdict(state: AgentRuntimeState, visible_blocker: bool) -> qoro_detect::Verdict {
+        qoro_detect::Verdict {
+            state,
+            rule: "test".into(),
+            visible_blocker,
+            visible_idle: false,
+            visible_working: false,
+        }
+    }
+
+    /// B3: a hook beats a screen reading from the same generation.
+    #[test]
+    fn a_hook_report_overrules_a_screen_reading_from_the_same_generation() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, false)));
+        let changed = r
+            .observe_hook(
+                1,
+                &TerminalId::new("1"),
+                &token,
+                AgentRuntimeState::Idle,
+                false,
+            )
+            .expect("an admitted report applies");
+        assert!(changed);
+        let after = r.agent(1).expect("agent");
+        assert_eq!(after.belief.state, AgentRuntimeState::Idle);
+        assert_eq!(after.belief.source, ObservationSource::Hook);
+    }
+
+    /// B3 + B1: the wire clock is advisory only. A hook carrying huge nanos gets
+    /// a small counter sequence, so a later screen blocker still outranks it
+    /// through the visible-blocker override instead of drowning under it.
+    #[test]
+    fn a_hook_with_a_huge_wire_clock_still_gets_a_small_counter_sequence() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        // The clock is not even a parameter of `observe_hook`: there is no call
+        // that could copy it. What matters is the assigned sequence.
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Working,
+            false,
+        )
+        .expect("applies");
+        let held = r.agent(1).expect("agent");
+        assert_eq!(held.belief.sequence, 1, "a counter, never a wall clock");
+        // A newer screen reading that positively sees a blocker must win, which
+        // is exactly what a leaked wall clock would break: no later screen
+        // sequence could ever exceed nanos.
+        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Blocked, true)));
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Blocked
+        );
+    }
+
+    /// B3: a claim sampled under an older generation is refused after the
+    /// foreground process moved on.
+    #[test]
+    fn a_claim_from_before_a_leader_change_is_refused() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let first = r.agent(1).expect("agent").capability.generation;
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me)).expect("a change");
+        assert_eq!(
+            r.admit(1, &TerminalId::new("1"), Some(&token), first),
+            Err(ClaimRefusal::StaleGeneration)
+        );
+    }
+
+    /// B3 end to end: a hook event goes through `admit()` into a state change,
+    /// and a forged token never becomes an observation.
+    #[test]
+    fn a_hook_event_drives_a_state_change_through_admit_and_a_forgery_does_not() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let generation = r.agent(1).expect("agent").capability.generation;
+        r.admit(1, &TerminalId::new("1"), Some(&token), generation)
+            .expect("the real token is admitted");
+        let changed = r
+            .observe_hook(
+                1,
+                &TerminalId::new("1"),
+                &token,
+                AgentRuntimeState::Blocked,
+                true,
+            )
+            .expect("applies");
+        assert!(changed);
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Blocked
+        );
+
+        let forged = CapabilityToken::new("forged");
+        assert_eq!(
+            r.observe_hook(
+                1,
+                &TerminalId::new("1"),
+                &forged,
+                AgentRuntimeState::Idle,
+                false
+            ),
+            Err(ClaimRefusal::WrongTerminal)
+        );
+        assert_eq!(
+            r.observe_hook(
+                9,
+                &TerminalId::new("9"),
+                &token,
+                AgentRuntimeState::Idle,
+                false
+            ),
+            Err(ClaimRefusal::WrongTerminal)
+        );
+        // The forgery changed nothing.
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Blocked
+        );
+    }
+
+    /// D1: a held blocker survives re-announces unchanged, and each tick emits
+    /// so a panel that missed one refresh still converges.
+    #[test]
+    fn a_blocker_held_across_reannounce_ticks_stays_blocked() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Blocked,
+            true,
+        )
+        .expect("applies");
+        let mut rx = r.subscribe();
+        // The observe above announced; drain it so the count below is ticks only.
+        let _ = rx.try_recv();
+
+        let before = r.agent(1).expect("agent").belief.clone();
+        assert!(before.visible_blocker);
+        for _ in 0..3 {
+            r.reannounce(1);
+            assert_eq!(
+                r.agent(1).expect("agent").belief,
+                before,
+                "a repeat is not news"
+            );
+            rx.try_recv().expect("each tick re-announces");
+        }
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Blocked
+        );
+    }
+
+    /// D2: a soak of identical evaluations publishes nothing, while a newly
+    /// appearing blocker publishes once.
+    #[test]
+    fn a_no_change_soak_publishes_nothing_and_a_new_blocker_publishes_once() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let mut rx = r.subscribe();
+        let _ = rx.try_recv(); // the registration announcement
+
+        let working = screen_verdict(AgentRuntimeState::Working, false);
+        assert!(r.observe_screen(1, &working));
+        rx.try_recv().expect("the change announces");
+        for _ in 0..10 {
+            assert!(!r.observe_screen(1, &working), "no change, no publish");
+        }
+        assert!(rx.try_recv().is_err(), "the soak must not publish anything");
+
+        // Same state, newly visible blocker: observable, so published once.
+        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, true)));
+        rx.try_recv().expect("the new blocker announces");
+        assert!(!r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, true)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// D3: a Hook-held blocker plus exit settles to Idle through the
+    /// acceptance rule. The regression this guards: a bare screen Idle offered
+    /// to the Hook belief would be `Outranked` and the dead terminal would
+    /// stick on `blocked`.
+    #[test]
+    fn a_hook_held_blocker_plus_exit_settles_to_idle() {
+        use qoro_domain::{ObservationSource, ObservationVerdict};
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Blocked,
+            true,
+        )
+        .expect("applies");
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Blocked
+        );
+
+        // A bare screen Idle against that belief is outranked: the composition
+        // below must not be built that way.
+        let stale_screen = qoro_domain::AgentObservation {
+            agent_id: qoro_domain::AgentId::new("1"),
+            terminal_id: TerminalId::new("1"),
+            sampled_generation: r.agent(1).expect("agent").belief.generation,
+            state: AgentRuntimeState::Idle,
+            source: ObservationSource::ScreenHeuristic,
+            confidence: qoro_domain::Confidence::Medium,
+            sequence: 99,
+            visible_blocker: false,
+        };
+        assert_eq!(
+            r.agent(1).expect("agent").belief.evaluate(&stale_screen),
+            ObservationVerdict::Outranked
+        );
+
+        {
+            let mut terminals = r.terminals.lock().unwrap();
+            let agent = terminals.get_mut(&1).expect("agent");
+            settle_exit(agent, 1);
+        }
+        let after = r.agent(1).expect("agent");
+        assert_eq!(after.belief.state, AgentRuntimeState::Idle);
+        assert!(!after.belief.visible_blocker);
     }
 }

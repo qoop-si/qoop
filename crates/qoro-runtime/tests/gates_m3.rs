@@ -115,9 +115,13 @@ async fn a_terminals_child_is_launched_with_that_terminals_token() {
     );
 
     // And a second terminal gets a different one, or the token proves nothing.
+    let terminals = d.terminals_arc();
+    let stream = terminals.mint();
     let other = qoro_runtime::daemon::open_terminal(
-        d.terminals_arc(),
+        terminals,
+        stream,
         1,
+        None,
         std::path::Path::new("/bin/sh"),
         None,
         d.warnings_arc(),
@@ -125,6 +129,7 @@ async fn a_terminals_child_is_launched_with_that_terminals_token() {
         d.scanner_arc(),
         d.agents_arc(),
         d.events(),
+        None,
     )
     .expect("a second terminal");
     assert_ne!(

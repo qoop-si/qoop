@@ -285,6 +285,178 @@ pub fn program_of(pid: Pid) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+/// The directory a process is in now.
+///
+/// Where a tab actually is, which is not where it was started: a person opens a tab, cds
+/// into a worktree and starts an agent there, and a restore that used the directory the
+/// tab was born in would put that agent back in the wrong project and carry on the wrong
+/// conversation.
+#[cfg(target_os = "macos")]
+pub fn cwd_of(pid: Pid) -> Option<std::path::PathBuf> {
+    // `proc_pidinfo` with `PROC_PIDVNODEPATHINFO` fills a struct whose first member is the
+    // current directory, path included. It refuses a process we do not own, which is the
+    // same answer as not knowing.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: info is a live, correctly sized buffer for PROC_PIDVNODEPATHINFO.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid.0,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n < size {
+        return None;
+    }
+    // The path is declared as chunks of an array rather than one, so it is flattened back
+    // into the string of bytes it is, and read to the first nul.
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf8(bytes).ok()?))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn cwd_of(pid: Pid) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{}/cwd", pid.0)).ok()
+}
+
+/// Every process in one process group.
+///
+/// The leader is not always the interesting one. A person who starts an agent through a
+/// wrapper puts the wrapper at the head of the group and the agent under it, both in the
+/// same foreground group, and asking only the leader answers `opencode-vpn` for a terminal
+/// that is running opencode. Measured on a real machine: the tab said so and the agents
+/// panel left the row out entirely, because the wrapper is not a name in the agent table.
+///
+/// The group and not the process tree: a group is what the kernel already calls "the job in
+/// the foreground", and walking children instead would also collect the `rg` an agent
+/// happens to be running this second.
+#[cfg(target_os = "macos")]
+pub fn group_members(pgid: Pgid) -> Vec<Pid> {
+    // `proc_listpids` with `PROC_PGRP_ONLY` answers exactly this question and answers it as
+    // a plain array of pids, so nothing here has to know the shape of a kernel struct.
+    // From `libproc.h`: 1 all, 2 process group, 3 tty, 4 uid, 5 ruid, 6 parent.
+    const PROC_PGRP_ONLY: u32 = 2;
+    // SAFETY: a null buffer asks for the size the answer needs.
+    let bytes =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid.0 as u32, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    let count = bytes as usize / std::mem::size_of::<i32>();
+    // Room for a process that started between the two calls, which is a race the kernel
+    // does not protect against and which would otherwise truncate the answer.
+    let mut pids = vec![0i32; count + 8];
+    // SAFETY: the same call with a buffer of the size it asked for, plus slack. The return
+    // is how many bytes were written, and nothing past that is read.
+    let written = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            pgid.0 as u32,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if written <= 0 {
+        return Vec::new();
+    }
+    pids.truncate(written as usize / std::mem::size_of::<i32>());
+    pids.into_iter().filter(|p| *p > 0).map(Pid).collect()
+}
+
+/// Every process in one process group, read from `/proc`.
+#[cfg(not(target_os = "macos"))]
+pub fn group_members(pgid: Pgid) -> Vec<Pid> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pgrp` is the fifth field, and the second can contain spaces and brackets, so the
+        // scan starts after the last close bracket.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        if rest
+            .split_whitespace()
+            .nth(2)
+            .and_then(|f| f.parse::<i32>().ok())
+            == Some(pgid.0)
+        {
+            out.push(Pid(pid));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    /// A job is a process group: the shell that leads it and everything it started. Asking
+    /// only the leader is how an agent behind a wrapper became invisible.
+    #[test]
+    fn a_group_holds_the_leader_and_what_it_started() {
+        // Its own group, the way a shell puts a job in one. Without this the child inherits
+        // the test runner's group and there is no group with its pid to ask about.
+        let mut child = unsafe {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 5 & wait")
+                .stdout(std::process::Stdio::null())
+                // SAFETY: post fork, async signal safe, no allocation.
+                .pre_exec(|| {
+                    if libc::setpgid(0, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn a little job")
+        };
+        let leader = child.id() as i32;
+        // The shell has to reach its `sleep` before the group has two members in it.
+        let mut members = Vec::new();
+        for _ in 0..50 {
+            members = group_members(Pgid(leader));
+            if members.len() > 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            members.iter().any(|p| p.0 == leader),
+            "the leader is not in its own group: {members:?}"
+        );
+        assert!(
+            members.len() > 1,
+            "the group holds only its leader, so nothing started under it was seen: \
+             {members:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod argv_tests {
     use super::*;
@@ -869,5 +1041,51 @@ mod real_agents {
             }
         }
         eprintln!("agents identified on this machine: {seen:?}");
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    /// The directory a process is in, read for a process whose directory we know.
+    #[test]
+    fn a_process_reports_the_directory_it_is_actually_in() {
+        let dir = std::env::temp_dir();
+        // A child that changes directory and then waits, so there is something to read.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cd / && exec sleep 5")
+            .spawn()
+            .expect("a child");
+        // Given a moment to reach the `exec`, which is when its directory is `/`.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let read = cwd_of(Pid(child.id() as i32));
+        let _ = child.kill();
+        let _ = child.wait();
+        let read = read.expect("a directory for a live child we started");
+        assert_eq!(
+            read,
+            std::path::Path::new("/"),
+            "the directory read is not the one the child moved to"
+        );
+        assert_ne!(
+            read, dir,
+            "reading the caller's own directory instead of the child's would pass every \
+             test that never moved"
+        );
+    }
+
+    #[test]
+    fn a_process_that_is_gone_has_no_directory() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("a child");
+        let pid = Pid(child.id() as i32);
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(cwd_of(pid), None);
     }
 }

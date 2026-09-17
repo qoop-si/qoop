@@ -62,6 +62,13 @@ pub struct Snapshot {
     ///
     /// Empty when a row is entirely unstyled, which is the common case and costs nothing.
     pub styles: Vec<Vec<Span>>,
+    /// What the program in this terminal has asked its terminal to be.
+    ///
+    /// Part of the snapshot rather than a separate question, because a client acts on it at
+    /// the same moment it draws: whether a wheel is the program's to handle or the
+    /// interface's depends on whether the program asked for the mouse, and asking in a
+    /// second round trip is asking about a screen that has already changed.
+    pub modes: TerminalModes,
 }
 
 /// A run of columns that share one style.
@@ -133,6 +140,18 @@ pub trait TerminalEngine: Send {
     /// them the wrong end: a screen taller than the trim put the agent's question above the
     /// slice and the rules matched nothing at all.
     fn visible_text(&self) -> Vec<String>;
+    /// The latest OSC 0/2 window title the child set, or empty.
+    ///
+    /// Retained for agent detection, which reads titles the child never draws as
+    /// text (a spinner in the title bar, a confirmation notice). Defaulted so an
+    /// engine that never sees OSC keeps the seam: detection reads an empty title
+    /// and behaves exactly as before.
+    fn title(&self) -> &str {
+        ""
+    }
+    /// Forget the retained title: the foreground process changed, and the title
+    /// described a process that is no longer there.
+    fn clear_title(&mut self) {}
     fn modes(&self) -> TerminalModes;
     /// Lines that have scrolled out of the visible region since the last call, oldest
     /// first, for the disk spill.

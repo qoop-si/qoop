@@ -513,6 +513,7 @@ mod tests {
 
     fn snap(lines: &[&str]) -> SnapshotWire {
         SnapshotWire {
+            modes: Default::default(),
             cols: 20,
             rows: lines.len(),
             cursor: (1, 3),

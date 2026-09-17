@@ -73,19 +73,72 @@ fn strip_escapes(text: &str) -> String {
 }
 
 /// The screen row the spaces panel's title is drawn on. Taken from the interface rather
-/// than written as `2`, so this test cannot disagree with the layout the next time the
-/// layout changes.
-const SPACES_TITLE_ROW: usize = qoro_tui::screen::TABS + 1;
+/// than written as `1`, so this test cannot disagree with the layout the next time the
+/// layout changes. The tab bar is over the pane, not over this column, so the column
+/// starts at the very top.
+const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP;
 
 /// The screen row the first space is drawn on, directly under that title.
 const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 
-/// The first line of the first agent.
+/// The first line of the first agent, on a window this size with one space in the daemon.
 ///
-/// The spaces panel takes its title and one row per space, and a fresh daemon holds one
-/// space, so the agents title is two rows down and the first agent is one row after that.
-/// A test that starts a second space works this out for itself rather than using this.
-const FIRST_AGENT_ROW: usize = FIRST_SPACE_ROW + 2;
+/// The spaces panel holds a section of its own rather than hugging its content, so the
+/// rows under the spaces are blank and the agents panel starts below them. Worked out from
+/// the panel's own arithmetic rather than counted off a screenshot, so it follows the
+/// layout instead of pinning it.
+/// Every row of the agents panel, from its first line down to the bottom of the column.
+///
+/// Read off the screen rather than worked out from the layout. The column divides at a
+/// share of its height that yields to whatever the lower panel needs, so where the panel
+/// starts depends on the window and on what is running in it: a row number computed in a
+/// test would be a second copy of that arithmetic, and a wrong one the first time either
+/// changed. It also has to be read again on every poll, because the division moves as
+/// agents arrive.
+fn agents_panel(painted: &str) -> Vec<String> {
+    let first = first_agent_row_of(painted);
+    // The column stops where the status rows start. Reading into them picked up the notice,
+    // which names the focused terminal, so a search for an agent's name found it there and
+    // said the panel had it.
+    (first..=(ROWS as usize).saturating_sub(qoro_tui::screen::STATUS))
+        .map(|row| {
+            let at = format!("\x1b[{row};1H");
+            painted
+                .rfind(&at)
+                .map(|start| {
+                    strip_escapes(&painted[start + at.len()..])
+                        .chars()
+                        .take(index_width())
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The screen row the agents panel's first line is drawn on.
+///
+/// Found on the screen rather than worked out from the layout. The column divides at a
+/// share of its height that yields to whatever the lower panel needs, so where the agents
+/// panel starts depends on the window and on what is running in it: a number computed here
+/// would be a second copy of that arithmetic, and a wrong one the first time either
+/// changed.
+fn first_agent_row_of(painted: &str) -> usize {
+    for row in SPACES_TITLE_ROW..=ROWS as usize {
+        let at = format!("\x1b[{row};1H");
+        let Some(start) = painted.rfind(&at) else {
+            continue;
+        };
+        let line: String = strip_escapes(&painted[start + at.len()..])
+            .chars()
+            .take(index_width())
+            .collect();
+        if line.trim_end().starts_with(" agents") {
+            return row + 1;
+        }
+    }
+    panic!("the agents panel is not on screen:\n{painted}")
+}
 
 /// The interface's own idea of how wide the left column is, so this test cannot drift from
 /// it.
@@ -95,23 +148,48 @@ fn index_width() -> usize {
 
 impl Interface {
     fn start() -> Self {
+        Self::start_impl(false)
+    }
+
+    /// A daemon launched the way production launches one: backgrounded, with
+    /// SIGINT and SIGQUIT ignored. G12.16 needs that condition to exist, and
+    /// building it here rather than assuming it is what makes the gate about
+    /// the daemon instead of about the machine running the test.
+    fn start_backgrounded() -> Self {
+        Self::start_impl(true)
+    }
+
+    fn start_impl(backgrounded: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(
             dir.path(),
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .expect("chmod");
-        let daemon = Command::new(env!("CARGO_BIN_EXE_qoro"))
+        let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
+        daemon_cmd
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(dir.path().join("daemon.log")).expect("log"),
-            ))
-            .spawn()
-            .expect("spawn the daemon");
-        let socket = dir.path().join("qorod.sock");
+            ));
+        if backgrounded {
+            // SAFETY: `pre_exec` runs post fork with async-signal-safe calls and no
+            // allocation, and `signal` only sets a disposition. A shell backgrounds
+            // a daemon this way with `&`.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                daemon_cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let daemon = daemon_cmd.spawn().expect("spawn the daemon");
+        let socket = qoro_testkit::socket_in(dir.path());
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline && !socket.exists() {
             std::thread::sleep(Duration::from_millis(50));
@@ -266,14 +344,34 @@ impl Interface {
         )
     }
 
-    /// The tab bar, as painted most recently.
-    fn tab_bar(&self) -> Option<String> {
-        let at = format!("\x1b[{};1H", qoro_tui::screen::TABS);
+    /// One whole screen row, as painted most recently.
+    fn row(&self, row: usize) -> Option<String> {
+        let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
         Some(
             strip_escapes(&self.painted[start..])
                 .chars()
                 .take(COLS as usize)
+                .collect(),
+        )
+    }
+
+    /// The tab bar, as painted most recently.
+    fn tab_bar(&self) -> Option<String> {
+        // The bar starts where the pane starts, past the column and its rule.
+        let at = format!(
+            "\x1b[{};{}H",
+            qoro_tui::screen::TABS,
+            qoro_tui::screen::left(COLS) + 1
+        );
+        let start = self.painted.rfind(&at)? + at.len();
+        // Only the bar's own columns. It stops where the pane stops, and reading past it
+        // picks up the row the cursor moved to next.
+        let (pane_cols, _) = qoro_tui::screen::pane_size(COLS, ROWS);
+        Some(
+            strip_escapes(&self.painted[start..])
+                .chars()
+                .take(pane_cols as usize)
                 .collect(),
         )
     }
@@ -321,7 +419,9 @@ impl Interface {
         let at = bar
             .find(&format!("[{terminal} "))
             .or_else(|| bar.find(&format!(" {terminal} ")))?;
-        Some(at as u16 + 2)
+        // The bar is read from its own left edge and a click is sent in screen columns, so
+        // the column the pane starts at has to be added back.
+        Some(at as u16 + 2 + qoro_tui::screen::left(COLS) as u16)
     }
 
     /// One row of the left column exactly as it was written, escapes and all.
@@ -330,16 +430,46 @@ impl Interface {
     /// this row's colour: searching the whole painted stream for a yellow also finds a
     /// yellow the child process printed into the pane, which is a gate that passes when the
     /// wrong row is coloured or when nothing in the interface is.
+    ///
+    /// The keyboard's own rows lead with reverse video before their colour, so every
+    /// leading sequence is consumed rather than just the first.
     fn raw_panel_line(&self, row: usize) -> Option<&str> {
         let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
         let rest = &self.painted[start..];
-        Some(match rest.find("\x1b[") {
-            // Up to the next escape, unless that escape is this row's own colour.
-            Some(0) => &rest[..rest[2..].find("\x1b[").map(|n| n + 2).unwrap_or(rest.len())],
-            Some(n) => &rest[..n],
-            None => rest,
-        })
+        if !rest.starts_with("\x1b[") {
+            return Some(match rest.find("\x1b[") {
+                Some(n) => &rest[..n],
+                None => rest,
+            });
+        }
+        let mut at = 0;
+        while rest[at..].starts_with("\x1b[") {
+            at += rest[at..]
+                .find('m')
+                .map(|n| at + n + 1)
+                .unwrap_or(rest.len());
+        }
+        let end = rest[at..]
+            .find("\x1b[")
+            .map(|n| at + n)
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    /// Read until some row of the agents panel says what is wanted.
+    ///
+    /// Across the whole panel and re-read on every poll, because where it starts and which
+    /// row an agent lands on both move as agents arrive.
+    fn wait_for_agents(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if agents_panel(&self.painted).iter().any(|row| want(row)) {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
     }
 
     /// Read until the nth space, counted down the spaces panel from one, is the focused one.
@@ -402,6 +532,45 @@ impl Interface {
         self.type_in(format!("\x1b[<0;{col};{row}m").as_bytes());
     }
 
+    /// Make a terminal the way a person does: ask for one, then answer the naming box.
+    ///
+    /// An empty answer is a real one, and it means the default name.
+    fn create_terminal(&mut self, name: &str) {
+        let mark = self.painted.len();
+        self.command(b'c');
+        self.answer_prompt(mark, name);
+    }
+
+    /// Make a space the same way.
+    fn create_space(&mut self, name: &str) {
+        let mark = self.painted.len();
+        self.command(b'w');
+        self.answer_prompt(mark, name);
+    }
+
+    /// Type a name into the box that opened after `mark`, and confirm it.
+    ///
+    /// After `mark` and not merely somewhere on screen. The box is painted into the stream
+    /// like everything else, so a box from the previous press is still in it, and a frame
+    /// painted before this press is still the last one until the test reads again: waiting
+    /// on either answered "was a box ever open" and typed the name into a shell.
+    fn answer_prompt(&mut self, mark: usize, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !self.painted[mark..].contains("esc to stop") {
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(80));
+        }
+        assert!(
+            self.painted[mark..].contains("esc to stop"),
+            "the naming box never opened:\n{}",
+            &self.painted[mark..]
+        );
+        if !name.is_empty() {
+            self.type_in(name.as_bytes());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        self.type_in(b"\r");
+    }
+
     /// The prefix key, then a command key. Two writes, because that is how a keyboard
     /// sends them and the decoder is resumable for exactly this reason.
     fn command(&mut self, key: u8) {
@@ -411,15 +580,30 @@ impl Interface {
     }
 }
 
-/// G12.1: the interface opens, and the spaces, the agents, the tabs, the terminal and the
-/// keys are all on screen.
+/// G12.1: the interface opens, and the spaces, the agents, the tabs, the terminal, the
+/// notice and the keys are all on screen.
 #[test]
 fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() {
     let mut ui = Interface::start();
     assert!(
         ui.wait_for("d detach", Duration::from_secs(20)).is_some(),
-        "the status line never appeared:\n{}",
+        "the key list never appeared:\n{}",
         ui.painted
+    );
+    // Two rows at the bottom, not one. The keys are a reference and never change; the row
+    // above them is the news. One row carrying both meant the keys vanished exactly when
+    // something went wrong, which is when a person most needs to be told which key to
+    // press.
+    let keys = ui
+        .row(ROWS as usize)
+        .unwrap_or_else(|| panic!("no key row:\n{}", ui.painted));
+    assert!(keys.contains("ctrl-a:"), "{keys:?}");
+    let notice = ui
+        .row(ROWS as usize - 1)
+        .unwrap_or_else(|| panic!("no notice row:\n{}", ui.painted));
+    assert!(
+        !notice.trim().is_empty() && !notice.contains("ctrl-a:"),
+        "the notice row is empty or is the key list again: {notice:?}"
     );
     // Both panels of the left column, each with its own title, and the daemon's own space
     // named under the first of them. Waited for rather than checked: the first frame is
@@ -442,11 +626,11 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         Some(" spaces".to_string())
     );
     assert_eq!(
-        ui.panel_line(FIRST_AGENT_ROW - 1)
+        ui.panel_line(first_agent_row_of(&ui.painted) - 1)
             .map(|l| l.trim_end().to_string()),
         Some(" agents".to_string()),
         "the agents panel has no title: {:?}",
-        ui.panel_line(FIRST_AGENT_ROW - 1)
+        ui.panel_line(first_agent_row_of(&ui.painted) - 1)
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
     // answers "who needs me", and a shell is only ever the first of those, so the panel is
@@ -459,23 +643,36 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     );
     let bar = ui.tab_bar().unwrap_or_default();
     assert!(bar.contains('+'), "the tab bar has no new tab: {bar:?}");
-    let program: String = bar[bar.find("[1 ").map(|at| at + 3).unwrap_or_default()..]
-        .chars()
-        .take_while(|c| *c != ']')
-        .collect();
-    assert!(
-        program
+    // The bracket lands before the daemon has named the foreground program, so the
+    // name is waited for rather than read off the first frame that carries a tab:
+    // asserting on whatever happened to be buffered is how a test reports a race
+    // as a failure, and a loaded machine lands that frame with an empty name.
+    let named = |bar: &str| {
+        let label: String = bar[bar.find("[1 ").map(|at| at + 3).unwrap_or_default()..]
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-            && !program.is_empty(),
-        "the tab names no program: {bar:?}"
+            .take_while(|c| *c != ']')
+            .collect();
+        // The label carries the state dot after the program (`bash o`), so the
+        // name is the first word of it.
+        let program = label.split_whitespace().next().unwrap_or("");
+        !program.is_empty()
+            && program
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    assert!(
+        ui.wait_for_tabs(named, Duration::from_secs(15)),
+        "the tab names no program: {:?}",
+        ui.tab_bar()
     );
+    // The panel says it is empty rather than leaving a void under its own title, and a
+    // plain shell is not what fills it.
     assert_eq!(
-        ui.panel_line(FIRST_AGENT_ROW)
+        ui.panel_line(first_agent_row_of(&ui.painted))
             .map(|l| l.trim_end().to_string()),
-        Some(String::new()),
+        Some(" no agents yet".to_string()),
         "a plain shell is listed as an agent: {:?}",
-        ui.panel_line(FIRST_AGENT_ROW)
+        ui.panel_line(first_agent_row_of(&ui.painted))
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
     ui.type_in(b"echo INTERFACE_$((6*7))\n");
@@ -501,7 +698,7 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
             .is_some()
     );
 
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(
         ui.wait_for_tab(2, Duration::from_secs(15)),
         "creating a terminal did not put a focused tab on the bar ({:?}), daemon said: {}",
@@ -628,7 +825,10 @@ fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
     ui.painted.clear();
     ui.command(b'd');
     let ended = Instant::now();
-    while ended.elapsed() < Duration::from_secs(10) {
+    // The same patience as every other wait in this file. Ten seconds is enough on an idle
+    // machine and was measured failing on a loaded one, which is a flaky gate rather than
+    // a finding: what is being asserted is that it exits, not how fast.
+    while ended.elapsed() < Duration::from_secs(20) {
         if ui.child.try_wait().ok().flatten().is_some() {
             break;
         }
@@ -676,27 +876,22 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
 
     ui.type_in(format!("{}\n", agent.display()).as_bytes());
 
-    // The name a person would say, not the interpreter that is running it.
+    // The name a person would say, not the interpreter that is running it. The
+    // detail line sits one row lower than it used to: the open group carries its
+    // own header now, so the title, the header, the head and then this line.
     assert!(
-        ui.wait_for_panel(
-            FIRST_AGENT_ROW + 1,
-            |line| line.contains("claude"),
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(15)),
         "the agents panel does not name the agent: {:?}",
-        ui.panel_line(FIRST_AGENT_ROW + 1)
+        agents_panel(&ui.painted)
     );
-    // What it is doing, read off its own screen.
+    // What it is doing, read off its own screen, on the same row that names it.
     assert!(
-        ui.wait_for_panel(
-            FIRST_AGENT_ROW + 1,
-            |line| line.contains("blocked"),
+        ui.wait_for_agents(
+            |line| line.contains("claude") && line.contains("blocked"),
             Duration::from_secs(15)
-        )
-        .is_some(),
+        ),
         "the agents panel does not say the agent is blocked: {:?}",
-        ui.panel_line(FIRST_AGENT_ROW + 1)
+        agents_panel(&ui.painted)
     );
     // And the tab is named after it too, so a person can find it without reading the panel.
     assert!(
@@ -711,12 +906,23 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     );
     // Coloured, because a column of identical grey rows is a column nobody scans. This
     // row's own bytes: the pane beside it carries whatever the child printed, yellow
-    // included, so a search of the whole screen answers a different question.
+    // included, so a search of the whole screen answers a different question. Taken from
+    // the theme rather than spelled out, so this gate cannot drift from it, and both forms
+    // are allowed because the row may also have the keyboard.
+    let blocked = [
+        qoro_tui::theme::fg(qoro_tui::theme::Role::Blocked),
+        qoro_tui::theme::selected_in(qoro_tui::theme::Role::Blocked),
+    ];
+    let detail = first_agent_row_of(&ui.painted)
+        + agents_panel(&ui.painted)
+            .iter()
+            .position(|line| line.contains("claude") && line.contains("blocked"))
+            .unwrap_or_else(|| panic!("no blocked row: {:?}", agents_panel(&ui.painted)));
     assert!(
-        ui.raw_panel_line(FIRST_AGENT_ROW + 1)
-            .is_some_and(|line| line.starts_with("\x1b[33m")),
-        "the blocked row is not coloured: {:?}",
-        ui.raw_panel_line(FIRST_AGENT_ROW + 1)
+        ui.raw_panel_line(detail)
+            .is_some_and(|line| blocked.iter().any(|ink| line.contains(ink.as_str()))),
+        "the blocked row is not painted as blocked: {:?}",
+        ui.raw_panel_line(detail)
     );
 }
 
@@ -729,7 +935,7 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
 fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(
         ui.wait_for_tab(2, Duration::from_secs(15)),
         "the second terminal never appeared: {:?}",
@@ -784,6 +990,34 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
         !ui.saw(&format!("[<0;{col}")),
         "part of a mouse report reached the terminal"
     );
+
+    // The `+` at the end of the bar is a way to make a terminal without knowing
+    // a key binding, not decoration: a click on it starts one in this space.
+    let bar = ui
+        .tab_bar()
+        .unwrap_or_else(|| panic!("no tab bar: {:?}", ui.tab_bar()));
+    let plus = bar
+        .find('+')
+        .unwrap_or_else(|| panic!("no new tab button: {bar:?}"));
+    // Read off the bar's own left edge, clicked in screen columns.
+    let mark = ui.painted.len();
+    ui.click(
+        plus as u16 + 1 + qoro_tui::screen::left(COLS) as u16,
+        qoro_tui::screen::TABS as u16,
+    );
+    // It asks what to call it rather than making one unasked, so the tab a person gets is
+    // one they can find again by name.
+    ui.answer_prompt(mark, "release");
+    assert!(
+        ui.wait_for_tab(3, Duration::from_secs(15)),
+        "a click on + did not start a terminal: {:?}",
+        ui.tab_bar()
+    );
+    assert!(
+        ui.tab_bar().is_some_and(|bar| bar.contains("release")),
+        "the tab is not called what it was named: {:?}",
+        ui.tab_bar()
+    );
 }
 
 /// G12.9: a space is a place, and both the keyboard and the pointer get to it.
@@ -803,7 +1037,7 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
 
     // A new space, which starts with a terminal in it: a space with nothing in it shows an
     // empty pane and a bar with only a `+` on it, and nobody wants to land there.
-    ui.command(b'w');
+    ui.create_space("");
     assert!(
         ui.wait_for_panel(
             FIRST_SPACE_ROW + 1,
@@ -921,24 +1155,25 @@ fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
     );
 
     ui.type_in(format!("{}\n", wrapper.display()).as_bytes());
+    // Unobserved agents draw bare, with no group header: this one is unknown, so
+    // its detail sits directly under the title as before.
     assert!(
-        ui.wait_for_panel(
-            FIRST_AGENT_ROW + 1,
+        ui.wait_for_agents(
             |line| line.contains("behind docker"),
             Duration::from_secs(15)
-        )
-        .is_some(),
+        ),
         "the panel does not carry the terminal behind the wrapper: {:?}\n{}",
-        ui.panel_line(FIRST_AGENT_ROW + 1),
+        agents_panel(&ui.painted),
         ui.painted
     );
     // The wrapper's own name is never printed where a program's name goes: a person shown
     // `docker` there would conclude their agent is called docker.
     assert!(
-        !ui.panel_line(FIRST_AGENT_ROW + 1)
-            .is_some_and(|line| line.trim_start().starts_with("docker")),
+        !agents_panel(&ui.painted)
+            .iter()
+            .any(|line| line.trim_start().starts_with("docker")),
         "the wrapper is named as the program: {:?}",
-        ui.panel_line(FIRST_AGENT_ROW + 1)
+        agents_panel(&ui.painted)
     );
 }
 
@@ -960,7 +1195,7 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
 
     // A second space with a terminal in it, then close that terminal, which is the only way
     // to reach a space that is empty and stays empty.
-    ui.command(b'w');
+    ui.create_space("");
     // On the second space, and not merely on a bar whose first tab is focused: every space
     // has a tab one, so waiting for that alone is satisfied before the space even exists.
     assert!(
@@ -1021,7 +1256,7 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     );
 
     // And the way out is still there: a terminal started here belongs to this space.
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(
         ui.wait_for_tabs(|bar| bar.contains('['), Duration::from_secs(15)),
         "ctrl-a c in an empty space did not start a terminal: {:?}",
@@ -1053,10 +1288,11 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
-    // One write, so both requests leave the client together and the daemon's two answers
-    // arrive in the same read. That is the case the client used to drop half of: the
-    // answers are folded one at a time and acted on once, after the whole read is drained.
-    ui.type_in(b"\x01w\x01w");
+    // Two, asked for back to back with no wait between them and both left unnamed, so both
+    // fall back to the counted default before either answer has arrived. That is the case
+    // the counter exists for: without it both came out as `space 2`.
+    ui.create_space("");
+    ui.create_space("");
 
     assert!(
         ui.wait_for_panel(
@@ -1065,8 +1301,12 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
             Duration::from_secs(15)
         )
         .is_some(),
-        "the second space never appeared: {:?}, daemon said: {}",
+        "the second space never appeared: {:?} {:?} {:?}, boxes: {}, confirms: {}, daemon said: {}",
+        ui.panel_line(FIRST_SPACE_ROW),
+        ui.panel_line(FIRST_SPACE_ROW + 1),
         ui.panel_line(FIRST_SPACE_ROW + 2),
+        ui.painted.matches("name the new space").count(),
+        ui.painted.matches("starting a space").count(),
         ui.daemon_log()
     );
 
@@ -1110,7 +1350,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     )
     .expect("chmod");
 
-    ui.command(b'w');
+    ui.create_space("");
     assert!(
         ui.wait_for_space(2, Duration::from_secs(15)),
         "the second space never came up: {}",
@@ -1119,14 +1359,21 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
     ui.type_in(format!("{}\n", agent.display()).as_bytes());
     assert!(
-        ui.wait_for_panel(
-            FIRST_AGENT_ROW + 2,
-            |line| line.contains("claude"),
-            Duration::from_secs(20)
-        )
-        .is_some(),
+        ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(20)),
         "the agent is not on the panel: {:?}\n{}",
-        ui.panel_line(FIRST_AGENT_ROW + 2),
+        agents_panel(&ui.painted),
+        ui.painted
+    );
+    // Wait for detection to settle: a fresh agent reports unknown, then idle
+    // while its generation is new, and only then the blocked its screen shows.
+    // The panel folds idle groups, so clicking before this lands on a fold line.
+    assert!(
+        ui.wait_for_agents(
+            |line| line.contains("claude") && line.contains("blocked"),
+            Duration::from_secs(20)
+        ),
+        "the agent never showed as blocked: {:?}\n{}",
+        agents_panel(&ui.painted),
         ui.painted
     );
 
@@ -1138,14 +1385,14 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
         "ctrl-a s did not go back: {:?}",
         ui.panel_line(FIRST_SPACE_ROW)
     );
-    // The agent's own first line, found by the detail line under it, which is the one that
-    // names the program.
-    let row = (FIRST_AGENT_ROW..FIRST_AGENT_ROW + 6)
-        .find(|row| {
-            ui.panel_line(row + 1)
-                .is_some_and(|line| line.contains("claude"))
-        })
+    // The agent's own row, which is the one that names the program: an agent takes one row
+    // now, since the space it lives in is a colour rather than a second line of words.
+    let panel = agents_panel(&ui.painted);
+    let at = panel
+        .iter()
+        .position(|line| line.contains("claude"))
         .unwrap_or_else(|| panic!("the agent has no row: {}", ui.painted));
+    let row = first_agent_row_of(&ui.painted) + at;
 
     ui.click(5, row as u16);
     assert!(
@@ -1179,16 +1426,16 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
 
     // A space of its own with three terminals in it, so that a client counting the daemon's
     // whole list lands somewhere visibly different from one counting this bar.
-    ui.command(b'w');
+    ui.create_space("");
     assert!(
         ui.wait_for_space(2, Duration::from_secs(15)),
         "the second space never came up: {}",
         ui.daemon_log()
     );
     assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(ui.wait_for_tab(3, Duration::from_secs(15)));
     // Three tabs here, and a fourth terminal on the daemon that belongs to another space.
     ui.type_in(b"echo THE_THIRD_TAB\n");
@@ -1246,7 +1493,7 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
 fn g12_15_a_shell_that_exits_takes_its_tab_and_hands_the_keyboard_on() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    ui.command(b'c');
+    ui.create_terminal("");
     assert!(
         ui.wait_for_tab(2, Duration::from_secs(15)),
         "the second terminal never appeared: {:?}",
@@ -1293,5 +1540,100 @@ fn g12_15_a_shell_that_exits_takes_its_tab_and_hands_the_keyboard_on() {
     assert!(
         ui.saw("\x1b[?1049l"),
         "the interface did not leave the alternate screen"
+    );
+}
+
+/// G12.16: ctrl-c interrupts a foreground process even when the daemon was
+/// started backgrounded.
+///
+/// A daemon launched with `&` (and by launchd and systemd) carries SIGINT and
+/// SIGQUIT as ignored, `exec` preserves an ignored disposition, and an
+/// interactive shell does not heal those two. Without the daemon resetting
+/// them for its children, every terminal ignores ctrl-c while ctrl-z keeps
+/// working, which reads as a broken key rather than an inherited disposition.
+/// The harness builds that condition on purpose: a daemon spawned with
+/// default dispositions would pass this gate with the fix deleted.
+#[test]
+fn g12_16_ctrl_c_interrupts_a_foreground_process_for_a_backgrounded_daemon() {
+    let mut ui = Interface::start_backgrounded();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    // The marker is computed by the shell, so the typed echo cannot match it: waiting
+    // for the echoed command line would pass without anything being interrupted.
+    ui.type_in(b"sleep 30; echo CTRL_C_WOKE_$((40 + 2))\n");
+    assert!(
+        ui.wait_for_tabs(|bar| bar.contains("sleep"), Duration::from_secs(15)),
+        "sleep never came to the foreground: {:?}",
+        ui.tab_bar()
+    );
+    ui.type_in(&[0x03]);
+    assert!(
+        ui.wait_for("CTRL_C_WOKE_42", Duration::from_secs(15))
+            .is_some(),
+        "ctrl-c did not interrupt the foreground sleep:\n{}",
+        ui.painted
+    );
+}
+
+/// G12.16: an agent started through a wrapper is still an agent.
+///
+/// Measured on a real machine: opencode launched through a shell script that tunnels it
+/// read as `opencode-vpn`, which is not a name in the agent table, so the tab said so and
+/// the agents panel left the terminal out of the list entirely. The wrapper leads the
+/// foreground process group and the agent runs under it, both in that one group, because
+/// starting one job puts the whole job in one group.
+///
+/// The stand in is a script that runs a compiled `codex` and waits for it, so the leader is
+/// the script and the agent is a member of its group: the exact shape that was invisible.
+#[test]
+fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    let dir = ui._dir.path().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let source = dir.join("codex.rs");
+    std::fs::write(
+        &source,
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
+    )
+    .expect("write");
+    let built = Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("codex"))
+        .output()
+        .expect("run rustc");
+    assert!(
+        built.status.success(),
+        "the stand in did not build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let wrapper = dir.join("codex-vpn");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\n{} &\nwait\n", dir.join("codex").display()),
+    )
+    .expect("write");
+    std::fs::set_permissions(
+        &wrapper,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+
+    ui.type_in(format!("{}\n", wrapper.display()).as_bytes());
+    assert!(
+        ui.wait_for_agents(|line| line.contains("codex"), Duration::from_secs(20)),
+        "the agent behind the wrapper is not on the panel: {:?}\n{}",
+        agents_panel(&ui.painted),
+        ui.painted
+    );
+    // And it is the agent's name, not the wrapper's: a person shown `codex-vpn` would go
+    // looking for a program by that name.
+    assert!(
+        !agents_panel(&ui.painted)
+            .iter()
+            .any(|line| line.contains("codex-vpn")),
+        "the wrapper is named as the agent: {:?}",
+        agents_panel(&ui.painted)
     );
 }

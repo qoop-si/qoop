@@ -93,7 +93,7 @@ fn start_daemon_with(trace: bool) -> Daemon {
         command.stderr(std::process::Stdio::null());
     }
     let child = command.spawn().expect("spawn");
-    let socket = dir.path().join("qorod.sock");
+    let socket = qoro_testkit::socket_in(dir.path());
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && !socket.exists() {
         std::thread::sleep(Duration::from_millis(50));
@@ -176,6 +176,7 @@ async fn fill(socket: &std::path::Path, count: usize) -> (TestClient, Vec<u32>) 
                     id: format!("t{i}"),
                     cwd: None,
                     workspace: None,
+                    name: None,
                 },
                 Duration::from_secs(20),
             )

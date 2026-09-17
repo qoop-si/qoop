@@ -25,15 +25,17 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qoro"))
-        .arg("daemon")
-        .env("QORO_RUNTIME_DIR", dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn the daemon");
+    let mut daemon = Reaped(
+        Command::new(env!("CARGO_BIN_EXE_qoro"))
+            .arg("daemon")
+            .env("QORO_RUNTIME_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the daemon"),
+    );
 
-    let socket = dir.path().join("qorod.sock");
+    let socket = qoro_testkit::socket_in(dir.path());
     assert!(
         wait_for(Duration::from_secs(10), || socket.exists()),
         "the daemon never bound its socket"
@@ -42,7 +44,7 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
     // shell a moment to be exec'd before asking the OS about its tty.
     std::thread::sleep(Duration::from_millis(500));
 
-    let pid = daemon.id();
+    let pid = daemon.0.id();
     let (masters, listing) = pty_masters(pid);
     assert_eq!(
         masters, 1,
@@ -82,8 +84,22 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
         "the child inherited the pty master:\n{child_listing}"
     );
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    let _ = daemon.0.kill();
+    let _ = daemon.0.wait();
+}
+
+/// Kills what it holds however the test ends.
+///
+/// Without it a failing assertion leaves the daemon running in a temporary directory that
+/// is deleted a moment later, so it holds a shell forever and nothing can reach it to stop
+/// it. The suite is run on a laptop.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// How many pty masters a process holds, read from the operating system.

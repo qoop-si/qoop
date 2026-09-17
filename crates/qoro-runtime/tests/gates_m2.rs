@@ -29,6 +29,7 @@ async fn two_terminals_are_two_shells_addressed_separately() {
                 id: "r1".into(),
                 cwd: None,
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )
@@ -70,6 +71,7 @@ async fn g2_5_closing_a_terminal_does_not_disturb_the_others() {
                 id: "r1".into(),
                 cwd: None,
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )
@@ -124,6 +126,7 @@ async fn a_command_for_a_closed_terminal_never_reaches_another_one() {
                 id: "r1".into(),
                 cwd: None,
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )
@@ -177,6 +180,7 @@ async fn listing_terminals_reports_the_registry() {
             id: "r1".into(),
             cwd: None,
             workspace: None,
+            name: None,
         },
         PATIENCE,
     )
@@ -246,6 +250,7 @@ async fn a_created_terminal_starts_where_the_client_asked() {
                 id: "r1".into(),
                 cwd: Some(asked.to_string_lossy().into_owned()),
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )
@@ -288,6 +293,7 @@ async fn a_working_directory_that_cannot_be_used_is_refused_in_words() {
                     id: id.into(),
                     cwd: Some(cwd.into()),
                     workspace: None,
+                    name: None,
                 },
                 PATIENCE,
             )
@@ -342,6 +348,7 @@ async fn terminal_metadata_survives_a_restart() {
                     id: "r1".into(),
                     cwd: Some(asked.to_string_lossy().into_owned()),
                     workspace: None,
+                    name: None,
                 },
                 PATIENCE,
             )
@@ -758,6 +765,7 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
                 id: "while-hung".into(),
                 cwd: None,
                 workspace: None,
+                name: None,
             },
             PATIENCE,
         )
@@ -834,6 +842,7 @@ async fn g2_13_a_hundred_terminals_quiesce_within_the_stated_bound() {
                     id: format!("t{i}"),
                     cwd: None,
                     workspace: None,
+                    name: None,
                 },
                 Duration::from_secs(30),
             )
@@ -965,6 +974,7 @@ async fn g2_16_a_terminal_belongs_to_the_workspace_it_was_made_in() {
                 id: "t1".into(),
                 cwd: None,
                 workspace: Some(made),
+                name: None,
             },
             PATIENCE,
         )
@@ -1019,4 +1029,73 @@ async fn g2_16_a_terminal_belongs_to_the_workspace_it_was_made_in() {
         Some(made),
         "the index puts the terminal in the wrong workspace: {agents:?}"
     );
+}
+
+/// G2.17: a screen that never stops changing is still read.
+///
+/// The settle that makes a burst one evaluation works because bursts end. An agent holding
+/// the turn is the case where they do not: it animates a timer, and every frame pushed the
+/// deadline out, so the screen was never read at all. Measured against a real codex, the
+/// panel said `idle` for the whole of a thirty second turn whose own screen said
+/// `Working (29s, esc to interrupt)` in as many words, which is the busiest state being the
+/// one state that could never be detected.
+///
+/// A stand in named after a real agent, because the rules that read a working screen are
+/// that agent's, and compiled rather than a shell script so the daemon reads its name off
+/// the process rather than the interpreter's.
+#[tokio::test]
+async fn g2_17_a_screen_that_never_settles_is_read_anyway() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("codex.rs");
+    std::fs::write(
+        &source,
+        "fn main() {\n\
+         \x20   for n in 0.. {\n\
+         \x20       println!(\"\\u{2022} Working ({n}s \\u{b7} esc to interrupt)\");\n\
+         \x20       std::thread::sleep(std::time::Duration::from_millis(50));\n\
+         \x20   }\n\
+         }\n",
+    )
+    .expect("write");
+    let built = std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.path().join("codex"))
+        .output()
+        .expect("run rustc");
+    assert!(
+        built.status.success(),
+        "the stand in did not build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("noisy").await;
+    let terminal = d.terminals().streams()[0];
+    c.input_to(
+        terminal,
+        format!("{}\n", dir.path().join("codex").display()).as_bytes(),
+    )
+    .await;
+
+    // Its screen never goes quiet: a frame every fifty milliseconds, under the eighty the
+    // settle waits for. The state has to arrive anyway.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut seen = None;
+    while Instant::now() < deadline {
+        if let Some(agent) = d.agent(terminal)
+            && agent.belief.state == qoro_domain::AgentRuntimeState::Working
+        {
+            seen = Some(agent.belief.state);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        seen,
+        Some(qoro_domain::AgentRuntimeState::Working),
+        "a screen that never stops printing `Working` was never read: {:?}",
+        d.agent(terminal).map(|a| a.belief.state)
+    );
+    c.input_to(terminal, &[0x03]).await;
 }

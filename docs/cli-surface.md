@@ -25,9 +25,27 @@ a claim nobody has to keep.
 | `qoro setup show <file>` | what a Setup will run, its content hash and its reproducibility level | no |
 | `qoro setup trust <file>` | confirm a Setup on this machine | no |
 | `qoro setup check <file>` | whether a Setup may run here | no |
+| `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
+| `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
+| `qoro read <terminal>` | print another terminal's current screen | no |
+| `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked | no |
+| `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
+| `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
+| `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
 | `qoro --version` | the version | no |
+
+## Options
+
+| Option | What it does |
+|---|---|
+| `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once, and the flag wins over it. Saying nothing is the `default` session. |
+
+The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
+`qoro send --session work 2 "x"` are the same thing. It is put into the environment of
+everything the session starts, which is what lets a shell inside a session say `qoro send`
+and reach its own daemon rather than the default one.
 
 Every row says no, and that is the design rather than a coincidence: there is no control
 plane in the product, and if one is ever added it is an addition to this table with a yes,

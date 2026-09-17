@@ -60,7 +60,7 @@ impl DaemonProcess {
         let dir = tempfile::tempdir()?;
         // `tempdir` creates 0755; the daemon refuses anything group or other accessible.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
-        let socket = dir.path().join("qorod.sock");
+        let socket = qoro_testkit::socket_in(dir.path());
         let child = Command::new(bin)
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())

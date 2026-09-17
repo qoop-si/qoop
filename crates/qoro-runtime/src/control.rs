@@ -25,6 +25,39 @@ pub enum ControlRequest {
         /// what a client that does not know about workspaces means.
         #[serde(default)]
         workspace: Option<i64>,
+        /// What a person called it, when they were asked.
+        ///
+        /// `None` means nobody chose one and the tab is named after whatever is running in
+        /// it, which is the right answer for a terminal somebody opened in a hurry. A name
+        /// outlives the program, so a tab called `release` stays `release` while it runs a
+        /// shell, then cargo, then an agent.
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Give a terminal a different name, or take its name away.
+    ///
+    /// A name and not a rename of the program: what is being changed is what a person
+    /// calls this terminal, which is the thing that outlives whatever is running in it.
+    RenameTerminal {
+        id: String,
+        terminal: TerminalStream,
+        /// `None` gives the terminal back to its program's name.
+        name: Option<String>,
+    },
+    /// Give a workspace a different name.
+    /// End this daemon, and with it every terminal it owns.
+    ///
+    /// A request rather than a signal, so the daemon tears its terminals down the way
+    /// ADR-014 says to rather than leaving whatever a `SIGKILL` leaves, and so the caller
+    /// is told it was heard. What is durable survives: the next start of this session
+    /// brings back the same spaces and tabs.
+    Shutdown {
+        id: String,
+    },
+    RenameWorkspace {
+        id: String,
+        workspace: i64,
+        name: String,
     },
     /// End a terminal and everything it contains, per ADR-014.
     CloseTerminal {
@@ -77,12 +110,46 @@ pub enum ControlRequest {
         terminal: TerminalStream,
         to: String,
     },
+    /// A hook or plugin inside the terminal reports the agent's state.
+    ///
+    /// An arrival, like output: frequent, not journalled, and never replayed. The
+    /// daemon admits it through the same token and generation check as any other
+    /// claim, then assigns its own sequence number. `clock` is the hook's wall
+    /// time, advisory only: it is never copied into the observation's sequence,
+    /// because a wall clock is not a counter and would let one source's numbers
+    /// dwarf every other source's forever.
+    ReportAgentState {
+        id: String,
+        terminal: TerminalStream,
+        token: String,
+        /// `starting`, `idle`, `working`, `blocked`, `done`, `failed`, `unknown`.
+        state: String,
+        #[serde(default)]
+        visible_blocker: bool,
+        #[serde(default)]
+        visible_idle: bool,
+        #[serde(default)]
+        visible_working: bool,
+        /// Wall-clock nanos from the hook. Advisory only, see above.
+        #[serde(default)]
+        clock: u64,
+    },
+    /// Re-read user agent-detection overrides from the config directory.
+    ///
+    /// Answered live from the files on disk, never journalled: replaying an
+    /// old answer would lie about what the files say now.
+    ReloadAgentManifests {
+        id: String,
+    },
 }
 
 impl ControlRequest {
     pub fn request_id(&self) -> &str {
         match self {
             Self::CreateTerminal { id, .. }
+            | Self::RenameTerminal { id, .. }
+            | Self::RenameWorkspace { id, .. }
+            | Self::Shutdown { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -91,6 +158,8 @@ impl ControlRequest {
             | Self::Subscribe { id, .. }
             | Self::Unsubscribe { id, .. }
             | Self::RequestOwnership { id, .. }
+            | Self::ReportAgentState { id, .. }
+            | Self::ReloadAgentManifests { id }
             | Self::GrantOwnership { id, .. } => id,
         }
     }
@@ -123,6 +192,15 @@ pub enum ControlResponse {
         id: String,
         workspace: i64,
     },
+    /// A terminal or a workspace now carries a different name.
+    /// The daemon heard, and is going. The count is what it is ending.
+    Stopping {
+        id: String,
+        terminals: usize,
+    },
+    Renamed {
+        id: String,
+    },
     Subscribed {
         id: String,
         terminals: Vec<TerminalStream>,
@@ -137,6 +215,20 @@ pub enum ControlResponse {
         id: String,
         terminal: TerminalStream,
         to: String,
+    },
+    /// A hook report was admitted and applied (or admitted and outranked: either
+    /// way the daemon heard it and the answer is not a retryable failure).
+    AgentStateReported {
+        id: String,
+        terminal: TerminalStream,
+    },
+    /// The override reload ran. `loaded` names manifest ids now serving
+    /// override rules; `errors` names `file: reason` pairs that kept the
+    /// previous rules. A missing override directory is an empty success.
+    ManifestsReloaded {
+        id: String,
+        loaded: Vec<String>,
+        errors: Vec<String>,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -172,6 +264,11 @@ pub struct AgentRow {
     /// space `0`. A missing field is a daemon that does not speak this protocol, which is
     /// worth failing on rather than drawing.
     pub workspace: i64,
+    /// What a person called this terminal, when they were asked. Shown in place of the
+    /// program on the tab, because a name somebody chose says more than the name of
+    /// whatever happens to be running right now.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The foreground program, when it can be read.
     pub program: Option<String>,
     /// What stands in the way, when it cannot. Never the wrapper's name as the program:
@@ -202,12 +299,35 @@ impl ControlResponse {
             | Self::Agents { id, .. }
             | Self::Workspaces { id, .. }
             | Self::WorkspaceCreated { id, .. }
+            | Self::Renamed { id, .. }
+            | Self::Stopping { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
+            | Self::AgentStateReported { id, .. }
+            | Self::ManifestsReloaded { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }
+}
+
+/// The state a hook may report, as the daemon reads it.
+///
+/// The same seven a manifest rule may declare. `uncertain` is deliberately
+/// absent: it is a conclusion the precedence layer draws when two sources
+/// disagree, and a single report cannot disagree with itself.
+pub fn parse_reported_state(name: &str) -> Option<qoro_domain::AgentRuntimeState> {
+    use qoro_domain::AgentRuntimeState as S;
+    Some(match name {
+        "starting" => S::Starting,
+        "idle" => S::Idle,
+        "working" => S::Working,
+        "blocked" => S::Blocked,
+        "done" => S::Done,
+        "failed" => S::Failed,
+        "unknown" => S::Unknown,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -220,6 +340,7 @@ mod tests {
             id: "r1".into(),
             cwd: None,
             workspace: None,
+            name: None,
         };
         let response = ControlResponse::TerminalCreated {
             id: request.request_id().to_string(),
@@ -235,6 +356,7 @@ mod tests {
                 id: "a".into(),
                 cwd: Some("/tmp".into()),
                 workspace: Some(2),
+                name: None,
             },
             ControlRequest::CloseTerminal {
                 id: "b".into(),
@@ -244,11 +366,63 @@ mod tests {
                 id: "c".into(),
                 terminals: vec![1, 2, 3],
             },
+            ControlRequest::ReportAgentState {
+                id: "d".into(),
+                terminal: 3,
+                token: "qoro-3-abc".into(),
+                state: "working".into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: true,
+                clock: 1758000000000000000,
+            },
+            ControlRequest::ReloadAgentManifests { id: "e".into() },
         ] {
             let encoded = serde_json::to_vec(&request).expect("encode");
             let decoded: ControlRequest = serde_json::from_slice(&encoded).expect("decode");
             assert_eq!(request, decoded);
         }
+    }
+
+    #[test]
+    fn a_hook_report_carries_its_id_and_an_old_client_omits_the_new_fields() {
+        // New fields are defaulted, so a hook built against an older schema still
+        // parses: it just claims no visible flags and no clock.
+        let minimal =
+            br#"{"op":"ReportAgentState","id":"x","terminal":1,"token":"t","state":"idle"}"#;
+        let request: ControlRequest = serde_json::from_slice(minimal).expect("decode");
+        assert_eq!(
+            request,
+            ControlRequest::ReportAgentState {
+                id: "x".into(),
+                terminal: 1,
+                token: "t".into(),
+                state: "idle".into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                clock: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_seven_reportable_states_parse_and_uncertain_does_not() {
+        use qoro_domain::AgentRuntimeState as S;
+        for (name, state) in [
+            ("starting", S::Starting),
+            ("idle", S::Idle),
+            ("working", S::Working),
+            ("blocked", S::Blocked),
+            ("done", S::Done),
+            ("failed", S::Failed),
+            ("unknown", S::Unknown),
+        ] {
+            assert_eq!(parse_reported_state(name), Some(state), "{name}");
+        }
+        assert_eq!(parse_reported_state("uncertain"), None);
+        assert_eq!(parse_reported_state("busy"), None);
+        assert_eq!(parse_reported_state(""), None);
     }
 
     #[test]
@@ -272,4 +446,33 @@ pub enum EventMessage {
     /// of truth that can arrive out of order with the first. This says where to look, and
     /// `ListAgents` says what is there.
     AgentChanged { terminal: TerminalStream },
+}
+
+#[cfg(test)]
+mod version_message_tests {
+    /// An old daemon says so, rather than reporting a serde error at a person.
+    ///
+    /// Measured against the real thing: a daemon two days old answered a rename with
+    /// `unknown variant RenameWorkspace, expected one of ...`, which reads as a broken
+    /// client. The situation is ordinary, because a daemon keeps running across an
+    /// upgrade, and the fix is one command.
+    #[test]
+    fn a_daemon_older_than_its_client_says_which_one_is_old() {
+        let said = crate::daemon::unparsable(
+            "unknown variant `RenameWorkspace`, expected one of `CreateTerminal`, `Subscribe`",
+        );
+        assert!(said.contains("older"), "{said}");
+        assert!(
+            said.contains("stop the session"),
+            "the fix has to be in the message: {said}"
+        );
+        assert!(
+            said.contains("comes back"),
+            "and it has to say the work is not lost, or nobody will run it: {said}"
+        );
+        // Anything else is still reported as what it is.
+        let other = crate::daemon::unparsable("expected value at line 1 column 1");
+        assert!(other.contains("malformed"), "{other}");
+        assert!(!other.contains("older"), "{other}");
+    }
 }

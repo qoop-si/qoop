@@ -46,6 +46,15 @@ pub fn leaked_pids() -> Vec<i32> {
 }
 
 /// A daemon with its own private runtime directory.
+/// Where a daemon started with `QORO_RUNTIME_DIR = dir` puts its socket.
+///
+/// One place, because six tests had written the join themselves and all six broke the day
+/// a session became a directory of its own. A test that builds a product path by hand is
+/// a test that stops testing the product.
+pub fn socket_in(dir: &Path) -> std::path::PathBuf {
+    paths::socket_path(&paths::session_dir(dir, paths::DEFAULT_SESSION))
+}
+
 pub struct TestDaemon {
     dir: tempfile::TempDir,
     socket: PathBuf,

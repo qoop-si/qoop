@@ -55,6 +55,14 @@ pub enum ClientCommand {
     /// End this terminal. The terminal runs its own teardown, because containment is the
     /// terminal's property and nobody else holds the set.
     Close,
+    /// Publish the current screen, for a subscriber that arrived after the output.
+    ///
+    /// Output is published only while somebody watches (the idle-cost rule), so a
+    /// terminal that worked with no subscribers holds a stale published screen.
+    /// A new subscription asks for the live one rather than showing the stale one
+    /// until the next output happens to arrive. Internal only: it carries no bytes
+    /// for the child and takes none, so it is not a write path.
+    Refresh,
     /// The owner has agreed to hand the geometry to this client. The only path that moves
     /// ownership other than the owner's connection ending (ADR-007).
     GrantOwnership {
@@ -272,6 +280,12 @@ pub struct TerminalHandle {
     /// store on every index, because an index is drawn far more often than a terminal is
     /// created.
     pub workspace: i64,
+    /// What a person called this terminal, when they were asked.
+    ///
+    /// Held here and not in the store, because a terminal is a pty this daemon owns: when
+    /// the daemon goes, so does the terminal, and a name that outlived its terminal would
+    /// be a row in a table nothing can ever point at again.
+    pub name: Option<String>,
     pub id: TerminalId,
     /// The token this terminal's child was launched with. Held so that a later observation
     /// can be checked against it without asking the child.
@@ -299,6 +313,21 @@ impl TerminalRegistry {
         self.inner.lock().unwrap().get(&stream).map(|h| h.workspace)
     }
 
+    pub fn name_of(&self, stream: u32) -> Option<String> {
+        self.inner.lock().unwrap().get(&stream)?.name.clone()
+    }
+
+    /// Give a terminal a different name. False when there is no such terminal.
+    fn rename(&self, stream: u32, name: Option<String>) -> bool {
+        match self.inner.lock().unwrap().get_mut(&stream) {
+            Some(handle) => {
+                handle.name = name;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn streams(&self) -> Vec<u32> {
         self.inner.lock().unwrap().keys().copied().collect()
     }
@@ -314,8 +343,19 @@ impl TerminalRegistry {
     /// Mint the next stream number. Monotonic and never reused within a run, so a client
     /// holding a stale id addresses nothing rather than addressing somebody else's
     /// terminal.
-    fn mint(&self) -> u32 {
+    /// The next terminal id. Minted by the caller rather than inside `open_terminal`,
+    /// because the durable row is written under this number before the pty exists: one
+    /// number for one terminal, in the registry and in the database.
+    pub fn mint(&self) -> u32 {
         self.next.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+
+    /// Carry on minting above the ids a restart brought back.
+    ///
+    /// Without this the first new terminal after a restore takes the number of a terminal
+    /// that is already on screen, and both rows point at one tab.
+    pub fn mint_above(&self, id: u32) {
+        self.next.fetch_max(id as u64, Ordering::Relaxed);
     }
 
     fn insert(&self, stream: u32, handle: TerminalHandle) {
@@ -352,6 +392,8 @@ pub struct Daemon {
     /// switching is a client surface and a later milestone, but the row has to exist from
     /// the first terminal or the metadata has nowhere to hang.
     workspace: i64,
+    /// Set by a shutdown, read by every terminal that ends after one.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Daemon {
@@ -405,17 +447,54 @@ impl Daemon {
         // One pass before the first terminal exists, so a terminal created immediately has
         // a set to absorb rather than an empty map.
         scanner.refresh().await;
-        open_terminal(
-            &terminals,
-            workspace,
-            shell,
-            None,
-            warnings.clone(),
-            Some(dir.join("history")),
-            scanner.clone(),
-            agents.clone(),
-            events.clone(),
-        )?;
+        // What the last daemon was holding when it stopped. A person who closed qoro and
+        // opened it again asked for their work back, not for an empty screen.
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let books = Bookkeeping {
+            store: store.clone(),
+            stopping: stopping.clone(),
+        };
+        let brought_back = restore(&Restore {
+            terminals: terminals.clone(),
+            books: books.clone(),
+            shell: shell.to_path_buf(),
+            warnings: warnings.clone(),
+            history_dir: Some(dir.join("history")),
+            scanner: scanner.clone(),
+            agents: agents.clone(),
+            events: events.clone(),
+        })
+        .await;
+        if brought_back == 0 {
+            // Nothing to bring back, so the one terminal a first start has always had.
+            let stream = terminals.mint();
+            if let Err(e) = store
+                .create_terminal(
+                    stream as i64,
+                    workspace,
+                    here().display().to_string(),
+                    shell.display().to_string(),
+                )
+                .await
+            {
+                return Err(io::Error::other(e));
+            }
+            open_terminal(
+                &terminals,
+                stream,
+                workspace,
+                // The terminal the daemon opens for itself, which nobody was asked about.
+                None,
+                shell,
+                None,
+                warnings.clone(),
+                Some(dir.join("history")),
+                scanner.clone(),
+                agents.clone(),
+                events.clone(),
+                Some(books.clone()),
+            )?;
+        }
 
         Ok(Self {
             listener,
@@ -431,7 +510,18 @@ impl Daemon {
             scanner,
             agents,
             events,
+            stopping,
         })
+    }
+
+    /// The durable metadata, so a gate can read what the daemon wrote rather than guess.
+    pub fn store(&self) -> crate::store::StoreHandle {
+        self.store.clone()
+    }
+
+    /// The workspace new terminals are recorded in.
+    pub fn workspace(&self) -> i64 {
+        self.workspace
     }
 
     /// The terminal registry. Taken before `serve` consumes the daemon.
@@ -594,6 +684,7 @@ impl Daemon {
             let served_shutdown = shutdown.clone();
             let served_outbound = self.outbound.clone();
             let served_store = self.store.clone();
+            let served_stopping = self.stopping.clone();
             let workspace = self.workspace;
             let served_history = self.history_dir.clone();
             let served_scanner = self.scanner.clone();
@@ -614,6 +705,7 @@ impl Daemon {
                         shutdown: served_shutdown,
                         outbound: served_outbound,
                         store: served_store,
+                        stopping: served_stopping,
                         workspace,
                         history_dir: served_history,
                         scanner: served_scanner,
@@ -870,6 +962,8 @@ pub struct ServeContext {
     pub shutdown: Arc<tokio::sync::Notify>,
     pub outbound: Arc<std::sync::atomic::AtomicUsize>,
     pub store: crate::store::StoreHandle,
+    /// Set by a shutdown, read by every terminal that ends after one.
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub workspace: i64,
     pub history_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
@@ -891,6 +985,7 @@ async fn serve_client(
         shutdown,
         outbound,
         store,
+        stopping,
         workspace,
         history_dir,
         scanner,
@@ -1102,6 +1197,7 @@ async fn serve_client(
                                 &shell,
                                 &warnings,
                                 &store,
+                                &stopping,
                                 workspace,
                                 history_dir.clone(),
                                 &client,
@@ -1116,7 +1212,7 @@ async fn serve_client(
                             // empty id is the honest answer, and it is why a client must match
                             // on its own id rather than on arrival order.
                             id: String::new(),
-                            reason: format!("malformed control request: {e}"),
+                            reason: unparsable(&e.to_string()),
                         },
                     };
                     let body = serde_json::to_vec(&response).map_err(to_io)?;
@@ -1201,6 +1297,11 @@ async fn serve_client(
 /// One task per subscription, holding that terminal's `watch::Receiver`. It coalesces on
 /// its own terminal only, so a terminal rendering faster than the client drains loses its
 /// own intermediate frames and nobody else's.
+///
+/// A new subscription also asks the terminal to publish its live screen. Output is
+/// published only while watched, so without this a subscriber that arrives after a quiet
+/// spell of work would sit on the last published screen, which can be the blank one from
+/// terminal birth, until something else happens to print.
 fn subscribe(
     terminals: &Arc<TerminalRegistry>,
     subscriptions: &Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>>,
@@ -1240,6 +1341,11 @@ fn subscribe(
         .lock()
         .unwrap()
         .insert(stream, task.abort_handle());
+    // The borrowed screen above can predate the subscription: anything the terminal
+    // printed while nobody watched was never published. Ask for the live one; the
+    // render lane keeps only the newest per terminal, so this supersedes the stale
+    // borrow rather than doubling the traffic.
+    let _ = handle.commands.try_send(ClientCommand::Refresh);
     true
 }
 
@@ -1276,6 +1382,7 @@ async fn handle_control(
     shell: &Path,
     warnings: &Arc<std::sync::Mutex<Vec<Warning>>>,
     store: &crate::store::StoreHandle,
+    stopping: &Arc<std::sync::atomic::AtomicBool>,
     workspace: i64,
     history_dir: Option<PathBuf>,
     client: &ClientId,
@@ -1299,6 +1406,7 @@ async fn handle_control(
         ControlRequest::CreateTerminal {
             cwd,
             workspace: wanted,
+            name,
             ..
         } => {
             // The workspace the client asked for, or the one the daemon opened. A client
@@ -1330,12 +1438,23 @@ async fn handle_control(
             // Recorded before it is started, and acknowledged only once the row is
             // durable (ADR-005 rule 2). A create acknowledged before the write is a create
             // a client cannot safely retry.
+            // The daemon's own directory when the client named none, spelled out rather
+            // than left as ".": a restart resolves it against wherever the next daemon
+            // happens to start, which is not where this shell was.
             let recorded_cwd = cwd
                 .as_deref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| ".".to_string());
+                .unwrap_or_else(|| here().display().to_string());
+            // Minted before the row is written, because the row is keyed by it. One
+            // number for one terminal, in the registry and in the database.
+            let stream = terminals.mint();
             if let Err(e) = store
-                .create_terminal(workspace, recorded_cwd.clone(), shell.display().to_string())
+                .create_terminal(
+                    stream as i64,
+                    workspace,
+                    recorded_cwd.clone(),
+                    shell.display().to_string(),
+                )
                 .await
             {
                 return ControlResponse::Failed {
@@ -1361,9 +1480,16 @@ async fn handle_control(
                     reason: format!("could not record the intent: {e}"),
                 };
             }
+            if let Some(name) = name.as_deref() {
+                // Written now rather than at the next rename, so a tab named at birth
+                // comes back under its name.
+                let _ = store.set_title(stream as i64, name.to_string()).await;
+            }
             match open_terminal(
                 terminals,
+                stream,
                 workspace,
+                name,
                 shell,
                 cwd.as_deref(),
                 warnings.clone(),
@@ -1371,13 +1497,12 @@ async fn handle_control(
                 scanner.clone(),
                 agents.clone(),
                 events.clone(),
+                Some(Bookkeeping {
+                    store: store.clone(),
+                    stopping: stopping.clone(),
+                }),
             ) {
-                Ok(handle) => {
-                    let stream = handle
-                        .id
-                        .as_str()
-                        .parse()
-                        .expect("the registry mints numeric ids");
+                Ok(_) => {
                     // Subscribed on creation. A client that asked for a terminal wants to
                     // see it, and a separate round trip to say so is a race in which the
                     // first output is lost.
@@ -1456,6 +1581,39 @@ async fn handle_control(
                 reason: format!("no terminal {terminal}"),
             },
         },
+        ControlRequest::Shutdown { .. } => {
+            // Set before anything is closed. Every terminal is about to end, and a
+            // terminal ending after this is the daemon going rather than a person closing
+            // a tab: recorded as closed, none of them would come back.
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            let live = terminals.streams();
+            for stream in &live {
+                if let Some(handle) = terminals.get(*stream) {
+                    // Asked rather than killed, so each terminal runs the teardown that
+                    // contains what it started (ADR-014). `try_send` because a terminal
+                    // whose queue is full is one being pasted into, and waiting on it
+                    // would hold up the shutdown of every other one.
+                    let _ = handle.commands.try_send(ClientCommand::Close);
+                }
+            }
+            let terminals = terminals.clone();
+            let counted = live.len();
+            tokio::spawn(async move {
+                // The answer goes out on the connection this handler returns to, so the
+                // exit waits for the terminals to actually go, and gives up on the ones
+                // that will not. Either way the process ends: a stop that leaves a daemon
+                // running because one shell ignored a hangup is not a stop.
+                let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
+                while tokio::time::Instant::now() < deadline && !terminals.streams().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                std::process::exit(0);
+            });
+            ControlResponse::Stopping {
+                id,
+                terminals: counted,
+            }
+        }
         ControlRequest::ListTerminals { .. } => ControlResponse::Terminals {
             id,
             terminals: terminals.streams(),
@@ -1483,6 +1641,45 @@ async fn handle_control(
                 Err(e) => ControlResponse::Failed {
                     id,
                     reason: format!("the workspaces could not be read: {e}"),
+                },
+            }
+        }
+        ControlRequest::RenameTerminal { terminal, name, .. } => {
+            // A name is trimmed here rather than at the client, because every client would
+            // otherwise have to remember to, and a terminal called `"  "` is a terminal
+            // with a blank tab.
+            let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+            if terminals.rename(terminal, name) {
+                // The index is what draws a name, so a rename that nobody is told about is
+                // a rename nobody sees until the next unrelated change.
+                agents.announce(terminal);
+                ControlResponse::Renamed { id }
+            } else {
+                ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no terminal {terminal}"),
+                }
+            }
+        }
+        ControlRequest::RenameWorkspace {
+            workspace, name, ..
+        } => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "a workspace needs a name".to_string(),
+                };
+            }
+            match store.rename_workspace(workspace, name).await {
+                Ok(0) => ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no workspace {workspace}"),
+                },
+                Ok(_) => ControlResponse::Renamed { id },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the workspace could not be renamed: {e}"),
                 },
             }
         }
@@ -1520,6 +1717,7 @@ async fn handle_control(
                         .to_string();
                     crate::control::AgentRow {
                         terminal,
+                        name: terminals.name_of(terminal),
                         workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
                         // Asked of the same table that resolved the name in the first
                         // place. The wrappers have already been seen through by the time
@@ -1589,6 +1787,72 @@ async fn handle_control(
                 reason: format!("no terminal {terminal}"),
             },
         },
+        ControlRequest::ReportAgentState {
+            terminal,
+            token,
+            state,
+            visible_blocker,
+            ..
+        } => {
+            // An arrival, like output: admitted, applied, and announced when it
+            // changed something, but never journalled. The wire clock is
+            // deliberately not read here at all: it is advisory, and the
+            // sequence the observation carries is assigned inside
+            // `observe_hook` from the daemon's own counter.
+            let Some(reported) = crate::control::parse_reported_state(&state) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("unknown agent state {state:?}"),
+                };
+            };
+            // The terminal id is the stream number as a string: the same binding
+            // `open_terminal` registered the capability under.
+            let terminal_id = TerminalId::new(terminal.to_string());
+            let token = qoro_domain::CapabilityToken::new(token);
+            match agents.observe_hook(terminal, &terminal_id, &token, reported, visible_blocker) {
+                Err(_) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the report for terminal {terminal} was refused"),
+                },
+                Ok(changed) => {
+                    if changed {
+                        let generation = agents
+                            .agent(terminal)
+                            .map(|a| a.belief.generation.0)
+                            .unwrap_or(0);
+                        events.observe(
+                            qoro_events::Stream::Terminal(terminal),
+                            qoro_events::Body::Observation {
+                                terminal,
+                                state: format!("{reported:?}"),
+                                source: "Hook".into(),
+                                confidence: "High".into(),
+                                sampled_generation: generation,
+                                evidence: "hook".into(),
+                                redacted: false,
+                            },
+                        );
+                    }
+                    ControlResponse::AgentStateReported { id, terminal }
+                }
+            }
+        }
+        ControlRequest::ReloadAgentManifests { .. } => {
+            // Answered live from the files, never journalled: a replayed answer
+            // would lie about what the directory says now. Good files replace
+            // their agent's rules; bad files keep the previous ones and are
+            // reported per file, so one typo cannot unload every override.
+            let outcome = qoro_detect::reload_overrides(&override_dir());
+            ControlResponse::ManifestsReloaded {
+                id,
+                loaded: outcome.loaded,
+                errors: outcome
+                    .errors
+                    .into_iter()
+                    .map(|(file, reason)| format!("{file}: {reason}"))
+                    .collect(),
+            }
+        }
         ControlRequest::Unsubscribe {
             terminals: wanted, ..
         } => {
@@ -1669,6 +1933,36 @@ pub struct SnapshotWire {
     /// nothing is styled, which is most of a screen and all of a shell prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub styles: Vec<Vec<SpanWire>>,
+    /// Whether the program in this terminal asked for the mouse, and whether it is on the
+    /// alternate screen.
+    ///
+    /// What a client needs to know to decide whose the wheel is. Defaulted on the wire for
+    /// the same reason the styles are: an older client reading a newer daemon's snapshot
+    /// gets a screen it understands and one fewer thing it can do.
+    #[serde(default)]
+    pub modes: ModesWire,
+}
+
+/// What the program in a terminal has asked its terminal to be, as it crosses the socket.
+///
+/// Two of the four the engine tracks. Bracketed paste and application cursor are the
+/// daemon's business, because it is the daemon that writes to the child; these two are the
+/// client's, because they decide what the client does with a wheel of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModesWire {
+    #[serde(default)]
+    pub alt_screen: bool,
+    #[serde(default)]
+    pub mouse_reporting: bool,
+    /// The program asked for application cursor keys, so an arrow is `SS3 A` and not
+    /// `CSI A`.
+    ///
+    /// Here because a client sends arrows of its own: a wheel over a full screen program
+    /// is turned into cursor keys, and the wrong spelling of one is a key the program does
+    /// not recognise. Measured against a real `less`, which takes `\x1bOB` and ignores
+    /// `\x1b[B` outright.
+    #[serde(default)]
+    pub application_cursor: bool,
 }
 
 /// A run of columns that share a style, as it crosses the socket.
@@ -1723,6 +2017,11 @@ impl From<&Snapshot> for SnapshotWire {
                 .iter()
                 .map(|row| row.iter().map(SpanWire::from).collect())
                 .collect(),
+            modes: ModesWire {
+                alt_screen: s.modes.alt_screen,
+                mouse_reporting: s.modes.mouse_reporting,
+                application_cursor: s.modes.application_cursor,
+            },
         }
     }
 }
@@ -1808,7 +2107,9 @@ fn is_canonical(master: std::os::fd::RawFd) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn open_terminal(
     terminals: &Arc<TerminalRegistry>,
+    stream: u32,
     workspace: i64,
+    name: Option<String>,
     shell: &Path,
     cwd: Option<&Path>,
     warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
@@ -1816,8 +2117,8 @@ pub fn open_terminal(
     scanner: Arc<ContainmentScanner>,
     agents: Arc<crate::agents::AgentRegistry>,
     events: crate::eventlog::EventLog,
+    books: Option<Bookkeeping>,
 ) -> io::Result<TerminalHandle> {
-    let stream = terminals.mint();
     let (commands, from_clients) = mpsc::channel(256);
     let (updates, _) = watch::channel(TerminalUpdate::Full(Snapshot {
         cols: 80,
@@ -1825,11 +2126,13 @@ pub fn open_terminal(
         cursor: (0, 0),
         lines: vec![String::new(); 24],
         styles: Vec::new(),
+        modes: Default::default(),
     }));
     let token = crate::agents::mint_token(stream);
     let terminal_id = TerminalId::new(stream.to_string());
     agents.register(stream, terminal_id.clone(), token.clone());
     let handle = TerminalHandle {
+        name,
         workspace,
         id: terminal_id,
         token: token.clone(),
@@ -1851,6 +2154,7 @@ pub fn open_terminal(
             stream,
             agents,
             events,
+            books: books.clone(),
         },
         from_clients,
         updates,
@@ -1860,10 +2164,180 @@ pub fn open_terminal(
         move || {
             registry.remove(stream);
             forgetting.forget(stream);
+            // A tab whose process ended is a tab the person is done with, so it stops
+            // coming back. A daemon going down is the other case and writes nothing, which
+            // is exactly why the next start finds its terminals still open.
+            if let Some(books) = books
+                && !books.stopping.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::spawn(async move {
+                    let _ = books.store.close_terminal(stream as i64).await;
+                });
+            }
         },
     )?;
     Ok(handle)
 }
+
+/// The agent in a terminal, if what is in it is an agent at all.
+fn agent_program(agents: &Arc<crate::agents::AgentRegistry>, stream: u32) -> Option<String> {
+    match agents.agent(stream)?.identity {
+        qoro_domain::AgentIdentity::Known { program, .. }
+            if qoro_domain::program::identify(&program, &[]).agent =>
+        {
+            Some(program)
+        }
+        _ => None,
+    }
+}
+
+/// Where a terminal starts when nobody said.
+///
+/// The daemon's own directory, resolved now rather than recorded as a dot: a dot is
+/// resolved against whoever reads it, and the next daemon reads it from somewhere else.
+fn here() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// Everything bringing a session back needs.
+/// What a terminal writes down, and whether writing it down still means anything.
+#[derive(Clone)]
+pub struct Bookkeeping {
+    pub store: crate::store::StoreHandle,
+    /// Set when the daemon is on its way out. A terminal that ends after this is not a tab
+    /// a person closed: recording it as closed is exactly what would stop it coming back.
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub struct Restore {
+    pub terminals: Arc<TerminalRegistry>,
+    pub books: Bookkeeping,
+    pub shell: PathBuf,
+    pub warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
+    pub history_dir: Option<PathBuf>,
+    pub scanner: Arc<ContainmentScanner>,
+    pub agents: Arc<crate::agents::AgentRegistry>,
+    pub events: crate::eventlog::EventLog,
+}
+
+/// Bring back the terminals the last daemon was holding, and say how many.
+///
+/// What comes back is the tab: its workspace, its place in the order, the directory it was
+/// in and the name it was given. What does not come back is whatever was running in it.
+/// The saved command line is read and deliberately not run: a tab that was halfway through
+/// a deploy, a migration or an `rm` would run it again on every start, and a person who
+/// typed it once did not ask for that.
+///
+/// The one exception is an agent, and it is an exception because an agent has a
+/// conversation rather than an effect. A tab that had a known agent in it gets that agent's
+/// own resume command typed into its shell, from the agent's manifest, so the conversation
+/// carries on where it stopped. The command is typed rather than execed so the person can
+/// see what ran, and so the tab is still a shell when the agent exits.
+pub async fn restore(into: &Restore) -> usize {
+    let Ok(spaces) = into.books.store.workspaces().await else {
+        return 0;
+    };
+    let mut brought_back = 0;
+    for space in spaces {
+        let Ok(rows) = into.books.store.open_terminals(space.id).await else {
+            continue;
+        };
+        for row in rows {
+            let stream = row.id as u32;
+            // The registry has to keep minting above what came back, or the next new
+            // terminal takes the number of one already on screen.
+            into.terminals.mint_above(stream);
+            let cwd = PathBuf::from(&row.cwd);
+            // A directory that is gone is not a reason to lose the tab. The shell starts
+            // where the daemon is instead, which is visible and recoverable, unlike a tab
+            // that silently did not come back.
+            let cwd = cwd.is_dir().then_some(cwd);
+            let opened = open_terminal(
+                &into.terminals,
+                stream,
+                space.id,
+                row.title.clone(),
+                &into.shell,
+                cwd.as_deref(),
+                into.warnings.clone(),
+                into.history_dir.clone(),
+                into.scanner.clone(),
+                into.agents.clone(),
+                into.events.clone(),
+                Some(into.books.clone()),
+            );
+            let Ok(handle) = opened else {
+                continue;
+            };
+            brought_back += 1;
+            if let Some(argv) = row
+                .agent
+                .as_deref()
+                .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()))
+            {
+                let mut line = shell_line(&argv);
+                line.push('\r');
+                let _ = handle
+                    .commands
+                    .send(ClientCommand::Input {
+                        from: ClientId::new("qoro-restore"),
+                        bytes: Bytes::from(line),
+                    })
+                    .await;
+            }
+        }
+    }
+    brought_back
+}
+
+/// One command line, quoted so a shell runs the argv that was meant.
+///
+/// A resume command carries a session id that came from an agent, and a directory name
+/// that came from a person. Neither is guaranteed to be free of the characters a shell
+/// reads, and this text is typed into a shell.
+fn shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What to say about a control request this daemon could not read.
+///
+/// A serde error is the truth and not the answer. The one that actually happens is a
+/// client newer than the daemon it found, because a daemon keeps running across an
+/// upgrade: the binary on disk changed and the process in memory did not. `unknown variant
+/// RenameWorkspace, expected one of ...` is that situation, and it reads like a bug in the
+/// client rather than like a daemon that has been running since before the feature
+/// existed. So it is named, and the fix is given, because the fix is one command.
+pub(crate) fn unparsable(error: &str) -> String {
+    if error.contains("unknown variant") {
+        return format!(
+            "this daemon is older than the client that called it: it does not know the \
+             method that was asked for ({error}). stop the session and open it again to \
+             pick up the new daemon; what is open comes back."
+        );
+    }
+    format!("malformed control request: {error}")
+}
+
+/// How long a shutdown waits for its terminals to end before going anyway.
+///
+/// Long enough for a shell to run its own exit, short enough that a person who typed
+/// `qoro stop` gets their prompt back. A terminal still there at the end of it loses its
+/// teardown and gets the hangup the closing pty sends, which is what would have happened
+/// anyway had the daemon been killed.
+const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The half of the history path that is allowed to wait on a disk.
 ///
@@ -1976,6 +2450,9 @@ pub struct TerminalSpawn {
     pub stream: u32,
     pub agents: Arc<crate::agents::AgentRegistry>,
     pub events: crate::eventlog::EventLog,
+    /// Where what this terminal is and where it is get recorded, so a restart knows what
+    /// to bring back. Absent for a daemon told not to persist.
+    pub books: Option<Bookkeeping>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1995,8 +2472,12 @@ fn spawn_terminal(
         stream,
         agents,
         events,
+        books,
     } = spawn;
     let register_master = agents.clone();
+    // What the row says this terminal's directory is: the one asked for, or the daemon's
+    // own, which is where a child with no directory of its own starts.
+    let started_in = cwd.clone().unwrap_or_else(here);
     let shell = shell.as_path();
     let cwd = cwd.as_deref();
     let pty = sys::open_pty(80, 24)?;
@@ -2008,6 +2489,11 @@ fn spawn_terminal(
     // SAFETY: the closure runs post-fork and calls only async-signal-safe syscalls, with no
     // allocation. setsid plus TIOCSCTTY is what gives the child its own session with this
     // pty as its controlling terminal, which is the containment identity teardown uses.
+    // The signal reset is the same kind of hygiene: a daemon started in the background
+    // (`&`, launchd, systemd) carries SIGINT and SIGQUIT as ignored, `exec` preserves an
+    // ignored disposition, and an interactive shell does not heal those two. Without the
+    // reset every shell and everything it runs ignores Ctrl-C forever, while Ctrl-Z keeps
+    // working, which reads as a broken key rather than an inherited disposition.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.stdin(dup_stdio(&slave_fd)?)
@@ -2020,6 +2506,9 @@ fn spawn_terminal(
                 if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                // `signal` is async-signal-safe and SIG_DFL is always a valid disposition.
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
                 Ok(())
             });
     }
@@ -2063,6 +2552,8 @@ fn spawn_terminal(
             agents,
             stream,
             events,
+            books,
+            started_in,
         )
         .await
         {
@@ -2237,6 +2728,9 @@ async fn terminal_task(
     agents: Arc<crate::agents::AgentRegistry>,
     stream: u32,
     events: crate::eventlog::EventLog,
+    books: Option<Bookkeeping>,
+    // Where this terminal was started, which is what its row already says.
+    started_in: PathBuf,
 ) -> io::Result<()> {
     let master_raw = master.as_raw_fd();
     let child_pid = child.id() as i32;
@@ -2252,9 +2746,24 @@ async fn terminal_task(
     let mut containment = Containment::new();
     containment.absorb(qoro_pty::sys::enumerate_tty(tty_dev));
     let mut last_scan = std::time::Instant::now();
+    // The agent last written down for this terminal, so a person switching between a
+    // shell and an agent does not write a row on every switch back.
+    let mut last_agent: Option<String> = None;
+    // And the directory last written down, for the same reason. Seeded with the one this
+    // terminal was started in, because that is already in the row: without it the first
+    // read writes the same value back and a daemon that has done nothing has still
+    // written to its database.
+    let mut last_cwd: Option<PathBuf> = Some(started_in);
     // When to read the screen for what the agent is doing. `None` while nothing has
     // happened, which is what keeps an idle terminal at no wakeups at all.
     let mut detect_at: Option<tokio::time::Instant> = None;
+    // When the run of output that `detect_at` is waiting out began, so that waiting it out
+    // can be given a ceiling.
+    let mut detect_since: Option<tokio::time::Instant> = None;
+    // When to re-announce a held blocker so a panel that missed one refresh
+    // still converges. `None` unless a blocker holds, for the same reason:
+    // the tick is recovery, not polling.
+    let mut blocker_at: Option<tokio::time::Instant> = None;
     let mut pending_input: Option<std::time::Instant> = None;
     // How far this terminal's history has reached, so the log can say where to read from.
     let mut history_to = 0u64;
@@ -2312,7 +2821,29 @@ async fn terminal_task(
                         // a signal to the child from here: the child is contained by the
                         // teardown that follows, and signalling twice from two places is how a
                         // containment set stops being the only path.
-                        ClientCommand::Close => break,
+                        ClientCommand::Close => {
+                            // Where this tab is, read while its shell is still alive,
+                            // which is the last moment it can be read at all. This is the
+                            // path a stop takes, and a stop is exactly when the directory
+                            // has to be right: the next start opens the tab here.
+                            if let Some(books) = books.clone()
+                                && let Some(now) =
+                                    qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
+                                && last_cwd.as_deref() != Some(now.as_path())
+                            {
+                                let _ = books
+                                    .store
+                                    .set_cwd(stream as i64, now.display().to_string())
+                                    .await;
+                            }
+                            break;
+                        }
+                        // A new subscriber wants the live screen, not the last published
+                        // one. Published unconditionally: the subscriber is watching by
+                        // definition, so the idle-cost rule is not what this bypasses.
+                        ClientCommand::Refresh => {
+                            let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                        }
                     ClientCommand::GrantOwnership { from, to } => {
                         // Only the owner can give it away, and it is checked here rather
                         // than at the control channel, because this is the one place that
@@ -2353,10 +2884,42 @@ async fn terminal_task(
                             // ask on every read. A change of foreground process is a new
                             // generation, and everything believed about the old one is
                             // cleared: a pid is not an identity.
-                            agents.note_foreground(
-                                stream,
-                                qoro_pty::sys::foreground_leader(master_raw),
-                            );
+                            if agents
+                                .note_foreground(
+                                    stream,
+                                    qoro_pty::sys::foreground_leader(master_raw),
+                                )
+                                .is_some()
+                            {
+                                // Who is in this terminal now, written down, because a
+                                // restart has no other way to know whose conversation to
+                                // carry on. An agent that is no longer there is written
+                                // down too, as nothing: a person who quit their agent quit
+                                // it, and bringing it back would undo that.
+                                //
+                                // A shell running `ls` is not an agent and does not clear
+                                // one either, because `ls` is the foreground process of a
+                                // tab whose agent is still sitting behind it. Only the
+                                // shell itself coming back to the foreground means the
+                                // agent has gone.
+                                let now = agent_program(&agents, stream);
+                                if let Some(books) = books.clone()
+                                    && now != last_agent
+                                {
+                                    last_agent = now.clone();
+                                    tokio::spawn(async move {
+                                        let _ = books.store.set_agent(stream as i64, now, None).await;
+                                    });
+                                }
+                                // The retained OSC title described the old process.
+                                // Same-pid `exec` also mints a generation (via the
+                                // process watcher) without touching the leader, so a
+                                // title can briefly outlive that narrower change; it
+                                // is replaced as soon as the new program sets its own,
+                                // and no bundled rule matches a foreign program's
+                                // title text.
+                                engine.clear_title();
+                            }
                             if last_scan.elapsed() >= CONTAINMENT_SCAN_INTERVAL {
                                 // A map lookup, not a scan. The scan is one pass for the
                                 // whole daemon, on the blocking pool, and this reads the
@@ -2367,6 +2930,24 @@ async fn terminal_task(
                                 containment.prune(&qoro_pty::sys::still_alive);
                                 containment.absorb(scanner.members(tty_dev));
                                 last_scan = std::time::Instant::now();
+                                // Where this tab is now, on the same throttle, because a
+                                // person moves around inside one shell and the directory a
+                                // tab was born in stops being where it is within a minute
+                                // of real use. One syscall, and only written when it
+                                // actually changed.
+                                if let Some(books) = books.clone()
+                                    && let Some(now) =
+                                        qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
+                                    && last_cwd.as_deref() != Some(now.as_path())
+                                {
+                                    last_cwd = Some(now.clone());
+                                    tokio::spawn(async move {
+                                        let _ = books
+                                            .store
+                                            .set_cwd(stream as i64, now.display().to_string())
+                                            .await;
+                                    });
+                                }
                             }
                             // Fed a slice at a time, yielding between them.
                             //
@@ -2437,7 +3018,17 @@ async fn terminal_task(
                             //
                             // While nothing is pending this arm is disabled, so an idle
                             // terminal still costs nothing.
-                            detect_at = Some(tokio::time::Instant::now() + DETECT_SETTLE);
+                            //
+                            // Pushed out by more output, but never past a ceiling. An agent
+                            // holding the turn redraws a ticking timer, so the screen never
+                            // goes quiet for eighty milliseconds and the deadline moved
+                            // forever: measured against a real codex, the panel said `idle`
+                            // for the whole of a thirty second turn whose own screen said
+                            // `Working (29s, esc to interrupt)` in as many words. The
+                            // busiest state was the one state that could never be read.
+                            let now = tokio::time::Instant::now();
+                            let began = *detect_since.get_or_insert(now);
+                            detect_at = Some((now + DETECT_SETTLE).min(began + DETECT_CEILING));
                             if trace && let Some(at) = pending_input.take() {
                                 eprintln!("trace: input to snapshot {:?}", at.elapsed());
                             }
@@ -2453,11 +3044,17 @@ async fn terminal_task(
                     }
                 }, if detect_at.is_some() => {
                     detect_at = None;
+                    detect_since = None;
                     // Whether or not anyone is subscribed, deliberately: an agent blocked
                     // in a terminal nobody is looking at is exactly what this notices.
                     if let Some(program) = agents.program_of(stream)
                         && let Some(manifest) = qoro_detect::rules_for(&program)
-                        && let Some(verdict) = manifest.evaluate(&engine.visible_text())
+                        && let Some(verdict) = manifest.evaluate_with_osc(
+                            &engine.visible_text(),
+                            &qoro_detect::OscContext {
+                                title: engine.title(),
+                            },
+                        )
                         && agents.observe_screen(stream, &verdict)
                     {
                         // Recorded when it changed, not on every look. The log is what a
@@ -2478,6 +3075,29 @@ async fn terminal_task(
                                 redacted: false,
                             },
                         );
+                    }
+                    // Armed only while a blocker holds. A re-announce is a
+                    // repeat, not news: it goes around the acceptance rule, so
+                    // it can neither change the belief nor be filtered by the
+                    // no-change gate, and anything but a blocker keeps using
+                    // that gate alone.
+                    blocker_at = agents
+                        .belief_visible_blocker(stream)
+                        .then(|| tokio::time::Instant::now() + BLOCKER_REANNOUNCE);
+                }
+                _ = async {
+                    match blocker_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        // Disabled like the detect arm: no blocker, no wakeups.
+                        None => std::future::pending().await,
+                    }
+                }, if blocker_at.is_some() => {
+                    if agents.belief_visible_blocker(stream) {
+                        agents.reannounce(stream);
+                        blocker_at =
+                            Some(tokio::time::Instant::now() + BLOCKER_REANNOUNCE);
+                    } else {
+                        blocker_at = None;
                     }
                 }
                 writable = afd.writable(), if want_write => {
@@ -2639,6 +3259,43 @@ pub const CONTAINMENT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::
 /// screen that gets read the settled one with the prompt on it rather than a screen halfway
 /// through being drawn.
 pub const DETECT_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The longest a screen may go unread while it keeps changing.
+///
+/// The settle above is what makes a burst one evaluation instead of one per read, and it
+/// works because bursts end. A screen that never stops is the case it gets wrong: an agent
+/// holding the turn animates a timer, every frame pushes the deadline out, and the screen
+/// is never read at all. So the push has a ceiling, and a terminal that has been talking
+/// for this long is read whether or not it has stopped.
+///
+/// Half a second, which is under the settle schedule ADR-009 already promises for a state
+/// change and far above the cost of reading one screen: a handful of regex passes over the
+/// visible rows, on a terminal that is already spending real work on the output itself.
+pub const DETECT_CEILING: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often a held blocker is re-announced while it holds.
+///
+/// Recovery, not polling: a panel that missed one index refresh converges on
+/// the next repeat. Armed only while a `visible_blocker` holds and disarmed
+/// the moment it clears, so terminals without a blocker schedule nothing.
+pub const BLOCKER_REANNOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Where user agent-detection overrides live: `<config>/qoro/agent-detection/`.
+///
+/// The user's own config directory, like their shell rc: same trust, no
+/// daemon-managed permissions. A missing directory simply means no overrides.
+fn override_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+                .ok()
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("qoro").join("agent-detection")
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn tear_down(

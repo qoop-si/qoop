@@ -115,9 +115,13 @@ fn cpu_ps(pid: u32) -> Duration {
 }
 
 struct Daemon {
+    /// The runtime directory the daemon was told to use, which is not the socket's parent:
+    /// a session lives in a directory of its own beneath it, and a client handed the
+    /// socket's parent would start a second daemon one level down.
+    runtime: std::path::PathBuf,
     child: Child,
     _dir: tempfile::TempDir,
-    socket: std::path::PathBuf,
+    _socket: std::path::PathBuf,
 }
 
 impl Drop for Daemon {
@@ -137,7 +141,7 @@ fn start_daemon() -> Daemon {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn");
-    let socket = dir.path().join("qorod.sock");
+    let socket = qoro_testkit::socket_in(dir.path());
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && !socket.exists() {
         std::thread::sleep(Duration::from_millis(50));
@@ -145,8 +149,9 @@ fn start_daemon() -> Daemon {
     assert!(socket.exists(), "the daemon never bound its socket");
     Daemon {
         child,
+        runtime: dir.path().to_path_buf(),
         _dir: dir,
-        socket,
+        _socket: socket,
     }
 }
 
@@ -183,7 +188,7 @@ fn measure(pid: u32, window: Duration, label: &str) -> Duration {
 fn g1_8_an_idle_terminal_with_a_live_child_costs_almost_nothing() {
     let daemon = start_daemon();
     // A client, so the render lane is live rather than dormant.
-    let mut client = attach(&daemon.socket);
+    let mut client = attach(&daemon.runtime);
     // Proves the client is really attached. If it had failed to connect it would have
     // exited, and this gate would be measuring a daemon with nobody watching.
     let _ = client_pid(client.id());
@@ -201,7 +206,7 @@ fn g1_8_an_idle_terminal_with_a_live_child_costs_almost_nothing() {
 #[test]
 fn g1_9_an_idle_terminal_after_its_child_exits_costs_almost_nothing() {
     let daemon = start_daemon();
-    let mut client = attach(&daemon.socket);
+    let mut client = attach(&daemon.runtime);
     let pid = client_pid(client.id());
     std::thread::sleep(Duration::from_secs(2));
 
@@ -253,7 +258,7 @@ fn shell_pid(daemon: u32) -> u32 {
 #[test]
 fn g1_20_an_idle_attached_client_costs_almost_nothing() {
     let daemon = start_daemon();
-    let mut client = attach(&daemon.socket);
+    let mut client = attach(&daemon.runtime);
     std::thread::sleep(Duration::from_secs(2));
 
     // Measured on the client process, not on the daemon: a client that polls its own stdin
@@ -277,7 +282,7 @@ fn g1_20_an_idle_attached_client_costs_almost_nothing() {
 #[test]
 fn g12_5_the_interface_with_eight_terminals_costs_almost_nothing_while_idle() {
     let daemon = start_daemon();
-    let mut client = attach(&daemon.socket);
+    let mut client = attach(&daemon.runtime);
     std::thread::sleep(Duration::from_secs(2));
 
     // Seven more, from the keyboard, which is the only way a person makes one.
@@ -338,8 +343,7 @@ fn client_pid(wrapper: u32) -> u32 {
 
 /// Attach a real client, with its stdin and stdout on a pty so it behaves as it does for a
 /// person rather than taking a non-tty path.
-fn attach(socket: &std::path::Path) -> Child {
-    let dir = socket.parent().expect("a runtime dir");
+fn attach(dir: &std::path::Path) -> Child {
     // `script` gives the client a controlling terminal without a terminal emulator. Without
     // one the client's raw-mode setup fails and it exits, and the gate would be measuring
     // a process that is not doing the thing.
