@@ -9,6 +9,8 @@ rust-version.workspace = true
 qoro-proto = { path = "../qoro-proto" }
 qoro-runtime = { path = "../qoro-runtime" }
 bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Already in the lock file by way of the terminal engine, so this adds a name and not a
 # download. A multiplexer that counts characters where the terminal counts columns puts
 # every wide character one column out.

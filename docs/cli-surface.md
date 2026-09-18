@@ -29,6 +29,8 @@ a claim nobody has to keep.
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
 | `qoro read <terminal>` | print another terminal's current screen | no |
 | `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked | no |
+| `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
+| `qoro master brief` | print the default supervisor instructions | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |

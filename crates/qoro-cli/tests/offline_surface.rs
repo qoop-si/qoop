@@ -25,8 +25,22 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
             continue;
         };
         let Some(end) = rest.find('`') else { continue };
-        let args: Vec<String> = rest[..end]
-            .split_whitespace()
+        let raw: Vec<&str> = rest[..end].split_whitespace().collect();
+        // An optional flag group like `[--json]` runs as its bare form: running
+        // it literally would only ever exercise the unknown-flag error path.
+        // `--json` variants are covered by their own tests. An optional
+        // positional like `[agent...]` is a placeholder instead: the bare form
+        // would install into the real home, so the row is skipped like the
+        // `<file>` rows below rather than run.
+        if raw
+            .iter()
+            .any(|a| a.contains('[') && !a.trim_matches(|c| c == '[' || c == ']').starts_with('-'))
+        {
+            continue;
+        }
+        let args: Vec<String> = raw
+            .into_iter()
+            .filter(|a| !a.contains('[') && !a.contains(']'))
             .map(|a| a.to_string())
             .collect();
         // `<file>` placeholders are filled in by the caller; a command with one is run
@@ -181,6 +195,26 @@ fn verbs(text: &str) -> std::collections::BTreeSet<String> {
         out.insert(word.to_string());
     }
     out
+}
+
+/// The new rows are actually enumerated as runnable commands, not just
+/// present in the table: the `[--json]` group must parse away to a bare
+/// `agents` invocation rather than a literal `[--json]` flag.
+#[test]
+fn the_new_rows_are_enumerated_as_their_bare_forms() {
+    let commands = runnable_from_the_document();
+    assert!(
+        commands.contains(&vec!["agents".to_string()]),
+        "bare `qoro agents` is not enumerated: {commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|c| c.iter().any(|a| a.contains('['))),
+        "an optional group leaked into the enumeration: {commands:?}"
+    );
+    assert!(
+        commands.contains(&vec!["master".to_string(), "brief".to_string()]),
+        "`qoro master brief` is not enumerated: {commands:?}"
+    );
 }
 
 /// The document and the binary agree about what exists.
