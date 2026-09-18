@@ -1099,3 +1099,121 @@ async fn g2_17_a_screen_that_never_settles_is_read_anyway() {
     );
     c.input_to(terminal, &[0x03]).await;
 }
+
+/// A finished opencode reads idle, not working.
+///
+/// Regression for the index showing `working` for agents that finished long
+/// ago. Two shapes: the live composer positively seen (an explicit idle rule
+/// outranks the stale interrupt hint still sitting above it), and a screen
+/// matching no rule at all (the known-agent idle fallback settles a
+/// screen-held belief instead of leaving the last state standing).
+///
+/// A stand in named after the real agent, like G2.17 above: the rules that
+/// read the screen are that agent's, and the daemon reads the program name
+/// off the process rather than the interpreter's.
+async fn run_opencode_stand_in(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let source = dir.path().join("opencode.rs");
+    std::fs::write(
+        &source,
+        "fn main() {\n\
+         \x20   let plain = std::env::args().nth(1).is_some();\n\
+         \x20   for n in 0..6 {\n\
+         \x20       println!(\"crunching {n} (esc to interrupt)\");\n\
+         \x20       std::thread::sleep(std::time::Duration::from_millis(200));\n\
+         \x20   }\n\
+         \x20   if plain {\n\
+         \x20       for n in 0..15 {\n\
+         \x20           println!(\"done line {n}\");\n\
+         \x20       }\n\
+         \x20   } else {\n\
+         \x20       println!(\"> ask me anything\");\n\
+         \x20   }\n\
+         \x20   std::thread::sleep(std::time::Duration::from_secs(30));\n\
+         }\n",
+    )
+    .expect("write");
+    let binary = dir.path().join("opencode");
+    let built = std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("run rustc");
+    assert!(
+        built.status.success(),
+        "the stand in did not build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    binary
+}
+
+async fn wait_for_state(
+    d: &qoro_testkit::TestDaemon,
+    terminal: u32,
+    want: qoro_domain::AgentRuntimeState,
+    secs: u64,
+) -> Option<qoro_domain::AgentRuntimeState> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Some(agent) = d.agent(terminal)
+            && agent.belief.state == want
+        {
+            return Some(want);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    d.agent(terminal).map(|a| a.belief.state)
+}
+
+#[tokio::test]
+async fn a_finished_opencode_with_a_live_composer_reads_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = run_opencode_stand_in(&dir).await;
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("opencode-idle").await;
+    let terminal = d.terminals().streams()[0];
+    c.input_to(terminal, format!("{}\n", binary.display()).as_bytes())
+        .await;
+
+    assert_eq!(
+        wait_for_state(&d, terminal, qoro_domain::AgentRuntimeState::Working, 15).await,
+        Some(qoro_domain::AgentRuntimeState::Working),
+        "the stand in's interrupt hint was never read as working",
+    );
+    assert_eq!(
+        wait_for_state(&d, terminal, qoro_domain::AgentRuntimeState::Idle, 15).await,
+        Some(qoro_domain::AgentRuntimeState::Idle),
+        "a finished opencode with its composer on screen still reads working: {:?}",
+        d.agent(terminal).map(|a| (a.belief.state, a.belief.source)),
+    );
+    c.input_to(terminal, &[0x03]).await;
+}
+
+#[tokio::test]
+async fn a_finished_opencode_matching_no_rule_reads_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let binary = run_opencode_stand_in(&dir).await;
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("opencode-fallback").await;
+    let terminal = d.terminals().streams()[0];
+    c.input_to(
+        terminal,
+        format!("{} plain\n", binary.display()).as_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for_state(&d, terminal, qoro_domain::AgentRuntimeState::Working, 15).await,
+        Some(qoro_domain::AgentRuntimeState::Working),
+        "the stand in's interrupt hint was never read as working",
+    );
+    assert_eq!(
+        wait_for_state(&d, terminal, qoro_domain::AgentRuntimeState::Idle, 15).await,
+        Some(qoro_domain::AgentRuntimeState::Idle),
+        "an opencode screen matching no rule kept its working belief: {:?}",
+        d.agent(terminal).map(|a| (a.belief.state, a.belief.source)),
+    );
+    c.input_to(terminal, &[0x03]).await;
+}

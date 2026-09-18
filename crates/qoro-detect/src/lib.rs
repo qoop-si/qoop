@@ -1269,6 +1269,61 @@ contains = "do you want to proceed"
     }
 
     #[test]
+    fn the_opencode_manifest_reads_its_composer_as_idle() {
+        let v = verdict("opencode", &["> tell me a joke"]).expect("a composer is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle);
+        assert_eq!(v.rule, "composer_idle");
+        assert!(v.visible_idle);
+    }
+
+    #[test]
+    fn an_opencode_interrupt_hint_in_scrollback_does_not_hold_working() {
+        // The hint sits in the transcript after the turn ends while the live
+        // composer waits below it. The working rule reads the live lines only,
+        // so the composer wins and the finished agent reads idle, not working.
+        let v = verdict(
+            "opencode",
+            &[
+                "esc to interrupt",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "> tell me a joke",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert_eq!(v.rule, "composer_idle");
+    }
+
+    #[test]
+    fn an_interrupted_opencode_turn_is_not_working() {
+        // The hint is still on screen but the turn is over: Esc was already
+        // pressed and the conversation notes it. Reporting working here is
+        // how a cancelled agent stays working until its next turn.
+        let v = verdict(
+            "opencode",
+            &[
+                "esc to interrupt",
+                "conversation interrupted",
+                "> tell me a joke",
+            ],
+        );
+        assert!(
+            !v.as_ref()
+                .is_some_and(|v| v.state == AgentRuntimeState::Working),
+            "an interrupted turn read as working: {v:?}"
+        );
+    }
+
+    #[test]
     fn the_cursor_manifest_reads_a_file_write_approval_as_a_visible_blocker() {
         let v = verdict(
             "cursor",

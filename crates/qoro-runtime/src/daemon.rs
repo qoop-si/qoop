@@ -1873,6 +1873,7 @@ async fn handle_control(
             token,
             state,
             visible_blocker,
+            visible_idle,
             session,
             ..
         } => {
@@ -1891,7 +1892,14 @@ async fn handle_control(
             // `open_terminal` registered the capability under.
             let terminal_id = TerminalId::new(terminal.to_string());
             let token = qoro_domain::CapabilityToken::new(token);
-            match agents.observe_hook(terminal, &terminal_id, &token, reported, visible_blocker) {
+            match agents.observe_hook(
+                terminal,
+                &terminal_id,
+                &token,
+                reported,
+                visible_blocker,
+                visible_idle,
+            ) {
                 Err(_) => ControlResponse::Failed {
                     id,
                     reason: format!("the report for terminal {terminal} was refused"),
@@ -3188,14 +3196,46 @@ async fn terminal_task(
                     // in a terminal nobody is looking at is exactly what this notices.
                     if let Some(program) = agents.program_of(stream)
                         && let Some(manifest) = qoro_detect::rules_for(&program)
-                        && let Some(verdict) = manifest.evaluate_with_osc(
-                            &engine.visible_text(),
-                            &qoro_detect::OscContext {
-                                title: engine.title(),
-                            },
-                        )
-                        && agents.observe_screen(stream, &verdict)
                     {
+                        let screen = engine.visible_text();
+                        let osc = qoro_detect::OscContext {
+                            title: engine.title(),
+                        };
+                        let matched = manifest.evaluate_with_osc(&screen, &osc);
+                        // A known agent whose screen matches no rule reads as idle,
+                        // never as its last state. Without this a turn whose end
+                        // face has no rule yet (or a manifest with no idle rule at
+                        // all) keeps its `working` belief forever, which is the
+                        // index showing working for agents that finished long ago.
+                        // The fallback is deliberately weak evidence: it carries
+                        // no visible flag, so it settles a screen-held belief of
+                        // the same source but never overrides a hook-held state
+                        // it cannot see. Only a positively seen composer (an
+                        // explicit idle rule with `visible_idle`) clears that.
+                        let fallback;
+                        let verdict = match matched {
+                            Some(v) => Some(v),
+                            None => {
+                                let known = qoro_detect::for_program(&program).is_some_and(
+                                    |m| m.id.to_lowercase() != "generic",
+                                );
+                                if known {
+                                    fallback = qoro_detect::Verdict {
+                                        state: qoro_domain::AgentRuntimeState::Idle,
+                                        rule: "known_agent_idle_fallback".into(),
+                                        visible_blocker: false,
+                                        visible_idle: false,
+                                        visible_working: false,
+                                    };
+                                    Some(fallback)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(verdict) = verdict
+                            && agents.observe_screen(stream, &verdict)
+                        {
                         // Recorded when it changed, not on every look. The log is what a
                         // client that was not connected reads to find out what happened
                         // while it was away, and a row per evaluation would bury that in
@@ -3214,6 +3254,7 @@ async fn terminal_task(
                                 redacted: false,
                             },
                         );
+                        }
                     }
                     // Armed only while a blocker holds. A re-announce is a
                     // repeat, not news: it goes around the acceptance rule, so

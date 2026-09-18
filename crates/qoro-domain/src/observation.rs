@@ -73,6 +73,13 @@ pub struct AgentObservation {
     /// the one case where a weaker source may override a stronger one, and only when it is
     /// also newer.
     pub visible_blocker: bool,
+    /// True only for an observation that positively saw the agent waiting for
+    /// input (its composer). Like a visible blocker, and only when newer: a
+    /// hook can miss the end of a turn and hold `working` forever, while a
+    /// live composer on screen cannot lie about the turn being over. A weak
+    /// idle with neither flag set is an absence of evidence, never an
+    /// override.
+    pub visible_idle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +146,7 @@ impl AgentBelief {
             && obs.source != self.source
             && gap.abs() <= COMPARABLE_STRENGTH
             && !obs.visible_blocker
+            && !obs.visible_idle
             && self.state != AgentRuntimeState::Unknown
         {
             return ObservationVerdict::Uncertain;
@@ -157,10 +165,14 @@ impl AgentBelief {
         if self.state == AgentRuntimeState::Unknown {
             return ObservationVerdict::Accept;
         }
-        // Weaker source. The one exception: a screen observation that positively saw a
-        // blocking modal, and is newer than what it is overriding. A hook can lag or
-        // under-report a modal; the live screen cannot lie about one being on screen.
-        if obs.visible_blocker && obs.sequence > self.sequence {
+        // Weaker source. Two exceptions, both requiring positive on-screen
+        // evidence newer than what is overridden: a blocking modal, or the
+        // idle composer. A hook can lag or miss a transition in either
+        // direction; the live screen cannot lie about a dialog or a composer
+        // being on screen. Anything weaker is an absence of evidence and stays
+        // outranked, which is what keeps a no-rule screen from clearing a
+        // hook-held state it cannot see.
+        if (obs.visible_blocker || obs.visible_idle) && obs.sequence > self.sequence {
             return ObservationVerdict::Accept;
         }
         ObservationVerdict::Outranked
@@ -225,6 +237,7 @@ mod one_source_changing_its_mind {
             confidence: Confidence::Medium,
             sequence,
             visible_blocker: false,
+            visible_idle: false,
         }
     }
 
@@ -277,6 +290,7 @@ mod unknown_is_not_a_claim {
             confidence: Confidence::Medium,
             sequence,
             visible_blocker: false,
+            visible_idle: false,
         }
     }
 
@@ -347,6 +361,7 @@ mod tests {
             confidence: Confidence::High,
             sequence: seq,
             visible_blocker: false,
+            visible_idle: false,
         }
     }
 
@@ -415,6 +430,41 @@ mod tests {
         );
         modal.visible_blocker = true;
         assert_ne!(b.evaluate(&modal), ObservationVerdict::Accept);
+    }
+
+    #[test]
+    fn a_newer_visible_composer_overrides_a_hook_that_still_says_working() {
+        // The idle twin of the modal override: a hook can miss the end of a
+        // turn and hold `working` forever, while a live composer on screen
+        // cannot lie about the turn being over. Without this a finished agent
+        // stays "working" in the index until its next turn.
+        let b = belief(1, AgentRuntimeState::Working, ObservationSource::Hook, 5);
+        let mut composer = obs(
+            1,
+            AgentRuntimeState::Idle,
+            ObservationSource::ScreenHeuristic,
+            6,
+        );
+        composer.visible_idle = true;
+        assert_eq!(b.evaluate(&composer), ObservationVerdict::Accept);
+    }
+
+    #[test]
+    fn a_weak_idle_without_positive_evidence_does_not_override_a_hook() {
+        // Absence of evidence is not evidence: a screen that matched no rule
+        // must not clear a hook-held state it cannot see. Only a positively
+        // seen composer overrides, which is also what keeps the known-agent
+        // idle fallback from fighting a lifecycle hook.
+        let b = belief(1, AgentRuntimeState::Working, ObservationSource::Hook, 5);
+        assert_eq!(
+            b.evaluate(&obs(
+                1,
+                AgentRuntimeState::Idle,
+                ObservationSource::ScreenHeuristic,
+                6
+            )),
+            ObservationVerdict::Outranked
+        );
     }
 
     #[test]

@@ -149,6 +149,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
         confidence: qoro_domain::Confidence::High,
         sequence: agent.belief.sequence.saturating_add(1),
         visible_blocker: false,
+        visible_idle: false,
     };
     if let Ok(next) = agent.belief.clone().accept(&idle) {
         agent.belief = next;
@@ -399,6 +400,7 @@ impl AgentRegistry {
             // order with each other.
             sequence: agent.belief.sequence.saturating_add(1),
             visible_blocker: verdict.visible_blocker,
+            visible_idle: verdict.visible_idle,
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -452,6 +454,7 @@ impl AgentRegistry {
         token: &CapabilityToken,
         state: AgentRuntimeState,
         visible_blocker: bool,
+        visible_idle: bool,
     ) -> Result<bool, ClaimRefusal> {
         let mut terminals = self.terminals.lock().unwrap();
         let Some(agent) = terminals.get_mut(&stream) else {
@@ -468,6 +471,7 @@ impl AgentRegistry {
             confidence: qoro_domain::Confidence::High,
             sequence: agent.belief.sequence.saturating_add(1),
             visible_blocker,
+            visible_idle,
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -652,6 +656,7 @@ mod tests {
                 &token,
                 AgentRuntimeState::Idle,
                 false,
+                false,
             )
             .expect("an admitted report applies");
         assert!(changed);
@@ -675,6 +680,7 @@ mod tests {
             &TerminalId::new("1"),
             &token,
             AgentRuntimeState::Working,
+            false,
             false,
         )
         .expect("applies");
@@ -723,6 +729,7 @@ mod tests {
                 &token,
                 AgentRuntimeState::Blocked,
                 true,
+                false,
             )
             .expect("applies");
         assert!(changed);
@@ -738,6 +745,7 @@ mod tests {
                 &TerminalId::new("1"),
                 &forged,
                 AgentRuntimeState::Idle,
+                false,
                 false
             ),
             Err(ClaimRefusal::WrongTerminal)
@@ -748,6 +756,7 @@ mod tests {
                 &TerminalId::new("9"),
                 &token,
                 AgentRuntimeState::Idle,
+                false,
                 false
             ),
             Err(ClaimRefusal::WrongTerminal)
@@ -772,6 +781,7 @@ mod tests {
             &token,
             AgentRuntimeState::Blocked,
             true,
+            false,
         )
         .expect("applies");
         let mut rx = r.subscribe();
@@ -836,6 +846,7 @@ mod tests {
             &token,
             AgentRuntimeState::Blocked,
             true,
+            false,
         )
         .expect("applies");
         assert_eq!(
@@ -854,6 +865,7 @@ mod tests {
             confidence: qoro_domain::Confidence::Medium,
             sequence: 99,
             visible_blocker: false,
+            visible_idle: false,
         };
         assert_eq!(
             r.agent(1).expect("agent").belief.evaluate(&stale_screen),
@@ -868,5 +880,41 @@ mod tests {
         let after = r.agent(1).expect("agent");
         assert_eq!(after.belief.state, AgentRuntimeState::Idle);
         assert!(!after.belief.visible_blocker);
+    }
+
+    /// A hook that missed the end of a turn holds `working` while the live
+    /// composer waits on screen. Positive idle evidence clears it; a weak
+    /// idle with no composer behind it must not.
+    #[test]
+    fn a_visible_idle_composer_clears_a_hook_held_working_state() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Working,
+            false,
+            false,
+        )
+        .expect("applies");
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Working
+        );
+
+        let composer = qoro_detect::Verdict {
+            state: AgentRuntimeState::Idle,
+            rule: "composer_idle".into(),
+            visible_blocker: false,
+            visible_idle: true,
+            visible_working: false,
+        };
+        assert!(r.observe_screen(1, &composer));
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Idle
+        );
     }
 }

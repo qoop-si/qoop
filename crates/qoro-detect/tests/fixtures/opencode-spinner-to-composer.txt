@@ -1,7 +1,8 @@
 # SYNTHESIZED transition, not a recording: opencode interrupt hint -> typed
-# composer. opencode has no idle rule (its idle face was never captured), so
-# the tail frames match nothing: the honest expectation is no phantom idle,
-# zero flaps under both policies.
+# composer. The composer reads as idle with visible_idle, so the tail
+# publishes Idle once and stays there: the honest expectation is a clean
+# Working-to-Idle handoff with no Working-to-Idle-to-Working flap on a
+# stable tail.
 agent: opencode
 @@ 0
 esc to interrupt
