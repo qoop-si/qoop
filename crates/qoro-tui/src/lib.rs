@@ -6,6 +6,7 @@
 //! that drives them is small enough to read in one sitting.
 
 pub mod keys;
+pub mod layout;
 pub mod palette;
 pub mod run;
 pub mod screen;

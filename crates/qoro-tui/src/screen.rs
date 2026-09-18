@@ -9,7 +9,18 @@ use qoro_runtime::control::{AgentRow, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
 use crate::palette::Palette;
-use crate::{sidebar, tabs, theme, width};
+use crate::{layout, sidebar, tabs, theme, width};
+
+/// One visible terminal and where it sits in the pane, in pane-local cells.
+///
+/// Empty in every test that draws a single pane: an empty list means the legacy
+/// path, exactly one terminal filling the pane.
+pub struct Tile<'a> {
+    pub terminal: u32,
+    pub rect: layout::Rect,
+    pub snapshot: Option<&'a SnapshotWire>,
+    pub focused: bool,
+}
 
 /// What the screen shows: the tab bar across the top, the spaces and agents down the left,
 /// one terminal filling the rest, and a line saying what the keys do.
@@ -58,6 +69,10 @@ pub struct Frame<'a> {
     pub rows_back: u64,
     /// The rows behind the screen this client has been given.
     pub behind: &'a crate::run::Behind,
+    /// The visible terminals and their rectangles, in pane-local cells. Empty
+    /// means one terminal filling the pane, drawn from `snapshot` exactly as
+    /// before, so a single pane paints pixel for pixel what it always has.
+    pub tiles: Vec<Tile<'a>>,
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
@@ -286,17 +301,30 @@ pub fn paint(frame: &Frame) -> String {
         // of the live screen, so a person reading upwards sees one continuous terminal
         // rather than two. The rows behind it are text alone: what was written to disk is
         // rows, and colour there would be a second format nobody reads back.
-        let (line, spans) = window_row(
-            frame.snapshot,
-            frame.behind,
-            frame.scroll,
-            frame.anchor,
-            pane_row,
-        );
-        let selected = frame
-            .selection
-            .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
-        out.push_str(&paint_row(line, spans, pane_cols as usize, selected));
+        // Tiled rows only when there is more than one tile to show: a single
+        // tile paints the legacy path, so one terminal paints pixel for pixel
+        // what it always has.
+        if frame.tiles.len() < 2 {
+            let (line, spans) = window_row(
+                frame.snapshot,
+                frame.behind,
+                frame.scroll,
+                frame.anchor,
+                pane_row,
+            );
+            let selected = frame
+                .selection
+                .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
+            out.push_str(&paint_row(line, spans, pane_cols as usize, selected));
+        } else {
+            paint_tiled_row(
+                frame,
+                pane_row,
+                pane_cols as usize,
+                left_for(frame.cols, frame.collapsed),
+                &mut out,
+            );
+        }
     }
 
     // Two lines, not one. The keys never change and the notice always does, and one row
@@ -401,14 +429,30 @@ pub fn paint(frame: &Frame) -> String {
         let col = (left + 4 + width::width(&palette.query)).min(left + w.saturating_sub(2));
         out.push_str(&at(row + 1, col + 1));
     } else if let Some(snapshot) = frame.snapshot {
-        let (row, cell) = snapshot.cursor;
-        let col = cursor_column(
-            snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
-            cell,
-        );
-        let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-        let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
-        out.push_str(&at(row, col));
+        // The cursor lives on the focused tile alone. Unfocused tiles never
+        // carry one, so a glance always knows where typing goes. With fewer
+        // than two tiles the legacy arithmetic below is byte for byte what it
+        // always was.
+        if frame.tiles.len() < 2 {
+            let (row, cell) = snapshot.cursor;
+            let col = cursor_column(
+                snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
+                cell,
+            );
+            let row = row.min(pane_rows as usize - 1) + 1 + TABS;
+            let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
+            out.push_str(&at(row, col));
+        } else if let Some(tile) = frame.tiles.iter().find(|t| t.focused) {
+            let (row, cell) = snapshot.cursor;
+            let col = cursor_column(
+                snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
+                cell,
+            );
+            let pane_left = left_for(frame.cols, frame.collapsed);
+            let row = tile.rect.y + row.min(tile.rect.rows.saturating_sub(1)) + 1 + TABS;
+            let col = pane_left + tile.rect.x + col.min(tile.rect.cols.saturating_sub(1)) + 1;
+            out.push_str(&at(row, col));
+        }
     }
     // Always back on, even with no snapshot yet. It is turned off at the top of every frame
     // so the repaint does not walk a visible cursor across the screen, and leaving it off
@@ -829,6 +873,11 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             .chain([
                 " ctrl-a R      rename this space".to_string(),
                 " ctrl-a 1..9   the nth tab of this space".to_string(),
+                " ctrl-a v/-    split side by side / stacked".to_string(),
+                " ctrl-a H/J/K/L focus the pane left/down/up/right".to_string(),
+                " ctrl-a o      next pane".to_string(),
+                " ctrl-a z      zoom the focused pane".to_string(),
+                " ctrl-a X      drop the pane, keeping its terminal".to_string(),
                 " ctrl-a p      previous tab".to_string(),
                 " ctrl-a S      previous space".to_string(),
                 " ctrl-a f      fold the idle groups".to_string(),
@@ -968,6 +1017,91 @@ pub fn window_row<'a>(
             .map(Vec::as_slice)
             .unwrap_or(&[]),
     )
+}
+
+/// Whether a tile covers a pane-local cell.
+fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
+    frame.tiles.iter().any(|t| {
+        pane_row >= t.rect.y
+            && pane_row < t.rect.y + t.rect.rows
+            && x >= t.rect.x
+            && x < t.rect.x + t.rect.cols
+    })
+}
+
+/// One pane row with several tiles in it, plus the dividers between them.
+///
+/// Each tile shows the leftmost columns of its own snapshot: the focused tile
+/// was resized to its rectangle so nothing is hidden there, the others are
+/// viewport-cropped. Scrollback, selection and the cursor belong to the
+/// focused tile alone. Cells no tile covers are dividers.
+fn paint_tiled_row(
+    frame: &Frame,
+    pane_row: usize,
+    pane_cols: usize,
+    pane_left: usize,
+    out: &mut String,
+) {
+    // One based, like every other position on the screen.
+    let screen_row = pane_row + TABS + 1;
+    for tile in &frame.tiles {
+        if pane_row < tile.rect.y || pane_row >= tile.rect.y + tile.rect.rows {
+            continue;
+        }
+        let local = pane_row - tile.rect.y;
+        let (line, spans) = if tile.focused {
+            window_row(
+                frame.snapshot,
+                frame.behind,
+                frame.scroll,
+                frame.anchor,
+                local,
+            )
+        } else {
+            (
+                tile.snapshot
+                    .and_then(|s| s.lines.get(local))
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                tile.snapshot
+                    .and_then(|s| s.styles.get(local))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+        };
+        let selected = if tile.focused {
+            frame
+                .selection
+                .and_then(|s| s.columns_on(local, tile.rect.cols))
+        } else {
+            None
+        };
+        out.push_str(&at(screen_row, pane_left + 1 + tile.rect.x));
+        out.push_str(&paint_row(line, spans, tile.rect.cols, selected));
+    }
+    let mut x = 0;
+    while x < pane_cols {
+        if covers(frame, x, pane_row) {
+            x += 1;
+            continue;
+        }
+        let start = x;
+        while x < pane_cols && !covers(frame, x, pane_row) {
+            x += 1;
+        }
+        // A gap with tiles on both sides on this row is a vertical divider,
+        // anything else is a horizontal one.
+        let vertical = start > 0
+            && x < pane_cols
+            && covers(frame, start - 1, pane_row)
+            && covers(frame, x, pane_row);
+        out.push_str(&theme::fg(theme::Role::Rule));
+        out.push_str(&at(screen_row, pane_left + 1 + start));
+        for _ in start..x {
+            out.push(if vertical { '\u{2502}' } else { '\u{2500}' });
+        }
+        out.push_str(theme::RESET);
+    }
 }
 
 fn paint_row(
@@ -1152,6 +1286,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1196,6 +1331,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1232,6 +1368,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1276,6 +1413,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1317,6 +1455,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1372,6 +1511,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1427,6 +1567,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1471,6 +1612,7 @@ mod tests {
                 scroll: 0,
                 anchor: 0,
                 rows_back: 0,
+                tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
             });
             // Every positioned run, measured as a terminal measures it.
@@ -1513,6 +1655,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1550,6 +1693,7 @@ mod tests {
                 scroll: 0,
                 anchor: 0,
                 rows_back: 0,
+                tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
@@ -1589,6 +1733,7 @@ mod tests {
                 scroll: 0,
                 anchor: 0,
                 rows_back: 0,
+                tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
             });
             // The two status rows own the bottom of the screen, so nothing else may
@@ -1646,6 +1791,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1700,6 +1846,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1779,6 +1926,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1827,6 +1975,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1865,6 +2014,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1900,6 +2050,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1936,6 +2087,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2001,6 +2153,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2071,6 +2224,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2129,6 +2283,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2168,6 +2323,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &crate::run::Behind::default(),
         });
         // The five columns under the drag are reversed, and the escape is written once at
@@ -2222,6 +2378,7 @@ mod tests {
                 scroll: 0,
                 anchor: 0,
                 rows_back: 0,
+                tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
             })
         };
@@ -2268,6 +2425,7 @@ mod tests {
             anchor: 98,
             rows_back: 2,
             behind: &behind,
+            tiles: Vec::new(),
         });
         // Two rows back: the last two rows written, then the screen from its top.
         assert!(painted.contains("gone 98"), "{painted:?}");
@@ -2317,6 +2475,7 @@ mod tests {
             scroll: 0,
             anchor: 0,
             rows_back: 0,
+            tiles: Vec::new(),
             behind: &behind,
         });
         assert!(painted.contains("live 0") && painted.contains("live 1"));
@@ -2354,5 +2513,236 @@ mod tests {
         assert_eq!(window_row(Some(&snapshot), &behind, 2, 10, 0).0, "");
         // And rows behind the screen carry no colour, because none was written down.
         assert!(window_row(Some(&snapshot), &behind, 2, 58, 0).1.is_empty());
+    }
+
+    fn paint_two_panes(
+        rows: &[AgentRow],
+        spaces: &[WorkspaceRow],
+        focused_snap: Option<&SnapshotWire>,
+        other_snap: Option<&SnapshotWire>,
+        focused: u32,
+        rects: Vec<(u32, crate::layout::Rect)>,
+    ) -> String {
+        let behind = crate::run::Behind::default();
+        let tiles = rects
+            .into_iter()
+            .map(|(terminal, rect)| Tile {
+                terminal,
+                rect,
+                snapshot: if terminal == focused {
+                    focused_snap
+                } else {
+                    other_snap
+                },
+                focused: terminal == focused,
+            })
+            .collect();
+        paint(&Frame {
+            rows,
+            spaces,
+            space: Some(1),
+            focused,
+            snapshot: focused_snap,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles,
+            behind: &behind,
+        })
+    }
+
+    #[test]
+    fn a_single_tile_paints_exactly_what_a_single_pane_always_has() {
+        let rows = [row(1, "zsh", "idle")];
+        let spaces = spaces();
+        let snap = snapshot(&["hello from the shell"]);
+        let behind = crate::run::Behind::default();
+        let (pane_cols, pane_rows) = pane_size(80, 24);
+        let legacy = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces,
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snap),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+        });
+        let tiled = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces,
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snap),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles: vec![Tile {
+                terminal: 1,
+                rect: crate::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: pane_cols as usize,
+                    rows: pane_rows as usize,
+                },
+                snapshot: Some(&snap),
+                focused: true,
+            }],
+            behind: &behind,
+        });
+        assert_eq!(tiled, legacy);
+    }
+
+    #[test]
+    fn two_side_by_side_panes_both_paint_and_share_the_width() {
+        let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+        let spaces = spaces();
+        let left = snapshot(&["left side"]);
+        let right = snapshot(&["right side"]);
+        let (pane_cols, pane_rows) = pane_size(80, 24);
+        let half = (pane_cols as usize - 1) / 2;
+        let painted = paint_two_panes(
+            &rows,
+            &spaces,
+            Some(&left),
+            Some(&right),
+            1,
+            vec![
+                (
+                    1,
+                    crate::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        cols: half,
+                        rows: pane_rows as usize,
+                    },
+                ),
+                (
+                    2,
+                    crate::layout::Rect {
+                        x: half + 1,
+                        y: 0,
+                        cols: pane_cols as usize - half - 1,
+                        rows: pane_rows as usize,
+                    },
+                ),
+            ],
+        );
+        assert!(painted.contains("left side"), "{painted:?}");
+        assert!(painted.contains("right side"), "{painted:?}");
+        assert!(painted.contains('\u{2502}'), "no divider: {painted:?}");
+    }
+
+    #[test]
+    fn a_pane_without_a_snapshot_yet_paints_blank_but_keeps_its_place() {
+        let rows = [row(1, "zsh", "idle"), row(2, "zsh", "starting")];
+        let spaces = spaces();
+        let left = snapshot(&["left side"]);
+        let (pane_cols, pane_rows) = pane_size(80, 24);
+        let half = (pane_cols as usize - 1) / 2;
+        let painted = paint_two_panes(
+            &rows,
+            &spaces,
+            Some(&left),
+            None,
+            1,
+            vec![
+                (
+                    1,
+                    crate::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        cols: half,
+                        rows: pane_rows as usize,
+                    },
+                ),
+                (
+                    2,
+                    crate::layout::Rect {
+                        x: half + 1,
+                        y: 0,
+                        cols: pane_cols as usize - half - 1,
+                        rows: pane_rows as usize,
+                    },
+                ),
+            ],
+        );
+        assert!(painted.contains("left side"), "{painted:?}");
+        assert!(painted.contains('\u{2502}'), "no divider: {painted:?}");
+    }
+
+    #[test]
+    fn stacked_panes_are_separated_by_a_horizontal_divider() {
+        let rows = [row(1, "zsh", "idle"), row(2, "zsh", "idle")];
+        let spaces = spaces();
+        let top = snapshot(&["top row"]);
+        let bottom = snapshot(&["bottom row"]);
+        let (pane_cols, pane_rows) = pane_size(80, 24);
+        let half = (pane_rows as usize - 1) / 2;
+        let painted = paint_two_panes(
+            &rows,
+            &spaces,
+            Some(&top),
+            Some(&bottom),
+            1,
+            vec![
+                (
+                    1,
+                    crate::layout::Rect {
+                        x: 0,
+                        y: 0,
+                        cols: pane_cols as usize,
+                        rows: half,
+                    },
+                ),
+                (
+                    2,
+                    crate::layout::Rect {
+                        x: 0,
+                        y: half + 1,
+                        cols: pane_cols as usize,
+                        rows: pane_rows as usize - half - 1,
+                    },
+                ),
+            ],
+        );
+        assert!(painted.contains("top row"), "{painted:?}");
+        assert!(painted.contains("bottom row"), "{painted:?}");
+        assert!(painted.contains('\u{2500}'), "no divider: {painted:?}");
     }
 }

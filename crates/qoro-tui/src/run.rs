@@ -15,6 +15,7 @@ use qoro_runtime::daemon::{ClientWire, SnapshotWire};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::keys::{Action, Keys};
+use crate::layout::{self, Layout};
 use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
 use crate::{sidebar, tabs};
@@ -133,6 +134,16 @@ struct State {
     rows: Vec<AgentRow>,
     focused: u32,
     snapshot: Option<SnapshotWire>,
+    /// Snapshots of the visible but unfocused tiles, by terminal. The focused
+    /// terminal lives in `snapshot` (with scrollback and selection); the
+    /// others are viewport-cropped live screens.
+    snapshots: std::collections::BTreeMap<u32, SnapshotWire>,
+    /// Terminals this client receives renders for. Always exactly the visible
+    /// set of the space on screen: over-subscribing spends daemon and client
+    /// work on output nobody sees.
+    subs: std::collections::BTreeSet<u32>,
+    /// One tiling tree per space. Spaces without an entry show a single pane.
+    layouts: std::collections::BTreeMap<i64, Layout>,
     cols: u16,
     lines: u16,
     message: Option<String>,
@@ -204,8 +215,39 @@ struct State {
     selection: Option<crate::selection::Selection>,
 }
 
+/// Which tile a screen position lands in: its terminal, the pane-global cell,
+/// and the tile-local cell. Divider cells answer `None`.
+type TileHit = (u32, (usize, usize), (usize, usize));
+
 impl State {
     fn frame(&self) -> Frame<'_> {
+        // The pane area in its own cells, shared by every tile rect.
+        let (pane_cols, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let full = layout::Rect {
+            x: 0,
+            y: 0,
+            cols: pane_cols as usize,
+            rows: pane_rows as usize,
+        };
+        let mut tiles = Vec::new();
+        if self.focused != 0
+            && let Some(space) = self.space
+            && let Some(layout) = self.layouts.get(&space)
+        {
+            for (terminal, rect) in layout.tile_rects(full) {
+                let snapshot = if terminal == self.focused {
+                    self.snapshot.as_ref()
+                } else {
+                    self.snapshots.get(&terminal)
+                };
+                tiles.push(screen::Tile {
+                    terminal,
+                    rect,
+                    snapshot,
+                    focused: terminal == self.focused,
+                });
+            }
+        }
         Frame {
             rows: &self.rows,
             spaces: &self.spaces,
@@ -227,6 +269,7 @@ impl State {
             anchor: self.anchor.unwrap_or_default(),
             rows_back: self.rows_back(),
             behind: &self.behind,
+            tiles,
         }
     }
 
@@ -241,12 +284,24 @@ impl State {
     /// the focused entry visible: the row a person clicked is not the entry's position in
     /// the list, and computing it here would be a second copy of that arithmetic that
     /// starts out right and drifts.
-    /// Where in the pane a screen position is, if it is in the pane at all.
+    /// Where in the focused pane a screen position is, if it is in it at all.
     ///
-    /// Zero based, which is what the snapshot's rows and the selection both count in. The
-    /// pane starts under the tab bar and to the right of the column, and the two status
-    /// rows at the foot are not it.
+    /// Zero based tile-local cells, which is what the snapshot's rows and the
+    /// selection both count in. Unfocused tiles never take input directly: a
+    /// click on one focuses it first, and the keystroke goes to the second
+    /// click. That ordering is what keeps a click aimed at one pane from being
+    /// typed into another.
     fn in_pane(&self, row: u16, col: u16) -> Option<(usize, usize)> {
+        if self.focused == 0 {
+            return None;
+        }
+        let (terminal, _, local) = self.tile_at_screen(row, col)?;
+        (terminal == self.focused).then_some(local)
+    }
+
+    /// Which visible tile a one based screen position lands in, with tile-local
+    /// coordinates. Divider cells answer `None`.
+    fn tile_at_screen(&self, row: u16, col: u16) -> Option<TileHit> {
         let (pane_cols, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
         let left = screen::left_for(self.cols, self.collapsed);
         let first_col = left + 1;
@@ -254,7 +309,31 @@ impl State {
             return None;
         }
         let within = (row as usize).checked_sub(screen::TABS + 1)?;
-        (within < pane_rows as usize).then_some((within, col as usize - first_col))
+        if within >= pane_rows as usize {
+            return None;
+        }
+        let x = col as usize - first_col;
+        if self.focused == 0 {
+            return None;
+        }
+        if let Some(space) = self.space
+            && let Some(layout) = self.layouts.get(&space)
+        {
+            let area = layout::Rect {
+                x: 0,
+                y: 0,
+                cols: pane_cols as usize,
+                rows: pane_rows as usize,
+            };
+            let hit = layout.hit(area, x, within)?;
+            let rect = layout
+                .tile_rects(area)
+                .into_iter()
+                .find(|(t, _)| *t == hit)
+                .map(|(_, r)| r)?;
+            return Some((hit, (within, x), (within - rect.y, x - rect.x)));
+        }
+        Some((self.focused, (within, x), (within, x)))
     }
 
     /// How many of the pane's rows come from behind the screen.
@@ -717,6 +796,9 @@ async fn drive(
         rows: Vec::new(),
         focused: 0,
         snapshot: None,
+        snapshots: std::collections::BTreeMap::new(),
+        subs: std::collections::BTreeSet::new(),
+        layouts: std::collections::BTreeMap::new(),
         cols,
         lines,
         // What the caller wanted said, or that this is connecting. A notice about a
@@ -846,25 +928,21 @@ async fn drive(
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
-                    let (pane_cols, pane_rows) = screen::pane_size(cols, lines);
-                    // The focused terminal only. A resize is a claim about the window the
+                    // The focused tile only. A resize is a claim about the window the
                     // person is looking at, and sending it to every terminal would reflow
                     // the ones they are not.
-                    let focused = state.focused;
-                    wr.write_all(&client::encode_command_to(
-                        focused,
-                        &ClientWire::Resize { cols: pane_cols, rows: pane_rows },
-                        seqs.entry(focused).or_default(),
-                    )?).await?;
+                    if let Some(resize) = resize_focused_to_tile(&state, &mut seqs)? {
+                        wr.write_all(&resize).await?;
+                    }
                     // A taller window reads further back, and what was fetched for the
                     // shorter one stops at the row the shorter one needed: without asking
                     // again, growing the window while scrolled back fills the new rows at
                     // the top with blanks until the person turns the wheel.
-                    if state.anchor.is_some() && focused != 0 {
+                    if state.anchor.is_some() && state.focused != 0 {
                         let want = behind_request(
-                            focused,
+                            state.focused,
                             state.rows_back() as usize,
-                            pane_rows as usize,
+                            focused_rect(&state).rows,
                         );
                         wr.write_all(&client::encode_control_seq(&want, &mut control_seq)?)
                             .await?;
@@ -1053,13 +1131,34 @@ async fn drive(
                             }
                             Action::Detach => return Ok(()),
                             Action::Click { row, col, shift } => {
-                                // In the pane, and the program in it has not taken the
-                                // mouse, or the person said this one is theirs: a press
-                                // starts a selection rather than reaching anything.
-                                if let Some((pane_row, pane_col)) = state.in_pane(row, col) {
+                                // A tiled pane first. A click on an unfocused tile only
+                                // focuses it: the click itself goes nowhere, so coordinates
+                                // aimed at one pane are never typed into another. The
+                                // keystroke goes to the second click.
+                                if let Some((terminal, _, (tile_row, tile_col))) =
+                                    state.tile_at_screen(row, col)
+                                {
+                                    if terminal != state.focused {
+                                        if terminal != 0
+                                            && let Some(bytes) = focus(
+                                                &mut state,
+                                                terminal,
+                                                &mut control_seq,
+                                                &mut seqs,
+                                            )?
+                                        {
+                                            wr.write_all(&bytes).await?;
+                                            dirty = true;
+                                        }
+                                        continue;
+                                    }
+                                    // In the focused pane, and the program in it has not
+                                    // taken the mouse, or the person said this one is
+                                    // theirs: a press starts a selection rather than
+                                    // reaching anything.
                                     if state.pane_wants_mouse() && !shift {
                                         if let Some(bytes) =
-                                            mouse_report(0, pane_row, pane_col, true)
+                                            mouse_report(0, tile_row, tile_col, true)
                                         {
                                             send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
                                                 .await?;
@@ -1067,7 +1166,7 @@ async fn drive(
                                     } else {
                                         state.selection =
                                             Some(crate::selection::Selection::start(
-                                                pane_row, pane_col,
+                                                tile_row, tile_col,
                                             ));
                                         dirty = true;
                                     }
@@ -1115,18 +1214,10 @@ async fn drive(
                                         // The pane's width changed with the column, and a
                                         // child that is not told reflows its output against
                                         // a width it no longer has.
-                                        let (cols, rows) = screen::pane_size_for(
-                                            state.cols,
-                                            state.lines,
-                                            state.collapsed,
-                                        );
-                                        let focused = state.focused;
-                                        if focused != 0 {
-                                            wr.write_all(&client::encode_command_to(
-                                                focused,
-                                                &ClientWire::Resize { cols, rows },
-                                                seqs.entry(focused).or_default(),
-                                            )?).await?;
+                                        if let Some(resize) =
+                                            resize_focused_to_tile(&state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
                                         }
                                         dirty = true;
                                     }
@@ -1161,13 +1252,10 @@ async fn drive(
                                     // live screen: scrolled back, the rows under the
                                     // pointer are rows that went past, and copying the
                                     // live screen instead would hand the person text they
-                                    // never saw.
-                                    let (pane_cols, pane_rows) = screen::pane_size_for(
-                                        state.cols,
-                                        state.lines,
-                                        state.collapsed,
-                                    );
-                                    let window: Vec<String> = (0..pane_rows as usize)
+                                    // never saw. Sized to the focused tile, like the
+                                    // selection itself.
+                                    let tile = focused_rect(&state);
+                                    let window: Vec<String> = (0..tile.rows)
                                         .map(|row| {
                                             screen::window_row(
                                                 state.snapshot.as_ref(),
@@ -1180,7 +1268,7 @@ async fn drive(
                                             .to_string()
                                         })
                                         .collect();
-                                    let text = selection.text(&window, pane_cols as usize);
+                                    let text = selection.text(&window, tile.cols);
                                     if !text.is_empty() {
                                         let mut out = std::io::stdout();
                                         crate::selection::copy(&text, &mut out)?;
@@ -1239,12 +1327,8 @@ async fn drive(
                                     // A shell on the ordinary screen. Arrow keys here
                                     // would walk the command history, so the wheel moves
                                     // this client's own view back through what has
-                                    // scrolled past instead.
-                                    let (_, pane_rows) = screen::pane_size_for(
-                                        state.cols,
-                                        state.lines,
-                                        state.collapsed,
-                                    );
+                                    // scrolled past instead. Sized to the focused tile.
+                                    let tile_rows = focused_rect(&state).rows;
                                     // The row the top of the pane is pinned to. Moving
                                     // the wheel moves the pin, and everything else about
                                     // the view follows from where it is.
@@ -1271,7 +1355,7 @@ async fn drive(
                                         let want = behind_request(
                                             state.focused,
                                             state.rows_back() as usize,
-                                            pane_rows as usize,
+                                            tile_rows,
                                         );
                                         wr.write_all(&client::encode_control_seq(
                                             &want,
@@ -1357,19 +1441,12 @@ async fn drive(
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
-                                // longer has.
-                                let (cols, rows) = screen::pane_size_for(
-                                    state.cols,
-                                    state.lines,
-                                    state.collapsed,
-                                );
-                                let focused = state.focused;
-                                if focused != 0 {
-                                    wr.write_all(&client::encode_command_to(
-                                        focused,
-                                        &ClientWire::Resize { cols, rows },
-                                        seqs.entry(focused).or_default(),
-                                    )?).await?;
+                                // longer has. Only the focused tile is told: the others
+                                // are viewport-cropped.
+                                if let Some(resize) =
+                                    resize_focused_to_tile(&state, &mut seqs)?
+                                {
+                                    wr.write_all(&resize).await?;
                                 }
                                 dirty = true;
                             }
@@ -1408,6 +1485,154 @@ async fn drive(
                                 state.fold.toggle_all();
                                 dirty = true;
                             }
+                            Action::SplitV | Action::SplitH => {
+                                let dir = if matches!(action, Action::SplitV) {
+                                    layout::Dir::V
+                                } else {
+                                    layout::Dir::H
+                                };
+                                let focused = state.focused;
+                                let space = state.space;
+                                if focused == 0 {
+                                    state.message = Some(
+                                        "nothing to split, ctrl-a c starts a terminal"
+                                            .to_string(),
+                                    );
+                                    dirty = true;
+                                } else {
+                                    ensure_layout(&mut state);
+                                    let area = pane_area(&state);
+                                    let placed = space
+                                        .and_then(|s| state.layouts.get_mut(&s))
+                                        .is_some_and(|layout| {
+                                            layout.split_placeholder(focused, dir, area)
+                                        });
+                                    if !placed {
+                                        state.message = Some(
+                                            "cannot split now: too small, zoomed, or one already on its way"
+                                                .to_string(),
+                                        );
+                                        dirty = true;
+                                    } else {
+                                        // The tree entry goes in first and the terminal
+                                        // follows: binding happens when `TerminalCreated`
+                                        // answers, rollback when it fails.
+                                        request += 1;
+                                        wr.write_all(&client::encode_control_seq(
+                                            &ControlRequest::CreateTerminal {
+                                                id: format!("split-{request}"),
+                                                cwd: None,
+                                                workspace: space,
+                                                name: None,
+                                            },
+                                            &mut control_seq,
+                                        )?).await?;
+                                    }
+                                }
+                            }
+                            Action::PaneMove(mv) => {
+                                let target = state.space.and_then(|space| {
+                                    state.layouts.get(&space).and_then(|layout| {
+                                        layout::neighbour_in_dir(
+                                            &layout.tile_rects(pane_area(&state)),
+                                            state.focused,
+                                            mv,
+                                        )
+                                    })
+                                });
+                                if let Some(next) = target
+                                    && let Some(bytes) =
+                                        focus(&mut state, next, &mut control_seq, &mut seqs)?
+                                {
+                                    wr.write_all(&bytes).await?;
+                                    dirty = true;
+                                }
+                            }
+                            Action::PaneNext => {
+                                let target = state.space.and_then(|space| {
+                                    state.layouts.get(&space).and_then(|layout| {
+                                        let visible = layout.visible();
+                                        if visible.len() < 2 {
+                                            return None;
+                                        }
+                                        let at = visible
+                                            .iter()
+                                            .position(|t| *t == state.focused)
+                                            .unwrap_or(0);
+                                        Some(visible[(at + 1) % visible.len()])
+                                    })
+                                });
+                                if let Some(next) = target
+                                    && let Some(bytes) =
+                                        focus(&mut state, next, &mut control_seq, &mut seqs)?
+                                {
+                                    wr.write_all(&bytes).await?;
+                                    dirty = true;
+                                }
+                            }
+                            Action::Zoom => {
+                                let space = state.space;
+                                let zoomed = match space
+                                    .and_then(|s| state.layouts.get_mut(&s))
+                                {
+                                    Some(layout) => layout.toggle_zoom(),
+                                    None => false,
+                                };
+                                if zoomed {
+                                    // Hidden tiles are unsubscribed with the sync below:
+                                    // their output costs nothing while zoomed, at the
+                                    // price of one `Refresh` each on the way back.
+                                    let mut out = BytesMut::new();
+                                    if let Some(sync) = sync_subs(&mut state, &mut control_seq)? {
+                                        out.extend_from_slice(&sync);
+                                    }
+                                    if let Some(resize) =
+                                        resize_focused_to_tile(&state, &mut seqs)?
+                                    {
+                                        out.extend_from_slice(&resize);
+                                    }
+                                    if !out.is_empty() {
+                                        wr.write_all(&out).await?;
+                                    }
+                                    dirty = true;
+                                }
+                            }
+                            Action::DetachPane => {
+                                let focused = state.focused;
+                                let space = state.space;
+                                // Detaching the last pane would leave a tree with no
+                                // leaves over a space that still has a terminal: refuse
+                                // instead, `ctrl-a x` is the way to close it.
+                                let next = match space
+                                    .and_then(|s| state.layouts.get_mut(&s))
+                                {
+                                    Some(layout) if layout.leaf_count() > 1 => {
+                                        layout.remove(focused);
+                                        Some(layout.focus)
+                                    }
+                                    _ => None,
+                                };
+                                match next {
+                                    Some(next) => {
+                                        if let Some(bytes) = focus(
+                                            &mut state,
+                                            next,
+                                            &mut control_seq,
+                                            &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                            dirty = true;
+                                        }
+                                    }
+                                    None => {
+                                        state.message = Some(
+                                            "only one pane, ctrl-a x closes its terminal"
+                                                .to_string(),
+                                        );
+                                        dirty = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     }
@@ -1435,13 +1660,33 @@ async fn drive(
                                 // this client has just dropped would otherwise paint
                                 // another space's terminal under this space's tab bar, and
                                 // silently put the keyboard back in it.
-                                if terminal == state.focused
-                                    || (state.focused == 0 && !state.adopted)
+                                if terminal == state.focused {
+                                    state.snapshot = Some(snapshot);
+                                    state.message = None;
+                                    dirty = true;
+                                } else if state.subs.contains(&terminal)
+                                    && state
+                                        .rows
+                                        .iter()
+                                        .any(|r| r.terminal == terminal && Some(r.workspace) == state.space)
                                 {
+                                    // A visible onlooker in this space: kept for its tile,
+                                    // never promoted, never scrolled. Anything else is a
+                                    // render from a dropped subscription or another space
+                                    // and is ignored.
+                                    state.snapshots.insert(terminal, snapshot);
+                                    dirty = true;
+                                } else if state.focused == 0 && !state.adopted {
                                     state.adopted = true;
                                     state.focused = terminal;
                                     state.snapshot = Some(snapshot);
                                     state.message = None;
+                                    // Bootstrap the tiling state to match: one pane, one
+                                    // subscription.
+                                    if let Some(space) = state.space {
+                                        state.layouts.insert(space, Layout::single(terminal));
+                                        state.subs.insert(terminal);
+                                    }
                                     dirty = true;
                                 }
                             }
@@ -1685,6 +1930,132 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
 /// Those four drifted apart once already: a click cleared the message and a key binding did
 /// not, so the same move left different text on the status line depending on how it was
 /// made.
+///
+/// The pane area in its own cells, shared by every tile rect.
+fn pane_area(state: &State) -> layout::Rect {
+    let (cols, rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed);
+    layout::Rect {
+        x: 0,
+        y: 0,
+        cols: cols as usize,
+        rows: rows as usize,
+    }
+}
+
+/// The rectangle of the focused terminal, or the whole pane when there is no
+/// tiling tree for this space.
+fn focused_rect(state: &State) -> layout::Rect {
+    let area = pane_area(state);
+    if state.focused == 0 {
+        return area;
+    }
+    let Some(space) = state.space else {
+        return area;
+    };
+    state
+        .layouts
+        .get(&space)
+        .and_then(|layout| {
+            layout
+                .tile_rects(area)
+                .into_iter()
+                .find(|(t, _)| *t == state.focused)
+                .map(|(_, r)| r)
+        })
+        .unwrap_or(area)
+}
+
+/// Make sure the space on screen has a tiling tree, seeding a single pane
+/// from the focused terminal (or the first tab) when it has none.
+fn ensure_layout(state: &mut State) {
+    let Some(space) = state.space else {
+        return;
+    };
+    if state.layouts.contains_key(&space) {
+        return;
+    }
+    let tabs = state.tabs();
+    let seed = tabs
+        .iter()
+        .find(|r| r.terminal == state.focused)
+        .or_else(|| tabs.first())
+        .map(|r| r.terminal)
+        .unwrap_or(0);
+    if seed == 0 {
+        return;
+    }
+    state.layouts.insert(space, Layout::single(seed));
+}
+
+/// Visible terminals of the space on screen: the layout's, or the focused one
+/// when there is no tree yet.
+fn visible_set(state: &State) -> Vec<u32> {
+    if let Some(space) = state.space
+        && let Some(layout) = state.layouts.get(&space)
+    {
+        return layout.visible();
+    }
+    if state.focused != 0 {
+        vec![state.focused]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Bring subscriptions to exactly the visible set, in one write. `None` when
+/// already there, so moving the focus inside the visible set costs no control
+/// traffic and no `Refresh` storm.
+fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
+    let want: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
+    if want == state.subs {
+        return Ok(None);
+    }
+    let drop: Vec<u32> = state.subs.difference(&want).copied().collect();
+    let add: Vec<u32> = want.difference(&state.subs).copied().collect();
+    state.subs = want;
+    let mut out = BytesMut::new();
+    if !drop.is_empty() {
+        out.extend_from_slice(&client::encode_control_seq(
+            &ControlRequest::Unsubscribe {
+                id: "hide-tiles".to_string(),
+                terminals: drop,
+            },
+            control_seq,
+        )?);
+    }
+    if !add.is_empty() {
+        out.extend_from_slice(&client::encode_control_seq(
+            &ControlRequest::Subscribe {
+                id: "show-tiles".to_string(),
+                terminals: add,
+            },
+            control_seq,
+        )?);
+    }
+    Ok(Some(out))
+}
+
+/// Resize the focused terminal to its own tile. The only resize this client
+/// sends for tiling: unfocused tiles are viewport-cropped and never resized,
+/// which is what keeps the single-owner rule of ADR-007 intact.
+fn resize_focused_to_tile(
+    state: &State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    if state.focused == 0 {
+        return Ok(None);
+    }
+    let rect = focused_rect(state);
+    Ok(Some(client::encode_command_to(
+        state.focused,
+        &ClientWire::Resize {
+            cols: rect.cols as u16,
+            rows: rect.rows as u16,
+        },
+        seqs.entry(state.focused).or_default(),
+    )?))
+}
+
 fn focus(
     state: &mut State,
     to: u32,
@@ -1694,36 +2065,62 @@ fn focus(
     if to == 0 || to == state.focused {
         return Ok(None);
     }
-    // Another terminal's screen, and another terminal's history. Both are dropped rather
-    // than carried, or the new tab opens scrolled into rows that are not its own.
-    state.anchor = None;
-    state.behind = Behind::default();
-    state.selection = None;
-    let mut out = switch(state.focused, to, control_seq)?;
-    let (pane_cols, pane_rows) = screen::pane_size(state.cols, state.lines);
-    out.extend_from_slice(&client::encode_command_to(
-        to,
-        &ClientWire::Resize {
-            cols: pane_cols,
-            rows: pane_rows,
-        },
-        seqs.entry(to).or_default(),
-    )?);
-    state.focused = to;
-    // Dropped rather than kept: it belongs to the terminal being left, and painting it
-    // under the new tab would show a person the wrong screen until the first render
-    // arrives.
-    state.snapshot = None;
-    state.message = None;
-    // The space follows the terminal. A click in the agents panel can land on an agent in
-    // another space, which is the point of that panel crossing spaces, and leaving the bar
-    // on the old space would show tabs that do not contain the focused one.
+    let from = state.focused;
+    // The space follows the terminal, first of all: a click in the agents
+    // panel can land on an agent in another space, which is the point of that
+    // panel crossing spaces, and every layout and subscription below is per
+    // space. Leaving the bar on the old space would show tabs that do not
+    // contain the focused one.
     state.space = state
         .rows
         .iter()
         .find(|r| r.terminal == to)
         .map(|r| r.workspace)
         .or(state.space);
+    // A tab outside the tiling tree drops the tree back to a single pane:
+    // tabs name every terminal in the space, tiles only the visible ones.
+    if let Some(space) = state.space {
+        ensure_layout(state);
+        if let Some(layout) = state.layouts.get_mut(&space) {
+            if layout.contains(to) {
+                layout.focus_terminal(to);
+            } else {
+                state.layouts.insert(space, Layout::single(to));
+            }
+        }
+    }
+    // Promote the already-visible snapshot instead of waiting for the next
+    // render: the subscription never dropped, so the picture is fresh.
+    if let Some(snap) = state.snapshots.remove(&to) {
+        if let Some(old) = state.snapshot.take() {
+            state.snapshots.insert(from, old);
+        }
+        state.snapshot = Some(snap);
+    } else {
+        // Another terminal's screen, and another terminal's history. Both are
+        // dropped rather than carried, or the new tab opens scrolled into rows
+        // that are not its own.
+        if let Some(old) = state.snapshot.take() {
+            state.snapshots.insert(from, old);
+        }
+        state.snapshot = None;
+    }
+    state.anchor = None;
+    state.behind = Behind::default();
+    state.selection = None;
+    state.focused = to;
+    // Dropped from the onlookers: a snapshot kept past its unsubscription is
+    // a screen that can never update again.
+    let visible: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
+    state.snapshots.retain(|t, _| visible.contains(t));
+    let mut out = BytesMut::new();
+    if let Some(sync) = sync_subs(state, control_seq)? {
+        out.extend_from_slice(&sync);
+    }
+    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+        out.extend_from_slice(&resize);
+    }
+    state.message = None;
     Ok(Some(out))
 }
 
@@ -1739,7 +2136,32 @@ fn enter_space(
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
     state.space = Some(space);
-    match state.tabs().first().map(|r| r.terminal) {
+    ensure_layout(state);
+    // The layout's visible terminals first, so a tiled space comes back as it
+    // was left; the tab list only when the tree names nothing alive.
+    let first = state
+        .layouts
+        .get(&space)
+        .and_then(|layout| {
+            layout
+                .visible()
+                .into_iter()
+                .find(|t| state.tabs().iter().any(|r| r.terminal == *t))
+        })
+        .or_else(|| state.tabs().first().map(|r| r.terminal));
+    match first {
+        // Already there: the subscriptions still name the old space, so sync
+        // and resize even though the focus does not move.
+        Some(first) if first == state.focused => {
+            let mut out = BytesMut::new();
+            if let Some(sync) = sync_subs(state, control_seq)? {
+                out.extend_from_slice(&sync);
+            }
+            if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+                out.extend_from_slice(&resize);
+            }
+            Ok(Some(out))
+        }
         Some(first) => focus(state, first, control_seq, seqs),
         None => unfocus(
             state,
@@ -1756,48 +2178,23 @@ fn enter_space(
 /// output painting under this space's tab bar, and left `ctrl-a x` closing it. Nothing on
 /// screen said any of that was happening.
 fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
-    let was = std::mem::replace(&mut state.focused, 0);
+    state.focused = 0;
     state.snapshot = None;
     state.message = Some(why.to_string());
-    if was == 0 {
+    // Every subscription goes, not just the focused one: with tiling the
+    // client can watch several terminals, and leaving any of them subscribed
+    // paints output from a space the person has left.
+    let drop: Vec<u32> = std::mem::take(&mut state.subs).into_iter().collect();
+    if drop.is_empty() {
         return Ok(None);
     }
     Ok(Some(client::encode_control_seq(
         &ControlRequest::Unsubscribe {
-            id: format!("hide-{was}"),
-            terminals: vec![was],
+            id: "hide-tiles".to_string(),
+            terminals: drop,
         },
         control_seq,
     )?))
-}
-
-/// Stop watching one terminal and start watching another, in one write.
-///
-/// Both halves together, because a client that subscribes before it unsubscribes is a
-/// client that receives renders for a terminal nobody is looking at, and hidden output not
-/// costing anything is the whole point of the subscription.
-fn switch(from: u32, to: u32, control_seq: &mut u32) -> io::Result<BytesMut> {
-    // Zero is not a terminal, it is this client having nothing on screen, so there is
-    // nothing to stop watching.
-    let mut out = if from == 0 {
-        BytesMut::new()
-    } else {
-        client::encode_control_seq(
-            &ControlRequest::Unsubscribe {
-                id: format!("hide-{from}"),
-                terminals: vec![from],
-            },
-            control_seq,
-        )?
-    };
-    out.extend_from_slice(&client::encode_control_seq(
-        &ControlRequest::Subscribe {
-            id: format!("show-{to}"),
-            terminals: vec![to],
-        },
-        control_seq,
-    )?);
-    Ok(out)
 }
 
 /// Fold one answer into what is on screen.
@@ -1844,6 +2241,15 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.creating = state.creating.saturating_sub(1);
             state.space = Some(workspace);
             state.snapshot = None;
+            // A new space starts bare: no tree, and forget the old subs. The
+            // unsubscribe itself cannot go out from here (`apply` cannot
+            // write), so it queues behind the terminal request the new space
+            // always triggers: `wants_terminal_in` drains with a write in
+            // hand, and the render filter below drops the old space's renders
+            // by space in the meantime.
+            state.layouts.remove(&workspace);
+            state.subs.clear();
+            state.snapshots.clear();
             // Asked for here rather than by the caller, because a space with no terminal in
             // it shows an empty pane and a bar with only a `+` on it, and the first thing
             // anybody does in a new space is start a terminal.
@@ -1871,13 +2277,47 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // the keyboard up with it. Measured before this: typing `exit` took the tab off
             // the bar and left the focus on a terminal that no longer existed, with the dead
             // screen still painted and every keystroke going nowhere.
+            //
+            // Tiling trees are pruned here too, in every space: a leaf nobody can focus
+            // is a zombie pane. Layouts left with no leaves and no pending split go
+            // away entirely, so the next focus reseeds a single pane.
+            for layout in state.layouts.values_mut() {
+                let dead: Vec<u32> = layout
+                    .leaves()
+                    .into_iter()
+                    .filter(|t| !agents.iter().any(|r| r.terminal == *t))
+                    .collect();
+                for terminal in dead {
+                    layout.remove(terminal);
+                }
+            }
+            state
+                .layouts
+                .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+            // TerminalClosed and Agents prune the local set silently: the
+            // daemon ended the terminal, which ends its subscription
+            // server-side too, so there is nothing to unsubscribe from. The
+            // assumption is one-directional on purpose: pruning an id the
+            // daemon still streams would resurface as a render for an unknown
+            // terminal, which the filter above drops.
+            let live: std::collections::BTreeSet<u32> = agents.iter().map(|r| r.terminal).collect();
+            state.snapshots.retain(|t, _| live.contains(t));
+            state.subs.retain(|t| live.contains(t));
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 state.focused = 0;
                 state.snapshot = None;
-                state.pending_focus = agents
-                    .iter()
-                    .find(|r| state.space.is_none_or(|s| r.workspace == s))
-                    .map(|r| r.terminal);
+                // The tree already picked the neighbour; fall back to the tab list
+                // only when the tree names nothing alive.
+                state.pending_focus = state
+                    .space
+                    .and_then(|space| state.layouts.get(&space))
+                    .and_then(|layout| layout.visible().into_iter().find(|t| live.contains(t)))
+                    .or_else(|| {
+                        agents
+                            .iter()
+                            .find(|r| state.space.is_none_or(|s| r.workspace == s))
+                            .map(|r| r.terminal)
+                    });
                 if state.pending_focus.is_none() {
                     state.message =
                         Some("this space is empty, ctrl-a c starts a terminal".to_string());
@@ -1906,16 +2346,52 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // Heal the bootstrap gap: the very first answers can arrive in any
+            // order, and a focus without a tree paints the legacy single pane
+            // while watching nothing the sync below can see. Trees are only
+            // seeded here, never disturbed: an existing layout is left alone.
+            // Subscriptions are NOT filled here: filling `subs` without a
+            // `Subscribe` on the wire makes the next `sync_subs` believe the
+            // daemon is already sending, and the pane stays dark. The first
+            // real focus or space entry sends the subscribe.
+            if state.focused != 0 {
+                ensure_layout(state);
+            }
             *dirty = true;
         }
         ControlResponse::TerminalCreated { terminal, .. } => {
-            // The caller subscribes: a new terminal that the client is not watching draws
-            // the terminal it came from, which is what the first version did.
+            // A split waiting for its terminal binds first, in the space on
+            // screen only: the placeholder was made there, and binding another
+            // space's placeholder would strand a foreign terminal in a tree
+            // that cannot see it. Anything else is an ordinary new tab.
+            let bound = state
+                .space
+                .and_then(|space| state.layouts.get_mut(&space))
+                .is_some_and(|layout| layout.bind_placeholder(terminal));
+            if !bound {
+                // The caller subscribes: a new terminal that the client is not
+                // watching draws the terminal it came from, which is what the
+                // first version did.
+                state.snapshot = None;
+            }
             state.pending_focus = Some(terminal);
-            state.snapshot = None;
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
+            // Out of every tree, so no space keeps a pane nobody can focus.
+            // Trees left with no leaves and no pending split go away, and the
+            // unsubscription of a tile nobody watches piggybacks on the next
+            // sync: the daemon already ended the terminal itself.
+            for layout in state.layouts.values_mut() {
+                layout.remove(terminal);
+            }
+            state
+                .layouts
+                .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+            state.snapshots.remove(&terminal);
+            // The daemon ended the terminal, which ends its subscription
+            // server-side too: pruning the local set without a goodbye write.
+            state.subs.remove(&terminal);
             if terminal == state.focused {
                 state.snapshot = None;
                 // From this space, and through the subscription path, which is why it is a
@@ -1923,14 +2399,27 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 // `rows` put the keyboard in another space without moving the tab bar
                 // there, and assigning it directly left the client unsubscribed, so the
                 // pane stayed empty until something else happened to move the focus.
+                // The tree already picked the neighbour; the tab list is the fallback.
                 state.focused = 0;
                 state.pending_focus = state
-                    .rows
-                    .iter()
-                    .find(|r| {
-                        r.terminal != terminal && state.space.is_none_or(|s| r.workspace == s)
+                    .space
+                    .and_then(|space| state.layouts.get(&space))
+                    .and_then(|layout| {
+                        layout
+                            .visible()
+                            .into_iter()
+                            .find(|t| state.rows.iter().any(|r| r.terminal == *t))
                     })
-                    .map(|r| r.terminal);
+                    .or_else(|| {
+                        state
+                            .rows
+                            .iter()
+                            .find(|r| {
+                                r.terminal != terminal
+                                    && state.space.is_none_or(|s| r.workspace == s)
+                            })
+                            .map(|r| r.terminal)
+                    });
                 if state.pending_focus.is_none() {
                     state.message =
                         Some("this space is empty, ctrl-a c starts a terminal".to_string());
@@ -1938,7 +2427,16 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             }
             *dirty = true;
         }
-        ControlResponse::Failed { reason, .. } => {
+        ControlResponse::Failed { id, reason, .. } => {
+            // A split whose spawn failed rolls its tree entry back, in the
+            // space on screen only: one failure must not clear another space's
+            // split still on its way.
+            if id.starts_with("split-")
+                && let Some(space) = state.space
+                && let Some(layout) = state.layouts.get_mut(&space)
+            {
+                layout.drop_placeholder();
+            }
             // Shown rather than swallowed. A refusal a person cannot see is a client that
             // looks broken instead of a daemon that said no.
             state.message = Some(reason);
@@ -2005,6 +2503,9 @@ mod tests {
             selection: None,
             anchor: None,
             behind: Behind::default(),
+            snapshots: std::collections::BTreeMap::new(),
+            subs: std::collections::BTreeSet::new(),
+            layouts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2197,6 +2698,9 @@ mod tests {
             rows: Vec::new(),
             focused: 1,
             snapshot: None,
+            snapshots: std::collections::BTreeMap::new(),
+            subs: std::collections::BTreeSet::new(),
+            layouts: std::collections::BTreeMap::new(),
             cols: 80,
             lines: 24,
             message: None,
@@ -2233,5 +2737,211 @@ mod tests {
             modes: Default::default(),
             behind,
         }
+    }
+
+    fn tiled_state() -> State {
+        // Space 1 with two terminals side by side, 1 focused, both watched.
+        let mut state = State {
+            rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
+            focused: 1,
+            snapshot: Some(snapshot_with_behind(0)),
+            snapshots: std::collections::BTreeMap::from([(2, snapshot_with_behind(0))]),
+            subs: std::collections::BTreeSet::from([1, 2]),
+            layouts: std::collections::BTreeMap::new(),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            pending_focus: None,
+            spaces: vec![space(1, "app")],
+            space: Some(1),
+            was: Default::default(),
+            ring: false,
+            wants_terminal_in: Vec::new(),
+            adopted: true,
+            creating: 0,
+            done: false,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            fold: sidebar::Fold::default(),
+            palette: None,
+            palette_pending: Vec::new(),
+            selection: None,
+            anchor: None,
+            behind: Behind::default(),
+        };
+        let area = pane_area(&state);
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, layout::Dir::V, area));
+        assert!(layout.bind_placeholder(2));
+        layout.focus_terminal(1);
+        state.layouts.insert(1, layout);
+        state
+    }
+
+    #[test]
+    fn moving_focus_inside_the_visible_set_resubscribes_nothing() {
+        let mut state = tiled_state();
+        let mut control_seq = 0;
+        // Already watching exactly the visible set.
+        assert!(sync_subs(&mut state, &mut control_seq).unwrap().is_none());
+        let mut seqs = std::collections::BTreeMap::new();
+        let before = control_seq;
+        let out = focus(&mut state, 2, &mut control_seq, &mut seqs)
+            .unwrap()
+            .expect("focus moves");
+        // No control traffic: only the resize to the newly focused tile.
+        assert_eq!(control_seq, before, "a subscribe slipped in: {out:?}");
+        assert!(!out.is_empty(), "the focused tile was never resized");
+        assert_eq!(state.focused, 2);
+    }
+
+    #[test]
+    fn focusing_a_visible_pane_promotes_its_snapshot() {
+        let mut state = tiled_state();
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 2, &mut control_seq, &mut seqs).unwrap();
+        // Terminal 2's picture was already here and is now the screen; terminal
+        // 1's waits in the map instead of being thrown away.
+        assert_eq!(state.snapshot.as_ref().map(|s| s.behind), Some(0));
+        assert!(state.snapshots.contains_key(&1));
+        assert!(!state.snapshots.contains_key(&2));
+    }
+
+    #[test]
+    fn focusing_a_tab_outside_the_tree_drops_back_to_a_single_pane() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![3]));
+        assert_eq!(state.subs, std::collections::BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn a_closed_terminal_leaves_no_zombie_pane() {
+        let mut state = tiled_state();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalClosed {
+                id: "x".to_string(),
+                terminal: 2,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1]));
+        assert!(!state.snapshots.contains_key(&2));
+        assert!(!state.subs.contains(&2));
+    }
+
+    #[test]
+    fn a_failed_split_rolls_its_tree_entry_back() {
+        let mut state = tiled_state();
+        let area = pane_area(&state);
+        // The tree holds two bound leaves, so this placeholder lands on
+        // terminal 1's tile.
+        assert!(
+            state
+                .layouts
+                .get_mut(&1)
+                .unwrap()
+                .split_placeholder(1, layout::Dir::H, area)
+        );
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: "split-9".to_string(),
+                reason: "no".to_string(),
+            },
+            &mut dirty,
+        );
+        assert!(!state.layouts.get(&1).unwrap().has_pending());
+        assert_eq!(state.message.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn clicks_find_their_tile_and_dividers_find_none() {
+        let state = tiled_state();
+        let left = screen::left_for(80, false);
+        let first_col = left + 1;
+        // Top-left cell of the pane is terminal 1's tile.
+        let hit = state.tile_at_screen((screen::TABS + 1) as u16, first_col as u16);
+        assert_eq!(hit.map(|h| h.0), Some(1));
+        // The divider column between the two tiles belongs to no pane.
+        let rects = state.layouts.get(&1).unwrap().tile_rects(pane_area(&state));
+        let left_rect = rects.iter().find(|(t, _)| *t == 1).unwrap().1;
+        let divider_col = (first_col + left_rect.cols) as u16;
+        assert_eq!(
+            state.tile_at_screen((screen::TABS + 1) as u16, divider_col),
+            None
+        );
+        // And the focused tile answers tile-local coordinates.
+        assert_eq!(
+            state.in_pane((screen::TABS + 1) as u16, first_col as u16),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_names_no_tile() {
+        let mut state = tiled_state();
+        state.focused = 0;
+        let left = screen::left_for(80, false);
+        assert_eq!(
+            state.tile_at_screen((screen::TABS + 1) as u16, (left + 1) as u16),
+            None
+        );
+        assert_eq!(
+            state.in_pane((screen::TABS + 1) as u16, (left + 1) as u16),
+            None
+        );
+    }
+
+    #[test]
+    fn a_new_space_starts_bare_and_forgets_the_old_subscriptions() {
+        let mut state = tiled_state();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::WorkspaceCreated {
+                id: "w".to_string(),
+                workspace: 2,
+            },
+            &mut dirty,
+        );
+        assert!(!state.layouts.contains_key(&2));
+        assert!(state.subs.is_empty());
+        assert!(state.snapshots.is_empty());
+        assert_eq!(state.wants_terminal_in, vec![2]);
+    }
+
+    #[test]
+    fn binds_only_happen_in_the_space_on_screen() {
+        let mut state = tiled_state();
+        state.space = Some(1);
+        state.layouts.insert(2, Layout::single(9));
+        let area = pane_area(&state);
+        state
+            .layouts
+            .get_mut(&1)
+            .unwrap()
+            .split_placeholder(1, layout::Dir::H, area);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "t".to_string(),
+                terminal: 3,
+            },
+            &mut dirty,
+        );
+        assert!(state.layouts.get(&1).unwrap().contains(3));
+        assert!(!state.layouts.get(&2).unwrap().contains(3));
     }
 }

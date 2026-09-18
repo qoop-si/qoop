@@ -103,6 +103,22 @@ pub enum Action {
     Palette,
     /// ctrl-a f: fold the idle groups away, or bring them all back.
     FoldAll,
+    /// ctrl-a v: split the focused pane side by side.
+    SplitV,
+    /// ctrl-a -: split the focused pane stacked.
+    SplitH,
+    /// ctrl-a H/J/K/L: focus the pane left/down/up/right.
+    ///
+    /// Uppercase on purpose: lowercase `l` is redraw, and the four directions
+    /// stay together rather than splitting one of them onto another letter.
+    PaneMove(crate::layout::Move),
+    /// ctrl-a o: focus the next pane in tree order.
+    PaneNext,
+    /// ctrl-a z: zoom the focused pane, or go back.
+    Zoom,
+    /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
+    /// alive as a tab. Lowercase `x` keeps killing the terminal.
+    DetachPane,
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
@@ -239,6 +255,15 @@ impl Keys {
                     // biggest key.
                     b' ' => Action::Palette,
                     b'f' => Action::FoldAll,
+                    b'v' => Action::SplitV,
+                    b'-' => Action::SplitH,
+                    b'H' => Action::PaneMove(crate::layout::Move::Left),
+                    b'J' => Action::PaneMove(crate::layout::Move::Down),
+                    b'K' => Action::PaneMove(crate::layout::Move::Up),
+                    b'L' => Action::PaneMove(crate::layout::Move::Right),
+                    b'o' => Action::PaneNext,
+                    b'z' => Action::Zoom,
+                    b'X' => Action::DetachPane,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -337,7 +362,7 @@ mod tests {
     #[test]
     fn an_unknown_command_byte_is_discarded_and_never_reaches_the_terminal() {
         let mut keys = Keys::default();
-        assert_eq!(keys.feed(b"\x01z"), vec![]);
+        assert_eq!(keys.feed(b"\x01q"), vec![]);
         assert_eq!(keys.feed(b"ok"), vec![input(b"ok")], "the decoder is stuck");
     }
 
@@ -354,6 +379,34 @@ mod tests {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01N"), vec![], "uppercase acted as a command");
         assert_eq!(keys.feed(b"\x01n"), vec![Action::Next]);
+    }
+
+    #[test]
+    fn split_and_pane_commands_decode() {
+        use crate::layout::Move::{Down, Left, Right, Up};
+        let mut keys = Keys::default();
+        assert_eq!(
+            keys.feed(b"\x01v\x01-\x01H\x01J\x01K\x01L\x01o\x01z\x01X"),
+            vec![
+                Action::SplitV,
+                Action::SplitH,
+                Action::PaneMove(Left),
+                Action::PaneMove(Down),
+                Action::PaneMove(Up),
+                Action::PaneMove(Right),
+                Action::PaneNext,
+                Action::Zoom,
+                Action::DetachPane,
+            ]
+        );
+    }
+
+    #[test]
+    fn lowercase_l_stays_redraw_while_uppercase_l_moves_focus() {
+        use crate::layout::Move::Right;
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01l"), vec![Action::Redraw]);
+        assert_eq!(keys.feed(b"\x01L"), vec![Action::PaneMove(Right)]);
     }
 
     #[test]
