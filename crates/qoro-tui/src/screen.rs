@@ -2270,7 +2270,9 @@ mod tests {
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 80,
-            lines: 24,
+            // Room for two-line pairs: every open agent takes two rows, so
+            // the folded summary needs the height to fit without scrolling.
+            lines: 30,
             message: None,
             hint: None,
             fold: sidebar::Fold::default_closed(),

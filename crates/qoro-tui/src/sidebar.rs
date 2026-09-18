@@ -60,7 +60,7 @@ pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
 ///
 /// Thirty. A comparable multiplexer ships twenty six as a default a person can drag
 /// between eighteen and thirty six, and the wide end of that range is the right default
-/// here: this column carries a space name, a separator, a tab number and a state word
+/// here: this column carries a space name, a separator, a mark, a name and a state word
 /// flush against the right edge, and at twenty two the state had nothing left. Thirty
 /// leaves a real project name room to be read rather than recognised from its first eight
 /// characters.
@@ -68,7 +68,7 @@ pub const WIDTH: usize = 30;
 
 /// Columns the left column occupies when it is folded away.
 ///
-/// Four: a state mark, a number, and the space they need. Enough to keep the one thing a
+/// Four: a state mark and the space it needs. Enough to keep the one thing a
 /// glance wants, which is colour and count, and cheap enough that folding is worth doing
 /// on a narrow window rather than a last resort.
 pub const COLLAPSED: usize = 4;
@@ -91,8 +91,9 @@ const UNFOCUSED: char = '\u{25cb}';
 /// mark, then a space.
 const SPACE_NAME_AT: usize = 3;
 
-/// The column an agent's number starts at: a leading space, the focus mark, and a space.
-const AGENT_POSITION_AT: usize = 3;
+/// The column an agent's first row starts its names at: a leading space, the
+/// focus mark, and a space.
+const AGENT_NAME_AT: usize = 3;
 
 /// Columns held back for the program name when a long state would otherwise eat the row.
 /// A row showing only its state does not say whose state it is.
@@ -352,9 +353,9 @@ fn rows(
     if height == 0 {
         return Vec::new();
     }
-    // The unfolded panel shows every agent, so what it wants is a title, a line for the
-    // group and two lines each.
-    let wanted = 1 + agents.iter().filter(|a| a.agent).count();
+    // The unfolded panel shows every agent, so what it wants is a title and two
+    // lines each.
+    let wanted = 1 + 2 * agents.iter().filter(|a| a.agent).count();
     let split = spaces_rows(spaces.len(), height, wanted);
     let mut out = spaces_panel(spaces, focused_space, split);
     // A rule between the panels, glued to both like a border, so the column
@@ -429,7 +430,7 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
                 Line {
                     // No state colour on the row: a workspace has no state to have one
                     // about. Its name carries its own colour instead, which is the same
-                    // colour the agents panel puts beside every agent that lives here.
+                    // colour the agents panel puts on every agent's mark that lives here.
                     text: fit(&format!(" {} {}", mark(space.id == focused), space.name)),
                     colour: None,
                     accent: Some((
@@ -449,8 +450,8 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
     out
 }
 
-/// The agents panel: its title, then one row per agent, scrolled to keep the focused one on
-/// screen.
+/// The agents panel: its title, then two rows per agent, scrolled to keep the
+/// focused one's first row on screen.
 ///
 /// Terminals that are not running an agent are dropped here and only here. They are still
 /// tabs, because a person needs to reach the shell they opened, but they are not something
@@ -492,15 +493,26 @@ fn agents_panel(
         }
         return out;
     }
-    // One row per agent, so the window is the rows there are.
-    let first = scrolled(
-        listed.len(),
-        listed.iter().position(|a| a.terminal == focused),
-        body,
-    );
+    // Two rows per agent, so the window is twice the rows there are. The scroll
+    // keeps the focused agent's first row on screen with room for its second:
+    // a focused pair split across the foot of the panel reads as one agent
+    // becoming two.
+    let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
+    for agent in &listed {
+        push_agent_lines(&mut content, spaces, agent, focused);
+    }
+    let focus_row = content
+        .iter()
+        .position(|(_, hit)| *hit == Some(Hit::Terminal(focused)));
+    let first = match focus_row {
+        Some(i) if content.len() > body => i
+            .saturating_sub(body.saturating_sub(2))
+            .min(content.len() - body),
+        _ => 0,
+    };
     for offset in 0..body {
-        match listed.get(first + offset) {
-            Some(agent) => push_agent(&mut out, spaces, agents, agent, focused),
+        match content.get(first + offset) {
+            Some(row) => out.push(row.clone()),
             None => out.push(blank()),
         }
     }
@@ -508,32 +520,43 @@ fn agents_panel(
     out
 }
 
-/// The one row an open agent takes, with what a click on it means.
+/// The two rows an open agent takes, with what a click on either means.
 ///
-/// One helper and not the same two pushes at each caller, because the unfolded panel
-/// and the folded one have to draw the same rows for the same agent.
-fn push_agent(
+/// First the project and the tab, then the session underneath: `app · release`
+/// above `claude`. Both rows reach the same terminal, so a click on either
+/// lands on the agent. The space is always named on the first row, which is
+/// what retired the shared-label suffix: with the space on every row there is
+/// no shared label left to qualify.
+///
+/// One helper and not the same four pushes at each caller, because the unfolded
+/// panel and the folded one have to draw the same rows for the same agent.
+fn push_agent_lines(
     out: &mut Vec<(Line, Option<Hit>)>,
     spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
     agent: &AgentRow,
     focused: u32,
 ) {
     let hit = Some(Hit::Terminal(agent.terminal));
-    // One row, not two. The second row carried the space's name, and the space is already
-    // said by the colour on the number: saying it twice cost every agent a row, which on a
-    // fleet of nine is half the panel spent repeating what the eye had already been told.
-    // The one exception is a label two agents share: four rows reading `opencode` identify
-    // nothing, so each of them carries its space's name after the label.
-    let position = position(agents, agent);
-    let head = format!(
-        " {} {position} {}",
-        mark(agent.terminal == focused),
-        display_name(spaces, agents, agent)
-    );
-    // The state is cut before the name is, but never so far that the name disappears: a
-    // row showing only a state does not say whose state it is.
-    let head_least = AGENT_POSITION_AT + 2 + MIN_NAME;
+    let tab = label(agent);
+    let space = spaces.iter().find(|s| s.id == agent.workspace);
+    let head = match space {
+        Some(space) => format!(
+            " {} {} \u{b7} {tab}",
+            mark(agent.terminal == focused),
+            space.name
+        ),
+        // A space the client has not heard of yet: the row still draws, under
+        // the tab alone, rather than vanishing until the index catches up.
+        None => format!(" {} {tab}", mark(agent.terminal == focused)),
+    };
+    // The state is cut before the names are, but never so far that the space
+    // and some of the tab disappear: a row showing only a state does not say
+    // whose state it is.
+    let (space_cols, dot_cols) = match space {
+        Some(space) => (crate::width::width(&space.name), 3),
+        None => (0, 0),
+    };
+    let head_least = AGENT_NAME_AT + space_cols + dot_cols + MIN_NAME;
     let state = clip(
         shown_state(&agent.state),
         WIDTH.saturating_sub(head_least + 1),
@@ -543,40 +566,39 @@ fn push_agent(
         Line {
             text: format!("{} {state}", fit_to(&head, room)),
             colour: colour_for(&agent.state),
-            // Which space this agent lives in, as the colour of its number. The number is
-            // the thing a person presses to reach it, so the colour lands on the one piece
-            // of the row that is about getting there.
-            accent: Some((
-                AGENT_POSITION_AT,
-                crate::width::width(&position.to_string()),
-                crate::theme::space_of(agent.workspace),
-            )),
+            // Which space this agent lives in, as the colour of its mark. The mark's
+            // shape says where the keyboard is, its colour says which space the rows
+            // belong to, and neither needs a number beside it.
+            accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
+        },
+        hit,
+    ));
+    // The session underneath: what is actually running in the tab, in the quiet
+    // colour, so the first row keeps the eye and the second keeps the answer.
+    out.push((
+        Line {
+            text: fit_to(&format!("  {}", session_program(agent)), WIDTH),
+            colour: Some(crate::theme::Role::Faint),
+            accent: None,
         },
         hit,
     ));
 }
 
-/// What the row calls the terminal, qualified when it has to be.
-///
-/// A label nobody else on the panel uses stands alone: the number's space colour
-/// says where it lives. A label two listed agents share gains its space's name
-/// after a middle dot, or four rows reading `opencode` answer nothing when one
-/// of them needs a person. Chosen names qualify the same way: a name picked
-/// twice in two spaces is still one row that cannot be told from another.
-fn display_name(spaces: &[WorkspaceRow], agents: &[AgentRow], agent: &AgentRow) -> String {
-    let name = label(agent);
-    let shared = agents
-        .iter()
-        .filter(|a| a.agent)
-        .filter(|a| label(a) == name)
-        .count()
-        > 1;
-    if !shared {
-        return name;
-    }
-    match spaces.iter().find(|s| s.id == agent.workspace) {
-        Some(space) => format!("{name} \u{b7} {}", space.name),
-        None => name,
+/// What runs in the tab: the program's last path segment, because a column
+/// this narrow renders `/opt/homebrew/bin/claude` as `/opt/homebre`. Never the
+/// chosen name: that is already on the row above, and repeating it would cost
+/// the one line that says what the session actually is.
+fn session_program(agent: &AgentRow) -> String {
+    match (&agent.program, &agent.behind) {
+        (Some(program), _) => program
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(program)
+            .to_string(),
+        (None, Some(wrapper)) => format!("behind {wrapper}"),
+        (None, None) => UNNAMED.to_string(),
     }
 }
 
@@ -621,7 +643,7 @@ pub(crate) fn rows_folded(
     out
 }
 
-/// The column folded away to a strip: a state mark and a number per row, and nothing else.
+/// The column folded away to a strip: a state mark per row, and nothing else.
 ///
 /// What a glance wants is colour and count, and both survive four columns. The names come
 /// back with the column, and the terminal gets twenty six columns in the meantime.
@@ -639,7 +661,7 @@ pub(crate) fn rows_collapsed(
         }
         out.push((
             Line {
-                text: strip(mark(space.id == focused_space), at + 1),
+                text: strip_space(mark(space.id == focused_space), at + 1),
                 colour: None,
                 accent: Some((1, 1, crate::theme::space_of(space.id))),
             },
@@ -661,10 +683,7 @@ pub(crate) fn rows_collapsed(
         }
         out.push((
             Line {
-                text: strip(
-                    mark(agent.terminal == focused_terminal),
-                    position(agents, agent),
-                ),
+                text: strip(mark(agent.terminal == focused_terminal)),
                 colour: colour_for(&agent.state),
                 accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
             },
@@ -688,8 +707,17 @@ pub(crate) fn rows_collapsed(
     out
 }
 
-/// One row of the folded strip: the focus mark and the number to press.
-fn strip(mark: char, n: usize) -> String {
+/// One row of the folded strip: the focus mark, in the space's colour.
+fn strip(mark: char) -> String {
+    let text = format!(" {mark}");
+    let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
+    format!("{text}{}", " ".repeat(pad))
+}
+
+/// One row of the folded strip for a space: the focus mark and its index among
+/// spaces. Spaces keep theirs; with no names on the strip the index is what
+/// tells one space row from another.
+fn strip_space(mark: char, n: usize) -> String {
     let text = format!(" {mark}{n}");
     let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
     format!("{text}{}", " ".repeat(pad))
@@ -873,11 +901,11 @@ fn agents_content(
         ));
     }
     for agent in needs {
-        push_agent(&mut content, spaces, agents, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused);
         shown += 1;
     }
     for agent in fresh {
-        push_agent(&mut content, spaces, agents, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused);
         shown += 1;
     }
     if !running.is_empty() {
@@ -888,14 +916,14 @@ fn agents_content(
         ));
     }
     for agent in running {
-        push_agent(&mut content, spaces, agents, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused);
         shown += 1;
     }
     if !finished.is_empty() {
         content.push(group_header("finished", finished.len(), colour_for("done")));
     }
     for agent in finished {
-        push_agent(&mut content, spaces, agents, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused);
         shown += 1;
     }
     if !idle.is_empty() {
@@ -909,7 +937,7 @@ fn agents_content(
         ));
     }
     for agent in idle {
-        push_agent(&mut content, spaces, agents, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused);
         shown += 1;
     }
     for group in [Group::Finished, Group::Idle] {
@@ -946,14 +974,17 @@ fn lay_out_agents(
     if body == 0 {
         return out;
     }
-    // Flat scroll keeping the focused agent's first line visible. Fold lines ride
-    // along at the end rather than being pinned: pinning them is a second scroll
-    // region and a second chance for a click to disagree with a paint.
+    // Flat scroll keeping the focused agent's first line visible with room for
+    // its second. Fold lines ride along at the end rather than being pinned:
+    // pinning them is a second scroll region and a second chance for a click
+    // to disagree with a paint.
     let focus_row = content
         .iter()
         .position(|(_, hit)| *hit == Some(Hit::Terminal(focused)));
     let first = match focus_row {
-        Some(i) if content.len() > body => i.saturating_sub(body - 1).min(content.len() - body),
+        Some(i) if content.len() > body => i
+            .saturating_sub(body.saturating_sub(2))
+            .min(content.len() - body),
         _ => 0,
     };
     for offset in 0..body {
@@ -1040,20 +1071,6 @@ fn label(agent: &AgentRow) -> String {
         (None, Some(wrapper)) => format!("behind {wrapper}"),
         (None, None) => UNNAMED.to_string(),
     }
-}
-
-/// Which tab this agent is, counted along its own space's bar.
-///
-/// The same number the tab bar draws and the same number `ctrl-a <n>` presses, so the two
-/// halves of the screen name the same terminal the same way. The terminal's own number is a
-/// stream this daemon handed out across every space, which is not a number anybody can act
-/// on and not one that means anything on a bar.
-fn position(agents: &[AgentRow], agent: &AgentRow) -> usize {
-    1 + agents
-        .iter()
-        .take_while(|a| a.terminal != agent.terminal)
-        .filter(|a| a.workspace == agent.workspace)
-        .count()
 }
 
 /// The first entry of a panel that is on screen.
@@ -1274,20 +1291,20 @@ mod tests {
             .collect();
         assert_eq!(marked.len(), 2, "{marked:?}");
         assert!(marked.iter().any(|t| t.contains("personal")), "{marked:?}");
-        // Terminal 3 is the first tab of the space it is in, so that is the number it
-        // carries here and the number a person presses to reach it. Which space it lives
-        // in is the colour on that number, with no word on the row: its label answers
-        // to nothing else on the panel.
+        // Terminal 3 is the focused agent: the mark, its space, then its label.
+        // Which space it lives in is said twice, once by the colour on its
+        // mark and once by the word beside it: the row answers "where" before
+        // it answers "what".
         assert!(
             marked
                 .iter()
-                .any(|t| t.starts_with(&format!(" {FOCUSED} 1 "))),
+                .any(|t| t.starts_with(&format!(" {FOCUSED} personal \u{b7} codex"))),
             "{marked:?}"
         );
     }
 
     #[test]
-    fn an_agent_shows_its_space_and_terminal_then_its_program_and_state() {
+    fn an_agent_shows_its_space_then_its_program_and_state() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 14);
         let texts: Vec<String> = lines
@@ -1296,11 +1313,12 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(&format!(" {FOCUSED} 1 claude")))
+            .position(|t| t.starts_with(&format!(" {FOCUSED} app \u{b7} claude")))
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // One row, and it carries everything: the number to press, the program, and the
-        // state flush against the right edge.
-        assert_eq!(texts[head], " \u{25cf} 1 claude            working");
+        // Two rows, and together they carry everything: the mark, the space,
+        // the program, and the state flush against the right edge of the first.
+        assert_eq!(texts[head], " \u{25cf} app \u{b7} claude        working");
+        assert_eq!(texts[head + 1], "  claude");
     }
 
     #[test]
@@ -1333,7 +1351,12 @@ mod tests {
             .filter(|l| l.text.contains("claude"))
             .map(|l| l.colour)
             .collect();
-        assert_eq!(coloured, vec![colour_for("working")]);
+        // Two rows for the one agent: the first wears the state's colour, the
+        // session underneath stays quiet.
+        assert_eq!(
+            coloured,
+            vec![colour_for("working"), Some(crate::theme::Role::Faint)]
+        );
         // A space row has no state to have a colour about; it wears its own instead, as an
         // accent on its name rather than on the whole row.
         assert!(
@@ -1412,17 +1435,25 @@ mod tests {
                 {
                     Some(Hit::Space(s.id))
                 } else {
-                    // Everything left is one agent's one row, found by the program it
-                    // names and the number it carries.
+                    // Everything left is one agent's two rows: the first names
+                    // the space and the tab, the second the session under it.
+                    // Both reach the same terminal.
                     agents
                         .iter()
                         .find(|a| {
-                            text.starts_with(&format!(
-                                " {} {} {}",
-                                mark(a.terminal == 3),
-                                position(&agents, a),
-                                label(a)
-                            ))
+                            let space = spaces
+                                .iter()
+                                .find(|s| s.id == a.workspace)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("");
+                            let first = if space.is_empty() {
+                                format!(" {} {}", mark(a.terminal == 3), label(a))
+                            } else {
+                                format!(" {} {} \u{b7} {}", mark(a.terminal == 3), space, label(a))
+                            };
+                            text.starts_with(&first)
+                                || (text.starts_with("  ")
+                                    && text.trim_end() == format!("  {}", session_program(a)))
                         })
                         .map(|a| Hit::Terminal(a.terminal))
                 };
@@ -1446,9 +1477,7 @@ mod tests {
         let agents = vec![agent(4, 77, "codex", "blocked")];
         let lines = render(&[], &agents, 1, 4, 8);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.text.starts_with(" \u{25cf} 1 codex")),
+            lines.iter().any(|l| l.text.starts_with(" \u{25cf} codex")),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -1474,8 +1503,8 @@ mod tests {
             .collect()
     }
 
-    /// The user's panel: four rows reading `opencode` identify nothing. Each of
-    /// them carries its space's name, so the row says which one needs them.
+    /// The user's panel: four rows reading `opencode` identify nothing. The space
+    /// is named on every first row, so each pair says which one needs them.
     #[test]
     fn agents_sharing_a_label_carry_their_space_names() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
@@ -1485,19 +1514,20 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("opencode \u{b7} app")),
+            texts.iter().any(|t| t.contains("app \u{b7} opencode")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("opencode \u{b7} personal")),
+            texts.iter().any(|t| t.contains("personal \u{b7} opencode")),
             "{texts:?}"
         );
     }
 
-    /// A label nobody else uses stands alone: the number's space colour already
-    /// says where it lives, and a word would repeat it on every row.
+    /// Every first row names its space: the mark's colour says where it lives,
+    /// and the word beside it says it again, so no label ever stands on its
+    /// colour alone.
     #[test]
-    fn a_label_nobody_shares_stands_alone() {
+    fn a_label_nobody_shares_still_names_its_space() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
         let agents = vec![
             agent(1, 1, "opencode", "idle"),
@@ -1506,17 +1536,17 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("claude") && !t.contains("\u{b7}")),
+            texts.iter().any(|t| t.contains("app \u{b7} claude")),
             "{texts:?}"
         );
+        // And the session underneath still says what runs in the tab.
+        assert!(texts.iter().any(|t| *t == "  claude"), "{texts:?}");
     }
 
-    /// A chosen name picked twice in two spaces is still one row that cannot be
-    /// told from another, so it qualifies the same way a program name does.
+    /// A chosen name picked twice in two spaces is still two pairs that cannot
+    /// be told from one another, so each first row names its space.
     #[test]
-    fn a_chosen_name_shared_by_two_agents_qualifies_too() {
+    fn a_chosen_name_shared_by_two_agents_names_both_spaces() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
         let agents = vec![
             named(1, 1, "release", "opencode", "idle"),
@@ -1524,20 +1554,22 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("release \u{b7} app")),
+            texts.iter().any(|t| t.contains("app \u{b7} release")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("release \u{b7} personal")),
+            texts.iter().any(|t| t.contains("personal \u{b7} release")),
             "{texts:?}"
         );
+        // And each session underneath still says what runs in its tab.
+        assert!(texts.iter().any(|t| *t == "  opencode"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "  claude"), "{texts:?}");
     }
 
     /// Two tabs of one space share the space's name as well as the program, and
-    /// still tell apart: the number to press differs, which is the handle that
-    /// acts.
+    /// still tell apart: their states differ, and each pair keeps its own hits.
     #[test]
-    fn two_tabs_of_one_space_share_the_space_name_but_not_the_number() {
+    fn two_tabs_of_one_space_share_the_space_name_but_not_the_state() {
         let spaces = vec![space(1, "app")];
         let agents = vec![
             agent(1, 1, "opencode", "idle"),
@@ -1546,13 +1578,19 @@ mod tests {
         let texts = agent_texts(&spaces, &agents, 1);
         let first = texts
             .iter()
-            .find(|t| t.contains("1 opencode \u{b7} app"))
+            .find(|t| t.contains("app \u{b7} opencode") && t.ends_with("idle"))
             .unwrap_or_else(|| panic!("{texts:?}"));
         let second = texts
             .iter()
-            .find(|t| t.contains("2 opencode \u{b7} app"))
+            .find(|t| t.contains("app \u{b7} opencode") && t.ends_with("blocked"))
             .unwrap_or_else(|| panic!("{texts:?}"));
         assert_ne!(first, second);
+        // Both pairs reach their own terminal, first row and session row alike.
+        let hits: Vec<Option<Hit>> = (0..20)
+            .map(|row| hit(&spaces, &agents, 1, 1, 20, row))
+            .collect();
+        assert!(hits.contains(&Some(Hit::Terminal(1))));
+        assert!(hits.contains(&Some(Hit::Terminal(2))));
     }
 
     #[test]
@@ -1632,9 +1670,13 @@ mod tests {
             .find(|l| l.text.contains('z'))
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        // The number to press and some of the program survive the cut: a row showing only
-        // a state does not say whose state it is.
-        assert!(row.text.starts_with(" \u{25cf} 1 cla"), "{:?}", row.text);
+        // The mark, the space and some of the program survive the cut: a row
+        // showing only a state does not say whose state it is.
+        assert!(
+            row.text.starts_with(" \u{25cf} app \u{b7} cla"),
+            "{:?}",
+            row.text
+        );
     }
 
     fn many_agents() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
@@ -1682,13 +1724,14 @@ mod tests {
         // Finished and idle are one counted line each.
         assert!(texts.iter().any(|t| t.contains("1 finished")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("4 idle")), "{texts:?}");
-        // Four agents open, so four rows: needs-you first, then running.
+        // Four agents open, so eight rows: each agent's pair, needs-you first,
+        // then running.
         assert_eq!(
             texts
                 .iter()
                 .filter(|t| t.contains("claude") || t.contains("codex"))
                 .count(),
-            4,
+            8,
             "{texts:?}"
         );
         // The title says how much is shown: 4 agents of 9.
