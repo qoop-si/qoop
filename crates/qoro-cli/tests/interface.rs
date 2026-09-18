@@ -96,7 +96,9 @@ const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 /// changed. It also has to be read again on every poll, because the division moves as
 /// agents arrive.
 fn agents_panel(painted: &str) -> Vec<String> {
-    let first = first_agent_row_of(painted);
+    let Some(first) = agents_title_row(painted).map(|row| row + 1) else {
+        return Vec::new();
+    };
     // The column stops where the status rows start. Reading into them picked up the notice,
     // which names the focused terminal, so a search for an agent's name found it there and
     // said the panel had it.
@@ -124,6 +126,18 @@ fn agents_panel(painted: &str) -> Vec<String> {
 /// would be a second copy of that arithmetic, and a wrong one the first time either
 /// changed.
 fn first_agent_row_of(painted: &str) -> usize {
+    agents_title_row(painted)
+        .map(|row| row + 1)
+        .unwrap_or_else(|| panic!("the agents panel is not on screen:\n{painted}"))
+}
+
+/// Where the agents panel's own title is, if a whole frame of it has arrived.
+///
+/// An answer rather than a panic, because the caller is usually waiting rather than
+/// asserting: what has been read so far can be half a frame, with the title in the part
+/// that has not arrived, and a helper that panicked there failed one run in three for a
+/// reason that had nothing to do with what was being tested.
+fn agents_title_row(painted: &str) -> Option<usize> {
     for row in SPACES_TITLE_ROW..=ROWS as usize {
         let at = format!("\x1b[{row};1H");
         let Some(start) = painted.rfind(&at) else {
@@ -134,10 +148,10 @@ fn first_agent_row_of(painted: &str) -> usize {
             .take(index_width())
             .collect();
         if line.trim_end().starts_with(" agents") {
-            return row + 1;
+            return Some(row);
         }
     }
-    panic!("the agents panel is not on screen:\n{painted}")
+    None
 }
 
 /// The interface's own idea of how wide the left column is, so this test cannot drift from

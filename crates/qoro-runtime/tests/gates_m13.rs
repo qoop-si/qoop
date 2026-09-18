@@ -368,3 +368,94 @@ async fn g13_8_what_scrolled_past_is_read_back_from_the_newest_row() {
         lines.len()
     );
 }
+
+/// G13.9: an agent's own id for its conversation reaches the row, and a forged one does not.
+///
+/// The id is what makes a restart come back to this conversation rather than to whichever
+/// one in the directory happens to be newest, which stops being the same thing the moment
+/// a person has two agents in one repository.
+#[tokio::test]
+async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
+    use qoro_runtime::control::ControlResponse;
+
+    let d = qoro_testkit::TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut client = d.attach("hook").await;
+
+    // A forged token is refused, and writes nothing.
+    let refused = client
+        .control(
+            &ControlRequest::ReportAgentState {
+                id: "forged".into(),
+                terminal,
+                token: "not-the-token".into(),
+                state: "working".into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: true,
+                clock: 0,
+                session: Some("stolen-id".into()),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "a forged report was accepted: {refused:?}"
+    );
+
+    // The real one is admitted, and its id is written down.
+    let accepted = client
+        .control(
+            &ControlRequest::ReportAgentState {
+                id: "real".into(),
+                terminal,
+                token,
+                state: "working".into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: true,
+                clock: 0,
+                session: Some("abc-123".into()),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(accepted, Some(ControlResponse::AgentStateReported { .. })),
+        "{accepted:?}"
+    );
+
+    // Written from a task of its own, so it is waited for rather than assumed.
+    let store = d.store();
+    let workspace = d.workspace();
+    let mut recorded = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let rows = store.open_terminals(workspace).await.expect("rows");
+        if let Some(row) = rows.iter().find(|r| r.id == terminal as i64)
+            && row.agent_session.is_some()
+        {
+            recorded = row.agent_session.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        recorded.as_deref(),
+        Some("abc-123"),
+        "the agent said which conversation it was having and nothing wrote it down"
+    );
+    assert_ne!(
+        recorded.as_deref(),
+        Some("stolen-id"),
+        "a refused report still wrote its id"
+    );
+}

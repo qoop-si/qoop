@@ -177,6 +177,12 @@ struct State {
     palette: Option<Palette>,
     /// The start of a palette key sequence the read ended in the middle of.
     palette_pending: Vec<u8>,
+    /// Something worth saying once, until the person does anything at all.
+    ///
+    /// Not a message: a message is cleared by the first render, which arrives in
+    /// milliseconds, so a thing said that way is a thing nobody reads. This sits under
+    /// everything urgent and goes on the first keystroke.
+    hint: Option<String>,
     /// The row the top of the pane is pinned to, when the pane is not at the bottom.
     ///
     /// An absolute row number and not a distance, because a distance from the bottom is a
@@ -209,6 +215,7 @@ impl State {
             cols: self.cols,
             lines: self.lines,
             message: self.message.as_deref(),
+            hint: self.hint.as_deref(),
             fold: self.fold,
             palette: self.palette.as_ref(),
             prompt: self.prompt.as_ref(),
@@ -673,6 +680,16 @@ enum PaletteOutcome {
 
 /// Run the interface until the user detaches or the daemon goes away.
 pub async fn run(socket: &Path) -> io::Result<()> {
+    run_with_notice(socket, None).await
+}
+
+/// The interface, with something to say on its first frame.
+///
+/// The notice is how a first start says that an agent on this machine has no hook
+/// installed. It is said once, on the row that says what just happened, and it goes the
+/// moment anything else happens: nothing is blocked, nothing is asked, and an agent with no
+/// hook is still read from its screen.
+pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Result<()> {
     let (stream, leftover) = client::connect(socket, "qoro-tui").await?;
     let guard = TerminalGuard::enter_raw()?;
     // A panic must not leave the outer terminal raw either, which is the one failure a
@@ -683,13 +700,17 @@ pub async fn run(socket: &Path) -> io::Result<()> {
         previous_hook(info);
     }));
 
-    let outcome = drive(stream, leftover).await;
+    let outcome = drive(stream, leftover, notice).await;
 
     drop(guard);
     outcome
 }
 
-async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result<()> {
+async fn drive(
+    stream: tokio::net::UnixStream,
+    leftover: BytesMut,
+    notice: Option<String>,
+) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (cols, lines) = client::outer_size();
     let mut state = State {
@@ -698,7 +719,11 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
         snapshot: None,
         cols,
         lines,
+        // What the caller wanted said, or that this is connecting. A notice about a
+        // missing hook is worth more than the word "connecting", which is gone by the time
+        // anybody reads it.
         message: Some("connecting".to_string()),
+        hint: notice,
         pending_focus: None,
         spaces: Vec::new(),
         space: None,
@@ -1002,6 +1027,9 @@ async fn drive(stream: tokio::net::UnixStream, leftover: BytesMut) -> io::Result
                     for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
+                                // The hint has been read or it has not; either way the
+                                // person is working now.
+                                state.hint = None;
                                 // Typing is talking to the program, and the program is at
                                 // the bottom. A key pressed while scrolled back would
                                 // answer into a view of an hour ago, and the person would
@@ -1957,6 +1985,7 @@ mod tests {
             cols: 80,
             lines: 24,
             message: None,
+            hint: None,
             pending_focus: None,
             spaces: vec![space(1, "app"), space(2, "webshop")],
             space: Some(2),
@@ -2171,6 +2200,7 @@ mod tests {
             cols: 80,
             lines: 24,
             message: None,
+            hint: None,
             pending_focus: None,
             spaces: Vec::new(),
             space: None,

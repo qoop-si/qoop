@@ -56,6 +56,8 @@ pub fn socket_in(dir: &Path) -> std::path::PathBuf {
 }
 
 pub struct TestDaemon {
+    store: qoro_runtime::store::StoreHandle,
+    workspace: i64,
     dir: tempfile::TempDir,
     socket: PathBuf,
     connections: std::sync::Arc<qoro_runtime::daemon::ConnectionRegistry>,
@@ -106,6 +108,8 @@ impl TestDaemon {
         let scanner = daemon.scanner();
         let events = daemon.events();
         let warnings = daemon.warnings();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
         tokio::spawn(async move {
             let _ = daemon.serve().await;
         });
@@ -118,7 +122,19 @@ impl TestDaemon {
             scanner,
             events,
             warnings,
+            store,
+            workspace,
         }
+    }
+
+    /// The durable metadata, so a gate can read what the daemon wrote down.
+    pub fn store(&self) -> qoro_runtime::store::StoreHandle {
+        self.store.clone()
+    }
+
+    /// The workspace this daemon records terminals in.
+    pub fn workspace(&self) -> i64 {
+        self.workspace
     }
 
     pub fn socket(&self) -> &Path {

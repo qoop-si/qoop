@@ -292,6 +292,20 @@ impl Store {
         Ok(())
     }
 
+    /// Record an agent's own id for the conversation in a terminal, without touching which
+    /// agent it is.
+    ///
+    /// Two writers, two questions. What is running is decided by watching the process
+    /// table; the id can only come from the agent itself, through its own hook, and an id
+    /// arriving must not overwrite a name the other writer knows better.
+    pub fn set_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE terminal SET agent_session = ?2 WHERE id = ?1",
+            params![id, session],
+        )?;
+        Ok(())
+    }
+
     /// Record which agent is in a terminal, and its own id for the conversation when it
     /// gave us one.
     ///

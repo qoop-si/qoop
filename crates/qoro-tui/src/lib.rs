@@ -15,4 +15,4 @@ pub mod tabs;
 pub mod theme;
 pub mod width;
 
-pub use run::run;
+pub use run::{run, run_with_notice};

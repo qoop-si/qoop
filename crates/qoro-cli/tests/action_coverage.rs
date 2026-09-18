@@ -155,6 +155,7 @@ fn actions() -> Vec<Action> {
                     visible_idle: false,
                     visible_working: true,
                     clock: 0,
+                    session: None,
                 })
             },
         },
@@ -272,6 +273,7 @@ fn every_control_method_is_reachable_from_some_action() {
             visible_idle: false,
             visible_working: false,
             clock: 0,
+            session: None,
         },
         ControlRequest::ReloadAgentManifests { id: String::new() },
         ControlRequest::Shutdown { id: String::new() },

@@ -48,13 +48,23 @@ except Exception:
 name = payload.get("hook_event_name") or ""
 if name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
              "SubagentStop"):
-    print("working --visible-working")
+    state = "working --visible-working"
 elif name in ("Notification", "PermissionRequest"):
-    print("blocked --visible-blocker")
+    state = "blocked --visible-blocker"
 elif name in ("Stop", "SessionEnd"):
-    print("idle --visible-idle")
+    state = "idle --visible-idle"
 else:
     raise SystemExit(1)
+# The conversation this report belongs to. It is what lets a tab come back to this
+# conversation after a restart rather than to whichever one in the directory is newest,
+# which is a different conversation the moment two agents share a repository. Refused
+# unless it looks like an id and nothing else: this string ends up on a command line.
+session = str(payload.get("session_id") or "")
+if session and len(session) <= 128 and all(
+    c.isalnum() or c in "-_." for c in session
+):
+    state += " --session-id " + session
+print(state)
 ' 2>/dev/null)" || exit 0
 
 # shellcheck disable=SC2086

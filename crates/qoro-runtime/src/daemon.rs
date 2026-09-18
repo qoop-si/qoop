@@ -453,13 +453,28 @@ impl Daemon {
         // One pass before the first terminal exists, so a terminal created immediately has
         // a set to absorb rather than an empty map.
         scanner.refresh().await;
-        // What the last daemon was holding when it stopped. A person who closed qoro and
-        // opened it again asked for their work back, not for an empty screen.
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let books = Bookkeeping {
             store: store.clone(),
             stopping: stopping.clone(),
         };
+        // Who is in each terminal, written down as it changes.
+        //
+        // Hung off the registry's own announcements rather than off the terminal's output,
+        // and that is the whole of the fix for a restore that brought back every tab as a
+        // bare shell. An agent is usually not known at the moment its process takes the
+        // foreground: it is behind a runtime or a wrapper, and the identity is settled a
+        // moment later by a probe. Written from the read path, which only fires when the
+        // foreground leader changes, that later promotion was never seen and the column
+        // stayed empty for every tab. Measured against a real Claude Code: the panel said
+        // `claude` and the row said nothing.
+        //
+        // Armed before anything is restored, so an agent that comes back is recorded the
+        // first time it is recognised rather than the first time it changes.
+        spawn_agent_recorder(agents.clone(), books.clone());
+
+        // What the last daemon was holding when it stopped. A person who closed qoro and
+        // opened it again asked for their work back, not for an empty screen.
         let brought_back = restore(&Restore {
             terminals: terminals.clone(),
             books: books.clone(),
@@ -1858,6 +1873,7 @@ async fn handle_control(
             token,
             state,
             visible_blocker,
+            session,
             ..
         } => {
             // An arrival, like output: admitted, applied, and announced when it
@@ -1881,6 +1897,18 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 },
                 Ok(changed) => {
+                    // The agent's own id for its conversation, recorded here and nowhere
+                    // else: this is the point at which the report has been admitted, so a
+                    // forged token cannot write one. It is the difference between coming
+                    // back to this conversation and coming back to whichever one in the
+                    // directory happens to be newest, which is not the same thing the
+                    // moment a person has two agents in one repository.
+                    if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
+                        let store = store.clone();
+                        tokio::spawn(async move {
+                            let _ = store.set_agent_session(terminal as i64, session).await;
+                        });
+                    }
                     if changed {
                         let generation = agents
                             .agent(terminal)
@@ -2253,6 +2281,45 @@ pub fn open_terminal(
         },
     )?;
     Ok(handle)
+}
+
+/// Record which agent is in each terminal, as the registry decides it.
+///
+/// One task for the daemon rather than one per terminal, because the registry announces
+/// every change through one channel and this is the only reader that needs all of them.
+fn spawn_agent_recorder(agents: Arc<crate::agents::AgentRegistry>, books: Bookkeeping) {
+    let mut changes = agents.subscribe();
+    tokio::spawn(async move {
+        // What was last written for each terminal, so a rename or a state change, which
+        // are announced through the same channel, does not write a row that says what the
+        // row already says.
+        let mut written: BTreeMap<u32, Option<String>> = BTreeMap::new();
+        loop {
+            let stream = match changes.recv().await {
+                Ok(stream) => stream,
+                // Announcements are news, not a ledger: a reader that fell behind has
+                // missed some and the current answer is still the right one to write.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            // Nothing is recorded once the daemon is going. Stopping kills every child,
+            // so every agent is announced as gone on the way out, and recording that would
+            // erase the one thing the next start needs: measured, a session with a real
+            // Claude Code in it came back as a bare shell because the row was cleared
+            // between the stop and the exit.
+            if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            let now = agent_program(&agents, stream);
+            if written.get(&stream).cloned().flatten() == now {
+                continue;
+            }
+            written.insert(stream, now.clone());
+            // An agent that has gone is written down as gone: a person who quit theirs
+            // quit it, and starting it again on the next open would undo that.
+            let _ = books.store.set_agent(stream as i64, now, None).await;
+        }
+    });
 }
 
 /// The agent in a terminal, if what is in it is an agent at all.
@@ -2841,9 +2908,6 @@ async fn terminal_task(
     let mut containment = Containment::new();
     containment.absorb(qoro_pty::sys::enumerate_tty(tty_dev));
     let mut last_scan = std::time::Instant::now();
-    // The agent last written down for this terminal, so a person switching between a
-    // shell and an agent does not write a row on every switch back.
-    let mut last_agent: Option<String> = None;
     // And the directory last written down, for the same reason. Seeded with the one this
     // terminal was started in, because that is already in the row: without it the first
     // read writes the same value back and a daemon that has done nothing has still
@@ -2986,26 +3050,6 @@ async fn terminal_task(
                                 )
                                 .is_some()
                             {
-                                // Who is in this terminal now, written down, because a
-                                // restart has no other way to know whose conversation to
-                                // carry on. An agent that is no longer there is written
-                                // down too, as nothing: a person who quit their agent quit
-                                // it, and bringing it back would undo that.
-                                //
-                                // A shell running `ls` is not an agent and does not clear
-                                // one either, because `ls` is the foreground process of a
-                                // tab whose agent is still sitting behind it. Only the
-                                // shell itself coming back to the foreground means the
-                                // agent has gone.
-                                let now = agent_program(&agents, stream);
-                                if let Some(books) = books.clone()
-                                    && now != last_agent
-                                {
-                                    last_agent = now.clone();
-                                    tokio::spawn(async move {
-                                        let _ = books.store.set_agent(stream as i64, now, None).await;
-                                    });
-                                }
                                 // The retained OSC title described the old process.
                                 // Same-pid `exec` also mints a generation (via the
                                 // process watcher) without touching the leader, so a

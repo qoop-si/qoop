@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod hooks;
+
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
 use qoro_runtime::daemon::ClientWire;
 use qoro_runtime::{Daemon, lock, paths};
@@ -71,6 +73,7 @@ fn main() -> std::io::Result<()> {
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
+        Some("hooks") => hooks::run(&args),
         Some("ls") => run_list_sessions(),
         Some("stop") => run_stop(&args, &session),
         Some("--version" | "-V") => {
@@ -93,6 +96,8 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
+                 \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
+                 \x20                 doing and which conversation it is having\n\
                  \x20 qoro ls         list the sessions and say which are running\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
                  \x20 qoro --version\n\
@@ -164,7 +169,18 @@ fn run_client() -> std::io::Result<()> {
     // The interface, not the bare attach. `qoro attach` is still there for the one terminal
     // case and for anything driving this program from a script, because a full screen
     // interface is the wrong thing to hand a pipe.
-    rt.block_on(qoro_tui::run(&socket))
+    // An agent on this machine with no hook installed is worth one line, once. It is not
+    // an error and nothing waits on it: an agent is read from its screen either way, and a
+    // hook makes that reading immediate and tells qoro which conversation the tab is
+    // having, which is what a restart needs.
+    let notice = match hooks::missing().as_slice() {
+        [] => None,
+        agents => Some(format!(
+            "{} here without a qoro hook: `qoro hooks install` reads them better",
+            agents.join(", ")
+        )),
+    };
+    rt.block_on(qoro_tui::run_with_notice(&socket, notice))
 }
 
 /// Attach to one terminal, with no interface around it.
@@ -373,6 +389,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let mut visible_idle = false;
     let mut visible_working = false;
     let mut id: Option<String> = None;
+    let mut session: Option<String> = None;
     let mut rest = args.iter().skip(2);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -385,9 +402,13 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             "--visible-idle" => visible_idle = true,
             "--visible-working" => visible_working = true,
             "--id" => id = rest.next().cloned(),
+            // The agent's own id for this conversation. Optional: most hooks do not know
+            // one, and the ones that do are what makes a restart come back to this
+            // conversation rather than to the newest one in the directory.
+            "--session-id" => session = rest.next().cloned(),
             other => {
                 return Err(std::io::Error::other(format!(
-                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T]"
+                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S]"
                 )));
             }
         }
@@ -426,6 +447,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
         visible_idle,
         visible_working,
         clock: nanos,
+        session,
     };
 
     let rt = tokio::runtime::Runtime::new()?;

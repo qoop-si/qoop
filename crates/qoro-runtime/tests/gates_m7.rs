@@ -64,6 +64,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             visible_idle: false,
             visible_working: true,
             clock: 0,
+            session: None,
         },
         ControlRequest::ReloadAgentManifests { id: "x12".into() },
         ControlRequest::RenameTerminal {

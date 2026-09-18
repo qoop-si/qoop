@@ -50,6 +50,27 @@ cargo build --release
 ./target/release/qoro
 ```
 
+Put it somewhere on your path and install the hooks for the agents you use:
+
+```
+qoro hooks install
+```
+
+That writes each agent's hook and adds one entry to that agent's own configuration, beside
+whatever is already in it. It is optional: every agent is read from its screen without one.
+What a hook buys is a state known the moment it changes rather than after it is drawn, and
+the agent's own id for its conversation, which is what lets a stopped session come back to
+that conversation rather than to whichever one in the directory is newest. `qoro hooks
+status` says what is installed and `qoro hooks uninstall` takes out exactly what was added.
+
+Sessions are named, and a stopped one comes back as itself:
+
+```
+qoro --session work     open one, or make it
+qoro ls                 what there is, and what is running
+qoro stop work          end it: the tabs come back on the next open
+```
+
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 

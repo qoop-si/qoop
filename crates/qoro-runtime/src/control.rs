@@ -150,6 +150,14 @@ pub enum ControlRequest {
         /// Wall-clock nanos from the hook. Advisory only, see above.
         #[serde(default)]
         clock: u64,
+        /// The agent's own id for this conversation, when its hook knows one.
+        ///
+        /// What turns a restart into the same conversation rather than the newest one in
+        /// the directory: two agents working in one repository both answer to "the newest
+        /// one", and only one of them is right. Optional and defaulted, because most hooks
+        /// do not report it and a daemon that predates the field ignores it.
+        #[serde(default)]
+        session: Option<String>,
     },
     /// Re-read user agent-detection overrides from the config directory.
     ///
@@ -405,6 +413,7 @@ mod tests {
                 visible_idle: false,
                 visible_working: true,
                 clock: 1758000000000000000,
+                session: None,
             },
             ControlRequest::ReloadAgentManifests { id: "e".into() },
         ] {
@@ -432,6 +441,7 @@ mod tests {
                 visible_idle: false,
                 visible_working: false,
                 clock: 0,
+                session: None,
             }
         );
     }

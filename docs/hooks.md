@@ -9,6 +9,33 @@ sees a state after it is drawn; the agent itself knows the moment it changes.
 A `blocked` report also carries the visible-blocker flag, which is the one
 case where a weaker source may overrule a stronger one under ADR-008.
 
+
+## Installing them
+
+```text
+qoro hooks status               which are installed
+qoro hooks install              every agent qoro ships a hook for
+qoro hooks install claude       one of them
+qoro hooks uninstall claude     exactly what was installed, and nothing else
+```
+
+The script is written to `<config>/qoro/hooks/`, and one entry is added to that agent's
+own configuration file. Three things this will not do to a person's configuration: it adds
+beside what is already there rather than replacing it, installing twice changes nothing the
+second time, and a file it cannot parse is reported rather than overwritten. A copy is kept
+before every write.
+
+An agent that is already running does not read its configuration again, so it has to be
+started afresh.
+
+A hook is also the only way an agent's own id for its conversation reaches qoro, and that
+id is what makes reopening a stopped session come back to that conversation rather than to
+whichever one in the directory is newest. Without it a restored tab runs the agent's
+continue-the-latest command, which is right until two agents share a repository.
+
+Each hook can also be installed by hand: every file under `hooks/` carries the exact
+configuration entry it needs in its own header.
+
 ## Which agents have hooks
 
 | agent    | hook-capable | source                                                                 | script                           |
