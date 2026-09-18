@@ -523,11 +523,13 @@ fn push_agent(
     // One row, not two. The second row carried the space's name, and the space is already
     // said by the colour on the number: saying it twice cost every agent a row, which on a
     // fleet of nine is half the panel spent repeating what the eye had already been told.
+    // The one exception is a label two agents share: four rows reading `opencode` identify
+    // nothing, so each of them carries its space's name after the label.
     let position = position(agents, agent);
     let head = format!(
         " {} {position} {}",
         mark(agent.terminal == focused),
-        label(agent)
+        display_name(spaces, agents, agent)
     );
     // The state is cut before the name is, but never so far that the name disappears: a
     // row showing only a state does not say whose state it is.
@@ -552,7 +554,30 @@ fn push_agent(
         },
         hit,
     ));
-    let _ = spaces;
+}
+
+/// What the row calls the terminal, qualified when it has to be.
+///
+/// A label nobody else on the panel uses stands alone: the number's space colour
+/// says where it lives. A label two listed agents share gains its space's name
+/// after a middle dot, or four rows reading `opencode` answer nothing when one
+/// of them needs a person. Chosen names qualify the same way: a name picked
+/// twice in two spaces is still one row that cannot be told from another.
+fn display_name(spaces: &[WorkspaceRow], agents: &[AgentRow], agent: &AgentRow) -> String {
+    let name = label(agent);
+    let shared = agents
+        .iter()
+        .filter(|a| a.agent)
+        .filter(|a| label(a) == name)
+        .count()
+        > 1;
+    if !shared {
+        return name;
+    }
+    match spaces.iter().find(|s| s.id == agent.workspace) {
+        Some(space) => format!("{name} \u{b7} {}", space.name),
+        None => name,
+    }
 }
 
 /// The state, or nothing when nothing has observed one.
@@ -994,10 +1019,17 @@ fn folded_title(shown: usize, total: usize) -> Line {
 
 /// What to call the program in the terminal.
 ///
-/// The last path segment, because a column this narrow renders `/opt/homebrew/bin/claude`
-/// as `/opt/homebre`, which identifies nothing. A wrapper is announced as a wrapper: a
-/// person shown `docker` would conclude their agent is called docker.
+/// A name a person chose outlives the program: a tab called `release` stays `release`
+/// while it runs a shell, then cargo, then an agent. The tab bar already spells it this
+/// way, and the panel spells it the same, so the two halves of the screen name the same
+/// terminal the same way. Without a chosen name the program's last path segment answers,
+/// because a column this narrow renders `/opt/homebrew/bin/claude` as `/opt/homebre`,
+/// which identifies nothing. A wrapper is announced as a wrapper: a person shown
+/// `docker` would conclude their agent is called docker.
 fn label(agent: &AgentRow) -> String {
+    if let Some(name) = agent.name.as_deref().filter(|n| !n.is_empty()) {
+        return name.to_string();
+    }
     match (&agent.program, &agent.behind) {
         (Some(program), _) => program
             .rsplit('/')
@@ -1244,7 +1276,8 @@ mod tests {
         assert!(marked.iter().any(|t| t.contains("personal")), "{marked:?}");
         // Terminal 3 is the first tab of the space it is in, so that is the number it
         // carries here and the number a person presses to reach it. Which space it lives
-        // in is the colour on that number, not a word on the row.
+        // in is the colour on that number, with no word on the row: its label answers
+        // to nothing else on the panel.
         assert!(
             marked
                 .iter()
@@ -1419,6 +1452,107 @@ mod tests {
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
+    }
+
+    fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
+        AgentRow {
+            terminal,
+            name: Some(name.to_string()),
+            workspace,
+            agent: true,
+            program: Some(program.to_string()),
+            behind: None,
+            state: state.to_string(),
+            generation: None,
+        }
+    }
+
+    fn agent_texts(spaces: &[WorkspaceRow], agents: &[AgentRow], focused: u32) -> Vec<String> {
+        render(spaces, agents, 1, focused, 20)
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect()
+    }
+
+    /// The user's panel: four rows reading `opencode` identify nothing. Each of
+    /// them carries its space's name, so the row says which one needs them.
+    #[test]
+    fn agents_sharing_a_label_carry_their_space_names() {
+        let spaces = vec![space(1, "app"), space(2, "personal")];
+        let agents = vec![
+            agent(1, 1, "opencode", "idle"),
+            agent(2, 2, "opencode", "idle"),
+        ];
+        let texts = agent_texts(&spaces, &agents, 1);
+        assert!(
+            texts.iter().any(|t| t.contains("opencode \u{b7} app")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("opencode \u{b7} personal")),
+            "{texts:?}"
+        );
+    }
+
+    /// A label nobody else uses stands alone: the number's space colour already
+    /// says where it lives, and a word would repeat it on every row.
+    #[test]
+    fn a_label_nobody_shares_stands_alone() {
+        let spaces = vec![space(1, "app"), space(2, "personal")];
+        let agents = vec![
+            agent(1, 1, "opencode", "idle"),
+            agent(2, 2, "opencode", "idle"),
+            agent(3, 1, "claude", "idle"),
+        ];
+        let texts = agent_texts(&spaces, &agents, 1);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("claude") && !t.contains("\u{b7}")),
+            "{texts:?}"
+        );
+    }
+
+    /// A chosen name picked twice in two spaces is still one row that cannot be
+    /// told from another, so it qualifies the same way a program name does.
+    #[test]
+    fn a_chosen_name_shared_by_two_agents_qualifies_too() {
+        let spaces = vec![space(1, "app"), space(2, "personal")];
+        let agents = vec![
+            named(1, 1, "release", "opencode", "idle"),
+            named(2, 2, "release", "claude", "idle"),
+        ];
+        let texts = agent_texts(&spaces, &agents, 1);
+        assert!(
+            texts.iter().any(|t| t.contains("release \u{b7} app")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("release \u{b7} personal")),
+            "{texts:?}"
+        );
+    }
+
+    /// Two tabs of one space share the space's name as well as the program, and
+    /// still tell apart: the number to press differs, which is the handle that
+    /// acts.
+    #[test]
+    fn two_tabs_of_one_space_share_the_space_name_but_not_the_number() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![
+            agent(1, 1, "opencode", "idle"),
+            agent(2, 1, "opencode", "blocked"),
+        ];
+        let texts = agent_texts(&spaces, &agents, 1);
+        let first = texts
+            .iter()
+            .find(|t| t.contains("1 opencode \u{b7} app"))
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        let second = texts
+            .iter()
+            .find(|t| t.contains("2 opencode \u{b7} app"))
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert_ne!(first, second);
     }
 
     #[test]
