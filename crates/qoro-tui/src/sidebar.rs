@@ -35,6 +35,15 @@ pub struct Line {
     /// space's colour. A row saying two things in two colours would be a row a person
     /// parses rather than reads.
     pub accent: Option<(usize, usize, crate::theme::Role)>,
+    /// The row's opening sign, painted in a role of its own: always column zero, always
+    /// one column.
+    ///
+    /// The spinner's head while the agent works, the dotted [`WAITING`] circle
+    /// while it idles, the hollow [`STOPPED`] square otherwise.
+    /// One run beside [`Line::accent`] rather than one of many, because these are the
+    /// only two things on a row that are not about the row's own state: where it lives,
+    /// and whether it is alive.
+    pub indicator: Option<(usize, usize, crate::theme::Role)>,
 }
 
 /// The colour a state earns.
@@ -108,6 +117,55 @@ const UNKNOWN: &str = "unknown";
 /// so naming it after the thing it is known not to be would be the one word on screen that
 /// is false.
 const UNNAMED: &str = "agent";
+
+/// The idle sign: a dotted circle, worn by rows waiting for work.
+///
+/// The middle rest between turning and stopping: an idle agent is neither doing
+/// something nor raising a signal, so it wears neither the turning head nor the
+/// hollow square. Dotted and faint, one column like every other sign.
+const WAITING: char = '\u{25cc}';
+
+/// The stopped sign: a hollow square, worn by every row that is neither working
+/// nor idle.
+///
+/// The spinner's resting form, and deliberately its kin rather than a word: a row that
+/// stops working should change one cell, not its whole shape. Hollow and faint, so a
+/// still panel reads as a panel at rest. One column by construction, like every head
+/// frame, which is what keeps the name exactly where it was while the sign spins.
+const STOPPED: char = '\u{25a1}';
+
+/// Whether this state spins rather than says its name.
+///
+/// Working and starting are aliveness, and aliveness is what the spinner is for. Every
+/// other state is a signal (`blocked`, `failed`, `done`) or its absence (`idle`,
+/// unobserved), and a signal that spun would stop being read as one.
+fn spins(state: &str) -> bool {
+    matches!(state, "working" | "starting")
+}
+
+/// The spinner's head frames: a braille arc orbiting a circle.
+///
+/// Braille and not quarter blocks, because the orbit reads as motion around
+/// something rather than something filling up: aliveness circling the row's
+/// own sign. Four frames, each exactly one column, which is what the head
+/// column arithmetic counts on.
+const SPIN_HEAD: [char; 4] = ['\u{2809}', '\u{2838}', '\u{28c0}', '\u{2807}'];
+
+/// The ember steps the head cycles through.
+///
+/// Eight against the head's four, so the combination repeats every eight ticks:
+/// a short loop, honestly so, and the colour still never lands on the same frame
+/// twice running.
+const SPIN_EMBERS: usize = 8;
+
+/// The spinner's head at this frame: one quarter-filled circle.
+///
+/// Single, with no trail behind it. A trail doubled the motion on the row and read as
+/// two signs doing the same job; the row opens on one cell that turns and rests as
+/// [`WAITING`] or [`STOPPED`], and that is the whole indicator.
+fn spin_head(tick: u64) -> char {
+    SPIN_HEAD[(tick % SPIN_HEAD.len() as u64) as usize]
+}
 
 /// The percentage of the column the spaces panel holds, its title and the blank rows under
 /// it included.
@@ -222,10 +280,88 @@ impl Default for Fold {
     }
 }
 
+/// How the agents panel lists its rows: in labelled groups, or flat by urgency.
+///
+/// Grouped is the panel a person already knows. Priority is the same rows with
+/// no headers, sorted so the one that needs a person is always on top: the
+/// inbox view of the fleet. Toggled with `ctrl-a g`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    Grouped,
+    Priority,
+}
+
+impl View {
+    /// The other one: a toggle carries no state of its own.
+    pub fn toggle(self) -> View {
+        match self {
+            View::Grouped => View::Priority,
+            View::Priority => View::Grouped,
+        }
+    }
+}
+
+/// The done rows a person has already looked at, as (terminal, generation).
+///
+/// Client-local, like the focus itself: one client reading a done agent does
+/// not mark it read for another. The generation travels with the terminal so
+/// a new agent reusing a terminal number does not inherit the old one's
+/// read receipt. Pruned by the caller when rows arrive; this module only reads.
+pub type Seen = std::collections::BTreeSet<(u32, u64)>;
+
+/// The generation that identifies this row's agent, or zero when the daemon
+/// predates generations.
+pub fn gen_of(agent: &AgentRow) -> u64 {
+    agent.generation.unwrap_or(0)
+}
+
+/// Whether this done row is news: finished, and the keyboard has not been
+/// here since. The focused row is never unread: standing on it is reading it.
+pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
+    agent.state == "done"
+        && agent.terminal != focused
+        && !seen.contains(&(agent.terminal, gen_of(agent)))
+}
+
+/// Where a row sorts in the priority view: what wants a person first, then
+/// what is alive, then what is settled. Daemon order breaks ties, so the view
+/// is a stable sort of the grouped one rather than a second list.
+fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen) -> u8 {
+    match agent.state.as_str() {
+        "blocked" => 0,
+        "failed" => 1,
+        _ if is_unread(agent, focused, seen) => 2,
+        "working" => 3,
+        "starting" => 4,
+        "done" => 5,
+        "idle" => 6,
+        _ => 7,
+    }
+}
+
+/// Whether the animation tick has anything to move.
+///
+/// Working and starting spin. Blocked pulses and an unread done blinks, both
+/// on the same tick. Anything else is a still panel, and a tick that repainted
+/// one would trade the loop's founding rule (no wake without an arrival) for
+/// eight redundant frames a second.
+pub fn wants_tick(rows: &[AgentRow], focused: u32, seen: &Seen) -> bool {
+    rows.iter().any(|row| {
+        row.agent
+            && (spins(&row.state)
+                || matches!(row.state.as_str(), "blocked" | "failed")
+                || is_unread(row, focused, seen))
+    })
+}
+
 /// The group an agent state belongs to.
+///
+/// Blocked and failed never reach this: the caller lifts them into the
+/// always-open needs-you section first, so no group owns them and no fold can
+/// hide them.
 fn group_of(state: &str) -> Group {
     match state {
-        "blocked" | "failed" => Group::Running,
         "working" | "starting" => Group::Running,
         "done" => Group::Finished,
         _ => Group::Idle,
@@ -273,6 +409,10 @@ pub fn render(
 /// Same contract as [`render`]: exactly `height` lines of exactly [`WIDTH`]
 /// columns. Collapsed groups become one counted line each, so the list reads
 /// instead of being skimmed. Empty groups leave no line at all.
+///
+/// Nine arguments and not a context struct: every caller already holds each
+/// piece separately, and a struct would move the same list one line down.
+#[allow(clippy::too_many_arguments)]
 pub fn render_folded(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
@@ -280,6 +420,9 @@ pub fn render_folded(
     focused_terminal: u32,
     height: usize,
     fold: &Fold,
+    tick: u64,
+    view: View,
+    seen: &Seen,
 ) -> Vec<Line> {
     rows_folded(
         spaces,
@@ -288,6 +431,9 @@ pub fn render_folded(
         focused_terminal,
         height,
         fold,
+        tick,
+        view,
+        seen,
     )
     .into_iter()
     .map(|(line, _)| line)
@@ -315,6 +461,9 @@ pub fn hit(
 /// What a click on one screen row of the folded column means, counted from zero.
 ///
 /// A click on a fold line opens that group; the caller repaints with the new fold.
+///
+/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn hit_folded(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
@@ -323,6 +472,8 @@ pub fn hit_folded(
     height: usize,
     fold: &Fold,
     row: usize,
+    view: View,
+    seen: &Seen,
 ) -> Option<Hit> {
     rows_folded(
         spaces,
@@ -331,6 +482,10 @@ pub fn hit_folded(
         focused_terminal,
         height,
         fold,
+        // Hit testing does not depend on the animation frame.
+        0,
+        view,
+        seen,
     )
     .into_iter()
     .nth(row)
@@ -438,6 +593,7 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
                         crate::width::width(&space.name),
                         crate::theme::space_of(space.id),
                     )),
+                    indicator: None,
                 },
                 Some(Hit::Space(space.id)),
             ),
@@ -485,6 +641,7 @@ fn agents_panel(
                 text: fit(" no agents yet"),
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
+                indicator: None,
             },
             None,
         ));
@@ -499,7 +656,10 @@ fn agents_panel(
     // becoming two.
     let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
     for agent in &listed {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        // The unfolded panel does not animate: it is the test-facing surface,
+        // and frame zero is the spinner's opening frame. The live folded panel
+        // below spends the real tick.
+        push_agent_lines(&mut content, spaces, agent, focused, 0, &Seen::new());
     }
     let focus_row = content
         .iter()
@@ -528,26 +688,43 @@ fn agents_panel(
 /// what retired the shared-label suffix: with the space on every row there is
 /// no shared label left to qualify.
 ///
-/// One helper and not the same four pushes at each caller, because the unfolded
+/// `tick` is the frame's animation step. A working agent spends it on the spinner;
+/// every other state ignores it, so a still panel is byte for byte the panel it was.
+///
+/// One helper and not the same pushes at each caller, because the unfolded
 /// panel and the folded one have to draw the same rows for the same agent.
 fn push_agent_lines(
     out: &mut Vec<(Line, Option<Hit>)>,
     spaces: &[WorkspaceRow],
     agent: &AgentRow,
     focused: u32,
+    tick: u64,
+    seen: &Seen,
 ) {
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
     let space = spaces.iter().find(|s| s.id == agent.workspace);
+    // The row opens on its indicator and then the focus mark: a turning circle
+    // says working, a dotted circle says idle, a hollow square says everything
+    // else, and the mark beside it says where the keyboard is. One sign reads
+    // as information; two signs side by side read as exactly two facts.
+    let spinning = spins(&agent.state);
+    let sign = if spinning {
+        spin_head(tick)
+    } else if agent.state == "idle" {
+        WAITING
+    } else {
+        STOPPED
+    };
     let head = match space {
         Some(space) => format!(
-            " {} {} \u{b7} {tab}",
+            "{sign} {} {} \u{b7} {tab}",
             mark(agent.terminal == focused),
             space.name
         ),
         // A space the client has not heard of yet: the row still draws, under
         // the tab alone, rather than vanishing until the index catches up.
-        None => format!(" {} {tab}", mark(agent.terminal == focused)),
+        None => format!("{sign} {} {tab}", mark(agent.terminal == focused)),
     };
     // The state is cut before the names are, but never so far that the space
     // and some of the tab disappear: a row showing only a state does not say
@@ -557,11 +734,41 @@ fn push_agent_lines(
         None => (0, 0),
     };
     let head_least = AGENT_NAME_AT + space_cols + dot_cols + MIN_NAME;
-    let state = clip(
-        shown_state(&agent.state),
-        WIDTH.saturating_sub(head_least + 1),
-    );
+    // A working agent says nothing on the right and spins on the left instead. The word
+    // `working` trained the eye to read the one column that matters when an agent really
+    // is blocked; the spinner carries aliveness on its own channel, in the brand's own
+    // ambers.
+    let state = if spinning {
+        String::new()
+    } else {
+        clip(
+            shown_state(&agent.state),
+            WIDTH.saturating_sub(head_least + 1),
+        )
+    };
     let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
+    // The sign is always column zero, so its run is a constant rather than arithmetic.
+    // Three alivenesses, three treatments: the spinner wears the ember wheel while
+    // working, a blocked row pulses its warm ink against the brand's ember, and an
+    // unread done blinks its sage against faint. Everything settled stays quiet.
+    let unread = is_unread(agent, focused, seen);
+    let sign_role = if spinning {
+        crate::theme::Role::Ember((tick % SPIN_EMBERS as u64) as usize)
+    } else if agent.state == "blocked" {
+        if tick % 8 < 4 {
+            crate::theme::Role::Blocked
+        } else {
+            crate::theme::Role::Ember(2)
+        }
+    } else if unread {
+        if tick % 8 < 4 {
+            crate::theme::Role::Done
+        } else {
+            crate::theme::Role::Faint
+        }
+    } else {
+        crate::theme::Role::Faint
+    };
     out.push((
         Line {
             text: format!("{} {state}", fit_to(&head, room)),
@@ -570,6 +777,7 @@ fn push_agent_lines(
             // shape says where the keyboard is, its colour says which space the rows
             // belong to, and neither needs a number beside it.
             accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
+            indicator: Some((0, 1, sign_role)),
         },
         hit,
     ));
@@ -580,6 +788,7 @@ fn push_agent_lines(
             text: fit_to(&format!("  {}", session_program(agent)), WIDTH),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
+            indicator: None,
         },
         hit,
     ));
@@ -617,6 +826,9 @@ fn shown_state(state: &str) -> &str {
 /// function so a click lands on the row a person aimed at by construction.
 /// Also shared with the screen painter, which needs the hits to mark the
 /// keyboard's own rows: the text alone cannot say which row is selected.
+///
+/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rows_folded(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
@@ -624,6 +836,9 @@ pub(crate) fn rows_folded(
     focused_terminal: u32,
     height: usize,
     fold: &Fold,
+    tick: u64,
+    view: View,
+    seen: &Seen,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
@@ -635,6 +850,9 @@ pub(crate) fn rows_folded(
         focused_terminal,
         height,
         fold,
+        tick,
+        view,
+        seen,
     );
     // The mark that folds the column away, at its foot, where the eye lands last.
     if let Some(last) = out.last_mut() {
@@ -664,6 +882,7 @@ pub(crate) fn rows_collapsed(
                 text: strip_space(mark(space.id == focused_space), at + 1),
                 colour: None,
                 accent: Some((1, 1, crate::theme::space_of(space.id))),
+                indicator: None,
             },
             Some(Hit::Space(space.id)),
         ));
@@ -673,6 +892,7 @@ pub(crate) fn rows_collapsed(
             text: " ".repeat(COLLAPSED),
             colour: Some(crate::theme::Role::Rule),
             accent: None,
+            indicator: None,
         },
         None,
     ));
@@ -686,6 +906,7 @@ pub(crate) fn rows_collapsed(
                 text: strip(mark(agent.terminal == focused_terminal)),
                 colour: colour_for(&agent.state),
                 accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
+                indicator: None,
             },
             Some(Hit::Terminal(agent.terminal)),
         ));
@@ -696,6 +917,7 @@ pub(crate) fn rows_collapsed(
                 text: " ".repeat(COLLAPSED),
                 colour: None,
                 accent: None,
+                indicator: None,
             },
             None,
         ));
@@ -733,6 +955,7 @@ fn collapse_row(collapsed: bool) -> (Line, Option<Hit>) {
                 text: format!("{}{mark} ", " ".repeat(width.saturating_sub(2))),
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
+                indicator: None,
             },
             Some(Hit::Collapse),
         );
@@ -754,6 +977,7 @@ fn collapse_row(collapsed: bool) -> (Line, Option<Hit>) {
             // The mark and the name together, so the accent reads as one wordmark rather
             // than as a coloured bullet next to grey text.
             accent: Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand)),
+            indicator: None,
         },
         Some(Hit::Collapse),
     )
@@ -768,6 +992,9 @@ const BRAND_MARK: char = '\u{25cf}';
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The column as it is when it is not folded away.
+///
+/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+#[allow(clippy::too_many_arguments)]
 fn rows_open(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
@@ -775,11 +1002,15 @@ fn rows_open(
     focused_terminal: u32,
     height: usize,
     fold: &Fold,
+    tick: u64,
+    view: View,
+    seen: &Seen,
 ) -> Vec<(Line, Option<Hit>)> {
     // What the lower panel wants, asked before the column is divided. The division is a
     // place and not a consequence of how many spaces there happen to be, but a panel that
     // held its half while the list below it scrolled would be a place at the wrong price.
-    let (content, shown, total) = agents_content(spaces, agents, focused_terminal, fold);
+    let (content, shown, total) =
+        agents_content(spaces, agents, focused_terminal, fold, tick, view, seen);
     let split = spaces_rows(spaces.len(), height, content.len() + 1);
     let mut out = spaces_panel(spaces, focused_space, split);
     let rest = height - split;
@@ -816,6 +1047,9 @@ fn agents_content(
     agents: &[AgentRow],
     focused: u32,
     fold: &Fold,
+    tick: u64,
+    view: View,
+    seen: &Seen,
 ) -> (Vec<(Line, Option<Hit>)>, usize, usize) {
     let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
     if listed.is_empty() {
@@ -826,6 +1060,7 @@ fn agents_content(
                     text: fit(" no agents yet"),
                     colour: Some(crate::theme::Role::Faint),
                     accent: None,
+                    indicator: None,
                 },
                 None,
             )],
@@ -838,13 +1073,26 @@ fn agents_content(
         .find(|a| a.terminal == focused)
         .map(|a| a.state.as_str());
     // A group is open when the fold says so, or when the keyboard is inside it.
+    // Needs-you rows belong to no group, so a focused blocked row opens nothing:
+    // its own section is always open anyway.
     let open = |group: Group| {
-        if focused_state.is_some_and(|s| group_of(s) == group) {
+        if focused_state.is_some_and(|s| !needs_you(s) && group_of(s) == group) {
             true
         } else {
             fold.is_open(group)
         }
     };
+    // The priority view: the same rows, no headers, sorted so what wants a
+    // person is on top. Folds do not apply: an inbox hides nothing.
+    if view == View::Priority {
+        let mut ordered: Vec<&AgentRow> = listed.to_vec();
+        ordered.sort_by_key(|a| priority_of(a, focused, seen));
+        let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
+        for agent in &ordered {
+            push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        }
+        return (content, ordered.len(), listed.len());
+    }
     // What needs a person comes first, in daemon order, then the rest that is open,
     // in daemon order. Daemon order within each half, so a short list draws exactly
     // the rows the unfolded panel draws.
@@ -875,9 +1123,17 @@ fn agents_content(
         .filter(|a| {
             !needs_you(&a.state)
                 && !unobserved(&a.state)
-                && group_of(&a.state) == Group::Finished
+                && a.state == "done"
+                && !is_unread(a, focused, seen)
                 && open(Group::Finished)
         })
+        .copied()
+        .collect();
+    // Done rows nobody has looked at yet: always open, under their own header,
+    // so finished-but-unread never hides behind the finished fold.
+    let new_done: Vec<&AgentRow> = listed
+        .iter()
+        .filter(|a| a.state == "done" && is_unread(a, focused, seen))
         .copied()
         .collect();
     let idle: Vec<&AgentRow> = listed
@@ -901,11 +1157,18 @@ fn agents_content(
         ));
     }
     for agent in needs {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
         shown += 1;
     }
     for agent in fresh {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        shown += 1;
+    }
+    if !new_done.is_empty() {
+        content.push(group_header("new", new_done.len(), colour_for("done")));
+    }
+    for agent in new_done {
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
         shown += 1;
     }
     if !running.is_empty() {
@@ -916,14 +1179,14 @@ fn agents_content(
         ));
     }
     for agent in running {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
         shown += 1;
     }
     if !finished.is_empty() {
         content.push(group_header("finished", finished.len(), colour_for("done")));
     }
     for agent in finished {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
         shown += 1;
     }
     if !idle.is_empty() {
@@ -937,7 +1200,7 @@ fn agents_content(
         ));
     }
     for agent in idle {
-        push_agent_lines(&mut content, spaces, agent, focused);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
         shown += 1;
     }
     for group in [Group::Finished, Group::Idle] {
@@ -946,6 +1209,7 @@ fn agents_content(
             .filter(|a| {
                 !needs_you(&a.state)
                     && !unobserved(&a.state)
+                    && !is_unread(a, focused, seen)
                     && group_of(&a.state) == group
                     && !open(group)
             })
@@ -954,7 +1218,6 @@ fn agents_content(
             content.push(fold_line(group, n));
         }
     }
-    let _ = focused;
     (content, shown, listed.len())
 }
 
@@ -1015,6 +1278,7 @@ fn group_header(
             text: format!("{left} {count}"),
             colour,
             accent: None,
+            indicator: None,
         },
         None,
     )
@@ -1027,6 +1291,7 @@ fn fold_line(group: Group, count: usize) -> (Line, Option<Hit>) {
             text: fit(&format!(" \u{25b8} {count} {}", group.name())),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
+            indicator: None,
         },
         Some(Hit::Fold(group)),
     )
@@ -1044,6 +1309,7 @@ fn folded_title(shown: usize, total: usize) -> Line {
             text: fit(&format!(" {AGENTS_TITLE} {shown} of {total}")),
             colour: Some(crate::theme::Role::Title),
             accent: None,
+            indicator: None,
         }
     }
 }
@@ -1098,6 +1364,7 @@ fn footer_row() -> (Line, Option<Hit>) {
             text: format!("{left}{}{right}", " ".repeat(gap)),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
+            indicator: None,
         },
         // The row itself answers nothing: the caller asks again with the column.
         None,
@@ -1124,6 +1391,7 @@ fn title(text: &str) -> Line {
         text: fit(&format!(" {text}")),
         colour: Some(crate::theme::Role::Title),
         accent: None,
+        indicator: None,
     }
 }
 
@@ -1136,6 +1404,7 @@ fn divider() -> (Line, Option<Hit>) {
             text: "\u{2500}".repeat(WIDTH),
             colour: Some(crate::theme::Role::Rule),
             accent: None,
+            indicator: None,
         },
         None,
     )
@@ -1148,6 +1417,7 @@ fn blank() -> (Line, Option<Hit>) {
             text: " ".repeat(WIDTH),
             colour: None,
             accent: None,
+            indicator: None,
         },
         None,
     )
@@ -1219,6 +1489,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1232,6 +1503,7 @@ mod tests {
             behind: None,
             state: "idle".to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1298,7 +1570,7 @@ mod tests {
         assert!(
             marked
                 .iter()
-                .any(|t| t.starts_with(&format!(" {FOCUSED} personal \u{b7} codex"))),
+                .any(|t| t.starts_with(&format!("{WAITING} {FOCUSED} personal \u{b7} codex"))),
             "{marked:?}"
         );
     }
@@ -1313,11 +1585,21 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(&format!(" {FOCUSED} app \u{b7} claude")))
+            .position(|t| t.starts_with(&format!("{} {FOCUSED} app \u{b7} claude", spin_head(0))))
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // Two rows, and together they carry everything: the mark, the space,
-        // the program, and the state flush against the right edge of the first.
-        assert_eq!(texts[head], " \u{25cf} app \u{b7} claude        working");
+        // Two rows, and together they carry everything: the spinner head, the
+        // mark, the space, and the program underneath. A working agent says
+        // nothing on the right and spins on the left instead, so the word
+        // `working` is exactly what the head row must not contain.
+        assert_eq!(
+            texts[head].trim_end(),
+            format!("{} \u{25cf} app \u{b7} claude", spin_head(0))
+        );
+        assert!(
+            !texts[head].contains("working"),
+            "a working agent spins rather than says so: {:?}",
+            texts[head]
+        );
         assert_eq!(texts[head + 1], "  claude");
     }
 
@@ -1446,10 +1728,25 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            let first = if space.is_empty() {
-                                format!(" {} {}", mark(a.terminal == 3), label(a))
+                            // The row opens on its indicator; the test panel
+                            // renders frame zero, so a working agent wears the
+                            // spinner's opening head.
+                            let sign = if spins(&a.state) {
+                                spin_head(0)
+                            } else if a.state == "idle" {
+                                WAITING
                             } else {
-                                format!(" {} {} \u{b7} {}", mark(a.terminal == 3), space, label(a))
+                                STOPPED
+                            };
+                            let first = if space.is_empty() {
+                                format!("{sign} {} {}", mark(a.terminal == 3), label(a))
+                            } else {
+                                format!(
+                                    "{sign} {} {} \u{b7} {}",
+                                    mark(a.terminal == 3),
+                                    space,
+                                    label(a)
+                                )
                             };
                             text.starts_with(&first)
                                 || (text.starts_with("  ")
@@ -1477,7 +1774,9 @@ mod tests {
         let agents = vec![agent(4, 77, "codex", "blocked")];
         let lines = render(&[], &agents, 1, 4, 8);
         assert!(
-            lines.iter().any(|l| l.text.starts_with(" \u{25cf} codex")),
+            lines
+                .iter()
+                .any(|l| l.text.starts_with(&format!("{STOPPED} \u{25cf} codex"))),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -1493,6 +1792,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1604,6 +1904,7 @@ mod tests {
             behind: Some("docker".to_string()),
             state: "idle".to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1627,6 +1928,7 @@ mod tests {
             behind: Some("docker".to_string()),
             state: UNKNOWN.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1671,9 +1973,11 @@ mod tests {
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
         // The mark, the space and some of the program survive the cut: a row
-        // showing only a state does not say whose state it is.
+        // showing only a state does not say whose state it is. The row opens
+        // on the stopped sign, since a state of pure noise spins nothing.
         assert!(
-            row.text.starts_with(" \u{25cf} app \u{b7} cla"),
+            row.text
+                .starts_with(&format!("{STOPPED} \u{25cf} app \u{b7} cl")),
             "{:?}",
             row.text
         );
@@ -1700,7 +2004,11 @@ mod tests {
     fn folded_needs_you_and_running_are_open_and_the_rest_is_two_lines() {
         let (spaces, agents) = many_agents();
         let fold = Fold::default_closed();
-        let lines = render_folded(&spaces, &agents, 2, 1, 30, &fold);
+        // Terminal 5 is done and already looked at, so it folds like before:
+        // the unread path gets its own test below.
+        let mut seen = Seen::new();
+        seen.insert((5, 0));
+        let lines = render_folded(&spaces, &agents, 2, 1, 30, &fold, 0, View::Grouped, &seen);
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
@@ -1708,7 +2016,10 @@ mod tests {
         // Needs-you and running agents are drawn as usual, each under its own
         // header carrying its count flush right.
         assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("working")), "{texts:?}");
+        // Running agents spin rather than say `working`: aliveness is the
+        // turning head on the left, so the word must not appear anywhere.
+        assert!(texts.iter().any(|t| t.contains(spin_head(0))), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("working")), "{texts:?}");
         assert!(
             texts
                 .iter()
@@ -1745,7 +2056,17 @@ mod tests {
     fn folded_an_idle_agent_collapses_while_a_working_one_stays() {
         let (spaces, agents) = sample();
         let fold = Fold::default_closed();
-        let folded = render_folded(&spaces, &agents, 1, 1, 14, &fold);
+        let folded = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            14,
+            &fold,
+            0,
+            View::Grouped,
+            &Seen::new(),
+        );
         let texts: Vec<String> = folded
             .iter()
             .map(|l| l.text.trim_end().to_string())
@@ -1763,7 +2084,17 @@ mod tests {
     fn folded_an_empty_group_leaves_no_line() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "blocked")];
-        let lines = render_folded(&spaces, &agents, 1, 1, 10, &Fold::default_closed());
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            10,
+            &Fold::default_closed(),
+            0,
+            View::Grouped,
+            &Seen::new(),
+        );
         // The blocked agent draws two rows under its own header and nothing else:
         // no fold lines for groups with nobody in them, and the plain title.
         let texts: Vec<String> = lines
@@ -1785,21 +2116,55 @@ mod tests {
         let (spaces, agents) = many_agents();
         let fold = Fold::default_closed();
         let height = 30;
-        let row = render_folded(&spaces, &agents, 2, 1, height, &fold)
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .position(|t| t.contains("4 idle"))
-            .expect("no idle fold line");
+        // Terminal 5 is done and already looked at, so the fold lines sit
+        // where they always have.
+        let mut seen = Seen::new();
+        seen.insert((5, 0));
+        let row = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            height,
+            &fold,
+            0,
+            View::Grouped,
+            &seen,
+        )
+        .iter()
+        .map(|l| l.text.trim_end().to_string())
+        .position(|t| t.contains("4 idle"))
+        .expect("no idle fold line");
         assert_eq!(
-            hit_folded(&spaces, &agents, 2, 1, height, &fold, row),
+            hit_folded(
+                &spaces,
+                &agents,
+                2,
+                1,
+                height,
+                &fold,
+                row,
+                View::Grouped,
+                &seen
+            ),
             Some(Hit::Fold(Group::Idle))
         );
         let mut opened = fold;
         opened.open(Group::Idle);
-        let texts: Vec<String> = render_folded(&spaces, &agents, 2, 1, height, &opened)
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
+        let texts: Vec<String> = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            height,
+            &opened,
+            0,
+            View::Grouped,
+            &seen,
+        )
+        .iter()
+        .map(|l| l.text.trim_end().to_string())
+        .collect();
         assert!(
             !texts.iter().any(|t| t.contains("4 idle")),
             "the fold line is still there: {texts:?}"
@@ -1811,7 +2176,17 @@ mod tests {
     fn folded_the_group_holding_the_keyboard_is_open_even_when_folded() {
         let (spaces, agents) = many_agents();
         // Terminal 5 is done and would fold, but it has the keyboard.
-        let lines = render_folded(&spaces, &agents, 1, 5, 30, &Fold::default_closed());
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            5,
+            30,
+            &Fold::default_closed(),
+            0,
+            View::Grouped,
+            &Seen::new(),
+        );
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
@@ -1822,7 +2197,19 @@ mod tests {
         );
         // And a click on its rows still reaches it.
         let hits: Vec<Option<Hit>> = (0..30)
-            .map(|row| hit_folded(&spaces, &agents, 1, 5, 30, &Fold::default_closed(), row))
+            .map(|row| {
+                hit_folded(
+                    &spaces,
+                    &agents,
+                    1,
+                    5,
+                    30,
+                    &Fold::default_closed(),
+                    row,
+                    View::Grouped,
+                    &Seen::new(),
+                )
+            })
             .collect();
         assert!(hits.contains(&Some(Hit::Terminal(5))));
     }
@@ -1831,10 +2218,30 @@ mod tests {
     fn folded_hit_returns_what_folded_render_drew_on_every_row() {
         let (spaces, agents) = many_agents();
         for fold in [Fold::default_closed(), Fold::all_open()] {
-            let lines = render_folded(&spaces, &agents, 2, 1, 20, &fold);
+            let lines = render_folded(
+                &spaces,
+                &agents,
+                2,
+                1,
+                20,
+                &fold,
+                0,
+                View::Grouped,
+                &Seen::new(),
+            );
             assert_eq!(lines.len(), 20);
             for (row, line) in lines.iter().enumerate() {
-                let got = hit_folded(&spaces, &agents, 2, 1, 20, &fold, row);
+                let got = hit_folded(
+                    &spaces,
+                    &agents,
+                    2,
+                    1,
+                    20,
+                    &fold,
+                    row,
+                    View::Grouped,
+                    &Seen::new(),
+                );
                 let text = line.text.trim_end().to_string();
                 match got {
                     Some(Hit::Fold(group)) => {
@@ -1849,7 +2256,20 @@ mod tests {
                     Some(Hit::Space(_) | Hit::New | Hit::Menu | Hit::Collapse) | None => {}
                 }
             }
-            assert_eq!(hit_folded(&spaces, &agents, 2, 1, 20, &fold, 20), None);
+            assert_eq!(
+                hit_folded(
+                    &spaces,
+                    &agents,
+                    2,
+                    1,
+                    20,
+                    &fold,
+                    20,
+                    View::Grouped,
+                    &Seen::new()
+                ),
+                None
+            );
         }
     }
 
@@ -1866,6 +2286,7 @@ mod tests {
             behind: None,
             state: UNKNOWN.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }];
         let lines = render_folded(
             &[space(1, "app"), space(2, "webshop")],
@@ -1874,6 +2295,9 @@ mod tests {
             1,
             10,
             &Fold::default_closed(),
+            0,
+            View::Grouped,
+            &Seen::new(),
         );
         let texts: Vec<String> = lines
             .iter()
@@ -1892,10 +2316,20 @@ mod tests {
         fold.toggle_all();
         assert_eq!(fold, Fold::all_open());
         let (spaces, agents) = many_agents();
-        let texts: Vec<String> = render_folded(&spaces, &agents, 2, 1, 30, &fold)
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
+        let texts: Vec<String> = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            30,
+            &fold,
+            0,
+            View::Grouped,
+            &Seen::new(),
+        )
+        .iter()
+        .map(|l| l.text.trim_end().to_string())
+        .collect();
         assert!(
             texts.iter().any(|t| *t == " agents"),
             "a fully open panel carries the plain title: {texts:?}"
@@ -1937,5 +2371,147 @@ mod tests {
         let (strip, _) = collapse_row(true);
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
+    }
+
+    /// A done row is unread until the keyboard has been there: not focused,
+    /// and no receipt in the seen set.
+    #[test]
+    fn unread_is_a_done_row_nobody_has_looked_at() {
+        let (spaces, agents) = many_agents();
+        let _ = spaces;
+        let done = agents.iter().find(|a| a.terminal == 5).unwrap();
+        let empty = Seen::new();
+        assert!(is_unread(done, 1, &empty));
+        // Standing on it is reading it.
+        assert!(!is_unread(done, 5, &empty));
+        let mut seen = Seen::new();
+        seen.insert((5, 0));
+        assert!(!is_unread(done, 1, &seen));
+        // A receipt for another generation does not cover this one.
+        let mut old = Seen::new();
+        old.insert((5, 7));
+        assert!(is_unread(done, 1, &old));
+    }
+
+    /// An unread done never hides behind the finished fold: it draws under its
+    /// own open `new` header, ahead of running.
+    #[test]
+    fn folded_an_unread_done_gets_its_own_open_group() {
+        let (spaces, agents) = many_agents();
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            30,
+            &Fold::default_closed(),
+            0,
+            View::Grouped,
+            &Seen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.trim_start().starts_with("new") && t.trim_end().ends_with("1")),
+            "no open new group: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("finished")),
+            "the unread done folded: {texts:?}"
+        );
+        // Needs-you two, running two, new one: five of nine on screen.
+        assert!(texts.iter().any(|t| *t == " agents 5 of 9"), "{texts:?}");
+    }
+
+    /// The priority view is the same rows with no headers, sorted so what
+    /// wants a person is on top.
+    #[test]
+    fn priority_view_sorts_by_urgency_without_headers() {
+        let (spaces, agents) = many_agents();
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            40,
+            &Fold::default_closed(),
+            0,
+            View::Priority,
+            &Seen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        for header in ["needs you", "running", "finished"] {
+            assert!(
+                !texts.iter().any(|t| t.trim_start().starts_with(header)),
+                "a group header leaked into the priority view: {texts:?}"
+            );
+        }
+        let at = |word: &str| {
+            texts
+                .iter()
+                .position(|t| t.contains(word))
+                .unwrap_or_else(|| panic!("no {word} row: {texts:?}"))
+        };
+        assert!(at("blocked") < at("failed"), "{texts:?}");
+        assert!(at("failed") < at("done"), "{texts:?}");
+        // Every agent draws, folded or not: nine pairs, eighteen name rows.
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("claude") || t.contains("codex"))
+                .count(),
+            18,
+            "{texts:?}"
+        );
+    }
+
+    /// Blocked pulses and an unread done blinks: the indicator at tick four is
+    /// not the one at tick zero, while a settled row never moves.
+    #[test]
+    fn the_attention_signs_move_while_settled_rows_do_not() {
+        let (spaces, agents) = many_agents();
+        let at = |tick: u64| {
+            rows_folded(
+                &spaces,
+                &agents,
+                2,
+                1,
+                40,
+                &Fold::default_closed(),
+                tick,
+                View::Grouped,
+                &Seen::new(),
+            )
+        };
+        let sign_of = |rows: &[(Line, Option<Hit>)], word: &str| {
+            rows.iter()
+                .find(|(line, _)| line.text.contains(word))
+                .and_then(|(line, _)| line.indicator)
+                .unwrap_or_else(|| panic!("no {word} row"))
+        };
+        let blocked_0 = sign_of(&at(0), "blocked");
+        let blocked_4 = sign_of(&at(4), "blocked");
+        assert_ne!(blocked_0, blocked_4, "the blocked pulse is still");
+        assert_eq!(blocked_0.2, crate::theme::Role::Blocked);
+        let done_0 = sign_of(&at(0), "done");
+        let done_4 = sign_of(&at(4), "done");
+        assert_ne!(done_0, done_4, "the unread done does not blink");
+        assert_eq!(done_0.2, crate::theme::Role::Done);
+        let failed_0 = sign_of(&at(0), "failed");
+        assert_eq!(sign_of(&at(4), "failed"), failed_0, "failed moved");
+    }
+
+    #[test]
+    fn view_toggle_flips_between_grouped_and_priority() {
+        assert_eq!(View::Grouped.toggle(), View::Priority);
+        assert_eq!(View::Priority.toggle(), View::Grouped);
+        assert_eq!(View::default(), View::Grouped);
     }
 }

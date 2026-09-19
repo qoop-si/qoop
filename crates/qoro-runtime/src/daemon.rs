@@ -1,9 +1,10 @@
-//! The daemon: one socket, one terminal for now, real PTYs.
+//! The daemon: one socket, many terminals, real PTYs.
 //!
-//! Milestone 1 is one terminal on purpose. Everything that makes many terminals work
-//! (workspaces, per-client focus, layout) is milestone 2, and adding it before the single
-//! terminal is boringly reliable is how a runtime ends up unreliable in a way that features
-//! cannot fix.
+//! Focus lives on the connection, never in here: each client subscribes the
+//! terminals it draws and types at the stream it addresses, so two clients
+//! hold different terminals without a shared focus to diverge. There is no
+//! daemon-global focused terminal to move, which is what keeps one client's
+//! viewport from ever following another client's navigation.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -400,6 +401,9 @@ pub struct Daemon {
     workspace: i64,
     /// Set by a shutdown, read by every terminal that ends after one.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// What the last restart brought back, counted by kind. Kept so a gate, a
+    /// client, or a startup line can read what survived without reopening tabs.
+    restore_report: RestoreReport,
 }
 
 impl Daemon {
@@ -471,11 +475,11 @@ impl Daemon {
         //
         // Armed before anything is restored, so an agent that comes back is recorded the
         // first time it is recognised rather than the first time it changes.
-        spawn_agent_recorder(agents.clone(), books.clone());
+        spawn_agent_recorder(agents.clone(), terminals.clone(), books.clone());
 
         // What the last daemon was holding when it stopped. A person who closed qoro and
         // opened it again asked for their work back, not for an empty screen.
-        let brought_back = restore(&Restore {
+        let report = restore_report(&Restore {
             terminals: terminals.clone(),
             books: books.clone(),
             shell: shell.to_path_buf(),
@@ -486,7 +490,7 @@ impl Daemon {
             events: events.clone(),
         })
         .await;
-        if brought_back == 0 {
+        if report.brought_back == 0 {
             // Nothing to bring back, so the one terminal a first start has always had.
             let stream = terminals.mint();
             if let Err(e) = store
@@ -532,7 +536,16 @@ impl Daemon {
             agents,
             events,
             stopping,
+            restore_report: report,
         })
+    }
+
+    /// What the last restart brought back, counted by kind.
+    ///
+    /// A gate reads this rather than reopening tabs: the report is written once at
+    /// bind, from the same rows the restore read.
+    pub fn restore_report(&self) -> RestoreReport {
+        self.restore_report.clone()
     }
 
     /// The durable metadata, so a gate can read what the daemon wrote rather than guess.
@@ -1083,17 +1096,10 @@ async fn serve_client(
     let mut changes = agents.subscribe();
     let events_task = tokio::spawn(async move {
         loop {
-            let terminal = match changes.recv().await {
-                Ok(terminal) => terminal,
-                // Lagged means this connection missed some. The right answer is to say so
-                // once rather than to replay: the message is "look again", and looking
-                // again once covers everything that was missed.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            let Some(event) = pump_agent_event(&mut changes).await else {
+                return;
             };
-            let body = match serde_json::to_vec(&crate::control::EventMessage::AgentChanged {
-                terminal,
-            }) {
+            let body = match serde_json::to_vec(&event) {
                 Ok(body) => body,
                 Err(_) => return,
             };
@@ -1796,6 +1802,15 @@ async fn handle_control(
                         .map(|a| state_name(a.belief.state))
                         .unwrap_or("unknown")
                         .to_string();
+                    // Read before the row moves the strings: the mapping only
+                    // borrows, and the literal below owns.
+                    let readiness = crate::control::readiness_of(
+                        program.as_deref(),
+                        behind.as_deref(),
+                        &state,
+                        agent.as_ref().is_some_and(|a| a.setup_gate),
+                    )
+                    .to_string();
                     crate::control::AgentRow {
                         terminal,
                         name: terminals.name_of(terminal),
@@ -1822,6 +1837,7 @@ async fn handle_control(
                         behind,
                         state,
                         generation,
+                        readiness,
                     }
                 })
                 .collect();
@@ -2295,7 +2311,11 @@ pub fn open_terminal(
 ///
 /// One task for the daemon rather than one per terminal, because the registry announces
 /// every change through one channel and this is the only reader that needs all of them.
-fn spawn_agent_recorder(agents: Arc<crate::agents::AgentRegistry>, books: Bookkeeping) {
+fn spawn_agent_recorder(
+    agents: Arc<crate::agents::AgentRegistry>,
+    terminals: Arc<TerminalRegistry>,
+    books: Bookkeeping,
+) {
     let mut changes = agents.subscribe();
     tokio::spawn(async move {
         // What was last written for each terminal, so a rename or a state change, which
@@ -2303,31 +2323,75 @@ fn spawn_agent_recorder(agents: Arc<crate::agents::AgentRegistry>, books: Bookke
         // row already says.
         let mut written: BTreeMap<u32, Option<String>> = BTreeMap::new();
         loop {
-            let stream = match changes.recv().await {
-                Ok(stream) => stream,
-                // Announcements are news, not a ledger: a reader that fell behind has
-                // missed some and the current answer is still the right one to write.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            match changes.recv().await {
+                Ok(stream) => {
+                    record_stream(&agents, &books, &mut written, stream).await;
+                }
+                // Announcements are news, not a ledger, but a reader that fell behind
+                // cannot know which terminals changed: re-read every open one rather
+                // than waiting for the next announcement, which may never come.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    for stream in terminals.streams() {
+                        record_stream(&agents, &books, &mut written, stream).await;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            };
-            // Nothing is recorded once the daemon is going. Stopping kills every child,
-            // so every agent is announced as gone on the way out, and recording that would
-            // erase the one thing the next start needs: measured, a session with a real
-            // Claude Code in it came back as a bare shell because the row was cleared
-            // between the stop and the exit.
-            if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                continue;
             }
-            let now = agent_program(&agents, stream);
-            if written.get(&stream).cloned().flatten() == now {
-                continue;
-            }
-            written.insert(stream, now.clone());
-            // An agent that has gone is written down as gone: a person who quit theirs
-            // quit it, and starting it again on the next open would undo that.
-            let _ = books.store.set_agent(stream as i64, now, None).await;
         }
     });
+}
+
+/// Write down what is in one terminal, unless the row already says it.
+///
+/// Nothing is recorded once the daemon is going. Stopping kills every child,
+/// so every agent is announced as gone on the way out, and recording that would
+/// erase the one thing the next start needs: measured, a session with a real
+/// Claude Code in it came back as a bare shell because the row was cleared
+/// between the stop and the exit.
+async fn record_stream(
+    agents: &Arc<crate::agents::AgentRegistry>,
+    books: &Bookkeeping,
+    written: &mut BTreeMap<u32, Option<String>>,
+    stream: u32,
+) {
+    if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let now = agent_program(agents, stream);
+    if written.get(&stream).cloned().flatten() == now {
+        return;
+    }
+    // An agent that has gone is written down as gone: a person who quit theirs
+    // quit it, and starting it again on the next open would undo that. The map
+    // moves only once the write lands: a failed write with an updated map would
+    // skip the retry and every later reconciliation with it.
+    if books
+        .store
+        .set_agent(stream as i64, now.clone(), None)
+        .await
+        .is_ok()
+    {
+        written.insert(stream, now);
+    }
+}
+
+/// One step of the per-connection news pump: the next event to send.
+///
+/// A lagged receiver missed some announcements, and the missed ones are gone from
+/// the channel. The answer is a resync rather than silence: the message is "look
+/// again", and looking again once covers everything that was missed, including
+/// the case where the missed change was the last one for a while. `None` ends
+/// the pump; every other outcome is something the client should hear.
+async fn pump_agent_event(
+    changes: &mut tokio::sync::broadcast::Receiver<u32>,
+) -> Option<crate::control::EventMessage> {
+    match changes.recv().await {
+        Ok(terminal) => Some(crate::control::EventMessage::AgentChanged { terminal }),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Some(crate::control::EventMessage::Resync)
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 /// The agent in a terminal, if what is in it is an agent at all.
@@ -2371,6 +2435,45 @@ pub struct Restore {
     pub events: crate::eventlog::EventLog,
 }
 
+/// What a restart brought back, counted by kind rather than as one number.
+///
+/// A single count hides the failures that matter: a tab that came back as a bare
+/// shell where a conversation was, or a tab that moved directory because its own
+/// is gone. The report names each, so a person sees what survived and what fell
+/// back without opening every tab to find out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Workspaces read.
+    pub spaces: usize,
+    /// Terminal rows recorded as open.
+    pub terminals: usize,
+    /// Tabs reopened.
+    pub brought_back: usize,
+    /// Tabs whose directory was gone, started where the daemon is instead.
+    pub cwd_fallback: usize,
+    /// Tabs where the agent's own resume command was typed back in.
+    pub agents_resumed: usize,
+    /// Tabs that named an agent but had no resume command for it, so a shell.
+    pub agents_shell_fallback: usize,
+    /// Tabs with no agent recorded, restored as plain shells.
+    pub plain_shells: usize,
+}
+
+impl RestoreReport {
+    /// One line for the startup log: what survived and what fell back.
+    pub fn summary(&self) -> String {
+        format!(
+            "restore: {}/{} panes, {} agents resumed, {} agent shells, {} plain shells, {} moved directory",
+            self.brought_back,
+            self.terminals,
+            self.agents_resumed,
+            self.agents_shell_fallback,
+            self.plain_shells,
+            self.cwd_fallback,
+        )
+    }
+}
+
 /// Bring back the terminals the last daemon was holding, and say how many.
 ///
 /// What comes back is the tab: its workspace, its place in the order, the directory it was
@@ -2385,15 +2488,25 @@ pub struct Restore {
 /// carries on where it stopped. The command is typed rather than execed so the person can
 /// see what ran, and so the tab is still a shell when the agent exits.
 pub async fn restore(into: &Restore) -> usize {
+    restore_report(into).await.brought_back
+}
+
+/// Bring back the terminals the last daemon was holding, counted by kind.
+///
+/// The same work as [`restore`], with the categories kept instead of folded into one
+/// number. See [`RestoreReport`] for why the split matters.
+pub async fn restore_report(into: &Restore) -> RestoreReport {
+    let mut report = RestoreReport::default();
     let Ok(spaces) = into.books.store.workspaces().await else {
-        return 0;
+        return report;
     };
-    let mut brought_back = 0;
+    report.spaces = spaces.len();
     for space in spaces {
         let Ok(rows) = into.books.store.open_terminals(space.id).await else {
             continue;
         };
         for row in rows {
+            report.terminals += 1;
             let stream = row.id as u32;
             // The registry has to keep minting above what came back, or the next new
             // terminal takes the number of one already on screen.
@@ -2420,25 +2533,47 @@ pub async fn restore(into: &Restore) -> usize {
             let Ok(handle) = opened else {
                 continue;
             };
-            brought_back += 1;
-            if let Some(argv) = row
+            report.brought_back += 1;
+            let resume = row
                 .agent
                 .as_deref()
-                .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()))
-            {
+                .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()));
+            // The resume command is typed into the shell, and the send is what does
+            // it: a tab whose send failed holds a shell, not a resumed agent, and the
+            // report says so rather than counting an intent as a recovery.
+            let mut sent = false;
+            if let Some(argv) = resume {
                 let mut line = shell_line(&argv);
                 line.push('\r');
-                let _ = handle
+                sent = handle
                     .commands
                     .send(ClientCommand::Input {
                         from: ClientId::new("qoro-restore"),
                         bytes: Bytes::from(line),
                     })
-                    .await;
+                    .await
+                    .is_ok();
+            }
+            match (&row.agent, sent) {
+                (Some(_), true) => {
+                    report.agents_resumed += 1;
+                }
+                (Some(_), false) => {
+                    report.agents_shell_fallback += 1;
+                }
+                (None, _) => {
+                    report.plain_shells += 1;
+                }
+            }
+            // A row whose directory is gone started where the daemon is instead. Counted
+            // here, after the open succeeded, so a tab that never opened is missing from
+            // both halves of the summary rather than half reported as moved.
+            if cwd.is_none() {
+                report.cwd_fallback += 1;
             }
         }
     }
-    brought_back
+    report
 }
 
 /// One command line, quoted so a shell runs the argv that was meant.
@@ -2628,7 +2763,7 @@ pub struct TerminalSpawn {
 #[allow(clippy::too_many_arguments)]
 fn spawn_terminal(
     spawn: TerminalSpawn,
-    mut from_clients: mpsc::Receiver<ClientCommand>,
+    from_clients: mpsc::Receiver<ClientCommand>,
     updates: watch::Sender<TerminalUpdate>,
     warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
     spill: crate::spill::SpillRing,
@@ -2709,25 +2844,72 @@ fn spawn_terminal(
     // `sleep` will never produce.
     register_master.attach_master(stream, master_fd.as_raw_fd());
 
+    // What the supervisor needs if the task below panics: the nested task dies
+    // with the child handle, so the ordered teardown never runs. The tty
+    // identity, the child's pid with its start time, and a clone of the shared
+    // scanner stay outside the panic boundary, which is what the fallback
+    // teardown kills the tree with.
+    let fallback_scanner = scanner.clone();
+    let fallback_pid = child.id();
+    let fallback_start = i32::try_from(fallback_pid)
+        .ok()
+        .and_then(|pid| qoro_pty::sys::start_time_of(qoro_pty::teardown::Pid(pid)));
     tokio::spawn(async move {
-        if let Err(e) = terminal_task(
+        // A panic in one terminal's task must not take the daemon or its neighbours
+        // with it, and must not leave a corpse tab behind either: without the
+        // containment below, the task dies, `on_end` never runs, the registry keeps
+        // a dead handle, and the tab reads as alive while nothing runs in it. The
+        // join is the containment: a panic arrives here as an error rather than
+        // unwinding the supervisor.
+        let outcome = tokio::spawn(terminal_task(
             master_fd,
             child,
             tty_dev,
-            &mut from_clients,
+            from_clients,
             updates.clone(),
             warnings,
             spill,
             scanner,
-            agents,
+            agents.clone(),
             stream,
-            events,
+            events.clone(),
             books,
             started_in,
-        )
-        .await
-        {
-            eprintln!("qorod: terminal ended: {e}");
+        ))
+        .await;
+        match classify_task_end(outcome) {
+            TaskEnd::Clean => {}
+            TaskEnd::Ended { error } => {
+                eprintln!("qorod: terminal ended: {error}");
+            }
+            TaskEnd::Panicked => {
+                let generation = agents
+                    .agent(stream)
+                    .map(|a| a.belief.generation.0)
+                    .unwrap_or(0);
+                events.observe(
+                    qoro_events::Stream::Terminal(stream),
+                    qoro_events::Body::Observation {
+                        terminal: stream,
+                        state: "failed".into(),
+                        source: "supervisor".into(),
+                        confidence: "High".into(),
+                        sampled_generation: generation,
+                        evidence: "terminal task panicked and was contained".into(),
+                        redacted: false,
+                    },
+                );
+                agents.announce(stream);
+                // The ordered teardown died with the task, so the tree would
+                // otherwise survive with no tab: kill it by tty identity before
+                // the tab is deregistered below.
+                let seen =
+                    fallback_teardown(&fallback_scanner, tty_dev, fallback_pid, fallback_start)
+                        .await;
+                eprintln!(
+                    "qorod: terminal {stream} task panicked; contained ({seen} tracked processes)"
+                );
+            }
         }
         // Deregistered before the last update, so a client that reacts to `Gone` by asking
         // for the terminal cannot find a handle whose task has already returned.
@@ -2738,6 +2920,152 @@ fn spawn_terminal(
         let _ = updates.send(TerminalUpdate::Ended(last));
     });
     Ok(())
+}
+
+/// How one terminal's task ended, after panic containment.
+///
+/// A task that returns is over however it returned; a task that panicked is over
+/// however loudly. The distinction matters because only the last one means the
+/// runtime itself broke, which is what the Failed observation reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TaskEnd {
+    Clean,
+    Ended { error: String },
+    Panicked,
+}
+
+/// Sort a joined task outcome into its ending.
+///
+/// A returned error keeps its text for the caller's log line; a panic keeps
+/// nothing, because a panic payload is arbitrary. Cancellation is not expected
+/// (nothing aborts this task) and reads as an ending, because the tab is over
+/// either way.
+fn classify_task_end(outcome: Result<std::io::Result<()>, tokio::task::JoinError>) -> TaskEnd {
+    match outcome {
+        Ok(Ok(())) => TaskEnd::Clean,
+        Ok(Err(e)) => TaskEnd::Ended {
+            error: e.to_string(),
+        },
+        Err(join) if join.is_panic() => TaskEnd::Panicked,
+        Err(join) => TaskEnd::Ended {
+            error: join.to_string(),
+        },
+    }
+}
+
+/// Kill a terminal's tree after its task panicked.
+///
+/// The nested task died with the child handle, so the ordered teardown never
+/// ran and the shell and its jobs would otherwise survive with no tab. What
+/// remains outside the panic boundary is the tty identity, the child's pid
+/// with the start time captured at spawn, and the shared scanner: signal the
+/// recorded tree with escalating HUP, TERM, KILL and a grace between rounds,
+/// pruning recycled pids before every round so a reused pid in a recycled
+/// group is never signalled, then reap the child by pid.
+///
+/// The child itself is signalled directly every round, not only through its
+/// group: an empty scanner snapshot would otherwise leave a HUP-ignoring
+/// shell running with no tab. The start time captured at spawn guards the
+/// direct signal, so a recycled pid is never touched.
+///
+/// Only the scanner snapshot is trusted, never a fresh enumeration: the master
+/// is already dropped, so the device number may be recycled under a new
+/// terminal, and signalling a fresh enumeration could kill that terminal's
+/// processes. A job the last scan never captured is the accepted residual;
+/// the count is returned so the caller logs what the fallback saw.
+///
+/// Deliberately not the ordered teardown: there is no master to drain, only
+/// orphans to stop and one child to reap. A tree that outlives the last round
+/// is logged, never silently kept.
+async fn fallback_teardown(
+    scanner: &ContainmentScanner,
+    tty_dev: u64,
+    child_pid: u32,
+    child_start: Option<u64>,
+) -> usize {
+    let child = i32::try_from(child_pid).ok().map(qoro_pty::teardown::Pid);
+    // A missing start time disables the direct signal below: signalling a pid
+    // without its generation could hit a recycled stranger, and an unsignalled
+    // orphan is the smaller failure. Said out loud, so the residual is visible
+    // rather than silent. Capture fails only when the kernel will not describe
+    // our own just-spawned child, which is how rarely this fires.
+    if child.is_some() && child_start.is_none() {
+        eprintln!(
+            "qorod: fallback teardown for pid {child_pid} has no start time; direct signal skipped"
+        );
+    }
+    let mut set = Containment::new();
+    // Once, before the first signal: the snapshot is frozen here and never
+    // refreshed. A scan taken after the master is dropped may already belong
+    // to a recycled device's new owner, so absorbing again inside the loop
+    // could signal a terminal this fallback did not come for. What the last
+    // scan missed stays missed; the count says so.
+    set.absorb(scanner.members(tty_dev));
+    let seen = set.len();
+    let mut round = 0usize;
+    while let Some(signal) = teardown::plan(round) {
+        set.prune(&qoro_pty::sys::still_alive);
+        // The known child first: this is the one pid that is ours by spawn,
+        // guarded by the start time from that same spawn.
+        if let (Some(pid), Some(start)) = (child, child_start)
+            && qoro_pty::sys::still_alive(pid, start)
+        {
+            let _ = qoro_pty::sys::signal_pid(pid, signal);
+        }
+        let child_gone = child
+            .zip(child_start)
+            .is_none_or(|(pid, start)| !qoro_pty::sys::still_alive(pid, start));
+        let groups = set.groups_to_signal(round, &qoro_pty::sys::still_alive);
+        if groups.is_empty() && child_gone {
+            break;
+        }
+        for g in groups {
+            let _ = qoro_pty::sys::signal_group(g, signal);
+        }
+        round += 1;
+        tokio::time::sleep(teardown::GRACE).await;
+    }
+    reap_child(child_pid).await;
+    set.prune(&qoro_pty::sys::still_alive);
+    if !set
+        .groups_to_signal(round, &qoro_pty::sys::still_alive)
+        .is_empty()
+    {
+        eprintln!("qorod: fallback teardown for pid {child_pid} left processes behind");
+    }
+    seen
+}
+
+/// Reap one child without its handle.
+///
+/// The daemon is still the parent, so `waitpid` on exactly this pid reaps
+/// exactly this child and nothing else. Anything that is not "still alive"
+/// ends the loop: reaped, already gone, or never ours. A non-positive or
+/// unrepresentable pid waits for nothing, because `waitpid(-1)` means any
+/// child and this must never touch a terminal it did not come for.
+async fn reap_child(child_pid: u32) {
+    let pid = i32::try_from(child_pid).ok().filter(|p| *p > 0);
+    let Some(pid) = pid else { return };
+    for _ in 0..20 {
+        let mut status = 0;
+        // SAFETY: waitpid on our own child's pid with WNOHANG; blocks nothing,
+        // reaps nothing but this pid.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return;
+        }
+        if r == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+        // Interrupted before reaping anything: retry rather than leave a
+        // zombie behind. Anything else negative is ECHILD or a real error,
+        // and both mean there is nothing left to wait for.
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return;
+    }
 }
 
 fn dup_stdio(fd: &OwnedFd) -> io::Result<std::process::Stdio> {
@@ -2890,7 +3218,7 @@ async fn terminal_task(
     master: OwnedFd,
     mut child: std::process::Child,
     tty_dev: u64,
-    from_clients: &mut mpsc::Receiver<ClientCommand>,
+    mut from_clients: mpsc::Receiver<ClientCommand>,
     updates: watch::Sender<TerminalUpdate>,
     warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
     spill: crate::spill::SpillRing,
@@ -3226,6 +3554,10 @@ async fn terminal_task(
                                         visible_blocker: false,
                                         visible_idle: false,
                                         visible_working: false,
+                                        // An idle fallback is the absence of any
+                                        // dialog, so it clears a gate rather than
+                                        // holding one.
+                                        setup_gate: false,
                                     };
                                     Some(fallback)
                                 } else {
@@ -3631,5 +3963,114 @@ fn write_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod restore_report_tests {
+    use super::RestoreReport;
+
+    /// The summary names every category, so a silent fallback has nowhere to hide.
+    #[test]
+    fn the_summary_counts_panes_agents_and_fallbacks() {
+        let report = RestoreReport {
+            spaces: 1,
+            terminals: 4,
+            brought_back: 4,
+            cwd_fallback: 1,
+            agents_resumed: 1,
+            agents_shell_fallback: 1,
+            plain_shells: 2,
+        };
+        assert_eq!(
+            report.summary(),
+            "restore: 4/4 panes, 1 agents resumed, 1 agent shells, 2 plain shells, 1 moved directory"
+        );
+    }
+
+    /// An empty store restores nothing and says nothing came back.
+    #[test]
+    fn an_empty_report_says_zero_of_zero() {
+        let report = RestoreReport::default();
+        assert_eq!(report.brought_back, 0);
+        assert!(report.summary().starts_with("restore: 0/0 panes"));
+    }
+
+    /// A lagged news reader is told to re-read rather than left behind silently.
+    ///
+    /// The channel holds one announcement and two are sent, so the oldest is
+    /// dropped and the next receive reports the lag instead of it.
+    #[tokio::test]
+    async fn a_lagged_news_reader_gets_a_resync() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        tx.send(1u32).expect("a listener");
+        tx.send(2u32).expect("overflow the channel");
+        assert_eq!(
+            super::pump_agent_event(&mut rx).await,
+            Some(crate::control::EventMessage::Resync),
+            "a missed announcement must say so rather than vanish"
+        );
+    }
+
+    /// The ordinary step passes the terminal through untouched.
+    #[tokio::test]
+    async fn an_unlagged_news_reader_gets_the_terminal() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        tx.send(7u32).expect("a listener");
+        assert_eq!(
+            super::pump_agent_event(&mut rx).await,
+            Some(crate::control::EventMessage::AgentChanged { terminal: 7 }),
+        );
+    }
+
+    /// A closed channel ends the pump rather than resyncing forever.
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_pump() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<u32>(16);
+        drop(tx);
+        assert_eq!(super::pump_agent_event(&mut rx).await, None);
+    }
+
+    /// A task ending is sorted by how it ended: clean, returned error, or panic.
+    #[tokio::test]
+    async fn a_task_ending_keeps_a_returned_error_and_names_a_panic() {
+        let clean = tokio::spawn(async { Ok::<(), std::io::Error>(()) }).await;
+        assert_eq!(super::classify_task_end(clean), super::TaskEnd::Clean);
+        let ended =
+            tokio::spawn(async { Err::<(), std::io::Error>(std::io::Error::other("gone")) }).await;
+        assert_eq!(
+            super::classify_task_end(ended),
+            super::TaskEnd::Ended {
+                error: "gone".into()
+            },
+            "a returned error keeps its text for the log line"
+        );
+        let panicked = tokio::spawn(async {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        assert_eq!(super::classify_task_end(panicked), super::TaskEnd::Panicked);
+    }
+
+    /// A fallback teardown over a tty nothing lives on is a no-op, not a wait.
+    ///
+    /// No groups means no rounds and no sleeps: the timeout only fires if a
+    /// regression parks the supervisor on an empty tree while real terminals
+    /// wait behind it. `u32::MAX` also proves the reap guard: it is not a
+    /// positive pid, so no waitpid runs and no unrelated child is touched.
+    /// `None` for the start time proves the direct signal is skipped without
+    /// one: there is no pid a signal without a generation could reach.
+    #[tokio::test]
+    async fn a_fallback_teardown_with_nobody_on_the_tty_returns_at_once() {
+        let scanner = super::ContainmentScanner::default();
+        let seen = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::fallback_teardown(&scanner, u64::MAX, u32::MAX, None),
+        )
+        .await
+        .expect("an empty tree kills nothing and waits for nothing");
+        assert_eq!(seen, 0, "nothing was tracked on an empty tty");
     }
 }

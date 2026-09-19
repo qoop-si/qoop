@@ -14,6 +14,8 @@
 //! 3. input latency, local and quiet.
 //! 4. input latency while the terminal streams about 1 MiB/s to itself.
 //! 5. resident memory per terminal, at two sizes.
+//! 6. fan-out delivery: four clients on four terminals, slowest client wins.
+//! 7. reconnect catch-up: a fresh client sees prior output with no retype.
 
 mod proc;
 mod report;
@@ -48,6 +50,8 @@ async fn main() -> std::process::ExitCode {
     outcomes.push(scenarios::input_latency::run_quiet().await);
     outcomes.push(scenarios::input_latency::run_noisy().await);
     outcomes.extend(scenarios::memory::run(&bin).await);
+    outcomes.push(scenarios::fanout::run_fanout().await);
+    outcomes.push(scenarios::fanout::run_reconnect().await);
 
     println!();
     report::print_table(&outcomes);

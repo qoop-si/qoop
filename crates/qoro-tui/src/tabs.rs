@@ -81,6 +81,7 @@ pub fn render(terminals: &[AgentRow], focused: u32, cols: usize) -> Line {
         text: exactly(&bar, cols),
         colour: None,
         accent: None,
+        indicator: None,
     }
 }
 
@@ -276,6 +277,7 @@ mod tests {
             behind: None,
             state: "idle".to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -291,6 +293,7 @@ mod tests {
             behind: None,
             state: "unknown".to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 

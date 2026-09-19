@@ -253,6 +253,7 @@ pub fn rows(
             text: crate::width::fit(&format!(" needs you {}", needs.len()), MASTER_WIDTH),
             colour: Some(crate::theme::Role::Title),
             accent: None,
+            indicator: None,
         },
         None,
     ));
@@ -269,6 +270,7 @@ pub fn rows(
                     text: crate::width::fit(" son rapor", MASTER_WIDTH),
                     colour: Some(crate::theme::Role::Title),
                     accent: None,
+                    indicator: None,
                 },
                 None,
             ));
@@ -278,6 +280,7 @@ pub fn rows(
                         text: crate::width::fit(&format!(" {line}"), MASTER_WIDTH),
                         colour: None,
                         accent: None,
+                        indicator: None,
                     },
                     None,
                 ));
@@ -289,6 +292,7 @@ pub fn rows(
             text: crate::width::fit("[E] master [a] onayla [u] reddet", MASTER_WIDTH),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
+            indicator: None,
         },
         Some(Hit::Footer),
     ));
@@ -333,6 +337,7 @@ fn header(
                 ),
                 colour: crate::sidebar::colour_for(&row.state),
                 accent: None,
+                indicator: None,
             },
             Some(Hit::Header),
         ),
@@ -341,6 +346,7 @@ fn header(
                 text: crate::width::fit("master yok: bir tab pinle", MASTER_WIDTH),
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
+                indicator: None,
             },
             Some(Hit::Header),
         ),
@@ -388,6 +394,7 @@ fn triage(
                         crate::width::width(&space),
                         crate::theme::space_of(row.workspace),
                     )),
+                    indicator: None,
                 },
                 Some(Hit::Need(row.terminal)),
             ));
@@ -436,6 +443,7 @@ fn divider() -> (crate::sidebar::Line, Option<Hit>) {
             text: "\u{2500}".repeat(MASTER_WIDTH),
             colour: Some(crate::theme::Role::Rule),
             accent: None,
+            indicator: None,
         },
         None,
     )
@@ -463,6 +471,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: Some(1),
+            readiness: "ready".to_string(),
         }
     }
 
@@ -476,6 +485,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: Some(1),
+            readiness: "ready".to_string(),
         }
     }
 
@@ -598,6 +608,7 @@ mod tests {
                 behind: None,
                 state: "failed".to_string(),
                 generation: None,
+                readiness: "ready".to_string(),
             },
         ];
         let spaces = vec![space(1, "app")];

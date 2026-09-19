@@ -7,10 +7,12 @@
 //! timing from that process's spawn to the first bytes of a rendered frame reaching the
 //! outer terminal.
 //!
-//! `qoro_runtime::client::render` always begins a frame with `ESC [ H` (home cursor), and
-//! nothing else the client writes on startup contains that sequence: the attach preamble
-//! disables mouse modes and shows the cursor, neither of which is `\x1b[H`. That makes the
-//! byte sequence a real signal of "a snapshot was drawn", not a guess about timing.
+//! A rendered frame is recognised by the first cursor-addressing sequence
+//! (`CSI params H`): the attach preamble disables mouse modes and shows the
+//! cursor, which are `h`/`l` sequences, while every painted frame moves the
+//! cursor with `H`. Measured against the real client: its first bytes are
+//! `ESC[?1000l...` preamble followed by `ESC[1;32H...` paint, with no bare
+//! `ESC[H` anywhere, so matching only the bare home sequence never fires.
 
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
@@ -25,7 +27,6 @@ use crate::stats::summarize;
 
 const WARMUP: usize = 3;
 const SAMPLES: usize = 30;
-const FIRST_FRAME_MARKER: &[u8] = b"\x1b[H";
 const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run(bin: &Path) -> ScenarioOutcome {
@@ -69,6 +70,13 @@ fn attach_once(bin: &Path, runtime_dir: &Path) -> std::io::Result<Duration> {
     let start = Instant::now();
     let mut child = Command::new(bin)
         .env("QORO_RUNTIME_DIR", runtime_dir)
+        // Same session pinning as the daemon spawn above: the client must
+        // attach the session the warm daemon actually holds.
+        .env_remove(qoro_runtime::paths::SESSION_ENV)
+        // And the same token hygiene: a bench run inside a qoro terminal
+        // must not leak that terminal's identity into the client.
+        .env_remove("QORO_TOKEN")
+        .env_remove("QORO_TERMINAL")
         .stdin(dup_slave(&pty)?)
         .stdout(dup_slave(&pty)?)
         .stderr(Stdio::null())
@@ -115,7 +123,7 @@ fn read_until_first_frame(
         let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n > 0 {
             seen.extend_from_slice(&buf[..n as usize]);
-            if contains(&seen, FIRST_FRAME_MARKER) {
+            if contains_cup(&seen) {
                 return Ok(Instant::now().duration_since(start));
             }
         } else if n == 0 {
@@ -134,6 +142,42 @@ fn read_until_first_frame(
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+/// Whether the bytes so far contain a cursor-addressing sequence: `ESC [`
+/// followed by digits and semicolons, terminated by `H`. The bare home
+/// `ESC[H` is one instance; the client paints with explicit coordinates
+/// (`ESC[1;32H`), which is another. The startup preamble's `h`/`l` sequences
+/// never match, so the first match is the first painted frame.
+fn contains_cup(haystack: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 <= haystack.len() {
+        if haystack[i] == 0x1b && haystack[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < haystack.len() && (haystack[j].is_ascii_digit() || haystack[j] == b';') {
+                j += 1;
+            }
+            if j < haystack.len() && haystack[j] == b'H' {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_cup;
+
+    #[test]
+    fn the_preamble_alone_is_not_a_frame() {
+        assert!(!contains_cup(b"\x1b[?1000l\x1b[?1002l\x1b[?25h"));
+    }
+
+    #[test]
+    fn a_positioned_cursor_is_a_frame() {
+        assert!(contains_cup(b"\x1b[?25h\x1b[1;32Hhello"));
+        assert!(contains_cup(b"\x1b[H"));
+    }
 }

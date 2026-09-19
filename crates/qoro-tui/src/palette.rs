@@ -216,6 +216,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
             behind: None,
             state: "idle".to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 

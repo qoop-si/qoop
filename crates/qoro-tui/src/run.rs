@@ -73,22 +73,53 @@ impl Behind {
 /// the program. Three is what a terminal sends and what a hand expects.
 const WHEEL_ROWS: usize = 3;
 
-/// What to say when something has been copied.
-fn copied(text: &str) -> String {
+/// Whether the spinner tick has anything to animate.
+///
+/// Working and starting spin, blocked pulses, and an unread done blinks, all
+/// on the same tick. Anything else is a still panel, and a tick that repainted
+/// one would trade the loop's founding rule (no wake without an arrival) for
+/// eight redundant frames a second.
+fn wants_tick(rows: &[AgentRow], focused: u32, seen: &sidebar::Seen) -> bool {
+    sidebar::wants_tick(rows, focused, seen)
+}
+
+/// How often the working spinner advances one frame.
+///
+/// Eight frames a second: fast enough to read as alive, slow enough to read as calm.
+/// The tick only repaints while an agent is working (see the `spin_tick` arm below),
+/// so this costs nothing on a still screen.
+const SPIN_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// What to say when something has been copied, given how it left.
+///
+/// A system clipboard write is a promise kept by this machine, so it says
+/// "copied". An OSC 52 escape is a request to the terminal in front of the
+/// person, which that terminal may swallow: saying "copied" for one is how a
+/// person ends up pasting nothing. The notice names the path instead.
+fn copied(text: &str, via: crate::selection::CopyVia) -> String {
+    let what = short_copied(text);
+    match via {
+        crate::selection::CopyVia::System => format!("copied {what}"),
+        crate::selection::CopyVia::TerminalEscape => {
+            format!("sent to terminal clipboard ({what})")
+        }
+    }
+}
+
+/// The short form of what was copied: a line count, or the text itself cut to
+/// the notice row.
+fn short_copied(text: &str) -> String {
     let lines = text.lines().count();
     if lines > 1 {
-        return format!("copied {lines} lines");
+        return format!("{lines} lines");
     }
     let one = text.trim();
     // Shown, so a person can see they got the right thing, and cut so a long line does not
     // push the rest of the notice off the row.
     if crate::width::width(one) > 40 {
-        format!(
-            "copied {}\u{2026}",
-            crate::selection::in_columns(one, 0..39)
-        )
+        format!("{}\u{2026}", crate::selection::in_columns(one, 0..39))
     } else {
-        format!("copied {one}")
+        one.to_string()
     }
 }
 
@@ -184,6 +215,20 @@ struct State {
     creating: usize,
     /// Which idle groups of the agents panel are expanded.
     fold: sidebar::Fold,
+    /// The agents panel as labelled groups, or as a flat urgency list.
+    view: sidebar::View,
+    /// The done rows this client has already looked at, as (terminal, generation).
+    ///
+    /// Client-local, like the focus itself: reading a done agent here does not
+    /// mark it read anywhere else. A focused done row counts as read without
+    /// an entry, so this only holds rows finished while the keyboard was away.
+    seen_done: sidebar::Seen,
+    /// The working spinner's animation step.
+    ///
+    /// Advanced by the run loop's spinner tick while an agent is working, held while
+    /// none is. Wrapping rather than resetting: a reset would replay the same opening
+    /// frame every time an agent starts, and uptime outlives `u64` anyway.
+    tick: u64,
     /// The open search palette, or `None` when the terminal has the keyboard.
     palette: Option<Palette>,
     /// The start of a palette key sequence the read ended in the middle of.
@@ -325,6 +370,9 @@ impl State {
             message: self.message.as_deref(),
             hint: self.hint.as_deref(),
             fold: self.fold,
+            view: self.view,
+            seen: &self.seen_done,
+            tick: self.tick,
             palette: self.palette.as_ref(),
             prompt: self.prompt.as_ref(),
             menu: self.menu,
@@ -540,6 +588,8 @@ impl State {
                 column_rows,
                 &self.fold,
                 within,
+                self.view,
+                &self.seen_done,
             )
         };
         // The row between the panels answers by which half was clicked, so the column has
@@ -552,6 +602,10 @@ impl State {
                 self.focused,
                 column_rows,
                 &self.fold,
+                // Hit testing does not depend on the animation frame.
+                0,
+                self.view,
+                &self.seen_done,
             );
             let is_footer = rows
                 .get(within)
@@ -934,6 +988,9 @@ async fn drive(
         creating: 0,
         done: false,
         fold: sidebar::Fold::default(),
+        view: sidebar::View::default(),
+        seen_done: sidebar::Seen::new(),
+        tick: 0,
         palette: None,
         palette_pending: Vec::new(),
         selection: None,
@@ -971,6 +1028,13 @@ async fn drive(
     // after a minute of sitting still, with no error, which reads as a crash.
     let mut ack_tick = tokio::time::interval(client::ACK_INTERVAL);
     ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The spinner's step. Nothing else in this loop is on a timer: every other wake is
+    // an arrival, which is why the interface costs nothing while nobody is typing. The
+    // spinner is the one exception, and it only ticks while there is something spinning:
+    // an interval that fired with no working agent would repaint a still panel eight
+    // times a second for nothing.
+    let mut spin_tick = tokio::time::interval(SPIN_EVERY);
+    spin_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Ask what is there before drawing anything, so the first frame is the real index
     // rather than an empty one that fills in a moment later.
@@ -1039,6 +1103,15 @@ async fn drive(
                 _ = ack_tick.tick() => {
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
+                    }
+                }
+                _ = spin_tick.tick() => {
+                    // The step advances and the frame repaints only while a working agent
+                    // is on screen. Otherwise the tick passes silently and the loop keeps
+                    // its rule: no wake without an arrival.
+                    if wants_tick(&state.rows, state.focused, &state.seen_done) {
+                        state.tick = state.tick.wrapping_add(1);
+                        dirty = true;
                     }
                 }
                 _ = sigterm.recv() => return Ok(()),
@@ -1404,8 +1477,17 @@ async fn drive(
                                     let text = selection.text(&window, tile.cols);
                                     if !text.is_empty() {
                                         let mut out = std::io::stdout();
-                                        crate::selection::copy(&text, &mut out)?;
-                                        state.message = Some(copied(&text));
+                                        match crate::selection::copy(&text, &mut out)? {
+                                            Some(via) => {
+                                                state.message = Some(copied(&text, via));
+                                            }
+                                            // Empty text never reaches here (guarded
+                                            // above); a `None` without text is a click
+                                            // that released outside any cell.
+                                            None => {
+                                                state.selection = None;
+                                            }
+                                        }
                                         dirty = true;
                                     } else {
                                         // A click, not a drag. Nothing was selected, so
@@ -1647,6 +1729,10 @@ async fn drive(
                                 state.fold.toggle_all();
                                 dirty = true;
                             }
+                            Action::ToggleView => {
+                                state.view = state.view.toggle();
+                                dirty = true;
+                            }
                             Action::SplitV | Action::SplitH => {
                                 let dir = if matches!(action, Action::SplitV) {
                                     layout::Dir::V
@@ -1852,9 +1938,12 @@ async fn drive(
                                     dirty = true;
                                 }
                             }
-                            Incoming::Event(EventMessage::AgentChanged { .. }) => {
+                            Incoming::Event(EventMessage::AgentChanged { .. })
+                            | Incoming::Event(EventMessage::Resync) => {
                                 // What changed is not in the message on purpose, so the
-                                // answer comes from the one place that has it.
+                                // answer comes from the one place that has it. A resync
+                                // is the same refresh: the daemon missed nothing, this
+                                // client did, and re-reading the index converges it.
                                 refresh = true;
                             }
                             Incoming::Control(response) => {
@@ -2334,6 +2423,13 @@ fn focus(
     state.behind = Behind::default();
     state.selection = None;
     state.focused = to;
+    // Standing on a done row is reading it: it stops blinking the moment the
+    // keyboard arrives, with no extra keystroke asked.
+    if let Some(row) = state.rows.iter().find(|r| r.terminal == to)
+        && row.state == "done"
+    {
+        state.seen_done.insert((to, sidebar::gen_of(row)));
+    }
     // Dropped from the onlookers: a snapshot kept past its unsubscription is
     // a screen that can never update again.
     let visible: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
@@ -2584,6 +2680,23 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // The read receipts follow the rows: entries for terminals that are
+            // gone or no longer done leave, and a done row under the keyboard
+            // counts as read without waiting for a focus change to say so.
+            state.seen_done.retain(|(terminal, generation)| {
+                state.rows.iter().any(|r| {
+                    r.terminal == *terminal
+                        && sidebar::gen_of(r) == *generation
+                        && r.state == "done"
+                })
+            });
+            if let Some(row) = state
+                .rows
+                .iter()
+                .find(|r| r.terminal == state.focused && r.state == "done")
+            {
+                state.seen_done.insert((row.terminal, sidebar::gen_of(row)));
+            }
             // Heal the bootstrap gap: the very first answers can arrive in any
             // order, and a focus without a tree paints the legacy single pane
             // while watching nothing the sync below can see. Trees are only
@@ -2712,7 +2825,29 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: None,
+            readiness: "ready".to_string(),
         }
+    }
+
+    /// The spinner tick fires while something moves, and passes silently otherwise:
+    /// a still panel must not cost eight repaints a second.
+    #[test]
+    fn the_spinner_tick_only_fires_while_something_moves() {
+        let seen = sidebar::Seen::new();
+        assert!(wants_tick(&[agent(1, 1, "claude", "working")], 0, &seen));
+        assert!(wants_tick(&[agent(1, 1, "claude", "starting")], 0, &seen));
+        assert!(!wants_tick(&[agent(1, 1, "claude", "idle")], 0, &seen));
+        // Blocked pulses on its own channel, so it ticks too.
+        assert!(wants_tick(&[agent(1, 1, "codex", "blocked")], 0, &seen));
+        // A done row nobody has looked at blinks; a read one is still.
+        assert!(wants_tick(&[agent(1, 1, "claude", "done")], 0, &seen));
+        assert!(!wants_tick(&[agent(1, 1, "claude", "done")], 1, &seen));
+        assert!(!wants_tick(&[], 0, &seen));
+        // A shell running a command is not an agent and never ticks, whatever its state
+        // string claims.
+        let mut shell = agent(2, 1, "sh", "working");
+        shell.agent = false;
+        assert!(!wants_tick(&[shell], 0, &seen));
     }
 
     fn state() -> State {
@@ -2741,6 +2876,9 @@ mod tests {
             creating: 0,
             done: false,
             fold: sidebar::Fold::default(),
+            view: sidebar::View::default(),
+            seen_done: sidebar::Seen::new(),
+            tick: 0,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
             selection: None,
@@ -2967,6 +3105,9 @@ mod tests {
             reading: None,
             creating: 0,
             fold: sidebar::Fold::default(),
+            view: sidebar::View::default(),
+            seen_done: sidebar::Seen::new(),
+            tick: 0,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,
@@ -3019,6 +3160,9 @@ mod tests {
             collapsed: false,
             reading: None,
             fold: sidebar::Fold::default(),
+            view: sidebar::View::default(),
+            seen_done: sidebar::Seen::new(),
+            tick: 0,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,
@@ -3637,6 +3781,9 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            tick: state.tick,
+            view: state.view,
+            seen: &state.seen_done,
             master,
             master_shown: state.master_shown,
             master_snapshot: None,

@@ -64,6 +64,17 @@ impl DaemonProcess {
         let child = Command::new(bin)
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
+            // The harness polls the default session's socket, so a session
+            // inherited from the surrounding shell (running the bench inside
+            // a qoro session) would make the daemon listen where nobody
+            // looks and every spawn time out. Measured exactly that way.
+            .env_remove(qoro_runtime::paths::SESSION_ENV)
+            // A bench run inside a qoro terminal also inherits the terminal's
+            // own token pair. The daemon ignores them, but any `qoro` child
+            // process spawned later must not mistake itself for that
+            // terminal's shell, so they are stripped at every spawn.
+            .env_remove("QORO_TOKEN")
+            .env_remove("QORO_TERMINAL")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

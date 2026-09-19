@@ -247,6 +247,90 @@ async fn g13_3_a_stop_ends_the_terminals_without_ending_the_session() {
     );
 }
 
+/// The restart says what survived and what fell back, counted by kind.
+///
+/// One agent with a resume command, one agent without one, and one plain shell
+/// whose directory is gone. The report must name each: resumed, shell fallback,
+/// plain, and moved directory. A single count would call all of these "3 panes".
+#[tokio::test]
+async fn a_restart_reports_resumed_agents_shell_fallbacks_and_moved_directories() {
+    let dir = runtime_dir();
+
+    // A manifest id no other test uses. The override table is process wide and a
+    // missing-directory reload does not clear it, so sharing `claude` with g13_5
+    // would let the two tests swap each other's resume command mid-run.
+    let overrides = tempfile::tempdir().expect("a directory");
+    std::fs::write(
+        overrides.path().join("restore-probe-xyz.toml"),
+        "id = \"restore-probe-xyz\"\nversion = \"test\"\n[resume]\nlatest = [\"/usr/bin/true\"]\n",
+    )
+    .expect("an override");
+    let outcome = qoro_detect::reload_overrides(overrides.path());
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+    // A directory that is gone: under the temp dir and never created, rather than a
+    // fixed path that could exist on some machine.
+    let gone = dir.path().join("gone");
+    assert!(!gone.exists());
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        let resumed = terminals.mint();
+        store
+            .create_terminal(resumed as i64, workspace, "/tmp".into(), "/bin/sh".into())
+            .await
+            .expect("a row");
+        store
+            .set_agent(resumed as i64, Some("restore-probe-xyz".into()), None)
+            .await
+            .expect("an agent");
+        let fallback = terminals.mint();
+        store
+            .create_terminal(fallback as i64, workspace, "/tmp".into(), "/bin/sh".into())
+            .await
+            .expect("a row");
+        store
+            .set_agent(fallback as i64, Some("no-such-agent-xyz".into()), None)
+            .await
+            .expect("an agent");
+        let moved = terminals.mint();
+        store
+            .create_terminal(
+                moved as i64,
+                workspace,
+                gone.display().to_string(),
+                "/bin/sh".into(),
+            )
+            .await
+            .expect("a row");
+    })
+    .await;
+
+    let report = with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        assert!(
+            until(|| terminals.streams().len() == 4).await,
+            "the session came back with {} tabs rather than four: {:?}",
+            terminals.streams().len(),
+            terminals.streams()
+        );
+        daemon.restore_report()
+    })
+    .await;
+
+    assert_eq!(
+        report.terminals, 4,
+        "three rows plus the daemon's own: {report:?}"
+    );
+    assert_eq!(report.brought_back, 4, "{report:?}");
+    assert_eq!(report.agents_resumed, 1, "{report:?}");
+    assert_eq!(report.agents_shell_fallback, 1, "{report:?}");
+    assert_eq!(report.plain_shells, 2, "{report:?}");
+    assert_eq!(report.cwd_fallback, 1, "{report:?}");
+}
+
 /// The shutdown request answers before it goes, and says what it is ending.
 ///
 /// Not run against a daemon that would exit the test process: what is asserted is that the

@@ -313,6 +313,20 @@ pub struct AgentRow {
     pub behind: Option<String>,
     /// `starting`, `idle`, `working`, `blocked`, `done`, `failed`, `uncertain`, `unknown`.
     pub state: String,
+    /// Whether this terminal is past setup: `spawning`, `trust_required`,
+    /// `booting`, or `ready`.
+    ///
+    /// A second dimension beside `state`, because "what the agent is doing"
+    /// and "whether anything typed will reach a session" are different
+    /// questions. A trust dialog reads as `blocked`, and blocked is refused
+    /// by `prompt` either way, but an automation that cannot tell "session
+    /// does not exist yet" from "agent is busy" cannot decide whether to wait
+    /// for a person or for the agent. `ready` means past setup, not accepting
+    /// tasks: a shell at its prompt is ready, and so is a finished agent.
+    /// Defaulted, so a client from an older build reading a row from an older
+    /// daemon sees `unknown` rather than failing to parse the row.
+    #[serde(default = "unknown_readiness")]
+    pub readiness: String,
     /// True when the program in this terminal is a coding agent rather than a shell or an
     /// ordinary command.
     ///
@@ -325,6 +339,39 @@ pub struct AgentRow {
     /// Bumped when the process in the terminal is replaced, so a client can tell a new
     /// agent from a new state.
     pub generation: Option<u64>,
+}
+
+/// The readiness an older daemon's row carries when the field is absent.
+///
+/// `unknown` and not `ready`: a row that predates readiness says nothing
+/// about setup, and reading silence as ready would type over a trust screen.
+fn unknown_readiness() -> String {
+    "unknown".to_string()
+}
+
+/// Whether a terminal is past setup, from what the index already knows.
+///
+/// The gate first: a trust dialog on screen means no session exists yet no
+/// matter what else the row says. Then identity: nothing observed yet means
+/// the process may not have printed its first byte. Then starting. Everything
+/// else is past setup, including a shell at its prompt and a finished agent:
+/// `ready` answers "will typed bytes reach a session", never "will the agent
+/// do the task".
+pub fn readiness_of(
+    program: Option<&str>,
+    behind: Option<&str>,
+    state: &str,
+    setup_gate: bool,
+) -> &'static str {
+    if setup_gate {
+        "trust_required"
+    } else if program.is_none() && behind.is_none() {
+        "spawning"
+    } else if state == "starting" {
+        "booting"
+    } else {
+        "ready"
+    }
 }
 
 impl ControlResponse {
@@ -371,6 +418,51 @@ pub fn parse_reported_state(name: &str) -> Option<qoro_domain::AgentRuntimeState
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_names_setup_before_identity_before_starting() {
+        // The gate wins over everything: no session exists while it stands.
+        assert_eq!(
+            readiness_of(Some("codex"), None, "blocked", true),
+            "trust_required"
+        );
+        // Nothing observed yet: the process may not have printed its first byte.
+        assert_eq!(readiness_of(None, None, "unknown", false), "spawning");
+        assert_eq!(
+            readiness_of(None, None, "starting", false),
+            "spawning",
+            "no identity outranks the state string"
+        );
+        // A known program still coming up.
+        assert_eq!(
+            readiness_of(Some("claude"), None, "starting", false),
+            "booting"
+        );
+        // Past setup, whatever the state: a shell at its prompt, a busy
+        // agent, a mid-task approval, a finished one.
+        for state in ["idle", "working", "blocked", "done", "failed", "unknown"] {
+            assert_eq!(
+                readiness_of(Some("sh"), None, state, false),
+                "ready",
+                "{state}"
+            );
+        }
+        assert_eq!(
+            readiness_of(None, Some("docker"), "unknown", false),
+            "ready",
+            "a wrapper hides the program, not the session"
+        );
+    }
+
+    #[test]
+    fn a_row_from_an_older_daemon_reads_unknown_rather_than_ready() {
+        // No `readiness` key: the row predates the field, and silence must
+        // not read as permission to type over a trust screen.
+        let row: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"blocked"}"#)
+                .expect("decode");
+        assert_eq!(row.readiness, "unknown");
+    }
 
     #[test]
     fn a_request_and_its_response_carry_the_same_id() {
@@ -486,6 +578,14 @@ pub enum EventMessage {
     /// of truth that can arrive out of order with the first. This says where to look, and
     /// `ListAgents` says what is there.
     AgentChanged { terminal: TerminalStream },
+    /// Some news for this connection was dropped before it arrived. Re-read the whole
+    /// index rather than waiting for the next change: the missed change may be the last
+    /// one for a while, and waiting would leave the client behind silently.
+    ///
+    /// An older client that does not know this variant ignores it (the event lane
+    /// decodes leniently by design), which degrades to the old behaviour of waiting
+    /// for the next change rather than breaking the connection.
+    Resync,
 }
 
 #[cfg(test)]

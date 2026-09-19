@@ -171,6 +171,68 @@ pub fn tty_dev(slave: RawFd) -> io::Result<u64> {
     Ok(st.st_rdev as u32 as u64)
 }
 
+/// Signal one process, for the fallback that knows its child's pid.
+///
+/// The same `pid <= 1` refusal as [`signal_group`]: pid 0 signals our own
+/// group and pid -1 every process we can, and neither is ever the child.
+pub fn signal_pid(pid: Pid, sig: crate::teardown::Signal) -> io::Result<()> {
+    if pid.0 <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to signal process {}", pid.0),
+        ));
+    }
+    let s = match sig {
+        crate::teardown::Signal::Hup => libc::SIGHUP,
+        crate::teardown::Signal::Term => libc::SIGTERM,
+        crate::teardown::Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: a positive pid signals exactly that process.
+    if unsafe { libc::kill(pid.0, s) } < 0 {
+        let e = last_err();
+        // No such process is the normal outcome once the child has gone.
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// This pid's start time, for the reuse guard.
+///
+/// `None` when the pid is gone or unreadable, which reads as "not ours".
+/// The value is whatever [`still_alive`] compares against, so capturing it
+/// at spawn and probing with `still_alive` later is one consistent check.
+#[cfg(target_os = "macos")]
+pub fn start_time_of(pid: Pid) -> Option<u64> {
+    // SAFETY: zeroed proc_bsdinfo is a valid out-param.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: info is live and correctly sized.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid.0,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (rc == size).then_some(info.pbi_start_tvsec)
+}
+
+/// This pid's start time, for the reuse guard.
+///
+/// Same field [`still_alive`] reads on this platform, so the two agree by
+/// construction rather than by matching comments.
+#[cfg(not(target_os = "macos"))]
+pub fn start_time_of(pid: Pid) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.0)).ok()?;
+    let after = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let f: Vec<&str> = after.split_whitespace().collect();
+    (f.len() > 19).then(|| f[19].parse::<u64>().unwrap_or(0))
+}
+
 pub fn signal_group(pgid: Pgid, sig: crate::teardown::Signal) -> io::Result<()> {
     // `kill(-1, ...)` signals every process the user can signal, and `kill(0, ...)` signals
     // our own group. Either would be catastrophic here, and both are reachable from a
@@ -959,6 +1021,22 @@ mod tests {
         assert!(
             !still_alive(me, start.wrapping_add(1)),
             "a mismatched start time must not match"
+        );
+    }
+
+    #[test]
+    fn a_captured_start_time_is_what_still_alive_checks() {
+        let me = Pid(std::process::id() as i32);
+        let start = start_time_of(me).expect("this test's own process is readable");
+        assert!(still_alive(me, start));
+        assert_eq!(start_time_of(Pid(-1)), None, "no such pid has a start time");
+        assert!(
+            signal_pid(Pid(0), crate::teardown::Signal::Hup).is_err(),
+            "pid 0 would signal our own group"
+        );
+        assert!(
+            signal_pid(Pid(-1), crate::teardown::Signal::Hup).is_err(),
+            "pid -1 would signal everything we can"
         );
     }
 }
