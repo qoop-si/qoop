@@ -445,28 +445,17 @@ impl Interface {
     /// yellow the child process printed into the pane, which is a gate that passes when the
     /// wrong row is coloured or when nothing in the interface is.
     ///
-    /// The keyboard's own rows lead with reverse video before their colour, so every
-    /// leading sequence is consumed rather than just the first.
+    /// The whole row up to the reset the painter writes after its text, interior
+    /// escapes included: the state dot and the space accent both repaint
+    /// mid-row, and cutting at the first escape would return a prefix of the
+    /// row rather than the row.
     fn raw_panel_line(&self, row: usize) -> Option<&str> {
         let at = format!("\x1b[{row};1H");
         let start = self.painted.rfind(&at)? + at.len();
         let rest = &self.painted[start..];
-        if !rest.starts_with("\x1b[") {
-            return Some(match rest.find("\x1b[") {
-                Some(n) => &rest[..n],
-                None => rest,
-            });
-        }
-        let mut at = 0;
-        while rest[at..].starts_with("\x1b[") {
-            at += rest[at..]
-                .find('m')
-                .map(|n| at + n + 1)
-                .unwrap_or(rest.len());
-        }
-        let end = rest[at..]
-            .find("\x1b[")
-            .map(|n| at + n)
+        let end = rest
+            .find("\x1b[0m")
+            .map(|n| n + "\x1b[0m".len())
             .unwrap_or(rest.len());
         Some(&rest[..end])
     }
@@ -479,6 +468,28 @@ impl Interface {
         let start = Instant::now();
         while start.elapsed() < within {
             if agents_panel(&self.painted).iter().any(|row| want(row)) {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
+    }
+
+    /// Read until some row of the agents panel is painted as wanted, escapes and all.
+    ///
+    /// What a state gate uses: the state is the dot's ink at the start of the
+    /// row, and the stripped text `wait_for_agents` reads never contains a
+    /// state word. Same polling shape, so a row arriving mid-frame reads the
+    /// same either way.
+    fn wait_for_agents_raw(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            let Some(first) = agents_title_row(&self.painted).map(|row| row + 1) else {
+                let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+                continue;
+            };
+            let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
+            if (first..=last).any(|row| self.raw_panel_line(row).is_some_and(&want)) {
                 return true;
             }
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
@@ -927,13 +938,21 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
         "the agents panel does not name the agent: {:?}",
         agents_panel(&ui.painted)
     );
-    // What it is doing, read off its own screen, on the same row that names it.
+    // What it is doing, read off the row that names it: the state dot at
+    // the row's start wears the blocked colour. The stripped text says no
+    // state, so this reads the raw bytes, in both painted forms: the row
+    // may also have the keyboard.
+    let blocked_inks = [
+        qoro_tui::theme::fg(qoro_tui::theme::Role::Blocked),
+        qoro_tui::theme::selected_in(qoro_tui::theme::Role::Blocked),
+    ];
     assert!(
-        ui.wait_for_agents(
-            |line| line.contains("claude") && line.contains("blocked"),
+        ui.wait_for_agents_raw(
+            |line| line.contains("claude")
+                && blocked_inks.iter().any(|ink| line.contains(ink.as_str())),
             Duration::from_secs(15)
         ),
-        "the agents panel does not say the agent is blocked: {:?}",
+        "the agents panel does not show the agent as blocked: {:?}",
         agents_panel(&ui.painted)
     );
     // And the tab is named after it too, so a person can find it without reading the panel.
@@ -956,11 +975,17 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
         qoro_tui::theme::fg(qoro_tui::theme::Role::Blocked),
         qoro_tui::theme::selected_in(qoro_tui::theme::Role::Blocked),
     ];
-    let detail = first_agent_row_of(&ui.painted)
-        + agents_panel(&ui.painted)
-            .iter()
-            .position(|line| line.contains("claude") && line.contains("blocked"))
-            .unwrap_or_else(|| panic!("no blocked row: {:?}", agents_panel(&ui.painted)));
+    let panel = agents_panel(&ui.painted);
+    let first = first_agent_row_of(&ui.painted);
+    let detail = (0..panel.len())
+        .find(|at| {
+            panel[*at].contains("claude")
+                && ui
+                    .raw_panel_line(first + *at)
+                    .is_some_and(|line| blocked.iter().any(|ink| line.contains(ink.as_str())))
+        })
+        .unwrap_or_else(|| panic!("no blocked row: {panel:?}"))
+        + first;
     assert!(
         ui.raw_panel_line(detail)
             .is_some_and(|line| blocked.iter().any(|ink| line.contains(ink.as_str()))),
@@ -1402,9 +1427,16 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     // Wait for detection to settle: a fresh agent reports unknown, then idle
     // while its generation is new, and only then the blocked its screen shows.
     // The panel folds idle groups, so clicking before this lands on a fold line.
+    // The state is the dot's ink, so this reads the raw bytes like G12.7:
+    // both painted forms, since the row may have the keyboard.
+    let blocked_inks = [
+        qoro_tui::theme::fg(qoro_tui::theme::Role::Blocked),
+        qoro_tui::theme::selected_in(qoro_tui::theme::Role::Blocked),
+    ];
     assert!(
-        ui.wait_for_agents(
-            |line| line.contains("claude") && line.contains("blocked"),
+        ui.wait_for_agents_raw(
+            |line| line.contains("claude")
+                && blocked_inks.iter().any(|ink| line.contains(ink.as_str())),
             Duration::from_secs(20)
         ),
         "the agent never showed as blocked: {:?}\n{}",
@@ -1420,8 +1452,8 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
         "ctrl-a s did not go back: {:?}",
         ui.panel_line(FIRST_SPACE_ROW)
     );
-    // The agent's own row, which is the one that names the program: an agent takes one row
-    // now, since the space it lives in is a colour rather than a second line of words.
+    // The agent's own first row, which is the one that names the session
+    // behind its state dot; the tab and the space live on the row under it.
     let panel = agents_panel(&ui.painted);
     let at = panel
         .iter()

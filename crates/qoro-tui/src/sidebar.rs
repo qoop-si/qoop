@@ -9,10 +9,11 @@
 //! not looking at is exactly the one they need to be told about, and a panel that only
 //! listed the current space would hide it until they went looking.
 //!
-//! Pure text here. The caller paints the raised background over the
-//! keyboard's rows, so plain text carries no selection mark: a screenshot,
-//! a test assertion, a pipe into a file and a terminal with no colour all
-//! read the same static rows.
+//! An agent's first row opens with its state dot, painted in the state's
+//! own colour through [`Line::indicator`]. The caller paints the raised
+//! background over the keyboard's rows, so the dot never marks selection:
+//! a screenshot, a test assertion, a pipe into a file and a terminal with
+//! no colour all read the same static rows.
 
 use qoro_runtime::control::{AgentRow, WorkspaceRow};
 
@@ -35,9 +36,9 @@ pub struct Line {
     /// space's colour. A row saying two things in two colours would be a row a person
     /// parses rather than reads.
     pub accent: Option<(usize, usize, crate::theme::Role)>,
-    /// The row's opening sign, unused. Kept so the painter's shape stays stable:
-    /// every row is static text, the state word on the right says what it is,
-    /// and no tick ever changes a cell. Always `None`.
+    /// The row's opening sign: the state dot at the start of an agent's
+    /// first row, in the state's own colour. `None` on every other row:
+    /// selection is the raised background the painter adds, never a mark.
     pub indicator: Option<(usize, usize, crate::theme::Role)>,
 }
 
@@ -91,13 +92,15 @@ const AGENTS_TITLE: &str = "agents";
 /// screenshot, a test assertion and a pipe into a file all answer the same.
 const SPACE_NAME_AT: usize = 1;
 
-/// The column an agent's first row starts its names at: one leading space.
-/// Same reason: no circle at the start, no filled dot for the selected row.
-const AGENT_NAME_AT: usize = 1;
-
-/// Columns held back for the program name when a long state would otherwise eat the row.
-/// A row showing only its state does not say whose state it is.
-const MIN_NAME: usize = 3;
+/// The state dot at the start of an agent's first row: one leading space,
+/// then the dot. The dot says the state in the state's own colour, so no
+/// state word is drawn on the right. Selection stays the raised background
+/// the painter adds, never a second dot.
+const DOT: char = '\u{25cf}';
+/// The column the state dot sits at: one leading space.
+const DOT_AT: usize = 1;
+/// Columns the state dot covers: one glyph, one column.
+const DOT_LEN: usize = 1;
 
 /// The state a terminal has when nothing has been able to say what it is doing.
 const UNKNOWN: &str = "unknown";
@@ -109,12 +112,12 @@ const UNKNOWN: &str = "unknown";
 /// is false.
 const UNNAMED: &str = "agent";
 
-/// The word an unread done row wears on the right.
+/// The group an unread done row draws under in the folded panel.
 ///
 /// A finished agent nobody has looked at is neither `done` nor `idle`: it is
-/// news. It keeps its sage colour but says `new`, so it reads as its own
-/// static state and never hides behind the finished fold.
-const NEW_STATE: &str = "new";
+/// news. Its dot keeps the done sage, and the folded panel lists it under
+/// its own open `new` header so it never hides behind the finished fold.
+const NEW_GROUP: &str = "new";
 
 /// The percentage of the column the spaces panel holds, its title and the blank rows under
 /// it included.
@@ -286,7 +289,8 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
 ///
 /// A daemon `done` nobody looked at, or an idle or done row that finished
 /// while the keyboard was away. The focused row is never new: standing on it
-/// is reading it. Same sage colour as `done`, same `new` word, no new theme.
+/// is reading it. Same sage dot as `done`, no new theme; the folded panel
+/// lists it under its own open `new` header.
 pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
     if agent.terminal == focused {
         return false;
@@ -326,10 +330,11 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> 
 
 /// Whether the animation tick has anything to move.
 ///
-/// Nothing: the panel is fully static. Every state says its word on the
-/// right, an unread done says `new`, and no tick ever repaints. This is what
-/// keeps the loop's founding rule (no wake without an arrival) and stops the
-/// full-screen flicker the spinner's eight frames a second caused.
+/// Nothing: the panel is fully static. Every state is its dot at the
+/// start of the first row, an unread done keeps the done sage on its dot,
+/// and no tick ever repaints. This is what keeps the loop's founding rule
+/// (no wake without an arrival) and stops the full-screen flicker the
+/// spinner's eight frames a second caused.
 pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen, _unseen: &Unseen) -> bool {
     false
 }
@@ -676,15 +681,15 @@ fn agents_panel(
 
 /// The two rows an open agent takes, with what a click on either means.
 ///
-/// First the session, then where it lives: ` opencode abc123ef` above
+/// First the session, then where it lives: ` ● abc123ef` above
 /// `release - app`. Both rows reach the same terminal, so a click on either
 /// lands on the agent.
 ///
-/// Static: every state says its word on the right (`working` included), an
-/// unread done says `new`, and `tick` is ignored so a still panel is byte for
-/// byte the panel it was. The keyboard's row is the raised background the
-/// painter adds; there is no circle at the start and no filled dot when
-/// selected.
+/// Static: the state is the dot at the start of the first row, in the
+/// state's own colour, and no state word is drawn on the right. An unread
+/// done keeps the done sage on its dot. `tick` is ignored so a still panel
+/// is byte for byte the panel it was. The keyboard's row is the raised
+/// background the painter adds; no filled dot ever marks selection.
 ///
 /// One helper and not the same pushes at each caller, because the unfolded
 /// panel and the folded one have to draw the same rows for the same agent.
@@ -700,36 +705,26 @@ fn push_agent_lines(
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
     let space = spaces.iter().find(|s| s.id == agent.workspace);
-    // Line one names the session: the agent's own conversation id when it has
-    // reported one, else what is actually running. The program stays beside a
-    // reported id so the row never loses which agent the session belongs to.
-    // Static: the state word is always drawn (`working` included), so the cut
-    // guards the session and never the state word alone.
+    // Line one names the session: the agent's own conversation id, and
+    // nothing else. The program never stands beside it: four rows reading
+    // `opencode` identify nothing, and the tab below already says what runs
+    // where. Static: the dot carries the state so the name keeps the row.
     let session = session_name(agent);
-    let head = format!(" {session}");
-    let head_least = AGENT_NAME_AT + MIN_NAME;
     let fresh = is_new(agent, focused, seen, unseen);
-    let word = if fresh {
-        NEW_STATE
-    } else {
-        shown_state(&agent.state)
-    };
-    let state = clip(word, WIDTH.saturating_sub(head_least + 1));
-    let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
     // A derived idle-after-work keeps the done sage: it is news, not calm.
-    let colour = if fresh {
-        colour_for("done")
+    let dot = if fresh {
+        crate::theme::of("done")
     } else {
-        colour_for(&agent.state)
+        crate::theme::of(&agent.state)
     };
     out.push((
         Line {
-            text: format!("{} {state}", fit_to(&head, room)),
-            colour,
+            text: fit(&format!(" {DOT} {session}")),
+            colour: None,
             // The space lives on the second row now, so the first row carries
             // no space accent: the keyboard's row is the raised background.
             accent: None,
-            indicator: None,
+            indicator: Some((DOT_AT, DOT_LEN, dot)),
         },
         hit,
     ));
@@ -760,14 +755,15 @@ fn push_agent_lines(
     ));
 }
 
-/// What the first row names: the agent's own conversation id when it has
-/// reported one, else what is actually running. The program stays beside a
-/// reported id so the row never loses which agent the session belongs to.
+/// What the first row names: the agent's own conversation id, and only
+/// that. No program beside it: the row below already says what runs in
+/// which tab, and a program prefix is how four live sessions all read
+/// `opencode`. Without a reported session the tab's own label answers,
+/// which prefers a chosen name over whatever happens to be running.
 fn session_name(agent: &AgentRow) -> String {
-    let program = session_program(agent);
     match short_session(agent.agent_session.as_deref()) {
-        Some(short) => format!("{program} {short}"),
-        None => program,
+        Some(short) => short,
+        None => label(agent),
     }
 }
 
@@ -789,32 +785,6 @@ fn short_session(session: Option<&str>) -> Option<String> {
     } else {
         Some(base.to_string())
     }
-}
-
-/// What runs in the tab: the program's last path segment, because a column
-/// this narrow renders `/opt/homebrew/bin/claude` as `/opt/homebre`. Never the
-/// chosen name: that is already on the row above, and repeating it would cost
-/// the one line that says what the session actually is.
-fn session_program(agent: &AgentRow) -> String {
-    match (&agent.program, &agent.behind) {
-        (Some(program), _) => program
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(program)
-            .to_string(),
-        (None, Some(wrapper)) => format!("behind {wrapper}"),
-        (None, None) => UNNAMED.to_string(),
-    }
-}
-
-/// The state, or nothing when nothing has observed one.
-///
-/// An unknown state is drawn as nothing. It is a claim about nothing, so a column of the
-/// word `unknown` trains the eye to skip the one column that matters when an agent really
-/// is blocked.
-fn shown_state(state: &str) -> &str {
-    if state == UNKNOWN { "" } else { state }
 }
 
 /// Every row of the folded column, with what a click on it means.
@@ -1196,7 +1166,7 @@ fn agents_content(
         shown += 1;
     }
     if !new_done.is_empty() {
-        content.push(group_header("new", new_done.len(), colour_for("done")));
+        content.push(group_header(NEW_GROUP, new_done.len(), colour_for("done")));
     }
     for agent in new_done {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
@@ -1487,12 +1457,6 @@ fn fit_to(text: &str, cols: usize) -> String {
     out
 }
 
-/// Cut to at most `cols` columns without padding, for the piece that is already flush
-/// against the right edge.
-fn clip(text: &str, cols: usize) -> String {
-    fit_to(text, cols).trim_end().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,13 +1558,14 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // No circle marks anywhere: no hollow ring on every row and no filled
-        // white dot on the selected one. The keyboard's row is the raised
-        // background the painter adds, so plain text carries no selection.
-        for bad in ['\u{25cf}', '\u{25cb}', '\u{25cc}', '\u{25a1}', '\u{2809}'] {
+        // No selection marks anywhere: no hollow ring on every row and no
+        // second dot on the selected one. The keyboard's row is the raised
+        // background the painter adds. The state dot opens every agent's
+        // first row, so it is expected; a spinner never is.
+        for bad in ['\u{25cb}', '\u{25cc}', '\u{25a1}', '\u{2809}'] {
             assert!(
                 !texts.iter().any(|t| t.contains(bad)),
-                "a circle or spinner leaked: {texts:?}"
+                "a selection mark or spinner leaked: {texts:?}"
             );
         }
         // The focused space and agent still draw their names.
@@ -1608,7 +1573,10 @@ mod tests {
         // Terminal 3 is the focused agent: its session on the first row, its
         // tab and space on the second. The first row answers "what", the
         // second "where".
-        assert!(texts.iter().any(|t| t.starts_with(" codex")), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.starts_with(" \u{25cf} codex")),
+            "{texts:?}"
+        );
         // And hits still know which rows have the keyboard.
         let hits: Vec<Option<Hit>> = (0..14)
             .map(|row| hit(&spaces, &agents, 2, 3, 14, row))
@@ -1618,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_shows_its_space_then_its_program_and_state() {
+    fn an_agent_shows_its_session_then_its_tab_and_space() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 14);
         let texts: Vec<String> = lines
@@ -1627,13 +1595,21 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(" claude"))
+            .position(|t| t.starts_with(" \u{25cf} claude"))
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // Two rows, and together they carry everything: the session, the tab
-        // and space underneath, and the state word on the right. Static:
-        // a working agent says `working` like every other state.
-        assert!(texts[head].ends_with("working"), "{texts:?}");
+        // Two rows, and together they carry everything: the session behind
+        // the state dot, and the tab and space underneath. No state word on
+        // the right: the dot at the start says the state in its colour.
+        assert_eq!(texts[head], " \u{25cf} claude", "{texts:?}");
         assert_eq!(texts[head + 1], "  claude - app");
+        // And the dot wears the working colour.
+        assert_eq!(
+            lines
+                .iter()
+                .find(|l| l.text.trim_end() == " \u{25cf} claude")
+                .and_then(|l| l.indicator),
+            Some((DOT_AT, DOT_LEN, crate::theme::of("working")))
+        );
     }
 
     #[test]
@@ -1651,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_row_carries_the_colour_of_its_state_and_a_title_carries_no_state() {
+    fn an_agent_row_carries_its_state_on_the_dot_and_a_title_carries_no_state() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 14);
         // A title has a look of its own, and it is never a state's: a panel heading that
@@ -1661,17 +1637,17 @@ mod tests {
             Some(crate::theme::Role::Title),
             "the spaces title"
         );
-        let coloured: Vec<Option<crate::theme::Role>> = lines
-            .iter()
-            .filter(|l| l.text.contains("claude"))
-            .map(|l| l.colour)
-            .collect();
-        // Two rows for the one agent: the first wears the state's colour, the
-        // session underneath stays quiet.
+        let rows: Vec<&Line> = lines.iter().filter(|l| l.text.contains("claude")).collect();
+        // Two rows for the one agent: the first is plain text with the
+        // state's colour on its dot, the tab and space underneath stay quiet.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].colour, None);
         assert_eq!(
-            coloured,
-            vec![colour_for("working"), Some(crate::theme::Role::Faint)]
+            rows[0].indicator,
+            Some((DOT_AT, DOT_LEN, crate::theme::of("working")))
         );
+        assert_eq!(rows[1].colour, Some(crate::theme::Role::Faint));
+        assert_eq!(rows[1].indicator, None);
         // A space row has no state to have a colour about; it wears its own instead, as an
         // accent on its name rather than on the whole row. Agent second rows
         // (`tab - space`) are excluded: they name a space but are not space rows.
@@ -1749,8 +1725,8 @@ mod tests {
                     Some(Hit::Space(s.id))
                 } else {
                     // Everything left is one agent's two rows: the first names
-                    // the session, the second the tab and the space under it.
-                    // Both reach the same terminal.
+                    // the session behind the state dot, the second the tab
+                    // and the space under it. Both reach the same terminal.
                     agents
                         .iter()
                         .find(|a| {
@@ -1759,7 +1735,7 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            let first = format!(" {}", session_name(a));
+                            let first = format!(" \u{25cf} {}", session_name(a));
                             let place = if space.is_empty() {
                                 label(a)
                             } else {
@@ -1790,7 +1766,7 @@ mod tests {
         let agents = vec![agent(4, 77, "codex", "blocked")];
         let lines = render(&[], &agents, 1, 4, 8);
         assert!(
-            lines.iter().any(|l| l.text.starts_with(" codex")),
+            lines.iter().any(|l| l.text.starts_with(" \u{25cf} codex")),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -1880,30 +1856,44 @@ mod tests {
             texts.iter().any(|t| t.contains("release - personal")),
             "{texts:?}"
         );
-        // And each first row still says what runs in its tab.
-        assert!(texts.iter().any(|t| t.contains("opencode")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
+        // Without a reported session the first row falls back to the tab's
+        // own label, so both first rows read the chosen name behind the dot.
+        assert_eq!(
+            texts.iter().filter(|t| *t == " \u{25cf} release").count(),
+            2,
+            "{texts:?}"
+        );
     }
 
     /// Two tabs of one space share the program, and still tell apart: their
-    /// states differ, and each pair keeps its own hits.
+    /// dots differ in the states' colours, and each pair keeps its own hits.
     #[test]
-    fn two_tabs_of_one_space_share_the_space_name_but_not_the_state() {
+    fn two_tabs_of_one_space_share_the_space_name_but_not_the_dot() {
         let spaces = vec![space(1, "app")];
         let agents = vec![
             agent(1, 1, "opencode", "idle"),
             agent(2, 1, "opencode", "blocked"),
         ];
-        let texts = agent_texts(&spaces, &agents, 1);
-        let first = texts
-            .iter()
-            .find(|t| t.contains("opencode") && t.ends_with("idle"))
-            .unwrap_or_else(|| panic!("{texts:?}"));
-        let second = texts
-            .iter()
-            .find(|t| t.contains("opencode") && t.ends_with("blocked"))
-            .unwrap_or_else(|| panic!("{texts:?}"));
-        assert_ne!(first, second);
+        let lines = render(&spaces, &agents, 1, 1, 20);
+        let dots: Vec<_> = lines.iter().filter_map(|l| l.indicator).collect();
+        assert_eq!(
+            dots,
+            vec![
+                (DOT_AT, DOT_LEN, crate::theme::of("idle")),
+                (DOT_AT, DOT_LEN, crate::theme::of("blocked")),
+            ],
+            "{dots:?}"
+        );
+        // No state word on the right of either row.
+        for line in &lines {
+            for word in ["idle", "blocked", "working"] {
+                assert!(
+                    !line.text.trim_end().ends_with(word) || line.text.contains(" - "),
+                    "a state word leaked: {:?}",
+                    line.text
+                );
+            }
+        }
         // Both pairs reach their own terminal, first row and second row alike.
         let hits: Vec<Option<Hit>> = (0..20)
             .map(|row| hit(&spaces, &agents, 1, 1, 20, row))
@@ -1913,15 +1903,18 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_session_names_the_first_row_and_the_tab_names_the_second() {
+    fn a_reported_session_names_the_first_row_alone_and_the_tab_names_the_second() {
         let spaces = vec![space(1, "app")];
         let mut a = agent(1, 1, "opencode", "idle");
         a.name = Some("release".to_string());
         a.agent_session = Some("abc123".to_string());
         let texts = agent_texts(&spaces, &[a], 1);
+        // The first row is the session id behind the dot: no program beside
+        // it, so four live sessions never all read `opencode`.
+        assert!(texts.iter().any(|t| *t == " \u{25cf} abc123"), "{texts:?}");
         assert!(
-            texts.iter().any(|t| t.contains("opencode abc123")),
-            "{texts:?}"
+            !texts.iter().any(|t| t.contains("opencode")),
+            "the program leaked onto a reported session row: {texts:?}"
         );
         assert!(texts.iter().any(|t| *t == "  release - app"), "{texts:?}");
     }
@@ -1940,10 +1933,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_session_the_first_row_names_what_runs() {
+    fn without_a_session_the_first_row_falls_back_to_the_tab() {
         let spaces = vec![space(1, "app")];
         let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
-        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        // No reported session, so the tab's own label answers behind the dot.
+        assert!(texts.iter().any(|t| *t == " \u{25cf} codex"), "{texts:?}");
         assert!(texts.iter().any(|t| *t == "  codex - app"), "{texts:?}");
     }
 
@@ -2016,27 +2010,29 @@ mod tests {
             .find(|l| l.text.contains('\u{6587}'))
             .unwrap_or_else(|| panic!("no space row"));
         assert_eq!(crate::width::width(&space_row.text), WIDTH);
+        // The agent's first row opens with the state dot and then the name;
+        // the pad after the wide name is one this module wrote.
         let row = lines
             .iter()
-            .find(|l| l.text.contains("idle"))
+            .find(|l| l.indicator.is_some())
             .unwrap_or_else(|| panic!("no agent row"));
-        // The state is still flush against the right edge.
-        assert!(row.text.ends_with("idle"), "{:?}", row.text);
+        assert!(row.text.starts_with(" \u{25cf} "), "{:?}", row.text);
         assert_eq!(crate::width::width(&row.text), WIDTH);
     }
 
     #[test]
-    fn an_absurdly_long_state_is_cut_but_still_leaves_some_of_the_program() {
+    fn an_absurdly_long_state_never_eats_the_session() {
         let agents = vec![agent(1, 1, "claude", &"z".repeat(80))];
         let lines = render(&[space(1, "app")], &agents, 1, 1, 8);
+        // No state word is drawn at all: the row is the dot and the session,
+        // however long the daemon's state string runs.
         let row = lines
             .iter()
-            .find(|l| l.text.contains('z'))
+            .find(|l| l.indicator.is_some())
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        // Some of the session survives the cut: a row showing only a state
-        // does not say whose state it is.
-        assert!(row.text.starts_with(" cl"), "{:?}", row.text);
+        assert_eq!(row.text.trim_end(), " \u{25cf} claude", "{:?}", row.text);
+        assert!(!row.text.contains('z'));
     }
 
     fn many_agents() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
@@ -2083,8 +2079,18 @@ mod tests {
         // Needs-you and running agents are drawn as usual, each under its own
         // header carrying its count flush right.
         assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
-        // Static: running agents say `working` on the right, no spinner.
-        assert!(texts.iter().any(|t| t.ends_with("working")), "{texts:?}");
+        // Static: running agents carry the working dot, no spinner, and no
+        // state word on the right.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("working")))),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.ends_with("working")),
+            "a state word leaked: {texts:?}"
+        );
         assert!(
             texts
                 .iter()
@@ -2588,16 +2594,38 @@ mod tests {
                 "a group header leaked into the priority view: {texts:?}"
             );
         }
-        let at = |word: &str| {
-            texts
+        // Urgency order without state words: the dots carry the states, so
+        // the terminals' first appearance runs blocked, failed, the unread
+        // done, then running. Terminals: 1 blocked, 2 failed, 5 unread
+        // done, 3 and 4 working.
+        let order: Vec<u32> = rows_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            40,
+            &Fold::default_closed(),
+            0,
+            View::Priority,
+            &Seen::new(),
+            &Unseen::new(),
+        )
+        .into_iter()
+        .filter_map(|(_, hit)| match hit {
+            Some(Hit::Terminal(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+        let first = |t: u32| {
+            order
                 .iter()
-                .position(|t| t.ends_with(word))
-                .unwrap_or_else(|| panic!("no {word} row: {texts:?}"))
+                .position(|u| *u == t)
+                .unwrap_or_else(|| panic!("no terminal {t}: {order:?}"))
         };
-        assert!(at("blocked") < at("failed"), "{texts:?}");
-        // The unread done wears `new`, not `done`, and still sorts ahead of
-        // running.
-        assert!(at("failed") < at("new"), "{texts:?}");
+        assert!(first(1) < first(2), "{order:?}");
+        assert!(first(2) < first(5), "{order:?}");
+        assert!(first(5) < first(3), "{order:?}");
+        assert!(first(3) < first(6), "{order:?}");
         // Every agent draws, folded or not: nine pairs, eighteen name rows.
         assert_eq!(
             texts
@@ -2609,8 +2637,8 @@ mod tests {
         );
     }
 
-    /// Static panel: the tick changes nothing, every row keeps its word and
-    /// no indicator ever appears.
+    /// Static panel: the tick changes nothing, every dot keeps its colour
+    /// and no state word is ever drawn.
     #[test]
     fn the_panel_is_static_across_ticks() {
         let (spaces, agents) = many_agents();
@@ -2628,17 +2656,32 @@ mod tests {
                 &Unseen::new(),
             )
         };
-        let zero: Vec<String> = at(0).iter().map(|(l, _)| l.text.clone()).collect();
-        let four: Vec<String> = at(4).iter().map(|(l, _)| l.text.clone()).collect();
+        let zero: Vec<Line> = at(0).iter().map(|(l, _)| l.clone()).collect();
+        let four: Vec<Line> = at(4).iter().map(|(l, _)| l.clone()).collect();
         assert_eq!(zero, four, "the tick repainted a static panel");
-        for (line, _) in at(0) {
-            assert_eq!(line.indicator, None, "an indicator leaked: {:?}", line.text);
-        }
-        // An unread done still says `new` on the right, steady.
+        // Every agent's first row opens with its state dot, steady.
         assert!(
-            zero.iter().any(|t| t.trim_end().ends_with("new")),
-            "no static new state: {zero:?}"
+            zero.iter()
+                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("blocked")))),
+            "no static blocked dot"
         );
+        // An unread done keeps the done sage on its dot, steady.
+        assert!(
+            zero.iter()
+                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
+            "no static unread dot"
+        );
+        // And no state word on the right of any agent row. Fold lines
+        // (`▸ 4 idle`) and group headers name their group, not a row.
+        for line in zero.iter().filter(|l| l.indicator.is_some()) {
+            for word in ["working", "blocked", "failed", "done", "idle"] {
+                assert!(
+                    !line.text.trim_end().ends_with(word),
+                    "a state word leaked: {:?}",
+                    line.text
+                );
+            }
+        }
     }
 
     #[test]
