@@ -23,7 +23,9 @@
 #
 # goose pipes the event payload as JSON on stdin (`event`, `session_id`,
 # `tool_name`, ...). Subagent lifecycle events are not emitted by goose, so
-# there is nothing to filter here.
+# there is nothing to filter here. The `session_id` is passed through as
+# `--session-id`, which is what lets a tab come back to this conversation
+# after a restart rather than to whichever one is newest.
 # Event reference: https://goose-docs.ai/docs/guides/context-engineering/hooks/
 
 set -eu
@@ -41,11 +43,19 @@ except Exception:
     raise SystemExit(1)
 name = payload.get("event") or ""
 if name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"):
-    print("working --visible-working")
+    state = "working --visible-working"
 elif name in ("Stop", "SessionEnd"):
-    print("idle --visible-idle")
+    state = "idle --visible-idle"
 else:
     raise SystemExit(1)
+# The conversation this report belongs to. Refused unless it looks like an
+# id and nothing else: this string ends up on a command line.
+session = str(payload.get("session_id") or "")
+if session and len(session) <= 128 and all(
+    c.isalnum() or c in "-_." for c in session
+):
+    state += " --session-id " + session
+print(state)
 ' 2>/dev/null)" || exit 0
 
 # shellcheck disable=SC2086

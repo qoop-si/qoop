@@ -517,21 +517,18 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
         "{accepted:?}"
     );
 
-    // Written from a task of its own, so it is waited for rather than assumed.
+    // The write is awaited before the answer, under the store deadline, rather
+    // than spawned: a stop that lands between the answer and a background write
+    // would lose the conversation the tab was having. So this reads the row
+    // straight after the answer, with no wait loop: a write that had not
+    // happened yet would read back empty here.
     let store = d.store();
     let workspace = d.workspace();
-    let mut recorded = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let rows = store.open_terminals(workspace).await.expect("rows");
-        if let Some(row) = rows.iter().find(|r| r.id == terminal as i64)
-            && row.agent_session.is_some()
-        {
-            recorded = row.agent_session.clone();
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let rows = store.open_terminals(workspace).await.expect("rows");
+    let recorded = rows
+        .iter()
+        .find(|r| r.id == terminal as i64)
+        .and_then(|r| r.agent_session.clone());
     assert_eq!(
         recorded.as_deref(),
         Some("abc-123"),
@@ -626,21 +623,18 @@ async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() 
         "a session report changed what the index shows"
     );
 
-    // Written from a task of its own, so it is waited for rather than assumed.
+    // The write is awaited before the answer, under the store deadline, rather
+    // than spawned: a stop that lands between the answer and a background write
+    // would lose the conversation the tab was having. So this reads the row
+    // straight after the answer, with no wait loop: a write that had not
+    // happened yet would read back empty here.
     let store = d.store();
     let workspace = d.workspace();
-    let mut recorded = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let rows = store.open_terminals(workspace).await.expect("rows");
-        if let Some(row) = rows.iter().find(|r| r.id == terminal as i64)
-            && row.agent_session.is_some()
-        {
-            recorded = row.agent_session.clone();
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let rows = store.open_terminals(workspace).await.expect("rows");
+    let recorded = rows
+        .iter()
+        .find(|r| r.id == terminal as i64)
+        .and_then(|r| r.agent_session.clone());
     assert_eq!(
         recorded.as_deref(),
         Some("solo-456"),
@@ -651,4 +645,145 @@ async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() 
         Some("stolen-id"),
         "a refused session report still wrote its id"
     );
+}
+
+/// A rename through the control request is durable before the answer.
+///
+/// The handler awaits the title write rather than spawning it, the way a name
+/// given at birth is written at create: a renamed tab that is stopped before
+/// a background write would come back under its old name. Read here straight
+/// after `Renamed`, with no wait loop; the trip from the row back to a tab is
+/// what G13.4 already gates, so this plus that is a rename that survives a
+/// restart.
+#[tokio::test]
+async fn a_rename_is_recorded_before_the_answer_and_a_cleared_name_forgets() {
+    use qoro_runtime::control::ControlResponse;
+
+    let d = qoro_testkit::TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let mut client = d.attach("renamer").await;
+
+    let renamed = client
+        .control(
+            &ControlRequest::RenameTerminal {
+                id: "rename-1".into(),
+                terminal,
+                name: Some("release".into()),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(renamed, Some(ControlResponse::Renamed { .. })),
+        "{renamed:?}"
+    );
+    let rows = d.store().open_terminals(d.workspace()).await.expect("rows");
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == terminal as i64)
+            .and_then(|r| r.title.clone())
+            .as_deref(),
+        Some("release"),
+        "the answer went out before the name was written down"
+    );
+
+    // Clearing gives the tab back to no name, rather than leaving the old one
+    // behind for a restart to resurrect.
+    let cleared = client
+        .control(
+            &ControlRequest::RenameTerminal {
+                id: "rename-2".into(),
+                terminal,
+                name: None,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(cleared, Some(ControlResponse::Renamed { .. })),
+        "{cleared:?}"
+    );
+    let rows = d.store().open_terminals(d.workspace()).await.expect("rows");
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == terminal as i64)
+            .and_then(|r| r.title.clone()),
+        None,
+        "a cleared tab came back cleared on screen but named in the row"
+    );
+}
+
+/// Two tabs in one directory resume two conversations, not the newest twice.
+///
+/// The failure this gates is every tab with no id falling back to `latest`:
+/// three `opencode` tabs in one repository converge on whichever conversation
+/// is newest. With an id per tab the restore asks each agent for its own.
+#[tokio::test]
+async fn two_tabs_in_one_directory_resume_distinct_conversations() {
+    let dir = runtime_dir();
+    let evidence = tempfile::tempdir().expect("a directory");
+
+    // A manifest id no other test uses: the override table is process wide.
+    let overrides = tempfile::tempdir().expect("a directory");
+    std::fs::write(
+        overrides.path().join("distinct-probe-xyz.toml"),
+        format!(
+            "id = \"distinct-probe-xyz\"\nversion = \"test\"\n[resume]\n\
+             session = [\"/usr/bin/touch\", \"{}/{{session}}\"]\n\
+             latest = [\"/usr/bin/touch\", \"{}/latest\"]\n",
+            evidence.path().display(),
+            evidence.path().display(),
+        ),
+    )
+    .expect("an override");
+    let outcome = qoro_detect::reload_overrides(overrides.path());
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        for id in ["conv-aaa", "conv-bbb"] {
+            let tab = terminals.mint();
+            store
+                .create_terminal(tab as i64, workspace, "/tmp".into(), "/bin/sh".into())
+                .await
+                .expect("a row");
+            // What the daemon writes down when a hook reports an id; the second
+            // half of this is G13.9, so this test sets the rows the way that
+            // path leaves them and gates the restore half.
+            store
+                .set_agent(
+                    tab as i64,
+                    Some("distinct-probe-xyz".into()),
+                    Some(id.into()),
+                )
+                .await
+                .expect("an agent with its conversation");
+        }
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        assert!(
+            until(|| terminals.streams().len() == 3).await,
+            "three tabs, not {}: {:?}",
+            terminals.streams().len(),
+            terminals.streams()
+        );
+        for id in ["conv-aaa", "conv-bbb"] {
+            assert!(
+                until(|| evidence.path().join(id).exists()).await,
+                "no tab resumed conversation {id}"
+            );
+        }
+        assert!(
+            !evidence.path().join("latest").exists(),
+            "a tab with an id fell back to the newest conversation"
+        );
+    })
+    .await;
+
+    qoro_detect::reload_overrides(std::path::Path::new("/nonexistent-qoro-overrides"));
 }

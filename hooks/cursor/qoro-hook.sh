@@ -16,6 +16,12 @@
 # Put this script's directory on PATH or use an absolute command path.
 # A hook that errors fails open and the screen reading keeps working.
 # Event reference: https://cursor.com/docs/hooks
+#
+# Every hook payload carries the session on stdin as `session_id` (the same
+# value as `conversation_id`). It is passed through as `--session-id`, which
+# is what lets a tab come back to this conversation after a restart rather
+# than to whichever one in the directory is newest. Without an id the report
+# goes out with no flag, same as before.
 
 set -eu
 
@@ -32,6 +38,22 @@ case "$state" in
   *) exit 0 ;;
 esac
 
+session=""
+if command -v python3 >/dev/null 2>&1; then
+  session="$(python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+session = str(payload.get("session_id") or payload.get("conversation_id") or "")
+if session and len(session) <= 128 and all(
+    c.isalnum() or c in "-_." for c in session
+):
+    print("--session-id " + session)
+' 2>/dev/null)" || session=""
+fi
+
 # shellcheck disable=SC2086
-qoro hook-report --state "$state" $flags >/dev/null 2>&1 || true
+qoro hook-report --state "$state" $flags $session >/dev/null 2>&1 || true
 exit 0

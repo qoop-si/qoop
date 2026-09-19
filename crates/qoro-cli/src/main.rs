@@ -115,8 +115,9 @@ fn main() -> std::io::Result<()> {
                  \n\
                  options:\n\
                  \x20 --session <name>  which session to work in (or QORO_SESSION).\n\
-                 \x20                   sessions do not see each other. the default is\n\
-                 \x20                   what you get when you say nothing.\n\
+                 \x20                   sessions do not see each other. the flag wins over\n\
+                 \x20                   the environment, which wins over the session last\n\
+                 \x20                   opened, which wins over the default.\n\
                  \n\
                  detach with ctrl-q. the shell keeps running.\n\
                  stop ends the processes; opening the session again brings the tabs back.\n"
@@ -176,6 +177,11 @@ fn run_client() -> std::io::Result<()> {
     // and exits without touching it.
     ensure_daemon(&socket)?;
 
+    // The open that bare `qoro` will come back to. Written after the daemon is
+    // up and before the interface starts, so a failed start records nothing
+    // and a good one is what the next bare open finds. Best effort: the attach
+    // matters, this file does not.
+    record_last_session();
     let rt = tokio::runtime::Runtime::new()?;
     // The interface, not the bare attach. `qoro attach` is still there for the one terminal
     // case and for anything driving this program from a script, because a full screen
@@ -199,8 +205,22 @@ fn run_attach() -> std::io::Result<()> {
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
     ensure_daemon(&socket)?;
+    record_last_session();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(attach(&socket))
+}
+
+/// Remember the session that was just opened, so the next bare `qoro` comes
+/// back to it. Best effort by design: a file that cannot be written is a file
+/// that is read as absent, and the open still succeeds.
+fn record_last_session() {
+    let Ok(session) = std::env::var(paths::SESSION_ENV) else {
+        return;
+    };
+    let Ok(base) = paths::runtime_base() else {
+        return;
+    };
+    paths::write_last_session(&base, &session);
 }
 
 async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
@@ -1346,6 +1366,10 @@ fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
 /// arguments it expects: `qoro send --session work 2 "text"` has to mean the same as
 /// `qoro --session work send 2 "text"`, and neither may leave `send` counting the flag as
 /// its terminal number.
+///
+/// What was asked wins over the environment, which wins over the last session that was
+/// opened, which wins over the default. The file is read only when neither the flag nor
+/// the environment names one, and a stale or invalid file is the default, never an error.
 fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
     let mut asked = None;
     let mut at = 1;
@@ -1368,7 +1392,21 @@ fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
             asked = Some(value);
         }
     }
-    paths::session_name(asked.as_deref())
+    if asked.is_some() {
+        return paths::session_name(asked.as_deref());
+    }
+    if std::env::var(paths::SESSION_ENV)
+        .ok()
+        .is_some_and(|n| !n.is_empty())
+    {
+        return paths::session_name(None);
+    }
+    if let Some(last) = paths::read_last_session(&paths::raw_runtime_base())
+        && paths::valid_session_name(&last)
+    {
+        return paths::session_name(Some(&last));
+    }
+    paths::session_name(None)
 }
 
 /// `qoro ls`: what sessions exist, and which of them are running.
@@ -1460,7 +1498,10 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
                     } else {
                         "terminals"
                     },
-                    if name == paths::DEFAULT_SESSION {
+                    // Bare `qoro` reopens the session last opened, which is this one
+                    // when it is stopped from inside itself. A session stopped from
+                    // elsewhere still needs its name spelled out.
+                    if name == current {
                         String::new()
                     } else {
                         format!(" --session {name}")
@@ -1479,8 +1520,9 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{explain_row, prompt_refusal, resolve_target};
+    use super::{explain_row, prompt_refusal, resolve_target, take_session};
     use qoro_runtime::control::AgentRow;
+    use qoro_runtime::paths;
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
@@ -1542,6 +1584,44 @@ mod tests {
             row(2, None, Some("sh")),
         ];
         assert_eq!(resolve_target(&rows, "reviewer").unwrap().terminal, 1);
+    }
+
+    #[test]
+    fn session_selection_is_flag_then_env_then_last_opened_then_default() {
+        let base = tempfile::tempdir().expect("a directory");
+        // SAFETY: no other test in this binary touches these variables, and the
+        // override keeps every read and write inside the tempdir.
+        unsafe {
+            std::env::set_var(paths::RUNTIME_DIR_ENV, base.path());
+            std::env::remove_var(paths::SESSION_ENV);
+        }
+        let bare = || take_session(&mut vec!["qoro".to_string()]).unwrap();
+        assert_eq!(bare(), paths::DEFAULT_SESSION);
+        // A recorded session with a directory is what a bare open reopens.
+        std::fs::create_dir_all(base.path().join("sessions").join("hobby")).unwrap();
+        paths::write_last_session(base.path(), "hobby");
+        assert_eq!(bare(), "hobby");
+        // The environment wins over the file.
+        unsafe { std::env::set_var(paths::SESSION_ENV, "work") };
+        assert_eq!(bare(), "work");
+        // The flag wins over both.
+        assert_eq!(
+            take_session(&mut vec![
+                "qoro".to_string(),
+                "--session".to_string(),
+                "play".to_string(),
+            ])
+            .unwrap(),
+            "play"
+        );
+        // A stale file is the default, never an error.
+        unsafe { std::env::remove_var(paths::SESSION_ENV) };
+        std::fs::write(paths::last_session_path(base.path()), "gone\n").unwrap();
+        assert_eq!(bare(), paths::DEFAULT_SESSION);
+        unsafe {
+            std::env::remove_var(paths::RUNTIME_DIR_ENV);
+            std::env::remove_var(paths::SESSION_ENV);
+        }
     }
 
     #[test]

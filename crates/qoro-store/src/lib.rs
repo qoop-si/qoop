@@ -279,6 +279,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget the name a person gave a terminal, so a cleared tab comes back
+    /// cleared rather than under a name that no longer exists on screen.
+    pub fn clear_title(&self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE terminal SET title = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// Record where a terminal actually is.
     ///
     /// Not where it was started. A person opens a tab, moves into a worktree and starts an

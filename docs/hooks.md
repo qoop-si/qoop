@@ -71,7 +71,14 @@ Notes:
 2. The agent's hook mechanism calls the script in `hooks/<agent>/` on lifecycle
    events. The script maps the event to a state and calls
    `qoro hook-report --state <state>`, which posts one `ReportAgentState`
-   control request and waits up to five seconds for the answer.
+   control request and waits up to five seconds for the answer. Each script
+   also passes the agent's own id for the conversation as
+   `--session-id`, read out of that agent's hook payload on stdin (claude's
+   `session_id`, codex's `session_id`, gemini's `session_id` or
+   `GEMINI_SESSION_ID`, cursor's `session_id`/`conversation_id`, goose's
+   `session_id`) or out of the plugin event (`properties.sessionID` for
+   opencode, `thread.id` for amp). A payload with no id reports with no flag,
+   same as before.
 3. The daemon admits the report through the existing token and generation
    check, assigns its own per-terminal counter as the observation sequence,
    and applies the normal acceptance rule. The hook's wall clock travels as
@@ -85,9 +92,8 @@ Notes:
 
 ```text
 qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown>
-    [--terminal N] [--token T]
+    [--terminal N] [--token T] [--session-id S]
     [--visible-blocker] [--visible-idle] [--visible-working]
-    [--session-id S]
 qoro hook-report --session-id S [--terminal N] [--token T]
 ```
 

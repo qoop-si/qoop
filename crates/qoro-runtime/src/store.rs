@@ -132,6 +132,11 @@ impl StoreHandle {
         self.run(move |s| s.set_title(id, &title)).await
     }
 
+    /// Forget a terminal's name, so a cleared tab comes back cleared too.
+    pub async fn clear_title(&self, id: i64) -> Result<(), HandleError> {
+        self.run(move |s| s.clear_title(id)).await
+    }
+
     pub async fn close_terminal(&self, id: i64) -> Result<bool, HandleError> {
         self.run(move |s| s.close_terminal(id, now())).await
     }

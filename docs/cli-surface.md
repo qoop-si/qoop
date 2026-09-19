@@ -48,7 +48,7 @@ a claim nobody has to keep.
 
 | Option | What it does |
 |---|---|
-| `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once, and the flag wins over it. Saying nothing is the `default` session. |
+| `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once. The flag wins over the environment, which wins over the session last opened, which wins over the `default` session: a bare `qoro` reopens whatever was opened last. |
 
 The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
 `qoro send --session work 2 "x"` are the same thing. It is put into the environment of

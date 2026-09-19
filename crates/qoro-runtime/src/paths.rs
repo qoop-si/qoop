@@ -153,6 +153,51 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join("qorod.lock")
 }
 
+/// The runtime base without creating or verifying anything, so reading the
+/// last-used session never creates state: `--help` must not make directories.
+pub fn raw_runtime_base() -> PathBuf {
+    if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
+        PathBuf::from(explicit)
+    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        Path::new(&xdg).join("qoro")
+    } else {
+        std::env::temp_dir().join(format!("qoro-{}", current_uid()))
+    }
+}
+
+/// The one file under the runtime base holding the last opened session.
+///
+/// A plain name, so a bare `qoro` can reopen what was there. Read only when no
+/// flag and no env name a session; written on every successful attach.
+pub fn last_session_path(base: &Path) -> PathBuf {
+    base.join("last-session")
+}
+
+/// The last opened session, if the file holds a name a session could have.
+///
+/// Anything else is no answer, not an error: a stale, edited or truncated file
+/// falls back to the default rather than failing the open. Stale means the
+/// session directory is gone, so a bare open never resurrects a name from a
+/// file alone without the directory that makes it a session.
+pub fn read_last_session(base: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(last_session_path(base)).ok()?;
+    let name = text.trim().to_string();
+    if !valid_session_name(&name) {
+        return None;
+    }
+    session_dir(base, &name).is_dir().then_some(name)
+}
+
+/// Remember the session that was just opened. Best effort: an attach that
+/// cannot write this still attaches, and the next bare open falls back as
+/// before. An invalid name is never written.
+pub fn write_last_session(base: &Path, name: &str) {
+    if !valid_session_name(name) {
+        return;
+    }
+    let _ = std::fs::write(last_session_path(base), format!("{name}\n"));
+}
+
 /// Where `qoro update --check` leaves the newest version it saw on GitHub Releases.
 ///
 /// A plain file holding a version like `0.4.0`, so the interface can show it without
@@ -437,5 +482,28 @@ mod tests {
         assert!(!is_newer_version("0.3.1", "0.3.1"));
         assert!(!is_newer_version("0.3.0", "0.3.1"));
         assert!(!is_newer_version("garbage", "0.3.1"));
+    }
+
+    #[test]
+    fn the_last_session_round_trips_and_garbage_is_no_answer() {
+        let base = tempfile::tempdir().unwrap();
+        assert_eq!(read_last_session(base.path()), None);
+        write_last_session(base.path(), "hobby");
+        // A name in the file alone never opens a session: without the session
+        // directory it is stale, and stale is no answer.
+        assert_eq!(read_last_session(base.path()), None);
+        std::fs::create_dir_all(session_dir(base.path(), "hobby")).unwrap();
+        assert_eq!(read_last_session(base.path()).as_deref(), Some("hobby"));
+        // An invalid name is never written, so the previous answer stands.
+        write_last_session(base.path(), "../etc");
+        assert_eq!(read_last_session(base.path()).as_deref(), Some("hobby"));
+        // A session that went away is stale: no answer, not an error, and the
+        // open falls back to the default rather than failing.
+        std::fs::remove_dir(session_dir(base.path(), "hobby")).unwrap();
+        assert_eq!(read_last_session(base.path()), None);
+        std::fs::write(last_session_path(base.path()), "../etc\n").unwrap();
+        assert_eq!(read_last_session(base.path()), None);
+        std::fs::write(last_session_path(base.path()), "\n").unwrap();
+        assert_eq!(read_last_session(base.path()), None);
     }
 }

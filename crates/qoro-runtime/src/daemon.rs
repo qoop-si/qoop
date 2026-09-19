@@ -1756,7 +1756,19 @@ async fn handle_control(
             // otherwise have to remember to, and a terminal called `"  "` is a terminal
             // with a blank tab.
             let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-            if terminals.rename(terminal, name) {
+            if terminals.rename(terminal, name.clone()) {
+                // Written down before the answer, the way a name given at birth is:
+                // a renamed tab that is stopped before a background write would come
+                // back under its old name. Clearing writes NULL rather than leaving
+                // the old name behind.
+                match name {
+                    Some(name) => {
+                        let _ = store.set_title(terminal as i64, name).await;
+                    }
+                    None => {
+                        let _ = store.clear_title(terminal as i64).await;
+                    }
+                }
                 // The index is what draws a name, so a rename that nobody is told about is
                 // a rename nobody sees until the next unrelated change.
                 agents.announce(terminal);
@@ -1965,12 +1977,13 @@ async fn handle_control(
                     // back to this conversation and coming back to whichever one in the
                     // directory happens to be newest, which is not the same thing the
                     // moment a person has two agents in one repository.
+                    //
+                    // Awaited before the answer, under the store deadline, rather than
+                    // spawned: a stop that lands between the answer and a background
+                    // write would lose the conversation the tab was having.
                     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
                         terminals.set_session(terminal, Some(session.clone()));
-                        let store = store.clone();
-                        tokio::spawn(async move {
-                            let _ = store.set_agent_session(terminal as i64, session).await;
-                        });
+                        let _ = store.set_agent_session(terminal as i64, session).await;
                     }
                     if changed {
                         let generation = agents
@@ -2028,10 +2041,8 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 };
             }
-            let store = store.clone();
-            tokio::spawn(async move {
-                let _ = store.set_agent_session(terminal as i64, session).await;
-            });
+            terminals.set_session(terminal, Some(session.clone()));
+            let _ = store.set_agent_session(terminal as i64, session).await;
             ControlResponse::AgentStateReported { id, terminal }
         }
         ControlRequest::ReloadAgentManifests { .. } => {
