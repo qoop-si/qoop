@@ -175,6 +175,19 @@ struct State {
     subs: std::collections::BTreeSet<u32>,
     /// One tiling tree per space. Spaces without an entry show a single pane.
     layouts: std::collections::BTreeMap<i64, Layout>,
+    /// Terminals created as split panes, hidden from the top tab bar.
+    /// A split is a sub-terminal inside its tab, never a new tab. Agents
+    /// in panes still list in the sidebar. Filled on `TerminalCreated`
+    /// with a `split-` id, cleared on close/prune/detach. Client-local like
+    /// layouts: a second client or a reconnect sees these terminals as
+    /// ordinary tabs until splits are made again.
+    panes: std::collections::BTreeSet<u32>,
+    /// Where each outstanding split was asked for, by request id. A split
+    /// answer carries no workspace, and the space on screen may have moved
+    /// since the request: without this the bind lands in the wrong tree or
+    /// the placeholder leaks and blocks every later split. Consumed by the
+    /// `TerminalCreated`/`Failed` answer.
+    split_origin: std::collections::BTreeMap<String, i64>,
     cols: u16,
     lines: u16,
     message: Option<String>,
@@ -362,6 +375,7 @@ impl State {
             rows: &self.rows,
             spaces: &self.spaces,
             space: self.space,
+            panes: &self.panes,
             focused: self.focused,
             snapshot: self.snapshot.as_ref(),
             cols: self.cols,
@@ -399,8 +413,13 @@ impl State {
     }
 
     /// The tabs of the space on screen, in the order the daemon reports them.
+    /// Split panes are sub-terminals inside their tab, never top tabs, so
+    /// they are filtered here. Agents in panes still list in the sidebar.
     fn tabs(&self) -> Vec<AgentRow> {
         screen::in_space(&self.rows, self.space)
+            .into_iter()
+            .filter(|r| !self.panes.contains(&r.terminal))
+            .collect()
     }
 
     /// What a click at a one based screen position means.
@@ -674,7 +693,8 @@ enum MenuOutcome {
 
 /// Decide what one read of stdin meant while the menu is open.
 ///
-/// Up and down move, enter chooses, esc closes, and the first letter of a row jumps to it.
+/// Up and down move, as do `k` and `j`; enter chooses, esc closes; a row's own
+/// `ctrl-a` key jumps to it, and the first letter jumps to a row with no key.
 /// A prefix or a bare detach closes the menu and hands the bytes on, so `ctrl-a d` still
 /// detaches out of it.
 fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
@@ -716,10 +736,26 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
                 return MenuOutcome::Passthrough(bytes[at - 1..].to_vec());
             }
             letter => {
+                if letter == b'k' {
+                    state.menu = Some(selected.saturating_sub(1));
+                    return MenuOutcome::Moved;
+                }
+                if letter == b'j' {
+                    state.menu = Some((selected + 1).min(MENU.len() - 1));
+                    return MenuOutcome::Moved;
+                }
+                // A row's own key first, so `r` means rename tab and never
+                // reload; then the first letter of a keyless row.
                 if let Some(found) = MENU
                     .iter()
-                    .position(|(name, _)| name.as_bytes().first() == Some(&letter))
+                    .position(|(_, key, _)| key.as_bytes().first() == Some(&letter))
                 {
+                    state.menu = Some(found);
+                    return MenuOutcome::Moved;
+                }
+                if let Some(found) = MENU.iter().position(|(name, key, _)| {
+                    key.is_empty() && name.as_bytes().first() == Some(&letter)
+                }) {
                     state.menu = Some(found);
                     return MenuOutcome::Moved;
                 }
@@ -733,13 +769,24 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
 ///
 /// Everything here does something today. A menu row that opened nothing would be the one
 /// place in the interface that lies about what the product can do, and a person who found
-/// one would be right to stop trusting the rest.
-pub const MENU: &[(&str, &str)] = &[
-    ("keybinds", "every key, and what it does"),
-    ("settings", "what this daemon is set to"),
-    ("reload manifests", "re-read the agent detection overrides"),
-    ("pin as master", "this tab reports to the right column"),
-    ("detach", "leave, and keep everything running"),
+/// one would be right to stop trusting the rest. The key is the `ctrl-a` letter that does
+/// the same thing without the menu; empty when the row has no direct key.
+pub const MENU: &[(&str, &str, &str)] = &[
+    ("new tab", "c", "name it, then it opens"),
+    ("new space", "w", "name it, then it opens"),
+    ("rename tab", "r", "rename what is focused"),
+    ("rename space", "R", "rename what is on screen"),
+    ("split side by side", "v", "a sub-terminal, not a new tab"),
+    ("split stacked", "-", "a sub-terminal, not a new tab"),
+    ("keybinds", "?", "every key, and what it does"),
+    ("settings", "", "what this daemon is set to"),
+    (
+        "reload manifests",
+        "",
+        "re-read the agent detection overrides",
+    ),
+    ("pin as master", "E", "this tab reports to the right column"),
+    ("detach", "d", "leave, and keep everything running"),
 ];
 
 /// A read only overlay opened from the menu.
@@ -966,6 +1013,8 @@ async fn drive(
         snapshots: std::collections::BTreeMap::new(),
         subs: std::collections::BTreeSet::new(),
         layouts: std::collections::BTreeMap::new(),
+        panes: std::collections::BTreeSet::new(),
+        split_origin: std::collections::BTreeMap::new(),
         cols,
         lines,
         // What the caller wanted said, or that this is connecting. A notice about a
@@ -1183,6 +1232,91 @@ async fn drive(
                             MenuOutcome::Moved | MenuOutcome::Closed => dirty = true,
                             MenuOutcome::Chose(item) => {
                                 match MENU[item].0 {
+                                    "new tab" => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Terminal,
+                                            text: String::new(),
+                                        });
+                                    }
+                                    "new space" => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Space,
+                                            text: String::new(),
+                                        });
+                                    }
+                                    "rename tab" => {
+                                        if state.focused != 0 {
+                                            let current = state
+                                                .rows
+                                                .iter()
+                                                .find(|r| r.terminal == state.focused)
+                                                .and_then(|r| r.name.clone())
+                                                .unwrap_or_default();
+                                            state.prompt = Some(Prompt {
+                                                what: Naming::RenameTerminal(state.focused),
+                                                text: current,
+                                            });
+                                        }
+                                    }
+                                    "rename space" => {
+                                        if let Some(space) = state.space {
+                                            let current = state
+                                                .spaces
+                                                .iter()
+                                                .find(|s| s.id == space)
+                                                .map(|s| s.name.clone())
+                                                .unwrap_or_default();
+                                            state.prompt = Some(Prompt {
+                                                what: Naming::RenameSpace(space),
+                                                text: current,
+                                            });
+                                        }
+                                    }
+                                    "split side by side" | "split stacked" => {
+                                        let dir = if MENU[item].0 == "split side by side" {
+                                            layout::Dir::V
+                                        } else {
+                                            layout::Dir::H
+                                        };
+                                        let focused = state.focused;
+                                        let space = state.space;
+                                        if focused == 0 {
+                                            state.message = Some(
+                                                "nothing to split, pick new tab instead"
+                                                    .to_string(),
+                                            );
+                                        } else {
+                                            ensure_layout(&mut state);
+                                            let area = pane_area(&state);
+                                            let placed = space
+                                                .and_then(|s| state.layouts.get_mut(&s))
+                                                .is_some_and(|layout| {
+                                                    layout.split_placeholder(focused, dir, area)
+                                                });
+                                            if !placed {
+                                                state.message = Some(
+                                                    "cannot split now: too small, zoomed, or one already on its way"
+                                                        .to_string(),
+                                                );
+                                            } else {
+                                                request += 1;
+                                                if let Some(s) = space {
+                                                    state
+                                                        .split_origin
+                                                        .insert(format!("split-{request}"), s);
+                                                }
+                                                wr.write_all(&client::encode_control_seq(
+                                                    &ControlRequest::CreateTerminal {
+                                                        id: format!("split-{request}"),
+                                                        cwd: None,
+                                                        workspace: space,
+                                                        name: None,
+                                                    },
+                                                    &mut control_seq,
+                                                )?).await?;
+                                            }
+                                        }
+                                    }
                                     "keybinds" => state.reading = Some(Reading::Keybinds),
                                     "settings" => state.reading = Some(Reading::Settings),
                                     "reload manifests" => {
@@ -1196,7 +1330,7 @@ async fn drive(
                                     }
                                     "pin as master" => pin_focused_as_master(&mut state),
                                     "detach" => return Ok(()),
-                                    _ => {}
+                                    _ => unreachable!("menu row without dispatch"),
                                 }
                                 dirty = true;
                             }
@@ -1639,6 +1773,10 @@ async fn drive(
                                 state.menu = Some(0);
                                 dirty = true;
                             }
+                            Action::Keybinds => {
+                                state.reading = Some(Reading::Keybinds);
+                                dirty = true;
+                            }
                             Action::Collapse => {
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
@@ -1753,6 +1891,9 @@ async fn drive(
                                         // follows: binding happens when `TerminalCreated`
                                         // answers, rollback when it fails.
                                         request += 1;
+                                        if let Some(s) = space {
+                                            state.split_origin.insert(format!("split-{request}"), s);
+                                        }
                                         wr.write_all(&client::encode_control_seq(
                                             &ControlRequest::CreateTerminal {
                                                 id: format!("split-{request}"),
@@ -1843,6 +1984,8 @@ async fn drive(
                                 {
                                     Some(layout) if layout.leaf_count() > 1 => {
                                         layout.remove(focused);
+                                        // Detached panes become real tabs again.
+                                        state.panes.remove(&focused);
                                         Some(layout.focus)
                                     }
                                     _ => None,
@@ -2450,7 +2593,9 @@ fn enter_space(
     state.space = Some(space);
     ensure_layout(state);
     // The layout's visible terminals first, so a tiled space comes back as it
-    // was left; the tab list only when the tree names nothing alive.
+    // was left; the tab list only when the tree names nothing alive. Panes
+    // never restore the keyboard: `tabs()` hides them, so re-entering lands
+    // on the first tab while the tile border keeps the pane focus inside.
     let first = state
         .layouts
         .get(&space)
@@ -2615,6 +2760,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             let live: std::collections::BTreeSet<u32> = agents.iter().map(|r| r.terminal).collect();
             state.snapshots.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
+            state.panes.retain(|t| live.contains(t));
             // The pin follows the terminal, not the number: a master that is gone stops
             // being the master here, where most deaths actually arrive, and never points
             // at a stranger.
@@ -2701,22 +2847,36 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             }
             *dirty = true;
         }
-        ControlResponse::TerminalCreated { terminal, .. } => {
-            // A split waiting for its terminal binds first, in the space on
-            // screen only: the placeholder was made there, and binding another
-            // space's placeholder would strand a foreign terminal in a tree
-            // that cannot see it. Anything else is an ordinary new tab.
-            let bound = state
-                .space
-                .and_then(|space| state.layouts.get_mut(&space))
-                .is_some_and(|layout| layout.bind_placeholder(terminal));
-            if !bound {
+        ControlResponse::TerminalCreated { id, terminal, .. } => {
+            // Split panes bind by id correlation: only a `split-` answer may
+            // claim a placeholder, and it claims the one in the space the
+            // request was made in. A racing `new-` tab must not steal it, and
+            // a split answer landing after a space switch binds home rather
+            // than stranding a foreign terminal in the tree on screen.
+            let is_split = id.starts_with("split-");
+            let origin = if is_split {
+                state.split_origin.remove(&id).or(state.space)
+            } else {
+                None
+            };
+            let bound = is_split
+                && origin
+                    .and_then(|space| state.layouts.get_mut(&space))
+                    .is_some_and(|layout| layout.bind_placeholder(terminal));
+            if bound {
+                state.panes.insert(terminal);
+            } else if !is_split {
                 // The caller subscribes: a new terminal that the client is not
                 // watching draws the terminal it came from, which is what the
                 // first version did.
                 state.snapshot = None;
             }
-            state.pending_focus = Some(terminal);
+            // An unbound split stays where the keyboard is: yanking the focus
+            // to a terminal in another space would collapse that space's tree
+            // onto one pane.
+            if bound && origin == state.space || !is_split {
+                state.pending_focus = Some(terminal);
+            }
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
@@ -2724,6 +2884,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // Trees left with no leaves and no pending split go away, and the
             // unsubscription of a tile nobody watches piggybacks on the next
             // sync: the daemon already ended the terminal itself.
+            state.panes.remove(&terminal);
             for layout in state.layouts.values_mut() {
                 layout.remove(terminal);
             }
@@ -2775,11 +2936,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Failed { id, reason, .. } => {
-            // A split whose spawn failed rolls its tree entry back, in the
-            // space on screen only: one failure must not clear another space's
-            // split still on its way.
+            // A split whose spawn failed rolls its tree entry back where it
+            // was asked for: one failure must not clear another space's
+            // split still on its way, and a rollback on screen only would
+            // leak the origin's placeholder forever.
             if id.starts_with("split-")
-                && let Some(space) = state.space
+                && let Some(space) = state.split_origin.remove(&id).or(state.space)
                 && let Some(layout) = state.layouts.get_mut(&space)
             {
                 layout.drop_placeholder();
@@ -2820,6 +2982,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -2878,6 +3041,8 @@ mod tests {
             snapshots: std::collections::BTreeMap::new(),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
+            panes: std::collections::BTreeSet::new(),
+            split_origin: std::collections::BTreeMap::new(),
             master: None,
             master_open: false,
             master_shown: false,
@@ -3078,6 +3243,8 @@ mod tests {
             snapshots: std::collections::BTreeMap::new(),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
+            panes: std::collections::BTreeSet::new(),
+            split_origin: std::collections::BTreeMap::new(),
             cols: 80,
             lines: 24,
             message: None,
@@ -3133,6 +3300,8 @@ mod tests {
             snapshots: std::collections::BTreeMap::from([(2, snapshot_with_behind(0))]),
             subs: std::collections::BTreeSet::from([1, 2]),
             layouts: std::collections::BTreeMap::new(),
+            panes: std::collections::BTreeSet::new(),
+            split_origin: std::collections::BTreeMap::new(),
             cols: 80,
             lines: 24,
             message: None,
@@ -3329,13 +3498,156 @@ mod tests {
         apply(
             &mut state,
             ControlResponse::TerminalCreated {
-                id: "t".to_string(),
+                id: "split-1".to_string(),
                 terminal: 3,
             },
             &mut dirty,
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
         assert!(!state.layouts.get(&2).unwrap().contains(3));
+        assert!(
+            state.panes.contains(&3),
+            "bound splits hide from the tab bar"
+        );
+        state.rows.push(agent(3, 1, "zsh", "idle"));
+        assert!(!state.tabs().iter().any(|r| r.terminal == 3));
+        assert!(state.rows.iter().any(|r| r.terminal == 3));
+    }
+
+    #[test]
+    fn a_racing_new_tab_does_not_steal_a_split_placeholder() {
+        let mut state = tiled_state();
+        state.space = Some(1);
+        let area = pane_area(&state);
+        state
+            .layouts
+            .get_mut(&1)
+            .unwrap()
+            .split_placeholder(1, layout::Dir::H, area);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "new-1".to_string(),
+                terminal: 3,
+            },
+            &mut dirty,
+        );
+        assert!(!state.layouts.get(&1).unwrap().contains(3));
+        assert!(!state.panes.contains(&3));
+        assert!(state.layouts.get(&1).unwrap().has_pending());
+    }
+
+    #[test]
+    fn a_split_answer_after_a_space_switch_binds_home_without_yanking_focus() {
+        let mut state = tiled_state();
+        state.space = Some(1);
+        let area = pane_area(&state);
+        state
+            .layouts
+            .get_mut(&1)
+            .unwrap()
+            .split_placeholder(1, layout::Dir::H, area);
+        state.split_origin.insert("split-9".to_string(), 1);
+        // Switched away while the spawn was on its way.
+        state.space = Some(2);
+        state.layouts.insert(2, Layout::single(9));
+        state.focused = 9;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "split-9".to_string(),
+                terminal: 3,
+            },
+            &mut dirty,
+        );
+        assert!(state.layouts.get(&1).unwrap().contains(3));
+        assert!(!state.layouts.get(&2).unwrap().contains(3));
+        assert!(state.panes.contains(&3));
+        assert_eq!(state.focused, 9, "focus stays where the keyboard is");
+        assert_eq!(state.pending_focus, None);
+        assert!(!state.split_origin.contains_key("split-9"));
+    }
+
+    #[test]
+    fn a_failed_split_after_a_space_switch_rolls_back_home() {
+        let mut state = tiled_state();
+        state.space = Some(1);
+        let area = pane_area(&state);
+        state
+            .layouts
+            .get_mut(&1)
+            .unwrap()
+            .split_placeholder(1, layout::Dir::H, area);
+        state.split_origin.insert("split-9".to_string(), 1);
+        state.space = Some(2);
+        state.layouts.insert(2, Layout::single(9));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: "split-9".to_string(),
+                reason: "no".to_string(),
+            },
+            &mut dirty,
+        );
+        assert!(!state.layouts.get(&1).unwrap().has_pending());
+        assert!(state.layouts.get(&2).unwrap().contains(9));
+        assert!(!state.split_origin.contains_key("split-9"));
+    }
+
+    #[test]
+    fn menu_moves_with_arrows_and_jk_and_jumps_by_key() {
+        let mut state = bare_state();
+        state.menu = Some(0);
+        assert!(matches!(menu_key(&mut state, 0, b"j"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(1));
+        assert!(matches!(menu_key(&mut state, 1, b"k"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(0));
+        // A row's own key wins over first letters: `r` is rename tab.
+        assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(2));
+        assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(6));
+        // Keyless rows answer to their first letter.
+        assert!(matches!(menu_key(&mut state, 6, b"s"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(7));
+        // Enter chooses, esc closes.
+        assert!(matches!(
+            menu_key(&mut state, 7, b"\r"),
+            MenuOutcome::Chose(7)
+        ));
+        assert_eq!(state.menu, None);
+        state.menu = Some(3);
+        assert!(matches!(
+            menu_key(&mut state, 3, b"\x1b"),
+            MenuOutcome::Closed
+        ));
+        assert_eq!(state.menu, None);
+    }
+
+    #[test]
+    fn every_menu_row_names_a_dispatched_choice() {
+        // The dispatch matches on the same names, so a row added without an
+        // arm fails here instead of dying silently behind `_`.
+        let names: Vec<&str> = MENU.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "new tab",
+                "new space",
+                "rename tab",
+                "rename space",
+                "split side by side",
+                "split stacked",
+                "keybinds",
+                "settings",
+                "reload manifests",
+                "pin as master",
+                "detach",
+            ]
+        );
     }
 
     /// Pinning names the focused tab with its generation, and pinning again unpins.
@@ -3793,6 +4105,7 @@ mod tests {
             rows: &state.rows,
             spaces: &state.spaces,
             space: state.space,
+            panes: &state.panes,
             focused: state.focused,
             snapshot: state.snapshot.as_ref(),
             cols: state.cols,

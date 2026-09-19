@@ -336,6 +336,11 @@ pub struct AgentRow {
     /// reading a newer daemon sees "not an agent" rather than failing to parse the row.
     #[serde(default)]
     pub agent: bool,
+    /// The agent's own id for its conversation, when it has reported one.
+    /// Shortened for display by the client. Defaulted so rows from an older
+    /// daemon parse without it.
+    #[serde(default)]
+    pub agent_session: Option<String>,
     /// Bumped when the process in the terminal is replaced, so a client can tell a new
     /// agent from a new state.
     pub generation: Option<u64>,
@@ -484,6 +489,7 @@ mod tests {
             serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"blocked"}"#)
                 .expect("decode");
         assert_eq!(row.readiness, "unknown");
+        assert_eq!(row.agent_session, None);
     }
 
     #[test]

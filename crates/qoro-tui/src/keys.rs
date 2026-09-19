@@ -99,6 +99,11 @@ pub enum Action {
     Update,
     /// ctrl-a m, the menu.
     Menu,
+    /// ctrl-a ?: every key, without going through the menu.
+    ///
+    /// Only `?`: `h` and `/` stay unbound, so the pane-left `H` keeps its
+    /// neighbourhood to itself.
+    Keybinds,
     /// ctrl-a 1 through ctrl-a 9, the nth tab of the current space, counted from one.
     ///
     /// Counted from one because that is what is written on the tab. Zero is not a command:
@@ -270,6 +275,7 @@ impl Keys {
                     b'b' => Action::Collapse,
                     b'U' => Action::Update,
                     b'm' => Action::Menu,
+                    b'?' => Action::Keybinds,
                     b'R' => Action::RenameSpace,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
@@ -518,6 +524,12 @@ mod tests {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01r"), vec![Action::Rename]);
         assert_eq!(keys.feed(b"\x01R"), vec![Action::RenameSpace]);
+    }
+
+    #[test]
+    fn question_mark_opens_every_key_without_the_menu() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01?"), vec![Action::Keybinds]);
     }
 
     #[test]

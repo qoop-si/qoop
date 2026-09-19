@@ -34,6 +34,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         source: None,
         rule: None,
         manifest: None,
+        agent_session: None,
     }
 }
 
@@ -53,6 +54,7 @@ fn main() {
         rows: &rows,
         spaces: &spaces,
         space: Some(1),
+        panes: &std::collections::BTreeSet::new(),
         focused: 1,
         snapshot: None,
         cols: 60,

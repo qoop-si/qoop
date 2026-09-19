@@ -31,6 +31,9 @@ pub struct Frame<'a> {
     pub spaces: &'a [WorkspaceRow],
     /// The space whose tabs are on the bar. `None` before the daemon has answered.
     pub space: Option<i64>,
+    /// Split panes hidden from the top tab bar. Sub-terminals inside their
+    /// tab, still listed in the sidebar when an agent runs in them.
+    pub panes: &'a std::collections::BTreeSet<u32>,
     pub focused: u32,
     /// The focused terminal's last snapshot. `None` before the first one arrives, which is
     /// a real state: a terminal that has produced nothing yet has nothing to draw.
@@ -99,7 +102,7 @@ pub struct Frame<'a> {
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  d detach  U update";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  ? keys  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -223,13 +226,13 @@ pub fn paint(frame: &Frame) -> String {
     let wide_enough = left > 0;
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
-    // past the column and its rule.
+    // past the column and its rule. Split panes are sub-terminals, never top tabs.
     out.push_str(&at(1, left + 1));
-    for (piece, style) in tabs::painted(
-        &in_space(frame.rows, frame.space),
-        frame.focused,
-        pane_cols as usize,
-    ) {
+    let tabs: Vec<AgentRow> = in_space(frame.rows, frame.space)
+        .into_iter()
+        .filter(|r| !frame.panes.contains(&r.terminal))
+        .collect();
+    for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize) {
         out.push_str(&match style {
             tabs::Ink::Focused => theme::tab_on(),
             tabs::Ink::Other => theme::tab_off(),
@@ -493,7 +496,7 @@ pub fn paint(frame: &Frame) -> String {
         // first, and a person stuck in here can still read the one that gets them out.
         EVERY_KEY
     } else {
-        "ctrl-a: n tab  c new  r rename  space find  d detach  U update"
+        "ctrl-a: n tab  c new  r rename  R space  d detach  space find  ? keys"
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);
@@ -908,12 +911,18 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
 /// than it is.
 fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
     let lines = frame.lines as usize;
-    let widest = crate::run::MENU
+    let (max_name, max_key) = crate::run::MENU
         .iter()
-        .map(|(name, _)| width::width(name))
-        .max()
-        .unwrap_or(0);
-    let w = (widest + 4).min(frame.cols as usize);
+        .fold((0, 0), |(n, k), (name, key, _)| {
+            let keypart = if key.is_empty() {
+                0
+            } else {
+                3 + width::width(key)
+            };
+            (n.max(width::width(name)), k.max(keypart))
+        });
+    let inner = 1 + max_name + 1 + max_key;
+    let w = (inner + 2).min(frame.cols as usize);
     if lines < crate::run::MENU.len() + 2 {
         return;
     }
@@ -932,7 +941,7 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         out.push_str(theme::RESET);
     };
     edge(out, top, '\u{256d}', '\u{2500}', '\u{256e}');
-    for (i, (name, _)) in crate::run::MENU.iter().enumerate() {
+    for (i, (name, key, _)) in crate::run::MENU.iter().enumerate() {
         let row = top + 1 + i;
         if row + 1 >= lines {
             break;
@@ -945,7 +954,17 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         } else {
             theme::fg(theme::Role::Text)
         });
-        out.push_str(&width::fit(&format!(" {name}"), w.saturating_sub(2)));
+        // The name on the left, its key on the right: the menu teaches the
+        // shortcut it replaces, so the next visit skips the menu entirely.
+        let inner = w.saturating_sub(2);
+        let keypart = if key.is_empty() {
+            String::new()
+        } else {
+            format!("^a {key}")
+        };
+        let gap = inner.saturating_sub(1 + width::width(name) + width::width(&keypart));
+        let cell = format!(" {name}{}{keypart}", " ".repeat(gap));
+        out.push_str(&width::fit(&cell, inner));
         out.push_str(&border);
         out.push('\u{2502}');
         out.push_str(theme::RESET);
@@ -974,7 +993,6 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                 None => format!(" {entry}"),
             })
             .chain([
-                " ctrl-a R      rename this space".to_string(),
                 " ctrl-a 1..9   the nth tab of this space".to_string(),
                 " ctrl-a v/-    split side by side / stacked".to_string(),
                 " ctrl-a H/J/K/L focus the pane left/down/up/right".to_string(),
@@ -1411,6 +1429,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -1446,6 +1465,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -1491,6 +1511,155 @@ mod tests {
     }
 
     #[test]
+    fn a_split_pane_is_not_a_top_tab_but_stays_in_the_sidebar() {
+        let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+        let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
+        let snapshot = snapshot(&["hello from the shell"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &panes,
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        // The tab bar is the first row: between the cursor address and the reset.
+        let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
+        let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
+        let bar = &painted[bar_start..bar_start + bar_end];
+        assert!(bar.contains("zsh"), "tab missing from bar: {bar:?}");
+        assert!(!bar.contains("claude"), "split pane leaked as tab: {bar:?}");
+        assert!(
+            painted.contains("claude"),
+            "pane agent left sidebar: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_focused_pane_leaves_the_bar_without_a_bracket() {
+        // Panes are sub-terminals, never tabs: with the keyboard in one, no
+        // tab wears the bracket, and the tile border carries the focus alone.
+        let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+        let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
+        let snapshot = snapshot(&["hello from the shell"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &panes,
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
+        let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
+        let addr_end = painted[bar_start..].find('H').expect("no bar address") + 1;
+        let bar = &painted[bar_start + addr_end..bar_start + bar_end];
+        assert!(bar.contains("zsh"), "tab missing from bar: {bar:?}");
+        assert!(!bar.contains("[1 "), "no tab owns the keyboard: {bar:?}");
+    }
+
+    #[test]
+    fn the_menu_teaches_the_key_each_row_replaces() {
+        let rows = [row(1, "zsh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: Some(0),
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        assert!(painted.contains("new tab"), "menu missing row: {painted:?}");
+        assert!(painted.contains("^a c"), "menu hides its key: {painted:?}");
+        assert!(painted.contains("split side by side"), "{painted:?}");
+        assert!(painted.contains("rename space"), "{painted:?}");
+    }
+
+    #[test]
     fn a_terminal_line_cannot_overwrite_the_rule_or_run_past_the_window() {
         let rows = [row(1, "zsh", "idle")];
         let long = "x".repeat(500);
@@ -1498,6 +1667,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -1542,6 +1712,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -1591,6 +1762,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -1643,6 +1815,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -1706,6 +1879,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -1769,6 +1943,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -1821,6 +1996,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -1871,6 +2047,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -1916,6 +2093,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -1963,6 +2141,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -2028,6 +2207,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2086,6 +2266,7 @@ mod tests {
             paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -2155,6 +2336,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &wide,
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2242,6 +2424,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2291,6 +2474,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -2302,6 +2486,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2348,6 +2533,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2391,6 +2577,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2435,6 +2622,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -2508,6 +2696,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -2586,6 +2775,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -2650,6 +2840,7 @@ mod tests {
                 source: None,
                 rule: None,
                 manifest: None,
+                agent_session: None,
             })
             .collect();
         let snapshot = snapshot(&["output"]);
@@ -2659,6 +2850,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2708,6 +2900,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2770,6 +2963,7 @@ mod tests {
             paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -2821,6 +3015,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2881,6 +3076,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2970,6 +3166,7 @@ mod tests {
         paint(&Frame {
             rows,
             spaces,
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused,
             snapshot: focused_snap,
@@ -3009,6 +3206,7 @@ mod tests {
         let legacy = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -3039,6 +3237,7 @@ mod tests {
         let tiled = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -3237,6 +3436,7 @@ mod tests {
         paint(&Frame {
             rows: &agents,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&pane),
@@ -3339,6 +3539,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &agents,
             spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&pane),

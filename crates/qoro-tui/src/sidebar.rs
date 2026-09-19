@@ -629,11 +629,9 @@ fn agents_panel(
 
 /// The two rows an open agent takes, with what a click on either means.
 ///
-/// First the project and the tab, then the session underneath: ` app · release`
-/// above `claude`. Both rows reach the same terminal, so a click on either
-/// lands on the agent. The space is always named on the first row, which is
-/// what retired the shared-label suffix: with the space on every row there is
-/// no shared label left to qualify.
+/// First the session, then where it lives: ` opencode abc123ef` above
+/// `release - app`. Both rows reach the same terminal, so a click on either
+/// lands on the agent.
 ///
 /// Static: every state says its word on the right (`working` included), an
 /// unread done says `new`, and `tick` is ignored so a still panel is byte for
@@ -654,20 +652,14 @@ fn push_agent_lines(
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
     let space = spaces.iter().find(|s| s.id == agent.workspace);
-    let head = match space {
-        Some(space) => format!(" {} \u{b7} {tab}", space.name),
-        // A space the client has not heard of yet: the row still draws, under
-        // the tab alone, rather than vanishing until the index catches up.
-        None => format!(" {tab}"),
-    };
-    // The state is cut before the names are, but never so far that the space
-    // and some of the tab disappear: a row showing only a state does not say
-    // whose state it is.
-    let (space_cols, dot_cols) = match space {
-        Some(space) => (crate::width::width(&space.name), 3),
-        None => (0, 0),
-    };
-    let head_least = AGENT_NAME_AT + space_cols + dot_cols + MIN_NAME;
+    // Line one names the session: the agent's own conversation id when it has
+    // reported one, else what is actually running. The program stays beside a
+    // reported id so the row never loses which agent the session belongs to.
+    // Static: the state word is always drawn (`working` included), so the cut
+    // guards the session and never the state word alone.
+    let session = session_name(agent);
+    let head = format!(" {session}");
+    let head_least = AGENT_NAME_AT + MIN_NAME;
     let unread = is_unread(agent, focused, seen);
     let word = if unread {
         NEW_STATE
@@ -676,34 +668,73 @@ fn push_agent_lines(
     };
     let state = clip(word, WIDTH.saturating_sub(head_least + 1));
     let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
-    let accent = space.map(|space| {
-        (
-            AGENT_NAME_AT,
-            crate::width::width(&space.name),
-            crate::theme::space_of(agent.workspace),
-        )
-    });
     out.push((
         Line {
             text: format!("{} {state}", fit_to(&head, room)),
             colour: colour_for(&agent.state),
-            // Which space this agent lives in, as the colour of its name.
-            accent,
-            indicator: None,
-        },
-        hit,
-    ));
-    // The session underneath: what is actually running in the tab, in the quiet
-    // colour, so the first row keeps the eye and the second keeps the answer.
-    out.push((
-        Line {
-            text: fit_to(&format!("  {}", session_program(agent)), WIDTH),
-            colour: Some(crate::theme::Role::Faint),
+            // The space lives on the second row now, so the first row carries
+            // no space accent: the keyboard's row is the raised background.
             accent: None,
             indicator: None,
         },
         hit,
     ));
+    // Where it lives, underneath: the tab and the space, in the quiet
+    // colour, so the first row keeps the eye and the second keeps the place.
+    // A space the client has not heard of yet still draws, under the tab
+    // alone, rather than vanishing until the index catches up. The space keeps
+    // its colour here, so it still wears one colour in both panels.
+    let (place, place_accent) = match space {
+        Some(space) => (
+            format!("{tab} - {}", space.name),
+            Some((
+                2 + crate::width::width(&tab) + 3,
+                crate::width::width(&space.name),
+                crate::theme::space_of(agent.workspace),
+            )),
+        ),
+        None => (tab.clone(), None),
+    };
+    out.push((
+        Line {
+            text: fit_to(&format!("  {place}"), WIDTH),
+            colour: Some(crate::theme::Role::Faint),
+            accent: place_accent,
+            indicator: None,
+        },
+        hit,
+    ));
+}
+
+/// What the first row names: the agent's own conversation id when it has
+/// reported one, else what is actually running. The program stays beside a
+/// reported id so the row never loses which agent the session belongs to.
+fn session_name(agent: &AgentRow) -> String {
+    let program = session_program(agent);
+    match short_session(agent.agent_session.as_deref()) {
+        Some(short) => format!("{program} {short}"),
+        None => program,
+    }
+}
+
+/// The conversation id, shortened for a thirty column row. A basename,
+/// because hooks report paths as well as ids, and a prefix when even that
+/// is long: the start is what a person recognises.
+fn short_session(session: Option<&str>) -> Option<String> {
+    let base = session?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let base = base
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(base);
+    if base.chars().count() > 12 {
+        Some(format!("{}…", base.chars().take(8).collect::<String>()))
+    } else {
+        Some(base.to_string())
+    }
 }
 
 /// What runs in the tab: the program's last path segment, because a column
@@ -1419,6 +1450,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -1436,6 +1468,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -1503,14 +1536,10 @@ mod tests {
         }
         // The focused space and agent still draw their names.
         assert!(texts.iter().any(|t| t.contains("personal")), "{texts:?}");
-        // Terminal 3 is the focused agent: its space, then its label.
-        // Which space it lives in is said by the word beside it.
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with(" personal \u{b7} codex")),
-            "{texts:?}"
-        );
+        // Terminal 3 is the focused agent: its session on the first row, its
+        // tab and space on the second. The first row answers "what", the
+        // second "where".
+        assert!(texts.iter().any(|t| t.starts_with(" codex")), "{texts:?}");
         // And hits still know which rows have the keyboard.
         let hits: Vec<Option<Hit>> = (0..14)
             .map(|row| hit(&spaces, &agents, 2, 3, 14, row))
@@ -1529,13 +1558,13 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(" app \u{b7} claude"))
+            .position(|t| t.starts_with(" claude"))
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // Two rows, and together they carry everything: the space, the tab,
-        // the state word on the right and the program underneath. Static:
+        // Two rows, and together they carry everything: the session, the tab
+        // and space underneath, and the state word on the right. Static:
         // a working agent says `working` like every other state.
         assert!(texts[head].ends_with("working"), "{texts:?}");
-        assert_eq!(texts[head + 1], "  claude");
+        assert_eq!(texts[head + 1], "  claude - app");
     }
 
     #[test]
@@ -1575,11 +1604,12 @@ mod tests {
             vec![colour_for("working"), Some(crate::theme::Role::Faint)]
         );
         // A space row has no state to have a colour about; it wears its own instead, as an
-        // accent on its name rather than on the whole row.
+        // accent on its name rather than on the whole row. Agent second rows
+        // (`tab - space`) are excluded: they name a space but are not space rows.
         assert!(
             lines
                 .iter()
-                .filter(|l| l.text.contains("personal"))
+                .filter(|l| l.text.contains("personal") && !l.text.contains(" - "))
                 .all(|l| l.colour.is_none() && l.accent.is_some())
         );
     }
@@ -1650,7 +1680,7 @@ mod tests {
                     Some(Hit::Space(s.id))
                 } else {
                     // Everything left is one agent's two rows: the first names
-                    // the space and the tab, the second the session under it.
+                    // the session, the second the tab and the space under it.
                     // Both reach the same terminal.
                     agents
                         .iter()
@@ -1660,14 +1690,15 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            let first = if space.is_empty() {
-                                format!(" {}", label(a))
+                            let first = format!(" {}", session_name(a));
+                            let place = if space.is_empty() {
+                                label(a)
                             } else {
-                                format!(" {} \u{b7} {}", space, label(a))
+                                format!("{} - {}", label(a), space)
                             };
                             text.starts_with(&first)
                                 || (text.starts_with("  ")
-                                    && text.trim_end() == format!("  {}", session_program(a)))
+                                    && text.trim_end() == format!("  {place}"))
                         })
                         .map(|a| Hit::Terminal(a.terminal))
                 };
@@ -1710,6 +1741,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -1720,8 +1752,9 @@ mod tests {
             .collect()
     }
 
-    /// The user's panel: four rows reading `opencode` identify nothing. The space
-    /// is named on every first row, so each pair says which one needs them.
+    /// The user's panel: four rows reading `opencode` identify nothing. Each
+    /// pair's second row names where it lives, so each pair says which one
+    /// needs them.
     #[test]
     fn agents_sharing_a_label_carry_their_space_names() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
@@ -1731,18 +1764,18 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("app \u{b7} opencode")),
+            texts.iter().any(|t| t.contains("opencode - app")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("personal \u{b7} opencode")),
+            texts.iter().any(|t| t.contains("opencode - personal")),
             "{texts:?}"
         );
     }
 
-    /// Every first row names its space: the mark's colour says where it lives,
-    /// and the word beside it says it again, so no label ever stands on its
-    /// colour alone.
+    /// Every pair names where it lives on its second row: the mark's colour
+    /// says where it lives, and the words beside it say it again, so no pair
+    /// ever stands on its colour alone.
     #[test]
     fn a_label_nobody_shares_still_names_its_space() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
@@ -1753,15 +1786,15 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("app \u{b7} claude")),
+            texts.iter().any(|t| t.contains("claude - app")),
             "{texts:?}"
         );
-        // And the session underneath still says what runs in the tab.
-        assert!(texts.iter().any(|t| *t == "  claude"), "{texts:?}");
+        // And the second row still says where the tab lives.
+        assert!(texts.iter().any(|t| *t == "  claude - app"), "{texts:?}");
     }
 
     /// A chosen name picked twice in two spaces is still two pairs that cannot
-    /// be told from one another, so each first row names its space.
+    /// be told from one another, so each second row names where it lives.
     #[test]
     fn a_chosen_name_shared_by_two_agents_names_both_spaces() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
@@ -1771,20 +1804,20 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("app \u{b7} release")),
+            texts.iter().any(|t| t.contains("release - app")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("personal \u{b7} release")),
+            texts.iter().any(|t| t.contains("release - personal")),
             "{texts:?}"
         );
-        // And each session underneath still says what runs in its tab.
-        assert!(texts.iter().any(|t| *t == "  opencode"), "{texts:?}");
-        assert!(texts.iter().any(|t| *t == "  claude"), "{texts:?}");
+        // And each first row still says what runs in its tab.
+        assert!(texts.iter().any(|t| t.contains("opencode")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
     }
 
-    /// Two tabs of one space share the space's name as well as the program, and
-    /// still tell apart: their states differ, and each pair keeps its own hits.
+    /// Two tabs of one space share the program, and still tell apart: their
+    /// states differ, and each pair keeps its own hits.
     #[test]
     fn two_tabs_of_one_space_share_the_space_name_but_not_the_state() {
         let spaces = vec![space(1, "app")];
@@ -1795,19 +1828,54 @@ mod tests {
         let texts = agent_texts(&spaces, &agents, 1);
         let first = texts
             .iter()
-            .find(|t| t.contains("app \u{b7} opencode") && t.ends_with("idle"))
+            .find(|t| t.contains("opencode") && t.ends_with("idle"))
             .unwrap_or_else(|| panic!("{texts:?}"));
         let second = texts
             .iter()
-            .find(|t| t.contains("app \u{b7} opencode") && t.ends_with("blocked"))
+            .find(|t| t.contains("opencode") && t.ends_with("blocked"))
             .unwrap_or_else(|| panic!("{texts:?}"));
         assert_ne!(first, second);
-        // Both pairs reach their own terminal, first row and session row alike.
+        // Both pairs reach their own terminal, first row and second row alike.
         let hits: Vec<Option<Hit>> = (0..20)
             .map(|row| hit(&spaces, &agents, 1, 1, 20, row))
             .collect();
         assert!(hits.contains(&Some(Hit::Terminal(1))));
         assert!(hits.contains(&Some(Hit::Terminal(2))));
+    }
+
+    #[test]
+    fn a_reported_session_names_the_first_row_and_the_tab_names_the_second() {
+        let spaces = vec![space(1, "app")];
+        let mut a = agent(1, 1, "opencode", "idle");
+        a.name = Some("release".to_string());
+        a.agent_session = Some("abc123".to_string());
+        let texts = agent_texts(&spaces, &[a], 1);
+        assert!(
+            texts.iter().any(|t| t.contains("opencode abc123")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| *t == "  release - app"), "{texts:?}");
+    }
+
+    #[test]
+    fn a_long_session_is_shortened_to_its_prefix() {
+        let spaces = vec![space(1, "app")];
+        let mut a = agent(1, 1, "claude", "idle");
+        a.agent_session = Some("sess_abc123def456".to_string());
+        let texts = agent_texts(&spaces, &[a], 1);
+        assert!(texts.iter().any(|t| t.contains("sess_abc…")), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("sess_abc123def456")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_session_the_first_row_names_what_runs() {
+        let spaces = vec![space(1, "app")];
+        let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
+        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "  codex - app"), "{texts:?}");
     }
 
     #[test]
@@ -1825,6 +1893,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1852,6 +1921,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1895,9 +1965,9 @@ mod tests {
             .find(|l| l.text.contains('z'))
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        // The space and some of the program survive the cut: a row
-        // showing only a state does not say whose state it is.
-        assert!(row.text.starts_with(" app \u{b7} cl"), "{:?}", row.text);
+        // Some of the session survives the cut: a row showing only a state
+        // does not say whose state it is.
+        assert!(row.text.starts_with(" cl"), "{:?}", row.text);
     }
 
     fn many_agents() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
@@ -2205,6 +2275,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }];
         let lines = render_folded(
             &[space(1, "app"), space(2, "webshop")],

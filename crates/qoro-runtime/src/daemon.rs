@@ -287,6 +287,10 @@ pub struct TerminalHandle {
     /// the daemon goes, so does the terminal, and a name that outlived its terminal would
     /// be a row in a table nothing can ever point at again.
     pub name: Option<String>,
+    /// The agent's own id for its conversation, last reported by hook.
+    /// Memory only, like the name: the store keeps a copy for resume, but
+    /// the index reads this so every poll stays off the disk.
+    pub session: Option<String>,
     pub id: TerminalId,
     /// How many rows of this terminal have gone behind the screen and been written down.
     ///
@@ -322,6 +326,22 @@ impl TerminalRegistry {
 
     pub fn name_of(&self, stream: u32) -> Option<String> {
         self.inner.lock().unwrap().get(&stream)?.name.clone()
+    }
+
+    /// The agent's conversation id, last reported by hook, if any.
+    pub fn session_of(&self, stream: u32) -> Option<String> {
+        self.inner.lock().unwrap().get(&stream)?.session.clone()
+    }
+
+    /// Remember a reported conversation id. False when there is no such terminal.
+    fn set_session(&self, stream: u32, session: Option<String>) -> bool {
+        match self.inner.lock().unwrap().get_mut(&stream) {
+            Some(handle) => {
+                handle.session = session;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Give a terminal a different name. False when there is no such terminal.
@@ -1855,6 +1875,7 @@ async fn handle_control(
                         source,
                         rule,
                         manifest,
+                        agent_session: terminals.session_of(terminal),
                     }
                 })
                 .collect();
@@ -1945,6 +1966,7 @@ async fn handle_control(
                     // directory happens to be newest, which is not the same thing the
                     // moment a person has two agents in one repository.
                     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
+                        terminals.set_session(terminal, Some(session.clone()));
                         let store = store.clone();
                         tokio::spawn(async move {
                             let _ = store.set_agent_session(terminal as i64, session).await;
@@ -2277,6 +2299,7 @@ pub fn open_terminal(
     let behind = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let handle = TerminalHandle {
         name,
+        session: None,
         workspace,
         history: behind.clone(),
         id: terminal_id,

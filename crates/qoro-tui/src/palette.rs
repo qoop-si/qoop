@@ -220,6 +220,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -237,6 +238,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 

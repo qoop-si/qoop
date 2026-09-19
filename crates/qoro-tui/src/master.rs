@@ -670,6 +670,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -687,6 +688,7 @@ mod tests {
             source: None,
             rule: None,
             manifest: None,
+            agent_session: None,
         }
     }
 
@@ -813,6 +815,7 @@ mod tests {
                 source: None,
                 rule: None,
                 manifest: None,
+                agent_session: None,
             },
         ];
         let spaces = vec![space(1, "app")];
@@ -1070,6 +1073,7 @@ mod tests {
                     source: None,
                     rule: None,
                     manifest: None,
+                    agent_session: None,
                 },
                 // A second row under the same triage state, so a test can tell
                 // whether the approval follows the paint or the file.
