@@ -805,6 +805,13 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("close tab", "x", "close what is focused"),
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
+    ("zoom pane", "z", "fill the pane with this tile, or go back"),
+    (
+        "fold idle groups",
+        "f",
+        "fold the idle groups away, or bring them back",
+    ),
+    ("toggle agents view", "g", "agents as groups or by urgency"),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "what this daemon is set to"),
     (
@@ -821,6 +828,9 @@ enum MenuSend {
     Nothing,
     Detach,
     Control(ControlRequest),
+    /// Flip zoom on the focused pane. The tree flips and the follow-up bytes
+    /// go out at the call sites, because they own the sequence numbers.
+    Zoom,
 }
 
 /// Run one menu row: prompts, messages and state changes happen here, and the
@@ -924,6 +934,15 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     })
                 }
             }
+        }
+        "zoom pane" => MenuSend::Zoom,
+        "fold idle groups" => {
+            state.fold.toggle_all();
+            MenuSend::Nothing
+        }
+        "toggle agents view" => {
+            state.view = state.view.toggle();
+            MenuSend::Nothing
         }
         "keybinds" => {
             state.reading = Some(Reading::Keybinds);
@@ -1576,6 +1595,16 @@ async fn drive(
                                             )?)
                                             .await?;
                                         }
+                                        MenuSend::Zoom => {
+                                            let (changed, out) = zoom_flip(
+                                                &mut state,
+                                                &mut control_seq,
+                                                &mut seqs,
+                                            )?;
+                                            if changed && let Some(out) = out {
+                                                wr.write_all(&out).await?;
+                                            }
+                                        }
                                     }
                                     if MENU[item].0 == "pin as master"
                                         && let Some(resize) =
@@ -1611,6 +1640,16 @@ async fn drive(
                                                 &mut control_seq,
                                             )?)
                                             .await?;
+                                        }
+                                        MenuSend::Zoom => {
+                                            let (changed, out) = zoom_flip(
+                                                &mut state,
+                                                &mut control_seq,
+                                                &mut seqs,
+                                            )?;
+                                            if changed && let Some(out) = out {
+                                                wr.write_all(&out).await?;
+                                            }
                                         }
                                     }
                                     if MENU[item].0 == "pin as master"
@@ -2311,27 +2350,13 @@ async fn drive(
                                 }
                             }
                             Action::Zoom => {
-                                let space = state.space;
-                                let zoomed = match space
-                                    .and_then(|s| state.layouts.get_mut(&s))
-                                {
-                                    Some(layout) => layout.toggle_zoom(),
-                                    None => false,
-                                };
-                                if zoomed {
+                                let (changed, out) =
+                                    zoom_flip(&mut state, &mut control_seq, &mut seqs)?;
+                                if changed {
                                     // Hidden tiles are unsubscribed with the sync below:
                                     // their output costs nothing while zoomed, at the
                                     // price of one `Refresh` each on the way back.
-                                    let mut out = BytesMut::new();
-                                    if let Some(sync) = sync_subs(&mut state, &mut control_seq)? {
-                                        out.extend_from_slice(&sync);
-                                    }
-                                    if let Some(resize) =
-                                        resize_focused_to_tile(&state, &mut seqs)?
-                                    {
-                                        out.extend_from_slice(&resize);
-                                    }
-                                    if !out.is_empty() {
+                                    if let Some(out) = out {
                                         wr.write_all(&out).await?;
                                     }
                                     dirty = true;
@@ -2867,6 +2892,34 @@ fn visible_set(state: &State) -> Vec<u32> {
 /// Bring subscriptions to exactly the visible set, in one write. `None` when
 /// already there, so moving the focus inside the visible set costs no control
 /// traffic and no `Refresh` storm.
+/// Flip zoom on the focused pane and build the follow-up bytes, if any.
+/// Hidden tiles unsubscribe on the way in and resubscribe on the way out,
+/// and the focused terminal relearns its tile. One function for the zoom key
+/// and the zoom menu row, so the two never drift. True when the tree
+/// changed; a no-op with a single leaf answers false and sends nothing.
+fn zoom_flip(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<(bool, Option<BytesMut>)> {
+    let space = state.space;
+    let changed = match space.and_then(|s| state.layouts.get_mut(&s)) {
+        Some(layout) => layout.toggle_zoom(),
+        None => false,
+    };
+    if !changed {
+        return Ok((false, None));
+    }
+    let mut out = BytesMut::new();
+    if let Some(sync) = sync_subs(state, control_seq)? {
+        out.extend_from_slice(&sync);
+    }
+    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+        out.extend_from_slice(&resize);
+    }
+    Ok((true, if out.is_empty() { None } else { Some(out) }))
+}
+
 fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
     let want: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
     if want == state.subs {
@@ -4144,10 +4197,10 @@ mod tests {
         assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(7));
+        assert_eq!(state.menu, Some(10));
         // Keyless rows answer to their first letter.
         assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(8));
+        assert_eq!(state.menu, Some(11));
         // `x` jumps straight to close tab.
         assert!(matches!(menu_key(&mut state, 0, b"x"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(4));
@@ -4180,6 +4233,9 @@ mod tests {
                 "close tab",
                 "split side by side",
                 "split stacked",
+                "zoom pane",
+                "fold idle groups",
+                "toggle agents view",
                 "keybinds",
                 "settings",
                 "reload manifests",
@@ -4238,6 +4294,59 @@ mod tests {
             MenuSend::Nothing
         ));
         assert!(state.message.is_some(), "silent no-op");
+    }
+
+    #[test]
+    fn choosing_zoom_fold_and_view_answers() {
+        // The zoom row only asks: the tree flips and the bytes go out at the
+        // call sites, because they own the sequence numbers.
+        let mut state = bare_state();
+        let mut request = 0;
+        let zoom = MENU.iter().position(|(n, _, _)| *n == "zoom pane").unwrap();
+        assert!(matches!(
+            apply_menu_choice(&mut state, zoom, &mut request),
+            MenuSend::Zoom
+        ));
+        // Fold and view flip locally and send nothing.
+        let fold = MENU
+            .iter()
+            .position(|(n, _, _)| *n == "fold idle groups")
+            .unwrap();
+        assert!(matches!(
+            apply_menu_choice(&mut state, fold, &mut request),
+            MenuSend::Nothing
+        ));
+        let view = MENU
+            .iter()
+            .position(|(n, _, _)| *n == "toggle agents view")
+            .unwrap();
+        let before = state.view;
+        assert!(matches!(
+            apply_menu_choice(&mut state, view, &mut request),
+            MenuSend::Nothing
+        ));
+        assert_ne!(state.view, before, "view toggles");
+    }
+
+    #[test]
+    fn zoom_flip_hides_a_tile_and_unflips_cleanly() {
+        // Two tiles side by side: zooming in hides one and resizes the other.
+        let mut state = tiled_state();
+        let mut control_seq = 0;
+        let mut seqs = std::collections::BTreeMap::new();
+        let (changed, out) = zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
+        assert!(changed, "two tiles zoom");
+        assert!(out.is_some(), "hide and resize go out");
+        assert_eq!(
+            state.layouts.get(&1).unwrap().zoomed,
+            Some(1),
+            "focused tile fills the pane"
+        );
+        // Back out: the hidden tile resubscribes.
+        let (changed, out) = zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
+        assert!(changed, "unzoom answers too");
+        assert!(out.is_some(), "show and resize go out");
+        assert_eq!(state.layouts.get(&1).unwrap().zoomed, None);
     }
 
     #[test]
