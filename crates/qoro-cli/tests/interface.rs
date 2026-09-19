@@ -1671,3 +1671,102 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
         agents_panel(&ui.painted)
     );
 }
+
+/// G12.17: clicking the master column header moves the keyboard to the master
+/// tab on that click, even with an idle daemon, and typing reaches the master
+/// there rather than staying in the terminal on the left.
+///
+/// The header click defers through the pending focus, which used to drain only
+/// on the daemon's next message. An idle daemon says nothing for minutes, so
+/// the click sat unapplied: typing stayed left, and when traffic finally came
+/// the focus yanked across mid-typing. The drain now also runs at the end of
+/// every keystroke batch.
+#[test]
+fn g12_17_a_click_on_the_master_header_moves_typing_to_the_master() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.create_terminal("");
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second terminal never appeared: {:?}",
+        ui.tab_bar()
+    );
+
+    // Pin tab 1 as master through the menu, then move away to tab 2.
+    let first = ui
+        .tab_column(1)
+        .unwrap_or_else(|| panic!("terminal 1 has no tab: {:?}", ui.tab_bar()));
+    ui.click(first, qoro_tui::screen::TABS as u16);
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(10)),
+        "a click on the first tab did not move to it: {:?}",
+        ui.tab_bar()
+    );
+    ui.command(b'm');
+    assert!(
+        ui.wait_for("pin as master", Duration::from_secs(10))
+            .is_some(),
+        "the menu never opened"
+    );
+    ui.type_in(b"E");
+    std::thread::sleep(Duration::from_millis(300));
+    ui.type_in(b"\r");
+    assert!(
+        ui.wait_for("needs you", Duration::from_secs(10)).is_some(),
+        "the master column never appeared"
+    );
+    let second = ui
+        .tab_column(2)
+        .unwrap_or_else(|| panic!("terminal 2 has no tab: {:?}", ui.tab_bar()));
+    ui.click(second, qoro_tui::screen::TABS as u16);
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(10)),
+        "a click on the second tab did not move to it: {:?}",
+        ui.tab_bar()
+    );
+
+    // Click the master column header (top row, far right): the keyboard must
+    // jump back to the master tab.
+    assert!(
+        ui.saw("pinned as master"),
+        "the menu did not pin tab 1 as master"
+    );
+    ui.click(COLS - 5, 1);
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(10)),
+        "clicking the master header did not jump to the master tab: {:?}",
+        ui.tab_bar()
+    );
+
+    // Typing now must reach the master, and only the master.
+    ui.type_in(b"echo MARK_IN_MASTER_9\n");
+    assert!(
+        ui.wait_for("MARK_IN_MASTER_9", Duration::from_secs(10))
+            .is_some(),
+        "typing never reached the master tab"
+    );
+    ui.click(second, qoro_tui::screen::TABS as u16);
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(10)),
+        "could not move back to the second tab"
+    );
+    // Let a frame of tab 2 paint, then read the pane cells only: the master
+    // column viewport may legitimately show the marker too.
+    std::thread::sleep(Duration::from_millis(800));
+    let left = qoro_tui::screen::left(COLS);
+    let (pane_cols, _) =
+        qoro_tui::screen::pane_size_for(COLS, ROWS, false, qoro_tui::master::MASTER_WIDTH + 1);
+    for screen_row in 2..=10u16 {
+        if let Some(line) = ui.row(screen_row as usize) {
+            let pane: String = line
+                .chars()
+                .skip(left + 1)
+                .take(pane_cols as usize)
+                .collect();
+            assert!(
+                !pane.contains("MARK_IN_MASTER_9"),
+                "typing reached the left terminal too (row {screen_row}): {pane:?}"
+            );
+        }
+    }
+}

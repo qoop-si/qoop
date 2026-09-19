@@ -2433,6 +2433,18 @@ async fn drive(
                             }
                         }
                     }
+                    // A deferred focus (the master header click, or a recovery
+                    // after a close) applies on this keystroke, not on the
+                    // daemon's next word: an idle daemon says nothing for
+                    // minutes, and until then the keyboard sits in the wrong
+                    // terminal while the screen already shows the new one.
+                    if let Some(next) = state.pending_focus.take()
+                        && let Some(bytes) =
+                            focus(&mut state, next, &mut control_seq, &mut seqs)?
+                    {
+                        wr.write_all(&bytes).await?;
+                        dirty = true;
+                    }
                     }
                 }
                 n = rd.read(&mut read) => {
