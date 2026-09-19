@@ -82,11 +82,19 @@ impl Palette {
 
     /// The rows matching the query, most urgent first.
     ///
-    /// Empty query is the whole palette: needs-you, running, finished, idle
-    /// (shells included, they are tabs somebody opened), every space, then the
-    /// two things the interface can start. A query keeps the same order and
-    /// drops what does not contain it.
-    pub fn items(&self, rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Vec<Entry> {
+    /// Empty query is the whole palette: needs-you, new (finished while
+    /// away), running, finished, idle (shells included, they are tabs
+    /// somebody opened), every space, then the two things the interface can
+    /// start. A query keeps the same order and drops what does not contain
+    /// it. Same order as the sidebar priority view: news above running.
+    pub fn items(
+        &self,
+        rows: &[AgentRow],
+        spaces: &[WorkspaceRow],
+        focused: u32,
+        seen: &crate::sidebar::Seen,
+        unseen: &crate::sidebar::Unseen,
+    ) -> Vec<Entry> {
         let mut out = Vec::new();
         let listed: Vec<&AgentRow> = rows.iter().collect();
         for agent in listed
@@ -97,18 +105,27 @@ impl Palette {
         }
         for agent in listed
             .iter()
+            .filter(|a| crate::sidebar::is_new(a, focused, seen, unseen))
+        {
+            out.push(terminal_entry(agent, spaces, "new"));
+        }
+        for agent in listed
+            .iter()
             .filter(|a| matches!(a.state.as_str(), "working" | "starting"))
         {
             out.push(terminal_entry(agent, spaces, "running"));
         }
-        for agent in listed.iter().filter(|a| a.state == "done") {
+        for agent in listed
+            .iter()
+            .filter(|a| a.state == "done" && !crate::sidebar::is_new(a, focused, seen, unseen))
+        {
             out.push(terminal_entry(agent, spaces, "finished"));
         }
         for agent in listed.iter().filter(|a| {
             !matches!(
                 a.state.as_str(),
                 "blocked" | "failed" | "working" | "starting" | "done"
-            )
+            ) && !crate::sidebar::is_new(a, focused, seen, unseen)
         }) {
             out.push(terminal_entry(agent, spaces, "idle"));
         }
@@ -155,8 +172,15 @@ impl Palette {
     }
 
     /// The selected row, if the filter left any.
-    pub fn picked(&self, rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Option<Item> {
-        self.items(rows, spaces)
+    pub fn picked(
+        &self,
+        rows: &[AgentRow],
+        spaces: &[WorkspaceRow],
+        focused: u32,
+        seen: &crate::sidebar::Seen,
+        unseen: &crate::sidebar::Unseen,
+    ) -> Option<Item> {
+        self.items(rows, spaces, focused, seen, unseen)
             .get(self.selected)
             .map(|e| e.item.clone())
     }
@@ -259,11 +283,20 @@ mod tests {
     #[test]
     fn an_empty_query_lists_what_needs_you_first() {
         let (rows, spaces) = sample();
-        let entries = Palette::open().items(&rows, &spaces);
+        let entries = Palette::open().items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
         assert_eq!(entries[0].section, "needs you");
         assert_eq!(entries[0].item, Item::Terminal(1));
         assert_eq!(entries[1].item, Item::Terminal(2));
-        assert_eq!(entries[2].section, "running");
+        // A daemon done nobody focused is news, above running like the sidebar.
+        assert_eq!(entries[2].section, "new");
+        assert_eq!(entries[2].item, Item::Terminal(5));
+        assert_eq!(entries[3].section, "running");
         // Shells are tabs too, so the palette finds them under idle.
         assert!(entries.iter().any(|e| e.item == Item::Terminal(4)));
         // Spaces and both actions close the list.
@@ -279,7 +312,13 @@ mod tests {
         for c in "webshop".chars() {
             palette.push(c);
         }
-        let entries = palette.items(&rows, &spaces);
+        let entries = palette.items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
         assert!(!entries.is_empty());
         assert!(
             entries
@@ -299,7 +338,13 @@ mod tests {
         for c in "BLOCKED".chars() {
             palette.push(c);
         }
-        let entries = palette.items(&rows, &spaces);
+        let entries = palette.items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].item, Item::Terminal(1));
     }
@@ -308,7 +353,15 @@ mod tests {
     fn typing_resets_the_selection_and_movement_clamps() {
         let (rows, spaces) = sample();
         let mut palette = Palette::open();
-        let count = palette.items(&rows, &spaces).len();
+        let count = palette
+            .items(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new(),
+            )
+            .len();
         palette.move_by(99, count);
         assert_eq!(palette.selected, count - 1);
         palette.move_by(-99, count);
@@ -335,13 +388,36 @@ mod tests {
         let (rows, spaces) = sample();
         let mut palette = Palette::open();
         assert_eq!(
-            palette.picked(&rows, &spaces),
+            palette.picked(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new()
+            ),
             Some(Item::Terminal(1)),
             "opens on what needs you"
         );
-        let count = palette.items(&rows, &spaces).len();
+        let count = palette
+            .items(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new(),
+            )
+            .len();
         palette.move_by((count - 1) as isize, count);
-        assert_eq!(palette.picked(&rows, &spaces), Some(Item::NewSpace));
+        assert_eq!(
+            palette.picked(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new()
+            ),
+            Some(Item::NewSpace)
+        );
     }
 
     #[test]
@@ -351,14 +427,39 @@ mod tests {
         for c in "zzz-no-such-thing".chars() {
             palette.push(c);
         }
-        assert!(palette.items(&rows, &spaces).is_empty());
-        assert_eq!(palette.picked(&rows, &spaces), None);
+        assert!(
+            palette
+                .items(
+                    &rows,
+                    &spaces,
+                    0,
+                    &crate::sidebar::Seen::new(),
+                    &crate::sidebar::Unseen::new()
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            palette.picked(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new()
+            ),
+            None
+        );
     }
 
     #[test]
     fn an_agent_in_an_unknown_space_still_matches() {
         let rows = vec![agent(9, 77, "codex", "blocked")];
-        let entries = Palette::open().items(&rows, &[]);
+        let entries = Palette::open().items(
+            &rows,
+            &[],
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
         assert!(entries[0].text.contains("77"), "{entries:?}");
     }
 }

@@ -50,6 +50,7 @@ fn main() {
     let behind = qoro_tui::run::Behind::default();
     let message = "static: working says working, unread done says new";
     let seen = sidebar::Seen::new();
+    let unseen = sidebar::Unseen::new();
     let painted = screen::paint(&Frame {
         rows: &rows,
         spaces: &spaces,
@@ -64,6 +65,7 @@ fn main() {
         fold: sidebar::Fold::all_open(),
         view: sidebar::View::Grouped,
         seen: &seen,
+        unseen: &unseen,
         palette: None,
         prompt: None,
         menu: None,

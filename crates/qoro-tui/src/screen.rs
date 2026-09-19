@@ -51,6 +51,8 @@ pub struct Frame<'a> {
     pub view: sidebar::View,
     /// The done rows this client has already looked at.
     pub seen: &'a sidebar::Seen,
+    /// Rows that finished while the keyboard was away.
+    pub unseen: &'a sidebar::Unseen,
     /// The animation step the working spinner is on.
     ///
     /// Advanced by the run loop while an agent is working, held while none is: a still
@@ -232,7 +234,7 @@ pub fn paint(frame: &Frame) -> String {
         .into_iter()
         .filter(|r| !frame.panes.contains(&r.terminal))
         .collect();
-    for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize) {
+    for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize, frame.unseen) {
         out.push_str(&match style {
             tabs::Ink::Focused => theme::tab_on(),
             tabs::Ink::Other => theme::tab_off(),
@@ -264,6 +266,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.tick,
             frame.view,
             frame.seen,
+            frame.unseen,
         )
     } else {
         Vec::new()
@@ -437,8 +440,20 @@ pub fn paint(frame: &Frame) -> String {
     out.push_str(&at(frame.lines as usize - 1, 1));
     // A transient message wins, then the single next thing to do, then where the keyboard
     // is. Never empty: a blank row is a row that has to be explained.
-    let (notice, notice_role) = match (frame.message, triage(frame.rows, frame.spaces)) {
-        (Some(message), _) => (message.to_string(), waiting(frame.rows)),
+    let (notice, notice_role) = match (
+        frame.message,
+        triage(
+            frame.rows,
+            frame.spaces,
+            frame.focused,
+            frame.seen,
+            frame.unseen,
+        ),
+    ) {
+        (Some(message), _) => (
+            message.to_string(),
+            waiting(frame.rows, frame.focused, frame.seen, frame.unseen),
+        ),
         // Being somewhere other than the bottom wins over what needs a person, because it
         // is the one thing on this row that explains what the pane is showing: a screen
         // that is not moving while an agent works looks broken until it says why.
@@ -463,7 +478,7 @@ pub fn paint(frame: &Frame) -> String {
             } else {
                 next
             },
-            waiting(frame.rows),
+            waiting(frame.rows, frame.focused, frame.seen, frame.unseen),
         ),
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
@@ -529,7 +544,16 @@ pub fn paint(frame: &Frame) -> String {
         // At the end of the query, inside the box, wherever the box ended up.
         let w = palette_width(frame.cols);
         let left = (frame.cols as usize).saturating_sub(w) / 2;
-        let rows = palette.items(frame.rows, frame.spaces).len().max(1);
+        let rows = palette
+            .items(
+                frame.rows,
+                frame.spaces,
+                frame.focused,
+                frame.seen,
+                frame.unseen,
+            )
+            .len()
+            .max(1);
         let row = palette_query_row(frame.lines, rows + count_headers(frame, palette));
         // Past the border and the prompt marker, at the end of what has been typed.
         let col = (left + 4 + width::width(&palette.query)).min(left + w.saturating_sub(2));
@@ -570,23 +594,39 @@ pub fn paint(frame: &Frame) -> String {
 
 /// The single next thing to do, when something is waiting.
 ///
-/// Blocked first, then failed: the first of either in daemon order. `None` when
-/// nothing waits, and then the status line carries the key list instead, which is
-/// how a person finds out they are done.
-fn triage(rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Option<String> {
+/// Blocked first, then failed, then finished-while-away: the first of each in
+/// daemon order. `None` when nothing waits, and then the status line carries
+/// the key list instead, which is how a person finds out they are done.
+fn triage(
+    rows: &[AgentRow],
+    spaces: &[WorkspaceRow],
+    focused: u32,
+    seen: &sidebar::Seen,
+    unseen: &sidebar::Unseen,
+) -> Option<String> {
     let row = rows
         .iter()
         .find(|r| r.state == "blocked")
-        .or_else(|| rows.iter().find(|r| r.state == "failed"))?;
+        .or_else(|| rows.iter().find(|r| r.state == "failed"))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| sidebar::is_new(r, focused, seen, unseen))
+        })?;
     let space = spaces
         .iter()
         .find(|s| s.id == row.workspace)
         .map(|s| s.name.clone())
         .unwrap_or_else(|| row.workspace.to_string());
+    // A derived idle-after-work is news, not calm: name it finished work
+    // rather than repeating the daemon's idle word.
+    let word = if sidebar::is_new(row, focused, seen, unseen) {
+        "done"
+    } else {
+        row.state.as_str()
+    };
     Some(format!(
-        "next: {space}/{} is {}  ^a space",
+        "next: {space}/{} is {word}  ^a space",
         palette_label(row),
-        row.state
     ))
 }
 
@@ -617,11 +657,26 @@ fn here(frame: &Frame) -> String {
 /// The state of the thing the status line is about to name, when something waits.
 ///
 /// The same order [`triage`] picks in, so the colour and the words are about one terminal.
-fn waiting(rows: &[AgentRow]) -> Option<theme::Role> {
+fn waiting(
+    rows: &[AgentRow],
+    focused: u32,
+    seen: &sidebar::Seen,
+    unseen: &sidebar::Unseen,
+) -> Option<theme::Role> {
     rows.iter()
         .find(|r| r.state == "blocked")
         .or_else(|| rows.iter().find(|r| r.state == "failed"))
-        .map(|r| theme::of(&r.state))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| sidebar::is_new(r, focused, seen, unseen))
+        })
+        .map(|r| {
+            if sidebar::is_new(r, focused, seen, unseen) {
+                theme::of("done")
+            } else {
+                theme::of(&r.state)
+            }
+        })
 }
 
 /// What a terminal is called outside the tab bar: its program's last segment, the
@@ -661,7 +716,13 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     if cols < 10 || lines < TABS + STATUS + 2 {
         return;
     }
-    let entries = palette.items(frame.rows, frame.spaces);
+    let entries = palette.items(
+        frame.rows,
+        frame.spaces,
+        frame.focused,
+        frame.seen,
+        frame.unseen,
+    );
     let w = palette_width(frame.cols);
     let left = cols.saturating_sub(w) / 2;
     // What each row is, so the painter can put the same colours on it that the column puts
@@ -815,7 +876,13 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
 
 /// How many section headers the palette will draw, which take rows like anything else.
 fn count_headers(frame: &Frame, palette: &Palette) -> usize {
-    let entries = palette.items(frame.rows, frame.spaces);
+    let entries = palette.items(
+        frame.rows,
+        frame.spaces,
+        frame.focused,
+        frame.seen,
+        frame.unseen,
+    );
     let mut sections = 0;
     let mut section = "";
     for entry in &entries {
@@ -1484,6 +1551,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1537,6 +1605,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1592,6 +1661,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1639,6 +1709,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1686,6 +1757,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1731,6 +1803,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1784,6 +1857,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1834,6 +1908,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1898,6 +1973,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1962,6 +2038,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2015,6 +2092,7 @@ mod tests {
                 tick: 0,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -2066,6 +2144,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2112,6 +2191,7 @@ mod tests {
                 tick: 0,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -2160,6 +2240,7 @@ mod tests {
                 tick: 0,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -2226,6 +2307,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2285,6 +2367,7 @@ mod tests {
                 tick,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -2355,6 +2438,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2443,6 +2527,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2505,6 +2590,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2552,6 +2638,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2596,6 +2683,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2641,6 +2729,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2670,7 +2759,15 @@ mod tests {
         );
         let w = palette_width(80);
         let left = (80usize.saturating_sub(w)) / 2;
-        let rows = palette.items(&rows, &spaces()).len();
+        let rows = palette
+            .items(
+                &rows,
+                &spaces(),
+                0,
+                &sidebar::Seen::new(),
+                &sidebar::Unseen::new(),
+            )
+            .len();
         let top = palette_query_row(24, rows + 4);
         assert!(top > 1, "the box is pinned to the top: {shown:?}");
         // The cursor sits at the end of the query, inside the box, where typing goes.
@@ -2715,6 +2812,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2794,6 +2892,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2871,6 +2970,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &seen,
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2919,6 +3019,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2982,6 +3083,7 @@ mod tests {
                 tick: 0,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -3034,6 +3136,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             // Pinned to the second to last row written, so the pane shows the last two
             // rows that went past and then the screen from its top.
             anchor: 98,
@@ -3095,6 +3198,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -3188,6 +3292,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
             master_snapshot: None,
@@ -3228,6 +3333,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
             master_snapshot: None,
@@ -3269,6 +3375,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
             master_snapshot: None,
@@ -3455,6 +3562,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -3558,6 +3666,7 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),

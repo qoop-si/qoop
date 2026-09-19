@@ -259,6 +259,15 @@ impl View {
 /// read receipt. Pruned by the caller when rows arrive; this module only reads.
 pub type Seen = std::collections::BTreeSet<(u32, u64)>;
 
+/// Rows that finished while the keyboard was away, as (terminal, generation).
+///
+/// For one event only: `done` is daemon-reported, but a screen
+/// agent that goes working to idle while unfocused reads as plain `idle`
+/// without this. The daemon never produces it, the client derives it from the
+/// transition, and it stays client-local like `Seen`. Colours and headers
+/// stay qoro's own; only the distinction is shared.
+pub type Unseen = std::collections::BTreeSet<(u32, u64)>;
+
 /// The generation that identifies this row's agent, or zero when the daemon
 /// predates generations.
 pub fn gen_of(agent: &AgentRow) -> u64 {
@@ -273,14 +282,40 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
         && !seen.contains(&(agent.terminal, gen_of(agent)))
 }
 
+/// Whether this row is news, daemon or derived.
+///
+/// A daemon `done` nobody looked at, or an idle or done row that finished
+/// while the keyboard was away. The focused row is never new: standing on it
+/// is reading it. Same sage colour as `done`, same `new` word, no new theme.
+pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
+    if agent.terminal == focused {
+        return false;
+    }
+    if is_unread(agent, focused, seen) {
+        return true;
+    }
+    matches!(agent.state.as_str(), "idle" | "done")
+        && unseen.contains(&(agent.terminal, gen_of(agent)))
+}
+
+/// Whether the tab bar should mark this terminal as freshly finished.
+///
+/// Tabs carry no `Seen`: a daemon `done` and a derived idle-after-work both
+/// read as the done glyph until focused. Same glyph as `done`, no new colour.
+pub fn tab_is_new(agent: &AgentRow, focused: u32, unseen: &Unseen) -> bool {
+    agent.terminal != focused
+        && matches!(agent.state.as_str(), "idle" | "done")
+        && unseen.contains(&(agent.terminal, gen_of(agent)))
+}
+
 /// Where a row sorts in the priority view: what wants a person first, then
 /// what is alive, then what is settled. Daemon order breaks ties, so the view
 /// is a stable sort of the grouped one rather than a second list.
-fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen) -> u8 {
+fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> u8 {
     match agent.state.as_str() {
         "blocked" => 0,
         "failed" => 1,
-        _ if is_unread(agent, focused, seen) => 2,
+        _ if is_new(agent, focused, seen, unseen) => 2,
         "working" => 3,
         "starting" => 4,
         "done" => 5,
@@ -295,7 +330,7 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen) -> u8 {
 /// right, an unread done says `new`, and no tick ever repaints. This is what
 /// keeps the loop's founding rule (no wake without an arrival) and stops the
 /// full-screen flicker the spinner's eight frames a second caused.
-pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen) -> bool {
+pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen, _unseen: &Unseen) -> bool {
     false
 }
 
@@ -367,6 +402,7 @@ pub fn render_folded(
     tick: u64,
     view: View,
     seen: &Seen,
+    unseen: &Unseen,
 ) -> Vec<Line> {
     rows_folded(
         spaces,
@@ -378,6 +414,7 @@ pub fn render_folded(
         tick,
         view,
         seen,
+        unseen,
     )
     .into_iter()
     .map(|(line, _)| line)
@@ -418,6 +455,7 @@ pub fn hit_folded(
     row: usize,
     view: View,
     seen: &Seen,
+    unseen: &Unseen,
 ) -> Option<Hit> {
     rows_folded(
         spaces,
@@ -430,6 +468,7 @@ pub fn hit_folded(
         0,
         view,
         seen,
+        unseen,
     )
     .into_iter()
     .nth(row)
@@ -606,7 +645,15 @@ fn agents_panel(
         // The unfolded panel does not animate: it is the test-facing surface,
         // and frame zero is the spinner's opening frame. The live folded panel
         // below spends the real tick.
-        push_agent_lines(&mut content, spaces, agent, focused, 0, &Seen::new());
+        push_agent_lines(
+            &mut content,
+            spaces,
+            agent,
+            focused,
+            0,
+            &Seen::new(),
+            &Unseen::new(),
+        );
     }
     let focus_row = content
         .iter()
@@ -648,6 +695,7 @@ fn push_agent_lines(
     focused: u32,
     _tick: u64,
     seen: &Seen,
+    unseen: &Unseen,
 ) {
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
@@ -660,18 +708,24 @@ fn push_agent_lines(
     let session = session_name(agent);
     let head = format!(" {session}");
     let head_least = AGENT_NAME_AT + MIN_NAME;
-    let unread = is_unread(agent, focused, seen);
-    let word = if unread {
+    let fresh = is_new(agent, focused, seen, unseen);
+    let word = if fresh {
         NEW_STATE
     } else {
         shown_state(&agent.state)
     };
     let state = clip(word, WIDTH.saturating_sub(head_least + 1));
     let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
+    // A derived idle-after-work keeps the done sage: it is news, not calm.
+    let colour = if fresh {
+        colour_for("done")
+    } else {
+        colour_for(&agent.state)
+    };
     out.push((
         Line {
             text: format!("{} {state}", fit_to(&head, room)),
-            colour: colour_for(&agent.state),
+            colour,
             // The space lives on the second row now, so the first row carries
             // no space accent: the keyboard's row is the raised background.
             accent: None,
@@ -782,6 +836,7 @@ pub(crate) fn rows_folded(
     tick: u64,
     view: View,
     seen: &Seen,
+    unseen: &Unseen,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
@@ -796,6 +851,7 @@ pub(crate) fn rows_folded(
         tick,
         view,
         seen,
+        unseen,
     );
     // The mark that folds the column away, at its foot, where the eye lands last.
     if let Some(last) = out.last_mut() {
@@ -967,12 +1023,21 @@ fn rows_open(
     tick: u64,
     view: View,
     seen: &Seen,
+    unseen: &Unseen,
 ) -> Vec<(Line, Option<Hit>)> {
     // What the lower panel wants, asked before the column is divided. The division is a
     // place and not a consequence of how many spaces there happen to be, but a panel that
     // held its half while the list below it scrolled would be a place at the wrong price.
-    let (content, shown, total) =
-        agents_content(spaces, agents, focused_terminal, fold, tick, view, seen);
+    let (content, shown, total) = agents_content(
+        spaces,
+        agents,
+        focused_terminal,
+        fold,
+        tick,
+        view,
+        seen,
+        unseen,
+    );
     let split = spaces_rows(spaces.len(), height, content.len() + 1);
     let mut out = spaces_panel(spaces, focused_space, split);
     let rest = height - split;
@@ -1004,6 +1069,7 @@ fn rows_open(
 /// a closed group is one line carrying its count, and a click on it opens it.
 /// The group holding the focused terminal is always open: hiding the keyboard's
 /// own row behind a fold would read as a terminal that died.
+#[allow(clippy::too_many_arguments)]
 fn agents_content(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
@@ -1012,6 +1078,7 @@ fn agents_content(
     tick: u64,
     view: View,
     seen: &Seen,
+    unseen: &Unseen,
 ) -> (Vec<(Line, Option<Hit>)>, usize, usize) {
     let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
     if listed.is_empty() {
@@ -1048,10 +1115,10 @@ fn agents_content(
     // person is on top. Folds do not apply: an inbox hides nothing.
     if view == View::Priority {
         let mut ordered: Vec<&AgentRow> = listed.to_vec();
-        ordered.sort_by_key(|a| priority_of(a, focused, seen));
+        ordered.sort_by_key(|a| priority_of(a, focused, seen, unseen));
         let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
         for agent in &ordered {
-            push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+            push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         }
         return (content, ordered.len(), listed.len());
     }
@@ -1086,16 +1153,17 @@ fn agents_content(
             !needs_you(&a.state)
                 && !unobserved(&a.state)
                 && a.state == "done"
-                && !is_unread(a, focused, seen)
+                && !is_new(a, focused, seen, unseen)
                 && open(Group::Finished)
         })
         .copied()
         .collect();
-    // Done rows nobody has looked at yet: always open, under their own header,
-    // so finished-but-unread never hides behind the finished fold.
+    // Rows nobody has looked at yet: always open, under their own header,
+    // so finished-but-unread never hides behind the finished fold. Daemon
+    // `done` and derived idle-after-work share the header and the sage.
     let new_done: Vec<&AgentRow> = listed
         .iter()
-        .filter(|a| a.state == "done" && is_unread(a, focused, seen))
+        .filter(|a| !needs_you(&a.state) && is_new(a, focused, seen, unseen))
         .copied()
         .collect();
     let idle: Vec<&AgentRow> = listed
@@ -1104,6 +1172,7 @@ fn agents_content(
             !needs_you(&a.state)
                 && !unobserved(&a.state)
                 && group_of(&a.state) == Group::Idle
+                && !is_new(a, focused, seen, unseen)
                 && open(Group::Idle)
         })
         .copied()
@@ -1119,18 +1188,18 @@ fn agents_content(
         ));
     }
     for agent in needs {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     for agent in fresh {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     if !new_done.is_empty() {
         content.push(group_header("new", new_done.len(), colour_for("done")));
     }
     for agent in new_done {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     if !running.is_empty() {
@@ -1141,14 +1210,14 @@ fn agents_content(
         ));
     }
     for agent in running {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     if !finished.is_empty() {
         content.push(group_header("finished", finished.len(), colour_for("done")));
     }
     for agent in finished {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     if !idle.is_empty() {
@@ -1162,7 +1231,7 @@ fn agents_content(
         ));
     }
     for agent in idle {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen);
+        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
     for group in [Group::Finished, Group::Idle] {
@@ -1171,7 +1240,7 @@ fn agents_content(
             .filter(|a| {
                 !needs_you(&a.state)
                     && !unobserved(&a.state)
-                    && !is_unread(a, focused, seen)
+                    && !is_new(a, focused, seen, unseen)
                     && group_of(&a.state) == group
                     && !open(group)
             })
@@ -1995,7 +2064,18 @@ mod tests {
         // the unread path gets its own test below.
         let mut seen = Seen::new();
         seen.insert((5, 0));
-        let lines = render_folded(&spaces, &agents, 2, 1, 30, &fold, 0, View::Grouped, &seen);
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            2,
+            1,
+            30,
+            &fold,
+            0,
+            View::Grouped,
+            &seen,
+            &Unseen::new(),
+        );
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
@@ -2051,6 +2131,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         );
         let texts: Vec<String> = folded
             .iter()
@@ -2079,6 +2160,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         );
         // The blocked agent draws two rows under its own header and nothing else:
         // no fold lines for groups with nobody in them, and the plain title.
@@ -2115,6 +2197,7 @@ mod tests {
             0,
             View::Grouped,
             &seen,
+            &Unseen::new(),
         )
         .iter()
         .map(|l| l.text.trim_end().to_string())
@@ -2130,7 +2213,8 @@ mod tests {
                 &fold,
                 row,
                 View::Grouped,
-                &seen
+                &seen,
+                &Unseen::new()
             ),
             Some(Hit::Fold(Group::Idle))
         );
@@ -2146,6 +2230,7 @@ mod tests {
             0,
             View::Grouped,
             &seen,
+            &Unseen::new(),
         )
         .iter()
         .map(|l| l.text.trim_end().to_string())
@@ -2171,6 +2256,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2193,6 +2279,7 @@ mod tests {
                     row,
                     View::Grouped,
                     &Seen::new(),
+                    &Unseen::new(),
                 )
             })
             .collect();
@@ -2213,6 +2300,7 @@ mod tests {
                 0,
                 View::Grouped,
                 &Seen::new(),
+                &Unseen::new(),
             );
             assert_eq!(lines.len(), 20);
             for (row, line) in lines.iter().enumerate() {
@@ -2226,6 +2314,7 @@ mod tests {
                     row,
                     View::Grouped,
                     &Seen::new(),
+                    &Unseen::new(),
                 );
                 let text = line.text.trim_end().to_string();
                 match got {
@@ -2251,7 +2340,8 @@ mod tests {
                     &fold,
                     20,
                     View::Grouped,
-                    &Seen::new()
+                    &Seen::new(),
+                    &Unseen::new()
                 ),
                 None
             );
@@ -2287,6 +2377,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2315,6 +2406,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         )
         .iter()
         .map(|l| l.text.trim_end().to_string())
@@ -2414,6 +2506,26 @@ mod tests {
         assert!(is_unread(done, 1, &old));
     }
 
+    /// An idle row that finished while the keyboard was away is news too, not
+    /// calm: same `new` word and sage as a daemon done, until focused.
+    #[test]
+    fn new_is_an_idle_row_that_finished_while_away() {
+        let (spaces, agents) = many_agents();
+        let _ = spaces;
+        let idle = agents.iter().find(|a| a.terminal == 7).unwrap();
+        assert_eq!(idle.state, "idle");
+        let seen = Seen::new();
+        let mut unseen = Unseen::new();
+        unseen.insert((7, 0));
+        assert!(is_new(idle, 1, &seen, &unseen));
+        assert!(!is_new(idle, 7, &seen, &unseen));
+        assert!(tab_is_new(idle, 1, &unseen));
+        assert!(!tab_is_new(idle, 7, &unseen));
+        // A plain idle with no finish behind it stays calm.
+        let calm = agents.iter().find(|a| a.terminal == 8).unwrap();
+        assert!(!is_new(calm, 1, &seen, &Unseen::new()));
+    }
+
     /// An unread done never hides behind the finished fold: it draws under its
     /// own open `new` header, ahead of running.
     #[test]
@@ -2429,6 +2541,7 @@ mod tests {
             0,
             View::Grouped,
             &Seen::new(),
+            &Unseen::new(),
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2463,6 +2576,7 @@ mod tests {
             0,
             View::Priority,
             &Seen::new(),
+            &Unseen::new(),
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2511,6 +2625,7 @@ mod tests {
                 tick,
                 View::Grouped,
                 &Seen::new(),
+                &Unseen::new(),
             )
         };
         let zero: Vec<String> = at(0).iter().map(|(l, _)| l.text.clone()).collect();

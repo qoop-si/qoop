@@ -236,6 +236,13 @@ struct State {
     /// mark it read anywhere else. A focused done row counts as read without
     /// an entry, so this only holds rows finished while the keyboard was away.
     seen_done: sidebar::Seen,
+    /// Rows that finished while the keyboard was away, as (terminal, generation).
+    ///
+    /// For one event only: a screen agent going working to idle
+    /// while unfocused is the same news as a daemon `done`. Derived here from
+    /// the transition, cleared on focus, pruned with the rows. Same sage,
+    /// same `new` word, no new theme.
+    unseen_finished: sidebar::Unseen,
     /// Unused animation step, kept so the frame shape stays stable.
     ///
     /// The panel is static and the tick never advances it; it stays zero so a
@@ -385,6 +392,7 @@ impl State {
             fold: self.fold,
             view: self.view,
             seen: &self.seen_done,
+            unseen: &self.unseen_finished,
             tick: self.tick,
             palette: self.palette.as_ref(),
             prompt: self.prompt.as_ref(),
@@ -577,6 +585,7 @@ impl State {
                 self.focused,
                 pane_cols as usize,
                 (col as usize).saturating_sub(left + 1),
+                &self.unseen_finished,
             ) {
                 Some(tabs::Hit::Terminal(terminal)) => Some(Clicked::Terminal(terminal)),
                 Some(tabs::Hit::New) => Some(Clicked::NewTerminal),
@@ -608,6 +617,7 @@ impl State {
                 within,
                 self.view,
                 &self.seen_done,
+                &self.unseen_finished,
             )
         };
         // The row between the panels answers by which half was clicked, so the column has
@@ -624,6 +634,7 @@ impl State {
                 0,
                 self.view,
                 &self.seen_done,
+                &self.unseen_finished,
             );
             let is_footer = rows
                 .get(within)
@@ -1038,6 +1049,7 @@ async fn drive(
         fold: sidebar::Fold::default(),
         view: sidebar::View::default(),
         seen_done: sidebar::Seen::new(),
+        unseen_finished: sidebar::Unseen::new(),
         tick: 0,
         palette: None,
         palette_pending: Vec::new(),
@@ -2257,12 +2269,28 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
             0x1b => match buf.get(i + 1) {
                 Some(b'[') => match buf.get(i + 2) {
                     Some(b'A') => {
-                        let count = palette.items(&state.rows, &state.spaces).len();
+                        let count = palette
+                            .items(
+                                &state.rows,
+                                &state.spaces,
+                                state.focused,
+                                &state.seen_done,
+                                &state.unseen_finished,
+                            )
+                            .len();
                         palette.move_by(-1, count);
                         i += 3;
                     }
                     Some(b'B') => {
-                        let count = palette.items(&state.rows, &state.spaces).len();
+                        let count = palette
+                            .items(
+                                &state.rows,
+                                &state.spaces,
+                                state.focused,
+                                &state.seen_done,
+                                &state.unseen_finished,
+                            )
+                            .len();
                         palette.move_by(1, count);
                         i += 3;
                     }
@@ -2292,7 +2320,13 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
                 }
             },
             b'\r' | b'\n' => {
-                if let Some(item) = palette.picked(&state.rows, &state.spaces) {
+                if let Some(item) = palette.picked(
+                    &state.rows,
+                    &state.spaces,
+                    state.focused,
+                    &state.seen_done,
+                    &state.unseen_finished,
+                ) {
                     close(state);
                     return PaletteOutcome::Confirm(item);
                 }
@@ -2557,12 +2591,15 @@ fn focus(
     state.behind = Behind::default();
     state.selection = None;
     state.focused = to;
-    // Standing on a done row is reading it: it stops saying `new` the moment
-    // the keyboard arrives, with no extra keystroke asked.
+    // Standing on a finished row is reading it: it stops saying `new` the
+    // moment the keyboard arrives, with no extra keystroke asked.
     if let Some(row) = state.rows.iter().find(|r| r.terminal == to)
-        && row.state == "done"
+        && matches!(row.state.as_str(), "idle" | "done")
     {
-        state.seen_done.insert((to, sidebar::gen_of(row)));
+        state.unseen_finished.remove(&(to, sidebar::gen_of(row)));
+        if row.state == "done" {
+            state.seen_done.insert((to, sidebar::gen_of(row)));
+        }
     }
     // Dropped from the onlookers: a snapshot kept past its unsubscription is
     // a screen that can never update again.
@@ -2811,6 +2848,35 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     state.ring = true;
                     state.message = Some(format!("terminal {} is {}", row.terminal, row.state));
                 }
+                // A screen agent that worked and now sits idle while the
+                // keyboard is elsewhere finished without ever reporting done.
+                // Same news as a daemon done, same bell, same `new` row.
+                let was_working =
+                    before.is_some_and(|b| matches!(b.as_str(), "working" | "starting"));
+                if was_working
+                    && matches!(row.state.as_str(), "idle" | "done")
+                    && row.terminal != state.focused
+                {
+                    state
+                        .unseen_finished
+                        .insert((row.terminal, sidebar::gen_of(row)));
+                    // Idle has no daemon done word to carry the news, so ring
+                    // here the way done does above.
+                    if row.state == "idle" {
+                        state.ring = true;
+                        state.message = Some(format!("terminal {} finished", row.terminal));
+                    }
+                }
+                // Back to work, or under the keyboard: no longer news.
+                if matches!(
+                    row.state.as_str(),
+                    "working" | "starting" | "blocked" | "failed"
+                ) || row.terminal == state.focused
+                {
+                    state
+                        .unseen_finished
+                        .remove(&(row.terminal, sidebar::gen_of(row)));
+                }
             }
             state.was = agents
                 .iter()
@@ -2818,13 +2884,21 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .collect();
             state.rows = agents;
             // The read receipts follow the rows: entries for terminals that are
-            // gone or no longer done leave, and a done row under the keyboard
-            // counts as read without waiting for a focus change to say so.
+            // gone or no longer finished leave, and a finished row under the
+            // keyboard counts as read without waiting for a focus change.
             state.seen_done.retain(|(terminal, generation)| {
                 state.rows.iter().any(|r| {
                     r.terminal == *terminal
                         && sidebar::gen_of(r) == *generation
                         && r.state == "done"
+                })
+            });
+            state.unseen_finished.retain(|(terminal, generation)| {
+                state.rows.iter().any(|r| {
+                    r.terminal == *terminal
+                        && sidebar::gen_of(r) == *generation
+                        && matches!(r.state.as_str(), "idle" | "done")
+                        && *terminal != state.focused
                 })
             });
             if let Some(row) = state
@@ -2833,6 +2907,13 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .find(|r| r.terminal == state.focused && r.state == "done")
             {
                 state.seen_done.insert((row.terminal, sidebar::gen_of(row)));
+            }
+            if let Some(row) = state.rows.iter().find(|r| {
+                r.terminal == state.focused && matches!(r.state.as_str(), "idle" | "done")
+            }) {
+                state
+                    .unseen_finished
+                    .remove(&(row.terminal, sidebar::gen_of(row)));
             }
             // Heal the bootstrap gap: the very first answers can arrive in any
             // order, and a focus without a tree paints the legacy single pane
@@ -2995,13 +3076,19 @@ mod tests {
             assert!(!sidebar::wants_tick(
                 &[agent(1, 1, "claude", state)],
                 0,
-                &seen
+                &seen,
+                &sidebar::Unseen::new()
             ));
         }
-        assert!(!sidebar::wants_tick(&[], 0, &seen));
+        assert!(!sidebar::wants_tick(&[], 0, &seen, &sidebar::Unseen::new()));
         let mut shell = agent(2, 1, "sh", "working");
         shell.agent = false;
-        assert!(!sidebar::wants_tick(&[shell], 0, &seen));
+        assert!(!sidebar::wants_tick(
+            &[shell],
+            0,
+            &seen,
+            &sidebar::Unseen::new()
+        ));
     }
 
     fn state() -> State {
@@ -3032,6 +3119,7 @@ mod tests {
             fold: sidebar::Fold::default(),
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
+            unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
@@ -3265,6 +3353,7 @@ mod tests {
             fold: sidebar::Fold::default(),
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
+            unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             palette: None,
             palette_pending: Vec::new(),
@@ -3322,6 +3411,7 @@ mod tests {
             fold: sidebar::Fold::default(),
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
+            unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             palette: None,
             palette_pending: Vec::new(),
@@ -4126,6 +4216,7 @@ mod tests {
             tick: state.tick,
             view: state.view,
             seen: &state.seen_done,
+            unseen: &state.unseen_finished,
             master,
             master_shown: state.master_shown,
             master_snapshot: None,
