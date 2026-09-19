@@ -74,6 +74,12 @@ qoro stop work          end it: the tabs come back on the next open
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
+Prebuilt macOS arm64 binaries live on GitHub Releases, published from this machine
+with `./scripts/release.sh 0.1.0`: GitHub only hosts the files, nothing is compiled
+there. `qoro update --check` notes what is newest, the sidebar signs itself
+`0.3.0>0.4.0` while something is, `ctrl-a U` says how it installs, and `qoro update`
+installs it once no session is running.
+
 ## What is measured
 
 Numbers, from `cargo run --release -p qoro-bench` and the scale gates, on a twelve core

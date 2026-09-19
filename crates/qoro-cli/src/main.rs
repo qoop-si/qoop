@@ -16,6 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod hooks;
+mod update;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
 use qoro_runtime::daemon::ClientWire;
@@ -70,10 +71,13 @@ fn main() -> std::io::Result<()> {
         Some("send") => run_send(&args),
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
+        Some("agents") => run_agents(&args),
+        Some("master") => run_master(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
+        Some("update") => update::run(&args),
         Some("ls") => run_list_sessions(),
         Some("stop") => run_stop(&args, &session),
         Some("--version" | "-V") => {
@@ -95,11 +99,15 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
+                  \x20 qoro agents [--json]  list every terminal and what it is doing\n\
+                  \x20 qoro master brief  print the default supervisor instructions\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
                  \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
                  \x20                 doing and which conversation it is having\n\
                  \x20 qoro ls         list the sessions and say which are running\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
+                 \x20 qoro update [--check]  fetch the newest release, and install it when\n\
+                 \x20                 nothing is live\n\
                  \x20 qoro --version\n\
                  \n\
                  options:\n\
@@ -1107,6 +1115,113 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         println!("prompted terminal {terminal}");
         Ok(())
     })
+}
+
+/// `qoro agents`: the live index, one row per terminal.
+///
+/// Read only: one `ListAgents` round trip, no subscription, no input. The
+/// text form is one `key=value` row per terminal for a person skimming; the
+/// `--json` form is the same rows as an array for an agent polling. Both
+/// come from the same response, so they cannot disagree.
+fn run_agents(args: &[String]) -> std::io::Result<()> {
+    use qoro_runtime::control::{ControlRequest, ControlResponse};
+
+    let usage = "usage: qoro agents [--json]";
+    let mut json = false;
+    for arg in args.iter().skip(2) {
+        if arg == "--json" {
+            json = true;
+        } else {
+            return Err(std::io::Error::other(format!(
+                "unknown flag {arg}; {usage}"
+            )));
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let socket = paths::socket_path(&dir);
+        let (stream, mut inbuf) = client::connect(&socket, "qoro-agents").await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let mut connection = client::Connection::new();
+        let mut seq = 0u32;
+        let id = format!(
+            "agents-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let agents = match control_roundtrip(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            &ControlRequest::ListAgents { id },
+            Duration::from_secs(10),
+        )
+        .await?
+        .0
+        {
+            ControlResponse::Agents { agents, .. } => agents,
+            ControlResponse::Failed { reason, .. } => {
+                return Err(std::io::Error::other(reason));
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "unexpected answer to the agent listing",
+                ));
+            }
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&agents).map_err(std::io::Error::other)?
+            );
+        } else {
+            for row in &agents {
+                println!("{}", agent_line(row));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `qoro master`: the supervisor account.
+///
+/// v1 has one verb: `brief` prints the default master instructions, the same
+/// text the repository ships, so the person and the panel never disagree
+/// about what the master was told. Spawning or pinning stays by hand: there
+/// is no create-terminal CLI, and adding one to serve setup would put process
+/// spawning on the surface G7 keeps narrow.
+fn run_master(args: &[String]) -> std::io::Result<()> {
+    let usage = "usage: qoro master brief";
+    match args.get(2).map(String::as_str) {
+        Some("brief") => {
+            print!("{}", include_str!("../../../docs/master-brief.md"));
+            Ok(())
+        }
+        _ => Err(std::io::Error::other(usage.to_string())),
+    }
+}
+
+/// One terminal on one line, for a person skimming `qoro agents`.
+///
+/// `key=value` rather than columns, because a chosen name can hold a space
+/// and columns would then stop lining up exactly when they are needed.
+fn agent_line(row: &qoro_runtime::control::AgentRow) -> String {
+    let program = row.program.as_deref().unwrap_or("-");
+    let name = row.name.as_deref().unwrap_or("-");
+    let generation = row
+        .generation
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "term={} state={} program={} name={} workspace={} generation={}",
+        row.terminal, row.state, program, name, row.workspace, generation
+    )
 }
 
 /// Start the daemon if there is not one, and wait for its socket.

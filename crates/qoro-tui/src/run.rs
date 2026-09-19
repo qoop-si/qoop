@@ -18,7 +18,7 @@ use crate::keys::{Action, Keys};
 use crate::layout::{self, Layout};
 use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
-use crate::{sidebar, tabs};
+use crate::{master, sidebar, tabs};
 
 /// What to ask for, given where the person has scrolled to.
 ///
@@ -120,6 +120,23 @@ fn short_copied(text: &str) -> String {
         format!("{}\u{2026}", crate::selection::in_columns(one, 0..39))
     } else {
         one.to_string()
+    }
+}
+
+/// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
+///
+/// Said, not fetched: the interface never touches the network, it only reads the notice
+/// `qoro update --check` left beside the sessions. The install itself runs outside, with
+/// no session live, which is why the answer names detaching first.
+fn update_message() -> String {
+    match qoro_runtime::paths::read_update_notice() {
+        Some(seen) if qoro_runtime::paths::is_newer_version(&seen, env!("CARGO_PKG_VERSION")) => {
+            format!("update {seen} is ready: detach and run `qoro update` with no session running")
+        }
+        _ => format!(
+            "qoro {} is current: `qoro update --check` looks for more",
+            env!("CARGO_PKG_VERSION")
+        ),
     }
 }
 
@@ -258,6 +275,25 @@ struct State {
     /// copied something looks at it to check they got the right thing. The next press in
     /// the pane clears it.
     selection: Option<crate::selection::Selection>,
+    /// The pinned master terminal and the generation it was pinned at, client-local
+    /// like `layouts` and `collapsed`. Set from the menu, cleared when its terminal is
+    /// gone, validated against the freshest rows before every paint.
+    master: Option<(u32, Option<u64>)>,
+    /// Whether the person asked for the master column. The column itself shows only
+    /// when the window holds it; see `master_shown`.
+    master_open: bool,
+    /// Whether the master column is on screen. Kept with one column of hysteresis so a
+    /// sigwinch sitting on the threshold does not flap the column (and its PTY resize)
+    /// every repaint.
+    master_shown: bool,
+    /// The session directory this client is attached to (the socket's own
+    /// directory): where the master's file and the approvals live. Read on
+    /// the index path, never per frame.
+    session_dir: std::path::PathBuf,
+    /// The master's file, when it is fresh. Reloaded on every index arrival;
+    /// stale or broken reads as absent, and the column shows the live index
+    /// alone.
+    master_report: Option<crate::master::Report>,
 }
 
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
@@ -265,9 +301,56 @@ struct State {
 type TileHit = (u32, (usize, usize), (usize, usize));
 
 impl State {
-    fn frame(&self) -> Frame<'_> {
+    /// The pin as the painter sees it: the terminal present in the freshest rows and
+    /// the generation equal.
+    ///
+    /// One helper because the frame and the click path have to agree on what the pin
+    /// names: two copies of this check is how a click lands on a stranger. An
+    /// exec-replaced process is a new generation, not the master, and a dangling id
+    /// renders as unpinned, never as someone else's screen.
+    fn valid_master(&self) -> Option<(u32, Option<u64>)> {
+        self.master.and_then(|(terminal, generation)| {
+            self.rows
+                .iter()
+                .find(|r| r.terminal == terminal)
+                .filter(|r| r.generation == generation)
+                .map(|_| (terminal, generation))
+        })
+    }
+
+    /// Recompute whether the master column is on screen, with one column of hysteresis.
+    ///
+    /// An open column stays while the window holds both columns plus one pane cell; a
+    /// hidden one comes back only past the threshold plus one. Without the extra column
+    /// a sigwinch sitting on the edge flaps the column and reflows the focused child on
+    /// every repaint.
+    fn refresh_master_shown(&mut self) {
+        let left = screen::left_for(self.cols, self.collapsed);
+        let room = (self.cols as usize) > left + master::MASTER_WIDTH + 2;
+        let room_wide = (self.cols as usize) > left + master::MASTER_WIDTH + 3;
+        self.master_shown = self.master_open && if self.master_shown { room } else { room_wide };
+    }
+
+    /// The columns the master column takes right now: what the last frame showed.
+    ///
+    /// Read from `master_shown` rather than recomputed, because the hysteresis lives in
+    /// the frame: every pane measurement between two frames has to agree with the last
+    /// one painted, or clicks land where the paint is not.
+    fn right_now(&self) -> usize {
+        screen::right_for(
+            self.cols,
+            screen::left_for(self.cols, self.collapsed),
+            self.master_shown,
+        )
+    }
+
+    fn frame(&mut self) -> Frame<'_> {
+        let master = self.valid_master();
+        self.refresh_master_shown();
+        let right = self.right_now();
         // The pane area in its own cells, shared by every tile rect.
-        let (pane_cols, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let (pane_cols, pane_rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, right);
         let full = layout::Rect {
             x: 0,
             y: 0,
@@ -318,6 +401,18 @@ impl State {
             rows_back: self.rows_back(),
             behind: &self.behind,
             tiles,
+            master,
+            master_shown: self.master_shown,
+            master_report: self.master_report.as_ref(),
+            master_snapshot: master.and_then(|(terminal, _)| {
+                // The focused terminal's own screen, or another tile's picture: the
+                // same data the unfocused tiles already receive, read only.
+                if terminal == self.focused {
+                    self.snapshot.as_ref()
+                } else {
+                    self.snapshots.get(&terminal)
+                }
+            }),
         }
     }
 
@@ -350,7 +445,8 @@ impl State {
     /// Which visible tile a one based screen position lands in, with tile-local
     /// coordinates. Divider cells answer `None`.
     fn tile_at_screen(&self, row: u16, col: u16) -> Option<TileHit> {
-        let (pane_cols, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let (pane_cols, pane_rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, self.right_now());
         let left = screen::left_for(self.cols, self.collapsed);
         let first_col = left + 1;
         if (col as usize) < first_col || (col as usize) >= first_col + pane_cols as usize {
@@ -389,7 +485,8 @@ impl State {
     /// Derived rather than stored: what is fixed is the row the top of the pane is pinned
     /// to, and how much of the pane that fills changes by itself as the terminal prints.
     fn scrolled_rows(&self) -> usize {
-        let (_, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let (_, pane_rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, self.right_now());
         let Some(anchor) = self.anchor else {
             return 0;
         };
@@ -443,8 +540,28 @@ impl State {
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
-        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed);
+        let right = self.right_now();
+        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed, right);
         let left = screen::left_for(self.cols, self.collapsed);
+        // The master column, when it is on screen. Checked before the tiles, or
+        // right-edge clicks fall through to the wrong tab.
+        if right > 0 && col as usize >= left + 1 + pane_cols as usize {
+            let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+            let column_rows = (self.lines as usize).saturating_sub(screen::STATUS);
+            return match master::hit(
+                &self.rows,
+                &self.spaces,
+                self.valid_master(),
+                self.focused,
+                self.master_report.as_ref(),
+                column_rows,
+                within,
+            ) {
+                Some(master::Hit::Header) => Some(Clicked::Master),
+                Some(master::Hit::Need(terminal)) => Some(Clicked::Terminal(terminal)),
+                Some(master::Hit::Footer) | None => None,
+            };
+        }
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
             if (row as usize) != screen::TABS {
@@ -639,6 +756,7 @@ pub const MENU: &[(&str, &str)] = &[
     ("keybinds", "every key, and what it does"),
     ("settings", "what this daemon is set to"),
     ("reload manifests", "re-read the agent detection overrides"),
+    ("pin as master", "this tab reports to the right column"),
     ("detach", "leave, and keep everything running"),
 ];
 
@@ -793,6 +911,8 @@ enum Clicked {
     Collapse,
     Space(i64),
     Terminal(u32),
+    /// The master column's header: jump to the master tab.
+    Master,
     NewTerminal,
     Fold(sidebar::Group),
 }
@@ -833,16 +953,27 @@ pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Resul
         previous_hook(info);
     }));
 
-    let outcome = drive(stream, leftover, notice).await;
+    let outcome = drive(stream, leftover, notice, session_dir(socket)).await;
 
     drop(guard);
     outcome
+}
+
+/// The directory the socket lives in is the session: its database, its event
+/// log, and now the master's file. A socket with no parent is a path that
+/// cannot exist, and reports from nowhere stay unread.
+fn session_dir(socket: &Path) -> std::path::PathBuf {
+    socket
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 async fn drive(
     stream: tokio::net::UnixStream,
     leftover: BytesMut,
     notice: Option<String>,
+    session_dir: std::path::PathBuf,
 ) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (cols, lines) = client::outer_size();
@@ -882,6 +1013,11 @@ async fn drive(
         selection: None,
         anchor: None,
         behind: Behind::default(),
+        master: None,
+        master_open: false,
+        master_shown: false,
+        session_dir,
+        master_report: None,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -1001,6 +1137,10 @@ async fn drive(
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
+                    // The window moved under the hysteresis: refresh what is shown before
+                    // sizing, or the child reflows against the width the pane no longer
+                    // has.
+                    state.refresh_master_shown();
                     // The focused tile only. A resize is a claim about the window the
                     // person is looking at, and sending it to every terminal would reflow
                     // the ones they are not.
@@ -1088,6 +1228,7 @@ async fn drive(
                                             &mut control_seq,
                                         )?).await?;
                                     }
+                                    "pin as master" => pin_focused_as_master(&mut state),
                                     "detach" => return Ok(()),
                                     _ => {}
                                 }
@@ -1203,6 +1344,10 @@ async fn drive(
                                 }
                             }
                             Action::Detach => return Ok(()),
+                            Action::Update => {
+                                state.message = Some(update_message());
+                                dirty = true;
+                            }
                             Action::Click { row, col, shift } => {
                                 // A tiled pane first. A click on an unfocused tile only
                                 // focuses it: the click itself goes nowhere, so coordinates
@@ -1291,6 +1436,15 @@ async fn drive(
                                             resize_focused_to_tile(&state, &mut seqs)?
                                         {
                                             wr.write_all(&resize).await?;
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Master) => {
+                                        // Through the pending focus, which is the path that
+                                        // subscribes and resizes: assigning it directly left
+                                        // the client unsubscribed and the pane dark.
+                                        if let Some((terminal, _)) = state.valid_master() {
+                                            state.pending_focus = Some(terminal);
                                         }
                                         dirty = true;
                                     }
@@ -1531,6 +1685,35 @@ async fn drive(
                                     wr.write_all(&resize).await?;
                                 }
                                 dirty = true;
+                            }
+                            Action::MasterPanel => {
+                                // Like Collapse above: the toggle, then exactly one resize
+                                // of the focused tile, which alone owns Resize.
+                                toggle_master(&mut state);
+                                if let Some(resize) =
+                                    resize_focused_to_tile(&state, &mut seqs)?
+                                {
+                                    wr.write_all(&resize).await?;
+                                }
+                                dirty = true;
+                            }
+                            Action::MasterApprove => {
+                                // The head of the master's ask list, answered with
+                                // the person's exact verdict and nothing else. A
+                                // file still present is pending; the loop applies
+                                // in seq order and deletes. Gated on the column
+                                // like the key: shut, it keeps its old meaning,
+                                // which is nothing.
+                                if state.master_shown {
+                                    approve_head(&mut state, "approved");
+                                    dirty = true;
+                                }
+                            }
+                            Action::MasterReject => {
+                                if state.master_shown {
+                                    approve_head(&mut state, "rejected");
+                                    dirty = true;
+                                }
                             }
                             Action::RenameSpace => {
                                 if let Some(space) = state.space {
@@ -1865,6 +2048,68 @@ async fn drive(
     outcome
 }
 
+/// Toggle the master column: the ask, the hysteresis refresh, and nothing else.
+///
+/// The resize is the caller's, like Collapse: one call is the whole reflow cost, and the
+/// focused tile alone owns Resize. Refreshing what is shown before sizing matters: the
+/// resize has to be against the width the pane has now, not the one it had.
+fn toggle_master(state: &mut State) {
+    state.master_open = !state.master_open;
+    state.refresh_master_shown();
+}
+
+/// Answer the head of the master's ask list with an exact verdict.
+///
+/// The id comes from the fresh report, never typed, so an approval cannot
+/// name the wrong terminal. No report or an empty ask list says so instead
+/// of filing a verdict for nobody.
+fn approve_head(state: &mut State, verdict: &str) {
+    let Some(head) = state
+        .master_report
+        .as_ref()
+        .and_then(|report| report.needs.first())
+    else {
+        state.message = Some("no pending approvals".to_string());
+        return;
+    };
+    // A file still present is pending: filing again would queue a duplicate
+    // verdict for the same ask, and the loop would apply it twice.
+    if master::is_pending(&state.session_dir, &head.id) {
+        state.message = Some(format!("already pending {}", head.id));
+        return;
+    }
+    match master::write_approval(&state.session_dir, &head.id, verdict) {
+        Ok(_) => state.message = Some(format!("{verdict} {}", head.id)),
+        Err(e) => state.message = Some(format!("approval failed: {e}")),
+    }
+}
+
+/// Pin the focused tab as the master, or unpin it when it already is.
+///
+/// The generation travels with the pin, so an exec-replaced process stops being the
+/// master instead of the pin following a stranger.
+fn pin_focused_as_master(state: &mut State) {
+    if state.focused == 0 {
+        state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
+        return;
+    }
+    if state
+        .master
+        .is_some_and(|(terminal, _)| terminal == state.focused)
+    {
+        state.master = None;
+        return;
+    }
+    match state.rows.iter().find(|r| r.terminal == state.focused) {
+        Some(row) => {
+            state.master = Some((state.focused, row.generation));
+        }
+        None => {
+            state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
+        }
+    }
+}
+
 /// Move the keyboard to another terminal: unsubscribe, subscribe, and size it to the pane,
 /// all in one write.
 ///
@@ -2022,7 +2267,8 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
 ///
 /// The pane area in its own cells, shared by every tile rect.
 fn pane_area(state: &State) -> layout::Rect {
-    let (cols, rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed);
+    let (cols, rows) =
+        screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
     layout::Rect {
         x: 0,
         y: 0,
@@ -2399,6 +2645,19 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             let live: std::collections::BTreeSet<u32> = agents.iter().map(|r| r.terminal).collect();
             state.snapshots.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
+            // The pin follows the terminal, not the number: a master that is gone stops
+            // being the master here, where most deaths actually arrive, and never points
+            // at a stranger.
+            if state
+                .master
+                .is_some_and(|(terminal, _)| !live.contains(&terminal))
+            {
+                state.master = None;
+            }
+            // The master's file, on the index path and nowhere else: a read per
+            // frame would bill the disk for every repaint, and a read here is
+            // already where every state change arrives.
+            state.master_report = master::read_report(&state.session_dir);
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 state.focused = 0;
                 state.snapshot = None;
@@ -2505,6 +2764,11 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // The daemon ended the terminal, which ends its subscription
             // server-side too: pruning the local set without a goodbye write.
             state.subs.remove(&terminal);
+            // And the pin when it was the master: the explicit close path, beside the
+            // index prune above, so neither one can leave a dangling id.
+            if state.master.is_some_and(|(pinned, _)| pinned == terminal) {
+                state.master = None;
+            }
             if terminal == state.focused {
                 state.snapshot = None;
                 // From this space, and through the subscription path, which is why it is a
@@ -2644,6 +2908,11 @@ mod tests {
             snapshots: std::collections::BTreeMap::new(),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
+            master: None,
+            master_open: false,
+            master_shown: false,
+            session_dir: std::path::PathBuf::new(),
+            master_report: None,
         }
     }
 
@@ -2800,7 +3069,7 @@ mod tests {
         let mut state = bare_state();
         state.cols = 80;
         state.lines = 26;
-        let (_, pane_rows) = crate::screen::pane_size_for(state.cols, state.lines, false);
+        let (_, pane_rows) = crate::screen::pane_size_for(state.cols, state.lines, false, 0);
         let pane_rows = pane_rows as u64;
 
         // A hundred rows behind the screen, and the person pins the pane ten back.
@@ -2865,6 +3134,11 @@ mod tests {
             selection: None,
             anchor: None,
             behind: Behind::default(),
+            master: None,
+            master_open: false,
+            master_shown: false,
+            session_dir: std::path::PathBuf::new(),
+            master_report: None,
         }
     }
 
@@ -2915,6 +3189,11 @@ mod tests {
             selection: None,
             anchor: None,
             behind: Behind::default(),
+            master: None,
+            master_open: false,
+            master_shown: false,
+            session_dir: std::path::PathBuf::new(),
+            master_report: None,
         };
         let area = pane_area(&state);
         let mut layout = Layout::single(1);
@@ -3087,5 +3366,463 @@ mod tests {
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
         assert!(!state.layouts.get(&2).unwrap().contains(3));
+    }
+
+    /// Pinning names the focused tab with its generation, and pinning again unpins.
+    #[test]
+    fn pinning_names_the_focused_tab_with_its_generation() {
+        let mut state = bare_state();
+        state.rows = vec![agent(1, 1, "claude", "working")];
+        state.rows[0].generation = Some(7);
+        state.focused = 1;
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, Some((1, Some(7))));
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, None, "pinning again unpins");
+    }
+
+    /// The pin is a terminal and a generation: an exec-replaced process stops being
+    /// the master, and a terminal that is gone is not the master either.
+    #[test]
+    fn an_exec_replaced_master_stops_being_the_master() {
+        let mut state = bare_state();
+        state.rows = vec![agent(1, 1, "claude", "working")];
+        state.rows[0].generation = Some(7);
+        state.master = Some((1, Some(7)));
+        assert_eq!(state.valid_master(), Some((1, Some(7))));
+        state.rows[0].generation = Some(8);
+        assert_eq!(state.valid_master(), None, "the generation moved on");
+        state.rows.clear();
+        assert_eq!(state.valid_master(), None, "the terminal is gone");
+    }
+
+    /// A closed master clears the pin in both close paths.
+    #[test]
+    fn a_closed_master_clears_the_pin_in_both_close_paths() {
+        // The explicit close path.
+        let mut state = bare_state();
+        state.master = Some((2, None));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalClosed {
+                id: "x".to_string(),
+                terminal: 2,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.master, None);
+        // The index prune, where most deaths actually arrive: the index no longer
+        // holds the terminal.
+        let mut state = bare_state();
+        state.master = Some((2, None));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(1, 1, "claude", "working")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.master, None);
+        // A terminal that is still there keeps its pin.
+        let mut state = bare_state();
+        state.master = Some((1, None));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(1, 1, "claude", "working")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.master, Some((1, None)));
+    }
+
+    /// The column keeps one column of hysteresis: staying open is cheaper than coming
+    /// back, so coming back costs one more column than staying.
+    #[test]
+    fn the_master_column_keeps_a_one_column_hysteresis() {
+        let mut state = bare_state();
+        // Unfolded, the left takes 31: room past 71, return past 72.
+        state.cols = 80;
+        state.master_open = true;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        state.cols = 72;
+        state.refresh_master_shown();
+        assert!(state.master_shown, "sitting on the threshold keeps showing");
+        state.cols = 71;
+        state.refresh_master_shown();
+        assert!(!state.master_shown, "past it hides");
+        state.cols = 72;
+        state.refresh_master_shown();
+        assert!(
+            !state.master_shown,
+            "the threshold alone does not bring it back"
+        );
+        state.cols = 73;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        // Shut at the ask, it never shows however wide the window is.
+        state.master_open = false;
+        state.refresh_master_shown();
+        assert!(!state.master_shown);
+    }
+
+    /// Toggling asks and shows, and untoggling stops asking.
+    #[test]
+    fn toggling_the_master_column_asks_and_shows() {
+        let mut state = bare_state();
+        state.cols = 120;
+        assert!(!state.master_open);
+        toggle_master(&mut state);
+        assert!(state.master_open);
+        assert!(state.master_shown);
+        toggle_master(&mut state);
+        assert!(!state.master_open);
+        assert!(!state.master_shown);
+    }
+
+    /// The frame shows the pin only when it is live, and the column only when it fits.
+    /// The pin itself survives a narrow window: hiding is not unpinning.
+    #[test]
+    fn the_frame_shows_the_master_only_when_it_is_live_and_fits() {
+        let mut state = bare_state();
+        state.cols = 120;
+        state.lines = 24;
+        state.rows = vec![agent(1, 1, "claude", "working")];
+        state.rows[0].generation = Some(7);
+        state.focused = 1;
+        state.master = Some((1, Some(7)));
+        state.master_open = true;
+        let frame = state.frame();
+        assert_eq!(frame.master, Some((1, Some(7))));
+        assert!(frame.master_shown);
+        state.cols = 60;
+        let frame = state.frame();
+        assert_eq!(frame.master, Some((1, Some(7))), "the pin is kept");
+        assert!(!frame.master_shown);
+        state.rows[0].generation = Some(8);
+        let frame = state.frame();
+        assert_eq!(frame.master, None, "an exec-replaced master is not shown");
+    }
+
+    /// Clicks on the right column reach the master and its needs, never a tile.
+    #[test]
+    fn clicks_on_the_right_column_reach_the_master_not_a_tile() {
+        let mut state = bare_state();
+        state.cols = 120;
+        state.lines = 24;
+        state.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "blocked"),
+        ];
+        state.focused = 1;
+        state.master = Some((1, None));
+        state.master_open = true;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        let left = screen::left_for(120, false);
+        let (pane_cols, _) = screen::pane_size_for(120, 24, false, state.right_now());
+        let master_col = (left + 1 + pane_cols as usize + 5) as u16;
+        // The header jumps to the master tab.
+        assert!(matches!(
+            state.clicked(1, master_col),
+            Some(Clicked::Master)
+        ));
+        // Header, rule, title, then the blocked terminal.
+        assert!(matches!(
+            state.clicked(4, master_col),
+            Some(Clicked::Terminal(2))
+        ));
+        // The footer answers nothing.
+        assert!(state.clicked(6, master_col).is_none());
+        // And the pane beside it still reaches its own tile.
+        assert!(state.tile_at_screen(2, (left + 1) as u16).is_some());
+    }
+
+    fn head_report(id: &str, terminal: u32) -> master::Report {
+        master::Report {
+            master_terminal: 1,
+            at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            needs: vec![master::Need {
+                id: id.to_string(),
+                session: "app".to_string(),
+                terminal,
+                state: "blocked".to_string(),
+                summary: "soru".to_string(),
+                report: String::new(),
+            }],
+            last_report: String::new(),
+            heartbeat_s: 15,
+        }
+    }
+
+    /// Clicks still agree with the paint when the report lengthens the block.
+    #[test]
+    fn clicks_agree_with_the_paint_when_a_report_is_present() {
+        let mut state = bare_state();
+        state.cols = 120;
+        state.lines = 24;
+        state.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "blocked"),
+        ];
+        state.focused = 1;
+        state.master = Some((1, None));
+        state.master_open = true;
+        state.master_report = Some(head_report("w1", 2));
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        let left = screen::left_for(120, false);
+        let (pane_cols, _) = screen::pane_size_for(120, 24, false, state.right_now());
+        let master_col = (left + 1 + pane_cols as usize + 5) as u16;
+        let column_rows = (24usize).saturating_sub(screen::STATUS);
+        for row in 0..column_rows {
+            let want = master::hit(
+                &state.rows,
+                &state.spaces,
+                state.valid_master(),
+                state.focused,
+                state.master_report.as_ref(),
+                column_rows,
+                row,
+            );
+            let got = state.clicked((row + screen::SIDEBAR_TOP) as u16, master_col);
+            match want {
+                Some(master::Hit::Header) => {
+                    assert!(matches!(got, Some(Clicked::Master)), "row {row}")
+                }
+                Some(master::Hit::Need(t)) => assert!(
+                    matches!(got, Some(Clicked::Terminal(u)) if u == t),
+                    "row {row}"
+                ),
+                Some(master::Hit::Footer) | None => assert!(got.is_none(), "row {row}"),
+            }
+        }
+        // The need is still reachable through the longer block.
+        let need_at = (0..column_rows)
+            .find(|row| {
+                matches!(
+                    master::hit(
+                        &state.rows,
+                        &state.spaces,
+                        state.valid_master(),
+                        state.focused,
+                        state.master_report.as_ref(),
+                        column_rows,
+                        *row,
+                    ),
+                    Some(master::Hit::Need(2))
+                )
+            })
+            .expect("the blocked terminal is in the column");
+        assert!(matches!(
+            state.clicked((need_at + screen::SIDEBAR_TOP) as u16, master_col),
+            Some(Clicked::Terminal(2))
+        ));
+    }
+
+    /// Approving files the head's id, and a second press does not duplicate it.
+    #[test]
+    fn approving_files_the_head_and_does_not_duplicate_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = bare_state();
+        state.session_dir = dir.path().to_path_buf();
+        state.master_shown = true;
+        state.master_report = Some(head_report("w9", 2));
+        approve_head(&mut state, "approved");
+        assert_eq!(state.message.as_deref(), Some("approved w9"));
+        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
+            .expect("list")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "one verdict file");
+        approve_head(&mut state, "approved");
+        assert_eq!(state.message.as_deref(), Some("already pending w9"));
+        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
+            .expect("list")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "no duplicate verdict");
+    }
+
+    /// Approving with the column shut, with no report, or with an empty list
+    /// files nothing.
+    #[test]
+    fn approving_without_a_shown_head_files_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Shut: the key keeps its old meaning, which is nothing.
+        let mut state = bare_state();
+        state.session_dir = dir.path().to_path_buf();
+        state.master_shown = false;
+        state.master_report = Some(head_report("w9", 2));
+        // Through the same gate the key handler uses.
+        if state.master_shown {
+            approve_head(&mut state, "approved");
+        }
+        assert!(state.message.is_none());
+        // No report at all.
+        let mut state = bare_state();
+        state.session_dir = dir.path().to_path_buf();
+        state.master_shown = true;
+        approve_head(&mut state, "approved");
+        assert_eq!(state.message.as_deref(), Some("no pending approvals"));
+        // A report with an empty ask list.
+        let mut empty = head_report("w9", 2);
+        empty.needs.clear();
+        let mut state = bare_state();
+        state.session_dir = dir.path().to_path_buf();
+        state.master_shown = true;
+        state.master_report = Some(empty);
+        approve_head(&mut state, "rejected");
+        assert_eq!(state.message.as_deref(), Some("no pending approvals"));
+        assert!(!master::approvals_dir(dir.path()).exists());
+    }
+
+    /// Collapsed, the left is a strip: the same one-column hysteresis applies
+    /// at the narrower thresholds.
+    #[test]
+    fn the_hysteresis_holds_when_the_left_column_is_collapsed() {
+        let mut state = bare_state();
+        state.collapsed = true;
+        state.master_open = true;
+        let left = screen::left_for(80, true);
+        let hide_at = left + master::MASTER_WIDTH + 2;
+        let show_at = hide_at + 1;
+        state.cols = 80;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        state.cols = hide_at as u16 + 1;
+        state.refresh_master_shown();
+        assert!(state.master_shown, "sitting on the threshold keeps showing");
+        state.cols = hide_at as u16;
+        state.refresh_master_shown();
+        assert!(!state.master_shown, "past it hides");
+        state.cols = hide_at as u16 + 1;
+        state.refresh_master_shown();
+        assert!(
+            !state.master_shown,
+            "the threshold alone does not bring it back"
+        );
+        state.cols = show_at as u16 + 1;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+    }
+
+    /// Toggling open on a narrow window asks but does not show: hiding is not
+    /// unpinning, and widening past the return threshold brings it back.
+    #[test]
+    fn toggling_open_while_narrow_asks_but_does_not_show() {
+        let mut state = bare_state();
+        state.cols = 60;
+        state.rows = vec![agent(1, 1, "claude", "working")];
+        state.focused = 1;
+        state.master = Some((1, None));
+        toggle_master(&mut state);
+        assert!(state.master_open);
+        assert!(!state.master_shown);
+        assert_eq!(state.valid_master(), Some((1, None)), "the pin is kept");
+        state.cols = 120;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+    }
+
+    /// Pin, report, paint and approve in one chain: the handoffs between the
+    /// four agree with each other.
+    #[test]
+    fn pin_report_paint_and_approve_agree_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = bare_state();
+        state.cols = 120;
+        state.lines = 24;
+        state.session_dir = dir.path().to_path_buf();
+        state.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "blocked"),
+        ];
+        state.focused = 1;
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, Some((1, None)));
+        // The master's file, as the loop writes it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(
+            master::report_path(dir.path()),
+            format!(
+                "{{\"master_terminal\": 1, \"at_unix\": {now}, \"needs\": [{{\"id\": \"w-e2e\", \"session\": \"app\", \"terminal\": 2, \"state\": \"blocked\", \"summary\": \"e2e soru\", \"report\": \"\"}}], \"last_report\": \"e2e rapor\", \"heartbeat_s\": 60}}"
+            ),
+        )
+        .expect("write the report");
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![
+                    agent(1, 1, "claude", "working"),
+                    agent(2, 1, "codex", "blocked"),
+                ],
+            },
+            &mut dirty,
+        );
+        let report = state.master_report.as_ref().expect("the report loaded");
+        assert_eq!(report.needs.first().map(|n| n.id.as_str()), Some("w-e2e"));
+        state.master_open = true;
+        state.refresh_master_shown();
+        assert!(state.master_shown);
+        let master = state.valid_master();
+        assert_eq!(master, Some((1, None)));
+        let painted = screen::paint(&screen::Frame {
+            rows: &state.rows,
+            spaces: &state.spaces,
+            space: state.space,
+            focused: state.focused,
+            snapshot: state.snapshot.as_ref(),
+            cols: state.cols,
+            lines: state.lines,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: state.collapsed,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            tick: state.tick,
+            view: state.view,
+            seen: &state.seen_done,
+            master,
+            master_shown: state.master_shown,
+            master_snapshot: None,
+            master_report: state.master_report.as_ref(),
+            behind: &state.behind,
+        });
+        assert!(painted.contains("e2e soru"), "{painted:?}");
+        assert!(painted.contains("e2e rapor"), "{painted:?}");
+        approve_head(&mut state, "approved");
+        assert_eq!(state.message.as_deref(), Some("approved w-e2e"));
+        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
+            .expect("list")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1);
+        let body = std::fs::read_to_string(files[0].path()).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["id"], "w-e2e");
+        assert_eq!(value["verdict"], "approved");
     }
 }

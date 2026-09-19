@@ -7,6 +7,7 @@
 
 pub mod keys;
 pub mod layout;
+pub mod master;
 pub mod palette;
 pub mod run;
 pub mod screen;

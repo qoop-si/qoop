@@ -72,6 +72,10 @@ fn main() {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &behind,
         });
         print!("\x1b[H\x1b[2J{painted}");

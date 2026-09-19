@@ -9,7 +9,7 @@ use qoro_runtime::control::{AgentRow, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
 use crate::palette::Palette;
-use crate::{layout, sidebar, tabs, theme, width};
+use crate::{layout, master, sidebar, tabs, theme, width};
 
 /// One visible terminal and where it sits in the pane, in pane-local cells.
 ///
@@ -82,11 +82,24 @@ pub struct Frame<'a> {
     /// means one terminal filling the pane, drawn from `snapshot` exactly as
     /// before, so a single pane paints pixel for pixel what it always has.
     pub tiles: Vec<Tile<'a>>,
+    /// The pinned master terminal and the generation it was pinned at, validated
+    /// against the freshest rows before every paint. `None` when nothing is
+    /// pinned, or when the pin no longer names a live terminal.
+    pub master: Option<(u32, Option<u64>)>,
+    /// Whether the right column is on screen this frame. False on a window too
+    /// narrow to hold it, however much the person wants it.
+    pub master_shown: bool,
+    /// The pinned terminal's latest snapshot, for the live viewport under the
+    /// structured block. The focused terminal's own when the master has the
+    /// keyboard, another tile's picture otherwise. Read only, like the tiles.
+    pub master_snapshot: Option<&'a SnapshotWire>,
+    /// The master's file, when it is fresh. Summaries and the last report;
+    /// `None` shows the live index alone.
+    pub master_report: Option<&'a master::Report>,
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str =
-    "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  d detach";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -109,13 +122,16 @@ pub const STATUS: usize = 2;
 /// second copy of that arithmetic in the caller is how a pane and its child end up
 /// disagreeing about how wide they are.
 pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
-    pane_size_for(cols, lines, false)
+    pane_size_for(cols, lines, false, 0)
 }
 
-/// The same, for a column that may be folded away to a strip.
-pub fn pane_size_for(cols: u16, lines: u16, collapsed: bool) -> (u16, u16) {
+/// The same, for a column that may be folded away to a strip and a master column that
+/// may be open on the right.
+pub fn pane_size_for(cols: u16, lines: u16, collapsed: bool, right: usize) -> (u16, u16) {
     (
-        cols.saturating_sub(left_for(cols, collapsed) as u16).max(1),
+        cols.saturating_sub(left_for(cols, collapsed) as u16)
+            .saturating_sub(right as u16)
+            .max(1),
         lines.saturating_sub((TABS + STATUS) as u16).max(1),
     )
 }
@@ -153,6 +169,20 @@ pub fn left_for(cols: u16, collapsed: bool) -> usize {
     }
 }
 
+/// The columns spent after the pane ends: the master column and the rule beside it.
+///
+/// Shown only when the person asked for it and the window holds both columns plus one
+/// pane cell, mirroring [`left_for`] including its hide rule. Dropped rather than
+/// squeezed, for the same reason: a squeezed column wraps every row and tears the layout
+/// apart, which also puts every click on the wrong thing.
+pub fn right_for(cols: u16, left: usize, master_open: bool) -> usize {
+    if master_open && (cols as usize) > left + master::MASTER_WIDTH + 2 {
+        master::MASTER_WIDTH + 1
+    } else {
+        0
+    }
+}
+
 /// The terminals of one space, in the order the daemon reports them.
 ///
 /// The tab bar is per space and the panel on the left is not, so this filter lives here
@@ -181,18 +211,20 @@ fn at(row: usize, col: usize) -> String {
 /// getting a diff wrong is a screen that is quietly out of date. When a frame is expensive
 /// enough to matter, the daemon has already coalesced it.
 pub fn paint(frame: &Frame) -> String {
-    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed);
+    let left = left_for(frame.cols, frame.collapsed);
+    let right = right_for(frame.cols, left, frame.master_shown);
+    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, right);
     let mut out = String::with_capacity(frame.cols as usize * frame.lines as usize + 256);
 
     // Hidden while painting: a cursor walking the screen during a repaint is the flicker
     // people notice most.
     out.push_str("\x1b[?25l");
 
-    let wide_enough = left_for(frame.cols, frame.collapsed) > 0;
+    let wide_enough = left > 0;
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule.
-    out.push_str(&at(1, left_for(frame.cols, frame.collapsed) + 1));
+    out.push_str(&at(1, left + 1));
     for (piece, style) in tabs::painted(
         &in_space(frame.rows, frame.space),
         frame.focused,
@@ -233,6 +265,21 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         Vec::new()
     };
+    // The structured block of the right column, when it is on screen. The live viewport
+    // of the master's snapshot fills whatever rows remain under it.
+    let master_rows: Vec<(sidebar::Line, Option<master::Hit>)> = if right > 0 {
+        master::rows(
+            frame.rows,
+            frame.spaces,
+            frame.master,
+            frame.focused,
+            frame.master_report,
+            column_rows,
+        )
+    } else {
+        Vec::new()
+    };
+    let structured = master_rows.len();
     for row in 0..column_rows {
         out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -323,6 +370,24 @@ pub fn paint(frame: &Frame) -> String {
             out.push(if joins { '\u{2524}' } else { '\u{2502}' });
             out.push_str(theme::RESET);
         }
+        // The right column, when it is on screen: its rule, then the structured block,
+        // then the master's live viewport. Painted here so the header sits beside the tab
+        // bar the way the left column's first row does. The rule is drawn every row so a
+        // terminal line long enough to reach it cannot swallow it.
+        if right > 0 {
+            out.push_str(&at(row + SIDEBAR_TOP, left + pane_cols as usize + 1));
+            out.push_str(&theme::fg(theme::Role::Rule));
+            out.push('\u{2502}');
+            out.push_str(theme::RESET);
+            if let Some((line, hit)) = master_rows.get(row) {
+                let selected =
+                    matches!(hit, Some(master::Hit::Need(terminal)) if *terminal == frame.focused);
+                out.push_str(&chrome_row(line, selected));
+            } else {
+                let (line, spans) = master_viewport_row(frame.master_snapshot, row - structured);
+                out.push_str(&paint_row(line, spans, master::MASTER_WIDTH, None));
+            }
+        }
         // The pane starts under the tab bar, so the column's first row has the bar beside
         // it and every row after that has a row of the terminal.
         let Some(pane_row) = row.checked_sub(TABS) else {
@@ -351,13 +416,7 @@ pub fn paint(frame: &Frame) -> String {
                 .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
             out.push_str(&paint_row(line, spans, pane_cols as usize, selected));
         } else {
-            paint_tiled_row(
-                frame,
-                pane_row,
-                pane_cols as usize,
-                left_for(frame.cols, frame.collapsed),
-                &mut out,
-            );
+            paint_tiled_row(frame, pane_row, pane_cols as usize, left, &mut out);
         }
     }
 
@@ -392,7 +451,16 @@ pub fn paint(frame: &Frame) -> String {
                 None,
             )
         }
-        (None, Some(next)) => (next, waiting(frame.rows)),
+        (None, Some(next)) => (
+            // A pin without its column still reports: on a narrow window the column is
+            // not painted, so the notice row carries one line of master triage instead.
+            if frame.master.is_some() && !frame.master_shown {
+                format!("master: {next}")
+            } else {
+                next
+            },
+            waiting(frame.rows),
+        ),
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
             None => (here(frame), None),
@@ -420,11 +488,11 @@ pub fn paint(frame: &Frame) -> String {
         "ctrl-a space find  enter go  esc back"
     } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
         // Every key when there is room for every key. On a narrower window the list is cut
-        // from the right, which takes the way out first: the one thing a person stuck in
-        // here has to be able to read.
+        // from the right, so the way out is not last: the cut takes the update key
+        // first, and a person stuck in here can still read the one that gets them out.
         EVERY_KEY
     } else {
-        "ctrl-a: n tab  c new  r rename  space find  d detach"
+        "ctrl-a: n tab  c new  r rename  space find  d detach  U update"
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);
@@ -916,6 +984,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                 " ctrl-a S      previous space".to_string(),
                 " ctrl-a f      fold the idle groups".to_string(),
                 " ctrl-a g      agents as groups or by urgency".to_string(),
+                " ctrl-a E      master panel".to_string(),
                 " ctrl-a l      repaint".to_string(),
                 " ctrl-q        detach".to_string(),
                 // The mouse is not a key, and it is the part of this a person is least
@@ -1139,7 +1208,75 @@ fn paint_tiled_row(
     }
 }
 
-fn paint_row(
+/// One chrome row, left column or right: its text in its own colour, with the
+/// keyboard's own row in reverse.
+///
+/// The state's colour goes on the whole row. A person scanning the column is looking for
+/// the one row that needs them, and a coloured word inside an otherwise grey line is a
+/// word they have to find first.
+///
+/// One run inside the row wears a colour of its own, which is the name of the space the
+/// row belongs to. Painted by cutting the row at its edges rather than by drawing over
+/// it, so the row is still written once and left to right, and a wide character in a
+/// name cannot be split.
+fn chrome_row(line: &sidebar::Line, selected: bool) -> String {
+    let base = match (selected, line.colour) {
+        (true, Some(role)) => theme::selected_in(role),
+        (true, None) => theme::selected(),
+        (false, Some(role)) => theme::fg(role),
+        (false, None) => theme::fg(theme::Role::Text),
+    };
+    let mut out = String::with_capacity(width::width(&line.text) + 16);
+    out.push_str(&base);
+    match line.accent {
+        Some((at, len, role)) if len > 0 && at + len <= width::width(&line.text) => {
+            let cut = |from: usize, to: usize| {
+                line.text
+                    .chars()
+                    .scan(0usize, |col, c| {
+                        let start = *col;
+                        *col += width::columns(c);
+                        Some((start, c))
+                    })
+                    .filter(|(start, _)| *start >= from && *start < to)
+                    .map(|(_, c)| c)
+                    .collect::<String>()
+            };
+            out.push_str(&cut(0, at));
+            out.push_str(&if selected {
+                theme::selected_in(role)
+            } else {
+                theme::fg(role)
+            });
+            out.push_str(&cut(at, at + len));
+            out.push_str(&base);
+            out.push_str(&cut(at + len, width::width(&line.text)));
+        }
+        _ => out.push_str(&line.text),
+    }
+    out.push_str(theme::RESET);
+    out
+}
+
+/// One row of the master's live viewport, leftmost-cropped to the column.
+///
+/// Blank when the snapshot has not arrived yet: a master that has produced nothing is
+/// every master for its first moments, and blank rows are what the pane paints too.
+/// Never byte or char sliced, only [`paint_row`], so wide characters cannot split.
+fn master_viewport_row(snapshot: Option<&SnapshotWire>, row: usize) -> (&str, &[SpanWire]) {
+    (
+        snapshot
+            .and_then(|s| s.lines.get(row))
+            .map(String::as_str)
+            .unwrap_or(""),
+        snapshot
+            .and_then(|s| s.styles.get(row))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    )
+}
+
+pub(crate) fn paint_row(
     line: &str,
     spans: &[SpanWire],
     cols: usize,
@@ -1326,6 +1463,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1374,6 +1515,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1414,6 +1559,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1462,6 +1611,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1507,6 +1660,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1566,6 +1723,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1625,6 +1786,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1673,6 +1838,10 @@ mod tests {
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
+                master: None,
+                master_shown: false,
+                master_snapshot: None,
+                master_report: None,
                 behind: &crate::run::Behind::default(),
             });
             // Every positioned run, measured as a terminal measures it.
@@ -1719,6 +1888,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1760,6 +1933,10 @@ mod tests {
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
+                master: None,
+                master_shown: false,
+                master_snapshot: None,
+                master_report: None,
                 behind: &crate::run::Behind::default(),
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
@@ -1803,6 +1980,10 @@ mod tests {
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
+                master: None,
+                master_shown: false,
+                master_snapshot: None,
+                master_report: None,
                 behind: &crate::run::Behind::default(),
             });
             // The two status rows own the bottom of the screen, so nothing else may
@@ -1864,6 +2045,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -1918,6 +2103,10 @@ mod tests {
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
+                master: None,
+                master_shown: false,
+                master_snapshot: None,
+                master_report: None,
                 behind: &crate::run::Behind {
                     terminal: 0,
                     from: 0,
@@ -1980,6 +2169,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2063,6 +2256,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2116,6 +2313,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2158,6 +2359,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2197,6 +2402,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2237,6 +2446,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2306,6 +2519,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2380,6 +2597,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2448,6 +2669,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
                 from: 0,
@@ -2491,6 +2716,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &crate::run::Behind::default(),
         });
         // The five columns under the drag are reversed, and the escape is written once at
@@ -2549,6 +2778,10 @@ mod tests {
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
+                master: None,
+                master_shown: false,
+                master_snapshot: None,
+                master_report: None,
                 behind: &crate::run::Behind::default(),
             })
         };
@@ -2599,6 +2832,10 @@ mod tests {
             rows_back: 2,
             behind: &behind,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
         });
         // Two rows back: the last two rows written, then the screen from its top.
         assert!(painted.contains("gone 98"), "{painted:?}");
@@ -2652,6 +2889,10 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &behind,
         });
         assert!(painted.contains("live 0") && painted.contains("live 1"));
@@ -2737,6 +2978,10 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &behind,
         })
     }
@@ -2772,6 +3017,10 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &behind,
         });
         let tiled = paint(&Frame {
@@ -2808,6 +3057,10 @@ mod tests {
             tick: 0,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
+            master: None,
+            master_shown: false,
+            master_snapshot: None,
+            master_report: None,
             behind: &behind,
         });
         assert_eq!(tiled, legacy);
@@ -2929,5 +3182,193 @@ mod tests {
         assert!(painted.contains("top row"), "{painted:?}");
         assert!(painted.contains("bottom row"), "{painted:?}");
         assert!(painted.contains('\u{2500}'), "no divider: {painted:?}");
+    }
+
+    /// The right column needs an open ask and room for both columns plus one pane cell.
+    #[test]
+    fn the_right_column_needs_an_open_ask_and_room_for_both_columns() {
+        let left = sidebar::WIDTH + 1;
+        assert_eq!(right_for(120, left, false), 0, "never asked");
+        assert_eq!(right_for(120, left, true), master::MASTER_WIDTH + 1);
+        // The hide rule mirrors left_for: both columns plus one pane cell, or nothing.
+        let threshold = left + master::MASTER_WIDTH + 2;
+        assert_eq!(right_for(threshold as u16, left, true), 0);
+        assert_eq!(
+            right_for(threshold as u16 + 1, left, true),
+            master::MASTER_WIDTH + 1
+        );
+    }
+
+    #[test]
+    fn the_pane_shrinks_from_the_right_exactly_as_it_shrinks_from_the_left() {
+        assert_eq!(
+            pane_size_for(120, 24, false, master::MASTER_WIDTH + 1),
+            (
+                120 - sidebar::WIDTH as u16 - 1 - master::MASTER_WIDTH as u16 - 1,
+                21
+            )
+        );
+        assert_eq!(pane_size_for(120, 24, false, 0), pane_size(120, 24));
+    }
+
+    /// A frame with the master column, for the three tests below.
+    fn paint_master(cols: u16, shown: bool) -> String {
+        let agents = [
+            row(1, "zsh", "idle"),
+            row(2, "claude", "working"),
+            blocked_row(3, "codex"),
+        ];
+        let pane = snapshot(&["pane output"]);
+        let master_snap = snapshot(&["master viewport line"]);
+        let behind = crate::run::Behind::default();
+        paint(&Frame {
+            rows: &agents,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&pane),
+            cols,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            master: Some((2, Some(1))),
+            master_shown: shown,
+            master_snapshot: Some(&master_snap),
+            master_report: None,
+            behind: &behind,
+        })
+    }
+
+    /// A wide window paints the master column beside the pane: header, needs, footer,
+    /// then the live viewport under the structured block.
+    #[test]
+    fn a_wide_window_paints_the_master_column_beside_the_pane() {
+        let painted = paint_master(120, true);
+        // The header names the pinned master and its state in one unbroken row.
+        assert!(painted.contains("master claude working"), "{painted:?}");
+        // The blocked terminal across the session is listed; the master is not its own
+        // need.
+        assert!(painted.contains("needs you 1"), "{painted:?}");
+        assert!(painted.contains("[E] master"), "{painted:?}");
+        // The live viewport fills the rows under the structured block.
+        assert!(painted.contains("master viewport line"), "{painted:?}");
+        // And the pane still paints: the column shrank it, it did not replace it.
+        assert!(painted.contains("pane output"), "{painted:?}");
+    }
+
+    /// A narrow window paints no column, and the notice row carries one line of master
+    /// triage instead.
+    #[test]
+    fn a_narrow_window_drops_the_column_and_the_ticker_names_the_master() {
+        let painted = paint_master(60, false);
+        // The left column's own "needs you" group stays; the right column's header,
+        // footer and viewport must not spill onto a window that cannot hold them.
+        assert!(
+            !painted.contains("master claude"),
+            "the column spilled onto a narrow window: {painted:?}"
+        );
+        assert!(
+            !painted.contains("[E] master"),
+            "the column spilled onto a narrow window: {painted:?}"
+        );
+        assert!(
+            !painted.contains("master viewport line"),
+            "the column spilled onto a narrow window: {painted:?}"
+        );
+        assert!(painted.contains("master: next:"), "{painted:?}");
+        assert!(painted.contains("is blocked"), "{painted:?}");
+    }
+
+    /// Every positioned run of a frame with the column open, measured as a terminal
+    /// measures it: the click columns have to land where the paint did.
+    #[test]
+    fn a_frame_with_the_master_column_paints_no_wider_than_it_is() {
+        for cols in [100u16, 120] {
+            let painted = paint_master(cols, true);
+            for run in painted.split("\x1b[").skip(1) {
+                let Some(text) = run.strip_suffix("").and_then(|r| r.split_once('H')) else {
+                    continue;
+                };
+                let drawn = text.1.split('\x1b').next().unwrap_or_default();
+                assert!(
+                    width::width(drawn) <= cols as usize,
+                    "{cols} columns, painted {} of them: {drawn:?}",
+                    width::width(drawn)
+                );
+            }
+        }
+    }
+
+    /// A long viewport line and a wide one both fit the column: the viewport
+    /// crops by columns, never by bytes or characters.
+    #[test]
+    fn a_long_and_wide_viewport_stays_inside_the_master_column() {
+        let agents = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+        let pane = snapshot(&["pane output"]);
+        let long = "x".repeat(200);
+        let wide = "\u{1f30d}".repeat(30);
+        let viewport = snapshot(&[long.as_str(), wide.as_str(), "kisa"]);
+        let behind = crate::run::Behind::default();
+        let painted = paint(&Frame {
+            rows: &agents,
+            spaces: &spaces(),
+            space: Some(1),
+            focused: 2,
+            snapshot: Some(&pane),
+            cols: 120,
+            lines: 24,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            master: Some((2, Some(1))),
+            master_shown: true,
+            master_snapshot: Some(&viewport),
+            master_report: None,
+            behind: &behind,
+        });
+        assert!(
+            !painted.contains(&"x".repeat(60)),
+            "the viewport spilled: {painted:?}"
+        );
+        for cols in [120u16] {
+            for run in painted.split("\x1b[").skip(1) {
+                let Some(text) = run.strip_suffix("").and_then(|r| r.split_once('H')) else {
+                    continue;
+                };
+                let drawn = text.1.split('\x1b').next().unwrap_or_default();
+                assert!(
+                    width::width(drawn) <= cols as usize,
+                    "{cols} columns, painted {} of them: {drawn:?}",
+                    width::width(drawn)
+                );
+            }
+        }
     }
 }

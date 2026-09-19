@@ -963,9 +963,13 @@ fn collapse_row(collapsed: bool) -> (Line, Option<Hit>) {
     // The foot of the column says what this is and what version of it, the way a product
     // signs its own window, and the fold mark sits at the far end of the same row rather
     // than taking a row of its own: the column is worth more to a person as list than as
-    // furniture.
+    // furniture. When `qoro update --check` saw something newer, the row says where this
+    // build stands against it, so the update is found rather than remembered.
     let brand = format!(" {BRAND_MARK} {BRAND}");
-    let version = format!("{VERSION} ");
+    let version = match update_available() {
+        Some(new) => format!("{VERSION}>{new} "),
+        None => format!("{VERSION} "),
+    };
     // The row is the mark and name, a space, the version, the gap, then the fold mark and
     // its own trailing space.
     let gap =
@@ -990,6 +994,17 @@ const BRAND: &str = "qoro";
 const BRAND_MARK: char = '\u{25cf}';
 /// Which build this is, read from the crate rather than written down twice.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A newer version `qoro update --check` saw, when it saw one.
+///
+/// Read off the notice file on every paint rather than held in state: the check runs in
+/// a process outside the interface, so anything held would be stale by construction. A
+/// missing file, garbage in it, or nothing newer is no notice, and the row is byte for
+/// byte what it always was.
+fn update_available() -> Option<String> {
+    let seen = qoro_runtime::paths::read_update_notice()?;
+    qoro_runtime::paths::is_newer_version(&seen, VERSION).then_some(seen)
+}
 
 /// The column as it is when it is not folded away.
 ///
@@ -2371,6 +2386,38 @@ mod tests {
         let (strip, _) = collapse_row(true);
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
+    }
+
+    /// A seen update signs the foot of the column with where this build stands.
+    #[test]
+    fn a_seen_update_names_itself_beside_the_version() {
+        // The notice file the check leaves, under a runtime directory of this test's
+        // own: no other test reads the variable, so holding it here races nothing.
+        let base = tempfile::tempdir().expect("tempdir");
+        // SAFETY: the only reader of this variable in this binary is the row below.
+        unsafe { std::env::set_var("QORO_RUNTIME_DIR", base.path()) };
+        std::fs::write(base.path().join("update-available"), "9.9.9\n").expect("notice");
+        let (line, _) = collapse_row(false);
+        assert!(
+            line.text.contains("9.9.9"),
+            "the waiting release has to be readable off the screen: {:?}",
+            line.text
+        );
+        assert_eq!(
+            crate::width::width(&line.text),
+            WIDTH,
+            "the longer row still fills the column exactly: {:?}",
+            line.text
+        );
+        std::fs::remove_file(base.path().join("update-available")).expect("cleanup");
+        let (plain, _) = collapse_row(false);
+        assert!(
+            !plain.text.contains('>'),
+            "no notice is the row it always was: {:?}",
+            plain.text
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("QORO_RUNTIME_DIR") };
     }
 
     /// A done row is unread until the keyboard has been there: not focused,
