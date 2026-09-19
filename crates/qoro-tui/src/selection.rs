@@ -133,20 +133,70 @@ pub fn in_columns(line: &str, range: Range<usize>) -> String {
 /// The escape is BEL terminated. ST is correct and newer emulators take both; some still
 /// only honour BEL, and a clipboard write that silently does nothing is worse than an
 /// old-fashioned terminator.
-pub fn copy(text: &str, out: &mut impl std::io::Write) -> std::io::Result<()> {
+///
+/// Answers how the text left: the caller reports it honestly, because an OSC 52
+/// escape the outer terminal swallows is not a clipboard write, and saying
+/// "copied" for one is a false report.
+pub fn copy(text: &str, out: &mut impl std::io::Write) -> std::io::Result<Option<CopyVia>> {
+    copy_with(text, &Environment::read(), platform_copy, out)
+}
+
+/// Which way a copy went, so the notice can say what actually happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyVia {
+    /// The platform tool took it: the desktop clipboard has it.
+    System,
+    /// An OSC 52 escape was written to the terminal in front of the person:
+    /// it arrives only if that terminal honours OSC 52.
+    TerminalEscape,
+}
+
+/// The testable core of [`copy`]: the environment and the platform attempt are
+/// parameters, so the routing matrix is a unit test rather than a machine with
+/// tmux and ssh installed.
+fn copy_with(
+    text: &str,
+    env: &Environment,
+    platform: impl FnOnce(&str) -> bool,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<Option<CopyVia>> {
     if text.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    if !prefer_escape(&Environment::read()) && platform_copy(text) {
-        return Ok(());
+    // One read, one decision: reading twice lets the environment change between
+    // the two reads and route the write by a mix of two worlds.
+    if !prefer_escape(env) && platform(text) {
+        return Ok(Some(CopyVia::System));
     }
-    out.write_all(escape(text.as_bytes()).as_bytes())?;
-    out.flush()
+    out.write_all(escape_for(env, text.as_bytes()).as_bytes())?;
+    out.flush()?;
+    Ok(Some(CopyVia::TerminalEscape))
 }
 
 /// The clipboard escape, for a caller that has its own way of writing to the terminal.
 pub fn escape(bytes: &[u8]) -> String {
-    format!("\x1b]52;c;{}\x07", base64(bytes))
+    escape_for(&Environment::default(), bytes)
+}
+
+/// The clipboard escape wrapped for the terminal in front of the person.
+///
+/// Inside tmux or GNU screen a bare OSC 52 never reaches the outer terminal:
+/// the multiplexer eats it, and the person sees "copied" while nothing
+/// arrives. Wrapped in the
+/// DCS passthrough, the multiplexer forwards it instead of swallowing it.
+pub fn escape_for(env: &Environment, bytes: &[u8]) -> String {
+    let raw = format!("\x1b]52;c;{}\x07", base64(bytes));
+    if env.tmux {
+        // tmux DCS passthrough: ESC P tmux ; <sequence with ESC doubled> ESC \.
+        // The inner sequence's ESCs are doubled so tmux forwards one copy.
+        return format!("\x1bPtmux;{}\x1b\\", raw.replace('\x1b', "\x1b\x1b"));
+    }
+    if env.screen {
+        // GNU screen strips the DCS wrapper and forwards the inner bytes as
+        // is: no ESC doubling here, which is tmux-specific.
+        return format!("\x1bP{}\x1b\\", raw);
+    }
+    raw
 }
 
 /// What decides which way the clipboard is written.
@@ -154,6 +204,10 @@ pub fn escape(bytes: &[u8]) -> String {
 pub struct Environment {
     pub ssh: bool,
     pub editor_terminal: bool,
+    /// Inside tmux: OSC 52 must be wrapped in the DCS passthrough.
+    pub tmux: bool,
+    /// Inside GNU screen: same, with screen's own wrapping.
+    pub screen: bool,
 }
 
 impl Environment {
@@ -162,6 +216,10 @@ impl Environment {
             ssh: std::env::var_os("SSH_CONNECTION").is_some()
                 || std::env::var_os("SSH_TTY").is_some(),
             editor_terminal: std::env::var_os("VSCODE_IPC_HOOK_CLI").is_some(),
+            tmux: std::env::var_os("TMUX").is_some(),
+            screen: std::env::var("TERM")
+                .map(|t| t.starts_with("screen"))
+                .unwrap_or(false),
         }
     }
 }
@@ -348,11 +406,13 @@ mod tests {
     fn a_person_over_ssh_gets_their_own_terminals_clipboard() {
         assert!(prefer_escape(&Environment {
             ssh: true,
-            editor_terminal: false
+            editor_terminal: false,
+            ..Environment::default()
         }));
         assert!(prefer_escape(&Environment {
             ssh: false,
-            editor_terminal: true
+            editor_terminal: true,
+            ..Environment::default()
         }));
         assert!(
             !prefer_escape(&Environment::default()),
@@ -363,7 +423,169 @@ mod tests {
     #[test]
     fn copying_nothing_writes_nothing() {
         let mut out: Vec<u8> = Vec::new();
-        copy("", &mut out).expect("no write");
+        assert_eq!(
+            copy("", &mut out).expect("no write"),
+            None,
+            "empty text is not a copy at all, so the caller shows no notice"
+        );
         assert!(out.is_empty());
+    }
+
+    /// The routing matrix: where the person sits decides which clipboard hears.
+    #[test]
+    fn the_routing_matrix_sends_remote_copies_to_the_terminal() {
+        let local = Environment::default();
+        let ssh = Environment {
+            ssh: true,
+            ..Environment::default()
+        };
+        let editor = Environment {
+            editor_terminal: true,
+            ..Environment::default()
+        };
+        // Locally the platform tool wins and nothing is written to the terminal.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            copy_with("hi", &local, |_| true, &mut out).expect("copy"),
+            Some(CopyVia::System)
+        );
+        assert!(out.is_empty());
+        // Over ssh the platform tool is not even tried: the far side's
+        // clipboard is not the one in front of the person.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            copy_with(
+                "hi",
+                &ssh,
+                |_| panic!("far-side tool must not run"),
+                &mut out
+            )
+            .expect("copy"),
+            Some(CopyVia::TerminalEscape)
+        );
+        assert_eq!(out, escape_for(&ssh, b"hi").as_bytes());
+        // Same inside an editor terminal.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            copy_with(
+                "hi",
+                &editor,
+                |_| panic!("host tool must not run"),
+                &mut out
+            )
+            .expect("copy"),
+            Some(CopyVia::TerminalEscape)
+        );
+        // No platform tool installed locally: fall through to the escape
+        // rather than reporting success while writing nothing.
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            copy_with("hi", &local, |_| false, &mut out).expect("copy"),
+            Some(CopyVia::TerminalEscape)
+        );
+        assert_eq!(out, escape(b"hi").as_bytes());
+    }
+
+    /// Inside tmux or screen a bare OSC 52 never reaches the outer terminal.
+    /// The DCS wrap is what forwards it; without it the person sees a notice
+    /// while nothing arrives.
+    #[test]
+    fn the_multiplexer_matrix_wraps_the_escape() {
+        let bare = escape(b"hi");
+        assert_eq!(bare, "\x1b]52;c;aGk=\x07");
+        let tmux = Environment {
+            tmux: true,
+            ..Environment::default()
+        };
+        let wrapped = escape_for(&tmux, b"hi");
+        assert!(
+            wrapped.starts_with("\x1bPtmux;"),
+            "tmux needs its DCS passthrough prefix: {wrapped:?}"
+        );
+        assert!(
+            wrapped.ends_with("\x1b\\"),
+            "an unterminated DCS swallows the rest of the session: {wrapped:?}"
+        );
+        assert!(
+            wrapped.contains(&bare.replace('\x1b', "\x1b\x1b")),
+            "the inner ESCs are doubled so tmux forwards one copy: {wrapped:?}"
+        );
+        let screen = Environment {
+            screen: true,
+            ..Environment::default()
+        };
+        let swrapped = escape_for(&screen, b"hi");
+        assert!(
+            swrapped.starts_with("\x1bP") && swrapped.ends_with("\x1b\\"),
+            "screen needs its own DCS wrap: {swrapped:?}"
+        );
+        // Both set: tmux is the inner multiplexer a person nests, so it wins.
+        let both = Environment {
+            tmux: true,
+            screen: true,
+            ..Environment::default()
+        };
+        assert_eq!(escape_for(&both, b"hi"), wrapped);
+        // tmux over ssh still wraps: the wrap and the route are orthogonal.
+        let tmux_ssh = Environment {
+            tmux: true,
+            ssh: true,
+            ..Environment::default()
+        };
+        assert_eq!(escape_for(&tmux_ssh, b"hi"), wrapped);
+    }
+
+    /// Clipboard bytes are bytes: CJK and emoji survive base64 and the wrap.
+    #[test]
+    fn cjk_and_emoji_survive_the_clipboard_bytes() {
+        for text in [
+            "\u{4e16}\u{754c}",
+            "\u{65e5}\u{672c}\u{8a9e}",
+            "\u{1f600}",
+            "t\u{00fc}rk",
+        ] {
+            let esc = escape(text.as_bytes());
+            let payload = esc
+                .strip_prefix("\x1b]52;c;")
+                .and_then(|s| s.strip_suffix('\x07'))
+                .expect("BEL-terminated OSC 52");
+            assert_eq!(
+                decode_base64(payload),
+                text.as_bytes(),
+                "clipboard mojibake for {text:?}"
+            );
+        }
+    }
+
+    /// Minimal base64 decoder, test-only: the encoder is hand-rolled, so the
+    /// test must not trust it to check itself.
+    #[cfg(test)]
+    fn decode_base64(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u32 {
+            match c {
+                b'A'..=b'Z' => (c - b'A') as u32,
+                b'a'..=b'z' => (c - b'a' + 26) as u32,
+                b'0'..=b'9' => (c - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("bad base64 char {c}"),
+            }
+        }
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        for c in b.chunks(4) {
+            let n = (val(c[0]) << 18)
+                | (val(c[1]) << 12)
+                | (if c[2] == b'=' { 0 } else { val(c[2]) << 6 })
+                | (if c[3] == b'=' { 0 } else { val(c[3]) });
+            out.push((n >> 16) as u8);
+            if c[2] != b'=' {
+                out.push((n >> 8) as u8);
+            }
+            if c[3] != b'=' {
+                out.push(n as u8);
+            }
+        }
+        out
     }
 }

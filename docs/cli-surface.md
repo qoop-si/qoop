@@ -28,7 +28,7 @@ a claim nobody has to keep.
 | `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
 | `qoro read <terminal>` | print another terminal's current screen | no |
-| `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked | no |
+| `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |

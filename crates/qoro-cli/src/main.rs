@@ -999,6 +999,31 @@ fn resolve_target<'a>(
     Err(format!("no such agent or terminal: {target}"))
 }
 
+/// Why a prompt must not be sent, if it must not be.
+///
+/// Pure, so the two refusals are tested without a daemon: a trust screen
+/// eats bytes as a shell command rather than a task, and a blocked agent
+/// answers a question nobody asked. Anything else is sendable, including a
+/// shell at its prompt, which just runs the text as a command.
+fn prompt_refusal(row: &qoro_runtime::control::AgentRow) -> Option<String> {
+    let who = row
+        .name
+        .clone()
+        .or_else(|| row.program.clone())
+        .unwrap_or_else(|| format!("terminal {}", row.terminal));
+    if row.readiness == "trust_required" {
+        return Some(format!(
+            "agent {who} is waiting on a trust prompt: answer it in the terminal first"
+        ));
+    }
+    if row.state == "blocked" {
+        return Some(format!(
+            "agent {who} is blocked and requires interactive input"
+        ));
+    }
+    None
+}
+
 /// `qoro prompt`: send text plus Enter to another session, unless it is blocked.
 ///
 /// Not limited to agents: a
@@ -1058,15 +1083,8 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
             }
         };
         let row = resolve_target(&rows, target).map_err(std::io::Error::other)?;
-        if row.state == "blocked" {
-            let who = row
-                .name
-                .clone()
-                .or_else(|| row.program.clone())
-                .unwrap_or_else(|| format!("terminal {}", row.terminal));
-            return Err(std::io::Error::other(format!(
-                "agent {who} is blocked and requires interactive input"
-            )));
+        if let Some(reason) = prompt_refusal(row) {
+            return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
         let mut term_seq = 0u32;
@@ -1255,7 +1273,7 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_target;
+    use super::{prompt_refusal, resolve_target};
     use qoro_runtime::control::AgentRow;
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
@@ -1268,6 +1286,7 @@ mod tests {
             state: "idle".into(),
             agent: true,
             generation: None,
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1303,5 +1322,27 @@ mod tests {
         let rows = vec![row(1, None, Some("sh"))];
         let err = resolve_target(&rows, "nobody").unwrap_err();
         assert!(err.contains("nobody"), "the error names the target: {err}");
+    }
+
+    #[test]
+    fn a_trust_screen_is_refused_by_name_and_a_shell_is_sendable() {
+        let mut trust = row(1, None, Some("codex"));
+        trust.state = "blocked".into();
+        trust.readiness = "trust_required".into();
+        let reason = prompt_refusal(&trust).expect("a trust screen refuses");
+        assert!(
+            reason.contains("trust prompt"),
+            "the fix is answering in the terminal: {reason}"
+        );
+        let mut approval = row(2, None, Some("claude"));
+        approval.state = "blocked".into();
+        approval.readiness = "ready".into();
+        let reason = prompt_refusal(&approval).expect("an approval refuses");
+        assert!(
+            !reason.contains("trust"),
+            "a mid-task approval is blocked, not unready: {reason}"
+        );
+        let shell = row(3, None, Some("sh"));
+        assert_eq!(prompt_refusal(&shell), None);
     }
 }

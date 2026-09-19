@@ -37,6 +37,13 @@ pub enum Role {
     Done,
     Failed,
     Idle,
+    /// The working spinner's head, one step of the brand's own ambers.
+    ///
+    /// The sidebar steps these eight times per loop while its glyph cycles four
+    /// circle frames, so the (glyph, step) combination repeats every eight ticks.
+    /// Amber and not teal on purpose: the row already wears [`Role::Working`],
+    /// and aliveness wants its own channel rather than a louder state colour.
+    Ember(usize),
     /// A terminal nothing has said anything about yet.
     Unobserved,
     /// Which space a thing belongs to, as a colour rather than as a word.
@@ -63,6 +70,13 @@ pub fn space_of(id: i64) -> Role {
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
 const SPACE_INKS: [u8; 6] = [111, 176, 215, 150, 117, 181];
+
+/// The spinner's ember wheel, from the brand accent out to pale amber and back.
+///
+/// `#FF6600` is 202, which is also [`Role::Brand`]'s ink: the spinner starts on the
+/// product's own mark and breathes outward. `#f59e0b` is 214, `#FFD166` is 222,
+/// and the midpoints 208 and 220 are the nearest 256 entries between them.
+const EMBER_INKS: [u8; 5] = [202, 208, 214, 220, 222];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
@@ -107,6 +121,7 @@ const fn ink(role: Role) -> u8 {
         Role::Failed => 174,
         Role::Idle => 245,
         Role::Unobserved => 240,
+        Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
     }
 }
@@ -200,6 +215,7 @@ mod tests {
         ]
         .into_iter()
         .chain((0..SPACE_INKS.len()).map(Role::Space))
+        .chain((0..EMBER_INKS.len()).map(Role::Ember))
         {
             assert!(ink(role) >= 16, "{role:?} uses a themed colour");
         }
@@ -273,6 +289,48 @@ mod tests {
         assert_eq!(space_of(3), space_of(3));
         for id in 1..6i64 {
             assert_ne!(space_of(id), space_of(id + 1), "spaces {id} and {}", id + 1);
+        }
+    }
+
+    /// The ember wheel is five distinct steps that come back round, so the spinner
+    /// breathes out to pale amber and back rather than jumping between two hues.
+    #[test]
+    fn the_ember_wheel_is_five_distinct_steps_that_wrap() {
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 0..EMBER_INKS.len() {
+            assert!(seen.insert(ink(Role::Ember(n))), "ember {n} repeats a step");
+        }
+        assert_eq!(ink(Role::Ember(0)), ink(Role::Brand));
+        assert_eq!(
+            ink(Role::Ember(EMBER_INKS.len())),
+            ink(Role::Ember(0)),
+            "the wheel does not come back round"
+        );
+    }
+
+    /// An ember is never a state colour: the spinner's aliveness must not read as
+    /// blocked, failed, working or done.
+    #[test]
+    fn an_ember_is_never_the_colour_of_a_state() {
+        let states = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Unobserved,
+        ]
+        .map(ink);
+        for n in 0..EMBER_INKS.len() {
+            // Ember(0) is Brand's own ink by design (see above); the rest of the
+            // wheel must belong to nobody else.
+            if n == 0 {
+                continue;
+            }
+            assert!(
+                !states.contains(&ink(Role::Ember(n))),
+                "ember {n} wears a state colour"
+            );
         }
     }
 }

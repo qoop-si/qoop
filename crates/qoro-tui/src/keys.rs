@@ -103,6 +103,8 @@ pub enum Action {
     Palette,
     /// ctrl-a f: fold the idle groups away, or bring them all back.
     FoldAll,
+    /// ctrl-a g: the agents panel as labelled groups, or as a flat urgency list.
+    ToggleView,
     /// ctrl-a v: split the focused pane side by side.
     SplitV,
     /// ctrl-a -: split the focused pane stacked.
@@ -255,6 +257,7 @@ impl Keys {
                     // biggest key.
                     b' ' => Action::Palette,
                     b'f' => Action::FoldAll,
+                    b'g' => Action::ToggleView,
                     b'v' => Action::SplitV,
                     b'-' => Action::SplitH,
                     b'H' => Action::PaneMove(crate::layout::Move::Left),
@@ -461,6 +464,7 @@ mod tests {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01 "), vec![Action::Palette]);
         assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
+        assert_eq!(keys.feed(b"\x01g"), vec![Action::ToggleView]);
     }
 
     #[test]

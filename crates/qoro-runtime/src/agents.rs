@@ -51,6 +51,10 @@ pub struct TerminalAgent {
     pub capability: TerminalCapability,
     pub identity: AgentIdentity,
     pub belief: AgentBelief,
+    /// A startup gate is on screen: answering it creates the session rather
+    /// than continuing one. Set from the matched manifest rule, never
+    /// inferred, and cleared by any later screen reading without one.
+    pub setup_gate: bool,
     /// The foreground leader this identity was read from.
     pub leader: Option<Pid>,
 }
@@ -140,6 +144,9 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
     agent.identity = AgentIdentity::None;
     agent.leader = None;
     agent.belief = fresh_belief(agent.capability.generation);
+    // A dead process shows no dialog: the exit voids any gate the old
+    // screen set, with the old belief.
+    agent.setup_gate = false;
     let idle = qoro_domain::AgentObservation {
         agent_id: qoro_domain::AgentId::new(stream.to_string()),
         terminal_id: agent.capability.terminal.clone(),
@@ -200,6 +207,7 @@ impl AgentRegistry {
                 },
                 identity: AgentIdentity::None,
                 belief: fresh_belief(generation),
+                setup_gate: false,
                 leader: None,
             },
         );
@@ -296,6 +304,9 @@ impl AgentRegistry {
             // generation by definition.
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
+            // The gate belonged to the old generation's screen: a new process
+            // means the old dialog reading is void, not held.
+            agent.setup_gate = false;
             agent.identity = AgentIdentity::Known {
                 program,
                 generation,
@@ -310,6 +321,10 @@ impl AgentRegistry {
         }
         let generation = agent.capability.advance();
         agent.belief = fresh_belief(generation);
+        // A new foreground generation voids the old screen's gate with the
+        // old belief: whatever dialog was showing belonged to a process that
+        // is no longer there.
+        agent.setup_gate = false;
         agent.identity = match leader {
             None => AgentIdentity::None,
             Some(pid) => {
@@ -356,6 +371,9 @@ impl AgentRegistry {
             };
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
+            // The gate belonged to the exited or execed process: a new
+            // generation voids the old screen's reading with the old belief.
+            agent.setup_gate = false;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
                 settle_exit(agent, stream);
@@ -404,16 +422,23 @@ impl AgentRegistry {
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
+        let before_gate = agent.setup_gate;
         // `accept` is the one that consumes the belief and returns the new one, so an
         // observation cannot be applied without going through the acceptance rule first.
         let Ok(next) = agent.belief.clone().accept(&observation) else {
             return false;
         };
         agent.belief = next;
-        // Published when anything observable changed: the state or the visible
-        // blocker. A soak of identical evaluations publishes nothing.
-        let changed =
-            agent.belief.state != before || agent.belief.visible_blocker != before_blocker;
+        // The gate rides with the accepted reading, not beside it: a refused
+        // observation changes nothing, and a later reading without a gate
+        // clears one, because the dialog is gone when the screen no longer
+        // shows it.
+        agent.setup_gate = verdict.setup_gate;
+        // Published when anything observable changed: the state, the visible
+        // blocker, or the gate. A soak of identical evaluations publishes nothing.
+        let changed = agent.belief.state != before
+            || agent.belief.visible_blocker != before_blocker
+            || agent.setup_gate != before_gate;
         drop(terminals);
         if changed {
             self.announce(stream);
@@ -475,12 +500,19 @@ impl AgentRegistry {
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
+        let before_gate = agent.setup_gate;
         let Ok(next) = agent.belief.clone().accept(&observation) else {
             return Ok(false);
         };
         agent.belief = next;
-        let changed =
-            agent.belief.state != before || agent.belief.visible_blocker != before_blocker;
+        // A hook report comes from inside a live session, so the session
+        // exists no matter what the screen last showed: accepting it clears
+        // a startup gate a refused screen reading would otherwise hold
+        // forever.
+        agent.setup_gate = false;
+        let changed = agent.belief.state != before
+            || agent.belief.visible_blocker != before_blocker
+            || before_gate;
         drop(terminals);
         if changed {
             self.announce(stream);
@@ -639,6 +671,7 @@ mod tests {
             visible_blocker,
             visible_idle: false,
             visible_working: false,
+            setup_gate: false,
         }
     }
 
@@ -910,11 +943,64 @@ mod tests {
             visible_blocker: false,
             visible_idle: true,
             visible_working: false,
+            setup_gate: false,
         };
         assert!(r.observe_screen(1, &composer));
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Idle
         );
+    }
+
+    /// A trust dialog on screen raises the setup gate, and the reading after
+    /// it clears the gate: the dialog is gone when the screen no longer
+    /// shows it, so holding the flag would refuse prompts over a live
+    /// session.
+    #[test]
+    fn a_trust_dialog_raises_the_setup_gate_until_the_screen_moves_on() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let trust = qoro_detect::Verdict {
+            state: AgentRuntimeState::Blocked,
+            rule: "trust_directory".into(),
+            visible_blocker: true,
+            visible_idle: false,
+            visible_working: false,
+            setup_gate: true,
+        };
+        assert!(r.observe_screen(1, &trust));
+        assert!(r.agent(1).expect("agent").setup_gate);
+        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, false)));
+        assert!(!r.agent(1).expect("agent").setup_gate);
+    }
+
+    /// A hook report comes from a live session, so accepting one clears a
+    /// gate the screen set: without this a session whose screen readings are
+    /// refused after the hook is accepted would read `trust_required` forever.
+    #[test]
+    fn an_accepted_hook_clears_a_screen_raised_setup_gate() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let trust = qoro_detect::Verdict {
+            state: AgentRuntimeState::Blocked,
+            rule: "trust_directory".into(),
+            visible_blocker: true,
+            visible_idle: false,
+            visible_working: false,
+            setup_gate: true,
+        };
+        assert!(r.observe_screen(1, &trust));
+        assert!(r.agent(1).expect("agent").setup_gate);
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Working,
+            false,
+            false,
+        )
+        .expect("a hook from the live session applies");
+        assert!(!r.agent(1).expect("agent").setup_gate);
     }
 }

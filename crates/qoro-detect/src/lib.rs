@@ -109,6 +109,12 @@ pub struct Verdict {
     pub visible_idle: bool,
     /// Work in progress is positively on screen.
     pub visible_working: bool,
+    /// The matched rule is a startup gate: answering it is what creates the
+    /// session rather than what continues one. A trust dialog on first run,
+    /// not a permission prompt mid task. The runtime turns this into
+    /// `trust_required` readiness, which is what an automation must not type
+    /// over: bytes sent to a trust screen become a shell command, not a task.
+    pub setup_gate: bool,
 }
 
 /// Why a manifest was rejected.
@@ -189,6 +195,10 @@ struct Rule {
     visible_idle: bool,
     visible_working: bool,
     skip_state_update: bool,
+    /// A startup gate: the session does not exist until this is answered.
+    /// Set in the manifest, never inferred, because only the rule's author
+    /// knows whether the dialog creates a session or continues one.
+    setup_gate: bool,
     gate: Gate,
 }
 
@@ -297,6 +307,11 @@ struct RawRule {
     visible_working: bool,
     #[serde(default)]
     skip_state_update: bool,
+    /// A startup gate: answering creates the session rather than continuing
+    /// one. False for every mid-task approval, which waits on a person but
+    /// with a live session behind it.
+    #[serde(default)]
+    setup_gate: bool,
     // The gate is spelled out here rather than flattened, because serde's `flatten` and
     // `deny_unknown_fields` cannot both apply to the same struct.
     contains: Option<String>,
@@ -459,6 +474,7 @@ impl Manifest {
                 visible_idle: r.visible_idle,
                 visible_working: r.visible_working,
                 skip_state_update: r.skip_state_update,
+                setup_gate: r.setup_gate,
                 gate,
             });
         }
@@ -512,6 +528,7 @@ impl Manifest {
             visible_blocker: rule.visible_blocker,
             visible_idle: rule.visible_idle,
             visible_working: rule.visible_working,
+            setup_gate: rule.setup_gate,
         })
     }
 }
@@ -1203,6 +1220,10 @@ contains = "do you want to proceed"
         let v = verdict("codex", &["Allow command?", "  Yes  No"]).expect("an approval request");
         assert_eq!(v.state, AgentRuntimeState::Blocked);
         assert!(v.visible_blocker);
+        assert!(
+            !v.setup_gate,
+            "a mid-task approval waits on a person with a live session behind it: {v:?}"
+        );
     }
 
     #[test]
@@ -1216,6 +1237,10 @@ contains = "do you want to proceed"
         )
         .expect("the trust dialog blocks startup");
         assert_eq!(v.state, AgentRuntimeState::Blocked);
+        assert!(
+            v.setup_gate,
+            "answering the trust dialog creates the session: {v:?}"
+        );
     }
 
     #[test]

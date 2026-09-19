@@ -1198,11 +1198,8 @@ async fn a_finished_opencode_matching_no_rule_reads_idle() {
     let d = TestDaemon::start().await;
     let mut c = d.attach("opencode-fallback").await;
     let terminal = d.terminals().streams()[0];
-    c.input_to(
-        terminal,
-        format!("{} plain\n", binary.display()).as_bytes(),
-    )
-    .await;
+    c.input_to(terminal, format!("{} plain\n", binary.display()).as_bytes())
+        .await;
 
     assert_eq!(
         wait_for_state(&d, terminal, qoro_domain::AgentRuntimeState::Working, 15).await,
@@ -1216,4 +1213,151 @@ async fn a_finished_opencode_matching_no_rule_reads_idle() {
         d.agent(terminal).map(|a| (a.belief.state, a.belief.source)),
     );
     c.input_to(terminal, &[0x03]).await;
+}
+
+/// Two clients hold different terminals and neither disturbs the other.
+///
+/// There is no daemon-global focused terminal: focus is per connection, so
+/// one client moving, subscribing, or leaving never reroutes what the other
+/// sees. This is the failure a global focus has, where a
+/// server-side focus move leaves a connected client's viewport behind.
+#[tokio::test]
+async fn two_clients_hold_different_terminals_with_no_shared_focus() {
+    let d = TestDaemon::start().await;
+    let first = d.terminals().streams()[0];
+    let mut maker = d.attach("maker").await;
+    let created = maker
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "r1".into(),
+                cwd: None,
+                workspace: None,
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    let second = terminal_of(&created);
+    assert_ne!(first, second);
+
+    // Each client watches its own terminal and types into it.
+    // A fresh connection auto-subscribes to the lowest terminal, so b starts
+    // holding `first`: drop it before holding `second`, or both clients hold
+    // `first` and the test proves nothing about isolation.
+    let mut a = d.attach("a").await;
+    let mut b = d.attach("b").await;
+    match b
+        .control(
+            &ControlRequest::Unsubscribe {
+                id: "b-drop-auto".into(),
+                terminals: vec![first],
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("b drops the auto subscription")
+    {
+        ControlResponse::Subscribed { terminals, .. } => assert!(
+            terminals.contains(&first),
+            "b never held the auto subscription it had to drop: {terminals:?}"
+        ),
+        other => panic!("expected an unsubscribe answer, got {other:?}"),
+    }
+    match a
+        .control(
+            &ControlRequest::Subscribe {
+                id: "a-sub".into(),
+                terminals: vec![first],
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a subscribes")
+    {
+        ControlResponse::Subscribed { terminals, .. } => assert!(
+            terminals.contains(&first),
+            "a's subscribe did not hold its terminal: {terminals:?}"
+        ),
+        other => panic!("expected a subscription, got {other:?}"),
+    }
+    match b
+        .control(
+            &ControlRequest::Subscribe {
+                id: "b-sub".into(),
+                terminals: vec![second],
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("b subscribes")
+    {
+        ControlResponse::Subscribed { terminals, .. } => assert!(
+            terminals.contains(&second),
+            "b's subscribe did not hold its terminal: {terminals:?}"
+        ),
+        other => panic!("expected a subscription, got {other:?}"),
+    }
+    a.input_to(first, b"echo ALPHA_$((6*7))\n").await;
+    b.input_to(second, b"echo BETA_$((6*8))\n").await;
+    assert!(
+        a.wait_for_text_on(first, "ALPHA_42", PATIENCE).await,
+        "client a lost its own terminal's output"
+    );
+    assert!(
+        b.wait_for_text_on(second, "BETA_48", PATIENCE).await,
+        "client b lost its own terminal's output"
+    );
+
+    // Client b drops its own subscription. Client a's view of the first
+    // terminal is unaffected: nothing one connection does reroutes another's
+    // renders. Unsubscribing from the terminal b actually holds (not a
+    // no-op), and the response names what was dropped.
+    match b
+        .control(
+            &ControlRequest::Unsubscribe {
+                id: "b-unsub".into(),
+                terminals: vec![second],
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("b unsubscribes")
+    {
+        ControlResponse::Subscribed { terminals, .. } => assert!(
+            terminals.contains(&second),
+            "b's unsubscribe dropped nothing it held: {terminals:?}"
+        ),
+        other => panic!("expected an unsubscribe answer, got {other:?}"),
+    }
+    a.input_to(first, b"echo STILL_$((6*9))\n").await;
+    assert!(
+        a.wait_for_text_on(first, "STILL_54", PATIENCE).await,
+        "one client's unsubscribe disturbed another client's renders"
+    );
+
+    // Both clients read the same index: it is per daemon, never per focus.
+    // Compared by terminal membership only: states settle asynchronously
+    // (~80 ms detector), so two sequential reads can straddle a transition
+    // on a correct daemon.
+    async fn index_terminals(c: &mut qoro_testkit::TestClient) -> Vec<u32> {
+        match c
+            .control(&ControlRequest::ListAgents { id: "idx".into() }, PATIENCE)
+            .await
+            .expect("an index")
+        {
+            ControlResponse::Agents { mut agents, .. } => {
+                agents.sort_by_key(|r| r.terminal);
+                agents.iter().map(|r| r.terminal).collect::<Vec<_>>()
+            }
+            other => panic!("expected an index, got {other:?}"),
+        }
+    }
+    let from_a = index_terminals(&mut a).await;
+    let from_b = index_terminals(&mut b).await;
+    assert_eq!(from_a, from_b, "two clients read different indexes");
+    assert!(
+        from_a.contains(&first) && from_a.contains(&second),
+        "the shared index is missing a terminal: {from_a:?}"
+    );
 }

@@ -67,3 +67,39 @@ written to the socket.
 Those samples are now counted as unobservable and excluded, with the count printed. The
 quiet scenario has no such effect, so a timeout there is a real sample and is recorded at
 the timeout rather than dropped.
+
+## Run of 2026-09-19 (debug build, two new scenarios, final methodology)
+
+New since the run above: `fan-out delivery` (4 clients on 4 terminals, slowest
+client per round, delivery awaited concurrently so no client is charged for
+another's wait) and `reconnect catch-up` (fresh client sees prior output with
+no retype, clock starting before the connect so the number is the full
+reattach path). Both measured, neither has a section-7 budget yet, so none is
+asserted. Harness fixes in this run: the attach scenario matches any
+cursor-addressing sequence rather than a bare home the painter never emits,
+and bench spawns strip `QORO_SESSION`, `QORO_TOKEN` and `QORO_TERMINAL`, so a
+run inside a qoro terminal measures the bench and not the surrounding session.
+
+```
+qoro binary under test: /Users/me/coding/qoro/target/debug/qoro
+git rev: 10fca21
+input latency path: real socket, real pty, real shell echo; daemon in this process, so one process boundary and the client's terminal handling are not included
+note: 3 R-prefixed echoes were scrolled away before any snapshot carried them and are excluded as unobservable, not as slow
+note: fan-out spread (slowest minus fastest client per round) p95 is 1.362 ms over 50 rounds; the table below reports the slowest client
+
+scenario                                           unit        p50        p90        p95        p99        max     n  budget
+qoro --version                                       ms      1.908      2.033      2.095      2.233      2.233    50  PASS p95 2.095 vs budget 50.000 (p95 under 50 ms, section 7)
+attach to a running daemon                           ms      7.833      8.315      9.821     10.180     10.180    30  PASS p95 9.821 vs budget 75.000 (p95 under 75 ms, section 7)
+input latency, local, quiet                          ms      0.425      0.562      0.623      0.727      0.778   200  PASS p50 0.425 vs budget 2.000 (p50 under 2 ms, section 7)
+input latency, streaming ~1 MiB/s to itself          ms      0.513      0.971      1.089      1.349      1.432   200  PASS p95 1.089 vs budget 8.000 (p95 under 8 ms, section 7)
+one terminal's growth in a fresh daemon, 80x24 scrolled    KiB   2256.000   2320.000   2320.000   2320.000   2320.000     3  ---- no stated budget
+one terminal's growth in a fresh daemon, 200x50 scrolled    KiB   5376.000   5376.000   5376.000   5376.000   5376.000     3  ---- no stated budget
+fan-out delivery, 4 clients on 4 terminals           ms      1.633      2.276      2.418      2.473      2.473    50  ---- no stated budget
+reconnect catch-up, fresh client, no retype          ms      0.136      0.155      0.159      0.161      0.161    20  ---- no stated budget
+```
+
+Reading: attach p95 9.8 ms against a 75 ms budget; fan-out slowest-client
+p50 1.6 ms with a 1.4 ms p95 spread between the four clients, so one busy
+client does not stall the rest; a fresh client catches up to prior output in
+0.14 ms with no retype. Full JSONL for this run is in the bench output, eight
+lines, all with `"error":null`.

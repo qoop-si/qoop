@@ -44,6 +44,15 @@ pub struct Frame<'a> {
     pub hint: Option<&'a str>,
     /// Which idle groups of the agents panel are expanded.
     pub fold: sidebar::Fold,
+    /// The agents panel as labelled groups, or as a flat urgency list.
+    pub view: sidebar::View,
+    /// The done rows this client has already looked at.
+    pub seen: &'a sidebar::Seen,
+    /// The animation step the working spinner is on.
+    ///
+    /// Advanced by the run loop while an agent is working, held while none is: a still
+    /// panel is a panel with nothing to say, and a ticking one is a repainting one.
+    pub tick: u64,
     /// The open search palette, drawn over the terminal when present.
     pub palette: Option<&'a Palette>,
     /// The open naming box, drawn over everything when a person is being asked what to
@@ -77,7 +86,7 @@ pub struct Frame<'a> {
 
 /// Every command the prefix takes, for a window wide enough to read them all.
 const EVERY_KEY: &str =
-    "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  d detach";
+    "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  d detach";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -217,6 +226,9 @@ pub fn paint(frame: &Frame) -> String {
             frame.focused,
             column_rows,
             &frame.fold,
+            frame.tick,
+            frame.view,
+            frame.seen,
         )
     } else {
         Vec::new()
@@ -245,35 +257,57 @@ pub fn paint(frame: &Frame) -> String {
                 (false, None) => theme::fg(theme::Role::Text),
             };
             out.push_str(&base);
-            match line.accent {
-                // One run inside the row in a colour of its own, which is the name of the
-                // space the row belongs to. Painted by cutting the row at its edges rather
-                // than by drawing over it, so the row is still written once and left to
-                // right, and a wide character in a name cannot be split.
-                Some((at, len, role)) if len > 0 && at + len <= width::width(&line.text) => {
-                    let cut = |from: usize, to: usize| {
-                        line.text
-                            .chars()
-                            .scan(0usize, |col, c| {
-                                let start = *col;
-                                *col += width::columns(c);
-                                Some((start, c))
-                            })
-                            .filter(|(start, _)| *start >= from && *start < to)
-                            .map(|(_, c)| c)
-                            .collect::<String>()
-                    };
-                    out.push_str(&cut(0, at));
-                    out.push_str(&if selected {
+            // The coloured runs inside the row: the space's name on the number, the
+            // opening sign at column zero. Painted by cutting the row at their edges
+            // rather than by drawing over it, so the row is still written once and left to
+            // right, and a wide character in a name cannot be split. The two runs never
+            // overlap by construction (one opens the row, one closes it); ordered by
+            // column, the paint below reads as one pass over the text.
+            let mut runs: Vec<(usize, usize, theme::Role)> = Vec::new();
+            if let Some(run) = line.accent {
+                runs.push(run);
+            }
+            if let Some(run) = line.indicator {
+                runs.push(run);
+            }
+            runs.retain(|(at, len, _)| *len > 0 && at + len <= width::width(&line.text));
+            runs.sort_by_key(|(at, _, _)| *at);
+            if runs.is_empty() {
+                out.push_str(&line.text);
+            } else {
+                let cut = |from: usize, to: usize| {
+                    line.text
+                        .chars()
+                        .scan(0usize, |col, c| {
+                            let start = *col;
+                            *col += width::columns(c);
+                            Some((start, c))
+                        })
+                        .filter(|(start, _)| *start >= from && *start < to)
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                };
+                let escape = |role: theme::Role| {
+                    if selected {
                         theme::selected_in(role)
                     } else {
                         theme::fg(role)
-                    });
+                    }
+                };
+                let mut pos = 0;
+                for (at, len, role) in runs {
+                    // A run that starts inside the previous one is a caller bug, and the
+                    // honest answer is to skip it rather than paint backwards.
+                    if at < pos {
+                        continue;
+                    }
+                    out.push_str(&cut(pos, at));
+                    out.push_str(&escape(role));
                     out.push_str(&cut(at, at + len));
                     out.push_str(&base);
-                    out.push_str(&cut(at + len, width::width(&line.text)));
+                    pos = at + len;
                 }
-                _ => out.push_str(&line.text),
+                out.push_str(&cut(pos, width::width(&line.text)));
             }
             out.push_str(theme::RESET);
         }
@@ -881,6 +915,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                 " ctrl-a p      previous tab".to_string(),
                 " ctrl-a S      previous space".to_string(),
                 " ctrl-a f      fold the idle groups".to_string(),
+                " ctrl-a g      agents as groups or by urgency".to_string(),
                 " ctrl-a l      repaint".to_string(),
                 " ctrl-q        detach".to_string(),
                 // The mouse is not a key, and it is the part of this a person is least
@@ -1234,6 +1269,7 @@ mod tests {
             behind: None,
             state: state.to_string(),
             generation: Some(1),
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1284,6 +1320,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1329,6 +1368,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1366,6 +1408,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1411,6 +1456,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1453,6 +1501,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1509,6 +1560,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1565,6 +1619,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1610,6 +1667,9 @@ mod tests {
                 reading: None,
                 selection: None,
                 scroll: 0,
+                tick: 0,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -1653,6 +1713,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1691,6 +1754,9 @@ mod tests {
                 reading: None,
                 selection: None,
                 scroll: 0,
+                tick: 0,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -1731,6 +1797,9 @@ mod tests {
                 reading: None,
                 selection: None,
                 scroll: 0,
+                tick: 0,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -1789,6 +1858,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1813,6 +1885,64 @@ mod tests {
             painted.contains(&theme::fg(theme::Role::Working))
                 || painted.contains(&theme::selected_in(theme::Role::Working)),
             "the state lost its colour to the space: {painted:?}"
+        );
+    }
+
+    /// The spinner reaches the screen: two ticks paint two frames, and the head wears
+    /// an ember rather than the row's own state colour.
+    #[test]
+    fn the_working_spinner_advances_with_the_tick() {
+        let rows = [row(1, "claude", "working")];
+        let paint_at = |tick: u64| {
+            paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols: 80,
+                lines: 24,
+                message: None,
+                hint: None,
+                fold: sidebar::Fold::all_open(),
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &crate::run::Behind {
+                    terminal: 0,
+                    from: 0,
+                    lines: Vec::new(),
+                    total: 0,
+                },
+            })
+        };
+        let first = paint_at(0);
+        let second = paint_at(1);
+        assert_ne!(first, second, "the tick changed nothing on screen");
+        // Either form, because the row may also have the keyboard.
+        assert!(
+            first.contains(&theme::fg(theme::Role::Ember(0)))
+                || first.contains(&theme::selected_in(theme::Role::Ember(0))),
+            "no ember on screen: {first:?}"
+        );
+        // The spinner glyph itself reached the screen, on the agent's row.
+        assert!(strip(&first).contains("\u{2809}"), "no spinner: {first:?}");
+        // The status sentence keeps the word on purpose: it says what the focused
+        // terminal is doing in prose, which is a different surface from the panel.
+        // Only the panel trades the word for the spinner.
+        assert!(
+            strip(&first).contains("app / claude, working"),
+            "the status line lost its sentence: {first:?}"
         );
     }
 
@@ -1844,6 +1974,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1924,6 +2057,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -1947,6 +2083,7 @@ mod tests {
             behind: None,
             state: "blocked".to_string(),
             generation: Some(1),
+            readiness: "ready".to_string(),
         }
     }
 
@@ -1973,6 +2110,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2012,6 +2152,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2048,6 +2191,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2085,6 +2231,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2151,6 +2300,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2222,6 +2374,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2260,9 +2415,13 @@ mod tests {
                 behind: None,
                 state: state.to_string(),
                 generation: Some(1),
+                readiness: "ready".to_string(),
             })
             .collect();
         let snapshot = snapshot(&["output"]);
+        // Terminal 5 is done and already looked at, so it folds like before.
+        let mut seen = sidebar::Seen::new();
+        seen.insert((5, 1));
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
@@ -2283,6 +2442,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &seen,
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2323,6 +2485,9 @@ mod tests {
             reading: None,
             selection: Some(selection),
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2378,6 +2543,9 @@ mod tests {
                 reading: None,
                 selection,
                 scroll: 0,
+                tick: 0,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
                 anchor: 0,
                 rows_back: 0,
                 tiles: Vec::new(),
@@ -2422,6 +2590,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 2,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             // Pinned to the second to last row written, so the pane shows the last two
             // rows that went past and then the screen from its top.
             anchor: 98,
@@ -2475,6 +2646,9 @@ mod tests {
             reading: None,
             selection: None,
             scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
@@ -2560,6 +2734,9 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             behind: &behind,
         })
     }
@@ -2592,6 +2769,9 @@ mod tests {
             anchor: 0,
             rows_back: 0,
             tiles: Vec::new(),
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             behind: &behind,
         });
         let tiled = paint(&Frame {
@@ -2625,6 +2805,9 @@ mod tests {
                 snapshot: Some(&snap),
                 focused: true,
             }],
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
             behind: &behind,
         });
         assert_eq!(tiled, legacy);
