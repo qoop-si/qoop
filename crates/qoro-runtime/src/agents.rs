@@ -55,6 +55,15 @@ pub struct TerminalAgent {
     /// than continuing one. Set from the matched manifest rule, never
     /// inferred, and cleared by any later screen reading without one.
     pub setup_gate: bool,
+    /// The rule the screen last matched in this generation, if any.
+    ///
+    /// What `qoro agents explain` reports. Recorded on every evaluation,
+    /// accepted or outranked: it says what the screen claimed, while the
+    /// belief says what was concluded. Cleared with the belief on every
+    /// generation change, because it described a process that is gone.
+    pub screen_rule: Option<String>,
+    /// The manifest that produced `screen_rule`, by id. Cleared with it.
+    pub screen_manifest: Option<String>,
     /// The foreground leader this identity was read from.
     pub leader: Option<Pid>,
 }
@@ -145,8 +154,11 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
     agent.leader = None;
     agent.belief = fresh_belief(agent.capability.generation);
     // A dead process shows no dialog: the exit voids any gate the old
-    // screen set, with the old belief.
+    // screen set, with the old belief. The old screen's rule reading goes
+    // with it, for the same reason.
     agent.setup_gate = false;
+    agent.screen_rule = None;
+    agent.screen_manifest = None;
     let idle = qoro_domain::AgentObservation {
         agent_id: qoro_domain::AgentId::new(stream.to_string()),
         terminal_id: agent.capability.terminal.clone(),
@@ -208,6 +220,8 @@ impl AgentRegistry {
                 identity: AgentIdentity::None,
                 belief: fresh_belief(generation),
                 setup_gate: false,
+                screen_rule: None,
+                screen_manifest: None,
                 leader: None,
             },
         );
@@ -305,8 +319,11 @@ impl AgentRegistry {
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
             // The gate belonged to the old generation's screen: a new process
-            // means the old dialog reading is void, not held.
+            // means the old dialog reading is void, not held. The old rule
+            // reading is void with it.
             agent.setup_gate = false;
+            agent.screen_rule = None;
+            agent.screen_manifest = None;
             agent.identity = AgentIdentity::Known {
                 program,
                 generation,
@@ -323,8 +340,10 @@ impl AgentRegistry {
         agent.belief = fresh_belief(generation);
         // A new foreground generation voids the old screen's gate with the
         // old belief: whatever dialog was showing belonged to a process that
-        // is no longer there.
+        // is no longer there. The old rule reading belonged to it too.
         agent.setup_gate = false;
+        agent.screen_rule = None;
+        agent.screen_manifest = None;
         agent.identity = match leader {
             None => AgentIdentity::None,
             Some(pid) => {
@@ -373,7 +392,10 @@ impl AgentRegistry {
             agent.belief = fresh_belief(generation);
             // The gate belonged to the exited or execed process: a new
             // generation voids the old screen's reading with the old belief.
+            // The old rule reading goes with it.
             agent.setup_gate = false;
+            agent.screen_rule = None;
+            agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
                 settle_exit(agent, stream);
@@ -401,11 +423,22 @@ impl AgentRegistry {
     /// caller of it.
     ///
     /// Answers whether anything changed, so a caller can avoid announcing a non event.
-    pub fn observe_screen(&self, stream: u32, verdict: &qoro_detect::Verdict) -> bool {
+    pub fn observe_screen(
+        &self,
+        stream: u32,
+        manifest: &str,
+        verdict: &qoro_detect::Verdict,
+    ) -> bool {
         let mut terminals = self.terminals.lock().unwrap();
         let Some(agent) = terminals.get_mut(&stream) else {
             return false;
         };
+        // Recorded before acceptance, and kept when outranked: the rule says
+        // what the screen claimed, the belief says what was concluded, and an
+        // explanation needs both halves to say why a state reads the way it
+        // does.
+        agent.screen_rule = Some(verdict.rule.clone());
+        agent.screen_manifest = Some(manifest.to_string());
         let generation = agent.belief.generation;
         let observation = qoro_domain::AgentObservation {
             agent_id: qoro_domain::AgentId::new(stream.to_string()),
@@ -628,6 +661,43 @@ mod tests {
         assert_eq!(r.note_foreground(1, Some(me)), None);
     }
 
+    /// Explain: the screen's last rule rides the terminal even when the reading
+    /// is outranked, and dies with the generation it described. An explanation
+    /// that only showed accepted readings could never say why a state stuck.
+    #[test]
+    fn the_screen_rule_is_recorded_even_when_outranked_and_cleared_on_a_new_generation() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        // A hook holds Blocked; a screen Working with no blocker is refused...
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Blocked,
+            true,
+            false,
+        )
+        .expect("applies");
+        assert!(!r.observe_screen(
+            1,
+            "claude",
+            &screen_verdict(AgentRuntimeState::Working, false)
+        ));
+        // ...but the explanation still says what the screen claimed.
+        let seen = r.agent(1).expect("agent");
+        assert_eq!(seen.belief.state, AgentRuntimeState::Blocked);
+        assert_eq!(seen.screen_rule.as_deref(), Some("test"));
+        assert_eq!(seen.screen_manifest.as_deref(), Some("claude"));
+        // A new foreground generation voids the old screen's reading with the
+        // old belief: the rule described a process that is no longer there.
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me)).expect("a change");
+        let after = r.agent(1).expect("agent");
+        assert_eq!(after.screen_rule, None);
+        assert_eq!(after.screen_manifest, None);
+    }
+
     #[test]
     fn a_claim_is_admitted_only_with_this_terminals_token() {
         let r = registry();
@@ -681,7 +751,11 @@ mod tests {
         let r = registry();
         let token = mint_token(1);
         r.register(1, TerminalId::new("1"), token.clone());
-        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, false)));
+        assert!(r.observe_screen(
+            1,
+            "test-manifest",
+            &screen_verdict(AgentRuntimeState::Working, false)
+        ));
         let changed = r
             .observe_hook(
                 1,
@@ -722,7 +796,11 @@ mod tests {
         // A newer screen reading that positively sees a blocker must win, which
         // is exactly what a leaked wall clock would break: no later screen
         // sequence could ever exceed nanos.
-        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Blocked, true)));
+        assert!(r.observe_screen(
+            1,
+            "test-manifest",
+            &screen_verdict(AgentRuntimeState::Blocked, true)
+        ));
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Blocked
@@ -849,17 +927,28 @@ mod tests {
         let _ = rx.try_recv(); // the registration announcement
 
         let working = screen_verdict(AgentRuntimeState::Working, false);
-        assert!(r.observe_screen(1, &working));
+        assert!(r.observe_screen(1, "test-manifest", &working));
         rx.try_recv().expect("the change announces");
         for _ in 0..10 {
-            assert!(!r.observe_screen(1, &working), "no change, no publish");
+            assert!(
+                !r.observe_screen(1, "test-manifest", &working),
+                "no change, no publish"
+            );
         }
         assert!(rx.try_recv().is_err(), "the soak must not publish anything");
 
         // Same state, newly visible blocker: observable, so published once.
-        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, true)));
+        assert!(r.observe_screen(
+            1,
+            "test-manifest",
+            &screen_verdict(AgentRuntimeState::Working, true)
+        ));
         rx.try_recv().expect("the new blocker announces");
-        assert!(!r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, true)));
+        assert!(!r.observe_screen(
+            1,
+            "test-manifest",
+            &screen_verdict(AgentRuntimeState::Working, true)
+        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -945,7 +1034,7 @@ mod tests {
             visible_working: false,
             setup_gate: false,
         };
-        assert!(r.observe_screen(1, &composer));
+        assert!(r.observe_screen(1, "test-manifest", &composer));
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Idle
@@ -968,9 +1057,13 @@ mod tests {
             visible_working: false,
             setup_gate: true,
         };
-        assert!(r.observe_screen(1, &trust));
+        assert!(r.observe_screen(1, "test-manifest", &trust));
         assert!(r.agent(1).expect("agent").setup_gate);
-        assert!(r.observe_screen(1, &screen_verdict(AgentRuntimeState::Working, false)));
+        assert!(r.observe_screen(
+            1,
+            "test-manifest",
+            &screen_verdict(AgentRuntimeState::Working, false)
+        ));
         assert!(!r.agent(1).expect("agent").setup_gate);
     }
 
@@ -990,7 +1083,7 @@ mod tests {
             visible_working: false,
             setup_gate: true,
         };
-        assert!(r.observe_screen(1, &trust));
+        assert!(r.observe_screen(1, "test-manifest", &trust));
         assert!(r.agent(1).expect("agent").setup_gate);
         r.observe_hook(
             1,

@@ -2817,6 +2817,9 @@ mod tests {
             state: state.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 

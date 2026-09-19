@@ -217,6 +217,9 @@ mod tests {
             state: state.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -231,6 +234,9 @@ mod tests {
             state: "idle".to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 

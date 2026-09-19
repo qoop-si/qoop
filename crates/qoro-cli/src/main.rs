@@ -100,6 +100,8 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
                   \x20 qoro agents [--json]  list every terminal and what it is doing\n\
+                  \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
+                  \x20                 the way it does: state, authority, matched rule\n\
                   \x20 qoro master brief  print the default supervisor instructions\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
                  \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
@@ -1126,15 +1128,38 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
 fn run_agents(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
-    let usage = "usage: qoro agents [--json]";
-    let mut json = false;
-    for arg in args.iter().skip(2) {
-        if arg == "--json" {
-            json = true;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "unknown flag {arg}; {usage}"
-            )));
+    let usage = "usage: qoro agents [--json]\n       qoro agents explain <target> [--json]";
+    enum Mode<'a> {
+        List { json: bool },
+        Explain { target: &'a str, json: bool },
+    }
+    let mut mode = Mode::List { json: false };
+    let mut rest = args.iter().skip(2);
+    if rest.clone().next().is_some_and(|a| a == "explain") {
+        rest.next();
+        let Some(target) = rest.next() else {
+            return Err(std::io::Error::other(usage.to_string()));
+        };
+        let mut json = false;
+        for arg in rest {
+            if arg == "--json" {
+                json = true;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "unknown flag {arg}; {usage}"
+                )));
+            }
+        }
+        mode = Mode::Explain { target, json };
+    } else {
+        for arg in rest {
+            if arg == "--json" {
+                mode = Mode::List { json: true };
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "unknown flag {arg}; {usage}"
+                )));
+            }
         }
     }
 
@@ -1175,14 +1200,33 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
                 ));
             }
         };
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string(&agents).map_err(std::io::Error::other)?
-            );
-        } else {
-            for row in &agents {
-                println!("{}", agent_line(row));
+        match mode {
+            Mode::List { json } => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&agents).map_err(std::io::Error::other)?
+                    );
+                } else {
+                    for row in &agents {
+                        println!("{}", agent_line(row));
+                    }
+                }
+            }
+            Mode::Explain { target, json } => {
+                // The listing is the only reader of the registry, so the
+                // explanation filters it rather than asking a second
+                // question: two answers to "what is there" would be two
+                // answers.
+                let row = resolve_target(&agents, target).map_err(std::io::Error::other)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(row).map_err(std::io::Error::other)?
+                    );
+                } else {
+                    print!("{}", explain_row(row));
+                }
             }
         }
         Ok(())
@@ -1221,6 +1265,34 @@ fn agent_line(row: &qoro_runtime::control::AgentRow) -> String {
     format!(
         "term={} state={} program={} name={} workspace={} generation={}",
         row.terminal, row.state, program, name, row.workspace, generation
+    )
+}
+
+/// Why one terminal reads the way it does, for `qoro agents explain`.
+///
+/// The belief first (state plus the source that holds it), then what the
+/// screen last matched in this generation. A missing rule is an answer, not
+/// a gap: it says the screen matched nothing since the generation began.
+fn explain_row(row: &qoro_runtime::control::AgentRow) -> String {
+    let program = row.program.as_deref().unwrap_or("-");
+    let generation = row
+        .generation
+        .map(|g| g.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let source = row.source.as_deref().unwrap_or("unobserved");
+    let rule = row.rule.as_deref().unwrap_or("-");
+    let manifest = row.manifest.as_deref().unwrap_or("-");
+    format!(
+        "terminal={} state={} source={} program={} generation={} readiness={} workspace={}\nrule={} manifest={}\n",
+        row.terminal,
+        row.state,
+        source,
+        program,
+        generation,
+        row.readiness,
+        row.workspace,
+        rule,
+        manifest,
     )
 }
 
@@ -1388,7 +1460,7 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{prompt_refusal, resolve_target};
+    use super::{explain_row, prompt_refusal, resolve_target};
     use qoro_runtime::control::AgentRow;
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
@@ -1402,6 +1474,9 @@ mod tests {
             agent: true,
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -1409,6 +1484,35 @@ mod tests {
     fn a_terminal_number_resolves_before_any_name() {
         let rows = vec![row(1, Some("1"), None), row(2, None, Some("sh"))];
         assert_eq!(resolve_target(&rows, "2").unwrap().terminal, 2);
+    }
+
+    #[test]
+    fn an_explanation_names_the_authority_and_the_rule() {
+        let mut explained = row(2, None, Some("claude"));
+        explained.state = "blocked".into();
+        explained.source = Some("ScreenHeuristic".into());
+        explained.rule = Some("needs_approval".into());
+        explained.manifest = Some("claude".into());
+        let text = explain_row(&explained);
+        assert!(
+            text.contains("state=blocked") && text.contains("source=ScreenHeuristic"),
+            "the belief and its authority come first: {text}"
+        );
+        assert!(
+            text.contains("rule=needs_approval") && text.contains("manifest=claude"),
+            "then what the screen matched: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_screen_is_an_answer_not_a_gap() {
+        // No rule since the generation began: the row says so plainly
+        // rather than leaving the field out.
+        let text = explain_row(&row(1, None, Some("sh")));
+        assert!(
+            text.contains("source=unobserved") && text.contains("rule=-"),
+            "silence reads as unmatched: {text}"
+        );
     }
 
     #[test]

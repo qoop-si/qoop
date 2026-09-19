@@ -31,6 +31,9 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         state: state.to_string(),
         generation: None,
         readiness: "ready".to_string(),
+        source: None,
+        rule: None,
+        manifest: None,
     }
 }
 

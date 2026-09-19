@@ -339,6 +339,28 @@ pub struct AgentRow {
     /// Bumped when the process in the terminal is replaced, so a client can tell a new
     /// agent from a new state.
     pub generation: Option<u64>,
+    /// Which source holds the belief: `Hook`, `ScreenHeuristic`, `ProcessIdentity`.
+    ///
+    /// What `qoro agents explain` shows as the authority behind the state. Absent
+    /// when no observation has been accepted yet, and absent on rows from a
+    /// daemon that predates the field.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The screen rule that last matched in this generation, if any.
+    ///
+    /// The rule's name, never the screen it matched: a screen is somebody's
+    /// source code and their client's name. `known_agent_idle_fallback`
+    /// means no rule matched and the known-agent fallback read idle. Absent
+    /// when the screen has not been evaluated in this generation, and absent
+    /// on rows from a daemon that predates the field.
+    #[serde(default)]
+    pub rule: Option<String>,
+    /// The manifest that produced the rule, by id.
+    ///
+    /// Absent together with `rule`. Absent on rows from a daemon that
+    /// predates the field.
+    #[serde(default)]
+    pub manifest: Option<String>,
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -462,6 +484,27 @@ mod tests {
             serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"blocked"}"#)
                 .expect("decode");
         assert_eq!(row.readiness, "unknown");
+    }
+
+    #[test]
+    fn an_explanation_from_an_older_daemon_is_absent_rather_than_wrong() {
+        // No `source`, `rule` or `manifest` keys: the row predates the
+        // fields, and silence must read as "nothing to say" rather than as a
+        // rule that never matched.
+        let row: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"blocked"}"#)
+                .expect("decode");
+        assert_eq!(row.source, None);
+        assert_eq!(row.rule, None);
+        assert_eq!(row.manifest, None);
+        // And a row that carries them keeps them across the wire.
+        let explained: AgentRow = serde_json::from_str(
+            r#"{"terminal":2,"workspace":1,"state":"blocked","source":"ScreenHeuristic","rule":"needs_approval","manifest":"claude"}"#,
+        )
+        .expect("decode");
+        assert_eq!(explained.source.as_deref(), Some("ScreenHeuristic"));
+        assert_eq!(explained.rule.as_deref(), Some("needs_approval"));
+        assert_eq!(explained.manifest.as_deref(), Some("claude"));
     }
 
     #[test]

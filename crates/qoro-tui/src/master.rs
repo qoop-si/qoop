@@ -667,6 +667,9 @@ mod tests {
             state: state.to_string(),
             generation: Some(1),
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -681,6 +684,9 @@ mod tests {
             state: state.to_string(),
             generation: Some(1),
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -804,6 +810,9 @@ mod tests {
                 state: "failed".to_string(),
                 generation: None,
                 readiness: "ready".to_string(),
+                source: None,
+                rule: None,
+                manifest: None,
             },
         ];
         let spaces = vec![space(1, "app")];
@@ -1058,6 +1067,9 @@ mod tests {
                     state: "blocked".to_string(),
                     generation: Some(1),
                     readiness: "ready".to_string(),
+                    source: None,
+                    rule: None,
+                    manifest: None,
                 },
                 // A second row under the same triage state, so a test can tell
                 // whether the approval follows the paint or the file.

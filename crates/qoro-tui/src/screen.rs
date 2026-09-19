@@ -1408,6 +1408,9 @@ mod tests {
             state: state.to_string(),
             generation: Some(1),
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -2285,6 +2288,9 @@ mod tests {
             state: "blocked".to_string(),
             generation: Some(1),
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -2641,6 +2647,9 @@ mod tests {
                 state: state.to_string(),
                 generation: Some(1),
                 readiness: "ready".to_string(),
+                source: None,
+                rule: None,
+                manifest: None,
             })
             .collect();
         let snapshot = snapshot(&["output"]);

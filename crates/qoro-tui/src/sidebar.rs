@@ -1416,6 +1416,9 @@ mod tests {
             state: state.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -1430,6 +1433,9 @@ mod tests {
             state: "idle".to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -1701,6 +1707,9 @@ mod tests {
             state: state.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }
     }
 
@@ -1813,6 +1822,9 @@ mod tests {
             state: "idle".to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1837,6 +1849,9 @@ mod tests {
             state: UNKNOWN.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2187,6 +2202,9 @@ mod tests {
             state: UNKNOWN.to_string(),
             generation: None,
             readiness: "ready".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
         }];
         let lines = render_folded(
             &[space(1, "app"), space(2, "webshop")],

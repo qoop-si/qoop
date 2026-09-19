@@ -1802,6 +1802,20 @@ async fn handle_control(
                         .map(|a| state_name(a.belief.state))
                         .unwrap_or("unknown")
                         .to_string();
+                    // The explanation rides the row: what holds the belief,
+                    // and what the screen last matched. A client that does
+                    // not know these fields ignores them; `qoro agents
+                    // explain` reads them.
+                    let (source, rule, manifest) = agent
+                        .as_ref()
+                        .map(|a| {
+                            (
+                                Some(format!("{:?}", a.belief.source)),
+                                a.screen_rule.clone(),
+                                a.screen_manifest.clone(),
+                            )
+                        })
+                        .unwrap_or((None, None, None));
                     // Read before the row moves the strings: the mapping only
                     // borrows, and the literal below owns.
                     let readiness = crate::control::readiness_of(
@@ -1838,6 +1852,9 @@ async fn handle_control(
                         state,
                         generation,
                         readiness,
+                        source,
+                        rule,
+                        manifest,
                     }
                 })
                 .collect();
@@ -3566,7 +3583,7 @@ async fn terminal_task(
                             }
                         };
                         if let Some(verdict) = verdict
-                            && agents.observe_screen(stream, &verdict)
+                            && agents.observe_screen(stream, &manifest.id, &verdict)
                         {
                         // Recorded when it changed, not on every look. The log is what a
                         // client that was not connected reads to find out what happened
