@@ -286,9 +286,10 @@ pub fn paint(frame: &Frame) -> String {
         // for the one row that needs them, and a coloured word inside an otherwise grey
         // line is a word they have to find first.
         //
-        // The keyboard's own rows also carry reverse video, which is what the designs
-        // draw as a selected background. The marker character stays: attributes do not
-        // survive a screenshot or a pipe into a file.
+        // The keyboard's own rows also carry the raised background, which is
+        // what the designs draw as a selected background. No marker character:
+        // the rows are static text and the background alone says where the
+        // keyboard is.
         if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
@@ -2073,10 +2074,10 @@ mod tests {
         );
     }
 
-    /// The spinner reaches the screen: two ticks paint two frames, and the head wears
-    /// an ember rather than the row's own state colour.
+    /// The frame is static: two ticks paint the same bytes, the working
+    /// row says its word on the right, and no spinner glyph ever appears.
     #[test]
-    fn the_working_spinner_advances_with_the_tick() {
+    fn the_working_row_is_static_across_ticks() {
         let rows = [row(1, "claude", "working")];
         let paint_at = |tick: u64| {
             paint(&Frame {
@@ -2117,15 +2118,18 @@ mod tests {
         };
         let first = paint_at(0);
         let second = paint_at(1);
-        assert_ne!(first, second, "the tick changed nothing on screen");
-        // Either form, because the row may also have the keyboard.
+        assert_eq!(first, second, "the tick repainted a static screen");
+        // The working row says its word on the right instead of spinning.
         assert!(
-            first.contains(&theme::fg(theme::Role::Ember(0)))
-                || first.contains(&theme::selected_in(theme::Role::Ember(0))),
-            "no ember on screen: {first:?}"
+            strip(&first).contains("working"),
+            "the working word never reached the screen: {first:?}"
         );
-        // The spinner glyph itself reached the screen, on the agent's row.
-        assert!(strip(&first).contains("\u{2809}"), "no spinner: {first:?}");
+        for glyph in ['\u{2809}', '\u{2838}', '\u{28c0}', '\u{2807}'] {
+            assert!(
+                !strip(&first).contains(glyph),
+                "a spinner frame leaked onto the screen: {first:?}"
+            );
+        }
         // The status sentence keeps the word on purpose: it says what the focused
         // terminal is doing in prose, which is a different surface from the panel.
         // Only the panel trades the word for the spinner.

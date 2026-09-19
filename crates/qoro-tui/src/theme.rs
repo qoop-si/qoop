@@ -167,10 +167,11 @@ pub fn status_in(role: Role) -> String {
     format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(role))
 }
 
-/// The tab with the keyboard: a light pill with dark text, which is the one high contrast
-/// thing on the bar and therefore findable without reading it.
+/// The tab with the keyboard: bright text on the same raised background
+/// the selected row wears, never a white pill. The brackets in the text say
+/// which tab it is, so the colour only has to find it, not to prove it.
 pub fn tab_on() -> String {
-    format!("\x1b[0;1;48;5;{};38;5;{}m", TAB_ON_BG, TAB_ON_FG)
+    format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, ink(Role::Focused))
 }
 
 /// Every other tab.
@@ -186,9 +187,6 @@ const SELECTED_BG: u8 = 236;
 /// The raised background of the status bar, a shade below the selected row so the two do
 /// not read as the same thing.
 const STATUS_BG: u8 = 233;
-/// The focused tab's pill.
-const TAB_ON_BG: u8 = 254;
-const TAB_ON_FG: u8 = 233;
 
 #[cfg(test)]
 mod tests {
@@ -219,7 +217,7 @@ mod tests {
         {
             assert!(ink(role) >= 16, "{role:?} uses a themed colour");
         }
-        for bg in [SELECTED_BG, STATUS_BG, TAB_ON_BG, TAB_ON_FG] {
+        for bg in [SELECTED_BG, STATUS_BG] {
             assert!(bg >= 16, "a background uses a themed colour");
         }
     }

@@ -9,10 +9,10 @@
 //! not looking at is exactly the one they need to be told about, and a panel that only
 //! listed the current space would hide it until they went looking.
 //!
-//! Pure text here. The caller paints attributes over these lines, so
-//! the focused space and the focused terminal carry a marker character too: a screenshot, a
-//! test assertion, a pipe into a file and a terminal with no colour all have to answer
-//! "which one has my keyboard".
+//! Pure text here. The caller paints the raised background over the
+//! keyboard's rows, so plain text carries no selection mark: a screenshot,
+//! a test assertion, a pipe into a file and a terminal with no colour all
+//! read the same static rows.
 
 use qoro_runtime::control::{AgentRow, WorkspaceRow};
 
@@ -35,14 +35,9 @@ pub struct Line {
     /// space's colour. A row saying two things in two colours would be a row a person
     /// parses rather than reads.
     pub accent: Option<(usize, usize, crate::theme::Role)>,
-    /// The row's opening sign, painted in a role of its own: always column zero, always
-    /// one column.
-    ///
-    /// The spinner's head while the agent works, the dotted [`WAITING`] circle
-    /// while it idles, the hollow [`STOPPED`] square otherwise.
-    /// One run beside [`Line::accent`] rather than one of many, because these are the
-    /// only two things on a row that are not about the row's own state: where it lives,
-    /// and whether it is alive.
+    /// The row's opening sign, unused. Kept so the painter's shape stays stable:
+    /// every row is static text, the state word on the right says what it is,
+    /// and no tick ever changes a cell. Always `None`.
     pub indicator: Option<(usize, usize, crate::theme::Role)>,
 }
 
@@ -91,18 +86,14 @@ pub const COLLAPSED: usize = 4;
 const SPACES_TITLE: &str = "spaces";
 const AGENTS_TITLE: &str = "agents";
 
-/// Marks the space or the terminal that has the keyboard. Characters and not just
-/// attributes, because attributes do not survive being copied out of a terminal.
-const FOCUSED: char = '\u{25cf}';
-const UNFOCUSED: char = '\u{25cb}';
+/// The column a space's name starts at in the spaces panel: one leading space.
+/// No focus mark: the keyboard's row is the raised background alone, so a
+/// screenshot, a test assertion and a pipe into a file all answer the same.
+const SPACE_NAME_AT: usize = 1;
 
-/// The column a space's name starts at in the spaces panel: a leading space and the focus
-/// mark, then a space.
-const SPACE_NAME_AT: usize = 3;
-
-/// The column an agent's first row starts its names at: a leading space, the
-/// focus mark, and a space.
-const AGENT_NAME_AT: usize = 3;
+/// The column an agent's first row starts its names at: one leading space.
+/// Same reason: no circle at the start, no filled dot for the selected row.
+const AGENT_NAME_AT: usize = 1;
 
 /// Columns held back for the program name when a long state would otherwise eat the row.
 /// A row showing only its state does not say whose state it is.
@@ -118,54 +109,12 @@ const UNKNOWN: &str = "unknown";
 /// is false.
 const UNNAMED: &str = "agent";
 
-/// The idle sign: a dotted circle, worn by rows waiting for work.
+/// The word an unread done row wears on the right.
 ///
-/// The middle rest between turning and stopping: an idle agent is neither doing
-/// something nor raising a signal, so it wears neither the turning head nor the
-/// hollow square. Dotted and faint, one column like every other sign.
-const WAITING: char = '\u{25cc}';
-
-/// The stopped sign: a hollow square, worn by every row that is neither working
-/// nor idle.
-///
-/// The spinner's resting form, and deliberately its kin rather than a word: a row that
-/// stops working should change one cell, not its whole shape. Hollow and faint, so a
-/// still panel reads as a panel at rest. One column by construction, like every head
-/// frame, which is what keeps the name exactly where it was while the sign spins.
-const STOPPED: char = '\u{25a1}';
-
-/// Whether this state spins rather than says its name.
-///
-/// Working and starting are aliveness, and aliveness is what the spinner is for. Every
-/// other state is a signal (`blocked`, `failed`, `done`) or its absence (`idle`,
-/// unobserved), and a signal that spun would stop being read as one.
-fn spins(state: &str) -> bool {
-    matches!(state, "working" | "starting")
-}
-
-/// The spinner's head frames: a braille arc orbiting a circle.
-///
-/// Braille and not quarter blocks, because the orbit reads as motion around
-/// something rather than something filling up: aliveness circling the row's
-/// own sign. Four frames, each exactly one column, which is what the head
-/// column arithmetic counts on.
-const SPIN_HEAD: [char; 4] = ['\u{2809}', '\u{2838}', '\u{28c0}', '\u{2807}'];
-
-/// The ember steps the head cycles through.
-///
-/// Eight against the head's four, so the combination repeats every eight ticks:
-/// a short loop, honestly so, and the colour still never lands on the same frame
-/// twice running.
-const SPIN_EMBERS: usize = 8;
-
-/// The spinner's head at this frame: one quarter-filled circle.
-///
-/// Single, with no trail behind it. A trail doubled the motion on the row and read as
-/// two signs doing the same job; the row opens on one cell that turns and rests as
-/// [`WAITING`] or [`STOPPED`], and that is the whole indicator.
-fn spin_head(tick: u64) -> char {
-    SPIN_HEAD[(tick % SPIN_HEAD.len() as u64) as usize]
-}
+/// A finished agent nobody has looked at is neither `done` nor `idle`: it is
+/// news. It keeps its sage colour but says `new`, so it reads as its own
+/// static state and never hides behind the finished fold.
+const NEW_STATE: &str = "new";
 
 /// The percentage of the column the spaces panel holds, its title and the blank rows under
 /// it included.
@@ -342,17 +291,12 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen) -> u8 {
 
 /// Whether the animation tick has anything to move.
 ///
-/// Working and starting spin. Blocked pulses and an unread done blinks, both
-/// on the same tick. Anything else is a still panel, and a tick that repainted
-/// one would trade the loop's founding rule (no wake without an arrival) for
-/// eight redundant frames a second.
-pub fn wants_tick(rows: &[AgentRow], focused: u32, seen: &Seen) -> bool {
-    rows.iter().any(|row| {
-        row.agent
-            && (spins(&row.state)
-                || matches!(row.state.as_str(), "blocked" | "failed")
-                || is_unread(row, focused, seen))
-    })
+/// Nothing: the panel is fully static. Every state says its word on the
+/// right, an unread done says `new`, and no tick ever repaints. This is what
+/// keeps the loop's founding rule (no wake without an arrival) and stops the
+/// full-screen flicker the spinner's eight frames a second caused.
+pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen) -> bool {
+    false
 }
 
 /// The group an agent state belongs to.
@@ -585,8 +529,11 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
                 Line {
                     // No state colour on the row: a workspace has no state to have one
                     // about. Its name carries its own colour instead, which is the same
-                    // colour the agents panel puts on every agent's mark that lives here.
-                    text: fit(&format!(" {} {}", mark(space.id == focused), space.name)),
+                    // colour the agents panel puts on the space name there.
+                    // No focus mark: the selected row is the raised background
+                    // alone, so there is no hollow circle on every row and no
+                    // filled white dot on the selected one.
+                    text: fit(&format!(" {}", space.name)),
                     colour: None,
                     accent: Some((
                         SPACE_NAME_AT,
@@ -682,14 +629,17 @@ fn agents_panel(
 
 /// The two rows an open agent takes, with what a click on either means.
 ///
-/// First the project and the tab, then the session underneath: `app · release`
+/// First the project and the tab, then the session underneath: ` app · release`
 /// above `claude`. Both rows reach the same terminal, so a click on either
 /// lands on the agent. The space is always named on the first row, which is
 /// what retired the shared-label suffix: with the space on every row there is
 /// no shared label left to qualify.
 ///
-/// `tick` is the frame's animation step. A working agent spends it on the spinner;
-/// every other state ignores it, so a still panel is byte for byte the panel it was.
+/// Static: every state says its word on the right (`working` included), an
+/// unread done says `new`, and `tick` is ignored so a still panel is byte for
+/// byte the panel it was. The keyboard's row is the raised background the
+/// painter adds; there is no circle at the start and no filled dot when
+/// selected.
 ///
 /// One helper and not the same pushes at each caller, because the unfolded
 /// panel and the folded one have to draw the same rows for the same agent.
@@ -698,33 +648,17 @@ fn push_agent_lines(
     spaces: &[WorkspaceRow],
     agent: &AgentRow,
     focused: u32,
-    tick: u64,
+    _tick: u64,
     seen: &Seen,
 ) {
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
     let space = spaces.iter().find(|s| s.id == agent.workspace);
-    // The row opens on its indicator and then the focus mark: a turning circle
-    // says working, a dotted circle says idle, a hollow square says everything
-    // else, and the mark beside it says where the keyboard is. One sign reads
-    // as information; two signs side by side read as exactly two facts.
-    let spinning = spins(&agent.state);
-    let sign = if spinning {
-        spin_head(tick)
-    } else if agent.state == "idle" {
-        WAITING
-    } else {
-        STOPPED
-    };
     let head = match space {
-        Some(space) => format!(
-            "{sign} {} {} \u{b7} {tab}",
-            mark(agent.terminal == focused),
-            space.name
-        ),
+        Some(space) => format!(" {} \u{b7} {tab}", space.name),
         // A space the client has not heard of yet: the row still draws, under
         // the tab alone, rather than vanishing until the index catches up.
-        None => format!("{sign} {} {tab}", mark(agent.terminal == focused)),
+        None => format!(" {tab}"),
     };
     // The state is cut before the names are, but never so far that the space
     // and some of the tab disappear: a row showing only a state does not say
@@ -734,50 +668,28 @@ fn push_agent_lines(
         None => (0, 0),
     };
     let head_least = AGENT_NAME_AT + space_cols + dot_cols + MIN_NAME;
-    // A working agent says nothing on the right and spins on the left instead. The word
-    // `working` trained the eye to read the one column that matters when an agent really
-    // is blocked; the spinner carries aliveness on its own channel, in the brand's own
-    // ambers.
-    let state = if spinning {
-        String::new()
-    } else {
-        clip(
-            shown_state(&agent.state),
-            WIDTH.saturating_sub(head_least + 1),
-        )
-    };
-    let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
-    // The sign is always column zero, so its run is a constant rather than arithmetic.
-    // Three alivenesses, three treatments: the spinner wears the ember wheel while
-    // working, a blocked row pulses its warm ink against the brand's ember, and an
-    // unread done blinks its sage against faint. Everything settled stays quiet.
     let unread = is_unread(agent, focused, seen);
-    let sign_role = if spinning {
-        crate::theme::Role::Ember((tick % SPIN_EMBERS as u64) as usize)
-    } else if agent.state == "blocked" {
-        if tick % 8 < 4 {
-            crate::theme::Role::Blocked
-        } else {
-            crate::theme::Role::Ember(2)
-        }
-    } else if unread {
-        if tick % 8 < 4 {
-            crate::theme::Role::Done
-        } else {
-            crate::theme::Role::Faint
-        }
+    let word = if unread {
+        NEW_STATE
     } else {
-        crate::theme::Role::Faint
+        shown_state(&agent.state)
     };
+    let state = clip(word, WIDTH.saturating_sub(head_least + 1));
+    let room = WIDTH.saturating_sub(crate::width::width(&state) + 1);
+    let accent = space.map(|space| {
+        (
+            AGENT_NAME_AT,
+            crate::width::width(&space.name),
+            crate::theme::space_of(agent.workspace),
+        )
+    });
     out.push((
         Line {
             text: format!("{} {state}", fit_to(&head, room)),
             colour: colour_for(&agent.state),
-            // Which space this agent lives in, as the colour of its mark. The mark's
-            // shape says where the keyboard is, its colour says which space the rows
-            // belong to, and neither needs a number beside it.
-            accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
-            indicator: Some((0, 1, sign_role)),
+            // Which space this agent lives in, as the colour of its name.
+            accent,
+            indicator: None,
         },
         hit,
     ));
@@ -877,9 +789,12 @@ pub(crate) fn rows_collapsed(
         if out.len() + 2 >= height {
             break;
         }
+        // No focus mark on the strip either: the selected row is the raised
+        // background alone. The index tells one space row from another.
+        let _ = (focused_space, focused_terminal);
         out.push((
             Line {
-                text: strip_space(mark(space.id == focused_space), at + 1),
+                text: strip_space(at + 1),
                 colour: None,
                 accent: Some((1, 1, crate::theme::space_of(space.id))),
                 indicator: None,
@@ -903,7 +818,7 @@ pub(crate) fn rows_collapsed(
         }
         out.push((
             Line {
-                text: strip(mark(agent.terminal == focused_terminal)),
+                text: strip_agent(),
                 colour: colour_for(&agent.state),
                 accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
                 indicator: None,
@@ -929,18 +844,19 @@ pub(crate) fn rows_collapsed(
     out
 }
 
-/// One row of the folded strip: the focus mark, in the space's colour.
-fn strip(mark: char) -> String {
-    let text = format!(" {mark}");
-    let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
+/// One row of the folded strip for an agent: a middle dot, in the row's state
+/// colour. No circle, no filled dot for the selected row.
+fn strip_agent() -> String {
+    let text = " \u{b7}";
+    let pad = COLLAPSED.saturating_sub(crate::width::width(text));
     format!("{text}{}", " ".repeat(pad))
 }
 
-/// One row of the folded strip for a space: the focus mark and its index among
-/// spaces. Spaces keep theirs; with no names on the strip the index is what
-/// tells one space row from another.
-fn strip_space(mark: char, n: usize) -> String {
-    let text = format!(" {mark}{n}");
+/// One row of the folded strip for a space: its index among spaces. Spaces
+/// keep theirs; with no names on the strip the index is what tells one space
+/// row from another.
+fn strip_space(n: usize) -> String {
+    let text = format!(" {n}");
     let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
     format!("{text}{}", " ".repeat(pad))
 }
@@ -1438,11 +1354,6 @@ fn blank() -> (Line, Option<Hit>) {
     )
 }
 
-/// The marker for a row that has the keyboard, and for one that does not.
-fn mark(focused: bool) -> char {
-    if focused { FOCUSED } else { UNFOCUSED }
-}
-
 /// Cut or pad to exactly [`WIDTH`] columns.
 fn fit(text: &str) -> String {
     fit_to(text, WIDTH)
@@ -1568,26 +1479,38 @@ mod tests {
     }
 
     #[test]
-    fn the_focused_space_and_the_focused_terminal_are_marked_in_plain_text() {
+    fn the_focused_space_and_the_focused_terminal_are_found_by_hit_not_by_glyph() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 2, 3, 14);
-        let marked: Vec<&str> = lines
+        let texts: Vec<String> = lines
             .iter()
-            .map(|l| l.text.trim_end())
-            .filter(|t| t.contains(FOCUSED))
+            .map(|l| l.text.trim_end().to_string())
             .collect();
-        assert_eq!(marked.len(), 2, "{marked:?}");
-        assert!(marked.iter().any(|t| t.contains("personal")), "{marked:?}");
-        // Terminal 3 is the focused agent: the mark, its space, then its label.
-        // Which space it lives in is said twice, once by the colour on its
-        // mark and once by the word beside it: the row answers "where" before
-        // it answers "what".
+        // No circle marks anywhere: no hollow ring on every row and no filled
+        // white dot on the selected one. The keyboard's row is the raised
+        // background the painter adds, so plain text carries no selection.
+        for bad in ['\u{25cf}', '\u{25cb}', '\u{25cc}', '\u{25a1}', '\u{2809}'] {
+            assert!(
+                !texts.iter().any(|t| t.contains(bad)),
+                "a circle or spinner leaked: {texts:?}"
+            );
+        }
+        // The focused space and agent still draw their names.
+        assert!(texts.iter().any(|t| t.contains("personal")), "{texts:?}");
+        // Terminal 3 is the focused agent: its space, then its label.
+        // Which space it lives in is said by the word beside it.
         assert!(
-            marked
+            texts
                 .iter()
-                .any(|t| t.starts_with(&format!("{WAITING} {FOCUSED} personal \u{b7} codex"))),
-            "{marked:?}"
+                .any(|t| t.starts_with(" personal \u{b7} codex")),
+            "{texts:?}"
         );
+        // And hits still know which rows have the keyboard.
+        let hits: Vec<Option<Hit>> = (0..14)
+            .map(|row| hit(&spaces, &agents, 2, 3, 14, row))
+            .collect();
+        assert!(hits.contains(&Some(Hit::Space(2))));
+        assert!(hits.contains(&Some(Hit::Terminal(3))));
     }
 
     #[test]
@@ -1600,21 +1523,12 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(&format!("{} {FOCUSED} app \u{b7} claude", spin_head(0))))
+            .position(|t| t.starts_with(" app \u{b7} claude"))
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // Two rows, and together they carry everything: the spinner head, the
-        // mark, the space, and the program underneath. A working agent says
-        // nothing on the right and spins on the left instead, so the word
-        // `working` is exactly what the head row must not contain.
-        assert_eq!(
-            texts[head].trim_end(),
-            format!("{} \u{25cf} app \u{b7} claude", spin_head(0))
-        );
-        assert!(
-            !texts[head].contains("working"),
-            "a working agent spins rather than says so: {:?}",
-            texts[head]
-        );
+        // Two rows, and together they carry everything: the space, the tab,
+        // the state word on the right and the program underneath. Static:
+        // a working agent says `working` like every other state.
+        assert!(texts[head].ends_with("working"), "{texts:?}");
         assert_eq!(texts[head + 1], "  claude");
     }
 
@@ -1726,10 +1640,7 @@ mod tests {
                     || text.is_empty()
                 {
                     None
-                } else if let Some(s) = spaces
-                    .iter()
-                    .find(|s| text == format!(" {} {}", mark(s.id == 2), s.name))
-                {
+                } else if let Some(s) = spaces.iter().find(|s| text == format!(" {}", s.name)) {
                     Some(Hit::Space(s.id))
                 } else {
                     // Everything left is one agent's two rows: the first names
@@ -1743,25 +1654,10 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            // The row opens on its indicator; the test panel
-                            // renders frame zero, so a working agent wears the
-                            // spinner's opening head.
-                            let sign = if spins(&a.state) {
-                                spin_head(0)
-                            } else if a.state == "idle" {
-                                WAITING
-                            } else {
-                                STOPPED
-                            };
                             let first = if space.is_empty() {
-                                format!("{sign} {} {}", mark(a.terminal == 3), label(a))
+                                format!(" {}", label(a))
                             } else {
-                                format!(
-                                    "{sign} {} {} \u{b7} {}",
-                                    mark(a.terminal == 3),
-                                    space,
-                                    label(a)
-                                )
+                                format!(" {} \u{b7} {}", space, label(a))
                             };
                             text.starts_with(&first)
                                 || (text.starts_with("  ")
@@ -1780,7 +1676,6 @@ mod tests {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 99, 99, 12);
         assert_eq!(lines.len(), 12);
-        assert!(!lines.iter().any(|l| l.text.contains(FOCUSED)));
         assert_eq!(render(&[], &[], 1, 1, 5).len(), 5);
     }
 
@@ -1789,9 +1684,7 @@ mod tests {
         let agents = vec![agent(4, 77, "codex", "blocked")];
         let lines = render(&[], &agents, 1, 4, 8);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.text.starts_with(&format!("{STOPPED} \u{25cf} codex"))),
+            lines.iter().any(|l| l.text.starts_with(" codex")),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -1987,15 +1880,9 @@ mod tests {
             .find(|l| l.text.contains('z'))
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        // The mark, the space and some of the program survive the cut: a row
-        // showing only a state does not say whose state it is. The row opens
-        // on the stopped sign, since a state of pure noise spins nothing.
-        assert!(
-            row.text
-                .starts_with(&format!("{STOPPED} \u{25cf} app \u{b7} cl")),
-            "{:?}",
-            row.text
-        );
+        // The space and some of the program survive the cut: a row
+        // showing only a state does not say whose state it is.
+        assert!(row.text.starts_with(" app \u{b7} cl"), "{:?}", row.text);
     }
 
     fn many_agents() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
@@ -2031,10 +1918,8 @@ mod tests {
         // Needs-you and running agents are drawn as usual, each under its own
         // header carrying its count flush right.
         assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
-        // Running agents spin rather than say `working`: aliveness is the
-        // turning head on the left, so the word must not appear anywhere.
-        assert!(texts.iter().any(|t| t.contains(spin_head(0))), "{texts:?}");
-        assert!(!texts.iter().any(|t| t.contains("working")), "{texts:?}");
+        // Static: running agents say `working` on the right, no spinner.
+        assert!(texts.iter().any(|t| t.ends_with("working")), "{texts:?}");
         assert!(
             texts
                 .iter()
@@ -2503,11 +2388,13 @@ mod tests {
         let at = |word: &str| {
             texts
                 .iter()
-                .position(|t| t.contains(word))
+                .position(|t| t.ends_with(word))
                 .unwrap_or_else(|| panic!("no {word} row: {texts:?}"))
         };
         assert!(at("blocked") < at("failed"), "{texts:?}");
-        assert!(at("failed") < at("done"), "{texts:?}");
+        // The unread done wears `new`, not `done`, and still sorts ahead of
+        // running.
+        assert!(at("failed") < at("new"), "{texts:?}");
         // Every agent draws, folded or not: nine pairs, eighteen name rows.
         assert_eq!(
             texts
@@ -2519,10 +2406,10 @@ mod tests {
         );
     }
 
-    /// Blocked pulses and an unread done blinks: the indicator at tick four is
-    /// not the one at tick zero, while a settled row never moves.
+    /// Static panel: the tick changes nothing, every row keeps its word and
+    /// no indicator ever appears.
     #[test]
-    fn the_attention_signs_move_while_settled_rows_do_not() {
+    fn the_panel_is_static_across_ticks() {
         let (spaces, agents) = many_agents();
         let at = |tick: u64| {
             rows_folded(
@@ -2537,22 +2424,17 @@ mod tests {
                 &Seen::new(),
             )
         };
-        let sign_of = |rows: &[(Line, Option<Hit>)], word: &str| {
-            rows.iter()
-                .find(|(line, _)| line.text.contains(word))
-                .and_then(|(line, _)| line.indicator)
-                .unwrap_or_else(|| panic!("no {word} row"))
-        };
-        let blocked_0 = sign_of(&at(0), "blocked");
-        let blocked_4 = sign_of(&at(4), "blocked");
-        assert_ne!(blocked_0, blocked_4, "the blocked pulse is still");
-        assert_eq!(blocked_0.2, crate::theme::Role::Blocked);
-        let done_0 = sign_of(&at(0), "done");
-        let done_4 = sign_of(&at(4), "done");
-        assert_ne!(done_0, done_4, "the unread done does not blink");
-        assert_eq!(done_0.2, crate::theme::Role::Done);
-        let failed_0 = sign_of(&at(0), "failed");
-        assert_eq!(sign_of(&at(4), "failed"), failed_0, "failed moved");
+        let zero: Vec<String> = at(0).iter().map(|(l, _)| l.text.clone()).collect();
+        let four: Vec<String> = at(4).iter().map(|(l, _)| l.text.clone()).collect();
+        assert_eq!(zero, four, "the tick repainted a static panel");
+        for (line, _) in at(0) {
+            assert_eq!(line.indicator, None, "an indicator leaked: {:?}", line.text);
+        }
+        // An unread done still says `new` on the right, steady.
+        assert!(
+            zero.iter().any(|t| t.trim_end().ends_with("new")),
+            "no static new state: {zero:?}"
+        );
     }
 
     #[test]

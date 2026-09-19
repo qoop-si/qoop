@@ -73,23 +73,6 @@ impl Behind {
 /// the program. Three is what a terminal sends and what a hand expects.
 const WHEEL_ROWS: usize = 3;
 
-/// Whether the spinner tick has anything to animate.
-///
-/// Working and starting spin, blocked pulses, and an unread done blinks, all
-/// on the same tick. Anything else is a still panel, and a tick that repainted
-/// one would trade the loop's founding rule (no wake without an arrival) for
-/// eight redundant frames a second.
-fn wants_tick(rows: &[AgentRow], focused: u32, seen: &sidebar::Seen) -> bool {
-    sidebar::wants_tick(rows, focused, seen)
-}
-
-/// How often the working spinner advances one frame.
-///
-/// Eight frames a second: fast enough to read as alive, slow enough to read as calm.
-/// The tick only repaints while an agent is working (see the `spin_tick` arm below),
-/// so this costs nothing on a still screen.
-const SPIN_EVERY: std::time::Duration = std::time::Duration::from_millis(120);
-
 /// What to say when something has been copied, given how it left.
 ///
 /// A system clipboard write is a promise kept by this machine, so it says
@@ -240,11 +223,10 @@ struct State {
     /// mark it read anywhere else. A focused done row counts as read without
     /// an entry, so this only holds rows finished while the keyboard was away.
     seen_done: sidebar::Seen,
-    /// The working spinner's animation step.
+    /// Unused animation step, kept so the frame shape stays stable.
     ///
-    /// Advanced by the run loop's spinner tick while an agent is working, held while
-    /// none is. Wrapping rather than resetting: a reset would replay the same opening
-    /// frame every time an agent starts, and uptime outlives `u64` anyway.
+    /// The panel is static and the tick never advances it; it stays zero so a
+    /// still screen never repaints.
     tick: u64,
     /// The open search palette, or `None` when the terminal has the keyboard.
     palette: Option<Palette>,
@@ -1045,13 +1027,6 @@ async fn drive(
     // after a minute of sitting still, with no error, which reads as a crash.
     let mut ack_tick = tokio::time::interval(client::ACK_INTERVAL);
     ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The spinner's step. Nothing else in this loop is on a timer: every other wake is
-    // an arrival, which is why the interface costs nothing while nobody is typing. The
-    // spinner is the one exception, and it only ticks while there is something spinning:
-    // an interval that fired with no working agent would repaint a still panel eight
-    // times a second for nothing.
-    let mut spin_tick = tokio::time::interval(SPIN_EVERY);
-    spin_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Ask what is there before drawing anything, so the first frame is the real index
     // rather than an empty one that fills in a moment later.
@@ -1120,15 +1095,6 @@ async fn drive(
                 _ = ack_tick.tick() => {
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
-                    }
-                }
-                _ = spin_tick.tick() => {
-                    // The step advances and the frame repaints only while a working agent
-                    // is on screen. Otherwise the tick passes silently and the loop keeps
-                    // its rule: no wake without an arrival.
-                    if wants_tick(&state.rows, state.focused, &state.seen_done) {
-                        state.tick = state.tick.wrapping_add(1);
-                        dirty = true;
                     }
                 }
                 _ = sigterm.recv() => return Ok(()),
@@ -2448,8 +2414,8 @@ fn focus(
     state.behind = Behind::default();
     state.selection = None;
     state.focused = to;
-    // Standing on a done row is reading it: it stops blinking the moment the
-    // keyboard arrives, with no extra keystroke asked.
+    // Standing on a done row is reading it: it stops saying `new` the moment
+    // the keyboard arrives, with no extra keystroke asked.
     if let Some(row) = state.rows.iter().find(|r| r.terminal == to)
         && row.state == "done"
     {
@@ -2854,25 +2820,22 @@ mod tests {
         }
     }
 
-    /// The spinner tick fires while something moves, and passes silently otherwise:
-    /// a still panel must not cost eight repaints a second.
+    /// The panel is static: no state ever asks for a tick, so the loop
+    /// never repaints without an arrival.
     #[test]
-    fn the_spinner_tick_only_fires_while_something_moves() {
+    fn nothing_ever_asks_for_a_tick() {
         let seen = sidebar::Seen::new();
-        assert!(wants_tick(&[agent(1, 1, "claude", "working")], 0, &seen));
-        assert!(wants_tick(&[agent(1, 1, "claude", "starting")], 0, &seen));
-        assert!(!wants_tick(&[agent(1, 1, "claude", "idle")], 0, &seen));
-        // Blocked pulses on its own channel, so it ticks too.
-        assert!(wants_tick(&[agent(1, 1, "codex", "blocked")], 0, &seen));
-        // A done row nobody has looked at blinks; a read one is still.
-        assert!(wants_tick(&[agent(1, 1, "claude", "done")], 0, &seen));
-        assert!(!wants_tick(&[agent(1, 1, "claude", "done")], 1, &seen));
-        assert!(!wants_tick(&[], 0, &seen));
-        // A shell running a command is not an agent and never ticks, whatever its state
-        // string claims.
+        for state in ["working", "starting", "idle", "blocked", "failed", "done"] {
+            assert!(!sidebar::wants_tick(
+                &[agent(1, 1, "claude", state)],
+                0,
+                &seen
+            ));
+        }
+        assert!(!sidebar::wants_tick(&[], 0, &seen));
         let mut shell = agent(2, 1, "sh", "working");
         shell.agent = false;
-        assert!(!wants_tick(&[shell], 0, &seen));
+        assert!(!sidebar::wants_tick(&[shell], 0, &seen));
     }
 
     fn state() -> State {
