@@ -1,4 +1,5 @@
 /target
+/dist/
 /ref/
 **/*.rs.bk
 .DS_Store
