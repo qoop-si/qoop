@@ -206,7 +206,19 @@ fn live_sessions() -> Vec<String> {
 
 /// Fetch the tarball, check it, and swap it over this binary atomically.
 fn install(latest: &Release, current: &str) -> std::io::Result<()> {
-    let work = std::env::temp_dir().join(format!("qoro-update-{}", std::process::id()));
+    let exe = std::env::current_exe()
+        .map_err(|e| std::io::Error::other(format!("qoro update: cannot find this binary: {e}")))?;
+    install_to(latest, current, &exe)
+}
+
+/// The same swap onto an explicit path, so tests drive the whole chain without
+/// touching the test binary they are running inside of.
+fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()> {
+    // Counted, because one process can install twice: two tests in one binary share
+    // a pid, and a shared work directory would have them unpacking over each other.
+    static INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work = std::env::temp_dir().join(format!("qoro-update-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&work)?;
     let cleanup = || std::fs::remove_dir_all(&work).ok();
     let failed = |message: String| -> std::io::Error {
@@ -262,13 +274,10 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
             format!("qoro {}", latest.version)
         )));
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| failed(format!("qoro update: cannot find this binary: {e}")))?;
-    std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755))?;
     let staged = exe.with_extension("new");
     std::fs::copy(&fresh, &staged)?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
-    if let Err(e) = std::fs::rename(&staged, &exe) {
+    if let Err(e) = std::fs::rename(&staged, exe) {
         let _ = std::fs::remove_file(&staged);
         return Err(failed(format!("qoro update: cannot replace {exe:?}: {e}")));
     }
@@ -335,7 +344,7 @@ fn clear_notice() {
 
 #[cfg(test)]
 mod tests {
-    use super::fetch_latest_parsing;
+    use super::{Release, fetch_latest_parsing, install_to};
 
     #[test]
     fn the_release_json_yields_a_version_and_an_asset_url() {
@@ -362,5 +371,68 @@ mod tests {
     fn a_non_version_tag_is_refused() {
         let body = serde_json::json!({"tag_name": "nightly", "assets": []});
         assert!(fetch_latest_parsing(&body).is_err());
+    }
+
+    /// A stand-in release tarball: a script answering `--version` the way the
+    /// real binary does, packed the way `scripts/release.sh` packs it.
+    fn fake_release(dir: &std::path::Path, reported: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("qoro");
+        std::fs::write(&script, format!("#!/bin/sh\necho \"qoro {reported}\"\n")).expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let tarball = dir.join("qoro-aarch64-apple-darwin.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tarball)
+            .arg("qoro")
+            .current_dir(dir)
+            .status()
+            .expect("tar");
+        assert!(status.success());
+        format!("file://{}", tarball.display())
+    }
+
+    #[test]
+    fn install_swaps_the_binary_after_verifying_its_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack dir");
+        let exe = dir.path().join("qoro");
+        std::fs::write(&exe, "old binary").expect("old");
+        let latest = Release {
+            version: "9.9.9".to_string(),
+            asset_url: fake_release(&pack, "9.9.9"),
+            checksum_url: None,
+        };
+        install_to(&latest, "0.0.0", &exe).expect("install");
+        let out = std::process::Command::new(&exe)
+            .arg("--version")
+            .output()
+            .expect("run the swapped binary");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "qoro 9.9.9",
+            "the file at the old path is the new release now"
+        );
+    }
+
+    #[test]
+    fn a_download_reporting_the_wrong_version_leaves_the_binary_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack dir");
+        let exe = dir.path().join("qoro");
+        std::fs::write(&exe, "old binary").expect("old");
+        let latest = Release {
+            version: "9.9.9".to_string(),
+            asset_url: fake_release(&pack, "0.0.0"),
+            checksum_url: None,
+        };
+        assert!(install_to(&latest, "0.0.0", &exe).is_err());
+        assert_eq!(
+            std::fs::read(&exe).expect("read"),
+            b"old binary",
+            "a refused download must not touch the binary in hand"
+        );
     }
 }
