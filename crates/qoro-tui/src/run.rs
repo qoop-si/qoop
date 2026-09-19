@@ -1340,7 +1340,17 @@ async fn drive(
                                             &mut control_seq,
                                         )?).await?;
                                     }
-                                    "pin as master" => pin_focused_as_master(&mut state),
+                                    "pin as master" => {
+                                        pin_focused_as_master(&mut state);
+                                        // The column takes pane width when it opens, and a
+                                        // child that is not told reflows against a width
+                                        // it no longer has.
+                                        if let Some(resize) =
+                                            resize_focused_to_tile(&state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
+                                    }
                                     "detach" => return Ok(()),
                                     _ => unreachable!("menu row without dispatch"),
                                 }
@@ -2212,7 +2222,9 @@ fn approve_head(state: &mut State, verdict: &str) {
 /// Pin the focused tab as the master, or unpin it when it already is.
 ///
 /// The generation travels with the pin, so an exec-replaced process stops being the
-/// master instead of the pin following a stranger.
+/// master instead of the pin following a stranger. Pinning also opens the master
+/// column, so the pin is visible without a second key press; unpinning leaves the
+/// column alone.
 fn pin_focused_as_master(state: &mut State) {
     if state.focused == 0 {
         state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
@@ -2228,6 +2240,8 @@ fn pin_focused_as_master(state: &mut State) {
     match state.rows.iter().find(|r| r.terminal == state.focused) {
         Some(row) => {
             state.master = Some((state.focused, row.generation));
+            state.master_open = true;
+            state.refresh_master_shown();
         }
         None => {
             state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
@@ -3741,6 +3755,7 @@ mod tests {
     }
 
     /// Pinning names the focused tab with its generation, and pinning again unpins.
+    /// Pinning also opens the master column; unpinning leaves the column alone.
     #[test]
     fn pinning_names_the_focused_tab_with_its_generation() {
         let mut state = bare_state();
@@ -3749,8 +3764,11 @@ mod tests {
         state.focused = 1;
         pin_focused_as_master(&mut state);
         assert_eq!(state.master, Some((1, Some(7))));
+        assert!(state.master_open, "pinning opens the master column");
+        assert!(state.master_shown, "the column shows when it fits");
         pin_focused_as_master(&mut state);
         assert_eq!(state.master, None, "pinning again unpins");
+        assert!(state.master_open, "unpinning leaves the column alone");
     }
 
     /// The pin is a terminal and a generation: an exec-replaced process stops being
