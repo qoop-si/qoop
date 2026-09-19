@@ -141,8 +141,13 @@ pub fn fg(role: Role) -> String {
 /// A background and not reverse video. Reverse paints the full width of the column in the
 /// foreground colour, which is a white block an eye lands on before anything else on the
 /// screen, and the selected row is not the most urgent thing on it.
+///
+/// The foreground is never white either: a stateless row keeps the quiet detail ink on
+/// the raised background, and a row with a state keeps that state's ink (see
+/// [`selected_in`]). White text would make the selected row the brightest thing on the
+/// screen, which is exactly what the background was chosen not to do.
 pub fn selected() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", SELECTED_BG, ink(Role::Focused))
+    format!("\x1b[0;48;5;{};38;5;{}m", SELECTED_BG, ink(Role::Detail))
 }
 
 /// A selected row that also has a state to say, so the state keeps its colour on the
@@ -167,11 +172,12 @@ pub fn status_in(role: Role) -> String {
     format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(role))
 }
 
-/// The tab with the keyboard: bright text on the same raised background
-/// the selected row wears, never a white pill. The brackets in the text say
-/// which tab it is, so the colour only has to find it, not to prove it.
+/// The tab with the keyboard: bold amber on the raised background.
+///
+/// Findable without reading it, and never a white pill: a white block is the brightest
+/// thing on the bar, and the selected tab is not the most urgent thing on it.
 pub fn tab_on() -> String {
-    format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, ink(Role::Focused))
+    format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, TAB_ON_FG)
 }
 
 /// Every other tab.
@@ -187,6 +193,10 @@ const SELECTED_BG: u8 = 236;
 /// The raised background of the status bar, a shade below the selected row so the two do
 /// not read as the same thing.
 const STATUS_BG: u8 = 233;
+/// The focused tab's ink: amber, on the selected row's background. White lives nowhere
+/// on the selected chrome: the selected row wears detail ink and a state row wears its
+/// state's ink (see [`selected`] and [`selected_in`]).
+const TAB_ON_FG: u8 = 214;
 
 #[cfg(test)]
 mod tests {
@@ -239,6 +249,18 @@ mod tests {
         for escape in escapes {
             assert!(escape.starts_with("\x1b[0;"), "{escape:?} does not reset");
             assert!(escape.ends_with('m'), "{escape:?} is not a whole escape");
+        }
+    }
+
+    /// The selected chrome is never white: neither the selected row nor the
+    /// selected tab may paint the brightest thing on the screen.
+    #[test]
+    fn nothing_selected_is_white() {
+        for escape in [selected(), tab_on()] {
+            assert!(
+                !escape.contains("38;5;255") && !escape.contains("38;5;254"),
+                "white leaked into the selected chrome: {escape:?}"
+            );
         }
     }
 
