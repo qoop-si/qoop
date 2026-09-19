@@ -176,13 +176,14 @@ pub fn left_for(cols: u16, collapsed: bool) -> usize {
 
 /// The columns spent after the pane ends: the master column and the rule beside it.
 ///
-/// Shown only when the person asked for it and the window holds both columns plus one
-/// pane cell, mirroring [`left_for`] including its hide rule. Dropped rather than
-/// squeezed, for the same reason: a squeezed column wraps every row and tears the layout
-/// apart, which also puts every click on the wrong thing.
+/// A quarter of the window when the person asked for it and the window holds both
+/// columns plus one pane cell, mirroring [`left_for`] including its hide rule.
+/// Dropped rather than squeezed, for the same reason: a squeezed column wraps every
+/// row and tears the layout apart, which also puts every click on the wrong thing.
 pub fn right_for(cols: u16, left: usize, master_open: bool) -> usize {
-    if master_open && (cols as usize) > left + master::MASTER_WIDTH + 2 {
-        master::MASTER_WIDTH + 1
+    let width = master::width_for(cols as usize);
+    if master_open && (cols as usize) > left + width + 2 {
+        width + 1
     } else {
         0
     }
@@ -281,6 +282,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.focused,
             frame.master_report,
             column_rows,
+            master::width_for(frame.cols as usize),
         )
     } else {
         Vec::new()
@@ -392,7 +394,12 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&chrome_row(line, selected));
             } else {
                 let (line, spans) = master_viewport_row(frame.master_snapshot, row - structured);
-                out.push_str(&paint_row(line, spans, master::MASTER_WIDTH, None));
+                out.push_str(&paint_row(
+                    line,
+                    spans,
+                    master::width_for(frame.cols as usize),
+                    None,
+                ));
             }
         }
         // The pane starts under the tab bar, so the column's first row has the bar beside
@@ -3729,25 +3736,27 @@ mod tests {
     #[test]
     fn the_right_column_needs_an_open_ask_and_room_for_both_columns() {
         let left = sidebar::WIDTH + 1;
+        // A 120 column window holds a 38 column quarter (120 / 4 is 30, floored).
+        let width = master::width_for(120);
+        assert_eq!(width, 38);
         assert_eq!(right_for(120, left, false), 0, "never asked");
-        assert_eq!(right_for(120, left, true), master::MASTER_WIDTH + 1);
+        assert_eq!(right_for(120, left, true), width + 1);
         // The hide rule mirrors left_for: both columns plus one pane cell, or nothing.
-        let threshold = left + master::MASTER_WIDTH + 2;
+        let threshold = left + width + 2;
         assert_eq!(right_for(threshold as u16, left, true), 0);
-        assert_eq!(
-            right_for(threshold as u16 + 1, left, true),
-            master::MASTER_WIDTH + 1
-        );
+        assert_eq!(right_for(threshold as u16 + 1, left, true), width + 1);
+        // A wide window grows the column to a quarter of the page, capped.
+        assert_eq!(master::width_for(240), 60);
+        assert_eq!(master::width_for(400), master::MAX_WIDTH);
+        assert_eq!(right_for(240, left, true), 60 + 1);
     }
 
     #[test]
     fn the_pane_shrinks_from_the_right_exactly_as_it_shrinks_from_the_left() {
+        let width = master::width_for(120);
         assert_eq!(
-            pane_size_for(120, 24, false, master::MASTER_WIDTH + 1),
-            (
-                120 - sidebar::WIDTH as u16 - 1 - master::MASTER_WIDTH as u16 - 1,
-                21
-            )
+            pane_size_for(120, 24, false, width + 1),
+            (120 - sidebar::WIDTH as u16 - 1 - width as u16 - 1, 21)
         );
         assert_eq!(pane_size_for(120, 24, false, 0), pane_size(120, 24));
     }

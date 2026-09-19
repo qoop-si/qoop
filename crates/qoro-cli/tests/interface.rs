@@ -162,7 +162,14 @@ fn index_width() -> usize {
 
 impl Interface {
     fn start() -> Self {
-        Self::start_impl(false)
+        Self::start_impl(false, None)
+    }
+
+    /// Like [`Self::start`], but the interface raises its automatic master
+    /// from this binary instead of the machine's agents: hermetic, and the
+    /// only test that opts into the auto-start.
+    fn start_with_master_agent(agent: &str) -> Self {
+        Self::start_impl(false, Some(agent.to_string()))
     }
 
     /// A daemon launched the way production launches one: backgrounded, with
@@ -170,10 +177,10 @@ impl Interface {
     /// building it here rather than assuming it is what makes the gate about
     /// the daemon instead of about the machine running the test.
     fn start_backgrounded() -> Self {
-        Self::start_impl(true)
+        Self::start_impl(true, None)
     }
 
-    fn start_impl(backgrounded: bool) -> Self {
+    fn start_impl(backgrounded: bool, master_agent: Option<String>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(
             dir.path(),
@@ -214,18 +221,28 @@ impl Interface {
         let slave = pty.slave;
         // SAFETY: the only unsafe part is `pre_exec` below, whose closure runs post fork
         // and calls two async signal safe syscalls with no allocation.
+        let stdin = slave.try_clone().expect("dup");
+        let stdout = slave.try_clone().expect("dup");
+        let stderr = slave.try_clone().expect("dup");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
+        cmd.env("QORO_RUNTIME_DIR", dir.path())
+            // Pinned for the same reason the scale gates pin it: an interactive shell
+            // with a configured prompt is somebody's machine, not this program.
+            .env("SHELL", "/bin/sh")
+            .env("TERM", "xterm-256color");
+        match &master_agent {
+            // The machine under test has real agents on PATH; every test
+            // but the auto-master one opts out of raising one per attach.
+            None => {
+                cmd.env("QORO_NO_AUTO_MASTER", "1");
+            }
+            Some(agent) => {
+                cmd.env("QORO_MASTER_AGENT", agent);
+            }
+        }
         let child = unsafe {
             use std::os::unix::process::CommandExt;
-            let stdin = slave.try_clone().expect("dup");
-            let stdout = slave.try_clone().expect("dup");
-            let stderr = slave.try_clone().expect("dup");
-            Command::new(env!("CARGO_BIN_EXE_qoro"))
-                .env("QORO_RUNTIME_DIR", dir.path())
-                // Pinned for the same reason the scale gates pin it: an interactive shell
-                // with a configured prompt is somebody's machine, not this program.
-                .env("SHELL", "/bin/sh")
-                .env("TERM", "xterm-256color")
-                .stdin(Stdio::from(stdin))
+            cmd.stdin(Stdio::from(stdin))
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
                 // SAFETY: post fork, async signal safe, no allocation. The interface needs
@@ -543,6 +560,26 @@ impl Interface {
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
         }
         false
+    }
+
+    /// Pane cells of one pane row, anchored at the pane's own cursor address.
+    ///
+    /// Unlike [`Self::row`], immune to whatever the master viewport shows: the
+    /// viewport paints the focused master's screen, so a whole-row read mixes
+    /// two terminals into one line. `pr` counts pane rows from zero.
+    fn pane_cells(&self, pr: usize) -> Option<String> {
+        let at = format!(
+            "\x1b[{};{}H",
+            pr + 1 + qoro_tui::screen::TABS,
+            1 + qoro_tui::screen::left(COLS)
+        );
+        let start = self.painted.rfind(&at)? + at.len();
+        Some(
+            strip_escapes(&self.painted[start..])
+                .chars()
+                .take(30)
+                .collect(),
+        )
     }
 
     /// The terminal's own column of one screen row, as painted most recently.
@@ -1782,23 +1819,75 @@ fn g12_17_a_click_on_the_master_header_moves_typing_to_the_master() {
         ui.wait_for_tab(2, Duration::from_secs(10)),
         "could not move back to the second tab"
     );
-    // Let a frame of tab 2 paint, then read the pane cells only: the master
-    // column viewport may legitimately show the marker too.
+    // Let a frame of tab 2 paint, then read the pane cells through the
+    // pane-anchored reader: the master column viewport shows the master's
+    // own screen, which legitimately carries the marker too.
     std::thread::sleep(Duration::from_millis(800));
-    let left = qoro_tui::screen::left(COLS);
-    let (pane_cols, _) =
-        qoro_tui::screen::pane_size_for(COLS, ROWS, false, qoro_tui::master::MASTER_WIDTH + 1);
-    for screen_row in 2..=10u16 {
-        if let Some(line) = ui.row(screen_row as usize) {
-            let pane: String = line
-                .chars()
-                .skip(left + 1)
-                .take(pane_cols as usize)
-                .collect();
+    for pr in 0..=8usize {
+        if let Some(pane) = ui.pane_cells(pr) {
             assert!(
                 !pane.contains("MARK_IN_MASTER_9"),
-                "typing reached the left terminal too (row {screen_row}): {pane:?}"
+                "typing reached the left terminal too (pane row {pr}): {pane:?}"
             );
         }
     }
+}
+
+/// G12.18: the master column is open from the first frame, like the left
+/// column: the needs list is the notifications, and they are no good hidden.
+#[test]
+fn g12_18_the_master_column_is_open_from_the_first_frame() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    assert!(
+        ui.wait_for("needs you", Duration::from_secs(10)).is_some(),
+        "the master column never opened by itself"
+    );
+    // Toggling shuts it again: hiding is a choice, not the default. Row 1
+    // always carries the left column's title, so it is a fresh read.
+    ui.command(b'E');
+    let _ = ui.wait_for("never appears", Duration::from_millis(500));
+    assert!(
+        ui.row(1).is_none_or(|line| !line.contains("master")),
+        "toggling the column did not shut it"
+    );
+}
+
+/// G12.19: a fresh session raises its own master: a second tab running the
+/// configured agent, briefed and pinned, while the keyboard stays in the
+/// shell. Driven with `/bin/sh` as the "agent" so the test is hermetic: the
+/// shell echoes the brief, which is what the assertion reads.
+#[test]
+fn g12_19_a_fresh_session_raises_briefs_and_pins_its_own_master() {
+    // `bash` is what the shell reports as its program on this machine, so the
+    // match fires on the first index instead of the settled-prompt fallback.
+    let mut ui = Interface::start_with_master_agent("bash");
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    // The master tab arrives beside the shell, unasked.
+    assert!(
+        ui.wait_for_tabs(|bar| bar.contains(" 2 master"), Duration::from_secs(20)),
+        "no master tab was raised: {:?}",
+        ui.tab_bar()
+    );
+    // The raising runs to the end: the send and the pin share one code path,
+    // and the confirmation names the agent. (The brief's own echo is not
+    // asserted: a 67-line burst passes through the render lane faster than it
+    // paints, and its early lines are coalesced away by design.)
+    assert!(
+        ui.wait_for("bash briefed as master", Duration::from_secs(30))
+            .is_some(),
+        "the master was never briefed and pinned"
+    );
+    // And the keyboard never left the shell.
+    assert_eq!(
+        ui.focused_tab(),
+        Some(1),
+        "raising the master stole the keyboard: {:?}",
+        ui.tab_bar()
+    );
+    // The column header names the pin.
+    assert!(
+        ui.wait_for("master ", Duration::from_secs(10)).is_some(),
+        "the column never named the master"
+    );
 }

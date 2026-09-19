@@ -11,7 +11,7 @@
 //! master means jumping to its tab.
 //!
 //! Pure text here, like the sidebar. The caller paints attributes over these lines, and
-//! every line is exactly [`MASTER_WIDTH`] columns, so the caller can paint blindly.
+//! every line is exactly the requested width in columns, so the caller can paint blindly.
 
 use std::path::{Path, PathBuf};
 
@@ -19,11 +19,18 @@ use qoro_runtime::control::{AgentRow, WorkspaceRow};
 
 /// Columns the right column occupies.
 ///
-/// Fixed rather than negotiated, for the same reason the sidebar is: the terminal beside
-/// it is a real PTY sized before its child starts. Thirty eight carries a
-/// `session/terminal state` row plus a short word; thirty (the sidebar width) left the
-/// state with nothing beside it.
-pub const MASTER_WIDTH: usize = 38;
+/// A quarter of the window, so the column grows with the screen the way the
+/// pane does: a fixed width is a margin on a wide monitor and a wall on a
+/// narrow one. Floored at the width a `session/terminal state` row plus a
+/// short word still fits in, capped before the column eats the terminal it
+/// watches. Every line is exactly the requested width.
+pub const MIN_WIDTH: usize = 38;
+pub const MAX_WIDTH: usize = 64;
+
+/// The column width for a window this wide, in columns.
+pub fn width_for(cols: usize) -> usize {
+    (cols / 4).clamp(MIN_WIDTH, MAX_WIDTH)
+}
 
 /// What the right column drew on one screen row, so a click can act on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +153,77 @@ pub fn report_path(dir: &Path) -> PathBuf {
 /// Where approvals wait for the loop, one file per ask.
 pub fn approvals_dir(dir: &Path) -> PathBuf {
     dir.join("master-approvals")
+}
+
+/// The default supervisor instructions, the same file `qoro master brief`
+/// prints: one source, so the pasted brief and the printed one never drift.
+pub const MASTER_BRIEF: &str = include_str!("../../../docs/master-brief.md");
+
+/// The agent binaries a fresh session starts its master in, first found wins.
+///
+/// `QORO_MASTER_AGENT` names one explicitly (a name or a path); otherwise the
+/// first of these on `PATH` is the default. The order is a guess about the
+/// machine, written down so it can be argued with rather than hidden.
+const KNOWN_AGENTS: [&str; 5] = ["opencode", "claude", "codex", "gemini", "cursor"];
+
+/// Which agent binary a fresh session starts its master in, if any.
+///
+/// `None` means no candidate: no override and nothing known on `PATH`. The
+/// caller says so instead of starting a shell with no master in it.
+pub fn detect_agent() -> Option<String> {
+    if let Ok(want) = std::env::var("QORO_MASTER_AGENT") {
+        let want = want.trim().to_string();
+        if !want.is_empty() {
+            return Some(want);
+        }
+    }
+    KNOWN_AGENTS
+        .iter()
+        .find(|a| on_path(a))
+        .map(|a| a.to_string())
+}
+
+/// Whether the session has already had its automatic master: marker file in
+/// the session directory, so a closed master tab never resurrects on the next
+/// attach. An empty directory (a socket with no parent) never auto-starts.
+pub fn auto_path(dir: &Path) -> PathBuf {
+    dir.join("master-auto")
+}
+
+pub fn auto_done(dir: &Path) -> bool {
+    dir.as_os_str().is_empty() || auto_path(dir).exists()
+}
+
+pub fn mark_auto(dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let _ = std::fs::write(auto_path(dir), "auto\n");
+}
+
+/// Whether this live row looks like the awaited master agent: the program is
+/// the binary (by path or by last segment), or the daemon already recognised
+/// a coding agent in the terminal. The program check is what fires in
+/// practice; the agent flag is the backstop for wrappers and shims.
+pub fn agent_matches(row: &AgentRow, binary: &str) -> bool {
+    let base = binary.rsplit('/').next().unwrap_or(binary);
+    if row.agent {
+        return true;
+    }
+    match row.program.as_deref() {
+        Some(program) => program == binary || program.rsplit('/').next().unwrap_or(program) == base,
+        None => false,
+    }
+}
+
+/// A binary name on `PATH`, the way a shell would find it.
+fn on_path(binary: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(binary);
+            std::fs::metadata(&candidate).is_ok_and(|m| !m.is_dir())
+        })
+    })
 }
 
 /// Read the report, or nothing when it is missing, broken or stale.
@@ -366,6 +444,7 @@ pub fn rows(
     focused: u32,
     report: Option<&Report>,
     height: usize,
+    width: usize,
 ) -> Vec<(crate::sidebar::Line, Option<Hit>)> {
     // The painter derives the keyboard's own row from the hit, the way it does for the
     // left column, so the text carries no focus mark of its own.
@@ -374,12 +453,12 @@ pub fn rows(
         return Vec::new();
     }
     let mut out = Vec::new();
-    out.push(header(rows, master));
-    out.push(divider());
-    let needs = triage(rows, spaces, master, report);
+    out.push(header(rows, master, width));
+    out.push(divider(width));
+    let needs = triage(rows, spaces, master, report, width);
     out.push((
         crate::sidebar::Line {
-            text: crate::width::fit(&format!(" needs you {}", needs.len()), MASTER_WIDTH),
+            text: crate::width::fit(&format!(" needs you {}", needs.len()), width),
             colour: Some(crate::theme::Role::Title),
             accent: None,
             indicator: None,
@@ -387,7 +466,7 @@ pub fn rows(
         None,
     ));
     out.extend(needs);
-    out.push(divider());
+    out.push(divider(width));
     // The master's own words, at most three rows: a fourth row of summary is
     // a paragraph, and paragraphs belong on the master tab, not in the
     // margin.
@@ -396,7 +475,7 @@ pub fn rows(
         if !said.is_empty() {
             out.push((
                 crate::sidebar::Line {
-                    text: crate::width::fit(" son rapor", MASTER_WIDTH),
+                    text: crate::width::fit(" son rapor", width),
                     colour: Some(crate::theme::Role::Title),
                     accent: None,
                     indicator: None,
@@ -407,7 +486,7 @@ pub fn rows(
                 let line = clean(line);
                 out.push((
                     crate::sidebar::Line {
-                        text: crate::width::fit(&format!(" {line}"), MASTER_WIDTH),
+                        text: crate::width::fit(&format!(" {line}"), width),
                         colour: None,
                         accent: None,
                         indicator: None,
@@ -419,7 +498,7 @@ pub fn rows(
     }
     out.push((
         crate::sidebar::Line {
-            text: crate::width::fit("[E] master [a] onayla [u] reddet", MASTER_WIDTH),
+            text: crate::width::fit("[E] master [a] onayla [u] reddet", width),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
             indicator: None,
@@ -442,8 +521,9 @@ pub fn hit(
     report: Option<&Report>,
     height: usize,
     row: usize,
+    width: usize,
 ) -> Option<Hit> {
-    rows(agents, spaces, master, focused, report, height)
+    rows(agents, spaces, master, focused, report, height, width)
         .into_iter()
         .nth(row)
         .and_then(|(_, hit)| hit)
@@ -486,6 +566,7 @@ pub fn approval_head(
 fn header(
     rows: &[AgentRow],
     master: Option<(u32, Option<u64>)>,
+    width: usize,
 ) -> (crate::sidebar::Line, Option<Hit>) {
     let pinned = master.and_then(|(terminal, generation)| {
         rows.iter()
@@ -496,7 +577,7 @@ fn header(
             crate::sidebar::Line {
                 text: crate::width::fit(
                     &format!("master {} {}", clean(&label(row)), clean(&row.state)),
-                    MASTER_WIDTH,
+                    width,
                 ),
                 colour: crate::sidebar::colour_for(&row.state),
                 accent: None,
@@ -506,7 +587,7 @@ fn header(
         ),
         None => (
             crate::sidebar::Line {
-                text: crate::width::fit("master yok: bir tab pinle", MASTER_WIDTH),
+                text: crate::width::fit("master yok: bir tab pinle", width),
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
                 indicator: None,
@@ -552,6 +633,7 @@ fn triage(
     spaces: &[WorkspaceRow],
     master: Option<(u32, Option<u64>)>,
     report: Option<&Report>,
+    width: usize,
 ) -> Vec<(crate::sidebar::Line, Option<Hit>)> {
     let mut out = Vec::new();
     for state in TRIAGE_ORDER {
@@ -582,7 +664,7 @@ fn triage(
             );
             out.push((
                 crate::sidebar::Line {
-                    text: crate::width::fit(&text, MASTER_WIDTH),
+                    text: crate::width::fit(&text, width),
                     colour: crate::sidebar::colour_for(&row.state),
                     accent: Some((
                         1,
@@ -632,10 +714,10 @@ fn label(row: &AgentRow) -> String {
 }
 
 /// The rule above and below the needs: one row of box drawing, clickable as nothing.
-fn divider() -> (crate::sidebar::Line, Option<Hit>) {
+fn divider(width: usize) -> (crate::sidebar::Line, Option<Hit>) {
     (
         crate::sidebar::Line {
-            text: "\u{2500}".repeat(MASTER_WIDTH),
+            text: "\u{2500}".repeat(width),
             colour: Some(crate::theme::Role::Rule),
             accent: None,
             indicator: None,
@@ -707,19 +789,16 @@ mod tests {
     #[test]
     fn every_line_is_exactly_the_column_width() {
         let (agents, spaces) = sample();
-        for master in [None, Some((3, Some(1))), Some((9, None))] {
-            // The structured block, uncut: everything below is a truncation of this.
-            let full = rows(&agents, &spaces, master, 4, None, 40).len();
-            for height in [1usize, 2, 3, 5, 9, 14, 40] {
-                let lines = rows(&agents, &spaces, master, 4, None, height);
-                assert_eq!(lines.len(), full.min(height), "height {height}");
-                for (line, _) in &lines {
-                    assert_eq!(
-                        crate::width::width(&line.text),
-                        MASTER_WIDTH,
-                        "{:?}",
-                        line.text
-                    );
+        for width in [MIN_WIDTH, 50, MAX_WIDTH] {
+            for master in [None, Some((3, Some(1))), Some((9, None))] {
+                // The structured block, uncut: everything below is a truncation of this.
+                let full = rows(&agents, &spaces, master, 4, None, 40, width).len();
+                for height in [1usize, 2, 3, 5, 9, 14, 40] {
+                    let lines = rows(&agents, &spaces, master, 4, None, height, width);
+                    assert_eq!(lines.len(), full.min(height), "height {height}");
+                    for (line, _) in &lines {
+                        assert_eq!(crate::width::width(&line.text), width, "{:?}", line.text);
+                    }
                 }
             }
         }
@@ -729,10 +808,10 @@ mod tests {
     fn a_wide_name_is_measured_in_columns_and_not_in_characters() {
         let agents = vec![agent(1, 1, &"\u{1f30d}".repeat(30), "blocked")];
         let spaces = vec![space(1, "app")];
-        for (line, _) in rows(&agents, &spaces, None, 1, None, 10) {
+        for (line, _) in rows(&agents, &spaces, None, 1, None, 10, MIN_WIDTH) {
             assert_eq!(
                 crate::width::width(&line.text),
-                MASTER_WIDTH,
+                MIN_WIDTH,
                 "{:?}",
                 line.text
             );
@@ -743,7 +822,7 @@ mod tests {
     #[test]
     fn the_needs_come_blocked_then_failed_then_done() {
         let (agents, spaces) = sample();
-        let lines = rows(&agents, &spaces, None, 4, None, 20);
+        let lines = rows(&agents, &spaces, None, 4, None, 20, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -761,7 +840,7 @@ mod tests {
     fn the_pinned_master_is_not_listed_as_its_own_need() {
         let (agents, spaces) = sample();
         // Terminal 3 is blocked and pinned: the header names it, the list must not.
-        let lines = rows(&agents, &spaces, Some((3, Some(1))), 4, None, 20);
+        let lines = rows(&agents, &spaces, Some((3, Some(1))), 4, None, 20, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -779,7 +858,7 @@ mod tests {
         assert_eq!(needs.len(), 2, "{texts:?}");
         assert!(texts.iter().any(|t| t == " needs you 2"), "{texts:?}");
         let hits: Vec<Option<Hit>> = (0..20)
-            .map(|row| hit(&agents, &spaces, Some((3, Some(1))), 4, None, 20, row))
+            .map(|row| hit(&agents, &spaces, Some((3, Some(1))), 4, None, 20, row, 38))
             .collect();
         assert!(!hits.contains(&Some(Hit::Need(3))), "{hits:?}");
         assert!(hits.contains(&Some(Hit::Need(2))), "{hits:?}");
@@ -789,7 +868,7 @@ mod tests {
     #[test]
     fn without_a_pin_the_header_says_how_to_get_one() {
         let (agents, spaces) = sample();
-        let lines = rows(&agents, &spaces, None, 4, None, 20);
+        let lines = rows(&agents, &spaces, None, 4, None, 20, 38);
         assert_eq!(
             lines[0].0.text.trim_end(),
             "master yok: bir tab pinle",
@@ -819,7 +898,7 @@ mod tests {
             },
         ];
         let spaces = vec![space(1, "app")];
-        let lines = rows(&agents, &spaces, None, 2, None, 20);
+        let lines = rows(&agents, &spaces, None, 2, None, 20, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -831,7 +910,7 @@ mod tests {
     #[test]
     fn the_footer_carries_the_three_keys() {
         let (agents, spaces) = sample();
-        let lines = rows(&agents, &spaces, None, 4, None, 20);
+        let lines = rows(&agents, &spaces, None, 4, None, 20, 38);
         let last = lines.last().expect("a footer");
         assert!(
             last.0.text.contains("[E]")
@@ -851,16 +930,25 @@ mod tests {
         for height in [1usize, 2, 3, 4, 7, 9, 14, 25] {
             for master in [None, Some((3, Some(1)))] {
                 for report in reports {
-                    let drawn = rows(&agents, &spaces, master, 4, report, height);
+                    let drawn = rows(&agents, &spaces, master, 4, report, height, 38);
                     for (at, (_, want)) in drawn.iter().enumerate() {
                         assert_eq!(
-                            hit(&agents, &spaces, master, 4, report, height, at),
+                            hit(&agents, &spaces, master, 4, report, height, at, 38),
                             *want,
                             "height {height} row {at}"
                         );
                     }
                     assert_eq!(
-                        hit(&agents, &spaces, master, 4, report, height, drawn.len() + 3),
+                        hit(
+                            &agents,
+                            &spaces,
+                            master,
+                            4,
+                            report,
+                            height,
+                            drawn.len() + 3,
+                            38
+                        ),
                         None,
                         "past the end"
                     );
@@ -895,7 +983,7 @@ mod tests {
     fn a_report_adds_summaries_and_at_most_three_report_rows() {
         let (agents, spaces) = sample();
         let report = fresh_report();
-        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30);
+        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -912,7 +1000,7 @@ mod tests {
             "the fourth report row is cut: {texts:?}"
         );
         for (line, _) in &lines {
-            assert_eq!(crate::width::width(&line.text), MASTER_WIDTH);
+            assert_eq!(crate::width::width(&line.text), MIN_WIDTH);
         }
     }
 
@@ -927,11 +1015,11 @@ mod tests {
             "\u{1f30d}".repeat(30),
             "kisa"
         );
-        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30);
+        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30, 38);
         for (line, _) in &lines {
             assert_eq!(
                 crate::width::width(&line.text),
-                MASTER_WIDTH,
+                MIN_WIDTH,
                 "{:?}",
                 line.text
             );
@@ -942,7 +1030,7 @@ mod tests {
     #[test]
     fn without_a_report_the_index_alone_is_shown() {
         let (agents, spaces) = sample();
-        let lines = rows(&agents, &spaces, None, 4, None, 30);
+        let lines = rows(&agents, &spaces, None, 4, None, 30, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -1111,12 +1199,20 @@ mod tests {
         let report = hostile_report();
         // The header paints too: pin the hostile terminal so its name runs
         // through the header's own cleaning, not just the need row's.
-        let pinned = rows(&agents, &spaces, Some((1, Some(1))), 1, Some(&report), 30);
+        let pinned = rows(
+            &agents,
+            &spaces,
+            Some((1, Some(1))),
+            1,
+            Some(&report),
+            30,
+            38,
+        );
         assert!(!pinned.is_empty());
         for (line, _) in &pinned {
             assert_eq!(
                 crate::width::width(&line.text),
-                MASTER_WIDTH,
+                MIN_WIDTH,
                 "{:?}",
                 line.text
             );
@@ -1136,12 +1232,12 @@ mod tests {
             texts[0].contains("master"),
             "the header names the pin: {texts:?}"
         );
-        let lines = rows(&agents, &spaces, None, 1, Some(&report), 30);
+        let lines = rows(&agents, &spaces, None, 1, Some(&report), 30, 38);
         assert!(!lines.is_empty());
         for (line, _) in &lines {
             assert_eq!(
                 crate::width::width(&line.text),
-                MASTER_WIDTH,
+                MIN_WIDTH,
                 "{:?}",
                 line.text
             );
@@ -1261,7 +1357,7 @@ mod tests {
         report.needs[0].terminal = 3;
         report.needs[0].generation = Some(2);
         report.needs[0].summary = "stale words".to_string();
-        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30);
+        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -1273,7 +1369,7 @@ mod tests {
         // Reports without a generation still match, as before.
         report.needs[0].generation = None;
         report.needs[0].summary = "soru soruyor".to_string();
-        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30);
+        let lines = rows(&agents, &spaces, None, 4, Some(&report), 30, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -1288,7 +1384,7 @@ mod tests {
     fn the_master_pin_holds_only_its_generation() {
         let (agents, spaces) = sample();
         // Terminal 3 is live at generation 1; the pin names generation 2.
-        let lines = rows(&agents, &spaces, Some((3, Some(2))), 4, None, 20);
+        let lines = rows(&agents, &spaces, Some((3, Some(2))), 4, None, 20, 38);
         let texts: Vec<String> = lines
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
@@ -1394,6 +1490,46 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(files.len(), 1, "no duplicate verdict");
+    }
+
+    #[test]
+    fn the_column_is_a_quarter_of_the_window_within_a_floor_and_a_cap() {
+        assert_eq!(width_for(100), MIN_WIDTH, "a narrow window keeps the floor");
+        assert_eq!(width_for(152), MIN_WIDTH, "152 / 4 is the floor exactly");
+        assert_eq!(width_for(160), 40, "past the floor it grows");
+        assert_eq!(width_for(240), 60, "a wide window reads a quarter page");
+        assert_eq!(width_for(400), MAX_WIDTH, "and no wider than the cap");
+        assert_eq!(width_for(40), MIN_WIDTH, "a strip window keeps the floor");
+    }
+
+    #[test]
+    fn the_agent_match_names_the_binary_by_path_or_by_detection() {
+        let mut row = agent(1, 1, "/opt/homebrew/bin/opencode", "working");
+        row.agent = false;
+        assert!(agent_matches(&row, "opencode"), "by last segment");
+        assert!(agent_matches(&row, "/opt/homebrew/bin/opencode"), "by path");
+        assert!(!agent_matches(&row, "claude"), "not another binary");
+        row.program = Some("/bin/sh".to_string());
+        assert!(agent_matches(&row, "/bin/sh"), "a full path matches itself");
+        assert!(!agent_matches(&row, "opencode"), "a shell is no agent");
+        row.agent = true;
+        assert!(
+            agent_matches(&row, "opencode"),
+            "a recognised agent is a match under any name"
+        );
+        row.program = None;
+        row.agent = false;
+        assert!(!agent_matches(&row, "opencode"), "nothing known, no match");
+    }
+
+    #[test]
+    fn the_auto_marker_survives_a_restart_and_empty_reads_as_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!auto_done(dir.path()), "fresh sessions raise once");
+        mark_auto(dir.path());
+        assert!(auto_done(dir.path()), "then never again");
+        let empty = std::path::PathBuf::new();
+        assert!(auto_done(&empty), "nowhere reads as done, never as fresh");
     }
 
     #[test]

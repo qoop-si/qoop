@@ -160,6 +160,104 @@ async fn send_to_pane(
     wr.write_all(&frame).await
 }
 
+/// Brief and pin the raising master once its agent shows in the index.
+///
+/// The agent gets a few indexes to appear under its own name (wrappers the
+/// detector never names still get briefed after five settled rounds:
+/// briefed is better than silent). The pin carries the live generation, so
+/// an exec-replaced master stops being the master instead of the pin
+/// following a stranger. Runs on the daemon branch, where the rows are fresh
+/// and a write is in hand.
+///
+/// Ordering matters: the brief goes out only after the first render of the
+/// master has arrived. An echo is a transient render, and one sent before
+/// the subscription exists is output nobody ever sees.
+async fn poll_auto_master(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    control_seq: &mut u32,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    dirty: &mut bool,
+) -> std::io::Result<()> {
+    let terminal = match state.auto_master.as_ref() {
+        Some(raised) if raised.terminal != 0 && !raised.briefed => raised.terminal,
+        _ => return Ok(()),
+    };
+    // First sighting: start the agent in the fresh shell, the way a person
+    // would type it. The brief follows once the agent shows.
+    if !state.auto_master.as_ref().is_some_and(|r| r.started) {
+        let Some(raised) = state.auto_master.as_mut() else {
+            return Ok(());
+        };
+        raised.started = true;
+        let mut start = raised.agent.clone().into_bytes();
+        start.push(b'\n');
+        let frame = client::encode_command_to(
+            terminal,
+            &ClientWire::Input { bytes: start },
+            seqs.entry(terminal).or_default(),
+        )?;
+        wr.write_all(&frame).await?;
+        *dirty = true;
+        return Ok(());
+    }
+    // No confirmed subscription and no render yet: the brief would be
+    // output nobody sees. Sync and wait for either proof.
+    if !state.master_synced && !state.snapshots.contains_key(&terminal) {
+        if let Some(sync) = sync_subs(state, control_seq)? {
+            wr.write_all(&sync).await?;
+        }
+        return Ok(());
+    }
+    let (agent, ready) = match state.auto_master.as_mut() {
+        Some(raised) if raised.terminal == terminal => {
+            let agent = raised.agent.clone();
+            let row = state.rows.iter().find(|r| r.terminal == terminal);
+            let Some(row) = row else {
+                // Closed before briefing: drop the flight, pin nothing.
+                state.auto_master = None;
+                return Ok(());
+            };
+            raised.rounds = if raised.last_program == row.program {
+                raised.rounds.saturating_add(1)
+            } else {
+                raised.last_program = row.program.clone();
+                1
+            };
+            // The fallback only into a settled prompt: briefing a shell that
+            // is still starting lands in its startup read-ahead, where the
+            // agent being started never sees it.
+            let settled = raised.rounds >= 5 && row.state == "idle";
+            let ready = master::agent_matches(row, &agent) || settled;
+            (agent, ready.then(|| row.generation))
+        }
+        _ => return Ok(()),
+    };
+    let Some(generation) = ready else {
+        return Ok(());
+    };
+    let mut brief = master::MASTER_BRIEF.as_bytes().to_vec();
+    brief.push(b'\n');
+    let frame = client::encode_command_to(
+        terminal,
+        &ClientWire::Input { bytes: brief },
+        seqs.entry(terminal).or_default(),
+    )?;
+    wr.write_all(&frame).await?;
+    state.master = Some((terminal, generation));
+    if let Some(raised) = state.auto_master.as_mut() {
+        raised.briefed = true;
+    }
+    // The pin subscribes: without the sync the column's viewport of the new
+    // master stays dark until some later focus change resubscribes.
+    if let Some(sync) = sync_subs(state, control_seq)? {
+        wr.write_all(&sync).await?;
+    }
+    state.message = Some(format!("{agent} briefed as master"));
+    *dirty = true;
+    Ok(())
+}
+
 /// Everything the screen is drawn from.
 struct State {
     rows: Vec<AgentRow>,
@@ -296,8 +394,10 @@ struct State {
     /// like `layouts` and `collapsed`. Set from the menu, cleared when its terminal is
     /// gone, validated against the freshest rows before every paint.
     master: Option<(u32, Option<u64>)>,
-    /// Whether the person asked for the master column. The column itself shows only
-    /// when the window holds it; see `master_shown`.
+    /// Whether the person asked for the master column. Open from the first
+    /// frame like the left column: the needs list is the notifications, and
+    /// they are no good hidden. The column itself shows only when the window
+    /// holds it; see `master_shown`. Shut at the ask with `ctrl-a E`.
     master_open: bool,
     /// Whether the master column is on screen. Kept with one column of hysteresis so a
     /// sigwinch sitting on the threshold does not flap the column (and its PTY resize)
@@ -311,6 +411,33 @@ struct State {
     /// stale or broken reads as absent, and the column shows the live index
     /// alone.
     master_report: Option<crate::master::Report>,
+    /// A master terminal asked for and not yet answered for: the fresh-session
+    /// auto-start and the menu's "start master" both queue here and drain with
+    /// a write in hand, the way `wants_terminal_in` does.
+    want_master: bool,
+    /// The in-flight automatic master: briefed and pinned once its agent shows
+    /// in the index. The keyboard is never moved to it; the column shows it.
+    auto_master: Option<AutoMaster>,
+    /// The raising master's subscription is confirmed: the daemon answered a
+    /// sync naming it, so its renders reach the viewport from here on. Read
+    /// with the snapshots as backstop: an older daemon answers every sync,
+    /// and a render already in hand proves the same.
+    master_synced: bool,
+}
+
+/// A master terminal being raised: which agent it should run, and whether the
+/// brief has reached it yet. `terminal` is zero until the create is answered.
+struct AutoMaster {
+    terminal: u32,
+    agent: String,
+    /// Consecutive polls seeing the same foreground program while idle.
+    /// After five the brief goes anyway: a wrapper the detector never names
+    /// is still better briefed than silent. Reset on every program change,
+    /// so the fallback never fires into a shell that is still starting.
+    rounds: u8,
+    last_program: Option<String>,
+    started: bool,
+    briefed: bool,
 }
 
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
@@ -343,8 +470,9 @@ impl State {
     /// every repaint.
     fn refresh_master_shown(&mut self) {
         let left = screen::left_for(self.cols, self.collapsed);
-        let room = (self.cols as usize) > left + master::MASTER_WIDTH + 2;
-        let room_wide = (self.cols as usize) > left + master::MASTER_WIDTH + 3;
+        let width = master::width_for(self.cols as usize);
+        let room = (self.cols as usize) > left + width + 2;
+        let room_wide = (self.cols as usize) > left + width + 3;
         self.master_shown = self.master_open && if self.master_shown { room } else { room_wide };
     }
 
@@ -580,6 +708,7 @@ impl State {
                 self.master_report.as_ref(),
                 column_rows,
                 within,
+                master::width_for(self.cols as usize),
             ) {
                 Some(master::Hit::Header) => Some(Clicked::Master),
                 Some(master::Hit::Need(terminal)) => Some(Clicked::Terminal(terminal)),
@@ -820,6 +949,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "re-read the agent detection overrides",
     ),
     ("pin as master", "E", "this tab reports to the right column"),
+    ("start master", "", "raise a master tab when there is none"),
     ("detach", "d", "leave, and keep everything running"),
 ];
 
@@ -961,6 +1091,14 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         }
         "pin as master" => {
             pin_focused_as_master(state);
+            MenuSend::Nothing
+        }
+        "start master" => {
+            // The same raising as a fresh session's, on demand: a closed
+            // master comes back this way. An in-flight raising is left alone;
+            // with no agent anywhere the honest answer is said, not a shell
+            // with no master in it.
+            start_master(state, master::detect_agent());
             MenuSend::Nothing
         }
         "detach" => MenuSend::Detach,
@@ -1380,10 +1518,13 @@ async fn drive(
         anchor: None,
         behind: Behind::default(),
         master: None,
-        master_open: false,
+        master_open: true,
         master_shown: false,
         session_dir,
         master_report: None,
+        want_master: false,
+        auto_master: None,
+        master_synced: false,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -2475,13 +2616,17 @@ async fn drive(
                                     state.message = None;
                                     dirty = true;
                                 } else if state.subs.contains(&terminal)
-                                    && state
+                                    && (state
                                         .rows
                                         .iter()
                                         .any(|r| r.terminal == terminal && Some(r.workspace) == state.space)
+                                        || Some(terminal)
+                                            == state.master.map(|(pinned, _)| pinned))
                                 {
                                     // A visible onlooker in this space: kept for its tile,
-                                    // never promoted, never scrolled. Anything else is a
+                                    // never promoted, never scrolled. The pinned master
+                                    // qualifies from any space: the column paints its
+                                    // viewport every frame. Anything else is a
                                     // render from a dropped subscription or another space
                                     // and is ignored.
                                     state.snapshots.insert(terminal, snapshot);
@@ -2554,6 +2699,25 @@ async fn drive(
                             &mut control_seq,
                         )?).await?;
                     }
+                    // A fresh session raises its own master: one create, asked
+                    // once, answered by id above. The keyboard stays where it
+                    // is; the column shows the master.
+                    if state.want_master {
+                        state.want_master = false;
+                        request += 1;
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::CreateTerminal {
+                                id: format!("master-{request}"),
+                                cwd: None,
+                                workspace: state.space,
+                                // Named, so the tab says what it is before the
+                                // agent names itself.
+                                name: Some("master".to_string()),
+                            },
+                            &mut control_seq,
+                        )?).await?;
+                    }
+                    poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty).await?;
                     if let Some(next) = state.pending_focus.take()
                         && let Some(bytes) =
                             focus(&mut state, next, &mut control_seq, &mut seqs)?
@@ -2651,6 +2815,31 @@ fn approve_head(state: &mut State, verdict: &str) {
             state.message = Some(format!("approval failed: {e}"));
         }
     }
+}
+
+/// Raise a master tab on demand: the menu's "start master" and, through the
+/// same fields, a fresh session's automatic one. Pure state: the create goes
+/// out with a write in hand, the brief and the pin follow from the index.
+fn start_master(state: &mut State, agent: Option<String>) {
+    if state.auto_master.is_some() {
+        state.message = Some("a master is already raising".to_string());
+        return;
+    }
+    let Some(agent) = agent else {
+        state.message = Some("no agent on PATH, set QORO_MASTER_AGENT".to_string());
+        return;
+    };
+    master::mark_auto(&state.session_dir);
+    state.master_synced = false;
+    state.want_master = true;
+    state.auto_master = Some(AutoMaster {
+        terminal: 0,
+        agent,
+        rounds: 0,
+        last_program: None,
+        started: false,
+        briefed: false,
+    });
 }
 
 /// Pin the focused tab as the master, or unpin it when it already is.
@@ -2919,19 +3108,35 @@ fn ensure_layout(state: &mut State) {
     state.layouts.insert(space, Layout::single(seed));
 }
 
-/// Visible terminals of the space on screen: the layout's, or the focused one
-/// when there is no tree yet.
+/// The terminals this client receives renders for: the visible set of the
+/// space on screen (or the focused one when there is no tree yet), plus the
+/// pinned master when it is one. The master is no tile, but the column paints
+/// its live viewport every frame, and a viewport with no subscription is a
+/// picture that never updates.
 fn visible_set(state: &State) -> Vec<u32> {
-    if let Some(space) = state.space
+    let mut set = if let Some(space) = state.space
         && let Some(layout) = state.layouts.get(&space)
     {
-        return layout.visible();
-    }
-    if state.focused != 0 {
+        layout.visible()
+    } else if state.focused != 0 {
         vec![state.focused]
     } else {
         Vec::new()
+    };
+    if let Some((terminal, _)) = state.valid_master()
+        && !set.contains(&terminal)
+    {
+        set.push(terminal);
     }
+    // The raising master too: its first render is the proof of life the
+    // briefing waits for, and without a subscription that render never comes.
+    if let Some(raised) = state.auto_master.as_ref()
+        && raised.terminal != 0
+        && !set.contains(&raised.terminal)
+    {
+        set.push(raised.terminal);
+    }
+    set
 }
 
 /// Bring subscriptions to exactly the visible set, in one write. `None` when
@@ -3267,6 +3472,25 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Agents { agents, .. } => {
+            // A fresh session raises its own master once, beside the shell the
+            // daemon opened for itself: no master tab yet, no marker from a
+            // run before, at most a fresh shell besides, and an agent on PATH
+            // (or named by QORO_MASTER_AGENT). Once means once: the marker
+            // goes down with the first raising, so later attaches never raise
+            // again. Opt out with QORO_NO_AUTO_MASTER. The create goes out
+            // with a write in hand below; the brief and the pin follow once
+            // the agent shows in the index. Sessions with real work already
+            // in them are left alone.
+            if state.auto_master.is_none()
+                && agents.len() <= 1
+                && agents.iter().all(|r| !r.agent)
+                && !agents.iter().any(|r| r.name.as_deref() == Some("master"))
+                && !master::auto_done(&state.session_dir)
+                && std::env::var_os("QORO_NO_AUTO_MASTER").is_none()
+                && let Some(agent) = master::detect_agent()
+            {
+                start_master(state, Some(agent));
+            }
             if state.focused == 0 && !state.adopted {
                 // Only before this client has ever had a terminal. The daemon subscribes a
                 // fresh client to what is already open, so this is the bootstrap and no
@@ -3466,9 +3690,17 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 && origin
                     .and_then(|space| state.layouts.get_mut(&space))
                     .is_some_and(|layout| layout.bind_placeholder(terminal));
+            // The automatic master answers by its own id: recorded for its
+            // brief, never focused and never drawn from. The keyboard stays
+            // where the person left it; the column shows the master.
+            let is_master = id.starts_with("master-");
+            if is_master && let Some(raised) = state.auto_master.as_mut() {
+                raised.terminal = terminal;
+                state.master_synced = false;
+            }
             if bound {
                 state.panes.insert(terminal);
-            } else if !is_split {
+            } else if !is_split && !is_master {
                 // The caller subscribes: a new terminal that the client is not
                 // watching draws the terminal it came from, which is what the
                 // first version did.
@@ -3477,7 +3709,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // An unbound split stays where the keyboard is: yanking the focus
             // to a terminal in another space would collapse that space's tree
             // onto one pane.
-            if bound && origin == state.space || !is_split {
+            if !is_master && (bound && origin == state.space || !is_split) {
                 state.pending_focus = Some(terminal);
             }
             *dirty = true;
@@ -3502,6 +3734,15 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // index prune above, so neither one can leave a dangling id.
             if state.master.is_some_and(|(pinned, _)| pinned == terminal) {
                 state.master = None;
+            }
+            // And the raising flight when it was the automatic master: a closed
+            // tab is never briefed, and the menu can raise another on demand.
+            if state
+                .auto_master
+                .as_ref()
+                .is_some_and(|raised| raised.terminal == terminal)
+            {
+                state.auto_master = None;
             }
             if terminal == state.focused {
                 state.snapshot = None;
@@ -3558,6 +3799,19 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 state.message = Some(reason);
             }
             *dirty = true;
+        }
+        ControlResponse::Subscribed { terminals, .. } => {
+            // The daemon confirmed the raising master's subscription: renders
+            // from here on reach the column's viewport, so the brief's echo
+            // is output somebody sees rather than a transient nobody does.
+            if state
+                .auto_master
+                .as_ref()
+                .is_some_and(|raised| raised.terminal != 0 && terminals.contains(&raised.terminal))
+            {
+                state.master_synced = true;
+                *dirty = true;
+            }
         }
         ControlResponse::FocusEvents {
             terminal, events, ..
@@ -3682,6 +3936,9 @@ mod tests {
             master_shown: false,
             session_dir: std::path::PathBuf::new(),
             master_report: None,
+            want_master: false,
+            auto_master: None,
+            master_synced: false,
         }
     }
 
@@ -3915,6 +4172,9 @@ mod tests {
             master_shown: false,
             session_dir: std::path::PathBuf::new(),
             master_report: None,
+            want_master: false,
+            auto_master: None,
+            master_synced: false,
         }
     }
 
@@ -3977,6 +4237,9 @@ mod tests {
             master_shown: false,
             session_dir: std::path::PathBuf::new(),
             master_report: None,
+            want_master: false,
+            auto_master: None,
+            master_synced: false,
         };
         let area = pane_area(&state);
         let mut layout = Layout::single(1);
@@ -4296,6 +4559,7 @@ mod tests {
                 "settings",
                 "reload manifests",
                 "pin as master",
+                "start master",
                 "detach",
             ]
         );
@@ -4457,6 +4721,36 @@ mod tests {
     }
 
     /// A closed master clears the pin in both close paths.
+    #[test]
+    fn starting_a_master_queues_a_raise_and_says_when_it_cannot() {
+        // No agent anywhere: the honest answer, not a shell with no master.
+        let mut state = bare_state();
+        start_master(&mut state, None);
+        assert!(state.auto_master.is_none());
+        assert_eq!(
+            state.message.as_deref(),
+            Some("no agent on PATH, set QORO_MASTER_AGENT")
+        );
+        // An agent: queued, unanswered (terminal zero), unbriefed.
+        let mut state = bare_state();
+        start_master(&mut state, Some("opencode".to_string()));
+        assert!(state.want_master);
+        let raised = state.auto_master.as_ref().expect("raising");
+        assert_eq!(raised.terminal, 0);
+        assert_eq!(raised.agent, "opencode");
+        assert!(!raised.started && !raised.briefed);
+        // Twice is once: the in-flight raising is left alone.
+        start_master(&mut state, Some("claude".to_string()));
+        assert_eq!(
+            state.message.as_deref(),
+            Some("a master is already raising")
+        );
+        assert_eq!(
+            state.auto_master.as_ref().expect("raising").agent,
+            "opencode"
+        );
+    }
+
     #[test]
     fn a_closed_master_clears_the_pin_in_both_close_paths() {
         // The explicit close path.
@@ -4826,6 +5120,7 @@ mod tests {
                 state.master_report.as_ref(),
                 column_rows,
                 row,
+                master::width_for(state.cols as usize),
             );
             let got = state.clicked((row + screen::SIDEBAR_TOP) as u16, master_col);
             match want {
@@ -4851,6 +5146,7 @@ mod tests {
                         state.master_report.as_ref(),
                         column_rows,
                         *row,
+                        master::width_for(state.cols as usize),
                     ),
                     Some(master::Hit::Need(2))
                 )
@@ -4964,7 +5260,8 @@ mod tests {
         state.collapsed = true;
         state.master_open = true;
         let left = screen::left_for(80, true);
-        let hide_at = left + master::MASTER_WIDTH + 2;
+        let width = master::width_for(80);
+        let hide_at = left + width + 2;
         let show_at = hide_at + 1;
         state.cols = 80;
         state.refresh_master_shown();
