@@ -2060,27 +2060,31 @@ fn toggle_master(state: &mut State) {
 
 /// Answer the head of the master's ask list with an exact verdict.
 ///
-/// The id comes from the fresh report, never typed, so an approval cannot
-/// name the wrong terminal. No report or an empty ask list says so instead
-/// of filing a verdict for nobody.
+/// The ask is the head of what the column paints (triage order over the live
+/// index), never the head of the file, so the verdict always names the
+/// terminal the person just looked at. The id comes from the fresh report,
+/// never typed. No painted head says so instead of filing a verdict for
+/// nobody, including asks whose terminal has since closed.
 fn approve_head(state: &mut State, verdict: &str) {
-    let Some(head) = state
-        .master_report
-        .as_ref()
-        .and_then(|report| report.needs.first())
-    else {
+    let Some(head) = master::approval_head(
+        &state.rows,
+        &state.spaces,
+        state.valid_master(),
+        state.master_report.as_ref(),
+    ) else {
         state.message = Some("no pending approvals".to_string());
         return;
     };
     // A file still present is pending: filing again would queue a duplicate
     // verdict for the same ask, and the loop would apply it twice.
-    if master::is_pending(&state.session_dir, &head.id) {
-        state.message = Some(format!("already pending {}", head.id));
-        return;
-    }
-    match master::write_approval(&state.session_dir, &head.id, verdict) {
+    match master::file_approval(&state.session_dir, &head.id, verdict) {
         Ok(_) => state.message = Some(format!("{verdict} {}", head.id)),
-        Err(e) => state.message = Some(format!("approval failed: {e}")),
+        Err(master::ApprovalError::Pending(id)) => {
+            state.message = Some(format!("already pending {id}"));
+        }
+        Err(master::ApprovalError::Io(e)) => {
+            state.message = Some(format!("approval failed: {e}"));
+        }
     }
 }
 
@@ -3555,6 +3559,7 @@ mod tests {
                 id: id.to_string(),
                 session: "app".to_string(),
                 terminal,
+                generation: None,
                 state: "blocked".to_string(),
                 summary: "soru".to_string(),
                 report: String::new(),
@@ -3636,6 +3641,9 @@ mod tests {
         let mut state = bare_state();
         state.session_dir = dir.path().to_path_buf();
         state.master_shown = true;
+        // The ask names a live terminal: ghosts file nothing, so the head
+        // needs its row on the index.
+        state.rows = vec![agent(2, 1, "codex", "blocked")];
         state.master_report = Some(head_report("w9", 2));
         approve_head(&mut state, "approved");
         assert_eq!(state.message.as_deref(), Some("approved w9"));
@@ -3651,6 +3659,40 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(files.len(), 1, "no duplicate verdict");
+    }
+
+    /// Approving answers the painted head, not the file head: the report
+    /// lists done first, but the column paints blocked first.
+    #[test]
+    fn approving_answers_the_painted_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = bare_state();
+        state.session_dir = dir.path().to_path_buf();
+        state.master_shown = true;
+        state.rows = vec![
+            agent(1, 1, "claude", "done"),
+            agent(2, 1, "codex", "blocked"),
+        ];
+        let mut report = head_report("w-blocked", 2);
+        report.needs.insert(
+            0,
+            master::Need {
+                id: "w-done".to_string(),
+                session: "app".to_string(),
+                terminal: 1,
+                generation: None,
+                state: "done".to_string(),
+                summary: String::new(),
+                report: String::new(),
+            },
+        );
+        state.master_report = Some(report);
+        approve_head(&mut state, "approved");
+        assert_eq!(state.message.as_deref(), Some("approved w-blocked"));
+        assert!(
+            !master::is_pending(dir.path(), "w-done"),
+            "the file head stays unfired"
+        );
     }
 
     /// Approving with the column shut, with no report, or with an empty list

@@ -25,11 +25,16 @@ the person; your only channel to a worker is the CLI below.
    of what the screen shows, suggested next step. One message per confirmed
    transition, never one per poll.
 5. Relay only the person's exact approved reply text, never your own words:
-   target not blocked: `qoro prompt <terminal-number>` with the number from
-   the freshest listing of that same session. Target blocked: `prompt`
-   refuses, so use `qoro send <terminal> <text> --enter`. After any relay,
-   list again; if state or `generation` moved mid-relay, say so instead of
-   claiming success.
+   target not blocked: `qoro --session <s> prompt <terminal-number>` with
+   the number from the freshest listing of that same session (add
+   `--session <s>` whenever the listing came from one; without it the relay
+   lands on the default session, not the worker's). Target blocked, or
+   waiting on a trust prompt: `prompt` refuses, so a blocked target takes
+   `qoro --session <s> send <terminal> <text> --enter` instead (a trust
+   prompt takes no relay at all: answer it in the terminal first). `send`
+   takes a terminal NUMBER only; only `prompt` also accepts an exact name
+   or program. After any relay, list again; if state or `generation` moved
+   mid-relay, say so instead of claiming success.
 
 ## Rules
 
@@ -38,17 +43,25 @@ the person; your only channel to a worker is the CLI below.
 - Address by terminal NUMBER from the freshest listing. Names and programs
   only when that listing shows exactly one match; `ambiguous` and `no such
   agent or terminal` mean re-list and re-report, never guess.
-- Consume approvals: files appear in `master-approvals/<id>.json`
-  (`{"id", "verdict": "approved|rejected", "seq"}`); apply in `seq` order,
-  then delete. A file still present is pending, never assumed.
+- Consume approvals: files appear in `master-approvals/` as
+  `<id>.<seq>.<pid>.json` (the id flattened, `/` and friends become `_`;
+  body `{"id", "verdict": "approved|rejected", "seq", "at_unix"}`); apply
+  in `seq` order, then delete. A file still present is pending, never
+  assumed.
 - Maintain `master.json` in this session's directory every poll (atomic
   write: tmp file plus rename):
   `{"master_terminal": N, "at_unix": 123, "needs":
-  [{"id": "w1", "session": "work", "terminal": 1, "state": "blocked",
-  "summary": "...", "report": "..."}], "last_report": "...",
-  "heartbeat_s": 15}`.
-  The panel reads it; stale data (`now - at_unix > 3 * heartbeat_s`) reads
-  as silence, so never skip a poll.
+  [{"id": "w1", "session": "work", "terminal": 1, "generation": 7,
+  "state": "blocked", "summary": "...", "report": "..."}],
+  "last_report": "...", "heartbeat_s": 15}`.
+  File `generation` from the same listing you matched the terminal in. The
+  panel drops asks whose generation no longer matches the live row, so a
+  number reused by a new terminal never inherits the old terminal's words.
+  The panel reads it; stale data reads as silence, so never skip a poll.
+  Stale means any of: `heartbeat_s` is 0 or past an hour, `at_unix` is in
+  the future, `now - at_unix > 3 * heartbeat_s`, or the file itself is
+  older than `3 * heartbeat_s + 60` seconds. Oversized bodies (past
+  256 KiB) read as absent too.
 - `done` and `failed` come from screen reading: no hook reports them.
   A `blocked` episode that starts and ends between two polls is invisible;
   say so when asked, never claim you saw it.
