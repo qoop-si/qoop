@@ -218,6 +218,21 @@ struct State {
     menu: Option<usize>,
     /// Whether the left column is folded away to a strip.
     collapsed: bool,
+    /// Whether the focus list covers the pane: the last prompt, the last
+    /// turns, one row a tool. Client-local like `collapsed`: the daemon
+    /// never knows, it only answers `ListFocusEvents`.
+    focus: bool,
+    /// The focused terminal's hook events, oldest first, as last listed.
+    /// Read-only paint input; the daemon owns the log.
+    focus_events: Vec<qoro_runtime::control::FocusEvent>,
+    /// Rows of the list hidden below the window. Zero pins the tail, so new
+    /// events arrive in view without scrolling.
+    focus_offset: usize,
+    /// A refetch is due: the index answered while open. Open and
+    /// terminal-switch fetch on their own bytes instead: on an idle daemon
+    /// nothing else arrives to drain a flag on. Consumed by the loop, never
+    /// on a timer.
+    focus_fetch: bool,
     /// An overlay showing something read only: the keys, or what this daemon is set to.
     reading: Option<Reading>,
     /// Spaces asked for and not yet answered for.
@@ -1114,6 +1129,122 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
 /// The most columns a name may take, which is the column it has to fit in.
 const NAME_LIMIT: usize = crate::sidebar::WIDTH - 6;
 
+/// What one read of stdin meant while the focus list owns the keyboard.
+#[derive(Debug)]
+enum FocusOutcome {
+    /// The list moved under the wheel or the arrows: repaint.
+    Scrolled,
+    /// The list closed with nothing sent: repaint.
+    Closed,
+    /// The list closed and these bytes are ordinary input after all: feed
+    /// them to the key decoder as though the list had never been open.
+    Passthrough(Vec<u8>),
+}
+
+/// Move the focus list, clamped to what it holds.
+///
+/// The window is bottom-pinned: offset zero shows the tail, so new events
+/// arrive in view by themselves, and scrolling up hides rows below.
+fn focus_height(state: &State) -> usize {
+    let (_, pane_rows) =
+        screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
+    (pane_rows as usize).max(1)
+}
+
+fn scroll_focus(state: &mut State, up: bool, step: usize) {
+    let max = state.focus_events.len().saturating_sub(focus_height(state));
+    if up {
+        state.focus_offset = state.focus_offset.saturating_add(step).min(max);
+    } else {
+        state.focus_offset = state.focus_offset.saturating_sub(step);
+    }
+}
+
+/// Shut the focus list: open state, scroll position and any unsent fetch.
+///
+/// One place because the view closes from five directions (its own keys, a
+/// click, the toggle, an empty space, a dead terminal) and a stale offset
+/// or a stuck fetch flag in any of them is a bug that only shows later.
+fn close_focus(state: &mut State) {
+    state.focus = false;
+    state.focus_offset = 0;
+    state.focus_fetch = false;
+}
+
+/// Decide what one read of stdin meant while the focus list owns the keyboard.
+///
+/// One logical key at a time, because a read can hold several: a held arrow
+/// repeats into one chunk, a paste coalesces, and matching the whole chunk
+/// would make scroll-vs-close depend on read chunking. A scroll key scrolls
+/// and the rest is reconsidered with the view still open; anything else
+/// closes first, and the bytes from the close keystroke on are ordinary
+/// input, so no keystroke is lost to the view.
+///
+/// The `ctrl-a F` pair that closes is swallowed, not passed on: feeding it
+/// to the decoder would toggle the view straight back open onto the same
+/// keystrokes. Any other prefix sequence is passed on untouched, so `ctrl-a
+/// d` still detaches. A prefix as the last byte of the chunk is passed on
+/// undecided: split across reads, the decoder holds it, and a following `F`
+/// reopens, which is the one keystroke this swallowing misses.
+fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
+    const PREFIX: u8 = crate::keys::PREFIX;
+    let mut scrolled = false;
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        // Arrow and SS3 spellings, the way the wheel arm spells them.
+        let scroll = if rest.starts_with(b"\x1b[A") || rest.starts_with(b"\x1bOA") {
+            Some((true, 3))
+        } else if rest.starts_with(b"\x1b[B") || rest.starts_with(b"\x1bOB") {
+            Some((false, 3))
+        } else if rest[0] == b'k' {
+            Some((true, 1))
+        } else if rest[0] == b'j' {
+            Some((false, 1))
+        } else {
+            None
+        };
+        if let Some((up, len)) = scroll {
+            scroll_focus(state, up, 1);
+            scrolled = true;
+            at += len;
+            continue;
+        }
+        // Everything else closes first; what differs is what survives it.
+        close_focus(state);
+        // The close keystroke itself is dropped; what follows it is typed.
+        let from = if rest[0] == PREFIX && rest.get(1) == Some(&b'F') {
+            at + 2
+        } else if rest[0] == b'\r' || rest[0] == b'\n' || rest[0] == b'q' {
+            at + 1
+        } else if rest[0] == 0x1b {
+            // A lone esc, or an esc opening something that is not an arrow:
+            // the esc was the close, and the byte after it is ordinary.
+            // A split arrow (`\x1b[` at the end of the chunk) types its tail
+            // the way the ordinary path does: the decoder there holds no
+            // partial escape either.
+            at + 1
+        } else {
+            at
+        };
+        if from < bytes.len() {
+            return FocusOutcome::Passthrough(bytes[from..].to_vec());
+        }
+        return if scrolled {
+            FocusOutcome::Scrolled
+        } else {
+            FocusOutcome::Closed
+        };
+    }
+    if scrolled {
+        FocusOutcome::Scrolled
+    } else {
+        // An empty read carries no key: nothing to scroll, nothing to send.
+        // The caller never sends one, and this arm is the honest default.
+        FocusOutcome::Closed
+    }
+}
+
 /// What the interface drew where a person clicked.
 enum Clicked {
     Menu,
@@ -1210,6 +1341,10 @@ async fn drive(
         prompt: None,
         menu: None,
         collapsed: false,
+        focus: false,
+        focus_events: Vec::new(),
+        focus_offset: 0,
+        focus_fetch: false,
         reading: None,
         wants_terminal_in: Vec::new(),
         adopted: false,
@@ -1316,6 +1451,24 @@ async fn drive(
                     state.ring = false;
                 }
                 out.write_all(painted.as_bytes())?;
+                // The focus list covers the pane the frame just drew, the way the
+                // palette does. Never over an overlay: an open palette owns the
+                // keyboard first, and the list never covers it.
+                if state.focus
+                    && state.focused != 0
+                    && state.palette.is_none()
+                    && state.prompt.is_none()
+                    && state.menu.is_none()
+                    && state.reading.is_none()
+                {
+                    // Cloned out from under the frame borrow: at most fifty
+                    // short rows, and only on a repaint while open.
+                    let events = state.focus_events.clone();
+                    let offset = state.focus_offset;
+                    let mut overlay = String::new();
+                    screen::paint_focus(&state.frame(), &events, offset, &mut overlay);
+                    out.write_all(overlay.as_bytes())?;
+                }
                 out.flush()?;
                 dirty = false;
             }
@@ -1547,6 +1700,20 @@ async fn drive(
                             }
                             PromptOutcome::Passthrough(rest) => feed = Some(rest),
                         }
+                    } else if state.focus {
+                        // The focus list owns the keyboard while it is open, the way the
+                        // palette and the naming box do, and hands the rest back for the
+                        // same reason. Checked after the overlays: an open palette owns
+                        // the keyboard first, and the list never covers it.
+                        match focus_key(&mut state, &bytes) {
+                            FocusOutcome::Scrolled | FocusOutcome::Closed => dirty = true,
+                            FocusOutcome::Passthrough(rest) => {
+                                // The close repaints with the list gone; the bytes
+                                // themselves run the ordinary path below.
+                                dirty = true;
+                                feed = Some(rest);
+                            }
+                        }
                     } else {
                         feed = Some(bytes);
                     }
@@ -1584,6 +1751,13 @@ async fn drive(
                                 dirty = true;
                             }
                             Action::Click { row, col, shift } => {
+                                // A click lands on the live pane, never on the
+                                // list: the list closes under it and the press
+                                // itself runs the ordinary path below.
+                                if state.focus {
+                                    close_focus(&mut state);
+                                    dirty = true;
+                                }
                                 // A tiled pane first. A click on an unfocused tile only
                                 // focuses it: the click itself goes nowhere, so coordinates
                                 // aimed at one pane are never typed into another. The
@@ -1687,6 +1861,12 @@ async fn drive(
                                 }
                             }
                             Action::Drag { row, col, shift } => {
+                                // Like a click: the drag starts on the live pane,
+                                // never on the list under the overlay.
+                                if state.focus {
+                                    close_focus(&mut state);
+                                    dirty = true;
+                                }
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
                                     continue;
                                 };
@@ -1705,6 +1885,12 @@ async fn drive(
                                 }
                             }
                             Action::Release { row, col, shift } => {
+                                // Like a click: the release belongs to the live
+                                // pane, never to the list under the overlay.
+                                if state.focus {
+                                    close_focus(&mut state);
+                                    dirty = true;
+                                }
                                 let inside = state.in_pane(row, col);
                                 if let Some(selection) = state.selection {
                                     // Copied when the button comes up, with no key to
@@ -1763,6 +1949,13 @@ async fn drive(
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
                                     continue;
                                 };
+                                if state.focus {
+                                    // The list scrolls under the wheel; the program
+                                    // underneath never sees it.
+                                    scroll_focus(&mut state, up, WHEEL_ROWS);
+                                    dirty = true;
+                                    continue;
+                                }
                                 if state.pane_wants_mouse() && !shift {
                                     // 64 up, 65 down: the program scrolls its own view,
                                     // which is the only view of it that exists.
@@ -1992,6 +2185,42 @@ async fn drive(
                             Action::ToggleView => {
                                 state.view = state.view.toggle();
                                 dirty = true;
+                            }
+                            Action::Focus => {
+                                if state.focus {
+                                    close_focus(&mut state);
+                                    dirty = true;
+                                } else if state.focused == 0 {
+                                    state.message = Some(
+                                        "nothing to focus, ctrl-a c starts a terminal"
+                                            .to_string(),
+                                    );
+                                    dirty = true;
+                                } else {
+                                    state.focus = true;
+                                    state.focus_offset = 0;
+                                    state.focus_events.clear();
+                                    // Asked for at once, not on the fetch flag: an idle
+                                    // daemon sends nothing, and the flag below is only
+                                    // drained on an arrival.
+                                    request += 1;
+                                    let (_, pane_rows) = screen::pane_size_for(
+                                        state.cols,
+                                        state.lines,
+                                        state.collapsed,
+                                        state.right_now(),
+                                    );
+                                    wr.write_all(&client::encode_control_seq(
+                                        &ControlRequest::ListFocusEvents {
+                                            id: format!("focus-{request}"),
+                                            terminal: state.focused,
+                                            last_n: pane_rows as usize,
+                                        },
+                                        &mut control_seq,
+                                    )?)
+                                    .await?;
+                                    dirty = true;
+                                }
                             }
                             Action::SplitV | Action::SplitH => {
                                 let dir = if matches!(action, Action::SplitV) {
@@ -2261,6 +2490,28 @@ async fn drive(
                     {
                         wr.write_all(&bytes).await?;
                         dirty = true;
+                    }
+                    // The focus list refetches on its own flag, never on a timer:
+                    // opened, moved to another terminal, or told the index
+                    // changed while open. A tool event arrives with the state
+                    // still `working`, so a state-change trigger would miss it.
+                    if state.focus_fetch && state.focus && state.focused != 0 {
+                        state.focus_fetch = false;
+                        request += 1;
+                        let (_, pane_rows) = screen::pane_size_for(
+                            state.cols,
+                            state.lines,
+                            state.collapsed,
+                            state.right_now(),
+                        );
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::ListFocusEvents {
+                                id: format!("focus-{request}"),
+                                terminal: state.focused,
+                                last_n: pane_rows as usize,
+                            },
+                            &mut control_seq,
+                        )?).await?;
                     }
                     if state.done {
                         return Ok(());
@@ -2720,6 +2971,13 @@ fn focus(
     state.behind = Behind::default();
     state.selection = None;
     state.focused = to;
+    // The list belongs to its terminal: a new one starts unlisted, and the
+    // fetch at the end of this function fills it rather than showing the
+    // old terminal's rows.
+    if state.focus {
+        state.focus_events.clear();
+        state.focus_offset = 0;
+    }
     // Standing on a finished row is reading it: it stops saying `new` the
     // moment the keyboard arrives, with no extra keystroke asked.
     if let Some(row) = state.rows.iter().find(|r| r.terminal == to)
@@ -2740,6 +2998,23 @@ fn focus(
     }
     if let Some(resize) = resize_focused_to_tile(state, seqs)? {
         out.extend_from_slice(&resize);
+    }
+    // The list refetches on the same bytes as the subscribe above: on an
+    // idle daemon nothing else arrives to drain a flag on.
+    if state.focus {
+        let (_, pane_rows) =
+            screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
+        // The id only has to name the family for the refusal arm; the answer
+        // is matched on its terminal, never on this string.
+        let id = format!("focus-term-{to}-{}", *control_seq);
+        out.extend_from_slice(&client::encode_control_seq(
+            &ControlRequest::ListFocusEvents {
+                id,
+                terminal: to,
+                last_n: pane_rows as usize,
+            },
+            control_seq,
+        )?);
     }
     state.message = None;
     Ok(Some(out))
@@ -2804,6 +3079,9 @@ fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Op
     state.focused = 0;
     state.snapshot = None;
     state.message = Some(why.to_string());
+    // No terminal, no list: the overlay hides, and so does the keyboard
+    // ownership that would otherwise intercept keys for nobody.
+    close_focus(state);
     // Every subscription goes, not just the focused one: with tiling the
     // client can watch several terminals, and leaving any of them subscribed
     // paints output from a space the person has left.
@@ -3012,6 +3290,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // The index changed while the list is open: fetch again. A state
+            // word comparison cannot trigger this, because a tool event
+            // arrives with the state still `working`.
+            if state.focus {
+                state.focus_fetch = true;
+            }
             // The read receipts follow the rows: entries for terminals that are
             // gone or no longer finished leave, and a finished row under the
             // keyboard counts as read without waiting for a focus change.
@@ -3156,9 +3440,29 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             {
                 layout.drop_placeholder();
             }
-            // Shown rather than swallowed. A refusal a person cannot see is a client that
-            // looks broken instead of a daemon that said no.
-            state.message = Some(reason);
+            // A refused focus fetch is silence, not news: an older daemon
+            // answers every one, and shouting on each would shout on every
+            // index while open. The list keeps what it has.
+            if !id.starts_with("focus-") {
+                // Shown rather than swallowed. A refusal a person cannot see is a client that
+                // looks broken instead of a daemon that said no.
+                state.message = Some(reason);
+            }
+            *dirty = true;
+        }
+        ControlResponse::FocusEvents {
+            terminal, events, ..
+        } if state.focus && terminal == state.focused => {
+            // A listing for the terminal on screen, while the list is open. A
+            // listing for anywhere else is a race with a focus change, and one
+            // with the list closed is a race with its toggle: both are
+            // dropped rather than painted under the wrong tab.
+            state.focus_events = events;
+            // A background refetch must not yank a scrolled-up reader to the
+            // tail: the offset stays, clamped to what the new list holds.
+            state.focus_offset = state
+                .focus_offset
+                .min(state.focus_events.len().saturating_sub(focus_height(state)));
             *dirty = true;
         }
         _ => {}
@@ -3240,6 +3544,10 @@ mod tests {
             prompt: None,
             menu: None,
             collapsed: false,
+            focus: false,
+            focus_events: Vec::new(),
+            focus_offset: 0,
+            focus_fetch: false,
             reading: None,
             wants_terminal_in: Vec::new(),
             adopted: true,
@@ -3477,6 +3785,10 @@ mod tests {
             prompt: None,
             menu: None,
             collapsed: false,
+            focus: false,
+            focus_events: Vec::new(),
+            focus_offset: 0,
+            focus_fetch: false,
             reading: None,
             creating: 0,
             fold: sidebar::Fold::default(),
@@ -3536,6 +3848,10 @@ mod tests {
             prompt: None,
             menu: None,
             collapsed: false,
+            focus: false,
+            focus_events: Vec::new(),
+            focus_offset: 0,
+            focus_fetch: false,
             reading: None,
             fold: sidebar::Fold::default(),
             view: sidebar::View::default(),
@@ -4018,6 +4334,178 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(state.master, Some((1, None)));
+    }
+
+    fn tool_event(label: &str) -> qoro_runtime::control::FocusEvent {
+        qoro_runtime::control::FocusEvent {
+            kind: "tool".to_string(),
+            label: label.to_string(),
+            at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn the_focus_list_scrolls_with_arrows_and_j_k() {
+        let mut state = bare_state();
+        // Three pane rows: five events do not fit.
+        state.lines = 6;
+        state.focus = true;
+        state.focus_events = (0..5).map(|i| tool_event(&format!("tool {i}"))).collect();
+        assert!(matches!(
+            focus_key(&mut state, b"\x1b[A"),
+            FocusOutcome::Scrolled
+        ));
+        assert_eq!(state.focus_offset, 1);
+        assert!(state.focus, "scrolling never closes");
+        assert!(matches!(
+            focus_key(&mut state, b"k"),
+            FocusOutcome::Scrolled
+        ));
+        assert_eq!(state.focus_offset, 2);
+        // Clamped at the head: no further.
+        assert!(matches!(
+            focus_key(&mut state, b"\x1b[A"),
+            FocusOutcome::Scrolled
+        ));
+        assert_eq!(state.focus_offset, 2);
+        assert!(matches!(
+            focus_key(&mut state, b"j"),
+            FocusOutcome::Scrolled
+        ));
+        assert_eq!(state.focus_offset, 1);
+        assert!(matches!(
+            focus_key(&mut state, b"\x1b[B"),
+            FocusOutcome::Scrolled
+        ));
+        assert_eq!(state.focus_offset, 0);
+    }
+
+    #[test]
+    fn enter_esc_and_q_close_the_focus_list_without_sending() {
+        let mut state = bare_state();
+        state.focus = true;
+        for bytes in [&b"\r"[..], &b"\n"[..], &b"\x1b"[..], &b"q"[..]] {
+            state.focus = true;
+            assert!(
+                matches!(focus_key(&mut state, bytes), FocusOutcome::Closed),
+                "{bytes:?} closes"
+            );
+            assert!(!state.focus);
+        }
+    }
+
+    #[test]
+    fn typing_closes_the_focus_list_and_reaches_the_terminal() {
+        let mut state = bare_state();
+        state.focus = true;
+        match focus_key(&mut state, b"hello") {
+            FocusOutcome::Passthrough(rest) => assert_eq!(rest, b"hello"),
+            other => panic!("typing is passed through: {other:?}"),
+        }
+        assert!(!state.focus);
+    }
+
+    #[test]
+    fn the_close_toggle_is_swallowed_while_other_prefixes_pass_through() {
+        let mut state = bare_state();
+        state.focus = true;
+        assert!(
+            matches!(focus_key(&mut state, b"\x01F"), FocusOutcome::Closed),
+            "the toggle that closes is the close itself, never a reopen"
+        );
+        assert!(!state.focus);
+    }
+
+    #[test]
+    fn a_focus_listing_for_the_open_terminal_is_kept_and_any_other_is_dropped() {
+        let mut state = bare_state();
+        state.focus = true;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::FocusEvents {
+                id: "focus-1".to_string(),
+                terminal: 1,
+                events: vec![tool_event("Read foo.rs")],
+            },
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert_eq!(state.focus_events.len(), 1);
+        // Another terminal's listing is a race with a focus change: dropped.
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::FocusEvents {
+                id: "focus-2".to_string(),
+                terminal: 9,
+                events: vec![tool_event("Read bar.rs")],
+            },
+            &mut dirty,
+        );
+        assert!(!dirty);
+        assert_eq!(state.focus_events.len(), 1);
+        // Closed, a listing is a race with the toggle: dropped.
+        state.focus = false;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::FocusEvents {
+                id: "focus-3".to_string(),
+                terminal: 1,
+                events: vec![],
+            },
+            &mut dirty,
+        );
+        assert!(!dirty);
+        assert_eq!(state.focus_events.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_focus_fetch_is_silence_not_news() {
+        let mut state = bare_state();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: "focus-1".to_string(),
+                reason: "no terminal 1".to_string(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.message, None,
+            "an old daemon would shout on every index"
+        );
+    }
+
+    #[test]
+    fn an_index_while_open_marks_a_refetch() {
+        let mut state = bare_state();
+        state.focus = true;
+        state.focus_fetch = false;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(1, 1, "claude", "working")],
+            },
+            &mut dirty,
+        );
+        assert!(state.focus_fetch);
+        // And shut, it marks nothing.
+        state.focus = false;
+        state.focus_fetch = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(1, 1, "claude", "working")],
+            },
+            &mut dirty,
+        );
+        assert!(!state.focus_fetch);
     }
 
     /// The column keeps one column of hysteresis: staying open is cheaper than coming

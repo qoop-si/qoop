@@ -31,6 +31,21 @@
 # `qoro hook-report`, and exits zero in every failure case: a hook that errors
 # fails open and the screen reading keeps working with no hooks installed.
 # Event reference: https://docs.anthropic.com/en/docs/claude-code/hooks
+#
+# State mapping is unchanged by focus events: the state words below are what
+# they always were, and `--event/--label` only adds a display row for the
+# focus view. `Stop`/`SessionEnd` still report `idle`, with `--event done`
+# beside it; the push behaviour does not move, because pushes derive from
+# state alone.
+#
+# Event map:
+#   SessionStart, SubagentStop -> working, no event
+#   UserPromptSubmit -> working + `--event user` (prompt head, best-effort)
+#   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
+#     the first file-ish `tool_input` field, best-effort)
+#   PermissionRequest -> blocked + `--event blocked` (tool label, best-effort)
+#   Notification -> blocked + `--event blocked`, no label (it carries no tool)
+#   Stop, SessionEnd -> idle + `--event done`, no label
 
 set -eu
 
@@ -39,34 +54,85 @@ set -eu
 command -v qoro >/dev/null 2>&1 || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
-report="$(python3 -c '
-import json, sys
+# The report runs inside python with an argv list, never through shell
+# interpolation: a prompt head or file path can hold spaces, quotes, `$`,
+# backticks and newlines, and none of those may reach a shell word.
+#
+# The payload is read first and the program travels in argv, because a
+# heredoc would otherwise take python's stdin for itself and the hook JSON
+# would never arrive: every event would decode nothing and report nothing.
+input=$(cat)
+prog=$(cat <<'PY'
+import json
+import subprocess
+import sys
+
+
+def first_fileish(tool_input):
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("file_path", "path", "command", "pattern"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def one_line(text, limit=120):
+    single = " ".join(str(text).split())
+    return single[:limit]
+
+
 try:
     payload = json.load(sys.stdin)
 except Exception:
-    raise SystemExit(1)
-name = payload.get("hook_event_name") or ""
-if name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-             "SubagentStop"):
-    state = "working --visible-working"
-elif name in ("Notification", "PermissionRequest"):
-    state = "blocked --visible-blocker"
-elif name in ("Stop", "SessionEnd"):
-    state = "idle --visible-idle"
-else:
-    raise SystemExit(1)
-# The conversation this report belongs to. It is what lets a tab come back to this
-# conversation after a restart rather than to whichever one in the directory is newest,
-# which is a different conversation the moment two agents share a repository. Refused
-# unless it looks like an id and nothing else: this string ends up on a command line.
-session = str(payload.get("session_id") or "")
-if session and len(session) <= 128 and all(
-    c.isalnum() or c in "-_." for c in session
-):
-    state += " --session-id " + session
-print(state)
-' 2>/dev/null)" || exit 0
+    raise SystemExit(0)
 
-# shellcheck disable=SC2086
-qoro hook-report --state $report >/dev/null 2>&1 || true
+name = payload.get("hook_event_name") or ""
+if name in ("SessionStart", "SubagentStop"):
+    state, flags, event, label = "working", "--visible-working", "", ""
+elif name == "UserPromptSubmit":
+    state, flags, event = "working", "--visible-working", "user"
+    label = one_line(payload.get("prompt") or "")
+elif name in ("PreToolUse", "PostToolUse"):
+    state, flags, event = "working", "--visible-working", "tool"
+    tool = str(payload.get("tool_name") or "").strip()
+    arg = first_fileish(payload.get("tool_input"))
+    head = f"{tool} {arg}".strip()
+    label = one_line(head or tool)
+elif name == "PermissionRequest":
+    state, flags, event = "blocked", "--visible-blocker", "blocked"
+    tool = str(payload.get("tool_name") or "").strip()
+    arg = first_fileish(payload.get("tool_input"))
+    head = f"{tool} {arg}".strip()
+    label = one_line(head or tool)
+elif name == "Notification":
+    state, flags, event, label = "blocked", "--visible-blocker", "blocked", ""
+elif name in ("Stop", "SessionEnd"):
+    state, flags, event, label = "idle", "--visible-idle", "done", ""
+else:
+    raise SystemExit(0)
+
+# The conversation this report belongs to. It is what lets a tab come back
+# to this conversation after a restart rather than to whichever one in the
+# directory is newest. Refused unless it looks like an id and nothing else:
+# this string ends up on a command line.
+session = str(payload.get("session_id") or "")
+if session and (len(session) > 128 or not all(c.isalnum() or c in "-_." for c in session)):
+    session = ""
+
+args = ["qoro", "hook-report", "--state", state, flags]
+if event:
+    args += ["--event", event]
+if label:
+    args += ["--label", label]
+if session:
+    args += ["--session-id", session]
+try:
+    subprocess.run(args, timeout=5, capture_output=True)
+except Exception:
+    pass
+PY
+)
+printf '%s' "$input" | python3 -c "$prog" >/dev/null 2>&1 || true
 exit 0

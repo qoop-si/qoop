@@ -61,6 +61,14 @@ Notes:
   lifecycle; the mapping mirrors the session-status table (`idle` to idle,
   `active`/`busy`/`pending`/`retry`/`running`/`streaming`/`working` to
   working, `permission.asked` to blocked).
+- focus events (claude + opencode only): both scripts add `--event
+  user|tool|blocked|done` with a one-line `--label` beside the unchanged
+  state word. The daemon keeps the last 50 per terminal in memory for the
+  focus view and nothing else: no journal, no push payload, no event log.
+  Other agents report state only and read as "no hook reports yet" in the
+  focus view. Labels are best-effort (tool name plus first file-ish
+  argument, or the prompt head, cut to 120 characters); a payload without
+  the field reports label-less, which is today's behaviour.
 
 ## How it works
 
@@ -70,7 +78,7 @@ Notes:
    `QORO_RUNTIME_DIR` exactly like any other client.
 2. The agent's hook mechanism calls the script in `hooks/<agent>/` on lifecycle
    events. The script maps the event to a state and calls
-   `qoro hook-report --state <state>`, which posts one `ReportAgentState`
+   `qoro hook-report --state <state> [--event <kind>] [--label ...]`, which posts one `ReportAgentState`
    control request and waits up to five seconds for the answer. Each script
    also passes the agent's own id for the conversation as
    `--session-id`, read out of that agent's hook payload on stdin (claude's
@@ -93,9 +101,15 @@ Notes:
 ```text
 qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown>
     [--terminal N] [--token T] [--session-id S]
+    [--event user|tool|blocked|done] [--label ...]
     [--visible-blocker] [--visible-idle] [--visible-working]
 qoro hook-report --session-id S [--terminal N] [--token T]
 ```
+
+`--event` needs `--state`, and `--label` needs `--event`; anything else is
+a usage error before anything reaches the daemon. An out-of-set `--event`
+is rejected the same way, while the daemon itself stays tolerant: a report
+with no (or an unknown) event still applies its state and records no row.
 
 `--terminal` and `--token` default to the environment. It prints nothing on
 success and the reason on stderr with a non-zero exit on failure.

@@ -65,6 +65,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             visible_working: true,
             clock: 0,
             session: None,
+            event: None,
+            label: None,
         },
         ControlRequest::ReloadAgentManifests { id: "x12".into() },
         // Session identity without a state claim: an id for the store, never
@@ -92,6 +94,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             up: 10,
             rows: 10,
         },
+        ControlRequest::ListFocusEvents {
+            id: "x17".into(),
+            terminal,
+            last_n: 10,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -109,6 +116,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
+            | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

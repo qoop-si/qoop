@@ -156,6 +156,8 @@ fn actions() -> Vec<Action> {
                     visible_working: true,
                     clock: 0,
                     session: None,
+                    event: None,
+                    label: None,
                 })
             },
         },
@@ -188,6 +190,16 @@ fn actions() -> Vec<Action> {
         Action {
             name: "re-read agent-detection overrides",
             method: || Method::Control(ControlRequest::ReloadAgentManifests { id: "a".into() }),
+        },
+        Action {
+            name: "read a terminal's recent hook events for the focus view",
+            method: || {
+                Method::Control(ControlRequest::ListFocusEvents {
+                    id: "a".into(),
+                    terminal: 1,
+                    last_n: 20,
+                })
+            },
         },
         Action {
             name: "type into the focused terminal",
@@ -285,6 +297,8 @@ fn every_control_method_is_reachable_from_some_action() {
             visible_working: false,
             clock: 0,
             session: None,
+            event: None,
+            label: None,
         },
         ControlRequest::ReportAgentSession {
             id: String::new(),
@@ -315,6 +329,11 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             name: String::new(),
         },
+        ControlRequest::ListFocusEvents {
+            id: String::new(),
+            terminal: 0,
+            last_n: 0,
+        },
     ];
     for request in &all {
         match request {
@@ -331,6 +350,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
+            | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

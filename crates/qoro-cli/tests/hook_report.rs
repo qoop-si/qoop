@@ -148,3 +148,96 @@ fn an_empty_session_id_is_refused_not_recorded_as_silence() {
         "an empty id is a caller error, not a report: {err:?}"
     );
 }
+
+#[test]
+fn an_unknown_event_is_rejected_before_anything_is_admitted() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--state",
+            "working",
+            "--event",
+            "started",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("unknown focus event"),
+        "the parse error names the event: {err:?}"
+    );
+}
+
+#[test]
+fn a_label_without_an_event_is_a_usage_error() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--state",
+            "working",
+            "--label",
+            "Read foo.rs",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("--label needs --event"),
+        "a label alone names the usage: {err:?}"
+    );
+}
+
+#[test]
+fn an_event_on_the_session_only_path_is_a_usage_error() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--session-id",
+            "solo-456",
+            "--event",
+            "tool",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("--event/--label need --state"),
+        "an event without a state names the usage: {err:?}"
+    );
+}
+
+#[test]
+fn an_event_report_reaches_the_daemon_instead_of_the_usage_error() {
+    // A forged token is refused by the daemon, which proves the event path
+    // built a real request: a usage error would fail differently.
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--state",
+            "working",
+            "--event",
+            "tool",
+            "--label",
+            "Read foo.rs",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok, "a forgery must not report");
+    assert!(err.contains("refused"), "the refusal names itself: {err:?}");
+}

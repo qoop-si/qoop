@@ -8,7 +8,7 @@
 //! the first program forever. The generation is what changes, and everything sampled under
 //! an older one is refused (ADR-008, invariant I5).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 
 use qoro_domain::{
@@ -82,6 +82,13 @@ pub struct AgentRegistry {
     /// Which terminal a watched pid belongs to.
     by_pid: Mutex<HashMap<i32, u32>>,
     terminals: Mutex<BTreeMap<u32, TerminalAgent>>,
+    /// Focus events per terminal, oldest first, capped at
+    /// [`crate::control::MAX_FOCUS_EVENTS`].
+    ///
+    /// Display only: hook reports admitted through the token check land
+    /// here as well as in the belief. Never journalled, never pushed,
+    /// never observed. A terminal that is gone takes its log with it.
+    focus: Mutex<BTreeMap<u32, VecDeque<crate::control::FocusEvent>>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
@@ -181,6 +188,7 @@ impl AgentRegistry {
             watch: ProcWatch::new()?,
             by_pid: Mutex::new(HashMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
+            focus: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
             changes: tokio::sync::broadcast::channel(64).0,
         })
@@ -230,6 +238,7 @@ impl AgentRegistry {
 
     pub fn forget(&self, stream: u32) {
         self.masters.lock().unwrap().remove(&stream);
+        self.focus.lock().unwrap().remove(&stream);
         if let Some(agent) = self.terminals.lock().unwrap().remove(&stream)
             && let Some(pid) = agent.leader
         {
@@ -551,6 +560,31 @@ impl AgentRegistry {
             self.announce(stream);
         }
         Ok(changed)
+    }
+
+    /// Record one admitted focus event for a terminal.
+    ///
+    /// The caller admits first: only reports through the token check reach
+    /// here, so a forged token cannot write the log. The kind is already
+    /// validated against the closed set and the label already truncated;
+    /// this only caps the per-terminal log.
+    pub fn push_focus_event(&self, stream: u32, event: crate::control::FocusEvent) {
+        let mut focus = self.focus.lock().unwrap();
+        let log = focus.entry(stream).or_default();
+        log.push_back(event);
+        while log.len() > crate::control::MAX_FOCUS_EVENTS {
+            log.pop_front();
+        }
+    }
+
+    /// A terminal's focus events, oldest first.
+    pub fn focus_events(&self, stream: u32) -> Vec<crate::control::FocusEvent> {
+        self.focus
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map(|log| log.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1095,5 +1129,47 @@ mod tests {
         )
         .expect("a hook from the live session applies");
         assert!(!r.agent(1).expect("agent").setup_gate);
+    }
+
+    /// Focus: the per-terminal log caps at MAX_FOCUS_EVENTS, oldest first.
+    #[test]
+    fn a_focus_log_caps_at_fifty_and_reads_oldest_first() {
+        let r = registry();
+        for n in 0..(crate::control::MAX_FOCUS_EVENTS + 5) {
+            r.push_focus_event(
+                1,
+                crate::control::FocusEvent {
+                    kind: "tool".into(),
+                    label: format!("Read {n}.rs"),
+                    at_unix: n as i64,
+                },
+            );
+        }
+        let events = r.focus_events(1);
+        assert_eq!(events.len(), crate::control::MAX_FOCUS_EVENTS);
+        assert_eq!(events.first().expect("a head").label, "Read 5.rs");
+        assert_eq!(
+            events.last().expect("a tail").label,
+            format!("Read {}.rs", crate::control::MAX_FOCUS_EVENTS + 4)
+        );
+    }
+
+    /// Focus: forgetting a terminal drops its log with it.
+    #[test]
+    fn forgetting_a_terminal_drops_its_focus_log() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token);
+        r.push_focus_event(
+            1,
+            crate::control::FocusEvent {
+                kind: "user".into(),
+                label: "hello".into(),
+                at_unix: 1,
+            },
+        );
+        assert_eq!(r.focus_events(1).len(), 1);
+        r.forget(1);
+        assert!(r.focus_events(1).is_empty());
     }
 }

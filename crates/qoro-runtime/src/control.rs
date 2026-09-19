@@ -158,6 +158,21 @@ pub enum ControlRequest {
         /// do not report it and a daemon that predates the field ignores it.
         #[serde(default)]
         session: Option<String>,
+        /// What happened, as a closed kind: `user`, `tool`, `blocked`, `done`.
+        ///
+        /// Display only: it never enters the belief, the push payload, or the
+        /// event log. Absent or outside the closed set means "a state report
+        /// with nothing to show", and the daemon records no event. Defaulted
+        /// so reports from older hooks parse without it.
+        #[serde(default)]
+        event: Option<String>,
+        /// One line saying what the event was: a tool name with its file-ish
+        /// argument, or the head of the user's prompt. Cut to 120 characters
+        /// by the daemon. Display only, like `event`: never journalled, never
+        /// pushed, never observed. An event without a label is a kind with no
+        /// words; a label without an event is refused by the CLI.
+        #[serde(default)]
+        label: Option<String>,
     },
     /// Re-read user agent-detection overrides from the config directory.
     ///
@@ -184,6 +199,16 @@ pub enum ControlRequest {
         /// is nothing to record, and silence must not clear what is there.
         session: String,
     },
+    /// The focus events a terminal's hooks have reported.
+    ///
+    /// Answered from the daemon's memory, never from disk: events are
+    /// arrivals like state reports, journalled nowhere and replayed never.
+    /// `last_n` is capped by the daemon like scrollback rows.
+    ListFocusEvents {
+        id: String,
+        terminal: TerminalStream,
+        last_n: usize,
+    },
 }
 
 impl ControlRequest {
@@ -204,6 +229,7 @@ impl ControlRequest {
             | Self::RequestOwnership { id, .. }
             | Self::ReportAgentState { id, .. }
             | Self::ReportAgentSession { id, .. }
+            | Self::ListFocusEvents { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::GrantOwnership { id, .. } => id,
         }
@@ -292,6 +318,26 @@ pub enum ControlResponse {
         id: String,
         reason: String,
     },
+    /// What `ListFocusEvents` asked for: the terminal's recent hook events,
+    /// oldest first, at most as many as were asked for.
+    FocusEvents {
+        id: String,
+        terminal: TerminalStream,
+        events: Vec<FocusEvent>,
+    },
+}
+
+/// One hook event, as the focus view draws it.
+///
+/// Plain strings on the wire, like `AgentRow`: a client that does not
+/// recognise a kind renders the string it was given. The daemon only ever
+/// stores the closed set (`user`, `tool`, `blocked`, `done`), so an unknown
+/// kind here would be a daemon bug, not a version skew.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusEvent {
+    pub kind: String,
+    pub label: String,
+    pub at_unix: i64,
 }
 
 /// One workspace, as a client lists it.
@@ -437,9 +483,47 @@ impl ControlResponse {
             | Self::OwnershipGranted { id, .. }
             | Self::AgentStateReported { id, .. }
             | Self::ManifestsReloaded { id, .. }
+            | Self::FocusEvents { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }
+}
+
+/// The most focus events one terminal keeps.
+///
+/// A bound, not a target: the list is a glance, and an unbounded per-terminal
+/// log in daemon memory grows with how long the session has been open.
+pub const MAX_FOCUS_EVENTS: usize = 50;
+
+/// The most characters of a focus label the daemon keeps.
+///
+/// Characters, not bytes: a label is cut on a char boundary, and a cut in
+/// the middle of a multi-byte character would paint garbage.
+pub const MAX_FOCUS_LABEL_CHARS: usize = 120;
+
+/// Whether a reported focus kind names a real event.
+///
+/// The set is closed on purpose, like the push reasons: a free string is
+/// where a second protocol grows. Anything else means "a state report with
+/// nothing to show", never a failure: older hooks predate the field.
+pub fn parse_focus_event(kind: &str) -> bool {
+    matches!(kind, "user" | "tool" | "blocked" | "done")
+}
+
+/// Cut a focus label to [`MAX_FOCUS_LABEL_CHARS`] characters.
+///
+/// Runs of whitespace collapse to one space first: a label travels on one
+/// row, and a multi-line prompt head would otherwise break the row it is
+/// drawn on.
+pub fn truncate_focus_label(label: &str) -> String {
+    let single: String = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= MAX_FOCUS_LABEL_CHARS {
+        return single;
+    }
+    single
+        .chars()
+        .take(MAX_FOCUS_LABEL_CHARS)
+        .collect::<String>()
 }
 
 /// The state a hook may report, as the daemon reads it.
@@ -574,6 +658,8 @@ mod tests {
                 visible_working: true,
                 clock: 1758000000000000000,
                 session: None,
+                event: Some("tool".into()),
+                label: Some("Read foo.rs".into()),
             },
             ControlRequest::ReloadAgentManifests { id: "e".into() },
         ] {
@@ -586,7 +672,7 @@ mod tests {
     #[test]
     fn a_hook_report_carries_its_id_and_an_old_client_omits_the_new_fields() {
         // New fields are defaulted, so a hook built against an older schema still
-        // parses: it just claims no visible flags and no clock.
+        // parses: it just claims no visible flags, no clock, and no focus event.
         let minimal =
             br#"{"op":"ReportAgentState","id":"x","terminal":1,"token":"t","state":"idle"}"#;
         let request: ControlRequest = serde_json::from_slice(minimal).expect("decode");
@@ -602,8 +688,63 @@ mod tests {
                 visible_working: false,
                 clock: 0,
                 session: None,
+                event: None,
+                label: None,
             }
         );
+    }
+
+    #[test]
+    fn only_the_four_focus_kinds_count_as_an_event() {
+        for kind in ["user", "tool", "blocked", "done"] {
+            assert!(parse_focus_event(kind), "{kind}");
+        }
+        // Anything else is a state report with nothing to show, never a failure.
+        for kind in ["", "working", "idle", "started", "TOOL", "note"] {
+            assert!(!parse_focus_event(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_focus_label_is_single_line_and_cut_on_a_char_boundary() {
+        assert_eq!(truncate_focus_label("Read foo.rs"), "Read foo.rs");
+        assert_eq!(
+            truncate_focus_label("first line\nsecond line"),
+            "first line second line"
+        );
+        let long = "x".repeat(MAX_FOCUS_LABEL_CHARS + 40);
+        let cut = truncate_focus_label(&long);
+        assert_eq!(cut.chars().count(), MAX_FOCUS_LABEL_CHARS);
+        // Multibyte survives the cut: no half character at the edge.
+        let wide = "ö".repeat(MAX_FOCUS_LABEL_CHARS + 40);
+        let cut = truncate_focus_label(&wide);
+        assert_eq!(cut.chars().count(), MAX_FOCUS_LABEL_CHARS);
+        assert!(cut.is_char_boundary(cut.len()));
+    }
+
+    #[test]
+    fn a_focus_event_list_round_trips_with_its_id() {
+        let request = ControlRequest::ListFocusEvents {
+            id: "f1".into(),
+            terminal: 2,
+            last_n: 20,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        let decoded: ControlRequest = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(request, decoded);
+        let response = ControlResponse::FocusEvents {
+            id: request.request_id().to_string(),
+            terminal: 2,
+            events: vec![FocusEvent {
+                kind: "tool".into(),
+                label: "Read foo.rs".into(),
+                at_unix: 100,
+            }],
+        };
+        assert_eq!(request.request_id(), response.request_id());
+        let encoded = serde_json::to_vec(&response).expect("encode");
+        let decoded: ControlResponse = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(response, decoded);
     }
 
     #[test]

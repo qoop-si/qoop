@@ -11,11 +11,11 @@
 //! shell moves the cursor to the start of the line.
 
 /// The prefix that turns the next byte into a command.
-const PREFIX: u8 = 0x01;
+pub(crate) const PREFIX: u8 = 0x01;
 
 /// ctrl-q, documented as detach since before there was a prefix key, so it stays a command
 /// on its own rather than becoming `ctrl-a d` only.
-const DETACH: u8 = 0x11;
+pub(crate) const DETACH: u8 = 0x11;
 
 /// What the interface should do with what was typed.
 ///
@@ -116,6 +116,13 @@ pub enum Action {
     FoldAll,
     /// ctrl-a g: the agents panel as labelled groups, or as a flat urgency list.
     ToggleView,
+    /// ctrl-a F: the focus view over the focused terminal: the user's last
+    /// prompt, the agent's last turns, and one row per tool call.
+    ///
+    /// Uppercase on purpose, like the pane moves: lowercase `f` already folds
+    /// the idle groups, and the help strings spell both out so the pair is
+    /// never misread as one key.
+    Focus,
     /// ctrl-a v: split the focused pane side by side.
     SplitV,
     /// ctrl-a -: split the focused pane stacked.
@@ -283,6 +290,7 @@ impl Keys {
                     b' ' => Action::Palette,
                     b'f' => Action::FoldAll,
                     b'g' => Action::ToggleView,
+                    b'F' => Action::Focus,
                     b'v' => Action::SplitV,
                     b'-' => Action::SplitH,
                     b'H' => Action::PaneMove(crate::layout::Move::Left),
@@ -430,6 +438,13 @@ mod tests {
                 Action::DetachPane,
             ]
         );
+    }
+
+    #[test]
+    fn uppercase_f_opens_the_focus_view_while_lowercase_folds() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01F"), vec![Action::Focus]);
+        assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
     }
 
     #[test]

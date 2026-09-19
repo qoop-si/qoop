@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
                  \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
                  \x20 qoro setup ...  capture, inspect, trust and run a Setup\n\
-                  \x20 qoro hook-report --state <state> [--session-id S]  report this terminal's agent state\n\
+                   \x20 qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
@@ -421,25 +421,91 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let mut visible_working = false;
     let mut id: Option<String> = None;
     let mut session: Option<String> = None;
+    let mut event: Option<String> = None;
+    let mut label: Option<String> = None;
     let mut rest = args.iter().skip(2);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--state" => state = rest.next().cloned(),
-            "--terminal" => {
-                terminal = rest.next().and_then(|v| v.parse().ok());
+            "--state" => {
+                state = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
             }
-            "--token" => token = rest.next().cloned(),
+            "--event" => {
+                event = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
+            }
+            "--label" => {
+                label = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
+            }
+            "--terminal" => {
+                terminal = match rest.next() {
+                    Some(v) => v.parse().ok(),
+                    None => None,
+                };
+                if terminal.is_none() {
+                    return Err(std::io::Error::other(
+                        "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                    ));
+                }
+            }
+            "--token" => {
+                token = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
+            }
             "--visible-blocker" => visible_blocker = true,
             "--visible-idle" => visible_idle = true,
             "--visible-working" => visible_working = true,
-            "--id" => id = rest.next().cloned(),
+            "--id" => {
+                id = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
+            }
             // The agent's own id for this conversation. Optional: most hooks do not know
             // one, and the ones that do are what makes a restart come back to this
             // conversation rather than to the newest one in the directory.
-            "--session-id" => session = rest.next().cloned(),
+            "--session-id" => {
+                session = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(std::io::Error::other(
+                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        ));
+                    }
+                }
+            }
             other => {
                 return Err(std::io::Error::other(format!(
-                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]"
+                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]"
                 )));
             }
         }
@@ -464,9 +530,14 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     // nothing about what the agent is doing.
     let request = match state {
         None => {
+            if event.is_some() || label.is_some() {
+                return Err(std::io::Error::other(
+                    "usage: --event/--label need --state; or qoro hook-report --session-id S [--terminal N] [--token T]",
+                ));
+            }
             let Some(session) = session.filter(|s| !s.trim().is_empty()) else {
                 return Err(std::io::Error::other(
-                    "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                    "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                 ));
             };
             let id = id.unwrap_or_else(|| format!("hook-session-{terminal}-{nanos}"));
@@ -483,6 +554,18 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     "unknown agent state {state:?}"
                 )));
             }
+            if let Some(ref kind) = event
+                && !qoro_runtime::control::parse_focus_event(kind)
+            {
+                return Err(std::io::Error::other(format!(
+                    "unknown focus event {kind:?}; usage: qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...]"
+                )));
+            }
+            if label.is_some() && event.is_none() {
+                return Err(std::io::Error::other(
+                    "usage: --label needs --event user|tool|blocked|done",
+                ));
+            }
             let id = id.unwrap_or_else(|| format!("hook-{terminal}-{nanos}"));
             ControlRequest::ReportAgentState {
                 id,
@@ -494,6 +577,8 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 visible_working,
                 clock: nanos,
                 session,
+                event,
+                label,
             }
         }
     };

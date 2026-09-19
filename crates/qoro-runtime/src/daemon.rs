@@ -1941,6 +1941,8 @@ async fn handle_control(
             visible_blocker,
             visible_idle,
             session,
+            event,
+            label,
             ..
         } => {
             // An arrival, like output: admitted, applied, and announced when it
@@ -1971,6 +1973,27 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 },
                 Ok(changed) => {
+                    // A focus event is display only: recorded after admission,
+                    // so a forged token cannot write the log, and kept out of
+                    // the belief, the push payload, the event log and the
+                    // store. An absent or out-of-set kind means "a state
+                    // report with nothing to show": no row, still a success.
+                    if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
+                        let at_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        agents.push_focus_event(
+                            terminal,
+                            crate::control::FocusEvent {
+                                kind,
+                                label: crate::control::truncate_focus_label(
+                                    label.as_deref().unwrap_or(""),
+                                ),
+                                at_unix,
+                            },
+                        );
+                    }
                     // The agent's own id for its conversation, recorded here and nowhere
                     // else: this is the point at which the report has been admitted, so a
                     // forged token cannot write one. It is the difference between coming
@@ -2044,6 +2067,28 @@ async fn handle_control(
             terminals.set_session(terminal, Some(session.clone()));
             let _ = store.set_agent_session(terminal as i64, session).await;
             ControlResponse::AgentStateReported { id, terminal }
+        }
+        ControlRequest::ListFocusEvents {
+            terminal, last_n, ..
+        } => {
+            // Answered from daemon memory, never from disk: events are
+            // arrivals like state reports. Capped, because the count comes
+            // from a client and a client that asks for a hundred million
+            // rows would be asking the daemon to allocate them.
+            if terminals.get(terminal).is_none() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no terminal {terminal}"),
+                };
+            }
+            let last_n = last_n.min(crate::control::MAX_FOCUS_EVENTS);
+            let all = agents.focus_events(terminal);
+            let from = all.len().saturating_sub(last_n);
+            ControlResponse::FocusEvents {
+                id,
+                terminal,
+                events: all[from..].to_vec(),
+            }
         }
         ControlRequest::ReloadAgentManifests { .. } => {
             // Answered live from the files, never journalled: a replayed answer

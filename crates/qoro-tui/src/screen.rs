@@ -5,7 +5,7 @@
 //! reconciled with the one the daemon already sends. Everything here is text in, text out,
 //! so a test can read a frame instead of looking at one.
 
-use qoro_runtime::control::{AgentRow, WorkspaceRow};
+use qoro_runtime::control::{AgentRow, FocusEvent, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
 use crate::palette::Palette;
@@ -104,7 +104,7 @@ pub struct Frame<'a> {
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  m menu  ? keys  d detach  U update";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  F focus  m menu  ? keys  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -515,7 +515,7 @@ pub fn paint(frame: &Frame) -> String {
         // first, and a person stuck in here can still read the one that gets them out.
         EVERY_KEY
     } else {
-        "ctrl-a: n tab  c new  r rename  R space  d detach  space find  m menu  ? keys"
+        "ctrl-a: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys"
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);
@@ -1121,6 +1121,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             " ctrl-a space  find tabs, spaces, agents".to_string(),
             " ctrl-a f      fold the idle groups".to_string(),
             " ctrl-a g      agents as groups or by urgency".to_string(),
+            " ctrl-a F      focus view: last prompt, last turns, one row a tool".to_string(),
             " ctrl-a b      fold the left column away".to_string(),
             " ctrl-a m      this menu".to_string(),
             " ctrl-a ?      every key, without the menu".to_string(),
@@ -1489,6 +1490,67 @@ pub(crate) fn paint_row(
 
 fn is_plain(s: &SpanWire) -> bool {
     s.fg.is_none() && s.bg.is_none() && s.attrs == 0
+}
+
+/// The focus list, as rows of text with the role each wears.
+///
+/// Oldest first in, bottom-pinned out: `offset` counts rows hidden below the
+/// window, so zero shows the tail and the list follows new events by itself.
+/// A short list shows what it has; an empty one says why, with the way out
+/// and the command that fills it. Pure, so a test reads rows, not a screen.
+pub fn paint_focus_list(
+    events: &[FocusEvent],
+    width: usize,
+    offset: usize,
+    height: usize,
+) -> Vec<(String, theme::Role)> {
+    if events.is_empty() {
+        return vec![(
+            "no hook reports yet: F closes, qoro hooks install".to_string(),
+            theme::Role::Faint,
+        )];
+    }
+    // Clamped before slicing, not after: an offset past the head shows the
+    // head, never an empty window.
+    let height = height.max(1);
+    let offset = offset.min(events.len().saturating_sub(height));
+    let end = events.len() - offset;
+    let start = end.saturating_sub(height);
+    events[start..end]
+        .iter()
+        .map(|event| {
+            let (mark, role) = match event.kind.as_str() {
+                "user" => ("›", theme::Role::Text),
+                "blocked" => ("!", theme::Role::Blocked),
+                "done" => ("·", theme::Role::Faint),
+                // `tool`, and anything a newer daemon stored that this build
+                // does not name: one collapsed row, never a failure.
+                _ => ("▸", theme::Role::Faint),
+            };
+            // Fitted here, so every row paints exactly `width` columns and
+            // nothing of the terminal shows through the list.
+            (width::fit(&format!("{mark} {}", event.label), width), role)
+        })
+        .collect()
+}
+
+/// The focus list over the pane, painted after the frame like the palette.
+///
+/// Full-width rows, so nothing of the terminal shows through. The cursor is
+/// left hidden behind it: the list takes no input, and a caret on a
+/// read-only view points at nothing. The next repaint shows it again.
+pub fn paint_focus(frame: &Frame, events: &[FocusEvent], offset: usize, out: &mut String) {
+    let left = left_for(frame.cols, frame.collapsed);
+    let right = right_for(frame.cols, left, frame.master_shown);
+    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, right);
+    let rows = paint_focus_list(events, pane_cols as usize, offset, pane_rows as usize);
+    for (i, (text, role)) in rows.iter().enumerate().take(pane_rows as usize) {
+        out.push_str(&at(TABS + 1 + i, left + 1));
+        out.push_str(&theme::fg(*role));
+        out.push_str(text);
+        out.push_str(theme::RESET);
+    }
+    out.push_str("\x1b[?25l");
 }
 
 /// The escape sequence for one run's style.
@@ -3341,6 +3403,67 @@ mod tests {
         assert_eq!(window_row(Some(&snapshot), &behind, 2, 10, 0).0, "");
         // And rows behind the screen carry no colour, because none was written down.
         assert!(window_row(Some(&snapshot), &behind, 2, 58, 0).1.is_empty());
+    }
+
+    fn focus_event(kind: &str, label: &str) -> FocusEvent {
+        FocusEvent {
+            kind: kind.to_string(),
+            label: label.to_string(),
+            at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn an_empty_focus_log_says_why_and_how_to_fill_it() {
+        let rows = paint_focus_list(&[], 40, 0, 20);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, theme::Role::Faint);
+        assert!(rows[0].0.contains("no hook reports yet"), "{rows:?}");
+        assert!(rows[0].0.contains("qoro hooks install"), "{rows:?}");
+    }
+
+    #[test]
+    fn every_focus_kind_has_its_mark_and_its_colour() {
+        let events = vec![
+            focus_event("user", "why is this slow"),
+            focus_event("tool", "Read foo.rs"),
+            focus_event("blocked", "Allow command?"),
+            focus_event("done", ""),
+        ];
+        let rows = paint_focus_list(&events, 40, 0, 20);
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].0.starts_with("› "), "{rows:?}");
+        assert_eq!(rows[0].1, theme::Role::Text);
+        assert!(rows[1].0.starts_with("▸ "), "{rows:?}");
+        assert_eq!(rows[1].1, theme::Role::Faint);
+        assert!(rows[2].0.starts_with("! "), "{rows:?}");
+        assert_eq!(rows[2].1, theme::Role::Blocked);
+        assert!(rows[3].0.starts_with("· "), "{rows:?}");
+        assert_eq!(rows[3].1, theme::Role::Faint);
+        // A kind a newer daemon stored that this build does not name is one
+        // collapsed row, never a failure.
+        let rows = paint_focus_list(&[focus_event("note", "hi")], 40, 0, 20);
+        assert!(rows[0].0.starts_with("▸ "), "{rows:?}");
+    }
+
+    #[test]
+    fn the_focus_window_is_bottom_pinned_and_moves_with_the_offset() {
+        let events: Vec<FocusEvent> = (0..5)
+            .map(|i| focus_event("tool", &format!("tool {i}")))
+            .collect();
+        // Offset zero shows the tail: the list follows new events by itself.
+        let rows = paint_focus_list(&events, 40, 0, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].0.contains("tool 2"), "{rows:?}");
+        assert!(rows[2].0.contains("tool 4"), "{rows:?}");
+        // Scrolled up by two: the two newest rows hide below the window.
+        let rows = paint_focus_list(&events, 40, 2, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].0.contains("tool 0"), "{rows:?}");
+        assert!(rows[2].0.contains("tool 2"), "{rows:?}");
+        // Past the oldest row clamps to the oldest row.
+        let rows = paint_focus_list(&events, 40, 100, 3);
+        assert!(rows[0].0.contains("tool 0"), "{rows:?}");
     }
 
     fn paint_two_panes(
