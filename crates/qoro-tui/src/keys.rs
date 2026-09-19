@@ -91,6 +91,12 @@ pub enum Action {
     RenameSpace,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
+    /// ctrl-a u, say whether a newer release is waiting and how it gets installed.
+    ///
+    /// Said, not fetched: the interface never touches the network, it only reads the
+    /// notice `qoro update --check` left, and the install itself runs outside, with no
+    /// session live.
+    Update,
     /// ctrl-a m, the menu.
     Menu,
     /// ctrl-a 1 through ctrl-a 9, the nth tab of the current space, counted from one.
@@ -262,6 +268,7 @@ impl Keys {
                     b'w' => Action::CreateSpace,
                     b'r' => Action::Rename,
                     b'b' => Action::Collapse,
+                    b'u' => Action::Update,
                     b'm' => Action::Menu,
                     b'R' => Action::RenameSpace,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
@@ -497,6 +504,12 @@ mod tests {
         assert_eq!(keys.feed(b"\x01 "), vec![Action::Palette]);
         assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
         assert_eq!(keys.feed(b"\x01g"), vec![Action::ToggleView]);
+    }
+
+    #[test]
+    fn u_names_the_waiting_update_without_touching_the_network() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01u"), vec![Action::Update]);
     }
 
     #[test]

@@ -37,6 +37,7 @@ a claim nobody has to keep.
 | `qoro hooks uninstall [agent...]` | take out exactly what was installed | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
+| `qoro update [--check]` | ask GitHub Releases for the newest macOS arm64 binary and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
 | `qoro --version` | the version | no |
@@ -52,9 +53,16 @@ The flag may be written anywhere in the command, so `qoro --session work send 2 
 everything the session starts, which is what lets a shell inside a session say `qoro send`
 and reach its own daemon rather than the default one.
 
-Every row says no, and that is the design rather than a coincidence: there is no control
-plane in the product, and if one is ever added it is an addition to this table with a yes,
-plus a row in the gate saying what happens when it is unreachable.
+Every row says no except one, and the one is the point: `qoro update` is the only
+subcommand that reaches the network, and only a person runs it. There is no control
+plane in the product, no background version check anywhere, and if anything else ever
+needs the network it is an addition to this table with a yes, plus a row in the gate
+saying what happens when it is unreachable.
+
+The gate skips the rows that say yes: with the network blackholed they fail closed
+with "could not reach GitHub", which is the same failure a person without a network
+gets, and asserting byte-identical output for them would be asserting that the
+network is reachable.
 
 ## What "the same result" means
 

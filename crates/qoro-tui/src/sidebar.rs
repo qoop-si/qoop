@@ -963,9 +963,13 @@ fn collapse_row(collapsed: bool) -> (Line, Option<Hit>) {
     // The foot of the column says what this is and what version of it, the way a product
     // signs its own window, and the fold mark sits at the far end of the same row rather
     // than taking a row of its own: the column is worth more to a person as list than as
-    // furniture.
+    // furniture. When `qoro update --check` saw something newer, the row says where this
+    // build stands against it, so the update is found rather than remembered.
     let brand = format!(" {BRAND_MARK} {BRAND}");
-    let version = format!("{VERSION} ");
+    let version = match update_available() {
+        Some(new) => format!("{VERSION}>{new} "),
+        None => format!("{VERSION} "),
+    };
     // The row is the mark and name, a space, the version, the gap, then the fold mark and
     // its own trailing space.
     let gap =
@@ -990,6 +994,17 @@ const BRAND: &str = "qoro";
 const BRAND_MARK: char = '\u{25cf}';
 /// Which build this is, read from the crate rather than written down twice.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A newer version `qoro update --check` saw, when it saw one.
+///
+/// Read off the notice file on every paint rather than held in state: the check runs in
+/// a process outside the interface, so anything held would be stale by construction. A
+/// missing file, garbage in it, or nothing newer is no notice, and the row is byte for
+/// byte what it always was.
+fn update_available() -> Option<String> {
+    let seen = qoro_runtime::paths::read_update_notice()?;
+    qoro_runtime::paths::is_newer_version(&seen, VERSION).then_some(seen)
+}
 
 /// The column as it is when it is not folded away.
 ///

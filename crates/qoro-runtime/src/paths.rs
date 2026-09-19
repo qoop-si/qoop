@@ -153,6 +153,60 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join("qorod.lock")
 }
 
+/// Where `qoro update --check` leaves the newest version it saw on GitHub Releases.
+///
+/// A plain file holding a version like `0.4.0`, so the interface can show it without
+/// touching the network: the TUI never fetches, it only reads this file. Built without
+/// creating or verifying anything, because reading a notice must not create state.
+pub fn update_notice_path() -> PathBuf {
+    let base = if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
+        PathBuf::from(explicit)
+    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        Path::new(&xdg).join("qoro")
+    } else {
+        std::env::temp_dir().join(format!("qoro-{}", current_uid()))
+    };
+    base.join("update-available")
+}
+
+/// The newest version the updater saw, if the file holds one shaped like a version.
+pub fn read_update_notice() -> Option<String> {
+    let text = std::fs::read_to_string(update_notice_path()).ok()?;
+    let version = text.trim().trim_start_matches('v').to_string();
+    parse_version(&version).map(|_| version)
+}
+
+/// A dotted version into its numbers: `v1.2.3`, `1.2` and `1` all parse, and anything
+/// else is refused rather than guessed at, so a tag nobody can parse never outranks
+/// the build in hand.
+pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let text = text.trim().trim_start_matches('v');
+    if text.is_empty() {
+        return None;
+    }
+    let mut parts = text.split('.');
+    let mut nums = [0u64; 3];
+    for (at, part) in parts.by_ref().take(3).enumerate() {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        nums[at] = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((nums[0], nums[1], nums[2]))
+}
+
+/// Whether `latest` is newer than `current`, both in the shape [`parse_version`] reads.
+/// Anything unparsable answers false: an unreadable notice is no notice.
+pub fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
 pub fn current_uid() -> u32 {
     // SAFETY: getuid takes no arguments and cannot fail.
     unsafe { libc::getuid() }
@@ -265,6 +319,24 @@ mod tests {
              default one"
         );
         assert_eq!(runtime_base().expect("the base"), dir);
+        // The update notice lives beside the sessions under the same override, so the
+        // interface reads what the updater wrote no matter which directory is in play.
+        // Asserted here rather than in a test of its own: both hold the same variable,
+        // and two tests holding it at once race each other.
+        assert_eq!(
+            update_notice_path(),
+            dir.join("update-available"),
+            "the notice is one file next to everything else, not a second directory tree"
+        );
+        assert_eq!(read_update_notice(), None, "no file is no notice");
+        std::fs::write(update_notice_path(), "0.4.0\n").unwrap();
+        assert_eq!(read_update_notice().as_deref(), Some("0.4.0"));
+        std::fs::write(update_notice_path(), "not a version\n").unwrap();
+        assert_eq!(
+            read_update_notice(),
+            None,
+            "garbage in the file is no notice"
+        );
         // SAFETY: as above.
         unsafe { std::env::remove_var(RUNTIME_DIR_ENV) };
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -351,5 +423,19 @@ mod tests {
         std::fs::write(sessions_dir(base.path()).join("notes.txt"), b"").unwrap();
         std::fs::create_dir(sessions_dir(base.path()).join(".git")).unwrap();
         assert_eq!(sessions(base.path()), vec!["play", "work"]);
+    }
+
+    #[test]
+    fn dotted_versions_parse_and_compare() {
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v0.4.0"), Some((0, 4, 0)));
+        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
+        assert!(parse_version("").is_none());
+        assert!(parse_version("1.2.x").is_none());
+        assert!(parse_version("1..2").is_none());
+        assert!(is_newer_version("0.4.0", "0.3.1"));
+        assert!(!is_newer_version("0.3.1", "0.3.1"));
+        assert!(!is_newer_version("0.3.0", "0.3.1"));
+        assert!(!is_newer_version("garbage", "0.3.1"));
     }
 }

@@ -99,8 +99,7 @@ pub struct Frame<'a> {
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str =
-    "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  d detach";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  x close  s space  w new space  space find  g view  u update  d detach";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -489,11 +488,11 @@ pub fn paint(frame: &Frame) -> String {
         "ctrl-a space find  enter go  esc back"
     } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
         // Every key when there is room for every key. On a narrower window the list is cut
-        // from the right, which takes the way out first: the one thing a person stuck in
-        // here has to be able to read.
+        // from the right, so the way out is not last: the cut takes the update key
+        // first, and a person stuck in here can still read the one that gets them out.
         EVERY_KEY
     } else {
-        "ctrl-a: n tab  c new  r rename  space find  d detach"
+        "ctrl-a: n tab  c new  r rename  space find  d detach  u update"
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);

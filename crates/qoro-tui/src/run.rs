@@ -123,6 +123,23 @@ fn short_copied(text: &str) -> String {
     }
 }
 
+/// What ctrl-a u says: whether a newer release is waiting, and how it gets installed.
+///
+/// Said, not fetched: the interface never touches the network, it only reads the notice
+/// `qoro update --check` left beside the sessions. The install itself runs outside, with
+/// no session live, which is why the answer names detaching first.
+fn update_message() -> String {
+    match qoro_runtime::paths::read_update_notice() {
+        Some(seen) if qoro_runtime::paths::is_newer_version(&seen, env!("CARGO_PKG_VERSION")) => {
+            format!("update {seen} is ready: detach and run `qoro update` with no session running")
+        }
+        _ => format!(
+            "qoro {} is current: `qoro update --check` looks for more",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+}
+
 /// One mouse report in the form a program that asked for the mouse expects.
 ///
 /// SGR (`CSI ? 1006`), which every program that asks for the mouse these days understands
@@ -1327,6 +1344,10 @@ async fn drive(
                                 }
                             }
                             Action::Detach => return Ok(()),
+                            Action::Update => {
+                                state.message = Some(update_message());
+                                dirty = true;
+                            }
                             Action::Click { row, col, shift } => {
                                 // A tiled pane first. A click on an unfocused tile only
                                 // focuses it: the click itself goes nowhere, so coordinates

@@ -16,6 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod hooks;
+mod update;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
 use qoro_runtime::daemon::ClientWire;
@@ -76,6 +77,7 @@ fn main() -> std::io::Result<()> {
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
+        Some("update") => update::run(&args),
         Some("ls") => run_list_sessions(),
         Some("stop") => run_stop(&args, &session),
         Some("--version" | "-V") => {
@@ -104,6 +106,8 @@ fn main() -> std::io::Result<()> {
                  \x20                 doing and which conversation it is having\n\
                  \x20 qoro ls         list the sessions and say which are running\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
+                 \x20 qoro update [--check]  fetch the latest release, and install it when\n\
+                 \x20                 nothing is live\n\
                  \x20 qoro --version\n\
                  \n\
                  options:\n\

@@ -68,6 +68,11 @@ with this.
 - A remote daemon keeps its agents through client updates for as long as the codec holds,
   which is the case where a restart costs the most.
 - The upgrade path is whatever installed the binary, and the daemon has no opinion about it.
+- For the prebuilt macOS arm64 binary that path is `qoro update`: explicit, refused
+  while a session runs, checksum verified, and installed over the file while every
+  running process keeps serving from its old image. `qoro update --check` only leaves
+  a notice the sidebar reads, so the interface advertises an update without ever
+  touching the network.
 
 ## Rollback
 

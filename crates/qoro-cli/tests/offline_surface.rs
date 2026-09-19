@@ -24,6 +24,12 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
         let Some(rest) = line.strip_prefix("| `qoro") else {
             continue;
         };
+        // A row marked yes in the network column is the declared exception: it reaches
+        // the network on purpose and fails closed without it, so byte-identical output
+        // is asserted for it in `update_fails_closed_with_the_network_gone` instead.
+        if line.trim_end().ends_with("| yes |") {
+            continue;
+        }
         let Some(end) = rest.find('`') else { continue };
         let raw: Vec<&str> = rest[..end].split_whitespace().collect();
         // An optional flag group like `[--json]` runs as its bare form: running
@@ -117,6 +123,40 @@ fn every_documented_subcommand_is_identical_with_the_network_gone() {
     }
 }
 
+/// The one yes row: `qoro update` fails closed with the network gone, having touched
+/// nothing. It names GitHub in the failure, exits nonzero, and leaves no notice behind.
+#[test]
+fn update_fails_closed_with_the_network_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(
+        dir.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("chmod");
+    let mut command = Command::new(qoro());
+    command
+        .args(["update", "--check"])
+        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("http_proxy", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("all_proxy", "http://127.0.0.1:1")
+        .env("QORO_CONTROL_PLANE", "http://127.0.0.1:1")
+        .env("RES_OPTIONS", "timeout:1 attempts:1");
+    let out = command.output().expect("run qoro");
+    assert!(
+        !out.status.success(),
+        "`qoro update --check` succeeded with the network gone, so the failure is silent"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GitHub"),
+        "`qoro update --check` failed without saying what it could not reach: {stderr}"
+    );
+    assert!(
+        !dir.path().join("update-available").exists(),
+        "a failed check left a notice behind, and the interface would advertise a version nobody saw"
+    );
+}
 /// The Setup subcommands, which take a file, run against a real artifact.
 #[test]
 fn the_setup_subcommands_are_identical_with_the_network_gone() {
