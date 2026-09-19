@@ -82,6 +82,13 @@ pub enum Action {
     PreviousSpace,
     /// ctrl-a w, a new space.
     CreateSpace,
+    /// ctrl-a W, close the space on screen when it holds nothing.
+    ///
+    /// Uppercase on purpose, like the rename pair: lowercase `w` makes the space this
+    /// one removes. A space that still holds terminals is refused rather than emptied:
+    /// closing a tab is one keystroke each, and a bulk close behind one letter would end
+    /// sessions somebody is still looking at.
+    CloseSpace,
     /// ctrl-a r, rename the tab; ctrl-a R, rename the space.
     ///
     /// A name given at creation is a guess: the terminal a person opened to "look at
@@ -278,6 +285,7 @@ impl Keys {
                     b's' => Action::NextSpace,
                     b'S' => Action::PreviousSpace,
                     b'w' => Action::CreateSpace,
+                    b'W' => Action::CloseSpace,
                     b'r' => Action::Rename,
                     b'b' => Action::Collapse,
                     b'U' => Action::Update,
@@ -438,6 +446,13 @@ mod tests {
                 Action::DetachPane,
             ]
         );
+    }
+
+    #[test]
+    fn uppercase_w_closes_the_space_while_lowercase_makes_one() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01W"), vec![Action::CloseSpace]);
+        assert_eq!(keys.feed(b"\x01w"), vec![Action::CreateSpace]);
     }
 
     #[test]

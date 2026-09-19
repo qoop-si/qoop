@@ -2119,6 +2119,37 @@ async fn drive(
                                 });
                                 dirty = true;
                             }
+                            Action::CloseSpace => {
+                                let Some(space) = state.space else {
+                                    state.message = Some("no space to close".to_string());
+                                    dirty = true;
+                                    continue;
+                                };
+                                // Counted here, refused there too: the index may lag a
+                                // close that is still settling, and the daemon is the
+                                // one that knows. Either refusal reads the same way.
+                                let held = state
+                                    .rows
+                                    .iter()
+                                    .filter(|r| r.workspace == space)
+                                    .count();
+                                if held > 0 {
+                                    state.message = Some(format!(
+                                        "space still holds {held} terminal{}, close them first (ctrl-a x)",
+                                        if held == 1 { "" } else { "s" }
+                                    ));
+                                    dirty = true;
+                                    continue;
+                                }
+                                request += 1;
+                                wr.write_all(&client::encode_control_seq(
+                                    &ControlRequest::CloseWorkspace {
+                                        id: format!("close-space-{request}"),
+                                        workspace: space,
+                                    },
+                                    &mut control_seq,
+                                )?).await?;
+                            }
                             // Prefilled with the name it has, because a rename is usually
                             // an edit and starting from empty makes the common case retype
                             // what was already right.
@@ -2477,6 +2508,7 @@ async fn drive(
                                     ControlResponse::TerminalCreated { .. }
                                         | ControlResponse::TerminalClosed { .. }
                                         | ControlResponse::WorkspaceCreated { .. }
+                                        | ControlResponse::WorkspaceClosed { .. }
                                         | ControlResponse::Renamed { .. }
                                 );
                                 refresh_spaces |= matches!(
@@ -2484,6 +2516,7 @@ async fn drive(
                                     ControlResponse::TerminalCreated { .. }
                                         | ControlResponse::TerminalClosed { .. }
                                         | ControlResponse::WorkspaceCreated { .. }
+                                        | ControlResponse::WorkspaceClosed { .. }
                                         // A renamed space is a changed space list, and
                                         // nothing else will say so.
                                         | ControlResponse::Renamed { .. }
@@ -3208,6 +3241,17 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // it shows an empty pane and a bar with only a `+` on it, and the first thing
             // anybody does in a new space is start a terminal.
             state.wants_terminal_in.push(workspace);
+            *dirty = true;
+        }
+        ControlResponse::WorkspaceClosed { workspace, .. } => {
+            // Its tree goes with it: a layout for a space that no longer exists would
+            // reseed nothing and leak the entry. The space itself moves to whatever the
+            // next list answers: `None` reads as "pick the first" on that path.
+            state.layouts.remove(&workspace);
+            if state.space == Some(workspace) {
+                state.space = None;
+                state.snapshot = None;
+            }
             *dirty = true;
         }
         ControlResponse::Agents { agents, .. } => {

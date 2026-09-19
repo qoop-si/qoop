@@ -53,6 +53,10 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x10".into(),
             name: "another".into(),
         },
+        ControlRequest::CloseWorkspace {
+            id: "x10b".into(),
+            workspace: 999,
+        },
         // A forged token: refused, but answered. The report carries a state for
         // the index, never bytes for the child.
         ControlRequest::ReportAgentState {
@@ -109,6 +113,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
+            | ControlRequest::CloseWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }

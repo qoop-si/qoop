@@ -161,6 +161,18 @@ impl Store {
         )?)
     }
 
+    /// Drop a workspace row.
+    ///
+    /// Answers how many rows it touched, like the rename above. Terminal and layout rows
+    /// go with it through `ON DELETE CASCADE`: the daemon only calls this for a
+    /// workspace with no live terminal, so what goes is dead history, never a session
+    /// somebody is looking at.
+    pub fn delete_workspace(&self, id: i64) -> Result<usize, StoreError> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM workspace WHERE id = ?1", params![id])?)
+    }
+
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
         let mut stmt = self
             .conn

@@ -95,6 +95,10 @@ impl StoreHandle {
         self.run(move |s| s.rename_workspace(id, &name)).await
     }
 
+    pub async fn delete_workspace(&self, id: i64) -> Result<usize, HandleError> {
+        self.run(move |s| s.delete_workspace(id)).await
+    }
+
     pub async fn create_terminal(
         &self,
         id: i64,

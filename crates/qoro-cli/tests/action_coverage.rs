@@ -125,6 +125,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "close an empty workspace",
+            method: || {
+                Method::Control(ControlRequest::CloseWorkspace {
+                    id: "a".into(),
+                    workspace: 2,
+                })
+            },
+        },
+        Action {
             name: "ask for the geometry",
             method: || {
                 Method::Control(ControlRequest::RequestOwnership {
@@ -275,6 +284,10 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             name: String::new(),
         },
+        ControlRequest::CloseWorkspace {
+            id: String::new(),
+            workspace: 0,
+        },
         ControlRequest::Subscribe {
             id: String::new(),
             terminals: Vec::new(),
@@ -343,6 +356,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
+            | ControlRequest::CloseWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }

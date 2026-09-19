@@ -1031,6 +1031,161 @@ async fn g2_16_a_terminal_belongs_to_the_workspace_it_was_made_in() {
     );
 }
 
+/// An empty workspace leaves the list, and nothing else does.
+///
+/// The list on the left of the interface is every workspace row the store holds, so a
+/// space whose terminals are all closed would sit there forever with nothing in it.
+/// Closing one is a deliberate act with three refusals: an unknown id, a workspace that
+/// still holds a live terminal, and the session's default, which is where a client that
+/// names no workspace lands and so must always exist.
+#[tokio::test]
+async fn an_empty_workspace_closes_and_a_live_default_or_unknown_one_does_not() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("spaces").await;
+
+    async fn workspaces(c: &mut TestClient) -> Vec<qoro_runtime::control::WorkspaceRow> {
+        match c
+            .control(&ControlRequest::ListWorkspaces { id: "w".into() }, PATIENCE)
+            .await
+            .expect("a workspace list")
+        {
+            ControlResponse::Workspaces { workspaces, .. } => workspaces,
+            other => panic!("expected a workspace list, got {other:?}"),
+        }
+    }
+
+    let default = workspaces(&mut c).await;
+    assert_eq!(default.len(), 1, "{default:?}");
+    let default_id = default[0].id;
+
+    // Unknown first: no row, no close.
+    let refused = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "c0".into(),
+                workspace: 999_999,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "closing an unknown workspace succeeded: {refused:?}"
+    );
+
+    // A second workspace with a terminal in it refuses while occupied.
+    let made = match c
+        .control(
+            &ControlRequest::CreateWorkspace {
+                id: "c1".into(),
+                name: "spare".into(),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a created workspace")
+    {
+        ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+        other => panic!("expected a created workspace, got {other:?}"),
+    };
+    let occupant = terminal_of(
+        &c.control(
+            &ControlRequest::CreateTerminal {
+                id: "c2".into(),
+                cwd: None,
+                workspace: Some(made),
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a created terminal"),
+    );
+    let refused = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "c3".into(),
+                workspace: made,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "closing an occupied workspace succeeded: {refused:?}"
+    );
+
+    // The default refuses even empty: it is where an unnamed creation lands.
+    let refused = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "c4".into(),
+                workspace: default_id,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "closing the default workspace succeeded: {refused:?}"
+    );
+
+    // Empty it, then it goes, and the list no longer names it. The close is
+    // answered before the registry lets go, so the test waits the way g2_5 does.
+    c.control(
+        &ControlRequest::CloseTerminal {
+            id: "c5".into(),
+            terminal: occupant,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("a closed terminal");
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline && d.terminals().get(occupant).is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        d.terminals().get(occupant).is_none(),
+        "a closed terminal is still registered"
+    );
+    let closed = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "c6".into(),
+                workspace: made,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(
+            closed,
+            Some(ControlResponse::WorkspaceClosed { workspace, .. }) if workspace == made
+        ),
+        "closing an empty workspace failed: {closed:?}"
+    );
+    let after = workspaces(&mut c).await;
+    assert!(
+        after.iter().all(|w| w.id != made),
+        "the closed workspace is still listed: {after:?}"
+    );
+    // Closing it twice is "unknown", not a second success.
+    let refused = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "c7".into(),
+                workspace: made,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "closing a workspace twice succeeded: {refused:?}"
+    );
+}
+
 /// G2.17: a screen that never stops changing is still read.
 ///
 /// The settle that makes a burst one evaluation works because bursts end. An agent holding

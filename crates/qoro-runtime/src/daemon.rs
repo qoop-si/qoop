@@ -1809,6 +1809,49 @@ async fn handle_control(
                 reason: format!("the workspace could not be created: {e}"),
             },
         },
+        ControlRequest::CloseWorkspace {
+            workspace: target, ..
+        } => {
+            // The default is where a client that names no workspace lands, so it is never
+            // closable: dropping it would turn every later default creation into a
+            // foreign-key refusal until the daemon restarts and opens another.
+            if target == workspace {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!(
+                        "workspace {target} is this session's default and cannot be closed"
+                    ),
+                };
+            }
+            let live = terminals
+                .streams()
+                .into_iter()
+                .filter(|s| terminals.workspace_of(*s) == Some(target))
+                .count();
+            if live > 0 {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!(
+                        "workspace {target} still holds {live} terminal{}, close them first",
+                        if live == 1 { "" } else { "s" }
+                    ),
+                };
+            }
+            match store.delete_workspace(target).await {
+                Ok(0) => ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no workspace {target}"),
+                },
+                Ok(_) => ControlResponse::WorkspaceClosed {
+                    id,
+                    workspace: target,
+                },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the workspace could not be closed: {e}"),
+                },
+            }
+        }
         ControlRequest::ListAgents { .. } => {
             // Read from the registry rather than by walking the process table here: the
             // registry is what the process watcher and the observation precedence in

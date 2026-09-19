@@ -104,7 +104,7 @@ pub struct Frame<'a> {
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  F focus  m menu  ? keys  d detach  U update";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  m menu  ? keys  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -1116,6 +1116,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             " ctrl-a s      next space".to_string(),
             " ctrl-a S      previous space".to_string(),
             " ctrl-a w      new space, name it first".to_string(),
+            " ctrl-a W      close this space, when it holds nothing".to_string(),
             " ctrl-a R      rename this space".to_string(),
             " find and view".to_string(),
             " ctrl-a space  find tabs, spaces, agents".to_string(),

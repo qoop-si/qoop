@@ -94,6 +94,18 @@ pub enum ControlRequest {
         id: String,
         name: String,
     },
+    /// Drop an empty workspace from the list.
+    ///
+    /// Only an empty one: a workspace that still holds terminals is refused, and so is
+    /// the session's default, which is where a client that names no workspace lands.
+    /// There is no "close and move its terminals" form: moving terminals between
+    /// workspaces does not exist, so closing a full workspace would have to end them,
+    /// and ending somebody's terminals as a side effect of tidying a list is not a
+    /// trade this protocol makes.
+    CloseWorkspace {
+        id: String,
+        workspace: i64,
+    },
     /// The index a client draws: one row per terminal, with who is in it.
     ///
     /// Separate from `ListTerminals` rather than an extra field on it, because the two
@@ -224,6 +236,7 @@ impl ControlRequest {
             | Self::ListAgents { id }
             | Self::ListWorkspaces { id }
             | Self::CreateWorkspace { id, .. }
+            | Self::CloseWorkspace { id, .. }
             | Self::Subscribe { id, .. }
             | Self::Unsubscribe { id, .. }
             | Self::RequestOwnership { id, .. }
@@ -260,6 +273,11 @@ pub enum ControlResponse {
         workspaces: Vec<WorkspaceRow>,
     },
     WorkspaceCreated {
+        id: String,
+        workspace: i64,
+    },
+    /// A workspace left the list. Only an empty one ever does; see `CloseWorkspace`.
+    WorkspaceClosed {
         id: String,
         workspace: i64,
     },
@@ -475,6 +493,7 @@ impl ControlResponse {
             | Self::Agents { id, .. }
             | Self::Workspaces { id, .. }
             | Self::WorkspaceCreated { id, .. }
+            | Self::WorkspaceClosed { id, .. }
             | Self::Renamed { id, .. }
             | Self::Stopping { id, .. }
             | Self::Scrollback { id, .. }
