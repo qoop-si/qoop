@@ -87,10 +87,21 @@ Notes:
 qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown>
     [--terminal N] [--token T]
     [--visible-blocker] [--visible-idle] [--visible-working]
+    [--session-id S]
+qoro hook-report --session-id S [--terminal N] [--token T]
 ```
 
 `--terminal` and `--token` default to the environment. It prints nothing on
 success and the reason on stderr with a non-zero exit on failure.
+
+A session id may also travel alone, with no `--state`: an agent that knows
+its own conversation id but has no lifecycle event to map reports where a
+restart should return without claiming anything about what it is doing. The
+report goes through the same token check and lands in the same store; the
+belief is untouched, so the index never moves on it. This is the path for
+third-party agents with no first-party hook: wrap their launch, read
+`QORO_TERMINAL` and `QORO_TOKEN` from the environment, and report the
+conversation id.
 
 ## Installing
 

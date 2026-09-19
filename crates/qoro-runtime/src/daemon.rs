@@ -1994,6 +1994,46 @@ async fn handle_control(
                 }
             }
         }
+        ControlRequest::ReportAgentSession {
+            terminal,
+            token,
+            session,
+            ..
+        } => {
+            // Session identity without a state claim: admitted like any other
+            // report, then written to the same store. The belief is untouched
+            // on purpose: saying which conversation this is says nothing
+            // about what the agent is doing, and an index that moved on a
+            // session report would be an action with no observation behind it.
+            if session.trim().is_empty() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "empty session id: there is nothing to record".into(),
+                };
+            }
+            let terminal_id = TerminalId::new(terminal.to_string());
+            let token = qoro_domain::CapabilityToken::new(token);
+            let Some(generation) = agents.agent(terminal).map(|a| a.belief.generation) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the report for terminal {terminal} was refused"),
+                };
+            };
+            if agents
+                .admit(terminal, &terminal_id, Some(&token), generation)
+                .is_err()
+            {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the report for terminal {terminal} was refused"),
+                };
+            }
+            let store = store.clone();
+            tokio::spawn(async move {
+                let _ = store.set_agent_session(terminal as i64, session).await;
+            });
+            ControlResponse::AgentStateReported { id, terminal }
+        }
         ControlRequest::ReloadAgentManifests { .. } => {
             // Answered live from the files, never journalled: a replayed answer
             // would lie about what the directory says now. Good files replace

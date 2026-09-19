@@ -67,6 +67,14 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             session: None,
         },
         ControlRequest::ReloadAgentManifests { id: "x12".into() },
+        // Session identity without a state claim: an id for the store, never
+        // bytes for the child, same as the state report above.
+        ControlRequest::ReportAgentSession {
+            id: "x12b".into(),
+            terminal,
+            token: "forged".into(),
+            session: "abc-123".into(),
+        },
         ControlRequest::RenameTerminal {
             id: "x13".into(),
             terminal,
@@ -100,6 +108,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
+            | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

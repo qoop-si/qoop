@@ -26,6 +26,7 @@ a claim nobody has to keep.
 | `qoro setup trust <file>` | confirm a Setup on this machine | no |
 | `qoro setup check <file>` | whether a Setup may run here | no |
 | `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
+| `qoro hook-report --session-id <id>` | report only the agent's conversation id, without claiming a state | no |
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
 | `qoro read <terminal>` | print another terminal's current screen | no |
 | `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt | no |

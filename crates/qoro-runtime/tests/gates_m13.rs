@@ -543,3 +543,112 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
         "a refused report still wrote its id"
     );
 }
+
+/// A session id reported without a state claim is recorded, refused when
+/// forged, and never moves the belief: saying which conversation this is
+/// says nothing about what the agent is doing.
+#[tokio::test]
+async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() {
+    use qoro_runtime::control::ControlResponse;
+
+    let d = qoro_testkit::TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut client = d.attach("hook-session").await;
+    let before = d
+        .agent(terminal)
+        .expect("the terminal is tracked")
+        .belief
+        .state;
+
+    // A forged token is refused, and writes nothing.
+    let refused = client
+        .control(
+            &ControlRequest::ReportAgentSession {
+                id: "forged-session".into(),
+                terminal,
+                token: "not-the-token".into(),
+                session: "stolen-id".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "a forged session report was accepted: {refused:?}"
+    );
+
+    // An empty id is refused too: there is nothing to record, and silence
+    // must not clear what is there.
+    let empty = client
+        .control(
+            &ControlRequest::ReportAgentSession {
+                id: "empty-session".into(),
+                terminal,
+                token: token.clone(),
+                session: "   ".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(empty, Some(ControlResponse::Failed { .. })),
+        "an empty session report was accepted: {empty:?}"
+    );
+
+    // The real one is admitted, and its id is written down.
+    let accepted = client
+        .control(
+            &ControlRequest::ReportAgentSession {
+                id: "real-session".into(),
+                terminal,
+                token,
+                session: "solo-456".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(accepted, Some(ControlResponse::AgentStateReported { .. })),
+        "{accepted:?}"
+    );
+
+    // The belief never moved: no observation was offered.
+    assert_eq!(
+        d.agent(terminal).expect("tracked").belief.state,
+        before,
+        "a session report changed what the index shows"
+    );
+
+    // Written from a task of its own, so it is waited for rather than assumed.
+    let store = d.store();
+    let workspace = d.workspace();
+    let mut recorded = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let rows = store.open_terminals(workspace).await.expect("rows");
+        if let Some(row) = rows.iter().find(|r| r.id == terminal as i64)
+            && row.agent_session.is_some()
+        {
+            recorded = row.agent_session.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        recorded.as_deref(),
+        Some("solo-456"),
+        "the agent said which conversation it was having and nothing wrote it down"
+    );
+    assert_ne!(
+        recorded.as_deref(),
+        Some("stolen-id"),
+        "a refused session report still wrote its id"
+    );
+}

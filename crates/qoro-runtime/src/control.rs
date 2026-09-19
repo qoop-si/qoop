@@ -166,6 +166,24 @@ pub enum ControlRequest {
     ReloadAgentManifests {
         id: String,
     },
+    /// A hook or plugin inside the terminal reports the agent's own id for
+    /// its conversation, without claiming a state.
+    ///
+    /// The session-only half of `ReportAgentState`: a third-party agent that
+    /// knows its conversation but has no lifecycle event to map still needs
+    /// to say which conversation a restart should come back to. Admitted
+    /// through the same token and generation check, recorded in the same
+    /// store, and answered with the same `AgentStateReported`. Never
+    /// journalled and never an observation: the belief is untouched, so this
+    /// cannot change what the index shows, only where a resume returns.
+    ReportAgentSession {
+        id: String,
+        terminal: TerminalStream,
+        token: String,
+        /// The agent's own id for this conversation. Empty is refused: there
+        /// is nothing to record, and silence must not clear what is there.
+        session: String,
+    },
 }
 
 impl ControlRequest {
@@ -185,6 +203,7 @@ impl ControlRequest {
             | Self::Unsubscribe { id, .. }
             | Self::RequestOwnership { id, .. }
             | Self::ReportAgentState { id, .. }
+            | Self::ReportAgentSession { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::GrantOwnership { id, .. } => id,
         }

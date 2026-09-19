@@ -96,3 +96,55 @@ fn without_a_terminal_or_a_token_there_is_nothing_to_admit() {
         "the usage error says what is missing: {err:?}"
     );
 }
+
+#[test]
+fn a_session_only_report_reaches_the_daemon_instead_of_the_usage_error() {
+    // A forged token is refused by the daemon, which proves the session-only
+    // path built a real request: a usage error would fail differently.
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--session-id",
+            "solo-456",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok, "a forgery must not report");
+    assert!(err.contains("refused"), "the refusal names itself: {err:?}");
+}
+
+#[test]
+fn neither_state_nor_session_is_a_usage_error() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(&["--terminal", "1", "--token", "forged"], false);
+    assert!(!ok);
+    assert!(
+        err.contains("usage"),
+        "missing both halves names the usage: {err:?}"
+    );
+}
+
+#[test]
+fn an_empty_session_id_is_refused_not_recorded_as_silence() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+            "--session-id",
+            "   ",
+        ],
+        false,
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("usage"),
+        "an empty id is a caller error, not a report: {err:?}"
+    );
+}

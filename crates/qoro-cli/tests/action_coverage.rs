@@ -160,6 +160,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "report the agent's conversation id without claiming a state",
+            method: || {
+                Method::Control(ControlRequest::ReportAgentSession {
+                    id: "a".into(),
+                    terminal: 1,
+                    token: "t".into(),
+                    session: "s".into(),
+                })
+            },
+        },
+        Action {
             name: "read what has scrolled past",
             method: || {
                 Method::Control(ControlRequest::Scrollback {
@@ -275,6 +286,12 @@ fn every_control_method_is_reachable_from_some_action() {
             clock: 0,
             session: None,
         },
+        ControlRequest::ReportAgentSession {
+            id: String::new(),
+            terminal: 0,
+            token: String::new(),
+            session: String::new(),
+        },
         ControlRequest::ReloadAgentManifests { id: String::new() },
         ControlRequest::Shutdown { id: String::new() },
         ControlRequest::Scrollback {
@@ -313,6 +330,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
+            | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

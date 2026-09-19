@@ -95,7 +95,8 @@ fn main() -> std::io::Result<()> {
                  \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
                  \x20 qoro setup ...  capture, inspect, trust and run a Setup\n\
-                  \x20 qoro hook-report --state <state>  report this terminal's agent state\n\
+                  \x20 qoro hook-report --state <state> [--session-id S]  report this terminal's agent state\n\
+                  \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
@@ -418,16 +419,11 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             "--session-id" => session = rest.next().cloned(),
             other => {
                 return Err(std::io::Error::other(format!(
-                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S]"
+                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]"
                 )));
             }
         }
     }
-    let Some(state) = state else {
-        return Err(std::io::Error::other(
-            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T]",
-        ));
-    };
     let Some(terminal) = terminal else {
         return Err(std::io::Error::other(
             "no terminal: pass --terminal or run inside a qoro terminal (QORO_TERMINAL)",
@@ -438,27 +434,50 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             "no token: pass --token or run inside a qoro terminal (QORO_TOKEN)",
         ));
     };
-    if qoro_runtime::control::parse_reported_state(&state).is_none() {
-        return Err(std::io::Error::other(format!(
-            "unknown agent state {state:?}"
-        )));
-    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let id = id.unwrap_or_else(|| format!("hook-{terminal}-{nanos}"));
-    let request = ControlRequest::ReportAgentState {
-        id: id.clone(),
-        terminal,
-        token,
-        state,
-        visible_blocker,
-        visible_idle,
-        visible_working,
-        clock: nanos,
-        session,
+    // Session identity without a state claim: a third-party agent that knows
+    // its conversation but has no lifecycle event to map. State and session
+    // travel separately because saying which conversation this is says
+    // nothing about what the agent is doing.
+    let request = match state {
+        None => {
+            let Some(session) = session.filter(|s| !s.trim().is_empty()) else {
+                return Err(std::io::Error::other(
+                    "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                ));
+            };
+            let id = id.unwrap_or_else(|| format!("hook-session-{terminal}-{nanos}"));
+            ControlRequest::ReportAgentSession {
+                id,
+                terminal,
+                token,
+                session,
+            }
+        }
+        Some(state) => {
+            if qoro_runtime::control::parse_reported_state(&state).is_none() {
+                return Err(std::io::Error::other(format!(
+                    "unknown agent state {state:?}"
+                )));
+            }
+            let id = id.unwrap_or_else(|| format!("hook-{terminal}-{nanos}"));
+            ControlRequest::ReportAgentState {
+                id,
+                terminal,
+                token,
+                state,
+                visible_blocker,
+                visible_idle,
+                visible_working,
+                clock: nanos,
+                session,
+            }
+        }
     };
+    let id = request.request_id().to_string();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
