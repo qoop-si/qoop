@@ -133,16 +133,24 @@ fn fetch_latest_parsing(json: &serde_json::Value) -> Result<Release, String> {
 }
 
 /// GET a URL to memory. Anything curl reports becomes text the person can act on.
+///
+/// An API token rides along when one is in the environment: anonymous calls share
+/// 60 requests an hour per IP, which a shared egress burns through, while a token
+/// gets 5000. Nothing is stored anywhere; the token only travels in this request.
 fn curl(url: &str) -> Result<Vec<u8>, String> {
-    let out = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "25",
-            "-H",
-            "Accept: application/vnd.github+json",
-            url,
-        ])
+    let mut command = Command::new("curl");
+    command.args([
+        "-fsSL",
+        "--max-time",
+        "25",
+        "-H",
+        "Accept: application/vnd.github+json",
+        url,
+    ]);
+    if let Some(token) = github_token() {
+        command.args(["-H", &format!("Authorization: Bearer {token}")]);
+    }
+    let out = command
         .output()
         .map_err(|e| format!("curl is not installed or cannot run: {e}"))?;
     if !out.status.success() {
@@ -154,6 +162,18 @@ fn curl(url: &str) -> Result<Vec<u8>, String> {
         });
     }
     Ok(out.stdout)
+}
+
+/// A GitHub API token from the environment, when the person has one.
+///
+/// `gh` users already do: it keeps exactly this variable. Checked at request time
+/// rather than at startup, so a failure never depends on when the process began.
+fn github_token() -> Option<String> {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|token| token.trim().to_string())
+        .find(|token| !token.is_empty())
 }
 
 /// Download a URL to a file.

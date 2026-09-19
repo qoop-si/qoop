@@ -28,7 +28,10 @@ qoro update           # install the newest release over this binary
 
 `--check` writes the newest version it saw to the notice file beside the
 sessions (`update-available` under the runtime directory). The interface never
-touches the network; it only reads that file.
+touches the network; it only reads that file. Anonymous API calls share 60
+requests an hour per IP, which a shared egress burns through, so when
+`GH_TOKEN` or `GITHUB_TOKEN` is in the environment it rides along and the
+quota is 5000 instead.
 
 The install refuses while any session is running and names what is live, so no
 agent dies to a routine upgrade. Stop the named sessions first
