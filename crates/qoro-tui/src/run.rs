@@ -787,6 +787,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("new space", "w", "name it, then it opens"),
     ("rename tab", "r", "rename what is focused"),
     ("rename space", "R", "rename what is on screen"),
+    ("close tab", "x", "close what is focused"),
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
     ("keybinds", "?", "every key, and what it does"),
@@ -799,6 +800,174 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("pin as master", "E", "this tab reports to the right column"),
     ("detach", "d", "leave, and keep everything running"),
 ];
+
+/// What choosing a menu row asks the daemon for, if anything.
+enum MenuSend {
+    Nothing,
+    Detach,
+    Control(ControlRequest),
+}
+
+/// Run one menu row: prompts, messages and state changes happen here, and the
+/// caller only sends the returned request. One function for the keyboard and
+/// the mouse, so the two cannot disagree about what a row does.
+fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuSend {
+    match MENU[item].0 {
+        "new tab" => {
+            state.prompt = Some(Prompt {
+                what: Naming::Terminal,
+                text: String::new(),
+            });
+            MenuSend::Nothing
+        }
+        "new space" => {
+            state.prompt = Some(Prompt {
+                what: Naming::Space,
+                text: String::new(),
+            });
+            MenuSend::Nothing
+        }
+        "rename tab" => {
+            if state.focused != 0 {
+                let current = state
+                    .rows
+                    .iter()
+                    .find(|r| r.terminal == state.focused)
+                    .and_then(|r| r.name.clone())
+                    .unwrap_or_default();
+                state.prompt = Some(Prompt {
+                    what: Naming::RenameTerminal(state.focused),
+                    text: current,
+                });
+            } else {
+                state.message = Some("nothing to rename, ctrl-a c starts a terminal".to_string());
+            }
+            MenuSend::Nothing
+        }
+        "rename space" => {
+            if let Some(space) = state.space {
+                let current = state
+                    .spaces
+                    .iter()
+                    .find(|s| s.id == space)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                state.prompt = Some(Prompt {
+                    what: Naming::RenameSpace(space),
+                    text: current,
+                });
+            } else {
+                state.message = Some("nothing to rename yet".to_string());
+            }
+            MenuSend::Nothing
+        }
+        "close tab" => {
+            if state.focused == 0 {
+                state.message = Some("nothing to close".to_string());
+                MenuSend::Nothing
+            } else {
+                *request += 1;
+                MenuSend::Control(ControlRequest::CloseTerminal {
+                    id: format!("close-{request}"),
+                    terminal: state.focused,
+                })
+            }
+        }
+        "split side by side" | "split stacked" => {
+            let dir = if MENU[item].0 == "split side by side" {
+                layout::Dir::V
+            } else {
+                layout::Dir::H
+            };
+            let focused = state.focused;
+            let space = state.space;
+            if focused == 0 {
+                state.message = Some("nothing to split, pick new tab instead".to_string());
+                MenuSend::Nothing
+            } else {
+                ensure_layout(state);
+                let area = pane_area(state);
+                let placed = space
+                    .and_then(|s| state.layouts.get_mut(&s))
+                    .is_some_and(|layout| layout.split_placeholder(focused, dir, area));
+                if !placed {
+                    state.message = Some(
+                        "cannot split now: too small, zoomed, or one already on its way"
+                            .to_string(),
+                    );
+                    MenuSend::Nothing
+                } else {
+                    *request += 1;
+                    if let Some(s) = space {
+                        state.split_origin.insert(format!("split-{request}"), s);
+                    }
+                    MenuSend::Control(ControlRequest::CreateTerminal {
+                        id: format!("split-{request}"),
+                        cwd: None,
+                        workspace: space,
+                        name: None,
+                    })
+                }
+            }
+        }
+        "keybinds" => {
+            state.reading = Some(Reading::Keybinds);
+            MenuSend::Nothing
+        }
+        "settings" => {
+            state.reading = Some(Reading::Settings);
+            MenuSend::Nothing
+        }
+        "reload manifests" => {
+            *request += 1;
+            state.message = Some("reloading agent manifests".to_string());
+            MenuSend::Control(ControlRequest::ReloadAgentManifests {
+                id: format!("reload-{request}"),
+            })
+        }
+        "pin as master" => {
+            pin_focused_as_master(state);
+            MenuSend::Nothing
+        }
+        "detach" => MenuSend::Detach,
+        _ => unreachable!("menu row without dispatch"),
+    }
+}
+
+/// A mouse press while the menu is open: which row it lands on, if any.
+///
+/// `Some(Some(row))` is a press on a row, `Some(None)` a press anywhere else,
+/// `None` no press in these bytes at all. Wheel, motion, releases and other
+/// buttons are not a choice, so they read as no press rather than as outside.
+fn menu_click(bytes: &[u8], cols: u16, lines: u16) -> Option<Option<usize>> {
+    let mut at = 0;
+    let mut found: Option<Option<usize>> = None;
+    while let Some(start) = bytes[at..].windows(3).position(|w| w == b"\x1b[<") {
+        let from = at + start;
+        let Some(end) = bytes[from..].iter().position(|b| *b == b'M' || *b == b'm') else {
+            break;
+        };
+        let end = from + end;
+        let press = bytes[end] == b'M';
+        if let Ok(body) = std::str::from_utf8(&bytes[from + 3..end]) {
+            let mut parts = body.split(';');
+            if let (Some(button), Some(col), Some(row)) = (
+                parts.next().and_then(|s| s.parse::<u16>().ok()),
+                parts.next().and_then(|s| s.parse::<u16>().ok()),
+                parts.next().and_then(|s| s.parse::<u16>().ok()),
+            ) {
+                let wheel = button & 64 != 0;
+                let motion = button & 32 != 0;
+                let plain = button & 0b0000_0011;
+                if press && !wheel && !motion && plain == 0 {
+                    found = Some(crate::screen::menu_row_at(cols, lines, row, col));
+                }
+            }
+        }
+        at = end + 1;
+    }
+    found
+}
 
 /// A read only overlay opened from the menu.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1237,126 +1406,70 @@ async fn drive(
                             }
                         }
                     } else if let Some(selected) = state.menu {
-                        // The menu owns the keyboard while it is open, the way the palette
-                        // and the naming box do, and hands a prefix back for the same
-                        // reason.
-                        match menu_key(&mut state, selected, &bytes) {
-                            MenuOutcome::Moved | MenuOutcome::Closed => dirty = true,
-                            MenuOutcome::Chose(item) => {
-                                match MENU[item].0 {
-                                    "new tab" => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Terminal,
-                                            text: String::new(),
-                                        });
-                                    }
-                                    "new space" => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Space,
-                                            text: String::new(),
-                                        });
-                                    }
-                                    "rename tab" => {
-                                        if state.focused != 0 {
-                                            let current = state
-                                                .rows
-                                                .iter()
-                                                .find(|r| r.terminal == state.focused)
-                                                .and_then(|r| r.name.clone())
-                                                .unwrap_or_default();
-                                            state.prompt = Some(Prompt {
-                                                what: Naming::RenameTerminal(state.focused),
-                                                text: current,
-                                            });
+                        // A click chooses a row, or closes on the box around it. Checked
+                        // before the keyboard owns the bytes, or the press reads as an
+                        // escape and the menu shuts without choosing anything.
+                        if let Some(hit) = menu_click(&bytes, state.cols, state.lines) {
+                            match hit {
+                                Some(item) => {
+                                    state.menu = None;
+                                    match apply_menu_choice(&mut state, item, &mut request) {
+                                        MenuSend::Nothing => {}
+                                        MenuSend::Detach => return Ok(()),
+                                        MenuSend::Control(ask) => {
+                                            wr.write_all(&client::encode_control_seq(
+                                                &ask,
+                                                &mut control_seq,
+                                            )?)
+                                            .await?;
                                         }
                                     }
-                                    "rename space" => {
-                                        if let Some(space) = state.space {
-                                            let current = state
-                                                .spaces
-                                                .iter()
-                                                .find(|s| s.id == space)
-                                                .map(|s| s.name.clone())
-                                                .unwrap_or_default();
-                                            state.prompt = Some(Prompt {
-                                                what: Naming::RenameSpace(space),
-                                                text: current,
-                                            });
-                                        }
-                                    }
-                                    "split side by side" | "split stacked" => {
-                                        let dir = if MENU[item].0 == "split side by side" {
-                                            layout::Dir::V
-                                        } else {
-                                            layout::Dir::H
-                                        };
-                                        let focused = state.focused;
-                                        let space = state.space;
-                                        if focused == 0 {
-                                            state.message = Some(
-                                                "nothing to split, pick new tab instead"
-                                                    .to_string(),
-                                            );
-                                        } else {
-                                            ensure_layout(&mut state);
-                                            let area = pane_area(&state);
-                                            let placed = space
-                                                .and_then(|s| state.layouts.get_mut(&s))
-                                                .is_some_and(|layout| {
-                                                    layout.split_placeholder(focused, dir, area)
-                                                });
-                                            if !placed {
-                                                state.message = Some(
-                                                    "cannot split now: too small, zoomed, or one already on its way"
-                                                        .to_string(),
-                                                );
-                                            } else {
-                                                request += 1;
-                                                if let Some(s) = space {
-                                                    state
-                                                        .split_origin
-                                                        .insert(format!("split-{request}"), s);
-                                                }
-                                                wr.write_all(&client::encode_control_seq(
-                                                    &ControlRequest::CreateTerminal {
-                                                        id: format!("split-{request}"),
-                                                        cwd: None,
-                                                        workspace: space,
-                                                        name: None,
-                                                    },
-                                                    &mut control_seq,
-                                                )?).await?;
-                                            }
-                                        }
-                                    }
-                                    "keybinds" => state.reading = Some(Reading::Keybinds),
-                                    "settings" => state.reading = Some(Reading::Settings),
-                                    "reload manifests" => {
-                                        request += 1;
-                                        wr.write_all(&client::encode_control_seq(
-                                            &ControlRequest::ReloadAgentManifests {
-                                                id: format!("reload-{request}"),
-                                            },
-                                            &mut control_seq,
-                                        )?).await?;
-                                    }
-                                    "pin as master" => {
-                                        pin_focused_as_master(&mut state);
+                                    if MENU[item].0 == "pin as master"
+                                        && let Some(resize) =
+                                            resize_focused_to_tile(&state, &mut seqs)?
+                                    {
                                         // The column takes pane width when it opens, and a
                                         // child that is not told reflows against a width
                                         // it no longer has.
-                                        if let Some(resize) =
-                                            resize_focused_to_tile(&state, &mut seqs)?
-                                        {
-                                            wr.write_all(&resize).await?;
+                                        wr.write_all(&resize).await?;
+                                    }
+                                }
+                                None => {
+                                    state.menu = None;
+                                }
+                            }
+                            dirty = true;
+                            // The release of the same click arrives next: with no press
+                            // in it this branch ignores it, and the closed menu lets
+                            // it fall through to the pane below.
+                        } else {
+                            // The menu owns the keyboard while it is open, the way the
+                            // palette and the naming box do, and hands a prefix back
+                            // for the same reason.
+                            match menu_key(&mut state, selected, &bytes) {
+                                MenuOutcome::Moved | MenuOutcome::Closed => dirty = true,
+                                MenuOutcome::Chose(item) => {
+                                    match apply_menu_choice(&mut state, item, &mut request) {
+                                        MenuSend::Nothing => {}
+                                        MenuSend::Detach => return Ok(()),
+                                        MenuSend::Control(ask) => {
+                                            wr.write_all(&client::encode_control_seq(
+                                                &ask,
+                                                &mut control_seq,
+                                            )?)
+                                            .await?;
                                         }
                                     }
-                                    "detach" => return Ok(()),
-                                    _ => unreachable!("menu row without dispatch"),
+                                    if MENU[item].0 == "pin as master"
+                                        && let Some(resize) =
+                                            resize_focused_to_tile(&state, &mut seqs)?
+                                    {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    dirty = true;
                                 }
-                                dirty = true;
+                                MenuOutcome::Passthrough(rest) => feed = Some(rest),
                             }
-                            MenuOutcome::Passthrough(rest) => feed = Some(rest),
                         }
                     } else if state.reading.is_some() {
                         // Anything at all closes a thing that is only being read.
@@ -2235,6 +2348,7 @@ fn pin_focused_as_master(state: &mut State) {
         .is_some_and(|(terminal, _)| terminal == state.focused)
     {
         state.master = None;
+        state.message = Some("unpinned the master".to_string());
         return;
     }
     match state.rows.iter().find(|r| r.terminal == state.focused) {
@@ -2242,6 +2356,7 @@ fn pin_focused_as_master(state: &mut State) {
             state.master = Some((state.focused, row.generation));
             state.master_open = true;
             state.refresh_master_shown();
+            state.message = Some("pinned as master".to_string());
         }
         None => {
             state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
@@ -3713,14 +3828,17 @@ mod tests {
         assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(6));
-        // Keyless rows answer to their first letter.
-        assert!(matches!(menu_key(&mut state, 6, b"s"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(7));
+        // Keyless rows answer to their first letter.
+        assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(8));
+        // `x` jumps straight to close tab.
+        assert!(matches!(menu_key(&mut state, 0, b"x"), MenuOutcome::Moved));
+        assert_eq!(state.menu, Some(4));
         // Enter chooses, esc closes.
         assert!(matches!(
-            menu_key(&mut state, 7, b"\r"),
-            MenuOutcome::Chose(7)
+            menu_key(&mut state, 8, b"\r"),
+            MenuOutcome::Chose(8)
         ));
         assert_eq!(state.menu, None);
         state.menu = Some(3);
@@ -3743,6 +3861,7 @@ mod tests {
                 "new space",
                 "rename tab",
                 "rename space",
+                "close tab",
                 "split side by side",
                 "split stacked",
                 "keybinds",
@@ -3752,6 +3871,76 @@ mod tests {
                 "detach",
             ]
         );
+    }
+
+    #[test]
+    fn choosing_close_tab_asks_to_close_the_focused_terminal() {
+        let mut state = bare_state();
+        state.focused = 2;
+        let mut request = 0;
+        let item = MENU.iter().position(|(n, _, _)| *n == "close tab").unwrap();
+        match apply_menu_choice(&mut state, item, &mut request) {
+            MenuSend::Control(ControlRequest::CloseTerminal { terminal, .. }) => {
+                assert_eq!(terminal, 2);
+            }
+            other => panic!(
+                "close tab sent nothing useful: {}",
+                matches!(other, MenuSend::Nothing)
+            ),
+        }
+        // Nothing focused is a message, not a request.
+        let mut state = bare_state();
+        state.focused = 0;
+        let mut request = 0;
+        assert!(matches!(
+            apply_menu_choice(&mut state, item, &mut request),
+            MenuSend::Nothing
+        ));
+        assert_eq!(state.message.as_deref(), Some("nothing to close"));
+    }
+
+    #[test]
+    fn choosing_reload_says_so_and_renaming_nothing_says_so() {
+        let mut state = bare_state();
+        let mut request = 0;
+        let reload = MENU
+            .iter()
+            .position(|(n, _, _)| *n == "reload manifests")
+            .unwrap();
+        assert!(matches!(
+            apply_menu_choice(&mut state, reload, &mut request),
+            MenuSend::Control(ControlRequest::ReloadAgentManifests { .. })
+        ));
+        assert_eq!(state.message.as_deref(), Some("reloading agent manifests"));
+        let rename = MENU
+            .iter()
+            .position(|(n, _, _)| *n == "rename tab")
+            .unwrap();
+        state.focused = 0;
+        assert!(matches!(
+            apply_menu_choice(&mut state, rename, &mut request),
+            MenuSend::Nothing
+        ));
+        assert!(state.message.is_some(), "silent no-op");
+    }
+
+    #[test]
+    fn a_menu_click_lands_on_a_row_or_outside_it() {
+        let cols = 80;
+        let lines = 24;
+        let Some((left, top, w, _)) = crate::screen::menu_rect(cols, lines) else {
+            panic!("no menu rect on 80x24");
+        };
+        // The third row's middle cell.
+        let row = (top + 2 + 2 + 1) as u16;
+        let col = (left + w / 2 + 1) as u16;
+        let press = format!("\x1b[<0;{col};{row}M").into_bytes();
+        assert_eq!(menu_click(&press, cols, lines), Some(Some(2)));
+        // Far away from the centred box is outside.
+        assert_eq!(menu_click(b"\x1b[<0;1;1M", cols, lines), Some(None));
+        // A release is not a choice.
+        let release = format!("\x1b[<0;{col};{row}m").into_bytes();
+        assert_eq!(menu_click(&release, cols, lines), None);
     }
 
     /// Pinning names the focused tab with its generation, and pinning again unpins.

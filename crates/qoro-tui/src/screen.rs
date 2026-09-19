@@ -104,7 +104,7 @@ pub struct Frame<'a> {
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  ? keys  d detach  U update";
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  x close  s space  w new space  space find  g view  m menu  ? keys  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -505,13 +505,17 @@ pub fn paint(frame: &Frame) -> String {
         "enter to make it  esc to stop"
     } else if frame.palette.is_some() {
         "ctrl-a space find  enter go  esc back"
+    } else if frame.menu.is_some() {
+        "up/down or j/k move  enter choose  esc close"
+    } else if frame.reading.is_some() {
+        "any key to close"
     } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
         // Every key when there is room for every key. On a narrower window the list is cut
         // from the right, so the way out is not last: the cut takes the update key
         // first, and a person stuck in here can still read the one that gets them out.
         EVERY_KEY
     } else {
-        "ctrl-a: n tab  c new  r rename  R space  d detach  space find  ? keys"
+        "ctrl-a: n tab  c new  r rename  R space  d detach  space find  m menu  ? keys"
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);
@@ -970,14 +974,15 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
     }
 }
 
-/// The menu, painted over the column it was opened from.
+/// Where the centred menu box sits: left, top, width and height in cells.
 ///
-/// Small and beside its own label rather than centred like the palette: it is a short list
-/// of things this interface can do, opened from a word at the foot of the column, and a box
-/// that jumped to the middle of the screen for four rows would read as something bigger
-/// than it is.
-fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
-    let lines = frame.lines as usize;
+/// Zero based, like the painter counts. The height covers both borders plus the
+/// title row, one row per menu entry and one hint row. Shared with hit testing,
+/// so a click and a repaint agree on which row is which and a second copy of
+/// this arithmetic cannot drift.
+pub(crate) fn menu_rect(cols: u16, lines: u16) -> Option<(usize, usize, usize, usize)> {
+    let cols = cols as usize;
+    let lines = lines as usize;
     let (max_name, max_key) = crate::run::MENU
         .iter()
         .fold((0, 0), |(n, k), (name, key, _)| {
@@ -988,14 +993,44 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
             };
             (n.max(width::width(name)), k.max(keypart))
         });
-    let inner = 1 + max_name + 1 + max_key;
-    let w = (inner + 2).min(frame.cols as usize);
-    if lines < crate::run::MENU.len() + 2 {
-        return;
+    let hint = "arrows/jk move  enter choose  esc close";
+    let inner = (1 + max_name + 1 + max_key)
+        .max(width::width(" menu") + 1)
+        .max(width::width(hint) + 1);
+    let w = inner + 2;
+    let height = crate::run::MENU.len() + 4;
+    if cols < w + 2 || lines < height + 2 {
+        return None;
     }
-    let left = left_for(frame.cols, frame.collapsed).saturating_sub(w + 1);
-    // Above the row it was opened from, so the label stays visible under it.
-    let top = (lines.saturating_sub(STATUS + crate::run::MENU.len() + 3)).max(TABS);
+    let left = cols.saturating_sub(w) / 2;
+    let top = lines.saturating_sub(height) / 2;
+    Some((left, top, w, height))
+}
+
+/// Which menu row a one based screen position lands on, if it lands on one.
+pub(crate) fn menu_row_at(cols: u16, lines: u16, row: u16, col: u16) -> Option<usize> {
+    let (left, top, w, height) = menu_rect(cols, lines)?;
+    let r = (row as usize).checked_sub(1)?;
+    let c = (col as usize).checked_sub(1)?;
+    if c < left || c >= left + w || r < top || r >= top + height {
+        return None;
+    }
+    let item = r.checked_sub(top + 2)?;
+    (item < crate::run::MENU.len()).then_some(item)
+}
+
+/// The menu, centred over the pane like the palette.
+///
+/// It used to sit low over the left column, above the row it was opened from,
+/// where it covered the spaces list and read as a glitch of the column rather
+/// than a choice. A short list opened from a word at the foot of the column is
+/// still a modal choice, so it gets the modal treatment: centred, with a title
+/// and a hint row, painted last over everything except the read only overlay.
+fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
+    let Some((left, top, w, _)) = menu_rect(frame.cols, frame.lines) else {
+        return;
+    };
+    let inner = w.saturating_sub(2);
     let border = theme::fg(theme::Role::Rule);
     let edge = |out: &mut String, row: usize, open: char, fill: char, close: char| {
         out.push_str(&at(row + 1, left + 1));
@@ -1008,11 +1043,17 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         out.push_str(theme::RESET);
     };
     edge(out, top, '\u{256d}', '\u{2500}', '\u{256e}');
+    // The title names what is open, the way the palette names its query.
+    out.push_str(&at(top + 2, left + 1));
+    out.push_str(&border);
+    out.push('\u{2502}');
+    out.push_str(&theme::fg(theme::Role::Title));
+    out.push_str(&width::fit(" menu", inner));
+    out.push_str(&border);
+    out.push('\u{2502}');
+    out.push_str(theme::RESET);
     for (i, (name, key, _)) in crate::run::MENU.iter().enumerate() {
-        let row = top + 1 + i;
-        if row + 1 >= lines {
-            break;
-        }
+        let row = top + 2 + i;
         out.push_str(&at(row + 1, left + 1));
         out.push_str(&border);
         out.push('\u{2502}');
@@ -1023,7 +1064,6 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         });
         // The name on the left, its key on the right: the menu teaches the
         // shortcut it replaces, so the next visit skips the menu entirely.
-        let inner = w.saturating_sub(2);
         let keypart = if key.is_empty() {
             String::new()
         } else {
@@ -1036,9 +1076,21 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         out.push('\u{2502}');
         out.push_str(theme::RESET);
     }
+    let hint_row = top + 2 + crate::run::MENU.len();
+    out.push_str(&at(hint_row + 1, left + 1));
+    out.push_str(&border);
+    out.push('\u{2502}');
+    out.push_str(&theme::fg(theme::Role::Faint));
+    out.push_str(&width::fit(
+        " arrows/jk move  enter choose  esc close",
+        inner,
+    ));
+    out.push_str(&border);
+    out.push('\u{2502}');
+    out.push_str(theme::RESET);
     edge(
         out,
-        top + 1 + crate::run::MENU.len(),
+        top + 3 + crate::run::MENU.len(),
         '\u{2570}',
         '\u{2500}',
         '\u{256f}',
@@ -1052,36 +1104,49 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
 /// than no settings page.
 fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) {
     let lines: Vec<String> = match reading {
-        crate::run::Reading::Keybinds => EVERY_KEY
-            .trim_start_matches("ctrl-a: ")
-            .split("  ")
-            .map(|entry| match entry.split_once(' ') {
-                Some((key, what)) => format!(" ctrl-a {key:<7}{what}"),
-                None => format!(" {entry}"),
-            })
-            .chain([
-                " ctrl-a 1..9   the nth tab of this space".to_string(),
-                " ctrl-a v/-    split side by side / stacked".to_string(),
-                " ctrl-a H/J/K/L focus the pane left/down/up/right".to_string(),
-                " ctrl-a o      next pane".to_string(),
-                " ctrl-a z      zoom the focused pane".to_string(),
-                " ctrl-a X      drop the pane, keeping its terminal".to_string(),
-                " ctrl-a p      previous tab".to_string(),
-                " ctrl-a S      previous space".to_string(),
-                " ctrl-a f      fold the idle groups".to_string(),
-                " ctrl-a g      agents as groups or by urgency".to_string(),
-                " ctrl-a E      master panel".to_string(),
-                " ctrl-a l      repaint".to_string(),
-                " ctrl-q        detach".to_string(),
-                // The mouse is not a key, and it is the part of this a person is least
-                // likely to guess: an interface that takes the mouse has taken their
-                // terminal's own selection with it, so it owes them this line.
-                " drag          select, and copy when you let go".to_string(),
-                " shift-drag    the same, over an agent that took the mouse".to_string(),
-                " wheel         scroll: the program's own, or back through what went past"
-                    .to_string(),
-            ])
-            .collect(),
+        crate::run::Reading::Keybinds => vec![
+            " tabs".to_string(),
+            " ctrl-a n      next tab".to_string(),
+            " ctrl-a p      previous tab".to_string(),
+            " ctrl-a 1..9   the nth tab of this space".to_string(),
+            " ctrl-a c      new tab, name it first".to_string(),
+            " ctrl-a r      rename the focused tab".to_string(),
+            " ctrl-a x      close the focused tab".to_string(),
+            " spaces".to_string(),
+            " ctrl-a s      next space".to_string(),
+            " ctrl-a S      previous space".to_string(),
+            " ctrl-a w      new space, name it first".to_string(),
+            " ctrl-a R      rename this space".to_string(),
+            " find and view".to_string(),
+            " ctrl-a space  find tabs, spaces, agents".to_string(),
+            " ctrl-a f      fold the idle groups".to_string(),
+            " ctrl-a g      agents as groups or by urgency".to_string(),
+            " ctrl-a b      fold the left column away".to_string(),
+            " ctrl-a m      this menu".to_string(),
+            " ctrl-a ?      every key, without the menu".to_string(),
+            " panes".to_string(),
+            " ctrl-a v/-    split side by side / stacked".to_string(),
+            " ctrl-a H/J/K/L focus the pane left/down/up/right".to_string(),
+            " ctrl-a o      next pane".to_string(),
+            " ctrl-a z      zoom the focused pane".to_string(),
+            " ctrl-a X      drop the pane, keeping its terminal".to_string(),
+            " master".to_string(),
+            " ctrl-a E      master column on the right".to_string(),
+            " ctrl-a a      approve the head ask".to_string(),
+            " ctrl-a u      reject the head ask".to_string(),
+            " session".to_string(),
+            " ctrl-a d      detach, keep everything running".to_string(),
+            " ctrl-q        detach".to_string(),
+            " ctrl-a U      say if an update waits, and how".to_string(),
+            " ctrl-a l      repaint".to_string(),
+            " mouse".to_string(),
+            // The mouse is not a key, and it is the part of this a person is least
+            // likely to guess: an interface that takes the mouse has taken their
+            // terminal's own selection with it, so it owes them this line.
+            " drag          select, and copy when you let go".to_string(),
+            " shift-drag    the same, over an agent that took the mouse".to_string(),
+            " wheel         scroll: the program's own, or back through what went past".to_string(),
+        ],
         crate::run::Reading::Settings => vec![
             format!(" window          {} by {}", frame.cols, frame.lines),
             format!(
@@ -1728,6 +1793,39 @@ mod tests {
         assert!(painted.contains("^a c"), "menu hides its key: {painted:?}");
         assert!(painted.contains("split side by side"), "{painted:?}");
         assert!(painted.contains("rename space"), "{painted:?}");
+        assert!(painted.contains("close tab"), "{painted:?}");
+        assert!(
+            painted.contains("^a x"),
+            "close tab hides its key: {painted:?}"
+        );
+        assert!(painted.contains(" menu"), "menu missing title: {painted:?}");
+        assert!(
+            painted.contains("enter choose"),
+            "menu missing hint: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_menu_is_centred_not_hugging_the_column() {
+        let Some((left, top, w, height)) = menu_rect(80, 24) else {
+            panic!("no menu rect on 80x24");
+        };
+        assert_eq!(height, crate::run::MENU.len() + 4);
+        assert_eq!(left, (80 - w) / 2, "menu not centred across");
+        assert_eq!(top, (24 - height) / 2, "menu not centred down");
+        assert!(left > 0, "menu still hugs the left edge");
+    }
+
+    #[test]
+    fn a_menu_click_address_matches_the_painted_rows() {
+        // Row 0 sits two rows under the box top: border plus title.
+        let Some((left, top, _, _)) = menu_rect(80, 24) else {
+            panic!("no menu rect on 80x24");
+        };
+        let row = (top + 2 + 4 + 1) as u16;
+        let col = (left + 3 + 1) as u16;
+        assert_eq!(menu_row_at(80, 24, row, col), Some(4), "close tab row");
+        assert_eq!(menu_row_at(80, 24, 1, 1), None, "outside reads as a row");
     }
 
     #[test]
