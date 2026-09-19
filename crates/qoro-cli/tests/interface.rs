@@ -487,10 +487,39 @@ impl Interface {
     }
 
     /// Read until the nth space, counted down the spaces panel from one, is the focused one.
+    ///
+    /// The background behind the row is the whole marker: no glyph says where
+    /// the keyboard is, so this reads the raw bytes (escapes intact) rather
+    /// than the stripped text `panel_line` returns.
     fn wait_for_space(&mut self, nth: usize, within: Duration) -> bool {
         let row = FIRST_SPACE_ROW + nth - 1;
-        self.wait_for_panel(row, |line| line.contains('\u{25cf}'), within)
-            .is_some()
+        self.wait_for_selected(row, within).is_some()
+    }
+
+    /// Whether one index row carries the keyboard, read out of the raw bytes.
+    ///
+    /// The selected background (`48;5;236`) is the marker, and it is the first
+    /// thing painted after the row's cursor move, so the first bytes decide.
+    /// The stripped text cannot answer this: stripping takes the colour out.
+    fn panel_selected(&self, row: usize) -> bool {
+        let at = format!("\x1b[{row};1H");
+        let Some(start) = self.painted.rfind(&at) else {
+            return false;
+        };
+        let rest = &self.painted[start + at.len()..];
+        rest[..rest.len().min(64)].contains("48;5;236")
+    }
+
+    /// Read until one index row carries the keyboard.
+    fn wait_for_selected(&mut self, row: usize, within: Duration) -> Option<Duration> {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self.panel_selected(row) {
+                return Some(start.elapsed());
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        None
     }
 
     /// Read until the tab bar says what is wanted.
@@ -1093,12 +1122,8 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // The keyboard reaches the other space too, so the pointer is not the only way in.
     ui.command(b's');
     assert!(
-        ui.wait_for_panel(
-            FIRST_SPACE_ROW + 1,
-            |line| line.contains('\u{25cf}'),
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        ui.wait_for_selected(FIRST_SPACE_ROW + 1, Duration::from_secs(15))
+            .is_some(),
         "ctrl-a s did not move to the next space: {:?}",
         ui.panel_line(FIRST_SPACE_ROW + 1)
     );
@@ -1115,12 +1140,8 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // Backwards again, which wraps the other way, off the front of the list.
     ui.command(b'S');
     assert!(
-        ui.wait_for_panel(
-            FIRST_SPACE_ROW + 1,
-            |line| line.contains('\u{25cf}'),
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        ui.wait_for_selected(FIRST_SPACE_ROW + 1, Duration::from_secs(15))
+            .is_some(),
         "ctrl-a S from the first space did not wrap to the last: {:?}",
         ui.panel_line(FIRST_SPACE_ROW + 1)
     );
@@ -1421,8 +1442,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
         ui.tab_bar()
     );
     assert!(
-        ui.panel_line(FIRST_SPACE_ROW + 1)
-            .is_some_and(|line| line.contains('\u{25cf}')),
+        ui.panel_selected(FIRST_SPACE_ROW + 1),
         "the spaces panel still marks the space that was left: {:?}",
         ui.panel_line(FIRST_SPACE_ROW + 1)
     );
