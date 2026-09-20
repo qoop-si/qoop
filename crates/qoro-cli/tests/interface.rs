@@ -1742,10 +1742,13 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
 }
 
 /// G12.17: clicking the master column header moves the keyboard to the master
-/// tab on that click, even with an idle daemon, and typing reaches the master
-/// there rather than staying in the terminal on the left.
+/// tile on that click, even with an idle daemon, and typing reaches the master
+/// there rather than staying in the worker tile.
 ///
-/// The header click defers through the pending focus, which used to drain only
+/// The master is a real tiling leaf, hidden from the tab bar like a split
+/// pane: the bar shows only the worker, so focus is read from the bar's
+/// brackets (worker focused) versus no brackets (master tile focused). The
+/// header click defers through the pending focus, which used to drain only
 /// on the daemon's next message. An idle daemon says nothing for minutes, so
 /// the click sat unapplied: typing stayed left, and when traffic finally came
 /// the focus yanked across mid-typing. The drain now also runs at the end of
@@ -1780,57 +1783,70 @@ fn g12_17_a_click_on_the_master_header_moves_typing_to_the_master() {
     ui.type_in(b"E");
     std::thread::sleep(Duration::from_millis(300));
     ui.type_in(b"\r");
+    // The column is open from the first frame, so its "needs you" row cannot
+    // confirm the pin: wait for the pin's own confirmation instead.
     assert!(
-        ui.wait_for("needs you", Duration::from_secs(10)).is_some(),
-        "the master column never appeared"
+        ui.wait_for("pinned as master", Duration::from_secs(10))
+            .is_some(),
+        "the menu did not pin tab 1 as master"
     );
-    let second = ui
-        .tab_column(2)
-        .unwrap_or_else(|| panic!("terminal 2 has no tab: {:?}", ui.tab_bar()));
-    ui.click(second, qoro_tui::screen::TABS as u16);
+    // The tiled master leaves the tab bar: tab labels are positions, so the
+    // one worker slides to position 1 and no position 2 remains. The pin
+    // keeps the keyboard, so no tab is bracketed.
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(10)),
-        "a click on the second tab did not move to it: {:?}",
+        ui.wait_for_tabs(
+            |bar| !bar.contains(" 2 ") && !bar.contains('['),
+            Duration::from_secs(10)
+        ),
+        "the tiled master never left the tab bar: {:?}",
+        ui.tab_bar()
+    );
+    // The worker sits at position 1 now: clicking it moves the keyboard
+    // there, bracketing it.
+    let worker = ui
+        .tab_column(1)
+        .unwrap_or_else(|| panic!("worker has no tab: {:?}", ui.tab_bar()));
+    ui.click(worker, qoro_tui::screen::TABS as u16);
+    assert!(
+        ui.wait_for_tab(1, Duration::from_secs(10)),
+        "a click on the worker tab did not move to it: {:?}",
         ui.tab_bar()
     );
 
     // Click the master column header (top row, far right): the keyboard must
-    // jump back to the master tab.
-    assert!(
-        ui.saw("pinned as master"),
-        "the menu did not pin tab 1 as master"
-    );
+    // leave the worker tab for the master tile, so the bar shows no focused
+    // tab anymore.
     ui.click(COLS - 5, 1);
     assert!(
-        ui.wait_for_tab(1, Duration::from_secs(10)),
-        "clicking the master header did not jump to the master tab: {:?}",
+        ui.wait_for_tabs(|bar| !bar.contains('['), Duration::from_secs(10)),
+        "clicking the master header did not leave the worker tab: {:?}",
         ui.tab_bar()
     );
 
-    // Typing now must reach the master, and only the master.
-    ui.type_in(b"echo MARK_IN_MASTER_9\n");
+    // Typing now must reach the master tile. The tile is narrow (a third
+    // of a 100-column pane), so the shell line wraps mid-word with cursor
+    // addresses between the halves: the needle is a short token that stays
+    // whole on the second row.
+    ui.type_in(b"echo QZ9\n");
     assert!(
-        ui.wait_for("MARK_IN_MASTER_9", Duration::from_secs(10))
-            .is_some(),
-        "typing never reached the master tab"
+        ui.wait_for("QZ9", Duration::from_secs(10)).is_some(),
+        "typing never reached the master tile"
     );
-    ui.click(second, qoro_tui::screen::TABS as u16);
+
+    // Clicking the worker tile (left side of the pane) brings the keyboard
+    // back: the bar brackets the worker position again.
+    let left = qoro_tui::screen::left(COLS);
+    ui.click((left + 3) as u16, (qoro_tui::screen::TABS + 5) as u16);
     assert!(
-        ui.wait_for_tab(2, Duration::from_secs(10)),
-        "could not move back to the second tab"
+        ui.wait_for_tab(1, Duration::from_secs(10)),
+        "a click on the worker tile did not move back to it: {:?}",
+        ui.tab_bar()
     );
-    // Let a frame of tab 2 paint, then read the pane cells through the
-    // pane-anchored reader: the master column viewport shows the master's
-    // own screen, which legitimately carries the marker too.
-    std::thread::sleep(Duration::from_millis(800));
-    for pr in 0..=8usize {
-        if let Some(pane) = ui.pane_cells(pr) {
-            assert!(
-                !pane.contains("MARK_IN_MASTER_9"),
-                "typing reached the left terminal too (pane row {pr}): {pane:?}"
-            );
-        }
-    }
+    ui.type_in(b"echo WK8\n");
+    assert!(
+        ui.wait_for("WK8", Duration::from_secs(10)).is_some(),
+        "typing never reached the worker tile after moving back"
+    );
 }
 
 /// G12.18: the master column is open from the first frame, like the left
@@ -1863,10 +1879,12 @@ fn g12_19_a_fresh_session_raises_briefs_and_pins_its_own_master() {
     // match fires on the first index instead of the settled-prompt fallback.
     let mut ui = Interface::start_with_master_agent("bash");
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    // The master tab arrives beside the shell, unasked.
+    // The master terminal arrives beside the shell, unasked, and tiles right
+    // away: it is no tab, so its arrival reads from the column header, not
+    // the tab bar.
     assert!(
-        ui.wait_for_tabs(|bar| bar.contains(" 2 master"), Duration::from_secs(20)),
-        "no master tab was raised: {:?}",
+        ui.wait_for("master ", Duration::from_secs(20)).is_some(),
+        "no master was raised: {:?}",
         ui.tab_bar()
     );
     // The raising runs to the end: the send and the pin share one code path,

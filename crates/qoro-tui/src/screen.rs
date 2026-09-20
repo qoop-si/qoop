@@ -94,10 +94,6 @@ pub struct Frame<'a> {
     /// Whether the right column is on screen this frame. False on a window too
     /// narrow to hold it, however much the person wants it.
     pub master_shown: bool,
-    /// The pinned terminal's latest snapshot, for the live viewport under the
-    /// structured block. The focused terminal's own when the master has the
-    /// keyboard, another tile's picture otherwise. Read only, like the tiles.
-    pub master_snapshot: Option<&'a SnapshotWire>,
     /// The master's file, when it is fresh. Summaries and the last report;
     /// `None` shows the live index alone.
     pub master_report: Option<&'a master::Report>,
@@ -229,11 +225,14 @@ pub fn paint(frame: &Frame) -> String {
     let wide_enough = left > 0;
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
-    // past the column and its rule. Split panes are sub-terminals, never top tabs.
+    // past the column and its rule. Split panes and the master tile are
+    // sub-terminals, never top tabs.
     out.push_str(&at(1, left + 1));
+    let master_terminal = frame.master.map(|(terminal, _)| terminal);
     let tabs: Vec<AgentRow> = in_space(frame.rows, frame.space)
         .into_iter()
         .filter(|r| !frame.panes.contains(&r.terminal))
+        .filter(|r| Some(r.terminal) != master_terminal)
         .collect();
     for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize, frame.unseen) {
         out.push_str(&match style {
@@ -272,8 +271,8 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         Vec::new()
     };
-    // The structured block of the right column, when it is on screen. The live viewport
-    // of the master's snapshot fills whatever rows remain under it.
+    // The structured block of the right column, when it is on screen: header,
+    // needs, report, footer. Nothing below it: the master is a tile now.
     let master_rows: Vec<(sidebar::Line, Option<master::Hit>)> = if right > 0 {
         master::rows(
             frame.rows,
@@ -287,7 +286,7 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         Vec::new()
     };
-    let structured = master_rows.len();
+    let width = master::width_for(frame.cols as usize);
     for row in 0..column_rows {
         out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -379,27 +378,21 @@ pub fn paint(frame: &Frame) -> String {
             out.push(if joins { '\u{2524}' } else { '\u{2502}' });
             out.push_str(theme::RESET);
         }
-        // The right column, when it is on screen: its rule, then the structured block,
-        // then the master's live viewport. Painted here so the header sits beside the tab
-        // bar the way the left column's first row does. The rule is drawn every row so a
-        // terminal line long enough to reach it cannot swallow it.
+        // The right column, when it is on screen: its rule, then the structured block.
+        // The master itself is a tile in the pane now, beside the worker: the column
+        // carries the asks and the keys, never a second picture of a screen. Below
+        // the block, blanks: a terminal line must not show through the chrome.
         if right > 0 {
             out.push_str(&at(row + SIDEBAR_TOP, left + pane_cols as usize + 1));
             out.push_str(&theme::fg(theme::Role::Rule));
-            out.push('\u{2502}');
+            out.push('│');
             out.push_str(theme::RESET);
             if let Some((line, hit)) = master_rows.get(row) {
                 let selected =
                     matches!(hit, Some(master::Hit::Need(terminal)) if *terminal == frame.focused);
                 out.push_str(&chrome_row(line, selected));
             } else {
-                let (line, spans) = master_viewport_row(frame.master_snapshot, row - structured);
-                out.push_str(&paint_row(
-                    line,
-                    spans,
-                    master::width_for(frame.cols as usize),
-                    None,
-                ));
+                out.push_str(&" ".repeat(width));
             }
         }
         // The pane starts under the tab bar, so the column's first row has the bar beside
@@ -1418,24 +1411,6 @@ fn chrome_row(line: &sidebar::Line, selected: bool) -> String {
     out
 }
 
-/// One row of the master's live viewport, leftmost-cropped to the column.
-///
-/// Blank when the snapshot has not arrived yet: a master that has produced nothing is
-/// every master for its first moments, and blank rows are what the pane paints too.
-/// Never byte or char sliced, only [`paint_row`], so wide characters cannot split.
-fn master_viewport_row(snapshot: Option<&SnapshotWire>, row: usize) -> (&str, &[SpanWire]) {
-    (
-        snapshot
-            .and_then(|s| s.lines.get(row))
-            .map(String::as_str)
-            .unwrap_or(""),
-        snapshot
-            .and_then(|s| s.styles.get(row))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-    )
-}
-
 pub(crate) fn paint_row(
     line: &str,
     spans: &[SpanWire],
@@ -1692,7 +1667,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -1746,7 +1720,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -1802,7 +1775,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -1850,7 +1822,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -1931,7 +1902,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -1977,7 +1947,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2031,7 +2000,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2082,7 +2050,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2147,7 +2114,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2212,7 +2178,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2266,7 +2231,6 @@ mod tests {
                 tiles: Vec::new(),
                 master: None,
                 master_shown: false,
-                master_snapshot: None,
                 master_report: None,
                 behind: &crate::run::Behind::default(),
             });
@@ -2318,7 +2282,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2365,7 +2328,6 @@ mod tests {
                 tiles: Vec::new(),
                 master: None,
                 master_shown: false,
-                master_snapshot: None,
                 master_report: None,
                 behind: &crate::run::Behind::default(),
             });
@@ -2414,7 +2376,6 @@ mod tests {
                 tiles: Vec::new(),
                 master: None,
                 master_shown: false,
-                master_snapshot: None,
                 master_report: None,
                 behind: &crate::run::Behind::default(),
             });
@@ -2481,7 +2442,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2541,7 +2501,6 @@ mod tests {
                 tiles: Vec::new(),
                 master: None,
                 master_shown: false,
-                master_snapshot: None,
                 master_report: None,
                 behind: &crate::run::Behind {
                     terminal: 0,
@@ -2612,7 +2571,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2701,7 +2659,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2764,7 +2721,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2812,7 +2768,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2857,7 +2812,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2903,7 +2857,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -2986,7 +2939,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -3066,7 +3018,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -3144,7 +3095,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind {
                 terminal: 0,
@@ -3193,7 +3143,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &crate::run::Behind::default(),
         });
@@ -3257,7 +3206,6 @@ mod tests {
                 tiles: Vec::new(),
                 master: None,
                 master_shown: false,
-                master_snapshot: None,
                 master_report: None,
                 behind: &crate::run::Behind::default(),
             })
@@ -3313,7 +3261,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
         });
         // Two rows back: the last two rows written, then the screen from its top.
@@ -3372,7 +3319,6 @@ mod tests {
             tiles: Vec::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &behind,
         });
@@ -3524,7 +3470,6 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &behind,
         })
@@ -3565,7 +3510,6 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &behind,
         });
@@ -3607,7 +3551,6 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             master: None,
             master_shown: false,
-            master_snapshot: None,
             master_report: None,
             behind: &behind,
         });
@@ -3769,7 +3712,6 @@ mod tests {
             blocked_row(3, "codex"),
         ];
         let pane = snapshot(&["pane output"]);
-        let master_snap = snapshot(&["master viewport line"]);
         let behind = crate::run::Behind::default();
         paint(&Frame {
             rows: &agents,
@@ -3799,14 +3741,14 @@ mod tests {
             tiles: Vec::new(),
             master: Some((2, Some(1))),
             master_shown: shown,
-            master_snapshot: Some(&master_snap),
             master_report: None,
             behind: &behind,
         })
     }
 
-    /// A wide window paints the master column beside the pane: header, needs, footer,
-    /// then the live viewport under the structured block.
+    /// A wide window paints the master column beside the pane: header, needs,
+    /// footer, and blanks below. The master itself is a tile in the pane now,
+    /// never a second picture in the margin.
     #[test]
     fn a_wide_window_paints_the_master_column_beside_the_pane() {
         let painted = paint_master(120, true);
@@ -3816,8 +3758,8 @@ mod tests {
         // need.
         assert!(painted.contains("needs you 1"), "{painted:?}");
         assert!(painted.contains("[E] master"), "{painted:?}");
-        // The live viewport fills the rows under the structured block.
-        assert!(painted.contains("master viewport line"), "{painted:?}");
+        // No viewport under the block: the margin carries asks and keys only.
+        assert!(!painted.contains("master viewport line"), "{painted:?}");
         // And the pane still paints: the column shrank it, it did not replace it.
         assert!(painted.contains("pane output"), "{painted:?}");
     }
@@ -3837,10 +3779,6 @@ mod tests {
             !painted.contains("[E] master"),
             "the column spilled onto a narrow window: {painted:?}"
         );
-        assert!(
-            !painted.contains("master viewport line"),
-            "the column spilled onto a narrow window: {painted:?}"
-        );
         assert!(painted.contains("master: next:"), "{painted:?}");
         assert!(painted.contains("is blocked"), "{painted:?}");
     }
@@ -3851,67 +3789,6 @@ mod tests {
     fn a_frame_with_the_master_column_paints_no_wider_than_it_is() {
         for cols in [100u16, 120] {
             let painted = paint_master(cols, true);
-            for run in painted.split("\x1b[").skip(1) {
-                let Some(text) = run.strip_suffix("").and_then(|r| r.split_once('H')) else {
-                    continue;
-                };
-                let drawn = text.1.split('\x1b').next().unwrap_or_default();
-                assert!(
-                    width::width(drawn) <= cols as usize,
-                    "{cols} columns, painted {} of them: {drawn:?}",
-                    width::width(drawn)
-                );
-            }
-        }
-    }
-
-    /// A long viewport line and a wide one both fit the column: the viewport
-    /// crops by columns, never by bytes or characters.
-    #[test]
-    fn a_long_and_wide_viewport_stays_inside_the_master_column() {
-        let agents = [row(1, "zsh", "idle"), row(2, "claude", "working")];
-        let pane = snapshot(&["pane output"]);
-        let long = "x".repeat(200);
-        let wide = "\u{1f30d}".repeat(30);
-        let viewport = snapshot(&[long.as_str(), wide.as_str(), "kisa"]);
-        let behind = crate::run::Behind::default();
-        let painted = paint(&Frame {
-            rows: &agents,
-            spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
-            space: Some(1),
-            focused: 2,
-            snapshot: Some(&pane),
-            cols: 120,
-            lines: 24,
-            message: None,
-            hint: None,
-            fold: sidebar::Fold::all_open(),
-            palette: None,
-            prompt: None,
-            menu: None,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            tick: 0,
-            view: sidebar::View::Grouped,
-            seen: &sidebar::Seen::new(),
-            unseen: &sidebar::Unseen::new(),
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            master: Some((2, Some(1))),
-            master_shown: true,
-            master_snapshot: Some(&viewport),
-            master_report: None,
-            behind: &behind,
-        });
-        assert!(
-            !painted.contains(&"x".repeat(60)),
-            "the viewport spilled: {painted:?}"
-        );
-        for cols in [120u16] {
             for run in painted.split("\x1b[").skip(1) {
                 let Some(text) = run.strip_suffix("").and_then(|r| r.split_once('H')) else {
                     continue;

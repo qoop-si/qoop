@@ -79,7 +79,6 @@ fn main() {
         tiles: Vec::new(),
         master: None,
         master_shown: false,
-        master_snapshot: None,
         master_report: None,
         behind: &behind,
     });

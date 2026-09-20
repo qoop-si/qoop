@@ -176,6 +176,33 @@ impl Layout {
         remove_first_placeholder(&mut self.root)
     }
 
+    /// Pin a terminal as the right leaf beside the whole tree.
+    ///
+    /// For the master tile: the master sits right of everything, the same in
+    /// every space. Refuses a bare empty root, a tree that already holds the
+    /// terminal, and a tree with a pending split: all three would leave a
+    /// pane nobody can focus or two panes answering to one terminal. Room is
+    /// the caller's call, the way `split_placeholder` leaves `fits` outside.
+    pub fn pin_right(&mut self, terminal: u32) -> bool {
+        if terminal == 0
+            || self.contains(terminal)
+            || has_placeholder(&self.root)
+            || matches!(self.root, Node::Leaf { terminal: None })
+        {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.root, Node::Leaf { terminal: None });
+        self.root = Node::Split {
+            dir: Dir::V,
+            ratio: 0.65,
+            first: Box::new(old),
+            second: Box::new(Node::Leaf {
+                terminal: Some(terminal),
+            }),
+        };
+        true
+    }
+
     /// Remove a terminal's leaf, collapsing the parent split. Returns true
     /// when no leaves remain. The root goes bare, not to a phantom pending
     /// placeholder: an empty tree is empty.
@@ -745,5 +772,39 @@ mod tests {
         // The column right after the left pane is the divider.
         assert_eq!(layout.hit(area(80, 24), left.cols, 0), None);
         assert_eq!(layout.hit(area(80, 24), 0, 0), Some(1));
+    }
+
+    #[test]
+    fn pin_right_puts_the_master_beside_everything_at_a_third() {
+        let mut layout = Layout::single(1);
+        assert!(layout.pin_right(9));
+        assert_eq!(layout.leaves(), vec![1, 9]);
+        let rects = layout.tile_rects(area(90, 24));
+        assert_eq!(rects.len(), 2);
+        let master = rects.iter().find(|(t, _)| *t == 9).expect("master rect");
+        let worker = rects.iter().find(|(t, _)| *t == 1).expect("worker rect");
+        assert!(worker.1.x < master.1.x, "master sits right");
+        assert!(master.1.cols >= MIN_COLS, "master keeps a usable width");
+        // Twice is once, and a duplicate id never makes two panes.
+        assert!(!layout.pin_right(9));
+        assert_eq!(layout.leaves(), vec![1, 9]);
+        // Removing collapses back to the worker alone.
+        layout.remove(9);
+        assert_eq!(layout.leaves(), vec![1]);
+    }
+
+    #[test]
+    fn pin_right_refuses_zero_an_empty_tree_and_a_pending_split() {
+        let mut empty = Layout {
+            root: Node::Leaf { terminal: None },
+            focus: 0,
+            prev_focus: None,
+            zoomed: None,
+        };
+        assert!(!empty.pin_right(9));
+        let mut layout = Layout::single(1);
+        assert!(!layout.pin_right(0));
+        assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
+        assert!(!layout.pin_right(9), "no pin beside a pending split");
     }
 }

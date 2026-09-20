@@ -253,6 +253,13 @@ async fn poll_auto_master(
     if let Some(sync) = sync_subs(state, control_seq)? {
         wr.write_all(&sync).await?;
     }
+    // The pin tiles: the focused tile just narrowed beside the new leaf, and
+    // a child that is not told reflows against a width it no longer has.
+    state.refresh_master_shown();
+    sync_master_tile(state);
+    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+        wr.write_all(&resize).await?;
+    }
     state.message = Some(format!("{agent} briefed as master"));
     *dirty = true;
     Ok(())
@@ -551,25 +558,19 @@ impl State {
             master,
             master_shown: self.master_shown,
             master_report: self.master_report.as_ref(),
-            master_snapshot: master.and_then(|(terminal, _)| {
-                // The focused terminal's own screen, or another tile's picture: the
-                // same data the unfocused tiles already receive, read only.
-                if terminal == self.focused {
-                    self.snapshot.as_ref()
-                } else {
-                    self.snapshots.get(&terminal)
-                }
-            }),
         }
     }
 
     /// The tabs of the space on screen, in the order the daemon reports them.
-    /// Split panes are sub-terminals inside their tab, never top tabs, so
-    /// they are filtered here. Agents in panes still list in the sidebar.
+    /// Split panes and the master tile are sub-terminals beside their tab,
+    /// never top tabs, so they are filtered here. Agents in panes still list
+    /// in the sidebar.
     fn tabs(&self) -> Vec<AgentRow> {
+        let master = self.valid_master().map(|(terminal, _)| terminal);
         screen::in_space(&self.rows, self.space)
             .into_iter()
             .filter(|r| !self.panes.contains(&r.terminal))
+            .filter(|r| Some(r.terminal) != master)
             .collect()
     }
 
@@ -1648,8 +1649,10 @@ async fn drive(
                     state.lines = lines;
                     // The window moved under the hysteresis: refresh what is shown before
                     // sizing, or the child reflows against the width the pane no longer
-                    // has.
+                    // has. The master tile follows the fit: a narrowed window drops
+                    // it, a widened one brings it back.
                     state.refresh_master_shown();
+                    sync_master_tile(&mut state);
                     // The focused tile only. A resize is a claim about the window the
                     // person is looking at, and sending it to every terminal would reflow
                     // the ones they are not.
@@ -2320,8 +2323,12 @@ async fn drive(
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
-                                // longer has. Only the focused tile is told: the others
+                                // longer has. The master column fit moves with the left
+                                // one, so the tile set refreshes before the resize.
+                                // Only the focused tile is told: the others
                                 // are viewport-cropped.
+                                state.refresh_master_shown();
+                                sync_master_tile(&mut state);
                                 if let Some(resize) =
                                     resize_focused_to_tile(&state, &mut seqs)?
                                 {
@@ -2330,9 +2337,11 @@ async fn drive(
                                 dirty = true;
                             }
                             Action::MasterPanel => {
-                                // Like Collapse above: the toggle, then exactly one resize
-                                // of the focused tile, which alone owns Resize.
+                                // Like Collapse above: the toggle, then the tile
+                                // set, then exactly one resize of the focused
+                                // tile, which alone owns Resize.
                                 toggle_master(&mut state);
+                                sync_master_tile(&mut state);
                                 if let Some(resize) =
                                     resize_focused_to_tile(&state, &mut seqs)?
                                 {
@@ -2540,6 +2549,12 @@ async fn drive(
                                 // Detaching the last pane would leave a tree with no
                                 // leaves over a space that still has a terminal: refuse
                                 // instead, `ctrl-a x` is the way to close it.
+                                // Detaching the master tile unpins it in every
+                                // space: a pin that re-tiled itself on the
+                                // next sync would make the detach a no-op,
+                                // and other spaces would keep a foreign pane.
+                                // Deferred past the tree borrow below.
+                                let unpin_master = state.master.is_some_and(|(pinned, _)| pinned == focused);
                                 let next = match space
                                     .and_then(|s| state.layouts.get_mut(&s))
                                 {
@@ -2547,10 +2562,19 @@ async fn drive(
                                         layout.remove(focused);
                                         // Detached panes become real tabs again.
                                         state.panes.remove(&focused);
+                                        if unpin_master {
+                                            state.master = None;
+                                        }
                                         Some(layout.focus)
                                     }
                                     _ => None,
                                 };
+                                // Only when the detach happened: a refused detach
+                                // (the last pane) unpins nothing.
+                                if unpin_master && next.is_some() {
+                                    remove_master_tile(&mut state, focused);
+                                }
+                                sync_master_tile(&mut state);
                                 match next {
                                     Some(next) => {
                                         if let Some(bytes) = focus(
@@ -2848,6 +2872,12 @@ fn start_master(state: &mut State, agent: Option<String>) {
 /// master instead of the pin following a stranger. Pinning also opens the master
 /// column, so the pin is visible without a second key press; unpinning leaves the
 /// column alone.
+///
+/// The pin is a tile, not a viewport: pinning sets a right leaf for the master in
+/// the space on screen, unpinning takes it back out everywhere. The keyboard
+/// never follows either way, except when it was standing on the master being
+/// unpinned: then it steps to the layout's neighbour through the pending
+/// focus, which is the path that subscribes and resizes.
 fn pin_focused_as_master(state: &mut State) {
     if state.focused == 0 {
         state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
@@ -2857,7 +2887,29 @@ fn pin_focused_as_master(state: &mut State) {
         .master
         .is_some_and(|(terminal, _)| terminal == state.focused)
     {
+        let unpinned = state.focused;
         state.master = None;
+        remove_master_tile(state, unpinned);
+        // Unpinning a sole-pane master emptied (and pruned) the tree: seed it
+        // back, or the pane goes blank with a live tab behind it.
+        if let Some(space) = state.space {
+            let empty = state
+                .layouts
+                .get(&space)
+                .is_none_or(|l| l.leaves().is_empty() && !l.has_pending());
+            if empty {
+                state.layouts.insert(space, Layout::single(unpinned));
+            }
+        }
+        sync_master_tile(state);
+        if state.focused == unpinned {
+            state.pending_focus = state
+                .space
+                .and_then(|space| state.layouts.get(&space))
+                .map(|layout| layout.focus)
+                .filter(|next| *next != unpinned)
+                .or_else(|| state.tabs().first().map(|r| r.terminal));
+        }
         state.message = Some("unpinned the master".to_string());
         return;
     }
@@ -2866,12 +2918,65 @@ fn pin_focused_as_master(state: &mut State) {
             state.master = Some((state.focused, row.generation));
             state.master_open = true;
             state.refresh_master_shown();
+            sync_master_tile(state);
             state.message = Some("pinned as master".to_string());
         }
         None => {
             state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
         }
     }
+}
+
+/// Keep the master tile in step with the pin: one right leaf in the space on
+/// screen while a live master is pinned and the column is shown, nowhere
+/// otherwise. Pure tree work; sizing the narrowed tiles is the caller's,
+/// beside every call.
+fn sync_master_tile(state: &mut State) {
+    let want = state
+        .valid_master()
+        .map(|(terminal, _)| terminal)
+        .filter(|_| state.master_shown);
+    if let Some(space) = state.space {
+        if let Some(want) = want {
+            if state.layouts.get(&space).is_none() {
+                ensure_layout(state);
+            }
+            if let Some(layout) = state.layouts.get_mut(&space)
+                && !layout.contains(want)
+            {
+                // An empty tree takes the master as its seed: a bare root
+                // refuses the pin, and a pinned-but-untiled master would
+                // vanish from the tab bar with no tile anywhere.
+                if layout.leaves().is_empty() && !layout.has_pending() {
+                    state.layouts.insert(space, Layout::single(want));
+                } else {
+                    layout.pin_right(want);
+                }
+            }
+        }
+    }
+    // No want means no tile anywhere: a hidden column, a narrowed window, a
+    // dead or exec-replaced pin. The pin id is still in hand here, unlike
+    // after it is cleared, so this is where the tile goes out everywhere.
+    if want.is_none()
+        && let Some(dead) = state.master.map(|(terminal, _)| terminal)
+    {
+        remove_master_tile(state, dead);
+    }
+}
+
+/// Take one terminal's master tile out of every space. Called with the dead
+/// id in hand, because after the pin is cleared `sync_master_tile` no longer
+/// knows which leaf was the master's. Trees left with no leaves go away, the
+/// way the close path drops them, so no space keeps an empty tree with a
+/// stale focus.
+fn remove_master_tile(state: &mut State, terminal: u32) {
+    for layout in state.layouts.values_mut() {
+        layout.remove(terminal);
+    }
+    state
+        .layouts
+        .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
 }
 
 /// Move the keyboard to another terminal: unsubscribe, subscribe, and size it to the pane,
@@ -3110,9 +3215,9 @@ fn ensure_layout(state: &mut State) {
 
 /// The terminals this client receives renders for: the visible set of the
 /// space on screen (or the focused one when there is no tree yet), plus the
-/// pinned master when it is one. The master is no tile, but the column paints
-/// its live viewport every frame, and a viewport with no subscription is a
-/// picture that never updates.
+/// pinned master when it is one. The master is a tile, so it is usually in
+/// the visible set already; the extra push covers the gap between the pin
+/// and the tile, and the raising flight before its first render.
 fn visible_set(state: &State) -> Vec<u32> {
     let mut set = if let Some(space) = state.space
         && let Some(layout) = state.layouts.get(&space)
@@ -3244,6 +3349,8 @@ fn focus(
         .or(state.space);
     // A tab outside the tiling tree drops the tree back to a single pane:
     // tabs name every terminal in the space, tiles only the visible ones.
+    // The master tile is re-pinned after: focusing a worker must not drop
+    // the master from the tree.
     if let Some(space) = state.space {
         ensure_layout(state);
         if let Some(layout) = state.layouts.get_mut(&space) {
@@ -3253,6 +3360,7 @@ fn focus(
                 state.layouts.insert(space, Layout::single(to));
             }
         }
+        sync_master_tile(state);
     }
     // Promote the already-visible snapshot instead of waiting for the next
     // render: the subscription never dropped, so the picture is fresh.
@@ -3336,10 +3444,24 @@ fn enter_space(
 ) -> io::Result<Option<BytesMut>> {
     state.space = Some(space);
     ensure_layout(state);
+    // The master tiles every space the same way: entering without it leaves
+    // the tile behind in the space just left.
+    sync_master_tile(state);
     // The layout's visible terminals first, so a tiled space comes back as it
     // was left; the tab list only when the tree names nothing alive. Panes
-    // never restore the keyboard: `tabs()` hides them, so re-entering lands
-    // on the first tab while the tile border keeps the pane focus inside.
+    // and the master tile never restore the keyboard on their own:
+    // `tabs()` hides them, so re-entering lands on the first tab while the
+    // tile border keeps the pane focus inside. A space with nothing but the
+    // master tile keeps the keyboard there instead of dropping it.
+    let master_fallback = state
+        .valid_master()
+        .map(|(terminal, _)| terminal)
+        .filter(|t| {
+            state
+                .layouts
+                .get(&space)
+                .is_some_and(|layout| layout.visible().contains(t))
+        });
     let first = state
         .layouts
         .get(&space)
@@ -3349,6 +3471,7 @@ fn enter_space(
                 .into_iter()
                 .find(|t| state.tabs().iter().any(|r| r.terminal == *t))
         })
+        .or(master_fallback)
         .or_else(|| state.tabs().first().map(|r| r.terminal));
     match first {
         // Already there: the subscriptions still name the old space, so sync
@@ -3540,12 +3663,23 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.panes.retain(|t| live.contains(t));
             // The pin follows the terminal, not the number: a master that is gone stops
             // being the master here, where most deaths actually arrive, and never points
-            // at a stranger.
-            if state
-                .master
-                .is_some_and(|(terminal, _)| !live.contains(&terminal))
-            {
+            // at a stranger. An exec-replaced process is a new generation, not the
+            // master either: the pin would otherwise name one terminal as both tab
+            // and tile. Its tile goes with it, everywhere.
+            let pin_dead = match state.master {
+                Some((terminal, generation)) => {
+                    match agents.iter().find(|r| r.terminal == terminal) {
+                        None => Some(terminal),
+                        Some(row) if row.generation != generation => Some(terminal),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some(dead) = pin_dead {
                 state.master = None;
+                remove_master_tile(state, dead);
+                sync_master_tile(state);
             }
             // The master's file, on the index path and nowhere else: a read per
             // frame would bill the disk for every repaint, and a read here is
@@ -3712,6 +3846,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if !is_master && (bound && origin == state.space || !is_split) {
                 state.pending_focus = Some(terminal);
             }
+            // A new leaf is a new chance for the master tile: a split
+            // answered while the pin waits lands the tile beside it.
+            sync_master_tile(state);
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
@@ -4690,6 +4827,7 @@ mod tests {
 
     /// Pinning names the focused tab with its generation, and pinning again unpins.
     /// Pinning also opens the master column; unpinning leaves the column alone.
+    /// The pin is a tile: pinning sets a right leaf, unpinning takes it out.
     #[test]
     fn pinning_names_the_focused_tab_with_its_generation() {
         let mut state = bare_state();
@@ -4703,6 +4841,38 @@ mod tests {
         pin_focused_as_master(&mut state);
         assert_eq!(state.master, None, "pinning again unpins");
         assert!(state.master_open, "unpinning leaves the column alone");
+    }
+
+    /// Pinning tiles the master as a right leaf; unpinning removes it
+    /// everywhere. The tab bar hides the tile like a split pane.
+    #[test]
+    fn pinning_tiles_the_master_and_hides_its_tab() {
+        let mut state = bare_state();
+        state.cols = 200;
+        state.lines = 24;
+        state.space = Some(1);
+        state.rows = vec![
+            agent(1, 1, "zsh", "working"),
+            agent(2, 1, "opencode", "working"),
+        ];
+        state.rows[0].generation = Some(1);
+        state.rows[1].generation = Some(1);
+        state.focused = 1;
+        state.layouts.insert(1, Layout::single(1));
+        state.focused = 2;
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, Some((2, Some(1))));
+        let layout = state.layouts.get(&1).expect("tree");
+        assert!(layout.contains(2), "the master is a leaf");
+        assert_eq!(layout.leaves(), vec![1, 2]);
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![1], "the tiled master is no tab");
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, None);
+        let layout = state.layouts.get(&1).expect("tree");
+        assert!(!layout.contains(2), "unpinning takes the tile out");
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![1, 2], "unpinning returns the tab");
     }
 
     /// The pin is a terminal and a generation: an exec-replaced process stops being
@@ -4793,6 +4963,74 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(state.master, Some((1, None)));
+        // An exec-replaced master is a new generation, not the master: the pin
+        // goes and its tile with it, instead of naming one terminal as both
+        // tab and tile.
+        let mut state = bare_state();
+        state.cols = 200;
+        state.space = Some(1);
+        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 1, "sh", "working")];
+        rows[0].generation = Some(7);
+        rows[1].generation = Some(1);
+        state.rows = rows;
+        state.focused = 2;
+        state.layouts.insert(1, Layout::single(2));
+        state.master = Some((1, Some(7)));
+        state.master_open = true;
+        state.master_shown = true;
+        sync_master_tile(&mut state);
+        assert!(state.layouts.get(&1).is_some_and(|l| l.contains(1)));
+        state.rows[0].generation = Some(8);
+        let rows = state.rows.clone();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: rows,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.master, None, "the replaced pin is cleared");
+        assert!(
+            !state.layouts.get(&1).is_some_and(|l| l.contains(1)),
+            "the replaced tile is gone"
+        );
+    }
+
+    /// Toggling the column off removes the tile everywhere; toggling back on
+    /// re-tiles it. A hidden column with a live tile is a narrowed pane for
+    /// nothing.
+    #[test]
+    fn toggling_the_column_off_removes_the_tile() {
+        let mut state = bare_state();
+        state.cols = 200;
+        state.space = Some(1);
+        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 1, "sh", "working")];
+        rows[0].generation = Some(1);
+        rows[1].generation = Some(1);
+        state.rows = rows;
+        state.focused = 1;
+        state.layouts.insert(1, Layout::single(1));
+        state.focused = 2;
+        // Pinning the unfocused tab tiles it beside the worker.
+        pin_focused_as_master(&mut state);
+        assert_eq!(state.master, Some((2, Some(1))));
+        assert!(state.layouts.get(&1).is_some_and(|l| l.contains(2)));
+        toggle_master(&mut state);
+        sync_master_tile(&mut state);
+        assert!(!state.master_shown);
+        assert!(
+            !state.layouts.get(&1).is_some_and(|l| l.contains(2)),
+            "hiding the column drops the tile"
+        );
+        toggle_master(&mut state);
+        sync_master_tile(&mut state);
+        assert!(state.master_shown);
+        assert!(
+            state.layouts.get(&1).is_some_and(|l| l.contains(2)),
+            "showing the column re-tiles"
+        );
     }
 
     fn tool_event(label: &str) -> qoro_runtime::control::FocusEvent {
@@ -5376,7 +5614,6 @@ mod tests {
             unseen: &state.unseen_finished,
             master,
             master_shown: state.master_shown,
-            master_snapshot: None,
             master_report: state.master_report.as_ref(),
             behind: &state.behind,
         });
