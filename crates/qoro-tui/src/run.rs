@@ -2656,17 +2656,25 @@ async fn drive(
                                     state.snapshots.insert(terminal, snapshot);
                                     dirty = true;
                                 } else if state.focused == 0 && !state.adopted {
-                                    state.adopted = true;
-                                    state.focused = terminal;
-                                    state.snapshot = Some(snapshot);
-                                    state.message = None;
-                                    // Bootstrap the tiling state to match: one pane, one
-                                    // subscription.
-                                    if let Some(space) = state.space {
-                                        state.layouts.insert(space, Layout::single(terminal));
-                                        state.subs.insert(terminal);
+                                    // Only what is on screen: adopting another space's
+                                    // first render paints it under this space's tab bar
+                                    // with the keyboard in it, and the person types
+                                    // somewhere they cannot see. Unknown rows (nothing
+                                    // listed yet) still adopt; the index below pulls
+                                    // the keyboard into its space when it lands.
+                                    if adopt_render(&state, terminal) {
+                                        state.adopted = true;
+                                        state.focused = terminal;
+                                        state.snapshot = Some(snapshot);
+                                        state.message = None;
+                                        // Bootstrap the tiling state to match: one pane, one
+                                        // subscription.
+                                        if let Some(space) = state.space {
+                                            state.layouts.insert(space, Layout::single(terminal));
+                                            state.subs.insert(terminal);
+                                        }
+                                        dirty = true;
                                     }
-                                    dirty = true;
                                 }
                             }
                             Incoming::Event(EventMessage::AgentChanged { .. })
@@ -2977,6 +2985,26 @@ fn remove_master_tile(state: &mut State, terminal: u32) {
     state
         .layouts
         .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+}
+
+/// Whether a fresh client's first render may adopt its terminal: only what
+/// is on screen. The daemon subscribes a fresh client to whatever is already
+/// open, which may be another space's terminal; adopting that paints it under
+/// this space's tab bar with the keyboard in it. With the space still unknown
+/// the first workspace wins, which is where the workspace list will park the
+/// bar: adopting anywhere else desyncs on arrival. Nothing listed yet still
+/// adopts; the index below pulls the space under the keyboard when it lands.
+fn adopt_render(state: &State, terminal: u32) -> bool {
+    match state.rows.iter().find(|r| r.terminal == terminal) {
+        Some(row) => match state.space {
+            Some(space) => row.workspace == space,
+            None => {
+                let first = state.rows.iter().map(|r| r.workspace).min();
+                Some(row.workspace) == first
+            }
+        },
+        None => state.rows.is_empty(),
+    }
 }
 
 /// Move the keyboard to another terminal: unsubscribe, subscribe, and size it to the pane,
@@ -3560,6 +3588,25 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
         ControlResponse::Workspaces { workspaces, .. } => {
             if state.space.is_none() {
                 state.space = workspaces.first().map(|w| w.id);
+                // The bar just parked somewhere: a keyboard adopted from
+                // another space comes home to its first tab now, through the
+                // subscribing path. An idle session sends no further index,
+                // so waiting for one would strand the keyboard unseen.
+                if state.pending_focus.is_none()
+                    && let Some(space) = state.space
+                    && state.focused != 0
+                {
+                    let here = state
+                        .rows
+                        .iter()
+                        .any(|r| r.terminal == state.focused && r.workspace == space)
+                        || state
+                            .valid_master()
+                            .is_some_and(|(m, _)| m == state.focused);
+                    if !here {
+                        state.pending_focus = state.tabs().first().map(|r| r.terminal);
+                    }
+                }
             }
             state.spaces = workspaces;
             *dirty = true;
@@ -3619,13 +3666,25 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 // fresh client to what is already open, so this is the bootstrap and no
                 // subscription of our own is needed. Later, nothing focused is a space with
                 // nothing in it, and reaching into another space's terminal here is how a
-                // person ends up typing somewhere they cannot see.
-                if let Some(first) = agents
-                    .iter()
-                    .find(|r| state.space.is_none_or(|s| r.workspace == s))
-                {
+                // person ends up typing somewhere they cannot see. Without a space yet
+                // the first workspace wins, the way the workspace list and the first
+                // render both pick it.
+                let first = match state.space {
+                    Some(s) => agents.iter().find(|r| r.workspace == s),
+                    None => {
+                        let min = agents.iter().map(|r| r.workspace).min();
+                        agents.iter().find(|r| Some(r.workspace) == min)
+                    }
+                };
+                if let Some(first) = first {
                     state.adopted = true;
                     state.focused = first.terminal;
+                    // The space follows the adoption: leaving it for the first
+                    // workspace list parks the bar in another space than the
+                    // keyboard, and the person types where they cannot see.
+                    if state.space.is_none() {
+                        state.space = Some(first.workspace);
+                    }
                 }
             }
             // A terminal can go away without this client having asked: its shell exited, or
@@ -3757,6 +3816,34 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // The keyboard lives in the space on screen. A focused terminal
+            // elsewhere is typing somewhere the person cannot see; bootstrap
+            // races (a render adopted before the index named its space) land
+            // here, never in front of the person. An in-flight deferred focus
+            // is left alone, and the pinned master qualifies from its tile in
+            // every space.
+            if state.pending_focus.is_none()
+                && let Some(space) = state.space
+                && state.focused != 0
+            {
+                let here = state
+                    .rows
+                    .iter()
+                    .any(|r| r.terminal == state.focused && r.workspace == space)
+                    || state
+                        .valid_master()
+                        .is_some_and(|(m, _)| m == state.focused);
+                if !here {
+                    state.pending_focus = state.tabs().first().map(|r| r.terminal).or_else(|| {
+                        state.valid_master().and_then(|(m, _)| {
+                            state
+                                .layouts
+                                .get(&space)
+                                .and_then(|l| l.visible().contains(&m).then_some(m))
+                        })
+                    });
+                }
+            }
             // The index changed while the list is open: fetch again. A state
             // word comparison cannot trigger this, because a tool event
             // arrives with the state still `working`.
@@ -4841,6 +4928,125 @@ mod tests {
         pin_focused_as_master(&mut state);
         assert_eq!(state.master, None, "pinning again unpins");
         assert!(state.master_open, "unpinning leaves the column alone");
+    }
+
+    /// A first render from another space never adopts: the keyboard would land
+    /// in a terminal the tab bar does not show. Nothing listed yet still
+    /// adopts; the index pulls the space under it when it lands.
+    #[test]
+    fn a_first_render_from_another_space_never_adopts() {
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.rows = vec![agent(1, 1, "zsh", "working"), agent(2, 2, "zsh", "working")];
+        assert!(adopt_render(&state, 1), "same space adopts");
+        assert!(!adopt_render(&state, 2), "another space does not adopt");
+        assert!(
+            !adopt_render(&state, 9),
+            "unknown terminal does not adopt behind rows"
+        );
+        // Space still unknown: the first workspace wins, where the bar parks.
+        state.space = None;
+        assert!(adopt_render(&state, 1), "first workspace adopts");
+        assert!(
+            !adopt_render(&state, 2),
+            "later workspaces wait for the index"
+        );
+        state.rows.clear();
+        assert!(adopt_render(&state, 9), "nothing listed yet adopts");
+    }
+
+    /// Bootstrap parks the space under the keyboard, and a focused terminal
+    /// outside the space on screen is pulled back to its first tab: typing
+    /// somewhere the person cannot see is never the steady state.
+    #[test]
+    fn bootstrap_and_index_keep_the_keyboard_in_its_space() {
+        // Adoption without a space takes the terminal's workspace with it.
+        let mut state = bare_state();
+        state.focused = 0;
+        state.adopted = false;
+        assert_eq!(state.space, None);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(7, 5, "zsh", "working")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.focused, 7);
+        assert_eq!(state.space, Some(5), "the space follows the adoption");
+        // A focused terminal from another space is pulled to this space's
+        // first tab through the subscribing path.
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.adopted = true;
+        state.focused = 2;
+        state.rows = vec![agent(1, 1, "zsh", "working"), agent(2, 2, "zsh", "working")];
+        let rows = state.rows.clone();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: rows,
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.pending_focus,
+            Some(1),
+            "the keyboard comes back to its space: {:?}",
+            state.pending_focus
+        );
+        // The pinned master qualifies from its tile: no yank.
+        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 2, "zsh", "working")];
+        rows[1].generation = Some(3);
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.adopted = true;
+        state.focused = 2;
+        state.master = Some((2, Some(3)));
+        state.rows = rows;
+        let rows = state.rows.clone();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: rows,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, None, "a focused master tile stays");
+    }
+
+    /// The first workspace list parks the bar: a keyboard adopted from
+    /// another space comes home on the spot, not on the next index, which an
+    /// idle session never sends.
+    #[test]
+    fn the_first_workspace_list_brings_a_stray_keyboard_home() {
+        let mut state = bare_state();
+        state.adopted = true;
+        state.focused = 2;
+        state.rows = vec![agent(1, 1, "zsh", "working"), agent(2, 2, "zsh", "working")];
+        assert_eq!(state.space, None);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Workspaces {
+                id: "ws".to_string(),
+                workspaces: vec![space(1, "default"), space(2, "other")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.space, Some(1));
+        assert_eq!(
+            state.pending_focus,
+            Some(1),
+            "the stray keyboard is sent home: {:?}",
+            state.pending_focus
+        );
     }
 
     /// Pinning tiles the master as a right leaf; unpinning removes it
