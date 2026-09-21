@@ -474,7 +474,10 @@ pub fn paint(frame: &Frame) -> String {
         let w = palette_width(frame.cols);
         let left = (frame.cols as usize).saturating_sub(w) / 2;
         let top = ((frame.lines as usize) / 3).max(TABS + 1);
-        let col = (left + 4 + width::width(&prompt.text)).min(left + w.saturating_sub(1));
+        // Past the ` > ` marker, at the end of what has been typed. The row
+        // carries no border cell, unlike the palette's query row below, so
+        // this is one less than the palette's otherwise identical sum.
+        let col = (left + 3 + width::width(&prompt.text)).min(left + w.saturating_sub(1));
         out.push_str(&at(top + 1, col + 1));
     } else if let Some(palette) = frame.palette {
         // At the end of the query, inside the box, wherever the box ended up.
@@ -1519,6 +1522,63 @@ mod tests {
         // Never zero and never a panic: a person dragging a window narrow is not an error.
         let (cols, rows) = pane_size(4, 1);
         assert!(cols >= 1 && rows >= 1);
+    }
+
+    /// The naming box cursor sits at the end of what has been typed, past the
+    /// ` > ` marker: one cell left of where it used to sit, when the sum was
+    /// copied from the bordered palette row.
+    #[test]
+    fn the_naming_box_cursor_sits_at_the_end_of_the_typed_text() {
+        let rows = [row(1, "zsh", "idle")];
+        let prompt = crate::run::Prompt {
+            what: crate::run::Naming::Space,
+            text: "ab".to_string(),
+        };
+        let cols = 100u16;
+        let lines = 24u16;
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols,
+            lines,
+            message: None,
+            hint: None,
+            fold: sidebar::Fold::all_open(),
+            palette: None,
+            prompt: Some(&prompt),
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        // The box is centred: ` > ab` starts three cells past its left edge,
+        // so the caret lands on the cell right after the `b`.
+        let w = cols.min(60).max(cols.min(20)) as usize;
+        let left = (cols as usize - w) / 2;
+        let top = ((lines as usize) / 3).max(TABS + 1);
+        let want = format!("\x1b[{};{}H", top + 1, left + 4 + 2);
+        assert!(
+            painted.contains(&want),
+            "no caret at the end of the typed text: {painted:?}"
+        );
     }
 
     #[test]
