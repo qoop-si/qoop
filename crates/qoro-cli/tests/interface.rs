@@ -162,14 +162,7 @@ fn index_width() -> usize {
 
 impl Interface {
     fn start() -> Self {
-        Self::start_impl(false, None)
-    }
-
-    /// Like [`Self::start`], but the interface raises its automatic master
-    /// from this binary instead of the machine's agents: hermetic, and the
-    /// only test that opts into the auto-start.
-    fn start_with_master_agent(agent: &str) -> Self {
-        Self::start_impl(false, Some(agent.to_string()))
+        Self::start_impl(false)
     }
 
     /// A daemon launched the way production launches one: backgrounded, with
@@ -177,10 +170,10 @@ impl Interface {
     /// building it here rather than assuming it is what makes the gate about
     /// the daemon instead of about the machine running the test.
     fn start_backgrounded() -> Self {
-        Self::start_impl(true, None)
+        Self::start_impl(true)
     }
 
-    fn start_impl(backgrounded: bool, master_agent: Option<String>) -> Self {
+    fn start_impl(backgrounded: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(
             dir.path(),
@@ -230,16 +223,6 @@ impl Interface {
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")
             .env("TERM", "xterm-256color");
-        match &master_agent {
-            // The machine under test has real agents on PATH; every test
-            // but the auto-master one opts out of raising one per attach.
-            None => {
-                cmd.env("QORO_NO_AUTO_MASTER", "1");
-            }
-            Some(agent) => {
-                cmd.env("QORO_MASTER_AGENT", agent);
-            }
-        }
         let child = unsafe {
             use std::os::unix::process::CommandExt;
             cmd.stdin(Stdio::from(stdin))
@@ -560,26 +543,6 @@ impl Interface {
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
         }
         false
-    }
-
-    /// Pane cells of one pane row, anchored at the pane's own cursor address.
-    ///
-    /// Unlike [`Self::row`], immune to whatever the master viewport shows: the
-    /// viewport paints the focused master's screen, so a whole-row read mixes
-    /// two terminals into one line. `pr` counts pane rows from zero.
-    fn pane_cells(&self, pr: usize) -> Option<String> {
-        let at = format!(
-            "\x1b[{};{}H",
-            pr + 1 + qoro_tui::screen::TABS,
-            1 + qoro_tui::screen::left(COLS)
-        );
-        let start = self.painted.rfind(&at)? + at.len();
-        Some(
-            strip_escapes(&self.painted[start..])
-                .chars()
-                .take(30)
-                .collect(),
-        )
     }
 
     /// The terminal's own column of one screen row, as painted most recently.
@@ -1738,174 +1701,5 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
             .any(|line| line.contains("codex-vpn")),
         "the wrapper is named as the agent: {:?}",
         agents_panel(&ui.painted)
-    );
-}
-
-/// G12.17: clicking the master column header moves the keyboard to the master
-/// tile on that click, even with an idle daemon, and typing reaches the master
-/// there rather than staying in the worker tile.
-///
-/// The master is a real tiling leaf, hidden from the tab bar like a split
-/// pane: the bar shows only the worker, so focus is read from the bar's
-/// brackets (worker focused) versus no brackets (master tile focused). The
-/// header click defers through the pending focus, which used to drain only
-/// on the daemon's next message. An idle daemon says nothing for minutes, so
-/// the click sat unapplied: typing stayed left, and when traffic finally came
-/// the focus yanked across mid-typing. The drain now also runs at the end of
-/// every keystroke batch.
-#[test]
-fn g12_17_a_click_on_the_master_header_moves_typing_to_the_master() {
-    let mut ui = Interface::start();
-    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    ui.create_terminal("");
-    assert!(
-        ui.wait_for_tab(2, Duration::from_secs(15)),
-        "the second terminal never appeared: {:?}",
-        ui.tab_bar()
-    );
-
-    // Pin tab 1 as master through the menu, then move away to tab 2.
-    let first = ui
-        .tab_column(1)
-        .unwrap_or_else(|| panic!("terminal 1 has no tab: {:?}", ui.tab_bar()));
-    ui.click(first, qoro_tui::screen::TABS as u16);
-    assert!(
-        ui.wait_for_tab(1, Duration::from_secs(10)),
-        "a click on the first tab did not move to it: {:?}",
-        ui.tab_bar()
-    );
-    ui.command(b'm');
-    assert!(
-        ui.wait_for("pin as master", Duration::from_secs(10))
-            .is_some(),
-        "the menu never opened"
-    );
-    ui.type_in(b"E");
-    std::thread::sleep(Duration::from_millis(300));
-    ui.type_in(b"\r");
-    // The column is open from the first frame, so its "needs you" row cannot
-    // confirm the pin: wait for the pin's own confirmation instead.
-    assert!(
-        ui.wait_for("pinned as master", Duration::from_secs(10))
-            .is_some(),
-        "the menu did not pin tab 1 as master"
-    );
-    // The tiled master leaves the tab bar: tab labels are positions, so the
-    // one worker slides to position 1 and no position 2 remains. The pin
-    // keeps the keyboard, so no tab is bracketed.
-    assert!(
-        ui.wait_for_tabs(
-            |bar| !bar.contains(" 2 ") && !bar.contains('['),
-            Duration::from_secs(10)
-        ),
-        "the tiled master never left the tab bar: {:?}",
-        ui.tab_bar()
-    );
-    // The worker sits at position 1 now: clicking it moves the keyboard
-    // there, bracketing it.
-    let worker = ui
-        .tab_column(1)
-        .unwrap_or_else(|| panic!("worker has no tab: {:?}", ui.tab_bar()));
-    ui.click(worker, qoro_tui::screen::TABS as u16);
-    assert!(
-        ui.wait_for_tab(1, Duration::from_secs(10)),
-        "a click on the worker tab did not move to it: {:?}",
-        ui.tab_bar()
-    );
-
-    // Click the master column header (top row, far right): the keyboard must
-    // leave the worker tab for the master tile, so the bar shows no focused
-    // tab anymore.
-    ui.click(COLS - 5, 1);
-    assert!(
-        ui.wait_for_tabs(|bar| !bar.contains('['), Duration::from_secs(10)),
-        "clicking the master header did not leave the worker tab: {:?}",
-        ui.tab_bar()
-    );
-
-    // Typing now must reach the master tile. The tile is narrow (a third
-    // of a 100-column pane), so the shell line wraps mid-word with cursor
-    // addresses between the halves: the needle is a short token that stays
-    // whole on the second row.
-    ui.type_in(b"echo QZ9\n");
-    assert!(
-        ui.wait_for("QZ9", Duration::from_secs(10)).is_some(),
-        "typing never reached the master tile"
-    );
-
-    // Clicking the worker tile (left side of the pane) brings the keyboard
-    // back: the bar brackets the worker position again.
-    let left = qoro_tui::screen::left(COLS);
-    ui.click((left + 3) as u16, (qoro_tui::screen::TABS + 5) as u16);
-    assert!(
-        ui.wait_for_tab(1, Duration::from_secs(10)),
-        "a click on the worker tile did not move back to it: {:?}",
-        ui.tab_bar()
-    );
-    ui.type_in(b"echo WK8\n");
-    assert!(
-        ui.wait_for("WK8", Duration::from_secs(10)).is_some(),
-        "typing never reached the worker tile after moving back"
-    );
-}
-
-/// G12.18: the master column is open from the first frame, like the left
-/// column: the needs list is the notifications, and they are no good hidden.
-#[test]
-fn g12_18_the_master_column_is_open_from_the_first_frame() {
-    let mut ui = Interface::start();
-    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    assert!(
-        ui.wait_for("needs you", Duration::from_secs(10)).is_some(),
-        "the master column never opened by itself"
-    );
-    // Toggling shuts it again: hiding is a choice, not the default. Row 1
-    // always carries the left column's title, so it is a fresh read.
-    ui.command(b'E');
-    let _ = ui.wait_for("never appears", Duration::from_millis(500));
-    assert!(
-        ui.row(1).is_none_or(|line| !line.contains("master")),
-        "toggling the column did not shut it"
-    );
-}
-
-/// G12.19: a fresh session raises its own master: a second tab running the
-/// configured agent, briefed and pinned, while the keyboard stays in the
-/// shell. Driven with `/bin/sh` as the "agent" so the test is hermetic: the
-/// shell echoes the brief, which is what the assertion reads.
-#[test]
-fn g12_19_a_fresh_session_raises_briefs_and_pins_its_own_master() {
-    // `bash` is what the shell reports as its program on this machine, so the
-    // match fires on the first index instead of the settled-prompt fallback.
-    let mut ui = Interface::start_with_master_agent("bash");
-    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    // The master terminal arrives beside the shell, unasked, and tiles right
-    // away: it is no tab, so its arrival reads from the column header, not
-    // the tab bar.
-    assert!(
-        ui.wait_for("master ", Duration::from_secs(20)).is_some(),
-        "no master was raised: {:?}",
-        ui.tab_bar()
-    );
-    // The raising runs to the end: the send and the pin share one code path,
-    // and the confirmation names the agent. (The brief's own echo is not
-    // asserted: a 67-line burst passes through the render lane faster than it
-    // paints, and its early lines are coalesced away by design.)
-    assert!(
-        ui.wait_for("bash briefed as master", Duration::from_secs(30))
-            .is_some(),
-        "the master was never briefed and pinned"
-    );
-    // And the keyboard never left the shell.
-    assert_eq!(
-        ui.focused_tab(),
-        Some(1),
-        "raising the master stole the keyboard: {:?}",
-        ui.tab_bar()
-    );
-    // The column header names the pin.
-    assert!(
-        ui.wait_for("master ", Duration::from_secs(10)).is_some(),
-        "the column never named the master"
     );
 }

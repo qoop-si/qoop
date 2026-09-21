@@ -32,7 +32,6 @@ a claim nobody has to keep.
 | `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
 | `qoro agents explain <target>` | one terminal: state, the source holding it, the screen rule that last matched and its manifest | no |
-| `qoro master brief` | print the default supervisor instructions | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |

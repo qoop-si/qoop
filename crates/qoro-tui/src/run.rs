@@ -18,7 +18,7 @@ use crate::keys::{Action, Keys};
 use crate::layout::{self, Layout};
 use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
-use crate::{master, sidebar, tabs};
+use crate::{sidebar, tabs};
 
 /// What to ask for, given where the person has scrolled to.
 ///
@@ -160,112 +160,6 @@ async fn send_to_pane(
     wr.write_all(&frame).await
 }
 
-/// Brief and pin the raising master once its agent shows in the index.
-///
-/// The agent gets a few indexes to appear under its own name (wrappers the
-/// detector never names still get briefed after five settled rounds:
-/// briefed is better than silent). The pin carries the live generation, so
-/// an exec-replaced master stops being the master instead of the pin
-/// following a stranger. Runs on the daemon branch, where the rows are fresh
-/// and a write is in hand.
-///
-/// Ordering matters: the brief goes out only after the first render of the
-/// master has arrived. An echo is a transient render, and one sent before
-/// the subscription exists is output nobody ever sees.
-async fn poll_auto_master(
-    state: &mut State,
-    seqs: &mut std::collections::BTreeMap<u32, u32>,
-    control_seq: &mut u32,
-    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-    dirty: &mut bool,
-) -> std::io::Result<()> {
-    let terminal = match state.auto_master.as_ref() {
-        Some(raised) if raised.terminal != 0 && !raised.briefed => raised.terminal,
-        _ => return Ok(()),
-    };
-    // First sighting: start the agent in the fresh shell, the way a person
-    // would type it. The brief follows once the agent shows.
-    if !state.auto_master.as_ref().is_some_and(|r| r.started) {
-        let Some(raised) = state.auto_master.as_mut() else {
-            return Ok(());
-        };
-        raised.started = true;
-        let mut start = raised.agent.clone().into_bytes();
-        start.push(b'\n');
-        let frame = client::encode_command_to(
-            terminal,
-            &ClientWire::Input { bytes: start },
-            seqs.entry(terminal).or_default(),
-        )?;
-        wr.write_all(&frame).await?;
-        *dirty = true;
-        return Ok(());
-    }
-    // No confirmed subscription and no render yet: the brief would be
-    // output nobody sees. Sync and wait for either proof.
-    if !state.master_synced && !state.snapshots.contains_key(&terminal) {
-        if let Some(sync) = sync_subs(state, control_seq)? {
-            wr.write_all(&sync).await?;
-        }
-        return Ok(());
-    }
-    let (agent, ready) = match state.auto_master.as_mut() {
-        Some(raised) if raised.terminal == terminal => {
-            let agent = raised.agent.clone();
-            let row = state.rows.iter().find(|r| r.terminal == terminal);
-            let Some(row) = row else {
-                // Closed before briefing: drop the flight, pin nothing.
-                state.auto_master = None;
-                return Ok(());
-            };
-            raised.rounds = if raised.last_program == row.program {
-                raised.rounds.saturating_add(1)
-            } else {
-                raised.last_program = row.program.clone();
-                1
-            };
-            // The fallback only into a settled prompt: briefing a shell that
-            // is still starting lands in its startup read-ahead, where the
-            // agent being started never sees it.
-            let settled = raised.rounds >= 5 && row.state == "idle";
-            let ready = master::agent_matches(row, &agent) || settled;
-            (agent, ready.then(|| row.generation))
-        }
-        _ => return Ok(()),
-    };
-    let Some(generation) = ready else {
-        return Ok(());
-    };
-    let mut brief = master::MASTER_BRIEF.as_bytes().to_vec();
-    brief.push(b'\n');
-    let frame = client::encode_command_to(
-        terminal,
-        &ClientWire::Input { bytes: brief },
-        seqs.entry(terminal).or_default(),
-    )?;
-    wr.write_all(&frame).await?;
-    state.master = Some((terminal, generation));
-    if let Some(raised) = state.auto_master.as_mut() {
-        raised.briefed = true;
-    }
-    // The pin subscribes: without the sync the column's viewport of the new
-    // master stays dark until some later focus change resubscribes.
-    if let Some(sync) = sync_subs(state, control_seq)? {
-        wr.write_all(&sync).await?;
-    }
-    // The pin tiles: the focused tile just narrowed beside the new leaf, and
-    // a child that is not told reflows against a width it no longer has.
-    state.refresh_master_shown();
-    sync_master_tile(state);
-    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
-        wr.write_all(&resize).await?;
-    }
-    state.message = Some(format!("{agent} briefed as master"));
-    *dirty = true;
-    Ok(())
-}
-
-/// Everything the screen is drawn from.
 struct State {
     rows: Vec<AgentRow>,
     focused: u32,
@@ -397,54 +291,6 @@ struct State {
     /// copied something looks at it to check they got the right thing. The next press in
     /// the pane clears it.
     selection: Option<crate::selection::Selection>,
-    /// The pinned master terminal and the generation it was pinned at, client-local
-    /// like `layouts` and `collapsed`. Set from the menu, cleared when its terminal is
-    /// gone, validated against the freshest rows before every paint.
-    master: Option<(u32, Option<u64>)>,
-    /// Whether the person asked for the master column. Open from the first
-    /// frame like the left column: the needs list is the notifications, and
-    /// they are no good hidden. The column itself shows only when the window
-    /// holds it; see `master_shown`. Shut at the ask with `ctrl-a E`.
-    master_open: bool,
-    /// Whether the master column is on screen. Kept with one column of hysteresis so a
-    /// sigwinch sitting on the threshold does not flap the column (and its PTY resize)
-    /// every repaint.
-    master_shown: bool,
-    /// The session directory this client is attached to (the socket's own
-    /// directory): where the master's file and the approvals live. Read on
-    /// the index path, never per frame.
-    session_dir: std::path::PathBuf,
-    /// The master's file, when it is fresh. Reloaded on every index arrival;
-    /// stale or broken reads as absent, and the column shows the live index
-    /// alone.
-    master_report: Option<crate::master::Report>,
-    /// A master terminal asked for and not yet answered for: the fresh-session
-    /// auto-start and the menu's "start master" both queue here and drain with
-    /// a write in hand, the way `wants_terminal_in` does.
-    want_master: bool,
-    /// The in-flight automatic master: briefed and pinned once its agent shows
-    /// in the index. The keyboard is never moved to it; the column shows it.
-    auto_master: Option<AutoMaster>,
-    /// The raising master's subscription is confirmed: the daemon answered a
-    /// sync naming it, so its renders reach the viewport from here on. Read
-    /// with the snapshots as backstop: an older daemon answers every sync,
-    /// and a render already in hand proves the same.
-    master_synced: bool,
-}
-
-/// A master terminal being raised: which agent it should run, and whether the
-/// brief has reached it yet. `terminal` is zero until the create is answered.
-struct AutoMaster {
-    terminal: u32,
-    agent: String,
-    /// Consecutive polls seeing the same foreground program while idle.
-    /// After five the brief goes anyway: a wrapper the detector never names
-    /// is still better briefed than silent. Reset on every program change,
-    /// so the fallback never fires into a shell that is still starting.
-    rounds: u8,
-    last_program: Option<String>,
-    started: bool,
-    briefed: bool,
 }
 
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
@@ -452,57 +298,10 @@ struct AutoMaster {
 type TileHit = (u32, (usize, usize), (usize, usize));
 
 impl State {
-    /// The pin as the painter sees it: the terminal present in the freshest rows and
-    /// the generation equal.
-    ///
-    /// One helper because the frame and the click path have to agree on what the pin
-    /// names: two copies of this check is how a click lands on a stranger. An
-    /// exec-replaced process is a new generation, not the master, and a dangling id
-    /// renders as unpinned, never as someone else's screen.
-    fn valid_master(&self) -> Option<(u32, Option<u64>)> {
-        self.master.and_then(|(terminal, generation)| {
-            self.rows
-                .iter()
-                .find(|r| r.terminal == terminal)
-                .filter(|r| r.generation == generation)
-                .map(|_| (terminal, generation))
-        })
-    }
-
-    /// Recompute whether the master column is on screen, with one column of hysteresis.
-    ///
-    /// An open column stays while the window holds both columns plus one pane cell; a
-    /// hidden one comes back only past the threshold plus one. Without the extra column
-    /// a sigwinch sitting on the edge flaps the column and reflows the focused child on
-    /// every repaint.
-    fn refresh_master_shown(&mut self) {
-        let left = screen::left_for(self.cols, self.collapsed);
-        let width = master::width_for(self.cols as usize);
-        let room = (self.cols as usize) > left + width + 2;
-        let room_wide = (self.cols as usize) > left + width + 3;
-        self.master_shown = self.master_open && if self.master_shown { room } else { room_wide };
-    }
-
-    /// The columns the master column takes right now: what the last frame showed.
-    ///
-    /// Read from `master_shown` rather than recomputed, because the hysteresis lives in
-    /// the frame: every pane measurement between two frames has to agree with the last
-    /// one painted, or clicks land where the paint is not.
-    fn right_now(&self) -> usize {
-        screen::right_for(
-            self.cols,
-            screen::left_for(self.cols, self.collapsed),
-            self.master_shown,
-        )
-    }
-
     fn frame(&mut self) -> Frame<'_> {
-        let master = self.valid_master();
-        self.refresh_master_shown();
-        let right = self.right_now();
         // The pane area in its own cells, shared by every tile rect.
         let (pane_cols, pane_rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, right);
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
         let full = layout::Rect {
             x: 0,
             y: 0,
@@ -555,22 +354,16 @@ impl State {
             rows_back: self.rows_back(),
             behind: &self.behind,
             tiles,
-            master,
-            master_shown: self.master_shown,
-            master_report: self.master_report.as_ref(),
         }
     }
 
     /// The tabs of the space on screen, in the order the daemon reports them.
-    /// Split panes and the master tile are sub-terminals beside their tab,
-    /// never top tabs, so they are filtered here. Agents in panes still list
-    /// in the sidebar.
+    /// Split panes are sub-terminals inside their tab, never top tabs, so
+    /// they are filtered here. Agents in panes still list in the sidebar.
     fn tabs(&self) -> Vec<AgentRow> {
-        let master = self.valid_master().map(|(terminal, _)| terminal);
         screen::in_space(&self.rows, self.space)
             .into_iter()
             .filter(|r| !self.panes.contains(&r.terminal))
-            .filter(|r| Some(r.terminal) != master)
             .collect()
     }
 
@@ -599,7 +392,7 @@ impl State {
     /// coordinates. Divider cells answer `None`.
     fn tile_at_screen(&self, row: u16, col: u16) -> Option<TileHit> {
         let (pane_cols, pane_rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, self.right_now());
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
         let left = screen::left_for(self.cols, self.collapsed);
         let first_col = left + 1;
         if (col as usize) < first_col || (col as usize) >= first_col + pane_cols as usize {
@@ -638,8 +431,7 @@ impl State {
     /// Derived rather than stored: what is fixed is the row the top of the pane is pinned
     /// to, and how much of the pane that fills changes by itself as the terminal prints.
     fn scrolled_rows(&self) -> usize {
-        let (_, pane_rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, self.right_now());
+        let (_, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
         let Some(anchor) = self.anchor else {
             return 0;
         };
@@ -693,29 +485,8 @@ impl State {
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
-        let right = self.right_now();
-        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed, right);
+        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
         let left = screen::left_for(self.cols, self.collapsed);
-        // The master column, when it is on screen. Checked before the tiles, or
-        // right-edge clicks fall through to the wrong tab.
-        if right > 0 && col as usize >= left + 1 + pane_cols as usize {
-            let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
-            let column_rows = (self.lines as usize).saturating_sub(screen::STATUS);
-            return match master::hit(
-                &self.rows,
-                &self.spaces,
-                self.valid_master(),
-                self.focused,
-                self.master_report.as_ref(),
-                column_rows,
-                within,
-                master::width_for(self.cols as usize),
-            ) {
-                Some(master::Hit::Header) => Some(Clicked::Master),
-                Some(master::Hit::Need(terminal)) => Some(Clicked::Terminal(terminal)),
-                Some(master::Hit::Footer) | None => None,
-            };
-        }
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
             if (row as usize) != screen::TABS {
@@ -949,8 +720,6 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "",
         "re-read the agent detection overrides",
     ),
-    ("pin as master", "E", "this tab reports to the right column"),
-    ("start master", "", "raise a master tab when there is none"),
     ("detach", "d", "leave, and keep everything running"),
 ];
 
@@ -1089,18 +858,6 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Control(ControlRequest::ReloadAgentManifests {
                 id: format!("reload-{request}"),
             })
-        }
-        "pin as master" => {
-            pin_focused_as_master(state);
-            MenuSend::Nothing
-        }
-        "start master" => {
-            // The same raising as a fresh session's, on demand: a closed
-            // master comes back this way. An in-flight raising is left alone;
-            // with no agent anywhere the honest answer is said, not a shell
-            // with no master in it.
-            start_master(state, master::detect_agent());
-            MenuSend::Nothing
         }
         "detach" => MenuSend::Detach,
         _ => unreachable!("menu row without dispatch"),
@@ -1304,8 +1061,7 @@ enum FocusOutcome {
 /// The window is bottom-pinned: offset zero shows the tail, so new events
 /// arrive in view by themselves, and scrolling up hides rows below.
 fn focus_height(state: &State) -> usize {
-    let (_, pane_rows) =
-        screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
+    let (_, pane_rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
     (pane_rows as usize).max(1)
 }
 
@@ -1409,8 +1165,6 @@ enum Clicked {
     Collapse,
     Space(i64),
     Terminal(u32),
-    /// The master column's header: jump to the master tab.
-    Master,
     NewTerminal,
     Fold(sidebar::Group),
 }
@@ -1451,27 +1205,16 @@ pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Resul
         previous_hook(info);
     }));
 
-    let outcome = drive(stream, leftover, notice, session_dir(socket)).await;
+    let outcome = drive(stream, leftover, notice).await;
 
     drop(guard);
     outcome
-}
-
-/// The directory the socket lives in is the session: its database, its event
-/// log, and now the master's file. A socket with no parent is a path that
-/// cannot exist, and reports from nowhere stay unread.
-fn session_dir(socket: &Path) -> std::path::PathBuf {
-    socket
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default()
 }
 
 async fn drive(
     stream: tokio::net::UnixStream,
     leftover: BytesMut,
     notice: Option<String>,
-    session_dir: std::path::PathBuf,
 ) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (cols, lines) = client::outer_size();
@@ -1518,14 +1261,6 @@ async fn drive(
         selection: None,
         anchor: None,
         behind: Behind::default(),
-        master: None,
-        master_open: true,
-        master_shown: false,
-        session_dir,
-        master_report: None,
-        want_master: false,
-        auto_master: None,
-        master_synced: false,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -1640,14 +1375,6 @@ async fn drive(
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
-                    // The automatic master raises on a clock of its own: a quiet
-                    // agent means a quiet daemon, and the raise would stall between
-                    // start and brief waiting for traffic that never comes. The
-                    // tick already exists for acks; the poll writes nothing once
-                    // briefed, so it costs one check per two seconds.
-                    if state.auto_master.as_ref().is_some_and(|raised| !raised.briefed) {
-                        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty).await?;
-                    }
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),
@@ -1655,12 +1382,9 @@ async fn drive(
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
-                    // The window moved under the hysteresis: refresh what is shown before
+                    // The window moved: refresh what is shown before
                     // sizing, or the child reflows against the width the pane no longer
-                    // has. The master tile follows the fit: a narrowed window drops
-                    // it, a widened one brings it back.
-                    state.refresh_master_shown();
-                    sync_master_tile(&mut state);
+                    // has.
                     // The focused tile only. A resize is a claim about the window the
                     // person is looking at, and sending it to every terminal would reflow
                     // the ones they are not.
@@ -1758,15 +1482,6 @@ async fn drive(
                                             }
                                         }
                                     }
-                                    if MENU[item].0 == "pin as master"
-                                        && let Some(resize) =
-                                            resize_focused_to_tile(&state, &mut seqs)?
-                                    {
-                                        // The column takes pane width when it opens, and a
-                                        // child that is not told reflows against a width
-                                        // it no longer has.
-                                        wr.write_all(&resize).await?;
-                                    }
                                 }
                                 None => {
                                     state.menu = None;
@@ -1803,12 +1518,6 @@ async fn drive(
                                                 wr.write_all(&out).await?;
                                             }
                                         }
-                                    }
-                                    if MENU[item].0 == "pin as master"
-                                        && let Some(resize) =
-                                            resize_focused_to_tile(&state, &mut seqs)?
-                                    {
-                                        wr.write_all(&resize).await?;
                                     }
                                     dirty = true;
                                 }
@@ -2036,15 +1745,6 @@ async fn drive(
                                             resize_focused_to_tile(&state, &mut seqs)?
                                         {
                                             wr.write_all(&resize).await?;
-                                        }
-                                        dirty = true;
-                                    }
-                                    Some(Clicked::Master) => {
-                                        // Through the pending focus, which is the path that
-                                        // subscribes and resizes: assigning it directly left
-                                        // the client unsubscribed and the pane dark.
-                                        if let Some((terminal, _)) = state.valid_master() {
-                                            state.pending_focus = Some(terminal);
                                         }
                                         dirty = true;
                                     }
@@ -2331,49 +2031,14 @@ async fn drive(
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
-                                // longer has. The master column fit moves with the left
-                                // one, so the tile set refreshes before the resize.
-                                // Only the focused tile is told: the others
+                                // longer has. Only the focused tile is told: the others
                                 // are viewport-cropped.
-                                state.refresh_master_shown();
-                                sync_master_tile(&mut state);
                                 if let Some(resize) =
                                     resize_focused_to_tile(&state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
                                 dirty = true;
-                            }
-                            Action::MasterPanel => {
-                                // Like Collapse above: the toggle, then the tile
-                                // set, then exactly one resize of the focused
-                                // tile, which alone owns Resize.
-                                toggle_master(&mut state);
-                                sync_master_tile(&mut state);
-                                if let Some(resize) =
-                                    resize_focused_to_tile(&state, &mut seqs)?
-                                {
-                                    wr.write_all(&resize).await?;
-                                }
-                                dirty = true;
-                            }
-                            Action::MasterApprove => {
-                                // The head of the master's ask list, answered with
-                                // the person's exact verdict and nothing else. A
-                                // file still present is pending; the loop applies
-                                // in seq order and deletes. Gated on the column
-                                // like the key: shut, it keeps its old meaning,
-                                // which is nothing.
-                                if state.master_shown {
-                                    approve_head(&mut state, "approved");
-                                    dirty = true;
-                                }
-                            }
-                            Action::MasterReject => {
-                                if state.master_shown {
-                                    approve_head(&mut state, "rejected");
-                                    dirty = true;
-                                }
                             }
                             Action::RenameSpace => {
                                 if let Some(space) = state.space {
@@ -2436,7 +2101,7 @@ async fn drive(
                                         state.cols,
                                         state.lines,
                                         state.collapsed,
-                                        state.right_now(),
+                                        0,
                                     );
                                     wr.write_all(&client::encode_control_seq(
                                         &ControlRequest::ListFocusEvents {
@@ -2557,12 +2222,6 @@ async fn drive(
                                 // Detaching the last pane would leave a tree with no
                                 // leaves over a space that still has a terminal: refuse
                                 // instead, `ctrl-a x` is the way to close it.
-                                // Detaching the master tile unpins it in every
-                                // space: a pin that re-tiled itself on the
-                                // next sync would make the detach a no-op,
-                                // and other spaces would keep a foreign pane.
-                                // Deferred past the tree borrow below.
-                                let unpin_master = state.master.is_some_and(|(pinned, _)| pinned == focused);
                                 let next = match space
                                     .and_then(|s| state.layouts.get_mut(&s))
                                 {
@@ -2570,19 +2229,10 @@ async fn drive(
                                         layout.remove(focused);
                                         // Detached panes become real tabs again.
                                         state.panes.remove(&focused);
-                                        if unpin_master {
-                                            state.master = None;
-                                        }
                                         Some(layout.focus)
                                     }
                                     _ => None,
                                 };
-                                // Only when the detach happened: a refused detach
-                                // (the last pane) unpins nothing.
-                                if unpin_master && next.is_some() {
-                                    remove_master_tile(&mut state, focused);
-                                }
-                                sync_master_tile(&mut state);
                                 match next {
                                     Some(next) => {
                                         if let Some(bytes) = focus(
@@ -2606,18 +2256,12 @@ async fn drive(
                             }
                         }
                     }
-                    // A deferred focus (the master header click, or a recovery
-                    // after a close) applies on this keystroke, not on the
+                    // A deferred focus (a recovery after a close)
+                    // applies on this keystroke, not on the
                     // daemon's next word: an idle daemon says nothing for
                     // minutes, and until then the keyboard sits in the wrong
                     // terminal while the screen already shows the new one.
-                    if let Some(next) = state.pending_focus.take()
-                        && let Some(bytes) =
-                            focus(&mut state, next, &mut control_seq, &mut seqs)?
-                    {
-                        wr.write_all(&bytes).await?;
-                        dirty = true;
-                    }
+                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     }
                 }
                 n = rd.read(&mut read) => {
@@ -2651,14 +2295,10 @@ async fn drive(
                                     && (state
                                         .rows
                                         .iter()
-                                        .any(|r| r.terminal == terminal && Some(r.workspace) == state.space)
-                                        || Some(terminal)
-                                            == state.master.map(|(pinned, _)| pinned))
+                                        .any(|r| r.terminal == terminal && Some(r.workspace) == state.space))
                                 {
                                     // A visible onlooker in this space: kept for its tile,
-                                    // never promoted, never scrolled. The pinned master
-                                    // qualifies from any space: the column paints its
-                                    // viewport every frame. Anything else is a
+                                    // never promoted, never scrolled. Anything else is a
                                     // render from a dropped subscription or another space
                                     // and is ignored.
                                     state.snapshots.insert(terminal, snapshot);
@@ -2739,32 +2379,7 @@ async fn drive(
                             &mut control_seq,
                         )?).await?;
                     }
-                    // A fresh session raises its own master: one create, asked
-                    // once, answered by id above. The keyboard stays where it
-                    // is; the column shows the master.
-                    if state.want_master {
-                        state.want_master = false;
-                        request += 1;
-                        wr.write_all(&client::encode_control_seq(
-                            &ControlRequest::CreateTerminal {
-                                id: format!("master-{request}"),
-                                cwd: None,
-                                workspace: state.space,
-                                // Named, so the tab says what it is before the
-                                // agent names itself.
-                                name: Some("master".to_string()),
-                            },
-                            &mut control_seq,
-                        )?).await?;
-                    }
-                    poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty).await?;
-                    if let Some(next) = state.pending_focus.take()
-                        && let Some(bytes) =
-                            focus(&mut state, next, &mut control_seq, &mut seqs)?
-                    {
-                        wr.write_all(&bytes).await?;
-                        dirty = true;
-                    }
+                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     // The focus list refetches on its own flag, never on a timer:
                     // opened, moved to another terminal, or told the index
                     // changed while open. A tool event arrives with the state
@@ -2776,7 +2391,7 @@ async fn drive(
                             state.cols,
                             state.lines,
                             state.collapsed,
-                            state.right_now(),
+                            0,
                         );
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::ListFocusEvents {
@@ -2815,184 +2430,6 @@ async fn drive(
     let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
-}
-
-/// Toggle the master column: the ask, the hysteresis refresh, and nothing else.
-///
-/// The resize is the caller's, like Collapse: one call is the whole reflow cost, and the
-/// focused tile alone owns Resize. Refreshing what is shown before sizing matters: the
-/// resize has to be against the width the pane has now, not the one it had.
-fn toggle_master(state: &mut State) {
-    state.master_open = !state.master_open;
-    state.refresh_master_shown();
-}
-
-/// Answer the head of the master's ask list with an exact verdict.
-///
-/// The ask is the head of what the column paints (triage order over the live
-/// index), never the head of the file, so the verdict always names the
-/// terminal the person just looked at. The id comes from the fresh report,
-/// never typed. No painted head says so instead of filing a verdict for
-/// nobody, including asks whose terminal has since closed.
-fn approve_head(state: &mut State, verdict: &str) {
-    let Some(head) = master::approval_head(
-        &state.rows,
-        &state.spaces,
-        state.valid_master(),
-        state.master_report.as_ref(),
-    ) else {
-        state.message = Some("no pending approvals".to_string());
-        return;
-    };
-    // A file still present is pending: filing again would queue a duplicate
-    // verdict for the same ask, and the loop would apply it twice.
-    match master::file_approval(&state.session_dir, &head.id, verdict) {
-        Ok(_) => state.message = Some(format!("{verdict} {}", head.id)),
-        Err(master::ApprovalError::Pending(id)) => {
-            state.message = Some(format!("already pending {id}"));
-        }
-        Err(master::ApprovalError::Io(e)) => {
-            state.message = Some(format!("approval failed: {e}"));
-        }
-    }
-}
-
-/// Raise a master tab on demand: the menu's "start master" and, through the
-/// same fields, a fresh session's automatic one. Pure state: the create goes
-/// out with a write in hand, the brief and the pin follow from the index.
-fn start_master(state: &mut State, agent: Option<String>) {
-    if state.auto_master.is_some() {
-        state.message = Some("a master is already raising".to_string());
-        return;
-    }
-    let Some(agent) = agent else {
-        state.message = Some("no agent on PATH, set QORO_MASTER_AGENT".to_string());
-        return;
-    };
-    master::mark_auto(&state.session_dir);
-    state.master_synced = false;
-    state.want_master = true;
-    state.auto_master = Some(AutoMaster {
-        terminal: 0,
-        agent,
-        rounds: 0,
-        last_program: None,
-        started: false,
-        briefed: false,
-    });
-}
-
-/// Pin the focused tab as the master, or unpin it when it already is.
-///
-/// The generation travels with the pin, so an exec-replaced process stops being the
-/// master instead of the pin following a stranger. Pinning also opens the master
-/// column, so the pin is visible without a second key press; unpinning leaves the
-/// column alone.
-///
-/// The pin is a tile, not a viewport: pinning sets a right leaf for the master in
-/// the space on screen, unpinning takes it back out everywhere. The keyboard
-/// never follows either way, except when it was standing on the master being
-/// unpinned: then it steps to the layout's neighbour through the pending
-/// focus, which is the path that subscribes and resizes.
-fn pin_focused_as_master(state: &mut State) {
-    if state.focused == 0 {
-        state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
-        return;
-    }
-    if state
-        .master
-        .is_some_and(|(terminal, _)| terminal == state.focused)
-    {
-        let unpinned = state.focused;
-        state.master = None;
-        remove_master_tile(state, unpinned);
-        // Unpinning a sole-pane master emptied (and pruned) the tree: seed it
-        // back, or the pane goes blank with a live tab behind it.
-        if let Some(space) = state.space {
-            let empty = state
-                .layouts
-                .get(&space)
-                .is_none_or(|l| l.leaves().is_empty() && !l.has_pending());
-            if empty {
-                state.layouts.insert(space, Layout::single(unpinned));
-            }
-        }
-        sync_master_tile(state);
-        if state.focused == unpinned {
-            state.pending_focus = state
-                .space
-                .and_then(|space| state.layouts.get(&space))
-                .map(|layout| layout.focus)
-                .filter(|next| *next != unpinned)
-                .or_else(|| state.tabs().first().map(|r| r.terminal));
-        }
-        state.message = Some("unpinned the master".to_string());
-        return;
-    }
-    match state.rows.iter().find(|r| r.terminal == state.focused) {
-        Some(row) => {
-            state.master = Some((state.focused, row.generation));
-            state.master_open = true;
-            state.refresh_master_shown();
-            sync_master_tile(state);
-            state.message = Some("pinned as master".to_string());
-        }
-        None => {
-            state.message = Some("nothing to pin, ctrl-a c starts a terminal".to_string());
-        }
-    }
-}
-
-/// Keep the master tile in step with the pin: one right leaf in the space on
-/// screen while a live master is pinned and the column is shown, nowhere
-/// otherwise. Pure tree work; sizing the narrowed tiles is the caller's,
-/// beside every call.
-fn sync_master_tile(state: &mut State) {
-    let want = state
-        .valid_master()
-        .map(|(terminal, _)| terminal)
-        .filter(|_| state.master_shown);
-    if let Some(space) = state.space {
-        if let Some(want) = want {
-            if state.layouts.get(&space).is_none() {
-                ensure_layout(state);
-            }
-            if let Some(layout) = state.layouts.get_mut(&space)
-                && !layout.contains(want)
-            {
-                // An empty tree takes the master as its seed: a bare root
-                // refuses the pin, and a pinned-but-untiled master would
-                // vanish from the tab bar with no tile anywhere.
-                if layout.leaves().is_empty() && !layout.has_pending() {
-                    state.layouts.insert(space, Layout::single(want));
-                } else {
-                    layout.pin_right(want);
-                }
-            }
-        }
-    }
-    // No want means no tile anywhere: a hidden column, a narrowed window, a
-    // dead or exec-replaced pin. The pin id is still in hand here, unlike
-    // after it is cleared, so this is where the tile goes out everywhere.
-    if want.is_none()
-        && let Some(dead) = state.master.map(|(terminal, _)| terminal)
-    {
-        remove_master_tile(state, dead);
-    }
-}
-
-/// Take one terminal's master tile out of every space. Called with the dead
-/// id in hand, because after the pin is cleared `sync_master_tile` no longer
-/// knows which leaf was the master's. Trees left with no leaves go away, the
-/// way the close path drops them, so no space keeps an empty tree with a
-/// stale focus.
-fn remove_master_tile(state: &mut State, terminal: u32) {
-    for layout in state.layouts.values_mut() {
-        layout.remove(terminal);
-    }
-    state
-        .layouts
-        .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
 }
 
 /// Whether a fresh client's first render may adopt its terminal: only what
@@ -3194,8 +2631,7 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
 ///
 /// The pane area in its own cells, shared by every tile rect.
 fn pane_area(state: &State) -> layout::Rect {
-    let (cols, rows) =
-        screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
+    let (cols, rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
     layout::Rect {
         x: 0,
         y: 0,
@@ -3250,12 +2686,9 @@ fn ensure_layout(state: &mut State) {
 }
 
 /// The terminals this client receives renders for: the visible set of the
-/// space on screen (or the focused one when there is no tree yet), plus the
-/// pinned master when it is one. The master is a tile, so it is usually in
-/// the visible set already; the extra push covers the gap between the pin
-/// and the tile, and the raising flight before its first render.
+/// space on screen, or the focused one when there is no tree yet.
 fn visible_set(state: &State) -> Vec<u32> {
-    let mut set = if let Some(space) = state.space
+    let set = if let Some(space) = state.space
         && let Some(layout) = state.layouts.get(&space)
     {
         layout.visible()
@@ -3264,20 +2697,28 @@ fn visible_set(state: &State) -> Vec<u32> {
     } else {
         Vec::new()
     };
-    if let Some((terminal, _)) = state.valid_master()
-        && !set.contains(&terminal)
-    {
-        set.push(terminal);
-    }
-    // The raising master too: its first render is the proof of life the
-    // briefing waits for, and without a subscription that render never comes.
-    if let Some(raised) = state.auto_master.as_ref()
-        && raised.terminal != 0
-        && !set.contains(&raised.terminal)
-    {
-        set.push(raised.terminal);
-    }
     set
+}
+
+/// Apply a deferred focus through the subscribing path: subscribe, move the
+/// keyboard, resize, all in one write. Both wake arms share it, so a focus
+/// deferred on an idle daemon applies on the next keystroke as well as on the
+/// next daemon message: until then the keyboard sits in the wrong terminal
+/// while the screen already shows the new one.
+async fn drain_pending_focus(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    dirty: &mut bool,
+) -> std::io::Result<()> {
+    if let Some(next) = state.pending_focus.take()
+        && let Some(bytes) = focus(state, next, control_seq, seqs)?
+    {
+        wr.write_all(&bytes).await?;
+        *dirty = true;
+    }
+    Ok(())
 }
 
 /// Bring subscriptions to exactly the visible set, in one write. `None` when
@@ -3385,8 +2826,6 @@ fn focus(
         .or(state.space);
     // A tab outside the tiling tree drops the tree back to a single pane:
     // tabs name every terminal in the space, tiles only the visible ones.
-    // The master tile is re-pinned after: focusing a worker must not drop
-    // the master from the tree.
     if let Some(space) = state.space {
         ensure_layout(state);
         if let Some(layout) = state.layouts.get_mut(&space) {
@@ -3396,7 +2835,6 @@ fn focus(
                 state.layouts.insert(space, Layout::single(to));
             }
         }
-        sync_master_tile(state);
     }
     // Promote the already-visible snapshot instead of waiting for the next
     // render: the subscription never dropped, so the picture is fresh.
@@ -3449,8 +2887,7 @@ fn focus(
     // The list refetches on the same bytes as the subscribe above: on an
     // idle daemon nothing else arrives to drain a flag on.
     if state.focus {
-        let (_, pane_rows) =
-            screen::pane_size_for(state.cols, state.lines, state.collapsed, state.right_now());
+        let (_, pane_rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
         // The id only has to name the family for the refusal arm; the answer
         // is matched on its terminal, never on this string.
         let id = format!("focus-term-{to}-{}", *control_seq);
@@ -3480,24 +2917,10 @@ fn enter_space(
 ) -> io::Result<Option<BytesMut>> {
     state.space = Some(space);
     ensure_layout(state);
-    // The master tiles every space the same way: entering without it leaves
-    // the tile behind in the space just left.
-    sync_master_tile(state);
     // The layout's visible terminals first, so a tiled space comes back as it
     // was left; the tab list only when the tree names nothing alive. Panes
-    // and the master tile never restore the keyboard on their own:
-    // `tabs()` hides them, so re-entering lands on the first tab while the
-    // tile border keeps the pane focus inside. A space with nothing but the
-    // master tile keeps the keyboard there instead of dropping it.
-    let master_fallback = state
-        .valid_master()
-        .map(|(terminal, _)| terminal)
-        .filter(|t| {
-            state
-                .layouts
-                .get(&space)
-                .is_some_and(|layout| layout.visible().contains(t))
-        });
+    // never restore the keyboard: `tabs()` hides them, so re-entering lands
+    // on the first tab while the tile border keeps the pane focus inside.
     let first = state
         .layouts
         .get(&space)
@@ -3507,7 +2930,6 @@ fn enter_space(
                 .into_iter()
                 .find(|t| state.tabs().iter().any(|r| r.terminal == *t))
         })
-        .or(master_fallback)
         .or_else(|| state.tabs().first().map(|r| r.terminal));
     match first {
         // Already there: the subscriptions still name the old space, so sync
@@ -3607,10 +3029,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     let here = state
                         .rows
                         .iter()
-                        .any(|r| r.terminal == state.focused && r.workspace == space)
-                        || state
-                            .valid_master()
-                            .is_some_and(|(m, _)| m == state.focused);
+                        .any(|r| r.terminal == state.focused && r.workspace == space);
                     if !here {
                         state.pending_focus = state.tabs().first().map(|r| r.terminal);
                     }
@@ -3650,25 +3069,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Agents { agents, .. } => {
-            // A fresh session raises its own master once, beside the shell the
-            // daemon opened for itself: no master tab yet, no marker from a
-            // run before, at most a fresh shell besides, and an agent on PATH
-            // (or named by QORO_MASTER_AGENT). Once means once: the marker
-            // goes down with the first raising, so later attaches never raise
-            // again. Opt out with QORO_NO_AUTO_MASTER. The create goes out
-            // with a write in hand below; the brief and the pin follow once
-            // the agent shows in the index. Sessions with real work already
-            // in them are left alone.
-            if state.auto_master.is_none()
-                && agents.len() <= 1
-                && agents.iter().all(|r| !r.agent)
-                && !agents.iter().any(|r| r.name.as_deref() == Some("master"))
-                && !master::auto_done(&state.session_dir)
-                && std::env::var_os("QORO_NO_AUTO_MASTER").is_none()
-                && let Some(agent) = master::detect_agent()
-            {
-                start_master(state, Some(agent));
-            }
             if state.focused == 0 && !state.adopted {
                 // Only before this client has ever had a terminal. The daemon subscribes a
                 // fresh client to what is already open, so this is the bootstrap and no
@@ -3728,30 +3128,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.snapshots.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
             state.panes.retain(|t| live.contains(t));
-            // The pin follows the terminal, not the number: a master that is gone stops
-            // being the master here, where most deaths actually arrive, and never points
-            // at a stranger. An exec-replaced process is a new generation, not the
-            // master either: the pin would otherwise name one terminal as both tab
-            // and tile. Its tile goes with it, everywhere.
-            let pin_dead = match state.master {
-                Some((terminal, generation)) => {
-                    match agents.iter().find(|r| r.terminal == terminal) {
-                        None => Some(terminal),
-                        Some(row) if row.generation != generation => Some(terminal),
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-            if let Some(dead) = pin_dead {
-                state.master = None;
-                remove_master_tile(state, dead);
-                sync_master_tile(state);
-            }
-            // The master's file, on the index path and nowhere else: a read per
-            // frame would bill the disk for every repaint, and a read here is
-            // already where every state change arrives.
-            state.master_report = master::read_report(&state.session_dir);
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 state.focused = 0;
                 state.snapshot = None;
@@ -3828,8 +3204,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // elsewhere is typing somewhere the person cannot see; bootstrap
             // races (a render adopted before the index named its space) land
             // here, never in front of the person. An in-flight deferred focus
-            // is left alone, and the pinned master qualifies from its tile in
-            // every space.
+            // is left alone.
             if state.pending_focus.is_none()
                 && let Some(space) = state.space
                 && state.focused != 0
@@ -3837,19 +3212,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 let here = state
                     .rows
                     .iter()
-                    .any(|r| r.terminal == state.focused && r.workspace == space)
-                    || state
-                        .valid_master()
-                        .is_some_and(|(m, _)| m == state.focused);
+                    .any(|r| r.terminal == state.focused && r.workspace == space);
                 if !here {
-                    state.pending_focus = state.tabs().first().map(|r| r.terminal).or_else(|| {
-                        state.valid_master().and_then(|(m, _)| {
-                            state
-                                .layouts
-                                .get(&space)
-                                .and_then(|l| l.visible().contains(&m).then_some(m))
-                        })
-                    });
+                    state.pending_focus = state.tabs().first().map(|r| r.terminal);
                 }
             }
             // The index changed while the list is open: fetch again. A state
@@ -3919,17 +3284,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 && origin
                     .and_then(|space| state.layouts.get_mut(&space))
                     .is_some_and(|layout| layout.bind_placeholder(terminal));
-            // The automatic master answers by its own id: recorded for its
-            // brief, never focused and never drawn from. The keyboard stays
-            // where the person left it; the column shows the master.
-            let is_master = id.starts_with("master-");
-            if is_master && let Some(raised) = state.auto_master.as_mut() {
-                raised.terminal = terminal;
-                state.master_synced = false;
-            }
             if bound {
                 state.panes.insert(terminal);
-            } else if !is_split && !is_master {
+            } else if !is_split {
                 // The caller subscribes: a new terminal that the client is not
                 // watching draws the terminal it came from, which is what the
                 // first version did.
@@ -3938,12 +3295,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // An unbound split stays where the keyboard is: yanking the focus
             // to a terminal in another space would collapse that space's tree
             // onto one pane.
-            if !is_master && (bound && origin == state.space || !is_split) {
+            if bound && origin == state.space || !is_split {
                 state.pending_focus = Some(terminal);
             }
-            // A new leaf is a new chance for the master tile: a split
-            // answered while the pin waits lands the tile beside it.
-            sync_master_tile(state);
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
@@ -3962,20 +3316,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // The daemon ended the terminal, which ends its subscription
             // server-side too: pruning the local set without a goodbye write.
             state.subs.remove(&terminal);
-            // And the pin when it was the master: the explicit close path, beside the
-            // index prune above, so neither one can leave a dangling id.
-            if state.master.is_some_and(|(pinned, _)| pinned == terminal) {
-                state.master = None;
-            }
-            // And the raising flight when it was the automatic master: a closed
-            // tab is never briefed, and the menu can raise another on demand.
-            if state
-                .auto_master
-                .as_ref()
-                .is_some_and(|raised| raised.terminal == terminal)
-            {
-                state.auto_master = None;
-            }
             if terminal == state.focused {
                 state.snapshot = None;
                 // From this space, and through the subscription path, which is why it is a
@@ -4032,19 +3372,8 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             }
             *dirty = true;
         }
-        ControlResponse::Subscribed { terminals, .. } => {
-            // The daemon confirmed the raising master's subscription: renders
-            // from here on reach the column's viewport, so the brief's echo
-            // is output somebody sees rather than a transient nobody does.
-            if state
-                .auto_master
-                .as_ref()
-                .is_some_and(|raised| raised.terminal != 0 && terminals.contains(&raised.terminal))
-            {
-                state.master_synced = true;
-                *dirty = true;
-            }
-        }
+        ControlResponse::Subscribed { .. } => {}
+
         ControlResponse::FocusEvents {
             terminal, events, ..
         } if state.focus && terminal == state.focused => {
@@ -4163,14 +3492,6 @@ mod tests {
             layouts: std::collections::BTreeMap::new(),
             panes: std::collections::BTreeSet::new(),
             split_origin: std::collections::BTreeMap::new(),
-            master: None,
-            master_open: false,
-            master_shown: false,
-            session_dir: std::path::PathBuf::new(),
-            master_report: None,
-            want_master: false,
-            auto_master: None,
-            master_synced: false,
         }
     }
 
@@ -4399,14 +3720,6 @@ mod tests {
             selection: None,
             anchor: None,
             behind: Behind::default(),
-            master: None,
-            master_open: false,
-            master_shown: false,
-            session_dir: std::path::PathBuf::new(),
-            master_report: None,
-            want_master: false,
-            auto_master: None,
-            master_synced: false,
         }
     }
 
@@ -4464,14 +3777,6 @@ mod tests {
             selection: None,
             anchor: None,
             behind: Behind::default(),
-            master: None,
-            master_open: false,
-            master_shown: false,
-            session_dir: std::path::PathBuf::new(),
-            master_report: None,
-            want_master: false,
-            auto_master: None,
-            master_synced: false,
         };
         let area = pane_area(&state);
         let mut layout = Layout::single(1);
@@ -4790,8 +4095,6 @@ mod tests {
                 "keybinds",
                 "settings",
                 "reload manifests",
-                "pin as master",
-                "start master",
                 "detach",
             ]
         );
@@ -4919,28 +4222,6 @@ mod tests {
         let release = format!("\x1b[<0;{col};{row}m").into_bytes();
         assert_eq!(menu_click(&release, cols, lines), None);
     }
-
-    /// Pinning names the focused tab with its generation, and pinning again unpins.
-    /// Pinning also opens the master column; unpinning leaves the column alone.
-    /// The pin is a tile: pinning sets a right leaf, unpinning takes it out.
-    #[test]
-    fn pinning_names_the_focused_tab_with_its_generation() {
-        let mut state = bare_state();
-        state.rows = vec![agent(1, 1, "claude", "working")];
-        state.rows[0].generation = Some(7);
-        state.focused = 1;
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, Some((1, Some(7))));
-        assert!(state.master_open, "pinning opens the master column");
-        assert!(state.master_shown, "the column shows when it fits");
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, None, "pinning again unpins");
-        assert!(state.master_open, "unpinning leaves the column alone");
-    }
-
-    /// A first render from another space never adopts: the keyboard would land
-    /// in a terminal the tab bar does not show. Nothing listed yet still
-    /// adopts; the index pulls the space under it when it lands.
     #[test]
     fn a_first_render_from_another_space_never_adopts() {
         let mut state = bare_state();
@@ -5007,26 +4288,6 @@ mod tests {
             "the keyboard comes back to its space: {:?}",
             state.pending_focus
         );
-        // The pinned master qualifies from its tile: no yank.
-        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 2, "zsh", "working")];
-        rows[1].generation = Some(3);
-        let mut state = bare_state();
-        state.space = Some(1);
-        state.adopted = true;
-        state.focused = 2;
-        state.master = Some((2, Some(3)));
-        state.rows = rows;
-        let rows = state.rows.clone();
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: rows,
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.pending_focus, None, "a focused master tile stays");
     }
 
     /// The first workspace list parks the bar: a keyboard adopted from
@@ -5057,241 +4318,50 @@ mod tests {
         );
     }
 
-    /// Pinning tiles the master as a right leaf; unpinning removes it
-    /// everywhere. The tab bar hides the tile like a split pane.
+    /// An index arriving while the focus list is open marks a refetch: a tool
+    /// event arrives with the state word unchanged, so the state comparison
+    /// cannot trigger it.
     #[test]
-    fn pinning_tiles_the_master_and_hides_its_tab() {
+    fn an_index_while_open_marks_a_refetch() {
         let mut state = bare_state();
-        state.cols = 200;
-        state.lines = 24;
+        state.focus = true;
+        state.focused = 1;
+        state.rows = vec![agent(1, 1, "claude", "working")];
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: vec![agent(1, 1, "claude", "working")],
+            },
+            &mut dirty,
+        );
+        assert!(state.focus_fetch, "the list refetches on the index");
+    }
+
+    /// A deferred focus applies through one shared helper: the keyboard moves
+    /// with its subscription and resize whether the wake was a keystroke or a
+    /// daemon message.
+    #[tokio::test]
+    async fn a_deferred_focus_moves_through_the_shared_drain() {
+        let mut state = bare_state();
         state.space = Some(1);
-        state.rows = vec![
-            agent(1, 1, "zsh", "working"),
-            agent(2, 1, "opencode", "working"),
-        ];
-        state.rows[0].generation = Some(1);
-        state.rows[1].generation = Some(1);
+        state.rows = vec![agent(1, 1, "zsh", "working"), agent(2, 1, "zsh", "working")];
         state.focused = 1;
         state.layouts.insert(1, Layout::single(1));
-        state.focused = 2;
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, Some((2, Some(1))));
-        let layout = state.layouts.get(&1).expect("tree");
-        assert!(layout.contains(2), "the master is a leaf");
-        assert_eq!(layout.leaves(), vec![1, 2]);
-        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
-        assert_eq!(tabs, vec![1], "the tiled master is no tab");
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, None);
-        let layout = state.layouts.get(&1).expect("tree");
-        assert!(!layout.contains(2), "unpinning takes the tile out");
-        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
-        assert_eq!(tabs, vec![1, 2], "unpinning returns the tab");
-    }
-
-    /// The pin is a terminal and a generation: an exec-replaced process stops being
-    /// the master, and a terminal that is gone is not the master either.
-    #[test]
-    fn an_exec_replaced_master_stops_being_the_master() {
-        let mut state = bare_state();
-        state.rows = vec![agent(1, 1, "claude", "working")];
-        state.rows[0].generation = Some(7);
-        state.master = Some((1, Some(7)));
-        assert_eq!(state.valid_master(), Some((1, Some(7))));
-        state.rows[0].generation = Some(8);
-        assert_eq!(state.valid_master(), None, "the generation moved on");
-        state.rows.clear();
-        assert_eq!(state.valid_master(), None, "the terminal is gone");
-    }
-
-    /// A closed master clears the pin in both close paths.
-    #[test]
-    fn starting_a_master_queues_a_raise_and_says_when_it_cannot() {
-        // No agent anywhere: the honest answer, not a shell with no master.
-        let mut state = bare_state();
-        start_master(&mut state, None);
-        assert!(state.auto_master.is_none());
-        assert_eq!(
-            state.message.as_deref(),
-            Some("no agent on PATH, set QORO_MASTER_AGENT")
-        );
-        // An agent: queued, unanswered (terminal zero), unbriefed.
-        let mut state = bare_state();
-        start_master(&mut state, Some("opencode".to_string()));
-        assert!(state.want_master);
-        let raised = state.auto_master.as_ref().expect("raising");
-        assert_eq!(raised.terminal, 0);
-        assert_eq!(raised.agent, "opencode");
-        assert!(!raised.started && !raised.briefed);
-        // Twice is once: the in-flight raising is left alone.
-        start_master(&mut state, Some("claude".to_string()));
-        assert_eq!(
-            state.message.as_deref(),
-            Some("a master is already raising")
-        );
-        assert_eq!(
-            state.auto_master.as_ref().expect("raising").agent,
-            "opencode"
-        );
-    }
-
-    #[test]
-    fn a_closed_master_clears_the_pin_in_both_close_paths() {
-        // The explicit close path.
-        let mut state = bare_state();
-        state.master = Some((2, None));
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::TerminalClosed {
-                id: "x".to_string(),
-                terminal: 2,
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.master, None);
-        // The index prune, where most deaths actually arrive: the index no longer
-        // holds the terminal.
-        let mut state = bare_state();
-        state.master = Some((2, None));
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: vec![agent(1, 1, "claude", "working")],
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.master, None);
-        // A terminal that is still there keeps its pin.
-        let mut state = bare_state();
-        state.master = Some((1, None));
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: vec![agent(1, 1, "claude", "working")],
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.master, Some((1, None)));
-        // An exec-replaced master is a new generation, not the master: the pin
-        // goes and its tile with it, instead of naming one terminal as both
-        // tab and tile.
-        let mut state = bare_state();
-        state.cols = 200;
-        state.space = Some(1);
-        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 1, "sh", "working")];
-        rows[0].generation = Some(7);
-        rows[1].generation = Some(1);
-        state.rows = rows;
-        state.focused = 2;
-        state.layouts.insert(1, Layout::single(2));
-        state.master = Some((1, Some(7)));
-        state.master_open = true;
-        state.master_shown = true;
-        sync_master_tile(&mut state);
-        assert!(state.layouts.get(&1).is_some_and(|l| l.contains(1)));
-        state.rows[0].generation = Some(8);
-        let rows = state.rows.clone();
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: rows,
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.master, None, "the replaced pin is cleared");
-        assert!(
-            !state.layouts.get(&1).is_some_and(|l| l.contains(1)),
-            "the replaced tile is gone"
-        );
-    }
-
-    /// The idle stall: a quiet agent means a quiet daemon, and only the ack
-    /// tick wakes the loop. The raise must still run from start to briefed on
-    /// ticks alone, with no index or render arriving in between.
-    #[tokio::test]
-    async fn the_raise_completes_on_ticks_alone_with_no_daemon_traffic() {
-        let mut state = bare_state();
-        state.space = Some(1);
-        let mut rows = vec![agent(2, 1, "opencode", "working")];
-        rows[0].generation = Some(4);
-        state.rows = rows;
-        state.master_synced = true;
-        state.auto_master = Some(AutoMaster {
-            terminal: 2,
-            agent: "opencode".to_string(),
-            rounds: 0,
-            last_program: None,
-            started: false,
-            briefed: false,
-        });
+        state.pending_focus = Some(2);
         let mut seqs = std::collections::BTreeMap::new();
         let mut control_seq = 0u32;
+        let mut wr = Vec::new();
         let mut dirty = false;
-        // First tick starts the agent in the fresh shell.
-        let mut wr = Vec::new();
-        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty)
+        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty)
             .await
-            .expect("start writes");
-        assert!(!wr.is_empty(), "nothing was typed into the shell");
-        assert!(state.auto_master.as_ref().is_some_and(|r| r.started));
-        assert!(!state.auto_master.as_ref().is_some_and(|r| r.briefed));
-        // The agent shows in the index; the next tick briefs and pins, still
-        // with no daemon traffic in between.
-        let mut wr = Vec::new();
-        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty)
-            .await
-            .expect("brief writes");
-        assert!(!wr.is_empty(), "the brief never went out");
-        assert!(state.auto_master.as_ref().is_some_and(|r| r.briefed));
-        assert_eq!(
-            state.master,
-            Some((2, Some(4))),
-            "the pin names the live generation"
-        );
+            .expect("drain writes");
+        assert_eq!(state.focused, 2, "the keyboard moved");
+        assert!(state.pending_focus.is_none(), "the deferral is consumed");
+        assert!(!wr.is_empty(), "subscribe and resize went out");
+        assert!(dirty);
     }
-
-    /// Toggling the column off removes the tile everywhere; toggling back on
-    /// re-tiles it. A hidden column with a live tile is a narrowed pane for
-    /// nothing.
-    #[test]
-    fn toggling_the_column_off_removes_the_tile() {
-        let mut state = bare_state();
-        state.cols = 200;
-        state.space = Some(1);
-        let mut rows = vec![agent(1, 1, "zsh", "working"), agent(2, 1, "sh", "working")];
-        rows[0].generation = Some(1);
-        rows[1].generation = Some(1);
-        state.rows = rows;
-        state.focused = 1;
-        state.layouts.insert(1, Layout::single(1));
-        state.focused = 2;
-        // Pinning the unfocused tab tiles it beside the worker.
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, Some((2, Some(1))));
-        assert!(state.layouts.get(&1).is_some_and(|l| l.contains(2)));
-        toggle_master(&mut state);
-        sync_master_tile(&mut state);
-        assert!(!state.master_shown);
-        assert!(
-            !state.layouts.get(&1).is_some_and(|l| l.contains(2)),
-            "hiding the column drops the tile"
-        );
-        toggle_master(&mut state);
-        sync_master_tile(&mut state);
-        assert!(state.master_shown);
-        assert!(
-            state.layouts.get(&1).is_some_and(|l| l.contains(2)),
-            "showing the column re-tiles"
-        );
-    }
-
     fn tool_event(label: &str) -> qoro_runtime::control::FocusEvent {
         qoro_runtime::control::FocusEvent {
             kind: "tool".to_string(),
@@ -5433,461 +4503,5 @@ mod tests {
             state.message, None,
             "an old daemon would shout on every index"
         );
-    }
-
-    #[test]
-    fn an_index_while_open_marks_a_refetch() {
-        let mut state = bare_state();
-        state.focus = true;
-        state.focus_fetch = false;
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: vec![agent(1, 1, "claude", "working")],
-            },
-            &mut dirty,
-        );
-        assert!(state.focus_fetch);
-        // And shut, it marks nothing.
-        state.focus = false;
-        state.focus_fetch = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: vec![agent(1, 1, "claude", "working")],
-            },
-            &mut dirty,
-        );
-        assert!(!state.focus_fetch);
-    }
-
-    /// The column keeps one column of hysteresis: staying open is cheaper than coming
-    /// back, so coming back costs one more column than staying.
-    #[test]
-    fn the_master_column_keeps_a_one_column_hysteresis() {
-        let mut state = bare_state();
-        // Unfolded, the left takes 31: room past 71, return past 72.
-        state.cols = 80;
-        state.master_open = true;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        state.cols = 72;
-        state.refresh_master_shown();
-        assert!(state.master_shown, "sitting on the threshold keeps showing");
-        state.cols = 71;
-        state.refresh_master_shown();
-        assert!(!state.master_shown, "past it hides");
-        state.cols = 72;
-        state.refresh_master_shown();
-        assert!(
-            !state.master_shown,
-            "the threshold alone does not bring it back"
-        );
-        state.cols = 73;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        // Shut at the ask, it never shows however wide the window is.
-        state.master_open = false;
-        state.refresh_master_shown();
-        assert!(!state.master_shown);
-    }
-
-    /// Toggling asks and shows, and untoggling stops asking.
-    #[test]
-    fn toggling_the_master_column_asks_and_shows() {
-        let mut state = bare_state();
-        state.cols = 120;
-        assert!(!state.master_open);
-        toggle_master(&mut state);
-        assert!(state.master_open);
-        assert!(state.master_shown);
-        toggle_master(&mut state);
-        assert!(!state.master_open);
-        assert!(!state.master_shown);
-    }
-
-    /// The frame shows the pin only when it is live, and the column only when it fits.
-    /// The pin itself survives a narrow window: hiding is not unpinning.
-    #[test]
-    fn the_frame_shows_the_master_only_when_it_is_live_and_fits() {
-        let mut state = bare_state();
-        state.cols = 120;
-        state.lines = 24;
-        state.rows = vec![agent(1, 1, "claude", "working")];
-        state.rows[0].generation = Some(7);
-        state.focused = 1;
-        state.master = Some((1, Some(7)));
-        state.master_open = true;
-        let frame = state.frame();
-        assert_eq!(frame.master, Some((1, Some(7))));
-        assert!(frame.master_shown);
-        state.cols = 60;
-        let frame = state.frame();
-        assert_eq!(frame.master, Some((1, Some(7))), "the pin is kept");
-        assert!(!frame.master_shown);
-        state.rows[0].generation = Some(8);
-        let frame = state.frame();
-        assert_eq!(frame.master, None, "an exec-replaced master is not shown");
-    }
-
-    /// Clicks on the right column reach the master and its needs, never a tile.
-    #[test]
-    fn clicks_on_the_right_column_reach_the_master_not_a_tile() {
-        let mut state = bare_state();
-        state.cols = 120;
-        state.lines = 24;
-        state.rows = vec![
-            agent(1, 1, "claude", "working"),
-            agent(2, 1, "codex", "blocked"),
-        ];
-        state.focused = 1;
-        state.master = Some((1, None));
-        state.master_open = true;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        let left = screen::left_for(120, false);
-        let (pane_cols, _) = screen::pane_size_for(120, 24, false, state.right_now());
-        let master_col = (left + 1 + pane_cols as usize + 5) as u16;
-        // The header jumps to the master tab.
-        assert!(matches!(
-            state.clicked(1, master_col),
-            Some(Clicked::Master)
-        ));
-        // Header, rule, title, then the blocked terminal.
-        assert!(matches!(
-            state.clicked(4, master_col),
-            Some(Clicked::Terminal(2))
-        ));
-        // The footer answers nothing.
-        assert!(state.clicked(6, master_col).is_none());
-        // And the pane beside it still reaches its own tile.
-        assert!(state.tile_at_screen(2, (left + 1) as u16).is_some());
-    }
-
-    fn head_report(id: &str, terminal: u32) -> master::Report {
-        master::Report {
-            master_terminal: 1,
-            at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            needs: vec![master::Need {
-                id: id.to_string(),
-                session: "app".to_string(),
-                terminal,
-                generation: None,
-                state: "blocked".to_string(),
-                summary: "soru".to_string(),
-                report: String::new(),
-            }],
-            last_report: String::new(),
-            heartbeat_s: 15,
-        }
-    }
-
-    /// Clicks still agree with the paint when the report lengthens the block.
-    #[test]
-    fn clicks_agree_with_the_paint_when_a_report_is_present() {
-        let mut state = bare_state();
-        state.cols = 120;
-        state.lines = 24;
-        state.rows = vec![
-            agent(1, 1, "claude", "working"),
-            agent(2, 1, "codex", "blocked"),
-        ];
-        state.focused = 1;
-        state.master = Some((1, None));
-        state.master_open = true;
-        state.master_report = Some(head_report("w1", 2));
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        let left = screen::left_for(120, false);
-        let (pane_cols, _) = screen::pane_size_for(120, 24, false, state.right_now());
-        let master_col = (left + 1 + pane_cols as usize + 5) as u16;
-        let column_rows = (24usize).saturating_sub(screen::STATUS);
-        for row in 0..column_rows {
-            let want = master::hit(
-                &state.rows,
-                &state.spaces,
-                state.valid_master(),
-                state.focused,
-                state.master_report.as_ref(),
-                column_rows,
-                row,
-                master::width_for(state.cols as usize),
-            );
-            let got = state.clicked((row + screen::SIDEBAR_TOP) as u16, master_col);
-            match want {
-                Some(master::Hit::Header) => {
-                    assert!(matches!(got, Some(Clicked::Master)), "row {row}")
-                }
-                Some(master::Hit::Need(t)) => assert!(
-                    matches!(got, Some(Clicked::Terminal(u)) if u == t),
-                    "row {row}"
-                ),
-                Some(master::Hit::Footer) | None => assert!(got.is_none(), "row {row}"),
-            }
-        }
-        // The need is still reachable through the longer block.
-        let need_at = (0..column_rows)
-            .find(|row| {
-                matches!(
-                    master::hit(
-                        &state.rows,
-                        &state.spaces,
-                        state.valid_master(),
-                        state.focused,
-                        state.master_report.as_ref(),
-                        column_rows,
-                        *row,
-                        master::width_for(state.cols as usize),
-                    ),
-                    Some(master::Hit::Need(2))
-                )
-            })
-            .expect("the blocked terminal is in the column");
-        assert!(matches!(
-            state.clicked((need_at + screen::SIDEBAR_TOP) as u16, master_col),
-            Some(Clicked::Terminal(2))
-        ));
-    }
-
-    /// Approving files the head's id, and a second press does not duplicate it.
-    #[test]
-    fn approving_files_the_head_and_does_not_duplicate_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = bare_state();
-        state.session_dir = dir.path().to_path_buf();
-        state.master_shown = true;
-        // The ask names a live terminal: ghosts file nothing, so the head
-        // needs its row on the index.
-        state.rows = vec![agent(2, 1, "codex", "blocked")];
-        state.master_report = Some(head_report("w9", 2));
-        approve_head(&mut state, "approved");
-        assert_eq!(state.message.as_deref(), Some("approved w9"));
-        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
-            .expect("list")
-            .flatten()
-            .collect();
-        assert_eq!(files.len(), 1, "one verdict file");
-        approve_head(&mut state, "approved");
-        assert_eq!(state.message.as_deref(), Some("already pending w9"));
-        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
-            .expect("list")
-            .flatten()
-            .collect();
-        assert_eq!(files.len(), 1, "no duplicate verdict");
-    }
-
-    /// Approving answers the painted head, not the file head: the report
-    /// lists done first, but the column paints blocked first.
-    #[test]
-    fn approving_answers_the_painted_head() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = bare_state();
-        state.session_dir = dir.path().to_path_buf();
-        state.master_shown = true;
-        state.rows = vec![
-            agent(1, 1, "claude", "done"),
-            agent(2, 1, "codex", "blocked"),
-        ];
-        let mut report = head_report("w-blocked", 2);
-        report.needs.insert(
-            0,
-            master::Need {
-                id: "w-done".to_string(),
-                session: "app".to_string(),
-                terminal: 1,
-                generation: None,
-                state: "done".to_string(),
-                summary: String::new(),
-                report: String::new(),
-            },
-        );
-        state.master_report = Some(report);
-        approve_head(&mut state, "approved");
-        assert_eq!(state.message.as_deref(), Some("approved w-blocked"));
-        assert!(
-            !master::is_pending(dir.path(), "w-done"),
-            "the file head stays unfired"
-        );
-    }
-
-    /// Approving with the column shut, with no report, or with an empty list
-    /// files nothing.
-    #[test]
-    fn approving_without_a_shown_head_files_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Shut: the key keeps its old meaning, which is nothing.
-        let mut state = bare_state();
-        state.session_dir = dir.path().to_path_buf();
-        state.master_shown = false;
-        state.master_report = Some(head_report("w9", 2));
-        // Through the same gate the key handler uses.
-        if state.master_shown {
-            approve_head(&mut state, "approved");
-        }
-        assert!(state.message.is_none());
-        // No report at all.
-        let mut state = bare_state();
-        state.session_dir = dir.path().to_path_buf();
-        state.master_shown = true;
-        approve_head(&mut state, "approved");
-        assert_eq!(state.message.as_deref(), Some("no pending approvals"));
-        // A report with an empty ask list.
-        let mut empty = head_report("w9", 2);
-        empty.needs.clear();
-        let mut state = bare_state();
-        state.session_dir = dir.path().to_path_buf();
-        state.master_shown = true;
-        state.master_report = Some(empty);
-        approve_head(&mut state, "rejected");
-        assert_eq!(state.message.as_deref(), Some("no pending approvals"));
-        assert!(!master::approvals_dir(dir.path()).exists());
-    }
-
-    /// Collapsed, the left is a strip: the same one-column hysteresis applies
-    /// at the narrower thresholds.
-    #[test]
-    fn the_hysteresis_holds_when_the_left_column_is_collapsed() {
-        let mut state = bare_state();
-        state.collapsed = true;
-        state.master_open = true;
-        let left = screen::left_for(80, true);
-        let width = master::width_for(80);
-        let hide_at = left + width + 2;
-        let show_at = hide_at + 1;
-        state.cols = 80;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        state.cols = hide_at as u16 + 1;
-        state.refresh_master_shown();
-        assert!(state.master_shown, "sitting on the threshold keeps showing");
-        state.cols = hide_at as u16;
-        state.refresh_master_shown();
-        assert!(!state.master_shown, "past it hides");
-        state.cols = hide_at as u16 + 1;
-        state.refresh_master_shown();
-        assert!(
-            !state.master_shown,
-            "the threshold alone does not bring it back"
-        );
-        state.cols = show_at as u16 + 1;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-    }
-
-    /// Toggling open on a narrow window asks but does not show: hiding is not
-    /// unpinning, and widening past the return threshold brings it back.
-    #[test]
-    fn toggling_open_while_narrow_asks_but_does_not_show() {
-        let mut state = bare_state();
-        state.cols = 60;
-        state.rows = vec![agent(1, 1, "claude", "working")];
-        state.focused = 1;
-        state.master = Some((1, None));
-        toggle_master(&mut state);
-        assert!(state.master_open);
-        assert!(!state.master_shown);
-        assert_eq!(state.valid_master(), Some((1, None)), "the pin is kept");
-        state.cols = 120;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-    }
-
-    /// Pin, report, paint and approve in one chain: the handoffs between the
-    /// four agree with each other.
-    #[test]
-    fn pin_report_paint_and_approve_agree_end_to_end() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = bare_state();
-        state.cols = 120;
-        state.lines = 24;
-        state.session_dir = dir.path().to_path_buf();
-        state.rows = vec![
-            agent(1, 1, "claude", "working"),
-            agent(2, 1, "codex", "blocked"),
-        ];
-        state.focused = 1;
-        pin_focused_as_master(&mut state);
-        assert_eq!(state.master, Some((1, None)));
-        // The master's file, as the loop writes it.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        std::fs::write(
-            master::report_path(dir.path()),
-            format!(
-                "{{\"master_terminal\": 1, \"at_unix\": {now}, \"needs\": [{{\"id\": \"w-e2e\", \"session\": \"app\", \"terminal\": 2, \"state\": \"blocked\", \"summary\": \"e2e soru\", \"report\": \"\"}}], \"last_report\": \"e2e rapor\", \"heartbeat_s\": 60}}"
-            ),
-        )
-        .expect("write the report");
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::Agents {
-                id: "index".to_string(),
-                agents: vec![
-                    agent(1, 1, "claude", "working"),
-                    agent(2, 1, "codex", "blocked"),
-                ],
-            },
-            &mut dirty,
-        );
-        let report = state.master_report.as_ref().expect("the report loaded");
-        assert_eq!(report.needs.first().map(|n| n.id.as_str()), Some("w-e2e"));
-        state.master_open = true;
-        state.refresh_master_shown();
-        assert!(state.master_shown);
-        let master = state.valid_master();
-        assert_eq!(master, Some((1, None)));
-        let painted = screen::paint(&screen::Frame {
-            rows: &state.rows,
-            spaces: &state.spaces,
-            space: state.space,
-            panes: &state.panes,
-            focused: state.focused,
-            snapshot: state.snapshot.as_ref(),
-            cols: state.cols,
-            lines: state.lines,
-            message: None,
-            hint: None,
-            fold: sidebar::Fold::all_open(),
-            palette: None,
-            prompt: None,
-            menu: None,
-            collapsed: state.collapsed,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            tick: state.tick,
-            view: state.view,
-            seen: &state.seen_done,
-            unseen: &state.unseen_finished,
-            master,
-            master_shown: state.master_shown,
-            master_report: state.master_report.as_ref(),
-            behind: &state.behind,
-        });
-        assert!(painted.contains("e2e soru"), "{painted:?}");
-        assert!(painted.contains("e2e rapor"), "{painted:?}");
-        approve_head(&mut state, "approved");
-        assert_eq!(state.message.as_deref(), Some("approved w-e2e"));
-        let files: Vec<_> = std::fs::read_dir(master::approvals_dir(dir.path()))
-            .expect("list")
-            .flatten()
-            .collect();
-        assert_eq!(files.len(), 1);
-        let body = std::fs::read_to_string(files[0].path()).expect("read");
-        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
-        assert_eq!(value["id"], "w-e2e");
-        assert_eq!(value["verdict"], "approved");
     }
 }

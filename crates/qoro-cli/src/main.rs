@@ -72,7 +72,6 @@ fn main() -> std::io::Result<()> {
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
         Some("agents") => run_agents(&args),
-        Some("master") => run_master(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
@@ -103,7 +102,6 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro agents [--json]  list every terminal and what it is doing\n\
                   \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
-                  \x20 qoro master brief  print the default supervisor instructions\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
                  \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
                  \x20                 doing and which conversation it is having\n\
@@ -1355,24 +1353,6 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
         }
         Ok(())
     })
-}
-
-/// `qoro master`: the supervisor account.
-///
-/// v1 has one verb: `brief` prints the default master instructions, the same
-/// text the repository ships, so the person and the panel never disagree
-/// about what the master was told. Spawning or pinning stays by hand: there
-/// is no create-terminal CLI, and adding one to serve setup would put process
-/// spawning on the surface G7 keeps narrow.
-fn run_master(args: &[String]) -> std::io::Result<()> {
-    let usage = "usage: qoro master brief";
-    match args.get(2).map(String::as_str) {
-        Some("brief") => {
-            print!("{}", include_str!("../../../docs/master-brief.md"));
-            Ok(())
-        }
-        _ => Err(std::io::Error::other(usage.to_string())),
-    }
 }
 
 /// One terminal on one line, for a person skimming `qoro agents`.

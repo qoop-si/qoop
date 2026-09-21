@@ -102,7 +102,7 @@ pub enum Action {
     ///
     /// Said, not fetched: the interface never touches the network, it only reads the
     /// notice `qoro update --check` left, and the install itself runs outside, with no
-    /// session live. Uppercase because lowercase `u` already rejects a master proposal.
+    /// session live.
     Update,
     /// ctrl-a m, the menu.
     Menu,
@@ -146,18 +146,6 @@ pub enum Action {
     /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
     /// alive as a tab. Lowercase `x` keeps killing the terminal.
     DetachPane,
-    /// ctrl-a E: toggle the master column on the right.
-    ///
-    /// Uppercase on purpose, like the pane moves: lowercase `e` is not a command, and
-    /// the master column is the third column the way the moves are the third direction.
-    MasterPanel,
-    /// ctrl-a a: approve the head of the master approval queue.
-    ///
-    /// Acts only while the master column is open; anywhere else it keeps its old
-    /// meaning, which is nothing: an unknown command byte is dropped.
-    MasterApprove,
-    /// ctrl-a u: reject the head of the master approval queue.
-    MasterReject,
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
@@ -308,9 +296,6 @@ impl Keys {
                     b'o' => Action::PaneNext,
                     b'z' => Action::Zoom,
                     b'X' => Action::DetachPane,
-                    b'E' => Action::MasterPanel,
-                    b'a' => Action::MasterApprove,
-                    b'u' => Action::MasterReject,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -471,23 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn the_master_keys_toggle_the_column_and_answer_the_queue() {
-        let mut keys = Keys::default();
-        assert_eq!(keys.feed(b"\x01E"), vec![Action::MasterPanel]);
-        assert_eq!(keys.feed(b"\x01a"), vec![Action::MasterApprove]);
-        assert_eq!(keys.feed(b"\x01u"), vec![Action::MasterReject]);
-        // In order, like they arrive from a hand: toggle, approve, reject.
-        assert_eq!(
-            keys.feed(b"\x01E\x01a\x01u"),
-            vec![
-                Action::MasterPanel,
-                Action::MasterApprove,
-                Action::MasterReject,
-            ]
-        );
-    }
-
-    #[test]
     fn a_bare_ctrl_q_detaches_wherever_it_appears() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x11"), vec![Action::Detach]);
@@ -543,10 +511,10 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_u_names_the_waiting_update_while_lowercase_rejects_a_master() {
+    fn uppercase_u_names_the_waiting_update_while_lowercase_is_dropped() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01U"), vec![Action::Update]);
-        assert_eq!(keys.feed(b"\x01u"), vec![Action::MasterReject]);
+        assert_eq!(keys.feed(b"\x01u"), Vec::<Action>::new());
     }
 
     #[test]

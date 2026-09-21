@@ -252,10 +252,6 @@ fn the_new_rows_are_enumerated_as_their_bare_forms() {
         !commands.iter().any(|c| c.iter().any(|a| a.contains('['))),
         "an optional group leaked into the enumeration: {commands:?}"
     );
-    assert!(
-        commands.contains(&vec!["master".to_string(), "brief".to_string()]),
-        "`qoro master brief` is not enumerated: {commands:?}"
-    );
 }
 
 /// The document and the binary agree about what exists.
