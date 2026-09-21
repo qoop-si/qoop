@@ -1640,6 +1640,14 @@ async fn drive(
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
+                    // The automatic master raises on a clock of its own: a quiet
+                    // agent means a quiet daemon, and the raise would stall between
+                    // start and brief waiting for traffic that never comes. The
+                    // tick already exists for acks; the poll writes nothing once
+                    // briefed, so it costs one check per two seconds.
+                    if state.auto_master.as_ref().is_some_and(|raised| !raised.briefed) {
+                        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty).await?;
+                    }
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),
@@ -5201,6 +5209,51 @@ mod tests {
         assert!(
             !state.layouts.get(&1).is_some_and(|l| l.contains(1)),
             "the replaced tile is gone"
+        );
+    }
+
+    /// The idle stall: a quiet agent means a quiet daemon, and only the ack
+    /// tick wakes the loop. The raise must still run from start to briefed on
+    /// ticks alone, with no index or render arriving in between.
+    #[tokio::test]
+    async fn the_raise_completes_on_ticks_alone_with_no_daemon_traffic() {
+        let mut state = bare_state();
+        state.space = Some(1);
+        let mut rows = vec![agent(2, 1, "opencode", "working")];
+        rows[0].generation = Some(4);
+        state.rows = rows;
+        state.master_synced = true;
+        state.auto_master = Some(AutoMaster {
+            terminal: 2,
+            agent: "opencode".to_string(),
+            rounds: 0,
+            last_program: None,
+            started: false,
+            briefed: false,
+        });
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0u32;
+        let mut dirty = false;
+        // First tick starts the agent in the fresh shell.
+        let mut wr = Vec::new();
+        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty)
+            .await
+            .expect("start writes");
+        assert!(!wr.is_empty(), "nothing was typed into the shell");
+        assert!(state.auto_master.as_ref().is_some_and(|r| r.started));
+        assert!(!state.auto_master.as_ref().is_some_and(|r| r.briefed));
+        // The agent shows in the index; the next tick briefs and pins, still
+        // with no daemon traffic in between.
+        let mut wr = Vec::new();
+        poll_auto_master(&mut state, &mut seqs, &mut control_seq, &mut wr, &mut dirty)
+            .await
+            .expect("brief writes");
+        assert!(!wr.is_empty(), "the brief never went out");
+        assert!(state.auto_master.as_ref().is_some_and(|r| r.briefed));
+        assert_eq!(
+            state.master,
+            Some((2, Some(4))),
+            "the pin names the live generation"
         );
     }
 
