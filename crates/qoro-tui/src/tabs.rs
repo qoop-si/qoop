@@ -5,10 +5,10 @@
 //! bar answers "what did I open", and a shell a person started and then could not reach
 //! again is a terminal they have lost.
 //!
-//! Pure text, as everywhere else in this crate. The focused tab is bracketed rather than
-//! merely highlighted, so it survives a screenshot, a test assertion and a terminal with no
-//! colour. The brackets sit where the tab's own padding would be, so the bar does not shift
-//! sideways every time the focus moves.
+//! Pure text, as everywhere else in this crate. The focused tab is colour,
+//! not brackets: the pill background says which tab has the keyboard, and
+//! every tab keeps the same text with or without it, so the bar never shifts
+//! sideways when the focus moves.
 
 use crate::sidebar::Line;
 use qoro_runtime::control::AgentRow;
@@ -31,7 +31,7 @@ const MAX_LABEL: usize = 12;
 ///
 /// One line, so one colour, and therefore no colour: a bar carries several terminals in
 /// several states and a single hint for all of them would be a hint about none of them. The
-/// caller paints the focused tab from the brackets it can see in the text.
+/// caller paints the focused tab from the ink [`painted`] marks it with.
 /// How one piece of the bar is painted.
 ///
 /// Three, not a colour per state. A tab bar carries several terminals in several states
@@ -153,7 +153,7 @@ fn segments(
     let mut out = Vec::with_capacity(terminals.len() + 1);
     let first = scrolled(terminals, focused, budget, unseen);
     for (at, row) in terminals.iter().enumerate().skip(first) {
-        let text = tab(row, at + 1, row.terminal == focused, focused, unseen);
+        let text = tab(row, at + 1, focused, unseen);
         let wide = crate::width::width(&text);
         if used + wide > budget {
             break;
@@ -184,15 +184,7 @@ fn scrolled(
         let fits = terminals[first..=at]
             .iter()
             .enumerate()
-            .map(|(i, row)| {
-                crate::width::width(&tab(
-                    row,
-                    first + i + 1,
-                    row.terminal == focused,
-                    focused,
-                    unseen,
-                ))
-            })
+            .map(|(i, row)| crate::width::width(&tab(row, first + i + 1, focused, unseen)))
             .sum::<usize>()
             <= budget;
         if fits {
@@ -203,19 +195,13 @@ fn scrolled(
     first
 }
 
-/// One tab: its label, with a space on each side, or brackets when it has the keyboard.
+/// One tab: its label, with a space on each side.
 ///
-/// The brackets take the place of the spaces rather than adding to them, so every tab keeps
-/// the same width whether or not it is focused.
-fn tab(
-    row: &AgentRow,
-    position: usize,
-    focused: bool,
-    focus: u32,
-    unseen: &crate::sidebar::Unseen,
-) -> String {
-    let (open, close) = if focused { ('[', ']') } else { (' ', ' ') };
-    format!("{open}{}{close}", label(row, position, focus, unseen))
+/// The focused tab reads the same text as an unfocused one: [`painted`] marks
+/// it with [`Ink::Focused`] instead, so the bar never shifts sideways when
+/// the focus moves.
+fn tab(row: &AgentRow, position: usize, focus: u32, unseen: &crate::sidebar::Unseen) -> String {
+    format!(" {} ", label(row, position, focus, unseen))
 }
 
 /// The state dot a tab carries, so the bar answers "what is it doing" without
@@ -328,6 +314,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -348,6 +335,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -400,10 +388,28 @@ mod tests {
     }
 
     #[test]
-    fn the_focused_tab_is_marked_in_plain_text() {
-        let line = render(&sample(), 3, 40, &crate::sidebar::Unseen::new());
-        assert!(line.text.contains("[3 private o]"), "{:?}", line.text);
-        assert!(!line.text.contains("[2 tue o]"));
+    fn the_focused_tab_is_marked_by_ink_and_not_by_text() {
+        // The text reads the same focused or not: the pill background carries
+        // it, so the bar never shifts when the focus moves.
+        let plain = render(&sample(), 9, 40, &crate::sidebar::Unseen::new());
+        let focused = render(&sample(), 3, 40, &crate::sidebar::Unseen::new());
+        assert_eq!(plain.text, focused.text);
+        assert!(!focused.text.contains('['), "{:?}", focused.text);
+        let pieces = painted(&sample(), 3, 40, &crate::sidebar::Unseen::new());
+        assert!(
+            pieces
+                .iter()
+                .any(|(text, ink)| text.contains("3 private") && *ink == Ink::Focused),
+            "{pieces:?}"
+        );
+        assert!(
+            pieces
+                .iter()
+                .filter(|(_, ink)| *ink == Ink::Focused)
+                .count()
+                == 1,
+            "exactly one tab owns the keyboard: {pieces:?}"
+        );
     }
 
     #[test]
@@ -411,7 +417,7 @@ mod tests {
         let unfocused = render(&sample(), 9, 40, &crate::sidebar::Unseen::new());
         for focused in 1..=4 {
             let line = render(&sample(), focused, 40, &crate::sidebar::Unseen::new());
-            assert_eq!(line.text.len(), unfocused.text.len(), "{:?}", line.text);
+            assert_eq!(line.text, unfocused.text, "{:?}", line.text);
         }
     }
 
@@ -428,8 +434,8 @@ mod tests {
     #[test]
     fn tabs_past_the_right_edge_are_dropped_and_the_ones_before_them_are_not() {
         let line = render(&sample(), 1, 12, &crate::sidebar::Unseen::new());
-        // Room for `[1]`, ` + `, and nothing else.
-        assert_eq!(line.text, "[1] +       ");
+        // Room for ` 1 `, ` + `, and nothing else.
+        assert_eq!(line.text, " 1  +       ");
         assert!(!line.text.contains("tue"));
     }
 
@@ -451,11 +457,7 @@ mod tests {
                 let want = rows.iter().enumerate().find(|(at, r)| {
                     // Where the label of this terminal was drawn, found in the painted bar
                     // rather than recomputed, so the test is not a copy of the code.
-                    let name = if r.terminal == 3 {
-                        format!("[{}]", label(r, at + 1, 3, &crate::sidebar::Unseen::new()))
-                    } else {
-                        format!(" {} ", label(r, at + 1, 3, &crate::sidebar::Unseen::new()))
-                    };
+                    let name = format!(" {} ", label(r, at + 1, 3, &crate::sidebar::Unseen::new()));
                     match text.find(&name) {
                         Some(byte) => {
                             let start = crate::width::width(&text[..byte]);
@@ -492,6 +494,7 @@ mod tests {
         for cols in [20usize, 40, 80, 200] {
             for focused in 1..=12u32 {
                 let line = render(&many, focused, cols, &crate::sidebar::Unseen::new());
+                let pieces = painted(&many, focused, cols, &crate::sidebar::Unseen::new());
                 let clickable: Vec<u32> = (0..cols)
                     .filter_map(|col| {
                         match hit(&many, focused, cols, col, &crate::sidebar::Unseen::new()) {
@@ -501,7 +504,7 @@ mod tests {
                     })
                     .collect();
                 assert!(
-                    line.text.contains('['),
+                    pieces.iter().any(|(_, ink)| *ink == Ink::Focused),
                     "{cols} columns, focus {focused}: nothing is marked: {:?}",
                     line.text
                 );

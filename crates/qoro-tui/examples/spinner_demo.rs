@@ -35,6 +35,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         rule: None,
         manifest: None,
         agent_session: None,
+        agent_title: None,
     }
 }
 
@@ -62,7 +63,6 @@ fn main() {
         lines: 16,
         message: Some(message),
         hint: None,
-        fold: sidebar::Fold::all_open(),
         view: sidebar::View::Grouped,
         seen: &seen,
         unseen: &unseen,

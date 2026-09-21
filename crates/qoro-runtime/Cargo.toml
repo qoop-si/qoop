@@ -20,6 +20,7 @@ qoro-proto = { path = "../qoro-proto" }
 qoro-pty = { path = "../qoro-pty" }
 qoro-terminal = { path = "../qoro-terminal" }
 qoro-detect = { path = "../qoro-detect" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 libc = { workspace = true }

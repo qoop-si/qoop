@@ -1409,6 +1409,94 @@ fn subscribe(
 /// A table and not a derive, because this string is on the socket: ADR-010 freezes the
 /// shape of what crosses it, and a rename in the domain would silently rename a field
 /// clients match on.
+
+/// Opencode conversation titles, read out of opencode's own database.
+///
+/// Best effort and cached: the hook already reports the session id, and the
+/// title sits in opencode's storage next to that id, so the panel can name
+/// the conversation the way the agent does. A rename arrives on its own
+/// because entries go stale after a minute. Anything unreadable (no database,
+/// unknown id, locked) reads as absent, never as an error: the panel falls
+/// back to the shortened id.
+fn agent_title(session: Option<&str>) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<HashMap<String, (Option<String>, Instant)>>> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(60);
+    let id = session.filter(|s| !s.trim().is_empty())?;
+    // Other agents' ids never touch the cache or the database: a miss per
+    // poll per agent would be pure overhead for a title that cannot exist.
+    if !id.starts_with("ses_") {
+        return None;
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some((title, at)) = cache.get(id)
+        && at.elapsed() < TTL
+    {
+        return title.clone();
+    }
+    let title = opencode_session_title(id);
+    if let Ok(mut cache) = cache.lock() {
+        // Bounded: entries only refresh, so evict the stale tail past this.
+        if cache.len() > 512 {
+            cache.retain(|_, (_, at)| at.elapsed() < TTL);
+        }
+        cache.insert(id.to_string(), (title.clone(), Instant::now()));
+    }
+    title
+}
+
+/// One title out of opencode's database, or nothing.
+fn opencode_session_title(id: &str) -> Option<String> {
+    opencode_db_path().and_then(|db| opencode_session_title_at(&db, id))
+}
+
+/// Where opencode keeps its database, when this machine has one.
+///
+/// XDG first, then the plain home layout this machine's own opencode uses,
+/// then the macOS application-support layout other installs use. First hit
+/// wins; nothing found reads as absent downstream.
+fn opencode_db_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(xdg).join("opencode/opencode.db"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(&home).join(".local/share/opencode/opencode.db"));
+        candidates
+            .push(PathBuf::from(&home).join("Library/Application Support/OpenCode/opencode.db"));
+        candidates
+            .push(PathBuf::from(&home).join("Library/Application Support/opencode/opencode.db"));
+    }
+    candidates.into_iter().find(|db| db.is_file())
+}
+
+/// One title out of the database at this path, or nothing. The id is
+/// opencode's own session key, so no directory matching is needed; a first
+/// line, trimmed, so a stored newline never reaches a thirty column row.
+///
+/// Synchronous on the control path on purpose: it runs at most once per
+/// session per minute (the cache above), and a single indexed primary-key
+/// read is cheaper than a thread hop.
+fn opencode_session_title_at(db: &Path, id: &str) -> Option<String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let title: Option<String> = conn
+        .query_row("SELECT title FROM session WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .ok()?;
+    title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| t.lines().next())
+        .map(str::to_string)
+}
+
 fn state_name(state: qoro_domain::AgentRuntimeState) -> &'static str {
     use qoro_domain::AgentRuntimeState as S;
     match state {
@@ -1877,6 +1965,10 @@ async fn handle_control(
                         .map(|a| state_name(a.belief.state))
                         .unwrap_or("unknown")
                         .to_string();
+                    // The session id is read once: the title resolves from the
+                    // same id, so one lookup serves both fields.
+                    let agent_session = terminals.session_of(terminal);
+                    let agent_title = agent_title(agent_session.as_deref());
                     // The explanation rides the row: what holds the belief,
                     // and what the screen last matched. A client that does
                     // not know these fields ignores them; `qoro agents
@@ -1930,7 +2022,8 @@ async fn handle_control(
                         source,
                         rule,
                         manifest,
-                        agent_session: terminals.session_of(terminal),
+                        agent_session,
+                        agent_title,
                     }
                 })
                 .collect();
@@ -4142,6 +4235,44 @@ fn write_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod session_title_tests {
+    use super::opencode_session_title_at;
+
+    fn fake_db_with(title: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).expect("create");
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL);")
+            .expect("schema");
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            ["ses_test123", title],
+        )
+        .expect("insert");
+        (dir, db)
+    }
+
+    /// The panel names the conversation the way the agent does: the title out
+    /// of opencode's own database, keyed by the reported session id. No
+    /// environment is touched: the lookup takes the database path.
+    #[test]
+    fn a_reported_session_resolves_to_its_title() {
+        let (_dir, db) = fake_db_with("Samimi selamla\u{15f}ma sohbeti");
+        assert_eq!(
+            opencode_session_title_at(&db, "ses_test123"),
+            Some("Samimi selamla\u{15f}ma sohbeti".to_string())
+        );
+        assert_eq!(opencode_session_title_at(&db, "ses_unknown"), None);
+        let (_dir, db) = fake_db_with("  \nSecond line");
+        assert_eq!(
+            opencode_session_title_at(&db, "ses_test123"),
+            Some("Second line".to_string()),
+            "a stored newline never reaches the row"
+        );
     }
 }
 

@@ -112,13 +112,6 @@ const UNKNOWN: &str = "unknown";
 /// is false.
 const UNNAMED: &str = "agent";
 
-/// The group an unread done row draws under in the folded panel.
-///
-/// A finished agent nobody has looked at is neither `done` nor `idle`: it is
-/// news. Its dot keeps the done sage, and the folded panel lists it under
-/// its own open `new` header so it never hides behind the finished fold.
-const NEW_GROUP: &str = "new";
-
 /// The percentage of the column the spaces panel holds, its title and the blank rows under
 /// it included.
 ///
@@ -139,8 +132,8 @@ const SPACES_FLOOR: usize = 4;
 pub enum Hit {
     Space(i64),
     Terminal(u32),
-    /// A collapsed group: a click opens it.
-    Fold(Group),
+    /// The `+` at the corner of the spaces title: a space, named first.
+    NewSpace,
     /// The `new` on the row between the panels: a terminal in the space on screen.
     New,
     /// The `menu` beside it: everything that is not a space, a tab or an agent.
@@ -149,94 +142,14 @@ pub enum Hit {
     Collapse,
 }
 
-/// One collapsible group of the agents panel.
+/// How the agents panel orders its rows: daemon order with what needs a
+/// person first, or flat by urgency.
 ///
-/// `NeedsYou` is not here on purpose: blocked and failed rows are the reason the
-/// panel exists, so they are always open and never fold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Group {
-    Running,
-    Finished,
-    Idle,
-}
-
-impl Group {
-    fn name(self) -> &'static str {
-        match self {
-            Group::Running => "running",
-            Group::Finished => "finished",
-            Group::Idle => "idle",
-        }
-    }
-}
-
-/// Which idle groups are expanded.
-///
-/// Needs-you (`blocked`, `failed`) and running (`working`, `starting`) are always
-/// open: they are what the panel is for. `finished` (`done`) and the rest start
-/// closed, so nine rows become three. A click on a fold line opens that group;
-/// `ctrl-a f` toggles both at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fold {
-    pub finished_open: bool,
-    pub idle_open: bool,
-}
-
-impl Fold {
-    /// Every group open: what the panel drew before folding existed.
-    pub fn all_open() -> Self {
-        Fold {
-            finished_open: true,
-            idle_open: true,
-        }
-    }
-
-    /// Needs-you and running open, the rest closed.
-    pub fn default_closed() -> Self {
-        Fold {
-            finished_open: false,
-            idle_open: false,
-        }
-    }
-
-    /// Open one group, leaving the other as it was.
-    pub fn open(&mut self, group: Group) {
-        match group {
-            Group::Running => {}
-            Group::Finished => self.finished_open = true,
-            Group::Idle => self.idle_open = true,
-        }
-    }
-
-    /// Both open or both closed, whichever is the change.
-    pub fn toggle_all(&mut self) {
-        if self.finished_open && self.idle_open {
-            *self = Fold::default_closed();
-        } else {
-            *self = Fold::all_open();
-        }
-    }
-
-    fn is_open(self, group: Group) -> bool {
-        match group {
-            Group::Running => true,
-            Group::Finished => self.finished_open,
-            Group::Idle => self.idle_open,
-        }
-    }
-}
-
-impl Default for Fold {
-    fn default() -> Self {
-        Fold::default_closed()
-    }
-}
-
-/// How the agents panel lists its rows: in labelled groups, or flat by urgency.
-///
-/// Grouped is the panel a person already knows. Priority is the same rows with
-/// no headers, sorted so the one that needs a person is always on top: the
-/// inbox view of the fleet. Toggled with `ctrl-a g`.
+/// Grouped is the panel a person already knows. Priority is the same rows
+/// sorted so the one that needs a person is always on top: the inbox view of
+/// the fleet. Both are flat lists: the state dot carries the state, and no
+/// header tree sits above calm rows. The title names the order. Toggled with
+/// `ctrl-a g`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
     #[default]
@@ -339,17 +252,12 @@ pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen, _unseen: &Uns
     false
 }
 
-/// The group an agent state belongs to.
+/// Whether the state reads as running: working or starting.
 ///
 /// Blocked and failed never reach this: the caller lifts them into the
-/// always-open needs-you section first, so no group owns them and no fold can
-/// hide them.
-fn group_of(state: &str) -> Group {
-    match state {
-        "working" | "starting" => Group::Running,
-        "done" => Group::Finished,
-        _ => Group::Idle,
-    }
+/// needs-you section first.
+fn is_running(state: &str) -> bool {
+    matches!(state, "working" | "starting")
 }
 
 /// Whether the state always stays open, whatever the fold says.
@@ -388,13 +296,13 @@ pub fn render(
         .collect()
 }
 
-/// Both panels of the left column with idle groups folded, painted into `height` rows.
+/// Both panels of the left column, painted into `height` rows.
 ///
 /// Same contract as [`render`]: exactly `height` lines of exactly [`WIDTH`]
-/// columns. Collapsed groups become one counted line each, so the list reads
-/// instead of being skimmed. Empty groups leave no line at all.
+/// columns. One flat list: every agent draws its rows, nothing folds and no
+/// group header sits above calm rows.
 ///
-/// Nine arguments and not a context struct: every caller already holds each
+/// Eight arguments and not a context struct: every caller already holds each
 /// piece separately, and a struct would move the same list one line down.
 #[allow(clippy::too_many_arguments)]
 pub fn render_folded(
@@ -403,7 +311,6 @@ pub fn render_folded(
     focused_space: i64,
     focused_terminal: u32,
     height: usize,
-    fold: &Fold,
     tick: u64,
     view: View,
     seen: &Seen,
@@ -415,7 +322,6 @@ pub fn render_folded(
         focused_space,
         focused_terminal,
         height,
-        fold,
         tick,
         view,
         seen,
@@ -444,11 +350,9 @@ pub fn hit(
         .and_then(|(_, hit)| hit)
 }
 
-/// What a click on one screen row of the folded column means, counted from zero.
+/// What a click on one screen row of the column means, counted from zero.
 ///
-/// A click on a fold line opens that group; the caller repaints with the new fold.
-///
-/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+/// Eight arguments, like [`render_folded`]: same pieces, same reason.
 #[allow(clippy::too_many_arguments)]
 pub fn hit_folded(
     spaces: &[WorkspaceRow],
@@ -456,7 +360,6 @@ pub fn hit_folded(
     focused_space: i64,
     focused_terminal: u32,
     height: usize,
-    fold: &Fold,
     row: usize,
     view: View,
     seen: &Seen,
@@ -468,7 +371,6 @@ pub fn hit_folded(
         focused_space,
         focused_terminal,
         height,
-        fold,
         // Hit testing does not depend on the animation frame.
         0,
         view,
@@ -551,11 +453,14 @@ fn spaces_rows(spaces: usize, height: usize, agents_wanted: usize) -> usize {
 
 /// The spaces panel: its title, then one row per space, scrolled to keep the focused one on
 /// screen and padded out to the rows it was given.
+///
+/// The `+` at the title's right corner makes a space directly: the same
+/// naming box `ctrl-a w` opens, without the key first.
 fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
     }
-    let mut out = vec![(title(SPACES_TITLE), None)];
+    let mut out = vec![(spaces_title(), None)];
     // The last row of this panel is the two things that are not a space: starting one more
     // terminal, and everything else. They sit at the foot of the upper panel rather than in
     // a bar of their own, because the column has two panels and a third strip would be a
@@ -755,12 +660,21 @@ fn push_agent_lines(
     ));
 }
 
-/// What the first row names: the agent's own conversation id, and only
-/// that. No program beside it: the row below already says what runs in
-/// which tab, and a program prefix is how four live sessions all read
-/// `opencode`. Without a reported session the tab's own label answers,
-/// which prefers a chosen name over whatever happens to be running.
+/// What the first row names: the agent's own conversation title, and only
+/// that. The title is what the agent calls the conversation, and it follows
+/// renames on its own because the daemon re-resolves it while the
+/// conversation runs. Without a title the shortened conversation id answers,
+/// and without that the tab's own label, which prefers a chosen name over
+/// whatever happens to be running. No program beside any of them: the row
+/// below already says what runs in which tab, and a program prefix is how
+/// four live sessions all read `opencode`.
 fn session_name(agent: &AgentRow) -> String {
+    if let Some(title) = agent.agent_title.as_deref() {
+        let title = title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+    }
     match short_session(agent.agent_session.as_deref()) {
         Some(short) => short,
         None => label(agent),
@@ -787,14 +701,14 @@ fn short_session(session: Option<&str>) -> Option<String> {
     }
 }
 
-/// Every row of the folded column, with what a click on it means.
+/// Every row of the column, with what a click on it means.
 ///
 /// Same contract as [`rows`]: [`render_folded`] and [`hit_folded`] share this one
 /// function so a click lands on the row a person aimed at by construction.
 /// Also shared with the screen painter, which needs the hits to mark the
 /// keyboard's own rows: the text alone cannot say which row is selected.
 ///
-/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+/// Eight arguments, like [`render_folded`]: same pieces, same reason.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rows_folded(
     spaces: &[WorkspaceRow],
@@ -802,7 +716,6 @@ pub(crate) fn rows_folded(
     focused_space: i64,
     focused_terminal: u32,
     height: usize,
-    fold: &Fold,
     tick: u64,
     view: View,
     seen: &Seen,
@@ -817,7 +730,6 @@ pub(crate) fn rows_folded(
         focused_space,
         focused_terminal,
         height,
-        fold,
         tick,
         view,
         seen,
@@ -981,7 +893,7 @@ fn update_available() -> Option<String> {
 
 /// The column as it is when it is not folded away.
 ///
-/// Nine arguments, like [`render_folded`]: same pieces, same reason.
+/// Eight arguments, like [`render_folded`]: same pieces, same reason.
 #[allow(clippy::too_many_arguments)]
 fn rows_open(
     spaces: &[WorkspaceRow],
@@ -989,7 +901,6 @@ fn rows_open(
     focused_space: i64,
     focused_terminal: u32,
     height: usize,
-    fold: &Fold,
     tick: u64,
     view: View,
     seen: &Seen,
@@ -998,16 +909,8 @@ fn rows_open(
     // What the lower panel wants, asked before the column is divided. The division is a
     // place and not a consequence of how many spaces there happen to be, but a panel that
     // held its half while the list below it scrolled would be a place at the wrong price.
-    let (content, shown, total) = agents_content(
-        spaces,
-        agents,
-        focused_terminal,
-        fold,
-        tick,
-        view,
-        seen,
-        unseen,
-    );
+    let (content, shown, total) =
+        agents_content(spaces, agents, focused_terminal, tick, view, seen, unseen);
     let split = spaces_rows(spaces.len(), height, content.len() + 1);
     let mut out = spaces_panel(spaces, focused_space, split);
     let rest = height - split;
@@ -1019,6 +922,7 @@ fn rows_open(
             total,
             focused_terminal,
             rest - 1,
+            view,
         ));
     } else {
         out.extend(lay_out_agents(
@@ -1027,24 +931,22 @@ fn rows_open(
             total,
             focused_terminal,
             rest,
+            view,
         ));
     }
     out
 }
 
-/// The agents panel with quiet groups folded into one counted line each.
+/// The agents panel: one flat list, needs-you first in daemon order and the
+/// rest after it, then by urgency in the priority view.
 ///
-/// Open agents draw exactly the rows [`agents_panel`] draws for them, so an
-/// expanded panel is the panel a person already knows. What changes is only that
-/// a closed group is one line carrying its count, and a click on it opens it.
-/// The group holding the focused terminal is always open: hiding the keyboard's
-/// own row behind a fold would read as a terminal that died.
+/// Every agent draws exactly the rows [`agents_panel`] draws for it. Nothing
+/// folds and nothing hides: the state dot carries the state.
 #[allow(clippy::too_many_arguments)]
 fn agents_content(
     spaces: &[WorkspaceRow],
     agents: &[AgentRow],
     focused: u32,
-    fold: &Fold,
     tick: u64,
     view: View,
     seen: &Seen,
@@ -1067,22 +969,8 @@ fn agents_content(
             0,
         );
     }
-    let focused_state = listed
-        .iter()
-        .find(|a| a.terminal == focused)
-        .map(|a| a.state.as_str());
-    // A group is open when the fold says so, or when the keyboard is inside it.
-    // Needs-you rows belong to no group, so a focused blocked row opens nothing:
-    // its own section is always open anyway.
-    let open = |group: Group| {
-        if focused_state.is_some_and(|s| !needs_you(s) && group_of(s) == group) {
-            true
-        } else {
-            fold.is_open(group)
-        }
-    };
-    // The priority view: the same rows, no headers, sorted so what wants a
-    // person is on top. Folds do not apply: an inbox hides nothing.
+    // The priority view: the same rows sorted so what wants a person is on
+    // top. Both views are flat lists; the order is the only difference.
     if view == View::Priority {
         let mut ordered: Vec<&AgentRow> = listed.to_vec();
         ordered.sort_by_key(|a| priority_of(a, focused, seen, unseen));
@@ -1109,12 +997,7 @@ fn agents_content(
         .collect();
     let running: Vec<&AgentRow> = listed
         .iter()
-        .filter(|a| {
-            !needs_you(&a.state)
-                && !unobserved(&a.state)
-                && group_of(&a.state) == Group::Running
-                && open(Group::Running)
-        })
+        .filter(|a| !needs_you(&a.state) && !unobserved(&a.state) && is_running(&a.state))
         .copied()
         .collect();
     let finished: Vec<&AgentRow> = listed
@@ -1124,13 +1007,11 @@ fn agents_content(
                 && !unobserved(&a.state)
                 && a.state == "done"
                 && !is_new(a, focused, seen, unseen)
-                && open(Group::Finished)
         })
         .copied()
         .collect();
-    // Rows nobody has looked at yet: always open, under their own header,
-    // so finished-but-unread never hides behind the finished fold. Daemon
-    // `done` and derived idle-after-work share the header and the sage.
+    // Rows nobody has looked at yet: daemon `done` and derived
+    // idle-after-work share the sage dot.
     let new_done: Vec<&AgentRow> = listed
         .iter()
         .filter(|a| !needs_you(&a.state) && is_new(a, focused, seen, unseen))
@@ -1141,22 +1022,12 @@ fn agents_content(
         .filter(|a| {
             !needs_you(&a.state)
                 && !unobserved(&a.state)
-                && group_of(&a.state) == Group::Idle
+                && !is_running(&a.state)
+                && a.state != "done"
                 && !is_new(a, focused, seen, unseen)
-                && open(Group::Idle)
         })
         .copied()
         .collect();
-    // An open group carries its own header with its count, so nine rows read as
-    // labelled groups rather than nine identical rows. A group that has just
-    // arrived and not been observed yet draws bare: it is news, not a group.
-    if !needs.is_empty() {
-        content.push(group_header(
-            "needs you",
-            needs.len(),
-            colour_for("blocked"),
-        ));
-    }
     for agent in needs {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
@@ -1165,59 +1036,21 @@ fn agents_content(
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
-    if !new_done.is_empty() {
-        content.push(group_header(NEW_GROUP, new_done.len(), colour_for("done")));
-    }
     for agent in new_done {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
-    }
-    if !running.is_empty() {
-        content.push(group_header(
-            "running",
-            running.len(),
-            colour_for("working"),
-        ));
     }
     for agent in running {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
-    if !finished.is_empty() {
-        content.push(group_header("finished", finished.len(), colour_for("done")));
-    }
     for agent in finished {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
     }
-    if !idle.is_empty() {
-        // Quiet, like the panel titles. Every other group header is the colour of what it
-        // holds, and idle holds the things that want nothing, so a header painted as
-        // ordinary text would be the loudest calm thing in the column.
-        content.push(group_header(
-            "idle",
-            idle.len(),
-            Some(crate::theme::Role::Title),
-        ));
-    }
     for agent in idle {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
         shown += 1;
-    }
-    for group in [Group::Finished, Group::Idle] {
-        let n = listed
-            .iter()
-            .filter(|a| {
-                !needs_you(&a.state)
-                    && !unobserved(&a.state)
-                    && !is_new(a, focused, seen, unseen)
-                    && group_of(&a.state) == group
-                    && !open(group)
-            })
-            .count();
-        if n > 0 && !open(group) {
-            content.push(fold_line(group, n));
-        }
     }
     (content, shown, listed.len())
 }
@@ -1229,19 +1062,18 @@ fn lay_out_agents(
     total: usize,
     focused: u32,
     height: usize,
+    view: View,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
     }
-    let mut out = vec![(folded_title(shown, total), None)];
+    let mut out = vec![(agents_title(view, shown, total), None)];
     let body = height - 1;
     if body == 0 {
         return out;
     }
     // Flat scroll keeping the focused agent's first line visible with room for
-    // its second. Fold lines ride along at the end rather than being pinned:
-    // pinning them is a second scroll region and a second chance for a click
-    // to disagree with a paint.
+    // its second.
     let focus_row = content
         .iter()
         .position(|(_, hit)| *hit == Some(Hit::Terminal(focused)));
@@ -1261,57 +1093,30 @@ fn lay_out_agents(
     out
 }
 
-/// One open group's title: its name and how many agents are under it.
+/// The agents title, carrying the sort order on its right.
 ///
-/// A header with nothing under it is a promise the panel does not keep, so the
-/// caller only pushes one for a group that drew at least one agent. The count
-/// sits flush right, where the agent rows carry their states, so the column
-/// keeps one edge the eye can scan.
-fn group_header(
-    title: &str,
-    count: usize,
-    colour: Option<crate::theme::Role>,
-) -> (Line, Option<Hit>) {
-    let count = count.to_string();
-    let left = fit_to(&format!(" {title}"), WIDTH.saturating_sub(count.len() + 1));
-    (
-        Line {
-            text: format!("{left} {count}"),
-            colour,
-            accent: None,
-            indicator: None,
-        },
-        None,
-    )
-}
-
-/// One collapsed group: its count, and what a click on it does.
-fn fold_line(group: Group, count: usize) -> (Line, Option<Hit>) {
-    (
-        Line {
-            text: fit(&format!(" \u{25b8} {count} {}", group.name())),
-            colour: Some(crate::theme::Role::Faint),
-            accent: None,
-            indicator: None,
-        },
-        Some(Hit::Fold(group)),
-    )
-}
-
-/// The agents title, carrying how much of the list is on screen.
-///
-/// The full list draws the plain title, so an expanded panel is byte for byte the
-/// panel it folds from.
-fn folded_title(shown: usize, total: usize) -> Line {
-    if shown == total {
-        title(AGENTS_TITLE)
+/// Grouped or priority, the way the rows below are ordered: the header is the
+/// one place that says which. The counts ride along when the list scrolls past
+/// the window, so a clipped panel still says how much of itself is hidden.
+fn agents_title(view: View, shown: usize, total: usize) -> Line {
+    let mode = match view {
+        View::Grouped => "grouped",
+        View::Priority => "priority",
+    };
+    let left = if shown == total {
+        format!(" {AGENTS_TITLE}")
     } else {
-        Line {
-            text: fit(&format!(" {AGENTS_TITLE} {shown} of {total}")),
-            colour: Some(crate::theme::Role::Title),
-            accent: None,
-            indicator: None,
-        }
+        format!(" {AGENTS_TITLE} {shown} of {total}")
+    };
+    let text = format!(
+        "{}{mode}",
+        fit_to(&left, WIDTH.saturating_sub(mode.len() + 1)),
+    );
+    Line {
+        text: format!("{text} "),
+        colour: Some(crate::theme::Role::Title),
+        accent: None,
+        indicator: None,
     }
 }
 
@@ -1372,6 +1177,15 @@ fn footer_row() -> (Line, Option<Hit>) {
     )
 }
 
+/// What a click at one column of the spaces title means.
+///
+/// Only the `+` cell itself, the last cell of the row: the rule column beside
+/// it and the word beside that are nothing, the way the footer's halves are
+/// exact cells rather than a whole row.
+pub fn spaces_title_hit(col: usize) -> Option<Hit> {
+    (col == WIDTH).then_some(Hit::NewSpace)
+}
+
 /// What a click at one column of the footer row means.
 pub fn footer_hit(col: usize) -> Option<Hit> {
     if col <= crate::width::width(NEW_LABEL) {
@@ -1390,6 +1204,21 @@ const MENU_LABEL: &str = "menu";
 fn title(text: &str) -> Line {
     Line {
         text: fit(&format!(" {text}")),
+        colour: Some(crate::theme::Role::Title),
+        accent: None,
+        indicator: None,
+    }
+}
+
+/// The spaces title, carrying its `+` at the right corner.
+///
+/// The row itself answers nothing: only the corner cell makes a space, so a
+/// click on the word `spaces` is a no-op rather than a space nobody asked
+/// for. The caller asks again with the column, the way the footer's
+/// `new`/`menu` halves do.
+fn spaces_title() -> Line {
+    Line {
+        text: format!("{}+", fit_to(&format!(" {SPACES_TITLE}"), WIDTH - 1)),
         colour: Some(crate::theme::Role::Title),
         accent: None,
         indicator: None,
@@ -1484,6 +1313,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -1502,6 +1332,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -1541,11 +1372,28 @@ mod tests {
     #[test]
     fn both_panels_carry_their_own_title() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 1, 1, 14);
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            14,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
         let texts: Vec<&str> = lines.iter().map(|l| l.text.trim_end()).collect();
-        assert_eq!(texts[0], format!(" {SPACES_TITLE}"));
+        // The spaces title carries its `+` at the right corner; the agents
+        // title names the sort order there instead.
         assert!(
-            texts.iter().any(|t| *t == format!(" {AGENTS_TITLE}")),
+            texts[0].starts_with(&format!(" {SPACES_TITLE}")) && texts[0].ends_with('+'),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with(&format!(" {AGENTS_TITLE}")) && t.ends_with("grouped")),
             "{texts:?}"
         );
     }
@@ -1716,10 +1564,11 @@ mod tests {
             for (row, line) in lines.iter().enumerate() {
                 let text = line.text.trim_end().to_string();
                 let got = hit(&spaces, &agents, 2, 3, height, row);
-                let want = if text == format!(" {SPACES_TITLE}")
-                    || text == format!(" {AGENTS_TITLE}")
-                    || text.is_empty()
-                {
+                let want = if text == format!(" {AGENTS_TITLE}") || text.is_empty() {
+                    None
+                } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
+                    // Row-granular hit: the corner cell is asked with the
+                    // column elsewhere, so here the title is nothing.
                     None
                 } else if let Some(s) = spaces.iter().find(|s| text == format!(" {}", s.name)) {
                     Some(Hit::Space(s.id))
@@ -1787,6 +1636,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -1920,6 +1770,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reported_title_names_the_first_row_and_follows_renames() {
+        let spaces = vec![space(1, "app")];
+        let mut a = agent(1, 1, "opencode", "idle");
+        a.agent_session = Some("ses_abc".to_string());
+        a.agent_title = Some("Samimi selamla\u{15f}ma sohbeti".to_string());
+        let texts = agent_texts(&spaces, &[a.clone()], 1);
+        // The title wins over the id: the row reads the way the agent names
+        // the conversation, not the way the tab does.
+        assert!(
+            texts.iter().any(|t| t.contains("Samimi selamla")),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("ses_abc")),
+            "the id leaked past the title: {texts:?}"
+        );
+        // A rename arrives on its own: the next index carries the new title.
+        a.agent_title = Some("Basit kurulum".to_string());
+        let texts = agent_texts(&spaces, std::slice::from_ref(&a), 1);
+        assert!(
+            texts.iter().any(|t| t.contains("Basit kurulum")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
     fn a_long_session_is_shortened_to_its_prefix() {
         let spaces = vec![space(1, "app")];
         let mut a = agent(1, 1, "claude", "idle");
@@ -1957,6 +1833,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -1985,6 +1862,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2053,11 +1931,9 @@ mod tests {
     }
 
     #[test]
-    fn folded_needs_you_and_running_are_open_and_the_rest_is_two_lines() {
+    fn every_agent_draws_its_rows_needs_first_and_no_headers() {
         let (spaces, agents) = many_agents();
-        let fold = Fold::default_closed();
-        // Terminal 5 is done and already looked at, so it folds like before:
-        // the unread path gets its own test below.
+        // Terminal 5 is done and already looked at.
         let mut seen = Seen::new();
         seen.insert((5, 0));
         let lines = render_folded(
@@ -2065,8 +1941,7 @@ mod tests {
             &agents,
             2,
             1,
-            30,
-            &fold,
+            40,
             0,
             View::Grouped,
             &seen,
@@ -2076,8 +1951,7 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // Needs-you and running agents are drawn as usual, each under its own
-        // header carrying its count flush right.
+        // Needs-you agents are drawn as usual, first.
         assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
         // Static: running agents carry the working dot, no spinner, and no
         // state word on the right.
@@ -2091,49 +1965,55 @@ mod tests {
             !texts.iter().any(|t| t.ends_with("working")),
             "a state word leaked: {texts:?}"
         );
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.trim_start().starts_with("needs you") && t.trim_end().ends_with("2")),
-            "{texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.trim_start().starts_with("running") && t.trim_end().ends_with("2")),
-            "{texts:?}"
-        );
-        // Finished and idle are one counted line each.
-        assert!(texts.iter().any(|t| t.contains("1 finished")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("4 idle")), "{texts:?}");
-        // Four agents open, so eight rows: each agent's pair, needs-you first,
-        // then running.
+        // No group headers and no fold lines anywhere: the state dot carries
+        // the state. (Agent programs here never contain these words, so any
+        // hit is chrome.)
+        for header in ["needs you", "running", "finished", "idle", "▸"] {
+            assert!(
+                !texts.iter().any(|t| t.contains(header)),
+                "a group header leaked: {header}: {texts:?}"
+            );
+        }
+        // All nine agents draw their pairs: needs-you first, then the rest in
+        // daemon order.
         assert_eq!(
             texts
                 .iter()
                 .filter(|t| t.contains("claude") || t.contains("codex"))
                 .count(),
-            8,
+            18,
             "{texts:?}"
         );
-        // The title says how much is shown: 4 agents of 9.
-        assert!(texts.iter().any(|t| *t == " agents 4 of 9"), "{texts:?}");
+        let first_codex = texts
+            .iter()
+            .position(|t| t.contains("codex"))
+            .expect("codex");
+        let first_claude = texts
+            .iter()
+            .position(|t| t.contains("claude"))
+            .expect("claude");
+        assert!(first_codex < first_claude, "{texts:?}");
+        // The title names the sort order on its right.
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
+            "{texts:?}"
+        );
         for line in &lines {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
     }
 
     #[test]
-    fn folded_an_idle_agent_collapses_while_a_working_one_stays() {
+    fn an_idle_agent_draws_its_rows_like_a_working_one() {
         let (spaces, agents) = sample();
-        let fold = Fold::default_closed();
         let folded = render_folded(
             &spaces,
             &agents,
             1,
             1,
             14,
-            &fold,
             0,
             View::Grouped,
             &Seen::new(),
@@ -2143,289 +2023,11 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // The working agent keeps its rows, the idle one becomes one line.
+        // Nothing folds: the working agent and the idle one both keep their
+        // rows, each pair with its own state dot.
         assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("1 idle")), "{texts:?}");
-        assert!(
-            !texts.iter().any(|t| t.contains("codex")),
-            "the idle agent's own rows are still drawn: {texts:?}"
-        );
+        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
     }
-
-    #[test]
-    fn folded_an_empty_group_leaves_no_line() {
-        let spaces = vec![space(1, "app")];
-        let agents = vec![agent(1, 1, "codex", "blocked")];
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            1,
-            10,
-            &Fold::default_closed(),
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-        );
-        // The blocked agent draws two rows under its own header and nothing else:
-        // no fold lines for groups with nobody in them, and the plain title.
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.trim_start().starts_with("needs you") && t.trim_end().ends_with("1")),
-            "{texts:?}"
-        );
-        assert!(!texts.iter().any(|t| t.contains("idle")), "{texts:?}");
-        assert!(texts.iter().any(|t| *t == " agents"), "{texts:?}");
-    }
-
-    #[test]
-    fn folded_a_click_on_a_fold_line_opens_that_group() {
-        let (spaces, agents) = many_agents();
-        let fold = Fold::default_closed();
-        let height = 30;
-        // Terminal 5 is done and already looked at, so the fold lines sit
-        // where they always have.
-        let mut seen = Seen::new();
-        seen.insert((5, 0));
-        let row = render_folded(
-            &spaces,
-            &agents,
-            2,
-            1,
-            height,
-            &fold,
-            0,
-            View::Grouped,
-            &seen,
-            &Unseen::new(),
-        )
-        .iter()
-        .map(|l| l.text.trim_end().to_string())
-        .position(|t| t.contains("4 idle"))
-        .expect("no idle fold line");
-        assert_eq!(
-            hit_folded(
-                &spaces,
-                &agents,
-                2,
-                1,
-                height,
-                &fold,
-                row,
-                View::Grouped,
-                &seen,
-                &Unseen::new()
-            ),
-            Some(Hit::Fold(Group::Idle))
-        );
-        let mut opened = fold;
-        opened.open(Group::Idle);
-        let texts: Vec<String> = render_folded(
-            &spaces,
-            &agents,
-            2,
-            1,
-            height,
-            &opened,
-            0,
-            View::Grouped,
-            &seen,
-            &Unseen::new(),
-        )
-        .iter()
-        .map(|l| l.text.trim_end().to_string())
-        .collect();
-        assert!(
-            !texts.iter().any(|t| t.contains("4 idle")),
-            "the fold line is still there: {texts:?}"
-        );
-        assert!(texts.iter().any(|t| *t == " agents 8 of 9"), "{texts:?}");
-    }
-
-    #[test]
-    fn folded_the_group_holding_the_keyboard_is_open_even_when_folded() {
-        let (spaces, agents) = many_agents();
-        // Terminal 5 is done and would fold, but it has the keyboard.
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            5,
-            30,
-            &Fold::default_closed(),
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(
-            texts.iter().any(|t| t.contains(" agents 5 of 9")),
-            "{texts:?}"
-        );
-        // And a click on its rows still reaches it.
-        let hits: Vec<Option<Hit>> = (0..30)
-            .map(|row| {
-                hit_folded(
-                    &spaces,
-                    &agents,
-                    1,
-                    5,
-                    30,
-                    &Fold::default_closed(),
-                    row,
-                    View::Grouped,
-                    &Seen::new(),
-                    &Unseen::new(),
-                )
-            })
-            .collect();
-        assert!(hits.contains(&Some(Hit::Terminal(5))));
-    }
-
-    #[test]
-    fn folded_hit_returns_what_folded_render_drew_on_every_row() {
-        let (spaces, agents) = many_agents();
-        for fold in [Fold::default_closed(), Fold::all_open()] {
-            let lines = render_folded(
-                &spaces,
-                &agents,
-                2,
-                1,
-                20,
-                &fold,
-                0,
-                View::Grouped,
-                &Seen::new(),
-                &Unseen::new(),
-            );
-            assert_eq!(lines.len(), 20);
-            for (row, line) in lines.iter().enumerate() {
-                let got = hit_folded(
-                    &spaces,
-                    &agents,
-                    2,
-                    1,
-                    20,
-                    &fold,
-                    row,
-                    View::Grouped,
-                    &Seen::new(),
-                    &Unseen::new(),
-                );
-                let text = line.text.trim_end().to_string();
-                match got {
-                    Some(Hit::Fold(group)) => {
-                        assert!(text.contains(group.name()), "row {row}: {text:?}");
-                    }
-                    Some(Hit::Terminal(t)) => {
-                        assert!(
-                            text.contains("claude") || text.contains("codex"),
-                            "row {row}: {text:?} for terminal {t}"
-                        );
-                    }
-                    Some(Hit::Space(_) | Hit::New | Hit::Menu | Hit::Collapse) | None => {}
-                }
-            }
-            assert_eq!(
-                hit_folded(
-                    &spaces,
-                    &agents,
-                    2,
-                    1,
-                    20,
-                    &fold,
-                    20,
-                    View::Grouped,
-                    &Seen::new(),
-                    &Unseen::new()
-                ),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn folded_an_unobserved_agent_stays_on_screen() {
-        // Unknown is not idleness: it is "not looked at yet", and folding it hides
-        // every arrival until detection settles.
-        let agents = vec![AgentRow {
-            terminal: 7,
-            name: None,
-            workspace: 2,
-            agent: true,
-            program: Some("claude".to_string()),
-            behind: None,
-            state: UNKNOWN.to_string(),
-            generation: None,
-            readiness: "ready".to_string(),
-            source: None,
-            rule: None,
-            manifest: None,
-            agent_session: None,
-        }];
-        let lines = render_folded(
-            &[space(1, "app"), space(2, "webshop")],
-            &agents,
-            1,
-            1,
-            10,
-            &Fold::default_closed(),
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
-        assert!(
-            !texts.iter().any(|t| t.contains("idle")),
-            "the unobserved agent folded: {texts:?}"
-        );
-    }
-
-    #[test]
-    fn toggle_all_opens_everything_and_then_folds_again() {
-        let mut fold = Fold::default_closed();
-        fold.toggle_all();
-        assert_eq!(fold, Fold::all_open());
-        let (spaces, agents) = many_agents();
-        let texts: Vec<String> = render_folded(
-            &spaces,
-            &agents,
-            2,
-            1,
-            30,
-            &fold,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-        )
-        .iter()
-        .map(|l| l.text.trim_end().to_string())
-        .collect();
-        assert!(
-            texts.iter().any(|t| *t == " agents"),
-            "a fully open panel carries the plain title: {texts:?}"
-        );
-        fold.toggle_all();
-        assert_eq!(fold, Fold::default_closed());
-    }
-
-    /// The foot of the column signs the product, and still folds it away.
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_name_and_the_version() {
         let (line, hit) = collapse_row(false);
@@ -2531,44 +2133,6 @@ mod tests {
         let calm = agents.iter().find(|a| a.terminal == 8).unwrap();
         assert!(!is_new(calm, 1, &seen, &Unseen::new()));
     }
-
-    /// An unread done never hides behind the finished fold: it draws under its
-    /// own open `new` header, ahead of running.
-    #[test]
-    fn folded_an_unread_done_gets_its_own_open_group() {
-        let (spaces, agents) = many_agents();
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            2,
-            1,
-            30,
-            &Fold::default_closed(),
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.trim_start().starts_with("new") && t.trim_end().ends_with("1")),
-            "no open new group: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains("finished")),
-            "the unread done folded: {texts:?}"
-        );
-        // Needs-you two, running two, new one: five of nine on screen.
-        assert!(texts.iter().any(|t| *t == " agents 5 of 9"), "{texts:?}");
-    }
-
-    /// The priority view is the same rows with no headers, sorted so what
-    /// wants a person is on top.
     #[test]
     fn priority_view_sorts_by_urgency_without_headers() {
         let (spaces, agents) = many_agents();
@@ -2578,7 +2142,6 @@ mod tests {
             2,
             1,
             40,
-            &Fold::default_closed(),
             0,
             View::Priority,
             &Seen::new(),
@@ -2604,7 +2167,6 @@ mod tests {
             2,
             1,
             40,
-            &Fold::default_closed(),
             0,
             View::Priority,
             &Seen::new(),
@@ -2649,7 +2211,6 @@ mod tests {
                 2,
                 1,
                 40,
-                &Fold::default_closed(),
                 tick,
                 View::Grouped,
                 &Seen::new(),
@@ -2671,8 +2232,7 @@ mod tests {
                 .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
             "no static unread dot"
         );
-        // And no state word on the right of any agent row. Fold lines
-        // (`▸ 4 idle`) and group headers name their group, not a row.
+        // And no state word on the right of any agent row.
         for line in zero.iter().filter(|l| l.indicator.is_some()) {
             for word in ["working", "blocked", "failed", "done", "idle"] {
                 assert!(
@@ -2689,5 +2249,167 @@ mod tests {
         assert_eq!(View::Grouped.toggle(), View::Priority);
         assert_eq!(View::Priority.toggle(), View::Grouped);
         assert_eq!(View::default(), View::Grouped);
+    }
+
+    /// A blocked agent draws its two rows and nothing else: no headers for
+    /// groups with nobody in them.
+    #[test]
+    fn a_blocked_agent_draws_two_rows_and_no_headers() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![agent(1, 1, "codex", "blocked")];
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            10,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("idle")), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
+            "{texts:?}"
+        );
+    }
+
+    /// Only the `+` corner of the spaces title opens a space: the title row
+    /// itself is a no-op, so a click on the word `spaces` never makes a space
+    /// nobody asked for.
+    #[test]
+    fn only_the_plus_corner_of_the_spaces_title_opens_a_space() {
+        let (spaces, agents) = sample();
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            14,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert!(texts[0].ends_with('+'), "{texts:?}");
+        assert_eq!(
+            hit_folded(
+                &spaces,
+                &agents,
+                1,
+                1,
+                14,
+                0,
+                View::Grouped,
+                &Seen::new(),
+                &Unseen::new()
+            ),
+            None,
+            "the title row must not open a space: {texts:?}"
+        );
+        assert_eq!(spaces_title_hit(5), None);
+        assert_eq!(spaces_title_hit(WIDTH), Some(Hit::NewSpace));
+    }
+
+    /// The keyboard's rows are always drawn: nothing folds them away, so a
+    /// focused terminal never reads as a terminal that died.
+    #[test]
+    fn the_focused_agent_always_draws_its_rows() {
+        let (spaces, agents) = many_agents();
+        for focused in [1u32, 5, 9] {
+            let hits: Vec<u32> = (0..30)
+                .filter_map(|row| {
+                    hit_folded(
+                        &spaces,
+                        &agents,
+                        1,
+                        focused,
+                        30,
+                        row,
+                        View::Grouped,
+                        &Seen::new(),
+                        &Unseen::new(),
+                    )
+                })
+                .filter_map(|hit| match hit {
+                    Hit::Terminal(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                hits.contains(&focused),
+                "focused {focused} vanished: {hits:?}"
+            );
+        }
+    }
+
+    /// An unobserved agent stays on screen: what has not been looked at stays
+    /// visible until detection settles, rather than folding away as idle.
+    #[test]
+    fn an_unobserved_agent_stays_on_screen() {
+        let spaces = vec![space(1, "app")];
+        let mut agents = vec![agent(1, 1, "sh", "unknown")];
+        agents[0].agent = true;
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            10,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("sh")), "{texts:?}");
+    }
+
+    /// An unread done draws inline with the done sage on its dot: news, not
+    /// calm, and no header above it.
+    #[test]
+    fn an_unread_done_draws_inline_with_the_done_dot() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![agent(1, 1, "claude", "done")];
+        let lines = render_folded(
+            &spaces,
+            &agents,
+            1,
+            2,
+            10,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains('\u{25b8}')),
+            "a fold line leaked: {texts:?}"
+        );
     }
 }

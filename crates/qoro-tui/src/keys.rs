@@ -119,16 +119,12 @@ pub enum Action {
     Tab(usize),
     /// ctrl-a space: the search palette over spaces, agents, tabs and actions.
     Palette,
-    /// ctrl-a f: fold the idle groups away, or bring them all back.
-    FoldAll,
-    /// ctrl-a g: the agents panel as labelled groups, or as a flat urgency list.
+    /// ctrl-a g: the agents panel grouped or by urgency.
     ToggleView,
     /// ctrl-a F: the focus view over the focused terminal: the user's last
     /// prompt, the agent's last turns, and one row per tool call.
     ///
-    /// Uppercase on purpose, like the pane moves: lowercase `f` already folds
-    /// the idle groups, and the help strings spell both out so the pair is
-    /// never misread as one key.
+    /// Uppercase on purpose, like the pane moves.
     Focus,
     /// ctrl-a v: split the focused pane side by side.
     SplitV,
@@ -284,7 +280,6 @@ impl Keys {
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
                     b' ' => Action::Palette,
-                    b'f' => Action::FoldAll,
                     b'g' => Action::ToggleView,
                     b'F' => Action::Focus,
                     b'v' => Action::SplitV,
@@ -441,10 +436,10 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_f_opens_the_focus_view_while_lowercase_folds() {
+    fn uppercase_f_opens_the_focus_view_while_lowercase_is_dropped() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01F"), vec![Action::Focus]);
-        assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
+        assert_eq!(keys.feed(b"\x01f"), Vec::<Action>::new());
     }
 
     #[test]
@@ -503,10 +498,9 @@ mod tests {
     }
 
     #[test]
-    fn space_opens_the_palette_and_f_folds_the_idle_groups() {
+    fn space_opens_the_palette_and_g_toggles_the_agents_view() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01 "), vec![Action::Palette]);
-        assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldAll]);
         assert_eq!(keys.feed(b"\x01g"), vec![Action::ToggleView]);
     }
 

@@ -595,6 +595,7 @@ dependencies = [
  "qoro-store",
  "qoro-terminal",
  "qoro-testkit",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

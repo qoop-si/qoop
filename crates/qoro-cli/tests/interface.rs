@@ -390,7 +390,8 @@ impl Interface {
         )
     }
 
-    /// Which tab is bracketed, counted along the bar, which is the one with the keyboard.
+    /// Which tab owns the keyboard, counted along the bar: the one painted
+    /// with the focused ink.
     ///
     /// A place on the bar and not a terminal number: the bar is numbered the way it is
     /// pressed, and terminal numbers are handed out across every space.
@@ -399,9 +400,23 @@ impl Interface {
     /// person can see, and an interface that believes it moved the focus and did not paint
     /// it is exactly the failure this is for.
     fn focused_tab(&self) -> Option<u32> {
-        let bar = self.tab_bar()?;
-        let open = bar.find('[')?;
-        bar[open + 1..]
+        let at = format!(
+            "\x1b[{};{}H",
+            qoro_tui::screen::TABS,
+            qoro_tui::screen::left(COLS) + 1
+        );
+        let start = self.painted.rfind(&at)? + at.len();
+        // Bounded to the bar's own paint: the bar text runs at most a pane
+        // wide with one ink run per tab, so anything past that window belongs
+        // to a later row (or a child echoing escapes) and must not forge a
+        // focus reading.
+        let (pane_cols, _) = qoro_tui::screen::pane_size(COLS, ROWS);
+        let end = (start + pane_cols as usize + 320).min(self.painted.len());
+        let after = &self.painted[start..end];
+        let on = qoro_tui::theme::tab_on();
+        let pos = after.find(&on)?;
+        after[pos + on.len()..]
+            .trim_start_matches(' ')
             .chars()
             .take_while(char::is_ascii_digit)
             .collect::<String>()
@@ -410,6 +425,19 @@ impl Interface {
     }
 
     /// Read until that terminal's tab is the focused one.
+    /// Read until some tab owns the keyboard.
+    fn wait_for_focused(&mut self, within: Duration) -> bool {
+        self.wait_for_tabs(|_| false, Duration::ZERO);
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self.focused_tab().is_some() {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
+    }
+
     /// Read until that tab, counted along the bar, is the focused one.
     fn wait_for_tab(&mut self, want: u32, within: Duration) -> bool {
         self.wait_for_tabs(|_| false, Duration::ZERO);
@@ -430,9 +458,7 @@ impl Interface {
     /// from it the first time a label changed.
     fn tab_column(&self, terminal: u32) -> Option<u16> {
         let bar = self.tab_bar()?;
-        let at = bar
-            .find(&format!("[{terminal} "))
-            .or_else(|| bar.find(&format!(" {terminal} ")))?;
+        let at = bar.find(&format!(" {terminal} "))?;
         // The bar is read from its own left edge and a click is sent in screen columns, so
         // the column the pane starts at has to be added back.
         Some(at as u16 + 2 + qoro_tui::screen::left(COLS) as u16)
@@ -674,15 +700,20 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         ui.panel_line(FIRST_SPACE_ROW),
         ui.painted
     );
-    assert_eq!(
-        ui.panel_line(SPACES_TITLE_ROW)
-            .map(|l| l.trim_end().to_string()),
-        Some(" spaces".to_string())
+    let title = ui
+        .panel_line(SPACES_TITLE_ROW)
+        .map(|l| l.trim_end().to_string())
+        .unwrap_or_default();
+    assert!(
+        title.starts_with(" spaces") && title.ends_with('+'),
+        "the spaces title lost its new-space corner: {title:?}"
     );
-    assert_eq!(
-        ui.panel_line(first_agent_row_of(&ui.painted) - 1)
-            .map(|l| l.trim_end().to_string()),
-        Some(" agents".to_string()),
+    let agents_title = ui
+        .panel_line(first_agent_row_of(&ui.painted) - 1)
+        .map(|l| l.trim_end().to_string())
+        .unwrap_or_default();
+    assert!(
+        agents_title.starts_with(" agents") && agents_title.ends_with("grouped"),
         "the agents panel has no title: {:?}",
         ui.panel_line(first_agent_row_of(&ui.painted) - 1)
     );
@@ -697,14 +728,14 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     );
     let bar = ui.tab_bar().unwrap_or_default();
     assert!(bar.contains('+'), "the tab bar has no new tab: {bar:?}");
-    // The bracket lands before the daemon has named the foreground program, so the
+    // The program name lands after the daemon has named the foreground program, so the
     // name is waited for rather than read off the first frame that carries a tab:
     // asserting on whatever happened to be buffered is how a test reports a race
     // as a failure, and a loaded machine lands that frame with an empty name.
     let named = |bar: &str| {
-        let label: String = bar[bar.find("[1 ").map(|at| at + 3).unwrap_or_default()..]
+        let label: String = bar[bar.find(" 1 ").map(|at| at + 3).unwrap_or_default()..]
             .chars()
-            .take_while(|c| *c != ']')
+            .take_while(|c| c.is_ascii_alphanumeric() || "-_. ".contains(*c))
             .collect();
         // The label carries the state dot after the program (`bash o`), so the
         // name is the first word of it.
@@ -785,10 +816,7 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
     // gate reported a feature that works as broken.
     ui.command(b'x');
     assert!(
-        ui.wait_for_tabs(
-            |bar| !bar.contains(" 2 ") && !bar.contains("[2"),
-            Duration::from_secs(15)
-        ),
+        ui.wait_for_tabs(|bar| !bar.contains(" 2 "), Duration::from_secs(15)),
         "the tab bar still carries a second tab after one terminal was closed: {:?}",
         ui.tab_bar()
     );
@@ -1121,7 +1149,7 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // Its own tab bar: one tab, which is this space's, and not the other space's as well.
     assert!(
         ui.wait_for_tabs(
-            |bar| bar.contains("[1") && !bar.contains(" 2 "),
+            |bar| bar.contains(" 1 ") && !bar.contains(" 2 "),
             Duration::from_secs(15)
         ),
         "the new space shows the other space's tabs: {:?}",
@@ -1266,7 +1294,7 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     );
     assert!(
         ui.wait_for_tabs(
-            |bar| bar.contains("[1") && !bar.contains(" 2 "),
+            |bar| bar.contains(" 1 ") && !bar.contains(" 2 "),
             Duration::from_secs(15)
         ),
         "the new space came up with no terminal of its own: {:?}",
@@ -1318,7 +1346,7 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     // And the way out is still there: a terminal started here belongs to this space.
     ui.create_terminal("");
     assert!(
-        ui.wait_for_tabs(|bar| bar.contains('['), Duration::from_secs(15)),
+        ui.wait_for_focused(Duration::from_secs(15)),
         "ctrl-a c in an empty space did not start a terminal: {:?}",
         ui.tab_bar()
     );
@@ -1373,7 +1401,7 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
     // Every space, walked from where the interface left off, has to have a tab in it.
     for step in 0..3 {
         assert!(
-            ui.wait_for_tabs(|bar| bar.contains('['), Duration::from_secs(15)),
+            ui.wait_for_focused(Duration::from_secs(15)),
             "a space came up with no terminal in it after {step} moves: {:?}\n{}",
             ui.tab_bar(),
             ui.painted
@@ -1416,7 +1444,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
         "the second space never came up: {}",
         ui.daemon_log()
     );
-    assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
+    assert!(ui.wait_for_tabs(|bar| bar.contains(" 1 "), Duration::from_secs(15)));
     ui.type_in(format!("{}\n", agent.display()).as_bytes());
     assert!(
         ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(20)),
@@ -1498,7 +1526,7 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
         "the second space never came up: {}",
         ui.daemon_log()
     );
-    assert!(ui.wait_for_tabs(|bar| bar.contains("[1"), Duration::from_secs(15)));
+    assert!(ui.wait_for_tabs(|bar| bar.contains(" 1 "), Duration::from_secs(15)));
     ui.create_terminal("");
     assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
     ui.create_terminal("");
@@ -1568,10 +1596,7 @@ fn g12_15_a_shell_that_exits_takes_its_tab_and_hands_the_keyboard_on() {
 
     ui.type_in(b"exit\n");
     assert!(
-        ui.wait_for_tabs(
-            |bar| !bar.contains(" 2 ") && !bar.contains("[2"),
-            Duration::from_secs(20)
-        ),
+        ui.wait_for_tabs(|bar| !bar.contains(" 2 "), Duration::from_secs(20)),
         "the tab of the shell that exited is still on the bar: {:?}",
         ui.tab_bar()
     );

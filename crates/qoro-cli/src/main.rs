@@ -1604,6 +1604,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 

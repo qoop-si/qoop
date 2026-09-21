@@ -45,9 +45,8 @@ pub struct Frame<'a> {
     /// Something worth saying while nothing else is happening, said until the person does
     /// anything. Under everything urgent, and never in place of it.
     pub hint: Option<&'a str>,
-    /// Which idle groups of the agents panel are expanded.
-    pub fold: sidebar::Fold,
-    /// The agents panel as labelled groups, or as a flat urgency list.
+    /// How the agents panel orders its rows: daemon order with what needs a
+    /// person first, or flat by urgency.
     pub view: sidebar::View,
     /// The done rows this client has already looked at.
     pub seen: &'a sidebar::Seen,
@@ -233,7 +232,6 @@ pub fn paint(frame: &Frame) -> String {
             frame.space.unwrap_or_default(),
             frame.focused,
             column_rows,
-            &frame.fold,
             frame.tick,
             frame.view,
             frame.seen,
@@ -256,7 +254,7 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
-                Some(sidebar::Hit::Fold(_) | sidebar::Hit::New | sidebar::Hit::Menu)
+                Some(sidebar::Hit::New | sidebar::Hit::NewSpace | sidebar::Hit::Menu)
                 | Some(sidebar::Hit::Collapse)
                 | None => false,
             };
@@ -1055,8 +1053,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             " ctrl-a R      rename this space".to_string(),
             " find and view".to_string(),
             " ctrl-a space  find tabs, spaces, agents".to_string(),
-            " ctrl-a f      fold the idle groups".to_string(),
-            " ctrl-a g      agents as groups or by urgency".to_string(),
+            " ctrl-a g      agents grouped or by urgency".to_string(),
             " ctrl-a F      focus view: last prompt, last turns, one row a tool".to_string(),
             " ctrl-a b      fold the left column away".to_string(),
             " ctrl-a m      this menu".to_string(),
@@ -1496,6 +1493,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -1524,6 +1522,58 @@ mod tests {
         assert!(cols >= 1 && rows >= 1);
     }
 
+    /// An agent TUI survives the paint byte for byte: truecolour runs, box
+    /// drawing and an inverse sweep all arrive on screen, cropped to the tile
+    /// and never spilling past it.
+    #[test]
+    fn an_agent_tui_with_truecolour_and_inverse_paints_faithfully() {
+        let line = "┃  Ask anything… \"Fix it\"";
+        let spans = vec![
+            SpanWire {
+                at: 0,
+                len: 1,
+                fg: Some(ColourWire::Rgb {
+                    r: 92,
+                    g: 156,
+                    b: 245,
+                }),
+                bg: None,
+                attrs: 0,
+            },
+            SpanWire {
+                at: 3,
+                len: 12,
+                fg: None,
+                bg: None,
+                attrs: attrs::INVERSE,
+            },
+        ];
+        let painted = paint_row(line, &spans, 40, None);
+        // Truecolour arrives as truecolour, inverse as inverse, and a reset
+        // closes every run so no style bleeds into the next cell.
+        assert!(painted.contains("38;2;92;156;245"), "{painted:?}");
+        assert!(painted.contains("\x1b[7m"), "{painted:?}");
+        assert!(painted.contains("Ask anything"), "{painted:?}");
+        assert!(
+            painted.ends_with("\x1b[0m") || !painted.contains("\x1b[7m \x1b"),
+            "a style leaked past its run: {painted:?}"
+        );
+        let mut plain = String::new();
+        let mut chars = painted.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            plain.push(c);
+        }
+        assert_eq!(crate::width::width(&plain), 40, "{plain:?}");
+    }
+
     /// The naming box cursor sits at the end of what has been typed, past the
     /// ` > ` marker: one cell left of where it used to sit, when the sum was
     /// copied from the bordered palette row.
@@ -1547,7 +1597,6 @@ mod tests {
             lines,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: Some(&prompt),
             menu: None,
@@ -1596,7 +1645,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1646,7 +1694,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1698,7 +1745,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1742,7 +1788,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: Some(0),
@@ -1819,7 +1864,6 @@ mod tests {
             lines: 5,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1861,7 +1905,6 @@ mod tests {
             lines: 5,
             message: Some("starting a terminal"),
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1911,7 +1954,6 @@ mod tests {
             lines: 5,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -1958,7 +2000,6 @@ mod tests {
             lines: 5,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2019,7 +2060,6 @@ mod tests {
             lines: 5,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2080,7 +2120,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2130,7 +2169,6 @@ mod tests {
                 lines: 6,
                 message: None,
                 hint: None,
-                fold: sidebar::Fold::all_open(),
                 palette: None,
                 prompt: None,
                 menu: None,
@@ -2178,7 +2216,6 @@ mod tests {
             lines: 5,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2221,7 +2258,6 @@ mod tests {
                 lines: 24,
                 message: None,
                 hint: None,
-                fold: sidebar::Fold::all_open(),
                 palette: None,
                 prompt: None,
                 menu: None,
@@ -2266,7 +2302,6 @@ mod tests {
                 lines,
                 message: Some("STATUS_LINE"),
                 hint: None,
-                fold: sidebar::Fold::all_open(),
                 palette: None,
                 prompt: None,
                 menu: None,
@@ -2329,7 +2364,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2385,7 +2419,6 @@ mod tests {
                 lines: 24,
                 message: None,
                 hint: None,
-                fold: sidebar::Fold::all_open(),
                 palette: None,
                 prompt: None,
                 menu: None,
@@ -2452,7 +2485,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2537,7 +2569,6 @@ mod tests {
             lines: 3,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2577,6 +2608,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -2596,7 +2628,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2640,7 +2671,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2681,7 +2711,6 @@ mod tests {
             lines: 24,
             message: Some("starting a terminal"),
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: None,
             prompt: None,
             menu: None,
@@ -2723,7 +2752,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: Some(&palette),
             prompt: None,
             menu: None,
@@ -2802,7 +2830,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: Some(&palette),
             prompt: None,
             menu: None,
@@ -2878,7 +2905,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::default_closed(),
             palette: Some(&palette),
             prompt: None,
             menu: None,
@@ -2905,9 +2931,8 @@ mod tests {
         assert!(!shown.contains("app codex"), "{shown:?}");
     }
 
-    /// Folding reaches the screen: nine agents become three actionable rows.
     #[test]
-    fn a_folded_panel_fits_nine_agents_without_scrolling() {
+    fn a_flat_panel_fits_nine_agents_without_scrolling() {
         let spaces = vec![WorkspaceRow {
             id: 1,
             name: "app".to_string(),
@@ -2933,50 +2958,39 @@ mod tests {
                 rule: None,
                 manifest: None,
                 agent_session: None,
+                agent_title: None,
             })
             .collect();
-        let snapshot = snapshot(&["output"]);
-        // Terminal 5 is done and already looked at, so it folds like before.
-        let mut seen = sidebar::Seen::new();
-        seen.insert((5, 1));
-        let painted = paint(&Frame {
-            rows: &rows,
-            spaces: &spaces,
-            panes: &std::collections::BTreeSet::new(),
-            space: Some(1),
-            focused: 1,
-            snapshot: Some(&snapshot),
-            cols: 80,
-            // Room for two-line pairs: every open agent takes two rows, so
-            // the folded summary needs the height to fit without scrolling.
-            lines: 30,
-            message: None,
-            hint: None,
-            fold: sidebar::Fold::default_closed(),
-            palette: None,
-            prompt: None,
-            menu: None,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            tick: 0,
-            view: sidebar::View::Grouped,
-            seen: &seen,
-            unseen: &sidebar::Unseen::new(),
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            behind: &crate::run::Behind {
-                terminal: 0,
-                from: 0,
-                lines: Vec::new(),
-                total: 0,
-            },
-        });
-        assert!(painted.contains("1 finished"), "{painted:?}");
-        assert!(painted.contains("4 idle"), "{painted:?}");
-        assert!(painted.contains("agents 4 of 9"), "{painted:?}");
+        // Nothing folds: all nine agents draw their pairs, no headers and no
+        // counted lines, and the title names the sort order.
+        let lines = sidebar::render_folded(
+            &spaces,
+            &rows,
+            1,
+            1,
+            38,
+            0,
+            sidebar::View::Grouped,
+            &sidebar::Seen::new(),
+            &sidebar::Unseen::new(),
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("claude - app")).count(),
+            9,
+            "agents lost rows: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("finished")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains('\u{25b8}')), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
+            "{texts:?}"
+        );
     }
 
     /// A selection is drawn as selected, and only where it is.
@@ -2997,7 +3011,6 @@ mod tests {
             lines: 6,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -3057,7 +3070,6 @@ mod tests {
                 lines: 6,
                 message: None,
                 hint: None,
-                fold: sidebar::Fold::all_open(),
                 palette: None,
                 prompt: None,
                 menu: None,
@@ -3106,7 +3118,6 @@ mod tests {
             lines: 7,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -3164,7 +3175,6 @@ mod tests {
             lines: 6,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -3312,7 +3322,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -3349,7 +3358,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,
@@ -3377,7 +3385,6 @@ mod tests {
             lines: 24,
             message: None,
             hint: None,
-            fold: sidebar::Fold::all_open(),
             palette: None,
             prompt: None,
             menu: None,

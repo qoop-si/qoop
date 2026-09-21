@@ -240,9 +240,8 @@ struct State {
     /// before either answer came back both counted the same list and both produced
     /// `space 2`, so the panel showed two rows with one name on them.
     creating: usize,
-    /// Which idle groups of the agents panel are expanded.
-    fold: sidebar::Fold,
-    /// The agents panel as labelled groups, or as a flat urgency list.
+    /// How the agents panel orders its rows: daemon order with what needs a
+    /// person first, or flat by urgency.
     view: sidebar::View,
     /// The done rows this client has already looked at, as (terminal, generation).
     ///
@@ -338,7 +337,6 @@ impl State {
             lines: self.lines,
             message: self.message.as_deref(),
             hint: self.hint.as_deref(),
-            fold: self.fold,
             view: self.view,
             seen: &self.seen_done,
             unseen: &self.unseen_finished,
@@ -529,7 +527,6 @@ impl State {
                 self.space.unwrap_or_default(),
                 self.focused,
                 column_rows,
-                &self.fold,
                 within,
                 self.view,
                 &self.seen_done,
@@ -538,29 +535,34 @@ impl State {
         };
         // The row between the panels answers by which half was clicked, so the column has
         // to ask a second question the row itself cannot answer.
-        let hit = hit.or_else(|| {
-            let rows = sidebar::rows_folded(
-                &self.spaces,
-                &self.rows,
-                self.space.unwrap_or_default(),
-                self.focused,
-                column_rows,
-                &self.fold,
-                // Hit testing does not depend on the animation frame.
-                0,
-                self.view,
-                &self.seen_done,
-                &self.unseen_finished,
-            );
-            let is_footer = rows
-                .get(within)
-                .is_some_and(|(line, _)| line.text.contains("menu"));
-            (is_footer && !self.collapsed).then(|| sidebar::footer_hit(col as usize))?
-        });
+        // The spaces title's `+` corner asks a second question too: the row
+        // itself is a no-op, only the corner cell makes a space.
+        let hit = hit
+            .or_else(|| {
+                (within == 0 && !self.collapsed).then(|| sidebar::spaces_title_hit(col as usize))?
+            })
+            .or_else(|| {
+                let rows = sidebar::rows_folded(
+                    &self.spaces,
+                    &self.rows,
+                    self.space.unwrap_or_default(),
+                    self.focused,
+                    column_rows,
+                    // Hit testing does not depend on the animation frame.
+                    0,
+                    self.view,
+                    &self.seen_done,
+                    &self.unseen_finished,
+                );
+                let is_footer = rows
+                    .get(within)
+                    .is_some_and(|(line, _)| line.text.contains("menu"));
+                (is_footer && !self.collapsed).then(|| sidebar::footer_hit(col as usize))?
+            });
         match hit? {
             sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
             sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
-            sidebar::Hit::Fold(group) => Some(Clicked::Fold(group)),
+            sidebar::Hit::NewSpace => Some(Clicked::NewSpace),
             sidebar::Hit::New => Some(Clicked::NewTerminal),
             sidebar::Hit::Menu => Some(Clicked::Menu),
             sidebar::Hit::Collapse => Some(Clicked::Collapse),
@@ -707,12 +709,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
     ("zoom pane", "z", "fill the pane with this tile, or go back"),
-    (
-        "fold idle groups",
-        "f",
-        "fold the idle groups away, or bring them back",
-    ),
-    ("toggle agents view", "g", "agents as groups or by urgency"),
+    ("toggle agents view", "g", "agents grouped or by urgency"),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "what this daemon is set to"),
     (
@@ -836,10 +833,6 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             }
         }
         "zoom pane" => MenuSend::Zoom,
-        "fold idle groups" => {
-            state.fold.toggle_all();
-            MenuSend::Nothing
-        }
         "toggle agents view" => {
             state.view = state.view.toggle();
             MenuSend::Nothing
@@ -1166,7 +1159,7 @@ enum Clicked {
     Space(i64),
     Terminal(u32),
     NewTerminal,
-    Fold(sidebar::Group),
+    NewSpace,
 }
 
 /// What one read of stdin meant while the palette owns the keyboard.
@@ -1251,7 +1244,7 @@ async fn drive(
         adopted: false,
         creating: 0,
         done: false,
-        fold: sidebar::Fold::default(),
+
         view: sidebar::View::default(),
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
@@ -1636,6 +1629,14 @@ async fn drive(
                                 // terminal that does not exist, and typing into the one
                                 // that was focused before addresses a terminal in a space
                                 // the person has left and cannot see.
+                                //
+                                // Typing also drops a selection: the text is already on
+                                // the clipboard from the button release, so the invert
+                                // staying up only reads as the program's own colours
+                                // going wrong.
+                                if state.selection.take().is_some() {
+                                    dirty = true;
+                                }
                                 let focused = state.focused;
                                 if focused != 0 {
                                     wr.write_all(&client::encode_command_to(
@@ -1720,16 +1721,19 @@ async fn drive(
                                         });
                                         dirty = true;
                                     }
+                                    Some(Clicked::NewSpace) => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Space,
+                                            text: String::new(),
+                                        });
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Space(space)) => {
                                         if let Some(bytes) = enter_space(
                                             &mut state, space, &mut control_seq, &mut seqs,
                                         )? {
                                             wr.write_all(&bytes).await?;
                                         }
-                                        dirty = true;
-                                    }
-                                    Some(Clicked::Fold(group)) => {
-                                        state.fold.open(group);
                                         dirty = true;
                                     }
                                     Some(Clicked::Menu) => {
@@ -2069,10 +2073,6 @@ async fn drive(
                             }
                             Action::Palette => {
                                 state.palette = Some(Palette::open());
-                                dirty = true;
-                            }
-                            Action::FoldAll => {
-                                state.fold.toggle_all();
                                 dirty = true;
                             }
                             Action::ToggleView => {
@@ -3421,6 +3421,7 @@ mod tests {
             rule: None,
             manifest: None,
             agent_session: None,
+            agent_title: None,
         }
     }
 
@@ -3477,7 +3478,7 @@ mod tests {
             adopted: true,
             creating: 0,
             done: false,
-            fold: sidebar::Fold::default(),
+
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
@@ -3710,7 +3711,7 @@ mod tests {
             focus_fetch: false,
             reading: None,
             creating: 0,
-            fold: sidebar::Fold::default(),
+
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
@@ -3767,7 +3768,7 @@ mod tests {
             focus_offset: 0,
             focus_fetch: false,
             reading: None,
-            fold: sidebar::Fold::default(),
+
             view: sidebar::View::default(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
@@ -4041,6 +4042,34 @@ mod tests {
         assert!(!state.split_origin.contains_key("split-9"));
     }
 
+    /// Only the `+` corner of the spaces title makes a space: the word
+    /// itself is a no-op, so a click aimed at the title never makes a space
+    /// nobody asked for.
+    #[test]
+    fn only_the_plus_corner_of_the_spaces_title_makes_a_space() {
+        let mut state = bare_state();
+        state.cols = 100;
+        state.lines = 30;
+        state.spaces = vec![qoro_runtime::control::WorkspaceRow {
+            id: 1,
+            name: "default".to_string(),
+            terminals: 0,
+        }];
+        state.space = Some(1);
+        assert!(matches!(
+            state.clicked(
+                crate::screen::SIDEBAR_TOP as u16,
+                crate::sidebar::WIDTH as u16
+            ),
+            Some(Clicked::NewSpace)
+        ));
+        assert!(
+            state
+                .clicked(crate::screen::SIDEBAR_TOP as u16, 5)
+                .is_none()
+        );
+    }
+
     #[test]
     fn menu_moves_with_arrows_and_jk_and_jumps_by_key() {
         let mut state = bare_state();
@@ -4053,10 +4082,10 @@ mod tests {
         assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(10));
+        assert_eq!(state.menu, Some(9));
         // Keyless rows answer to their first letter.
         assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(11));
+        assert_eq!(state.menu, Some(10));
         // `x` jumps straight to close tab.
         assert!(matches!(menu_key(&mut state, 0, b"x"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(4));
@@ -4090,7 +4119,6 @@ mod tests {
                 "split side by side",
                 "split stacked",
                 "zoom pane",
-                "fold idle groups",
                 "toggle agents view",
                 "keybinds",
                 "settings",
@@ -4162,15 +4190,7 @@ mod tests {
             apply_menu_choice(&mut state, zoom, &mut request),
             MenuSend::Zoom
         ));
-        // Fold and view flip locally and send nothing.
-        let fold = MENU
-            .iter()
-            .position(|(n, _, _)| *n == "fold idle groups")
-            .unwrap();
-        assert!(matches!(
-            apply_menu_choice(&mut state, fold, &mut request),
-            MenuSend::Nothing
-        ));
+        // View flips locally and sends nothing.
         let view = MENU
             .iter()
             .position(|(n, _, _)| *n == "toggle agents view")

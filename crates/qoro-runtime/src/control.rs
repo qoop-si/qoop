@@ -424,6 +424,14 @@ pub struct AgentRow {
     /// daemon parse without it.
     #[serde(default)]
     pub agent_session: Option<String>,
+    /// The agent's own title for its conversation, when the daemon could read
+    /// it out of the agent's own storage. Opencode keeps titles in its
+    /// database next to the session id the hook already reports, so the panel
+    /// names the conversation the way the agent does rather than the way the
+    /// tab does. Re-resolved while the conversation runs, so a rename arrives
+    /// on its own. Defaulted like every younger field.
+    #[serde(default)]
+    pub agent_title: Option<String>,
     /// Bumped when the process in the terminal is replaced, so a client can tell a new
     /// agent from a new state.
     pub generation: Option<u64>,
