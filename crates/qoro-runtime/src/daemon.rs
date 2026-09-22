@@ -1404,12 +1404,6 @@ fn subscribe(
     true
 }
 
-/// The wire name of a runtime state.
-///
-/// A table and not a derive, because this string is on the socket: ADR-010 freezes the
-/// shape of what crosses it, and a rename in the domain would silently rename a field
-/// clients match on.
-
 /// Opencode conversation titles, read out of opencode's own database.
 ///
 /// Best effort and cached: the hook already reports the session id, and the
@@ -1422,7 +1416,8 @@ fn agent_title(session: Option<&str>) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<HashMap<String, (Option<String>, Instant)>>> = OnceLock::new();
+    type Titles = HashMap<String, (Option<String>, Instant)>;
+    static CACHE: OnceLock<Mutex<Titles>> = OnceLock::new();
     const TTL: Duration = Duration::from_secs(60);
     let id = session.filter(|s| !s.trim().is_empty())?;
     // Other agents' ids never touch the cache or the database: a miss per
@@ -1497,6 +1492,11 @@ fn opencode_session_title_at(db: &Path, id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The wire name of a runtime state.
+///
+/// A table and not a derive, because this string is on the socket: ADR-010 freezes the
+/// shape of what crosses it, and a rename in the domain would silently rename a field
+/// clients match on.
 fn state_name(state: qoro_domain::AgentRuntimeState) -> &'static str {
     use qoro_domain::AgentRuntimeState as S;
     match state {
@@ -3556,6 +3556,12 @@ async fn terminal_task(
     // When to read the screen for what the agent is doing. `None` while nothing has
     // happened, which is what keeps an idle terminal at no wakeups at all.
     let mut detect_at: Option<tokio::time::Instant> = None;
+    // When the screen was last published, and when the output that arrived since is due.
+    // `None` while nothing is held back, so a quiet terminal has no timer.
+    let mut published: Option<tokio::time::Instant> = None;
+    let mut publish_at: Option<tokio::time::Instant> = None;
+    // When to look again at a foreground leader the read loop's look was held back for.
+    let mut relook_at: Option<tokio::time::Instant> = None;
     // When the run of output that `detect_at` is waiting out began, so that waiting it out
     // can be given a ceiling.
     let mut detect_since: Option<tokio::time::Instant> = None;
@@ -3699,6 +3705,10 @@ async fn terminal_task(
                                 // title text.
                                 engine.clear_title();
                             }
+                            if relook_at.is_none() {
+                                relook_at =
+                                    agents.relook_due(stream).map(tokio::time::Instant::from_std);
+                            }
                             if last_scan.elapsed() >= CONTAINMENT_SCAN_INTERVAL {
                                 // A map lookup, not a scan. The scan is one pass for the
                                 // whole daemon, on the blocking pool, and this reads the
@@ -3783,8 +3793,23 @@ async fn terminal_task(
                             // allocates one string per row whether or not a client is
                             // watching, and a terminal streaming in the background would
                             // do that on every read.
-                            if updates.receiver_count() > 0 {
-                                let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                            //
+                            // At most one screen per `PUBLISH_EVERY` while output streams:
+                            // one frame of a child's is several reads, and a snapshot per
+                            // read is a string per row each time for screens nobody sees.
+                            // The first read after a quiet spell goes out at once, so an
+                            // echoed key is not held; the rest wait for the arm below.
+                            if updates.receiver_count() > 0 && publish_at.is_none() {
+                                let now = tokio::time::Instant::now();
+                                match published {
+                                    Some(at) if now < at + PUBLISH_EVERY => {
+                                        publish_at = Some(at + PUBLISH_EVERY);
+                                    }
+                                    _ => {
+                                        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                                        published = Some(now);
+                                    }
+                                }
                             }
 
                             // The screen is read once the output stops, not while it is
@@ -3812,6 +3837,32 @@ async fn terminal_task(
                                 eprintln!("trace: input to snapshot {:?}", at.elapsed());
                             }
                         }
+                    }
+                }
+                _ = async {
+                    match relook_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if relook_at.is_some() => {
+                    relook_at = None;
+                    if agents
+                        .note_foreground(stream, qoro_pty::sys::foreground_leader(master_raw))
+                        .is_some()
+                    {
+                        engine.clear_title();
+                    }
+                }
+                _ = async {
+                    match publish_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if publish_at.is_some() => {
+                    publish_at = None;
+                    if updates.receiver_count() > 0 {
+                        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                        published = Some(tokio::time::Instant::now());
                     }
                 }
                 _ = async {
@@ -3942,6 +3993,11 @@ async fn terminal_task(
     if let Err(e) = &outcome {
         eprintln!("qorod: terminal for pid {child_pid} failed: {e}");
     }
+    // Output held back for the next frame is the child's last screen when the loop ends
+    // here, and the ended update repeats whatever was published last.
+    if publish_at.is_some() {
+        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+    }
 
     tear_down(
         &afd,
@@ -4065,6 +4121,10 @@ impl ContainmentScanner {
 /// and it was too coarse to be real: a scripted session that starts a background job and
 /// exits takes about 110 milliseconds end to end, so the scan never ran once.
 pub const CONTAINMENT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The shortest gap between two published screens of one terminal: sixty a second, the
+/// same as the interface's own frame, since a screen published faster is never drawn.
+pub const PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// How long a terminal has to be quiet before its screen is read for what the agent is
 /// doing.

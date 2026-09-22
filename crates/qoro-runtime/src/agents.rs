@@ -66,7 +66,23 @@ pub struct TerminalAgent {
     pub screen_manifest: Option<String>,
     /// The foreground leader this identity was read from.
     pub leader: Option<Pid>,
+    /// When a leader that is not an agent was last looked into, for the wrapper case.
+    pub relooked: Option<std::time::Instant>,
+    /// A look the read loop skipped for `RELOOK`, still owed: the output that asked for it
+    /// can be the last for a long time, an agent a wrapper started drawing once and then
+    /// waiting, and nothing else would ever look again.
+    pub relook_owed: bool,
 }
+
+/// The least time between two looks into a leader that is not an agent.
+///
+/// The look reads the program, its arguments and its whole group, several system calls,
+/// and the read loop asks on every read. Unbounded, a shell echoing keys or a build
+/// printing its log paid that on every chunk of output: measured, two thirds of the
+/// daemon's time under a child streaming at sixty frames a second. Once a second still
+/// finds an agent a wrapper starts within a second of it printing anything.
+// ponytail: fixed interval, a backoff if a second of idle wrapper looks ever shows up.
+const RELOOK: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct AgentRegistry {
     watch: ProcWatch,
@@ -211,7 +227,9 @@ impl AgentRegistry {
     /// is why the caller re-reads over a short settle window rather than once.
     pub fn refresh_foreground(&self, stream: u32) -> Option<GenerationId> {
         let master = self.masters.lock().unwrap().get(&stream).copied()?;
-        self.note_foreground(stream, qoro_pty::sys::foreground_leader(master))
+        // Never held back by `RELOOK`: this runs because a process event said the group
+        // changed, and the look it makes is the one that finds an agent a wrapper forked.
+        self.look(stream, qoro_pty::sys::foreground_leader(master), false)
     }
 
     /// Start tracking a terminal, and mint the token its child will carry.
@@ -231,6 +249,8 @@ impl AgentRegistry {
                 screen_rule: None,
                 screen_manifest: None,
                 leader: None,
+                relooked: None,
+                relook_owed: false,
             },
         );
         self.announce_new(stream);
@@ -284,7 +304,28 @@ impl AgentRegistry {
     /// A change of leader is a new generation, and so is an `exec` by the same leader.
     /// Both clear the previous evidence: what was believed described a process that is no
     /// longer there, and carrying it forward is how a finished agent stays "working".
+    ///
+    /// This is the read loop's call, on every chunk of output, so a leader that is not an
+    /// agent is looked into at most once per `RELOOK` from here.
     pub fn note_foreground(&self, stream: u32, leader: Option<Pid>) -> Option<GenerationId> {
+        self.look(stream, leader, true)
+    }
+
+    /// When the look `note_foreground` last held back is due, if one is owed.
+    ///
+    /// The read loop sleeps until then and asks again, so a held back look is late by at
+    /// most `RELOOK` and never lost.
+    pub fn relook_due(&self, stream: u32) -> Option<std::time::Instant> {
+        let terminals = self.terminals.lock().unwrap();
+        let agent = terminals.get(&stream)?;
+        agent
+            .relook_owed
+            .then(|| agent.relooked.map(|at| at + RELOOK))
+            .flatten()
+    }
+
+    /// `note_foreground`, with the look into a same leader held back only when `throttled`.
+    fn look(&self, stream: u32, leader: Option<Pid>, throttled: bool) -> Option<GenerationId> {
         let mut terminals = self.terminals.lock().unwrap();
         let agent = terminals.get_mut(&stream)?;
         if agent.leader == leader {
@@ -299,15 +340,27 @@ impl AgentRegistry {
             // up a tunnel before it starts opencode, which took twenty five seconds, and
             // any window short enough to be cheap would have closed first.
             //
-            // The probe's own backoff is what bounds the cost instead. It runs at fifty
-            // milliseconds right after something changes and doubles up to a minute while
-            // nothing does, so a shell sitting at its prompt costs one group read a minute,
-            // and that read finds a group of one and stops.
+            // `RELOOK` is what bounds the cost instead: the read loop asks on every read.
             let provisional = matches!(&agent.identity, AgentIdentity::Known { program, .. }
                 if !qoro_domain::program::identify(program, &[]).agent);
             if !provisional || leader.is_none() {
+                // Settled some other way, an exec into an agent or an exit: nothing is
+                // owed any more, and a debt left here would re-arm an expired timer on
+                // every read.
+                agent.relook_owed = false;
                 return None;
             }
+            let now = std::time::Instant::now();
+            if throttled
+                && agent
+                    .relooked
+                    .is_some_and(|at| now.duration_since(at) < RELOOK)
+            {
+                agent.relook_owed = true;
+                return None;
+            }
+            agent.relooked = Some(now);
+            agent.relook_owed = false;
             let pid = leader?;
             // Looked at with the generation it already has, because most of these look
             // again and find the same thing: minting one per probe would advance the
@@ -365,6 +418,8 @@ impl AgentRegistry {
             }
         };
         agent.leader = leader;
+        agent.relooked = None;
+        agent.relook_owed = false;
         // Dropped before announcing: a subscriber that reacts by asking what is there would
         // otherwise be asking while this lock is still held.
         drop(terminals);
@@ -693,6 +748,51 @@ mod tests {
         // The same leader again is not a change, and must not mint a generation: a
         // generation per read would reject every observation ever sampled.
         assert_eq!(r.note_foreground(1, Some(me)), None);
+    }
+
+    /// A leader that is not an agent is looked into once per `RELOOK`, not on every read:
+    /// the read loop asks on every chunk of output.
+    #[test]
+    fn a_leader_that_is_not_an_agent_is_looked_into_at_most_once_a_relook() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me)).expect("a change");
+        assert_eq!(r.agent(1).expect("agent").relooked, None);
+
+        assert_eq!(r.note_foreground(1, Some(me)), None);
+        let first = r.agent(1).expect("agent").relooked.expect("looked into");
+        for _ in 0..100 {
+            assert_eq!(r.note_foreground(1, Some(me)), None);
+        }
+        assert_eq!(r.agent(1).expect("agent").relooked, Some(first));
+        // Held back, not dropped: the read loop is told when to ask again.
+        assert_eq!(r.relook_due(1), Some(first + RELOOK));
+        // A process event's look is never held back: it is the one that finds the agent a
+        // wrapper just forked.
+        assert_eq!(r.look(1, Some(me), false), None);
+        assert!(r.agent(1).expect("agent").relooked > Some(first));
+        assert_eq!(r.relook_due(1), None, "a look pays what was owed");
+    }
+
+    /// A debt for a leader that stopped being provisional some other way is dropped by the
+    /// next look, not carried: the read loop would otherwise re-arm an expired timer.
+    #[test]
+    fn a_debt_for_a_settled_leader_is_dropped() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me)).expect("a change");
+        r.note_foreground(1, Some(me));
+        r.note_foreground(1, Some(me));
+        assert!(r.relook_due(1).is_some());
+        // Settled into an agent by another path.
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
+            program: "claude".into(),
+            generation: GenerationId::FIRST,
+        };
+        assert_eq!(r.note_foreground(1, Some(me)), None);
+        assert_eq!(r.relook_due(1), None);
     }
 
     /// Explain: the screen's last rule rides the terminal even when the reading
