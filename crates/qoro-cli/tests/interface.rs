@@ -34,7 +34,155 @@ struct Interface {
     /// Everything it has painted so far. The screen is a stream here, not a grid: a test
     /// asks whether something was ever drawn, and the last frame alone would lose an
     /// answer that was correct a moment ago.
+    ///
+    /// The bytes as they came, each chunk followed by the whole text of every row that
+    /// chunk wrote to. The interface writes only what changed, often the middle of a row,
+    /// so a word that was already on a row is not in the bytes again; the row's text is.
     painted: String,
+    /// What a terminal shows after those bytes, which is what the row readers read.
+    screen: Screen,
+}
+
+/// A terminal as far as this interface drives one: placement, colour and text.
+///
+/// The interface writes only the rows, and the parts of rows, that changed. Reading the
+/// newest full write of a row out of the byte stream reads a row as it was frames ago, so
+/// the rows are read the way a terminal would show them instead.
+struct Screen {
+    /// Each cell's character and the colour sequences in effect when it was drawn. The
+    /// second column of a wide character holds `\0`.
+    cells: Vec<Vec<(char, String)>>,
+    row: usize,
+    col: usize,
+    style: String,
+    /// The start of a sequence or a character a read cut in half, for the next read.
+    pending: Vec<u8>,
+}
+
+impl Screen {
+    fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            cells: vec![vec![(' ', String::new()); cols as usize]; rows as usize],
+            row: 0,
+            col: 0,
+            style: String::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Apply bytes, and say which rows they wrote to.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<usize> {
+        self.pending.extend_from_slice(bytes);
+        let data = std::mem::take(&mut self.pending);
+        let mut touched = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b {
+                match data.get(i + 1) {
+                    None => break,
+                    Some(b'[') => {
+                        let Some(len) =
+                            data[i + 2..].iter().position(|b| (0x40..=0x7e).contains(b))
+                        else {
+                            break;
+                        };
+                        let end = i + 2 + len;
+                        let params = String::from_utf8_lossy(&data[i + 2..end]).into_owned();
+                        match data[end] {
+                            b'H' => {
+                                let mut n = params
+                                    .split(';')
+                                    .map(|p| p.parse::<usize>().unwrap_or(1).max(1));
+                                self.row = n.next().unwrap_or(1) - 1;
+                                self.col = n.next().unwrap_or(1) - 1;
+                            }
+                            b'm' => {
+                                if params.is_empty() || params == "0" || params.starts_with("0;") {
+                                    self.style.clear();
+                                }
+                                if !(params.is_empty() || params == "0") {
+                                    self.style
+                                        .push_str(&String::from_utf8_lossy(&data[i..=end]));
+                                }
+                            }
+                            _ => {}
+                        }
+                        i = end + 1;
+                    }
+                    Some(b']') => {
+                        // An operating system command runs to a bell or a string terminator.
+                        let Some(len) = data[i + 2..]
+                            .windows(2)
+                            .position(|w| w[0] == 0x07 || w == b"\x1b\\")
+                        else {
+                            break;
+                        };
+                        let at = i + 2 + len;
+                        i = at + if data[at] == 0x07 { 1 } else { 2 };
+                    }
+                    Some(_) => i += 2,
+                }
+                continue;
+            }
+            let Some(c) = std::str::from_utf8(&data[i..(i + 4).min(data.len())])
+                .or_else(|e| std::str::from_utf8(&data[i..i + e.valid_up_to()]))
+                .ok()
+                .and_then(|s| s.chars().next())
+            else {
+                if data.len() - i < 4 {
+                    break;
+                }
+                i += 1;
+                continue;
+            };
+            i += c.len_utf8();
+            if c.is_control() {
+                continue;
+            }
+            let w = qoro_tui::width::columns(c);
+            if let Some(line) = self.cells.get_mut(self.row)
+                && self.col < line.len()
+            {
+                line[self.col] = (c, self.style.clone());
+                if w == 2
+                    && let Some(next) = line.get_mut(self.col + 1)
+                {
+                    *next = ('\0', self.style.clone());
+                }
+                if !touched.contains(&self.row) {
+                    touched.push(self.row);
+                }
+            }
+            self.col += w;
+        }
+        self.pending = data[i..].to_vec();
+        touched
+    }
+
+    /// One screen row's text, one based, the way a person reads it.
+    fn text(&self, row: usize) -> Option<String> {
+        let line = self.cells.get(row.checked_sub(1)?)?;
+        Some(
+            line.iter()
+                .map(|(c, _)| *c)
+                .filter(|c| *c != '\0')
+                .collect(),
+        )
+    }
+
+    /// The cells of one row, one based.
+    fn cells(&self, row: usize) -> Option<&[(char, String)]> {
+        self.cells.get(row.checked_sub(1)?).map(Vec::as_slice)
+    }
+}
+
+impl std::fmt::Display for Screen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for row in 1..=self.cells.len() {
+            writeln!(f, "{}", self.text(row).unwrap_or_default().trim_end())?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Interface {
@@ -53,29 +201,6 @@ impl Drop for Interface {
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
-
-/// What the row says, with the colour taken out.
-///
-/// A test that reads a screen has to read it the way a terminal does, and a terminal does
-/// not count an escape sequence as a column.
-fn strip_escapes(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // A control sequence runs to its final byte, which is the first one in the
-        // alphabetic range.
-        for c in chars.by_ref() {
-            if c.is_ascii_alphabetic() {
-                break;
-            }
-        }
-    }
-    out
-}
 
 /// The screen row the spaces panel's title is drawn on. Taken from the interface rather
 /// than written as `1`, so this test cannot disagree with the layout the next time the
@@ -100,8 +225,8 @@ const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 /// test would be a second copy of that arithmetic, and a wrong one the first time either
 /// changed. It also has to be read again on every poll, because the division moves as
 /// agents arrive.
-fn agents_panel(painted: &str) -> Vec<String> {
-    let Some(first) = agents_title_row(painted).map(|row| row + 2) else {
+fn agents_panel(screen: &Screen) -> Vec<String> {
+    let Some(first) = agents_title_row(screen).map(|row| row + 2) else {
         return Vec::new();
     };
     // The column stops where the status rows start. Reading into them picked up the notice,
@@ -109,15 +234,9 @@ fn agents_panel(painted: &str) -> Vec<String> {
     // said the panel had it.
     (first..=(ROWS as usize).saturating_sub(qoro_tui::screen::STATUS))
         .map(|row| {
-            let at = format!("\x1b[{row};1H");
-            painted
-                .rfind(&at)
-                .map(|start| {
-                    strip_escapes(&painted[start + at.len()..])
-                        .chars()
-                        .take(index_width())
-                        .collect::<String>()
-                })
+            screen
+                .text(row)
+                .map(|line| line.chars().take(index_width()).collect::<String>())
                 .unwrap_or_default()
         })
         .collect()
@@ -130,10 +249,10 @@ fn agents_panel(painted: &str) -> Vec<String> {
 /// panel starts depends on the window and on what is running in it: a number computed here
 /// would be a second copy of that arithmetic, and a wrong one the first time either
 /// changed.
-fn first_agent_row_of(painted: &str) -> usize {
-    agents_title_row(painted)
+fn first_agent_row_of(screen: &Screen) -> usize {
+    agents_title_row(screen)
         .map(|row| row + 2)
-        .unwrap_or_else(|| panic!("the agents panel is not on screen:\n{painted}"))
+        .unwrap_or_else(|| panic!("the agents panel is not on screen:\n{screen}"))
 }
 
 /// Where the agents panel's own title is, if a whole frame of it has arrived.
@@ -142,21 +261,16 @@ fn first_agent_row_of(painted: &str) -> usize {
 /// asserting: what has been read so far can be half a frame, with the title in the part
 /// that has not arrived, and a helper that panicked there failed one run in three for a
 /// reason that had nothing to do with what was being tested.
-fn agents_title_row(painted: &str) -> Option<usize> {
-    for row in SPACES_TITLE_ROW..=ROWS as usize {
-        let at = format!("\x1b[{row};1H");
-        let Some(start) = painted.rfind(&at) else {
-            continue;
-        };
-        let line: String = strip_escapes(&painted[start + at.len()..])
-            .chars()
-            .take(index_width())
-            .collect();
-        if line.trim_end().starts_with(" agents") {
-            return Some(row);
-        }
-    }
-    None
+fn agents_title_row(screen: &Screen) -> Option<usize> {
+    (SPACES_TITLE_ROW..=ROWS as usize).find(|&row| {
+        screen.text(row).is_some_and(|line| {
+            line.chars()
+                .take(index_width())
+                .collect::<String>()
+                .trim_end()
+                .starts_with(" agents")
+        })
+    })
 }
 
 /// The interface's own idea of how wide the left column is, so this test cannot drift from
@@ -200,6 +314,7 @@ impl Interface {
             cols,
             rows,
             painted: String::new(),
+            screen: Screen::new(cols, rows),
         }
     }
 
@@ -226,6 +341,7 @@ impl Interface {
             cols,
             rows,
             painted: String::new(),
+            screen: Screen::new(cols, rows),
         }
     }
 
@@ -361,7 +477,14 @@ impl Interface {
             }
             match file.read(&mut buf) {
                 Ok(0) => return None,
-                Ok(n) => self.painted.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(n) => {
+                    self.painted.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    for row in self.screen.feed(&buf[..n]) {
+                        self.painted.push('\n');
+                        self.painted
+                            .push_str(&self.screen.text(row + 1).unwrap_or_default());
+                    }
+                }
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
@@ -399,45 +522,24 @@ impl Interface {
     /// on this machine and dash on another, and a test that hardcodes one of them is a
     /// test about the machine.
     fn panel_line(&self, row: usize) -> Option<String> {
-        let at = format!("\x1b[{row};1H");
-        let start = self.painted.rfind(&at)? + at.len();
-        // Escapes stripped before counting: the index colours a row by its state, so the
-        // twenty characters after the cursor move are not twenty columns of index.
-        Some(
-            strip_escapes(&self.painted[start..])
-                .chars()
-                .take(index_width())
-                .collect(),
-        )
+        Some(self.screen.text(row)?.chars().take(index_width()).collect())
     }
 
-    /// One whole screen row, as painted most recently.
+    /// One whole screen row, as it is on screen now.
     fn row(&self, row: usize) -> Option<String> {
-        let at = format!("\x1b[{row};1H");
-        let start = self.painted.rfind(&at)? + at.len();
-        Some(
-            strip_escapes(&self.painted[start..])
-                .chars()
-                .take(COLS as usize)
-                .collect(),
-        )
+        Some(self.screen.text(row)?.chars().take(COLS as usize).collect())
     }
 
     /// The tab bar, as painted most recently.
     fn tab_bar(&self) -> Option<String> {
-        // The bar starts where the pane starts, past the column and its rule.
-        let at = format!(
-            "\x1b[{};{}H",
-            qoro_tui::screen::TABS,
-            qoro_tui::screen::left(self.cols) + 1
-        );
-        let start = self.painted.rfind(&at)? + at.len();
-        // Only the bar's own columns. It stops where the pane stops, and reading past it
-        // picks up the row the cursor moved to next.
+        // The bar starts where the pane starts, past the column and its rule, and stops
+        // where the pane stops.
         let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
         Some(
-            strip_escapes(&self.painted[start..])
+            self.screen
+                .text(qoro_tui::screen::TABS)?
                 .chars()
+                .skip(qoro_tui::screen::left(self.cols))
                 .take(pane_cols as usize)
                 .collect(),
         )
@@ -453,24 +555,16 @@ impl Interface {
     /// person can see, and an interface that believes it moved the focus and did not paint
     /// it is exactly the failure this is for.
     fn focused_tab(&self) -> Option<u32> {
-        let at = format!(
-            "\x1b[{};{}H",
-            qoro_tui::screen::TABS,
-            qoro_tui::screen::left(self.cols) + 1
-        );
-        let start = self.painted.rfind(&at)? + at.len();
-        // Bounded to the bar's own paint: the bar text runs at most a pane
-        // wide with one ink run per tab, so anything past that window belongs
-        // to a later row (or a child echoing escapes) and must not forge a
-        // focus reading.
         let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
-        let end = (start + pane_cols as usize + 320).min(self.painted.len());
-        let after = &self.painted[start..end];
+        let left = qoro_tui::screen::left(self.cols);
+        let bar = self.screen.cells(qoro_tui::screen::TABS)?;
+        let bar = &bar[left.min(bar.len())..(left + pane_cols as usize).min(bar.len())];
         let on = qoro_tui::theme::tab_on();
-        let pos = after.find(&on)?;
-        after[pos + on.len()..]
-            .trim_start_matches(' ')
-            .chars()
+        let at = bar.iter().position(|(_, style)| style.contains(&on))?;
+        bar[at..]
+            .iter()
+            .map(|(c, _)| *c)
+            .skip_while(|c| *c == ' ')
             .take_while(char::is_ascii_digit)
             .collect::<String>()
             .parse()
@@ -528,15 +622,20 @@ impl Interface {
     /// escapes included: the state dot and the space accent both repaint
     /// mid-row, and cutting at the first escape would return a prefix of the
     /// row rather than the row.
-    fn raw_panel_line(&self, row: usize) -> Option<&str> {
-        let at = format!("\x1b[{row};1H");
-        let start = self.painted.rfind(&at)? + at.len();
-        let rest = &self.painted[start..];
-        let end = rest
-            .find("\x1b[0m")
-            .map(|n| n + "\x1b[0m".len())
-            .unwrap_or(rest.len());
-        Some(&rest[..end])
+    fn raw_panel_line(&self, row: usize) -> Option<String> {
+        let mut line = String::new();
+        let mut ink = None;
+        for (c, style) in self.screen.cells(row)?.iter().take(index_width()) {
+            if ink != Some(style) {
+                line.push_str(if style.is_empty() { "\x1b[0m" } else { style });
+                ink = Some(style);
+            }
+            if *c != '\0' {
+                line.push(*c);
+            }
+        }
+        line.push_str("\x1b[0m");
+        Some(line)
     }
 
     /// Read until some row of the agents panel says what is wanted.
@@ -546,7 +645,7 @@ impl Interface {
     fn wait_for_agents(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < within {
-            if agents_panel(&self.painted).iter().any(|row| want(row)) {
+            if agents_panel(&self.screen).iter().any(|row| want(row)) {
                 return true;
             }
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
@@ -563,12 +662,12 @@ impl Interface {
     fn wait_for_agents_raw(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < within {
-            let Some(first) = agents_title_row(&self.painted).map(|row| row + 1) else {
+            let Some(first) = agents_title_row(&self.screen).map(|row| row + 1) else {
                 let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
                 continue;
             };
             let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
-            if (first..=last).any(|row| self.raw_panel_line(row).is_some_and(&want)) {
+            if (first..=last).any(|row| self.raw_panel_line(row).is_some_and(|l| want(&l))) {
                 return true;
             }
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
@@ -592,12 +691,10 @@ impl Interface {
     /// thing painted after the row's cursor move, so the first bytes decide.
     /// The stripped text cannot answer this: stripping takes the colour out.
     fn panel_selected(&self, row: usize) -> bool {
-        let at = format!("\x1b[{row};1H");
-        let Some(start) = self.painted.rfind(&at) else {
-            return false;
-        };
-        let rest = &self.painted[start + at.len()..];
-        rest[..rest.len().min(64)].contains("48;5;236")
+        self.screen
+            .cells(row)
+            .and_then(|cells| cells.first())
+            .is_some_and(|(_, style)| style.contains("48;5;236"))
     }
 
     /// Read until one index row carries the keyboard.
@@ -626,10 +723,9 @@ impl Interface {
 
     /// The terminal's own column of one screen row, as painted most recently.
     fn pane_line(&self, row: usize) -> Option<String> {
-        let at = format!("\x1b[{row};1H");
-        let start = self.painted.rfind(&at)? + at.len();
         Some(
-            strip_escapes(&self.painted[start..])
+            self.screen
+                .text(row)?
                 .chars()
                 .skip(index_width() + 1)
                 .take(30)
@@ -762,13 +858,13 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the spaces title lost its new-space corner: {title:?}"
     );
     let agents_title = ui
-        .panel_line(first_agent_row_of(&ui.painted) - 2)
+        .panel_line(first_agent_row_of(&ui.screen) - 2)
         .map(|l| l.trim_end().to_string())
         .unwrap_or_default();
     assert!(
         agents_title.starts_with(" agents") && agents_title.ends_with("grouped"),
         "the agents panel has no title: {:?}",
-        ui.panel_line(first_agent_row_of(&ui.painted) - 2)
+        ui.panel_line(first_agent_row_of(&ui.screen) - 2)
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
     // answers "who needs me", and a shell is only ever the first of those, so the panel is
@@ -805,11 +901,11 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     // The panel says it is empty rather than leaving a void under its own title, and a
     // plain shell is not what fills it.
     assert_eq!(
-        ui.panel_line(first_agent_row_of(&ui.painted))
+        ui.panel_line(first_agent_row_of(&ui.screen))
             .map(|l| l.trim_end().to_string()),
         Some(" no agents yet".to_string()),
         "a plain shell is listed as an agent: {:?}",
-        ui.panel_line(first_agent_row_of(&ui.painted))
+        ui.panel_line(first_agent_row_of(&ui.screen))
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
     ui.type_in(b"echo INTERFACE_$((6*7))\n");
@@ -1016,7 +1112,7 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     assert!(
         ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(15)),
         "the agents panel does not name the agent: {:?}",
-        agents_panel(&ui.painted)
+        agents_panel(&ui.screen)
     );
     // What it is doing, read off the row that names it: the state dot at
     // the row's start wears the blocked colour. The stripped text says no
@@ -1033,7 +1129,7 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
             Duration::from_secs(15)
         ),
         "the agents panel does not show the agent as blocked: {:?}",
-        agents_panel(&ui.painted)
+        agents_panel(&ui.screen)
     );
     // And the tab is named after it too, so a person can find it without reading the panel.
     assert!(
@@ -1055,8 +1151,8 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
         qoro_tui::theme::fg(qoro_tui::theme::Role::Blocked),
         qoro_tui::theme::selected_in(qoro_tui::theme::Role::Blocked),
     ];
-    let panel = agents_panel(&ui.painted);
-    let first = first_agent_row_of(&ui.painted);
+    let panel = agents_panel(&ui.screen);
+    let first = first_agent_row_of(&ui.screen);
     let detail = (0..panel.len())
         .find(|at| {
             panel[*at].contains("claude")
@@ -1303,17 +1399,17 @@ fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
             Duration::from_secs(15)
         ),
         "the panel does not carry the terminal behind the wrapper: {:?}\n{}",
-        agents_panel(&ui.painted),
+        agents_panel(&ui.screen),
         ui.painted
     );
     // The wrapper's own name is never printed where a program's name goes: a person shown
     // `docker` there would conclude their agent is called docker.
     assert!(
-        !agents_panel(&ui.painted)
+        !agents_panel(&ui.screen)
             .iter()
             .any(|line| line.trim_start().starts_with("docker")),
         "the wrapper is named as the program: {:?}",
-        agents_panel(&ui.painted)
+        agents_panel(&ui.screen)
     );
 }
 
@@ -1501,7 +1597,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     assert!(
         ui.wait_for_agents(|line| line.contains("claude"), Duration::from_secs(20)),
         "the agent is not on the panel: {:?}\n{}",
-        agents_panel(&ui.painted),
+        agents_panel(&ui.screen),
         ui.painted
     );
     // Wait for detection to settle: a fresh agent reports unknown, then idle
@@ -1520,7 +1616,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
             Duration::from_secs(20)
         ),
         "the agent never showed as blocked: {:?}\n{}",
-        agents_panel(&ui.painted),
+        agents_panel(&ui.screen),
         ui.painted
     );
 
@@ -1534,12 +1630,12 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     );
     // The agent's own first row, which is the one that names the session
     // behind its state dot; the tab and the space live on the row under it.
-    let panel = agents_panel(&ui.painted);
+    let panel = agents_panel(&ui.screen);
     let at = panel
         .iter()
         .position(|line| line.contains("claude"))
         .unwrap_or_else(|| panic!("the agent has no row: {}", ui.painted));
-    let row = first_agent_row_of(&ui.painted) + at;
+    let row = first_agent_row_of(&ui.screen) + at;
 
     ui.click(5, row as u16);
     assert!(
@@ -1767,17 +1863,17 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     assert!(
         ui.wait_for_agents(|line| line.contains("codex"), Duration::from_secs(20)),
         "the agent behind the wrapper is not on the panel: {:?}\n{}",
-        agents_panel(&ui.painted),
+        agents_panel(&ui.screen),
         ui.painted
     );
     // And it is the agent's name, not the wrapper's: a person shown `codex-vpn` would go
     // looking for a program by that name.
     assert!(
-        !agents_panel(&ui.painted)
+        !agents_panel(&ui.screen)
             .iter()
             .any(|line| line.contains("codex-vpn")),
         "the wrapper is named as the agent: {:?}",
-        agents_panel(&ui.painted)
+        agents_panel(&ui.screen)
     );
 }
 
@@ -1824,7 +1920,7 @@ fn g12_21_clicking_the_agents_mode_word_flips_grouped_and_priority() {
             Duration::from_secs(15),
         )
         .and_then(|_| {
-            agents_title_row(&ui.painted).and_then(|row| {
+            agents_title_row(&ui.screen).and_then(|row| {
                 ui.wait_for_panel(
                     row,
                     |line| line.trim_end().ends_with("grouped"),

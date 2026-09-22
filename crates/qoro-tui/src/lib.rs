@@ -8,6 +8,7 @@
 pub mod keys;
 pub mod layout;
 pub mod palette;
+pub mod present;
 pub mod run;
 pub mod screen;
 pub mod selection;

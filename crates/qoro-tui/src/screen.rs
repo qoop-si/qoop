@@ -211,34 +211,10 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     }
 }
 
-/// Whether a render only moved the cursor: same screen, new placement.
-///
-/// `behind` is ignored on purpose: the daemon stamps it per frame from the
-/// history counter, so it moves without any visible change. That blindness is
-/// safe only while the live view is on screen: scrolled back, the same lines
-/// paint at a different offset, so the caller must gate the fast path on the
-/// live view (no scrollback anchor). Modes compare except visibility, which is
-/// itself a cursor change. Everything else equal means the full repaint would
-/// draw the identical screen, so the run loop may move the host cursor with a
-/// tiny sequence instead. Cheap discriminants first: a streaming render fails
-/// on size or mode before the line comparison runs.
-pub(crate) fn render_moves_cursor_only(old: &SnapshotWire, new: &SnapshotWire) -> bool {
-    old.cols == new.cols
-        && old.rows == new.rows
-        && old.modes.alt_screen == new.modes.alt_screen
-        && old.modes.mouse_reporting == new.modes.mouse_reporting
-        && old.modes.application_cursor == new.modes.application_cursor
-        && (old.cursor != new.cursor || old.modes.cursor_visible != new.modes.cursor_visible)
-        && old.lines == new.lines
-        && old.styles == new.styles
-}
-
 /// Paint the whole screen.
 ///
-/// Whole, not incremental. A terminal snapshot already arrives as complete rows, so the
-/// saving from a diff is one write of a few kilobytes against another, and the cost of
-/// getting a diff wrong is a screen that is quietly out of date. When a frame is expensive
-/// enough to matter, the daemon has already coalesced it.
+/// Whole, not incremental, so a frame is a pure function a test can read. What actually
+/// reaches the terminal is only the rows that changed: see [`crate::present`].
 pub fn paint(frame: &Frame) -> String {
     let left = left_for(frame.cols, frame.collapsed);
     let right = 0;
@@ -2236,48 +2212,6 @@ mod tests {
         let placed = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
         assert!(!painted.contains(&placed), "hid cursor placed: {painted:?}");
         assert!(!painted.contains("?25h"), "hid cursor shown: {painted:?}");
-    }
-
-    #[test]
-    fn only_a_moved_cursor_is_a_cursor_only_render() {
-        let base = snapshot(&["$"]);
-        let mut moved = base.clone();
-        moved.cursor = (0, 1);
-        assert!(render_moves_cursor_only(&base, &moved));
-
-        let mut hid = base.clone();
-        hid.modes.cursor_visible = false;
-        assert!(render_moves_cursor_only(&base, &hid));
-
-        // `behind` moves with history, not with the screen: ignoring it is
-        // what lets the fast path fire while output scrolls past.
-        let mut scrolled = base.clone();
-        scrolled.behind = 41;
-        scrolled.cursor = (0, 1);
-        assert!(render_moves_cursor_only(&base, &scrolled));
-
-        // But history alone, with the cursor exactly where it was, is not a
-        // move: answering it with a cursor sequence would write escapes at a
-        // screen that changed in no visible way.
-        let mut history_only = base.clone();
-        history_only.behind = 41;
-        assert!(!render_moves_cursor_only(&base, &history_only));
-
-        let mut typed = base.clone();
-        typed.lines = vec!["$ x".to_string()];
-        assert!(!render_moves_cursor_only(&base, &typed));
-
-        let mut resized = base.clone();
-        resized.cols = 81;
-        assert!(!render_moves_cursor_only(&base, &resized));
-
-        let mut alted = base.clone();
-        alted.modes.alt_screen = true;
-        assert!(!render_moves_cursor_only(&base, &alted));
-
-        // Nothing differs at all: not a move, and the run loop must not
-        // answer it with a cursor sequence of its own.
-        assert!(!render_moves_cursor_only(&base, &base));
     }
 
     /// A window too narrow for the left column is a real one: two panes side by side in a

@@ -18,7 +18,7 @@ use crate::keys::{Action, Keys};
 use crate::layout::{self, Layout};
 use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
-use crate::{sidebar, tabs};
+use crate::{present, sidebar, tabs};
 
 /// What to ask for, given where the person has scrolled to.
 ///
@@ -123,24 +123,12 @@ fn update_message() -> String {
     }
 }
 
-/// Whether a cursor-only render may answer with a tiny cursor move instead
-/// of a full repaint.
+/// The shortest gap between two frames: sixty a second.
 ///
-/// Every gate is something that paints through the frame rather than through
-/// the snapshot: an open overlay owns the host cursor, and message, bell,
-/// selection and scrollback all draw around it. The caller additionally
-/// requires a stored snapshot and a cursor-only render (see
-/// [`screen::render_moves_cursor_only`], whose `behind` blindness is safe
-/// exactly because `live_view` here means no scrollback anchor is set.
-fn fast_path_cursor(
-    no_overlay: bool,
-    no_selection: bool,
-    live_view: bool,
-    no_message: bool,
-    no_bell: bool,
-) -> bool {
-    no_overlay && no_selection && live_view && no_message && no_bell
-}
+/// A streaming agent renders far faster than a person can read, and every frame is work for
+/// the terminal above this one (and for a tmux between them). Renders closer together than
+/// this are sent as one frame, the newest.
+const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// One mouse report in the form a program that asked for the mouse expects.
 ///
@@ -1373,18 +1361,18 @@ async fn drive(
     out.write_all(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h")?;
     out.flush()?;
     let mut dirty = true;
+    let mut presenter = present::Presenter::default();
+    let mut written = String::new();
+    let mut presented = tokio::time::Instant::now();
+    presented = presented.checked_sub(FRAME).unwrap_or(presented);
 
     let outcome: io::Result<()> = async {
         loop {
-            if dirty {
+            // At most one frame per `FRAME`. The first render after a quiet spell goes out
+            // at once, so a keystroke echoes with no added wait; renders arriving closer
+            // together than that wait for the timer arm below and go out as one frame.
+            if dirty && presented.elapsed() >= FRAME {
                 let mut painted = screen::paint(&state.frame());
-                if state.ring {
-                    // After the frame, so the terminal has the new colour on screen when
-                    // the person looks up.
-                    painted.push('\x07');
-                    state.ring = false;
-                }
-                out.write_all(painted.as_bytes())?;
                 // The focus list covers the pane the frame just drew, the way the
                 // palette does. Never over an overlay: an open palette owns the
                 // keyboard first, and the list never covers it.
@@ -1395,16 +1383,28 @@ async fn drive(
                     && state.menu.is_none()
                     && state.reading.is_none()
                 {
-                    // Cloned out from under the frame borrow: at most fifty
-                    // short rows, and only on a repaint while open.
-                    let events = state.focus_events.clone();
-                    let offset = state.focus_offset;
-                    let mut overlay = String::new();
-                    screen::paint_focus(&state.frame(), &events, offset, &mut overlay);
-                    out.write_all(overlay.as_bytes())?;
+                    screen::paint_focus(
+                        &state.frame(),
+                        &state.focus_events,
+                        state.focus_offset,
+                        &mut painted,
+                    );
                 }
-                out.flush()?;
+                written.clear();
+                presenter.present(&painted, state.cols, state.lines, &mut written);
+                if state.ring {
+                    // After the frame, so the terminal has the new colour on screen when
+                    // the person looks up.
+                    written.push('\x07');
+                    state.ring = false;
+                }
+                // A frame that changed nothing on screen is not a write at all.
+                if !written.is_empty() {
+                    out.write_all(written.as_bytes())?;
+                    out.flush()?;
+                }
                 dirty = false;
+                presented = tokio::time::Instant::now();
             }
 
             tokio::select! {
@@ -2341,62 +2341,9 @@ async fn drive(
                                 // another space's terminal under this space's tab bar, and
                                 // silently put the keyboard back in it.
                                 if terminal == state.focused {
-                                    // A render that only moved the cursor redraws
-                                    // nothing: the full repaint hides the cursor,
-                                    // rewrites the screen and shows it again, and
-                                    // that hide/show per frame is the pane flicker.
-                                    // Move the host cursor with a tiny sequence
-                                    // instead. Full repaint whenever anything else
-                                    // could be on screen: overlays own the cursor
-                                    // then, and message, bell, selection and
-                                    // scrollback all paint through the frame.
-                                    let cursor_only = state
-                                        .snapshot
-                                        .as_ref()
-                                        .is_some_and(|old| {
-                                            screen::render_moves_cursor_only(old, &snapshot)
-                                        })
-                                        && fast_path_cursor(
-                                            state.prompt.is_none()
-                                                && state.palette.is_none()
-                                                && state.menu.is_none()
-                                                && state.reading.is_none()
-                                                && !state.focus,
-                                            state.selection.is_none(),
-                                            state.anchor.is_none(),
-                                            state.message.is_none(),
-                                            !state.ring,
-                                        );
                                     state.snapshot = Some(snapshot);
-                                    if cursor_only {
-                                        // Owned before touching the host: the
-                                        // frame borrows state.
-                                        let frame = state.frame();
-                                        let show = frame
-                                            .snapshot
-                                            .is_none_or(|s| s.modes.cursor_visible);
-                                        let placed = if show {
-                                            frame.snapshot.and_then(|s| {
-                                                screen::pane_cursor(&frame, s)
-                                            })
-                                        } else {
-                                            None
-                                        };
-                                        drop(frame);
-                                        if show {
-                                            if let Some((row, col)) = placed {
-                                                let goto = screen::at(row, col);
-                                                out.write_all(goto.as_bytes())?;
-                                            }
-                                            out.write_all(b"\x1b[?25h")?;
-                                        } else {
-                                            out.write_all(b"\x1b[?25l")?;
-                                        }
-                                        out.flush()?;
-                                    } else {
-                                        state.message = None;
-                                        dirty = true;
-                                    }
+                                    state.message = None;
+                                    dirty = true;
                                 } else if state.subs.contains(&terminal)
                                     && (state
                                         .rows
@@ -2535,6 +2482,9 @@ async fn drive(
                         )?).await?;
                     }
                 }
+                // Last, so it never goes ahead of input: it only wakes the loop to send
+                // the frame that the renders above held back.
+                _ = tokio::time::sleep_until(presented + FRAME), if dirty => {}
             }
         }
     }
@@ -2803,7 +2753,7 @@ fn ensure_layout(state: &mut State) {
 /// The terminals this client receives renders for: the visible set of the
 /// space on screen, or the focused one when there is no tree yet.
 fn visible_set(state: &State) -> Vec<u32> {
-    let set = if let Some(space) = state.space
+    if let Some(space) = state.space
         && let Some(layout) = state.layouts.get(&space)
     {
         layout.visible()
@@ -2811,8 +2761,7 @@ fn visible_set(state: &State) -> Vec<u32> {
         vec![state.focused]
     } else {
         Vec::new()
-    };
-    set
+    }
 }
 
 /// Apply a deferred focus through the subscribing path: subscribe, move the
@@ -3697,22 +3646,6 @@ mod tests {
             other => panic!("a detach closed nothing: {other:?}"),
         }
         assert_eq!(state.palette, None);
-    }
-
-    /// The fast path fires only with a clear screen: anything that paints
-    /// through the frame holds the full repaint.
-    #[test]
-    fn the_cursor_fast_path_needs_a_clear_screen() {
-        assert!(fast_path_cursor(true, true, true, true, true));
-        for gated in [
-            fast_path_cursor(false, true, true, true, true),
-            fast_path_cursor(true, false, true, true, true),
-            fast_path_cursor(true, true, false, true, true),
-            fast_path_cursor(true, true, true, false, true),
-            fast_path_cursor(true, true, true, true, false),
-        ] {
-            assert!(!gated);
-        }
     }
 
     #[test]
