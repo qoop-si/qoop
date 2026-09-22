@@ -136,6 +136,9 @@ pub enum Hit {
     NewSpace,
     /// The `menu` at the foot of the spaces panel: everything that is not a space, a tab or an agent.
     Menu,
+    /// The `grouped` or `priority` word at the corner of the agents title:
+    /// the order the rows below are in, and the switch that flips it.
+    View,
     /// The mark at the foot of the column: fold the whole column away, and back.
     Collapse,
 }
@@ -147,7 +150,7 @@ pub enum Hit {
 /// sorted so the one that needs a person is always on top: the inbox view of
 /// the fleet. Both are flat lists: the state dot carries the state, and no
 /// header tree sits above calm rows. The title names the order. Toggled with
-/// `ctrl-a g`.
+/// `ctrl-a g`, or with a click on the `grouped`/`priority` word itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
     #[default]
@@ -1066,8 +1069,12 @@ fn lay_out_agents(
         return Vec::new();
     }
     let mut out = vec![(agents_title(view, shown, total), None)];
-    let body = height - 1;
+    // One breath between the title and the rows: the header is a switch now,
+    // and the gap keeps the first agent from reading as part of it.
+    out.push(blank());
+    let body = height.saturating_sub(2);
     if body == 0 {
+        out.truncate(height);
         return out;
     }
     // Flat scroll keeping the focused agent's first line visible with room for
@@ -1097,10 +1104,7 @@ fn lay_out_agents(
 /// one place that says which. The counts ride along when the list scrolls past
 /// the window, so a clipped panel still says how much of itself is hidden.
 fn agents_title(view: View, shown: usize, total: usize) -> Line {
-    let mode = match view {
-        View::Grouped => "grouped",
-        View::Priority => "priority",
-    };
+    let mode = title_mode(view);
     let left = if shown == total {
         format!(" {AGENTS_TITLE}")
     } else {
@@ -1116,6 +1120,24 @@ fn agents_title(view: View, shown: usize, total: usize) -> Line {
         accent: None,
         indicator: None,
     }
+}
+
+/// The word on the right of the agents title: the order the rows below are in.
+fn title_mode(view: View) -> &'static str {
+    match view {
+        View::Grouped => "grouped",
+        View::Priority => "priority",
+    }
+}
+
+/// What a click at one column of the agents title means.
+///
+/// Only the `grouped`/`priority` corner word flips the view: it sits at the
+/// right edge, ahead of the trailing space, both words plain ASCII. A click on
+/// the `agents` word itself is a click on nothing.
+pub fn agents_title_hit(view: View, col: usize) -> Option<Hit> {
+    let mode = title_mode(view);
+    (col + 1 >= WIDTH.saturating_sub(mode.len())).then_some(Hit::View)
 }
 
 /// What to call the program in the terminal.
@@ -2244,6 +2266,46 @@ mod tests {
         assert_eq!(View::Grouped.toggle(), View::Priority);
         assert_eq!(View::Priority.toggle(), View::Grouped);
         assert_eq!(View::default(), View::Grouped);
+    }
+
+    #[test]
+    fn only_the_mode_word_of_the_agents_title_flips_the_view() {
+        for view in [View::Grouped, View::Priority] {
+            assert_eq!(
+                agents_title_hit(view, 0),
+                None,
+                "the agents word is nothing"
+            );
+            assert_eq!(agents_title_hit(view, 5), None, "mid title is nothing");
+            assert_eq!(
+                agents_title_hit(view, WIDTH - 1),
+                Some(Hit::View),
+                "the mode corner flips"
+            );
+        }
+    }
+
+    #[test]
+    fn one_breath_sits_between_the_agents_title_and_the_rows() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![agent(1, 1, "codex", "idle")];
+        let (content, shown, total) = agents_content(
+            &spaces,
+            &agents,
+            1,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        let laid = lay_out_agents(content, shown, total, 1, 10, View::Grouped);
+        assert!(
+            laid[0].0.text.starts_with(" agents"),
+            "{:?}",
+            laid[0].0.text
+        );
+        assert_eq!(laid[1].0.text.trim(), "", "no gap under the switch");
+        assert!(laid[1].1.is_none(), "the gap is not clickable");
     }
 
     /// A blocked agent draws its two rows and nothing else: no headers for

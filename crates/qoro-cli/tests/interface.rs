@@ -101,7 +101,7 @@ const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 /// changed. It also has to be read again on every poll, because the division moves as
 /// agents arrive.
 fn agents_panel(painted: &str) -> Vec<String> {
-    let Some(first) = agents_title_row(painted).map(|row| row + 1) else {
+    let Some(first) = agents_title_row(painted).map(|row| row + 2) else {
         return Vec::new();
     };
     // The column stops where the status rows start. Reading into them picked up the notice,
@@ -132,7 +132,7 @@ fn agents_panel(painted: &str) -> Vec<String> {
 /// changed.
 fn first_agent_row_of(painted: &str) -> usize {
     agents_title_row(painted)
-        .map(|row| row + 1)
+        .map(|row| row + 2)
         .unwrap_or_else(|| panic!("the agents panel is not on screen:\n{painted}"))
 }
 
@@ -762,13 +762,13 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the spaces title lost its new-space corner: {title:?}"
     );
     let agents_title = ui
-        .panel_line(first_agent_row_of(&ui.painted) - 1)
+        .panel_line(first_agent_row_of(&ui.painted) - 2)
         .map(|l| l.trim_end().to_string())
         .unwrap_or_default();
     assert!(
         agents_title.starts_with(" agents") && agents_title.ends_with("grouped"),
         "the agents panel has no title: {:?}",
-        ui.panel_line(first_agent_row_of(&ui.painted) - 1)
+        ui.panel_line(first_agent_row_of(&ui.painted) - 2)
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
     // answers "who needs me", and a shell is only ever the first of those, so the panel is
@@ -1811,5 +1811,60 @@ fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
         ui2.wait_for(&expected, Duration::from_secs(10)).is_some(),
         "the adopted child reports a size that is not the pane's ({expected} expected):\n{}",
         ui2.painted
+    );
+}
+
+#[test]
+fn g12_21_clicking_the_agents_mode_word_flips_grouped_and_priority() {
+    let mut ui = Interface::start();
+    let title = ui
+        .wait_for_panel(
+            FIRST_SPACE_ROW,
+            |line| line.contains("default"),
+            Duration::from_secs(15),
+        )
+        .and_then(|_| {
+            agents_title_row(&ui.painted).and_then(|row| {
+                ui.wait_for_panel(
+                    row,
+                    |line| line.trim_end().ends_with("grouped"),
+                    Duration::from_secs(15),
+                )
+                .map(|_| row)
+            })
+        })
+        .unwrap_or_else(|| panic!("the agents title never said grouped:\n{}", ui.painted));
+    // The corner word flips the view, like `ctrl-a g`: the same rows, urgency first.
+    ui.click(28, title as u16);
+    assert!(
+        ui.wait_for_panel(
+            title,
+            |line| line.trim_end().ends_with("priority"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "a click on grouped did not flip to priority:\n{}",
+        ui.painted
+    );
+    // And back again with a second click.
+    ui.click(28, title as u16);
+    assert!(
+        ui.wait_for_panel(
+            title,
+            |line| line.trim_end().ends_with("grouped"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "a click on priority did not flip back to grouped:\n{}",
+        ui.painted
+    );
+    // The `agents` word itself is nothing: a click there leaves the view alone.
+    ui.click(5, title as u16);
+    let _ = ui.wait_for("never appears", Duration::from_secs(2));
+    assert!(
+        ui.panel_line(title)
+            .is_some_and(|line| line.trim_end().ends_with("grouped")),
+        "a click on the agents word moved the view:\n{}",
+        ui.painted
     );
 }

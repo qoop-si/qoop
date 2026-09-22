@@ -256,6 +256,7 @@ pub fn paint(frame: &Frame) -> String {
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
                 Some(sidebar::Hit::NewSpace | sidebar::Hit::Menu)
                 | Some(sidebar::Hit::Collapse)
+                | Some(sidebar::Hit::View)
                 | None => false,
             };
             let base = match (selected, line.colour) {
@@ -2968,7 +2969,7 @@ mod tests {
             &rows,
             1,
             1,
-            38,
+            39,
             0,
             sidebar::View::Grouped,
             &sidebar::Seen::new(),

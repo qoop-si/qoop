@@ -563,12 +563,32 @@ impl State {
                     .get(within)
                     .is_some_and(|(line, _)| line.text.contains("menu"));
                 (is_footer && !self.collapsed).then(|| sidebar::footer_hit(col as usize))?
+            })
+            .or_else(|| {
+                let rows = sidebar::rows_folded(
+                    &self.spaces,
+                    &self.rows,
+                    self.space.unwrap_or_default(),
+                    self.focused,
+                    column_rows,
+                    // Hit testing does not depend on the animation frame.
+                    0,
+                    self.view,
+                    &self.seen_done,
+                    &self.unseen_finished,
+                );
+                let is_agents_title = rows
+                    .get(within)
+                    .is_some_and(|(line, _)| line.text.starts_with(" agents"));
+                (is_agents_title && !self.collapsed)
+                    .then(|| sidebar::agents_title_hit(self.view, col as usize))?
             });
         match hit? {
             sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
             sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
             sidebar::Hit::NewSpace => Some(Clicked::NewSpace),
             sidebar::Hit::Menu => Some(Clicked::Menu),
+            sidebar::Hit::View => Some(Clicked::View),
             sidebar::Hit::Collapse => Some(Clicked::Collapse),
         }
     }
@@ -1159,6 +1179,7 @@ fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
 /// What the interface drew where a person clicked.
 enum Clicked {
     Menu,
+    View,
     Collapse,
     Space(i64),
     Terminal(u32),
@@ -1747,6 +1768,10 @@ async fn drive(
                                     }
                                     Some(Clicked::Menu) => {
                                         state.menu = Some(0);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::View) => {
+                                        state.view = state.view.toggle();
                                         dirty = true;
                                     }
                                     Some(Clicked::Collapse) => {
