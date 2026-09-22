@@ -209,6 +209,11 @@ struct State {
     wants_terminal_in: Vec<i64>,
     /// Whether this client has ever had a terminal on screen.
     adopted: bool,
+    /// The adopted child still needs sizing to this pane. Set where the
+    /// adoption happens without a write in hand (the index path); drained
+    /// with the deferred focus everywhere a write is in hand, including the
+    /// ack tick, so an idle daemon still sizes it within seconds.
+    adopted_resize: bool,
     /// Set when there is nothing left to be an interface to.
     done: bool,
     /// The open naming box, when a person is being asked what to call something.
@@ -1242,6 +1247,7 @@ async fn drive(
         reading: None,
         wants_terminal_in: Vec::new(),
         adopted: false,
+        adopted_resize: false,
         creating: 0,
         done: false,
 
@@ -1368,6 +1374,7 @@ async fn drive(
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
+                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),
@@ -1401,6 +1408,9 @@ async fn drive(
                 }
                 typed = stdin_rx.recv() => {
                     let Some(bytes) = typed else { return Ok(()) };
+                    // Ahead of the keystroke itself: a resize behind the input
+                    // loses the race with the shell reading it.
+                    drain_adopt_resize(&mut state, &mut seqs, &mut wr, &mut dirty).await?;
                     // The palette owns the keyboard while it is open: typing filters,
                     // enter goes, esc is back. A prefix or a detach inside it closes
                     // the palette and the bytes from there on are ordinary input, so
@@ -2321,6 +2331,15 @@ async fn drive(
                                             state.layouts.insert(space, Layout::single(terminal));
                                             state.subs.insert(terminal);
                                         }
+                                        // And the size to match: the child was sized for
+                                        // whoever had it before (a restore spawns at the
+                                        // default), so without this the first paint shows
+                                        // a small screen until anything moves the focus.
+                                        if let Some(resize) =
+                                            resize_focused_to_tile(&state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
                                         dirty = true;
                                     }
                                 }
@@ -2718,6 +2737,28 @@ async fn drain_pending_focus(
         wr.write_all(&bytes).await?;
         *dirty = true;
     }
+    drain_adopt_resize(state, seqs, wr, dirty).await
+}
+
+/// Size an adopted child to this pane, once.
+///
+/// An adoption without a write in hand cannot size inline, and the child was
+/// sized for whoever had it before. Runs everywhere a write is in hand, and
+/// ahead of typed input: a resize behind the keystroke loses the race with
+/// the shell reading it.
+async fn drain_adopt_resize(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    dirty: &mut bool,
+) -> std::io::Result<()> {
+    if state.adopted_resize {
+        state.adopted_resize = false;
+        if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+            wr.write_all(&resize).await?;
+            *dirty = true;
+        }
+    }
     Ok(())
 }
 
@@ -3087,6 +3128,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 if let Some(first) = first {
                     state.adopted = true;
                     state.focused = first.terminal;
+                    // No write in hand here; the resize goes out with the
+                    // deferred focus below, which also runs on the ack tick.
+                    state.adopted_resize = true;
                     // The space follows the adoption: leaving it for the first
                     // workspace list parks the bar in another space than the
                     // keyboard, and the person types where they cannot see.
@@ -3476,6 +3520,7 @@ mod tests {
             reading: None,
             wants_terminal_in: Vec::new(),
             adopted: true,
+            adopted_resize: false,
             creating: 0,
             done: false,
 
@@ -3701,6 +3746,7 @@ mod tests {
             ring: false,
             wants_terminal_in: Vec::new(),
             adopted: true,
+            adopted_resize: false,
             done: false,
             prompt: None,
             menu: None,
@@ -3758,6 +3804,7 @@ mod tests {
             ring: false,
             wants_terminal_in: Vec::new(),
             adopted: true,
+            adopted_resize: false,
             creating: 0,
             done: false,
             prompt: None,

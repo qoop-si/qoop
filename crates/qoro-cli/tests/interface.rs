@@ -24,8 +24,13 @@ struct Interface {
     /// `ensure_daemon` gives that to `/dev/null`.
     daemon: Child,
     master: OwnedFd,
-    #[allow(dead_code)]
-    _dir: tempfile::TempDir,
+    /// The runtime directory. Owned here when this interface started the
+    /// session, borrowed when it attached to another interface's: the owner
+    /// deletes it on drop, so an attacher must be dropped first.
+    _dir: Option<tempfile::TempDir>,
+    runtime: std::path::PathBuf,
+    cols: u16,
+    rows: u16,
     /// Everything it has painted so far. The screen is a stream here, not a grid: a test
     /// asks whether something was ever drawn, and the last frame alone would lose an
     /// answer that was correct a moment ago.
@@ -174,20 +179,70 @@ impl Interface {
     }
 
     fn start_impl(backgrounded: bool) -> Self {
+        Self::start_impl_sized(backgrounded, COLS, ROWS)
+    }
+
+    fn start_impl_sized(backgrounded: bool, cols: u16, rows: u16) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(
             dir.path(),
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .expect("chmod");
+        let runtime = dir.path().to_path_buf();
+        let (child, daemon, master) = Self::start_in(dir.path(), backgrounded, cols, rows);
+        Self {
+            child,
+            daemon,
+            master,
+            _dir: Some(dir),
+            runtime,
+            cols,
+            rows,
+            painted: String::new(),
+        }
+    }
+
+    /// Kill only the client, leaving the daemon and its terminals: the
+    /// next attach finds a live session with an unowned size.
+    fn disconnect_client(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// A second screen with its own window size on another interface's
+    /// session: no new daemon (a second bind fails and the spare exits on
+    /// its own), just another client, for testing what a fresh attach
+    /// adopts and sizes. Drop this before the interface that owns the
+    /// directory.
+    fn attach_sized(dir: &std::path::Path, cols: u16, rows: u16) -> Self {
+        let (child, daemon, master) = Self::start_in(dir, false, cols, rows);
+        Self {
+            child,
+            daemon,
+            master,
+            _dir: None,
+            runtime: dir.to_path_buf(),
+            cols,
+            rows,
+            painted: String::new(),
+        }
+    }
+
+    fn start_in(
+        dir: &std::path::Path,
+        backgrounded: bool,
+        cols: u16,
+        rows: u16,
+    ) -> (Child, Child, OwnedFd) {
         let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
         daemon_cmd
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QORO_RUNTIME_DIR", dir)
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                std::fs::File::create(dir.path().join("daemon.log")).expect("log"),
+                std::fs::File::create(dir.join("daemon.log")).expect("log"),
             ));
         if backgrounded {
             // SAFETY: `pre_exec` runs post fork with async-signal-safe calls and no
@@ -203,14 +258,14 @@ impl Interface {
             }
         }
         let daemon = daemon_cmd.spawn().expect("spawn the daemon");
-        let socket = qoro_testkit::socket_in(dir.path());
+        let socket = qoro_testkit::socket_in(dir);
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline && !socket.exists() {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(socket.exists(), "the daemon never bound its socket");
 
-        let pty = qoro_pty::sys::open_pty(COLS, ROWS).expect("a pty");
+        let pty = qoro_pty::sys::open_pty(cols, rows).expect("a pty");
         let slave = pty.slave;
         // SAFETY: the only unsafe part is `pre_exec` below, whose closure runs post fork
         // and calls two async signal safe syscalls with no allocation.
@@ -218,7 +273,7 @@ impl Interface {
         let stdout = slave.try_clone().expect("dup");
         let stderr = slave.try_clone().expect("dup");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
-        cmd.env("QORO_RUNTIME_DIR", dir.path())
+        cmd.env("QORO_RUNTIME_DIR", dir)
             // Pinned for the same reason the scale gates pin it: an interactive shell
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")
@@ -254,13 +309,7 @@ impl Interface {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        Self {
-            child,
-            daemon,
-            master: pty.master,
-            _dir: dir,
-            painted: String::new(),
-        }
+        (child, daemon, pty.master)
     }
 
     fn type_in(&mut self, bytes: &[u8]) {
@@ -320,13 +369,17 @@ impl Interface {
     }
 
     /// What the daemon said about itself, for a failure the screen cannot explain.
+    fn runtime_dir(&self) -> std::path::PathBuf {
+        self.runtime.clone()
+    }
+
     fn daemon_log(&mut self) -> String {
         let alive = match self.daemon.try_wait() {
             Ok(None) => "alive".to_string(),
             Ok(Some(status)) => format!("gone with {status}"),
             Err(e) => format!("unknown: {e}"),
         };
-        let said = std::fs::read_to_string(self._dir.path().join("daemon.log")).unwrap_or_default();
+        let said = std::fs::read_to_string(self.runtime.join("daemon.log")).unwrap_or_default();
         let interface = match self.child.try_wait() {
             Ok(None) => "alive".to_string(),
             Ok(Some(status)) => format!("gone with {status}"),
@@ -376,12 +429,12 @@ impl Interface {
         let at = format!(
             "\x1b[{};{}H",
             qoro_tui::screen::TABS,
-            qoro_tui::screen::left(COLS) + 1
+            qoro_tui::screen::left(self.cols) + 1
         );
         let start = self.painted.rfind(&at)? + at.len();
         // Only the bar's own columns. It stops where the pane stops, and reading past it
         // picks up the row the cursor moved to next.
-        let (pane_cols, _) = qoro_tui::screen::pane_size(COLS, ROWS);
+        let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
         Some(
             strip_escapes(&self.painted[start..])
                 .chars()
@@ -403,14 +456,14 @@ impl Interface {
         let at = format!(
             "\x1b[{};{}H",
             qoro_tui::screen::TABS,
-            qoro_tui::screen::left(COLS) + 1
+            qoro_tui::screen::left(self.cols) + 1
         );
         let start = self.painted.rfind(&at)? + at.len();
         // Bounded to the bar's own paint: the bar text runs at most a pane
         // wide with one ink run per tab, so anything past that window belongs
         // to a later row (or a child echoing escapes) and must not forge a
         // focus reading.
-        let (pane_cols, _) = qoro_tui::screen::pane_size(COLS, ROWS);
+        let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
         let end = (start + pane_cols as usize + 320).min(self.painted.len());
         let after = &self.painted[start..end];
         let on = qoro_tui::theme::tab_on();
@@ -461,7 +514,7 @@ impl Interface {
         let at = bar.find(&format!(" {terminal} "))?;
         // The bar is read from its own left edge and a click is sent in screen columns, so
         // the column the pane starts at has to be added back.
-        Some(at as u16 + 2 + qoro_tui::screen::left(COLS) as u16)
+        Some(at as u16 + 2 + qoro_tui::screen::left(self.cols) as u16)
     }
 
     /// One row of the left column exactly as it was written, escapes and all.
@@ -940,7 +993,7 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
-    let dir = ui._dir.path().join("bin");
+    let dir = ui.runtime_dir().join("bin");
     std::fs::create_dir_all(&dir).expect("dir");
     let agent = dir.join("claude");
     std::fs::write(
@@ -1214,7 +1267,7 @@ fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
-    let dir = ui._dir.path().join("bin");
+    let dir = ui.runtime_dir().join("bin");
     std::fs::create_dir_all(&dir).expect("dir");
     // A real executable and not a shell script, and compiled rather than copied. The
     // boundary is decided from the executable the process is actually running: a script
@@ -1423,7 +1476,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
 
     // A stand in agent in a second space, so there is a row in the panel to click. A shell
     // is not one: the panel lists agents.
-    let dir = ui._dir.path().join("bin");
+    let dir = ui.runtime_dir().join("bin");
     std::fs::create_dir_all(&dir).expect("dir");
     let agent = dir.join("claude");
     std::fs::write(
@@ -1679,7 +1732,7 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
-    let dir = ui._dir.path().join("bin");
+    let dir = ui.runtime_dir().join("bin");
     std::fs::create_dir_all(&dir).expect("dir");
     let source = dir.join("codex.rs");
     std::fs::write(
@@ -1725,5 +1778,38 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
             .any(|line| line.contains("codex-vpn")),
         "the wrapper is named as the agent: {:?}",
         agents_panel(&ui.painted)
+    );
+}
+
+/// G12.20: a fresh attach sizes the adopted terminal to its own pane.
+///
+/// A restored session's children were sized for whoever had them before (a
+/// restore spawns at the default): without a resize on adopt, the first
+/// paint shows a small screen until anything moves the focus. A second
+/// screen on the same session adopts what is already open and must size it
+/// on arrival.
+#[test]
+fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    // The old screen goes away first: it owns the size, and a second watcher
+    // never takes it. What is tested is the fresh attach after a disconnect.
+    ui.disconnect_client();
+    // Let the daemon reap the dead client and release its size ownership:
+    // an attach racing that cleanup gets its resize refused.
+    std::thread::sleep(Duration::from_secs(3));
+    // Another screen with its own window size on the same session: no new
+    // daemon, just a fresh adopt. A same-sized screen would prove nothing,
+    // since the child is already that size. Dropped before `ui`, so the
+    // directory outlives it.
+    let mut ui2 = Interface::attach_sized(&ui.runtime_dir(), 120, 34);
+    assert!(ui2.wait_for_tab(1, Duration::from_secs(20)));
+    ui2.type_in(b"stty size\n");
+    let (want_cols, want_rows) = qoro_tui::screen::pane_size(120, 34);
+    let expected = format!("{want_rows} {want_cols}");
+    assert!(
+        ui2.wait_for(&expected, Duration::from_secs(10)).is_some(),
+        "the adopted child reports a size that is not the pane's ({expected} expected):\n{}",
+        ui2.painted
     );
 }
