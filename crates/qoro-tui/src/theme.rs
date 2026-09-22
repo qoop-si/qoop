@@ -74,15 +74,17 @@ const SPACE_INKS: [u8; 6] = [111, 176, 215, 150, 117, 181];
 /// The spinner's ember wheel, from the brand accent out to pale amber and back.
 ///
 /// `#FF6600` is 202, which is also [`Role::Brand`]'s ink: the spinner starts on the
-/// product's own mark and breathes outward. `#f59e0b` is 214, `#FFD166` is 222,
+/// product's own mark and breathes outward, and a blocked row wears it steady. `#f59e0b` is 214, `#FFD166` is 222,
 /// and the midpoints 208 and 220 are the nearest 256 entries between them.
 const EMBER_INKS: [u8; 5] = [202, 208, 214, 220, 222];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
-/// Deliberately few and deliberately warm only where it matters: a person scanning this
-/// column is looking for the one row that needs them, and a column where every row is a
-/// different colour is a column with no signal in it.
+/// Loud on black on purpose: the column is scanned for the one row that needs
+/// a person, and that row wears the brand's own orange. Warm alarm: blocked is
+/// the accent (202), failed is full red (196), working is bright cyan (51),
+/// done is bright green (82). Idle and unobserved stay in the greys, because a
+/// colour on every row is a column with no signal in it.
 pub fn of(state: &str) -> Role {
     match state {
         "working" | "starting" => Role::Working,
@@ -115,12 +117,12 @@ const fn ink(role: Role) -> u8 {
         Role::Faint => 241,
         Role::Rule => 237,
         Role::Brand => 202,
-        Role::Working => 80,
-        Role::Blocked => 179,
-        Role::Done => 108,
-        Role::Failed => 174,
-        Role::Idle => 245,
-        Role::Unobserved => 240,
+        Role::Working => 51,
+        Role::Blocked => 202,
+        Role::Done => 82,
+        Role::Failed => 196,
+        Role::Idle => 242,
+        Role::Unobserved => 238,
         Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
     }
