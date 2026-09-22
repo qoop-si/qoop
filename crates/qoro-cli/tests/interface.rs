@@ -737,8 +737,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || "-_. ".contains(*c))
             .collect();
-        // The label carries the state dot after the program (`bash o`), so the
-        // name is the first word of it.
+        // The label is the program, so the name is the first word of it.
         let program = label.split_whitespace().next().unwrap_or("");
         !program.is_empty()
             && program

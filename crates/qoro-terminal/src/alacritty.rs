@@ -126,7 +126,21 @@ impl AlacrittyEngine {
         while spans.last().is_some_and(|s| s.style.is_plain()) {
             spans.pop();
         }
-        (text.trim_end().to_string(), spans)
+        // Keep the text through the last styled cell, and through the last
+        // non-space character besides: trimming past either would drop a
+        // background the program painted (an erase with the background set,
+        // a box drawn in spaces) or plain text after a styled run. Chars are
+        // columns here: a wide character carries its spacer along, so a char
+        // index is a cell index and no width table is needed.
+        let styled = spans
+            .iter()
+            .filter(|s| !s.style.is_plain())
+            .map(|s| s.at + s.len)
+            .max()
+            .unwrap_or(0);
+        let plain = text.trim_end().chars().count();
+        let keep = styled.max(plain);
+        (text.chars().take(keep).collect(), spans)
     }
 
     /// Capture rows that have entered the history ring since the last feed.
@@ -419,6 +433,37 @@ mod tests {
             split.snapshot(),
             whole.snapshot(),
             "a read that ended inside the first character lost what came after it"
+        );
+    }
+
+    /// An erase with the background set keeps the background: opencode draws
+    /// its input box this way, text plus erase-to-end under one grey, and a
+    /// trim past the text would show default where the program shows grey.
+    /// Plain text past a styled run keeps too: only trailing blanks go.
+    #[test]
+    fn an_erase_with_the_background_set_keeps_the_background() {
+        let mut e = engine();
+        e.feed(b"\x1b[48;2;30;30;30mhi\x1b[K");
+        let s = e.snapshot();
+        let end = s.styles[0]
+            .iter()
+            .map(|sp| sp.at + sp.len)
+            .max()
+            .unwrap_or(0);
+        assert!(end > 10, "the erase filled nothing: {s:?}");
+        assert!(
+            s.lines[0].chars().count() >= end,
+            "the text was trimmed past styled cells: {:?}",
+            s.lines[0]
+        );
+        // Styled then plain: the plain tail survives the styled head.
+        let mut e = engine();
+        e.feed(b"\x1b[31mhi\x1b[0mbye");
+        let s = e.snapshot();
+        assert!(
+            s.lines[0].starts_with("hibye"),
+            "plain text after a styled run vanished: {:?}",
+            s.lines[0]
         );
     }
 

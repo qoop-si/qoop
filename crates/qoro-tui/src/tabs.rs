@@ -205,15 +205,15 @@ fn tab(row: &AgentRow, position: usize, focus: u32, unseen: &crate::sidebar::Uns
 }
 
 /// The state dot a tab carries, so the bar answers "what is it doing" without
-/// leaving the top line. Same glyphs as the agents panel: `*` working, `!`
-/// blocked, `x` failed, `+` done, `o` idle, `.` for anything unobserved.
+/// leaving the top line. Same glyphs as the agents panel, minus idle: every
+/// calm tab ending in `o` is a row of marks that mean nothing is happening,
+/// competing with the ones that mean something. Silence is drawn as silence.
 fn dot(state: &str) -> char {
     match state {
         "working" | "starting" => '*',
         "blocked" => '!',
         "failed" => 'x',
         "done" => '+',
-        "idle" => 'o',
         _ => '.',
     }
 }
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn a_tab_is_named_after_its_program_and_a_bare_terminal_after_its_number() {
         let line = render(&sample(), 9, 40, &crate::sidebar::Unseen::new());
-        assert_eq!(line.text.trim_end(), " 1  2 tue o  3 private o  4 pet o  +");
+        assert_eq!(line.text.trim_end(), " 1  2 tue  3 private  4 pet  +");
     }
 
     /// A name somebody chose beats the name of whatever happens to be running, because the

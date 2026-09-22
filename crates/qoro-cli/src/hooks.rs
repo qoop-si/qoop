@@ -296,6 +296,17 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
+        // Dropped hooks have no configuration to edit: the file itself goes
+        // into the agent's plugin directory. The file is qoro's own and the
+        // person never edits it, so missing or different means install.
+        if matches!(target.shape, Shape::Dropped) {
+            match install_dropped(&home, &target) {
+                Ok(true) => println!("  {:<10} installed into {}", target.agent, target.config),
+                Ok(false) => println!("  {:<10} already installed", target.agent),
+                Err(e) => println!("  {:<10} {} not written: {e}", target.agent, target.config),
+            }
+            continue;
+        }
         let script = dir.join(target.file);
         std::fs::write(&script, target.body)?;
         if target.file.ends_with(".sh") {
@@ -317,6 +328,25 @@ fn install(args: &[String]) -> std::io::Result<()> {
     }
     println!("\nan agent already running does not read its configuration again: start it afresh.");
     Ok(())
+}
+
+/// Drop a Dropped hook's file into the agent's plugin directory.
+///
+/// True when written, false when the file on disk already carries this
+/// build's body. Missing parents are made. Before this existed, install
+/// wrote the script to qoro's own hooks directory and then failed editing
+/// the plugin *directory* as a file, so `install opencode` reported the
+/// script written and installed nothing at all.
+fn install_dropped(home: &Path, target: &Target) -> std::io::Result<bool> {
+    let dropped = home.join(target.config).join(target.file);
+    if std::fs::read_to_string(&dropped).ok().as_deref() == Some(target.body) {
+        return Ok(false);
+    }
+    if let Some(parent) = dropped.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dropped, target.body)?;
+    Ok(true)
 }
 
 fn uninstall(args: &[String]) -> std::io::Result<()> {
@@ -574,6 +604,25 @@ mod tests {
             .into_iter()
             .find(|t| t.agent == agent)
             .expect("a target")
+    }
+
+    /// A dropped hook lands in the agent's own directory: install used to
+    /// write the script to qoro's directory and then fail editing the plugin
+    /// directory as a file, so opencode never got its hook at all.
+    #[test]
+    fn installing_a_dropped_hook_writes_the_plugin_directory() {
+        let home = tempfile::tempdir().expect("a home");
+        let opencode = target("opencode");
+        assert!(install_dropped(home.path(), &opencode).expect("install"));
+        let dropped = home.path().join(opencode.config).join(opencode.file);
+        assert_eq!(
+            std::fs::read_to_string(&dropped).expect("read"),
+            opencode.body
+        );
+        assert!(
+            !install_dropped(home.path(), &opencode).expect("reinstall"),
+            "reinstalling says installed"
+        );
     }
 
     /// Installing adds beside what is there, and never over it.
