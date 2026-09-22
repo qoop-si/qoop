@@ -2341,10 +2341,11 @@ pub struct SnapshotWire {
 
 /// What the program in a terminal has asked its terminal to be, as it crosses the socket.
 ///
-/// Two of the four the engine tracks. Bracketed paste and application cursor are the
-/// daemon's business, because it is the daemon that writes to the child; these two are the
-/// client's, because they decide what the client does with a wheel of its own.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Four of the five the engine tracks. Bracketed paste is the daemon's
+/// business alone, because it is the daemon that writes to the child; the
+/// other four are the client's, because they decide what the client draws and
+/// what it does with a wheel of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModesWire {
     #[serde(default)]
     pub alt_screen: bool,
@@ -2359,6 +2360,36 @@ pub struct ModesWire {
     /// `\x1b[B` outright.
     #[serde(default)]
     pub application_cursor: bool,
+    /// Whether the program wants its cursor seen. True when the daemon never
+    /// said: an older daemon's snapshot predates the field, and its cursor was
+    /// always shown, so missing reads as shown rather than as hidden. Skipped
+    /// on the wire when shown, which is most frames of most programs. The
+    /// reverse mix, an older client on a newer daemon, ignores the field and
+    /// shows the cursor always: one stale cursor rather than none.
+    #[serde(default = "cursor_visible_default", skip_serializing_if = "is_shown")]
+    pub cursor_visible: bool,
+}
+
+/// A missing visibility is a visible cursor, for the reason on the field.
+fn cursor_visible_default() -> bool {
+    true
+}
+
+/// Shown is the common case, and the wire stays the size it always was for it.
+fn is_shown(visible: &bool) -> bool {
+    *visible
+}
+
+impl Default for ModesWire {
+    /// Visible, for the same reason a missing field reads as visible.
+    fn default() -> Self {
+        Self {
+            alt_screen: false,
+            mouse_reporting: false,
+            application_cursor: false,
+            cursor_visible: true,
+        }
+    }
 }
 
 /// A run of columns that share a style, as it crosses the socket.
@@ -2418,6 +2449,7 @@ impl From<&Snapshot> for SnapshotWire {
                 alt_screen: s.modes.alt_screen,
                 mouse_reporting: s.modes.mouse_reporting,
                 application_cursor: s.modes.application_cursor,
+                cursor_visible: s.modes.cursor_visible,
             },
         }
     }

@@ -393,6 +393,7 @@ impl TerminalEngine for AlacrittyEngine {
             bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
             mouse_reporting: m.intersects(TermMode::MOUSE_MODE),
             application_cursor: m.contains(TermMode::APP_CURSOR),
+            cursor_visible: m.contains(TermMode::SHOW_CURSOR),
         }
     }
 

@@ -204,7 +204,15 @@ pub fn render_viewport(
     // Terminal coordinates are one based, and the cursor is placed where it falls inside
     // this window. A cursor outside the window is parked at the nearest edge rather than
     // drawn off screen, which the outer terminal would clamp anyway and less predictably.
+    // Placed and shown only while the program wants it seen: a hidden cursor stays
+    // hidden with nothing more said, so a child that redraws behind a hidden cursor
+    // does not get a shown one painted over it.
     let (row, col) = snap.cursor;
+    if !snap.modes.cursor_visible {
+        buf.extend_from_slice(b"\x1b[?25l");
+        out.write_all(&buf)?;
+        return out.flush();
+    }
     let local_row = (row as u16)
         .saturating_sub(view.row)
         .min(view.rows.saturating_sub(1));
@@ -212,6 +220,9 @@ pub fn render_viewport(
         .saturating_sub(view.col)
         .min(view.cols.saturating_sub(1));
     buf.extend_from_slice(format!("\x1b[{};{}H", local_row + 1, local_col + 1).as_bytes());
+    // Shown, idempotently: no hide precedes it, so a shown cursor streaming
+    // does not blink the way hide-plus-show per frame does.
+    buf.extend_from_slice(b"\x1b[?25h");
     out.write_all(&buf)?;
     out.flush()
 }
@@ -521,6 +532,38 @@ mod tests {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             styles: Vec::new(),
         }
+    }
+
+    /// An older daemon never sent the field, and its cursor was always shown:
+    /// missing reads as visible, never as hidden.
+    #[test]
+    fn a_snapshot_without_cursor_visibility_reads_as_visible() {
+        let wire: SnapshotWire =
+            serde_json::from_str(r#"{"cols":20,"rows":1,"cursor":[1,3],"lines":["$"],"modes":{}}"#)
+                .expect("an old snapshot stops parsing");
+        assert!(wire.modes.cursor_visible);
+        assert!(crate::daemon::ModesWire::default().cursor_visible);
+    }
+
+    /// The hiding direction round-trips: an explicit false survives the wire
+    /// and still reads back as hidden.
+    #[test]
+    fn an_explicitly_hidden_cursor_survives_the_wire() {
+        let mut hidden = snap(&["$"]);
+        hidden.modes.cursor_visible = false;
+        let body = serde_json::to_string(&hidden).expect("a snapshot serialises");
+        assert!(
+            body.contains("cursor_visible"),
+            "hidden is the case worth paying bytes for: {body}"
+        );
+        let back: SnapshotWire = serde_json::from_str(&body).expect("and parses back");
+        assert!(!back.modes.cursor_visible);
+        hidden.modes.cursor_visible = true;
+        let shown_body = serde_json::to_string(&hidden).expect("a snapshot serialises");
+        assert!(
+            !shown_body.contains("cursor_visible"),
+            "shown stays the size it always was: {shown_body}"
+        );
     }
 
     #[test]

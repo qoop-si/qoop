@@ -114,12 +114,30 @@ pub enum Colour {
     Rgb(u8, u8, u8),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalModes {
     pub alt_screen: bool,
     pub bracketed_paste: bool,
     pub mouse_reporting: bool,
     pub application_cursor: bool,
+    /// Whether the program wants its cursor seen. Off while it redraws, so a
+    /// client that shows one anyway paints a cursor the program hid: flicker.
+    pub cursor_visible: bool,
+}
+
+impl Default for TerminalModes {
+    /// Visible. A mode set built from nothing is the terminal before any
+    /// program hid anything, and a hidden default would take the cursor off
+    /// every pane whose engine never said otherwise.
+    fn default() -> Self {
+        Self {
+            alt_screen: false,
+            bracketed_paste: false,
+            mouse_reporting: false,
+            application_cursor: false,
+            cursor_visible: true,
+        }
+    }
 }
 
 pub trait TerminalEngine: Send {

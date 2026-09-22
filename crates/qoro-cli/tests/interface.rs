@@ -1868,3 +1868,76 @@ fn g12_21_clicking_the_agents_mode_word_flips_grouped_and_priority() {
         ui.painted
     );
 }
+
+/// Complete frames sliced out of the accumulated stream after `mark`.
+/// The stream only grows, so the last slice may be mid-frame and is dropped.
+/// Empty when fewer than two separators arrived: a count, never a panic, so a
+/// quiet daemon fails the assertion instead of the helper.
+fn complete_frames(painted: &str, mark: usize) -> Vec<&str> {
+    let Some(tail) = painted.get(mark..) else {
+        return Vec::new();
+    };
+    let mut frames: Vec<&str> = tail.split("\x1b[?25l").collect();
+    if frames.len() < 3 {
+        return Vec::new();
+    }
+    frames.remove(0);
+    frames.pop();
+    // The first frame may predate the change: it was painted from a render
+    // that arrived before the shell processed the escape.
+    frames.remove(0);
+    frames
+}
+
+#[test]
+fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    // Stream while hidden: every line is a render, every render a frame, and
+    // none of those frames may show a cursor the child hid.
+    ui.type_in(b"printf '\\e[?25l'; for i in 1 2 3 4 5 6; do echo line$i; sleep 0.4; done\n");
+    assert!(
+        ui.wait_for("line6", Duration::from_secs(15)).is_some(),
+        "the hidden stream never printed:\n{}",
+        ui.painted
+    );
+    let mark = ui.painted.len();
+    ui.type_in(b"for i in 7 8 9; do echo more$i; sleep 0.4; done\n");
+    assert!(
+        ui.wait_for("more9", Duration::from_secs(15)).is_some(),
+        "the second stream never printed:\n{}",
+        ui.painted
+    );
+    let frames = complete_frames(&ui.painted, mark);
+    assert!(
+        !frames.is_empty(),
+        "no frames arrived while streaming hidden: {}",
+        ui.painted.len()
+    );
+    for frame in &frames {
+        assert!(
+            !frame.contains("?25h"),
+            "a hidden cursor was shown mid-stream: {frame:?}"
+        );
+    }
+    // And showing it again brings it back on the following frames.
+    ui.type_in(b"printf '\\e[?25h'; echo back\n");
+    assert!(
+        ui.wait_for("back", Duration::from_secs(15)).is_some(),
+        "the restore never printed:\n{}",
+        ui.painted
+    );
+    let mark = ui.painted.len();
+    ui.type_in(b"for i in 1 2 3; do echo showing$i; sleep 0.4; done\n");
+    assert!(
+        ui.wait_for("showing3", Duration::from_secs(15)).is_some(),
+        "the visible check never printed:\n{}",
+        ui.painted
+    );
+    let frames = complete_frames(&ui.painted, mark);
+    assert!(
+        frames.iter().any(|f| f.contains("?25h")),
+        "a shown cursor never came back: {}",
+        ui.painted.len()
+    );
+}

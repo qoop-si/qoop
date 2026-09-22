@@ -175,8 +175,62 @@ pub fn in_space(rows: &[AgentRow], space: Option<i64>) -> Vec<AgentRow> {
 }
 
 /// The escape sequence that puts the cursor at a one-based row and column.
-fn at(row: usize, col: usize) -> String {
+pub(crate) fn at(row: usize, col: usize) -> String {
     format!("\x1b[{row};{col}H")
+}
+
+/// Where the host cursor goes for the focused snapshot, one-based, or `None`
+/// when no tile carries it.
+///
+/// The cursor lives on the focused tile alone: unfocused tiles never carry
+/// one, so a glance always knows where typing goes. With fewer than two tiles
+/// the legacy arithmetic is byte for byte what it always was. One place, so
+/// the cursor-only fast path cannot drift from the full repaint.
+pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usize, usize)> {
+    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, 0);
+    if frame.tiles.len() < 2 {
+        let (row, cell) = snapshot.cursor;
+        let col = cursor_column(
+            snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
+            cell,
+        );
+        let row = row.min(pane_rows as usize - 1) + 1 + TABS;
+        let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
+        Some((row, col))
+    } else {
+        let tile = frame.tiles.iter().find(|t| t.focused)?;
+        let (row, cell) = snapshot.cursor;
+        let col = cursor_column(
+            snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
+            cell,
+        );
+        let pane_left = left_for(frame.cols, frame.collapsed);
+        let row = tile.rect.y + row.min(tile.rect.rows.saturating_sub(1)) + 1 + TABS;
+        let col = pane_left + tile.rect.x + col.min(tile.rect.cols.saturating_sub(1)) + 1;
+        Some((row, col))
+    }
+}
+
+/// Whether a render only moved the cursor: same screen, new placement.
+///
+/// `behind` is ignored on purpose: the daemon stamps it per frame from the
+/// history counter, so it moves without any visible change. That blindness is
+/// safe only while the live view is on screen: scrolled back, the same lines
+/// paint at a different offset, so the caller must gate the fast path on the
+/// live view (no scrollback anchor). Modes compare except visibility, which is
+/// itself a cursor change. Everything else equal means the full repaint would
+/// draw the identical screen, so the run loop may move the host cursor with a
+/// tiny sequence instead. Cheap discriminants first: a streaming render fails
+/// on size or mode before the line comparison runs.
+pub(crate) fn render_moves_cursor_only(old: &SnapshotWire, new: &SnapshotWire) -> bool {
+    old.cols == new.cols
+        && old.rows == new.rows
+        && old.modes.alt_screen == new.modes.alt_screen
+        && old.modes.mouse_reporting == new.modes.mouse_reporting
+        && old.modes.application_cursor == new.modes.application_cursor
+        && (old.cursor != new.cursor || old.modes.cursor_visible != new.modes.cursor_visible)
+        && old.lines == new.lines
+        && old.styles == new.styles
 }
 
 /// Paint the whole screen.
@@ -497,36 +551,25 @@ pub fn paint(frame: &Frame) -> String {
         let col = (left + 4 + width::width(&palette.query)).min(left + w.saturating_sub(2));
         out.push_str(&at(row + 1, col + 1));
     } else if let Some(snapshot) = frame.snapshot {
-        // The cursor lives on the focused tile alone. Unfocused tiles never
-        // carry one, so a glance always knows where typing goes. With fewer
-        // than two tiles the legacy arithmetic below is byte for byte what it
-        // always was.
-        if frame.tiles.len() < 2 {
-            let (row, cell) = snapshot.cursor;
-            let col = cursor_column(
-                snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
-                cell,
-            );
-            let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-            let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
-            out.push_str(&at(row, col));
-        } else if let Some(tile) = frame.tiles.iter().find(|t| t.focused) {
-            let (row, cell) = snapshot.cursor;
-            let col = cursor_column(
-                snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
-                cell,
-            );
-            let pane_left = left_for(frame.cols, frame.collapsed);
-            let row = tile.rect.y + row.min(tile.rect.rows.saturating_sub(1)) + 1 + TABS;
-            let col = pane_left + tile.rect.x + col.min(tile.rect.cols.saturating_sub(1)) + 1;
+        // Shown only when the program wants it seen. A child redraws with its
+        // cursor hidden, and a shown-anyway cursor is one the program hid:
+        // flicker. The frame starts hidden, so a hidden snapshot cursor stays
+        // hidden with nothing more said.
+        if snapshot.modes.cursor_visible
+            && let Some((row, col)) = pane_cursor(frame, snapshot)
+        {
             out.push_str(&at(row, col));
         }
     }
-    // Always back on, even with no snapshot yet. It is turned off at the top of every frame
-    // so the repaint does not walk a visible cursor across the screen, and leaving it off
-    // when there is nothing to place it against meant a terminal that had produced no output
-    // yet, which is every terminal for its first moments, had no cursor at all.
-    out.push_str("\x1b[?25h");
+    // Back on for our own placements (prompt, palette) and for a shown
+    // snapshot cursor. A hidden snapshot cursor stays off, and a terminal that
+    // has produced nothing yet keeps the visible default it always had.
+    let show = frame.prompt.is_some()
+        || frame.palette.is_some()
+        || frame.snapshot.is_none_or(|s| s.modes.cursor_visible);
+    if show {
+        out.push_str("\x1b[?25h");
+    }
     out
 }
 
@@ -2148,6 +2191,93 @@ mod tests {
             painted.ends_with(&format!("{want}\x1b[?25h")),
             "{painted:?}"
         );
+    }
+
+    /// A cursor the program hid stays hidden: no placement, no show. A shown
+    /// cursor painted over a child that hid its own is the flicker.
+    #[test]
+    fn a_hidden_snapshot_cursor_is_neither_placed_nor_shown() {
+        let mut snapshot = snapshot(&["$"]);
+        snapshot.cursor = (0, 2);
+        snapshot.modes.cursor_visible = false;
+        let rows = [row(1, "sh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        let placed = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
+        assert!(!painted.contains(&placed), "hid cursor placed: {painted:?}");
+        assert!(!painted.contains("?25h"), "hid cursor shown: {painted:?}");
+    }
+
+    #[test]
+    fn only_a_moved_cursor_is_a_cursor_only_render() {
+        let base = snapshot(&["$"]);
+        let mut moved = base.clone();
+        moved.cursor = (0, 1);
+        assert!(render_moves_cursor_only(&base, &moved));
+
+        let mut hid = base.clone();
+        hid.modes.cursor_visible = false;
+        assert!(render_moves_cursor_only(&base, &hid));
+
+        // `behind` moves with history, not with the screen: ignoring it is
+        // what lets the fast path fire while output scrolls past.
+        let mut scrolled = base.clone();
+        scrolled.behind = 41;
+        scrolled.cursor = (0, 1);
+        assert!(render_moves_cursor_only(&base, &scrolled));
+
+        // But history alone, with the cursor exactly where it was, is not a
+        // move: answering it with a cursor sequence would write escapes at a
+        // screen that changed in no visible way.
+        let mut history_only = base.clone();
+        history_only.behind = 41;
+        assert!(!render_moves_cursor_only(&base, &history_only));
+
+        let mut typed = base.clone();
+        typed.lines = vec!["$ x".to_string()];
+        assert!(!render_moves_cursor_only(&base, &typed));
+
+        let mut resized = base.clone();
+        resized.cols = 81;
+        assert!(!render_moves_cursor_only(&base, &resized));
+
+        let mut alted = base.clone();
+        alted.modes.alt_screen = true;
+        assert!(!render_moves_cursor_only(&base, &alted));
+
+        // Nothing differs at all: not a move, and the run loop must not
+        // answer it with a cursor sequence of its own.
+        assert!(!render_moves_cursor_only(&base, &base));
     }
 
     /// A window too narrow for the left column is a real one: two panes side by side in a
