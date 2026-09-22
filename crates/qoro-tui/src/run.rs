@@ -568,7 +568,6 @@ impl State {
             sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
             sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
             sidebar::Hit::NewSpace => Some(Clicked::NewSpace),
-            sidebar::Hit::New => Some(Clicked::NewTerminal),
             sidebar::Hit::Menu => Some(Clicked::Menu),
             sidebar::Hit::Collapse => Some(Clicked::Collapse),
         }

@@ -254,7 +254,7 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
-                Some(sidebar::Hit::New | sidebar::Hit::NewSpace | sidebar::Hit::Menu)
+                Some(sidebar::Hit::NewSpace | sidebar::Hit::Menu)
                 | Some(sidebar::Hit::Collapse)
                 | None => false,
             };

@@ -134,9 +134,7 @@ pub enum Hit {
     Terminal(u32),
     /// The `+` at the corner of the spaces title: a space, named first.
     NewSpace,
-    /// The `new` on the row between the panels: a terminal in the space on screen.
-    New,
-    /// The `menu` beside it: everything that is not a space, a tab or an agent.
+    /// The `menu` at the foot of the spaces panel: everything that is not a space, a tab or an agent.
     Menu,
     /// The mark at the foot of the column: fold the whole column away, and back.
     Collapse,
@@ -1156,18 +1154,19 @@ fn scrolled(len: usize, focused: Option<usize>, window: usize) -> usize {
     }
 }
 
-/// The row at the foot of the spaces panel: `new` on the left, `menu` on the right.
+/// The row at the foot of the spaces panel: `menu` on the right.
 ///
-/// One row for the two things that are neither a space nor an agent. Which half a click
-/// lands on decides which it meant, and the halves are the two words themselves rather than
-/// the halves of the column: a click on the empty middle is a click on neither.
+/// One row for what is neither a space nor an agent: the menu. Which half a
+/// click lands on decides what it meant, and the halves are the word itself
+/// rather than the halves of the column: a click on the empty rest is a click
+/// on nothing. The `new` half is gone: the tab bar and the spaces title both
+/// carry their own `+` already.
 fn footer_row() -> (Line, Option<Hit>) {
-    let left = format!(" {NEW_LABEL}");
     let right = format!("{MENU_LABEL} ");
-    let gap = WIDTH.saturating_sub(crate::width::width(&left) + crate::width::width(&right));
+    let gap = WIDTH.saturating_sub(crate::width::width(&right));
     (
         Line {
-            text: format!("{left}{}{right}", " ".repeat(gap)),
+            text: format!("{}{right}", " ".repeat(gap)),
             colour: Some(crate::theme::Role::Faint),
             accent: None,
             indicator: None,
@@ -1188,16 +1187,12 @@ pub fn spaces_title_hit(col: usize) -> Option<Hit> {
 
 /// What a click at one column of the footer row means.
 pub fn footer_hit(col: usize) -> Option<Hit> {
-    if col <= crate::width::width(NEW_LABEL) {
-        return Some(Hit::New);
-    }
     if col + 1 >= WIDTH.saturating_sub(crate::width::width(MENU_LABEL)) {
         return Some(Hit::Menu);
     }
     None
 }
 
-const NEW_LABEL: &str = "new";
 const MENU_LABEL: &str = "menu";
 
 /// A panel title, which is a row like any other and therefore the full width.
