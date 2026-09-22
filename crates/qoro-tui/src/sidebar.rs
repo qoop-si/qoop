@@ -585,7 +585,7 @@ fn agents_panel(
 /// The two rows an open agent takes, with what a click on either means.
 ///
 /// First the session, then where it lives: ` ● abc123ef` above
-/// `release - app`. Both rows reach the same terminal, so a click on either
+/// `app - release`. Both rows reach the same terminal, so a click on either
 /// lands on the agent.
 ///
 /// Static: the state is the dot at the start of the first row, in the
@@ -631,16 +631,16 @@ fn push_agent_lines(
         },
         hit,
     ));
-    // Where it lives, underneath: the tab and the space, in the quiet
+    // Where it lives, underneath: the space and then the tab, in the quiet
     // colour, so the first row keeps the eye and the second keeps the place.
     // A space the client has not heard of yet still draws, under the tab
     // alone, rather than vanishing until the index catches up. The space keeps
     // its colour here, so it still wears one colour in both panels.
     let (place, place_accent) = match space {
         Some(space) => (
-            format!("{tab} - {}", space.name),
+            format!("{} - {tab}", space.name),
             Some((
-                2 + crate::width::width(&tab) + 3,
+                2,
                 crate::width::width(&space.name),
                 crate::theme::space_of(agent.workspace),
             )),
@@ -1444,7 +1444,7 @@ mod tests {
         // the state dot, and the tab and space underneath. No state word on
         // the right: the dot at the start says the state in its colour.
         assert_eq!(texts[head], " \u{25cf} claude", "{texts:?}");
-        assert_eq!(texts[head + 1], "  claude - app");
+        assert_eq!(texts[head + 1], "  app - claude");
         // And the dot wears the working colour.
         assert_eq!(
             lines
@@ -1583,7 +1583,7 @@ mod tests {
                             let place = if space.is_empty() {
                                 label(a)
                             } else {
-                                format!("{} - {}", label(a), space)
+                                format!("{space} - {}", label(a))
                             };
                             text.starts_with(&first)
                                 || (text.starts_with("  ")
@@ -1654,11 +1654,11 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("opencode - app")),
+            texts.iter().any(|t| t.contains("app - opencode")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("opencode - personal")),
+            texts.iter().any(|t| t.contains("personal - opencode")),
             "{texts:?}"
         );
     }
@@ -1676,11 +1676,11 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("claude - app")),
+            texts.iter().any(|t| t.contains("app - claude")),
             "{texts:?}"
         );
         // And the second row still says where the tab lives.
-        assert!(texts.iter().any(|t| *t == "  claude - app"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "  app - claude"), "{texts:?}");
     }
 
     /// A chosen name picked twice in two spaces is still two pairs that cannot
@@ -1694,11 +1694,11 @@ mod tests {
         ];
         let texts = agent_texts(&spaces, &agents, 1);
         assert!(
-            texts.iter().any(|t| t.contains("release - app")),
+            texts.iter().any(|t| t.contains("app - release")),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("release - personal")),
+            texts.iter().any(|t| t.contains("personal - release")),
             "{texts:?}"
         );
         // Without a reported session the first row falls back to the tab's
@@ -1761,7 +1761,7 @@ mod tests {
             !texts.iter().any(|t| t.contains("opencode")),
             "the program leaked onto a reported session row: {texts:?}"
         );
-        assert!(texts.iter().any(|t| *t == "  release - app"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "  app - release"), "{texts:?}");
     }
 
     #[test]
@@ -1809,7 +1809,7 @@ mod tests {
         let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
         // No reported session, so the tab's own label answers behind the dot.
         assert!(texts.iter().any(|t| *t == " \u{25cf} codex"), "{texts:?}");
-        assert!(texts.iter().any(|t| *t == "  codex - app"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "  app - codex"), "{texts:?}");
     }
 
     #[test]

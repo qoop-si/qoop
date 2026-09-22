@@ -2979,7 +2979,7 @@ mod tests {
             .map(|l| l.text.trim_end().to_string())
             .collect();
         assert_eq!(
-            texts.iter().filter(|t| t.contains("claude - app")).count(),
+            texts.iter().filter(|t| t.contains("app - claude")).count(),
             9,
             "agents lost rows: {texts:?}"
         );
