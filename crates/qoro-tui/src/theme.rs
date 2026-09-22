@@ -82,9 +82,10 @@ const EMBER_INKS: [u8; 5] = [202, 208, 214, 220, 222];
 ///
 /// Loud on black on purpose: the column is scanned for the one row that needs
 /// a person, and that row wears the brand's own orange. Warm alarm: blocked is
-/// the accent (202), failed is full red (196), working is bright cyan (51),
-/// done is bright green (82). Idle and unobserved stay in the greys, because a
-/// colour on every row is a column with no signal in it.
+/// the accent (202), failed is full red (196), working is bright blue (75) so
+/// it never reads as done's green (82), done is bright green (82). Idle and
+/// unobserved stay in the greys, because a colour on every row is a column
+/// with no signal in it.
 pub fn of(state: &str) -> Role {
     match state {
         "working" | "starting" => Role::Working,
@@ -117,7 +118,7 @@ const fn ink(role: Role) -> u8 {
         Role::Faint => 241,
         Role::Rule => 237,
         Role::Brand => 202,
-        Role::Working => 51,
+        Role::Working => 75,
         Role::Blocked => 202,
         Role::Done => 82,
         Role::Failed => 196,
