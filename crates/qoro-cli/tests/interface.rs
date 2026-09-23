@@ -1602,7 +1602,6 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     );
     // Wait for detection to settle: a fresh agent reports unknown, then idle
     // while its generation is new, and only then the blocked its screen shows.
-    // The panel folds idle groups, so clicking before this lands on a fold line.
     // The state is the dot's ink, so this reads the raw bytes like G12.7:
     // both painted forms, since the row may have the keyboard.
     let blocked_inks = [

@@ -119,9 +119,6 @@ fn dot_glyph(role: crate::theme::Role) -> char {
     }
 }
 
-/// The state a terminal has when nothing has been able to say what it is doing.
-const UNKNOWN: &str = "unknown";
-
 /// What to call an agent whose identity the daemon could not read.
 ///
 /// Not `shell`. A row only reaches this panel because an agent is registered against it,
@@ -160,14 +157,15 @@ pub enum Hit {
     Collapse,
 }
 
-/// How the agents panel orders its rows: daemon order with what needs a
-/// person first, or flat by urgency.
+/// How the agents panel orders its rows: daemon order, or flat by urgency.
 ///
-/// Grouped is the panel a person already knows. Priority is the same rows
-/// sorted so the one that needs a person is always on top: the inbox view of
-/// the fleet. Both are flat lists: the state dot carries the state, and no
-/// header tree sits above calm rows. The title names the order. Toggled with
-/// `ctrl-a g`, or with a click on the `grouped`/`priority` word itself.
+/// Grouped is the panel a person already knows: the daemon's order, kept
+/// across state changes, so a row never moves under the eye. Priority is the
+/// same rows sorted so the one that needs a person is always on top: the
+/// inbox view of the fleet. Both are flat lists: the state dot carries the
+/// state, and no header tree sits above calm rows. The title names the order.
+/// Toggled with `ctrl-a g`, or with a click on the `grouped`/`priority` word
+/// itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
     #[default]
@@ -268,28 +266,6 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> 
 /// spinner's eight frames a second caused.
 pub fn wants_tick(_rows: &[AgentRow], _focused: u32, _seen: &Seen, _unseen: &Unseen) -> bool {
     false
-}
-
-/// Whether the state reads as running: working or starting.
-///
-/// Blocked and failed never reach this: the caller lifts them into the
-/// needs-you section first.
-fn is_running(state: &str) -> bool {
-    matches!(state, "working" | "starting")
-}
-
-/// Whether the state always stays open, whatever the fold says.
-fn needs_you(state: &str) -> bool {
-    matches!(state, "blocked" | "failed")
-}
-
-/// A state nothing has observed yet.
-///
-/// Not idleness: a new agent folds away the moment it starts if unknown counts
-/// as idle, and the panel would hide every arrival until detection settles. What
-/// has not been looked at stays on screen.
-fn unobserved(state: &str) -> bool {
-    state == UNKNOWN
 }
 
 /// Both panels of the left column, painted into `height` rows.
@@ -963,8 +939,8 @@ fn rows_open(
     out
 }
 
-/// The agents panel: one flat list, needs-you first in daemon order and the
-/// rest after it, then by urgency in the priority view.
+/// The agents panel: one flat list in daemon order, then by urgency in the
+/// priority view.
 ///
 /// Every agent draws exactly the rows [`agents_panel`] draws for it. Nothing
 /// folds and nothing hides: the state dot carries the state.
@@ -1006,79 +982,14 @@ fn agents_content(
         }
         return (content, ordered.len(), listed.len());
     }
-    // What needs a person comes first, in daemon order, then the rest that is open,
-    // in daemon order. Daemon order within each half, so a short list draws exactly
-    // the rows the unfolded panel draws.
+    // Grouped is the daemon's order, untouched: a row never moves under the
+    // eye while its state changes. Urgency lives in the priority view, the
+    // status line, the tab dots and the palette, never in this order.
     let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
-    let mut shown = 0;
-    let needs: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| needs_you(&a.state))
-        .copied()
-        .collect();
-    let fresh: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| !needs_you(&a.state) && unobserved(&a.state))
-        .copied()
-        .collect();
-    let running: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| !needs_you(&a.state) && !unobserved(&a.state) && is_running(&a.state))
-        .copied()
-        .collect();
-    let finished: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| {
-            !needs_you(&a.state)
-                && !unobserved(&a.state)
-                && a.state == "done"
-                && !is_new(a, focused, seen, unseen)
-        })
-        .copied()
-        .collect();
-    // Rows nobody has looked at yet: daemon `done` and derived
-    // idle-after-work share the sage dot.
-    let new_done: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| !needs_you(&a.state) && is_new(a, focused, seen, unseen))
-        .copied()
-        .collect();
-    let idle: Vec<&AgentRow> = listed
-        .iter()
-        .filter(|a| {
-            !needs_you(&a.state)
-                && !unobserved(&a.state)
-                && !is_running(&a.state)
-                && a.state != "done"
-                && !is_new(a, focused, seen, unseen)
-        })
-        .copied()
-        .collect();
-    for agent in needs {
+    for agent in &listed {
         push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
     }
-    for agent in fresh {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
-    }
-    for agent in new_done {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
-    }
-    for agent in running {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
-    }
-    for agent in finished {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
-    }
-    for agent in idle {
-        push_agent_lines(&mut content, spaces, agent, focused, tick, seen, unseen);
-        shown += 1;
-    }
-    (content, shown, listed.len())
+    (content, listed.len(), listed.len())
 }
 
 /// One built agents panel, scrolled and padded into the rows it was given.
@@ -1128,6 +1039,8 @@ fn lay_out_agents(
 /// Grouped or priority, the way the rows below are ordered: the header is the
 /// one place that says which. The counts ride along when the list scrolls past
 /// the window, so a clipped panel still says how much of itself is hidden.
+/// (`shown` always equals `total` today: every listed agent draws. The branch
+/// stays for the day one does not.)
 fn agents_title(view: View, shown: usize, total: usize) -> Line {
     let mode = title_mode(view);
     let left = if shown == total {
@@ -1331,6 +1244,9 @@ fn fit_to(text: &str, cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state a terminal has when nothing has been able to say what it is doing.
+    const UNKNOWN: &str = "unknown";
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
@@ -1976,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_draws_its_rows_needs_first_and_no_headers() {
+    fn every_agent_draws_its_rows_in_daemon_order_and_no_headers() {
         let (spaces, agents) = many_agents();
         // Terminal 5 is done and already looked at.
         let mut seen = Seen::new();
@@ -1996,7 +1912,9 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // Needs-you agents are drawn as usual, first.
+        // Every agent draws its rows, in the daemon's order: terminal 1
+        // (blocked) first because it is listed first, not because of what it
+        // needs.
         assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
         // Static: running agents carry the working dot, no spinner, and no
         // state word on the right.
@@ -2019,8 +1937,7 @@ mod tests {
                 "a group header leaked: {header}: {texts:?}"
             );
         }
-        // All nine agents draw their pairs: needs-you first, then the rest in
-        // daemon order.
+        // All nine agents draw their pairs, in the daemon's order.
         assert_eq!(
             texts
                 .iter()
@@ -2432,6 +2349,59 @@ mod tests {
         assert_eq!(View::Grouped.toggle(), View::Priority);
         assert_eq!(View::Priority.toggle(), View::Grouped);
         assert_eq!(View::default(), View::Grouped);
+    }
+
+    /// The reported bug: a working agent listed after idle ones must stay
+    /// last while grouped, and so must a blocked one. Grouped never reorders;
+    /// urgency is the priority view's job, where both jump to the top.
+    #[test]
+    fn grouped_keeps_daemon_order_while_priority_sorts_by_urgency() {
+        let spaces = vec![space(1, "app")];
+        for agents in [
+            vec![
+                agent(1, 1, "opencode", "idle"),
+                agent(2, 1, "opencode", "idle"),
+                agent(3, 1, "claude", "working"),
+            ],
+            vec![
+                agent(1, 1, "opencode", "idle"),
+                agent(2, 1, "opencode", "idle"),
+                agent(3, 1, "claude", "blocked"),
+            ],
+        ] {
+            for view in [View::Grouped, View::Priority] {
+                let rows = rows_folded(
+                    &spaces,
+                    &agents,
+                    1,
+                    1,
+                    20,
+                    0,
+                    view,
+                    &Seen::new(),
+                    &Unseen::new(),
+                );
+                let terminals: Vec<u32> = rows
+                    .iter()
+                    .filter_map(|(_, hit)| match hit {
+                        Some(Hit::Terminal(t)) => Some(*t),
+                        _ => None,
+                    })
+                    .collect();
+                // Two rows per agent, first row first: dedup keeps the order.
+                let mut order = Vec::new();
+                for t in terminals {
+                    if !order.contains(&t) {
+                        order.push(t);
+                    }
+                }
+                if view == View::Grouped {
+                    assert_eq!(order, vec![1, 2, 3], "grouped reordered: {order:?}");
+                } else {
+                    assert_eq!(order, vec![3, 1, 2], "priority did not sort: {order:?}");
+                }
+            }
+        }
     }
 
     #[test]

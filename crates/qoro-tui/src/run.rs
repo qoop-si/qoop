@@ -252,8 +252,7 @@ struct State {
     /// before either answer came back both counted the same list and both produced
     /// `space 2`, so the panel showed two rows with one name on them.
     creating: usize,
-    /// How the agents panel orders its rows: daemon order with what needs a
-    /// person first, or flat by urgency.
+    /// How the agents panel orders its rows: daemon order, or flat by urgency.
     view: sidebar::View,
     /// The done rows this client has already looked at, as (terminal, generation).
     ///

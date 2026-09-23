@@ -45,8 +45,7 @@ pub struct Frame<'a> {
     /// Something worth saying while nothing else is happening, said until the person does
     /// anything. Under everything urgent, and never in place of it.
     pub hint: Option<&'a str>,
-    /// How the agents panel orders its rows: daemon order with what needs a
-    /// person first, or flat by urgency.
+    /// How the agents panel orders its rows: daemon order, or flat by urgency.
     pub view: sidebar::View,
     /// The done rows this client has already looked at.
     pub seen: &'a sidebar::Seen,
