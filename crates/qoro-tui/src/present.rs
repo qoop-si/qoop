@@ -42,6 +42,12 @@ pub struct Presenter {
 }
 
 impl Presenter {
+    /// Where the last frame left the cursor, one based, and whether it was shown.
+    /// The image block restores exactly this after placing pictures.
+    pub fn cursor(&self) -> Option<((usize, usize), bool)> {
+        self.cursor
+    }
+
     /// The bytes that turn the last frame into `painted`, appended to `out`.
     ///
     /// Nothing is appended when nothing changed.

@@ -288,7 +288,17 @@ async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
                 if chunk.contains(&0x11) {
                     break;
                 }
-                wr.write_all(&client::encode_command_seq(&ClientWire::Input { bytes: chunk }, &mut seq)?).await?;
+                // Split like the interface does: one huge message trips the
+                // reassembly bound and drops the paste whole.
+                for piece in client::split_input(&chunk) {
+                    wr.write_all(&client::encode_command_seq(
+                        &ClientWire::Input {
+                            bytes: piece.to_vec(),
+                        },
+                        &mut seq,
+                    )?)
+                    .await?;
+                }
             }
             n = rd.read(&mut read) => {
                 let n = n?;

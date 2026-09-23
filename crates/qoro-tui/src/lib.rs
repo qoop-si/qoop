@@ -5,6 +5,7 @@
 //! the daemon said, so the parts that matter can be tested without a screen, and the loop
 //! that drives them is small enough to read in one sitting.
 
+pub mod graphics;
 pub mod keys;
 pub mod layout;
 pub mod palette;

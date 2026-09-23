@@ -11,7 +11,7 @@ use std::path::Path;
 use bytes::BytesMut;
 use qoro_runtime::client::{self, Connection, Incoming, TerminalGuard};
 use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage};
-use qoro_runtime::daemon::{ClientWire, SnapshotWire};
+use qoro_runtime::daemon::{ClientWire, SnapshotWire, StoredImage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::keys::{Action, Keys};
@@ -175,6 +175,18 @@ struct State {
     /// terminal lives in `snapshot` (with scrollback and selection); the
     /// others are viewport-cropped live screens.
     snapshots: std::collections::BTreeMap<u32, SnapshotWire>,
+    /// The newest image per terminal, by terminal. Drawn by the frame painter
+    /// (overlay or placeholder); keyed like `snapshots` so tiles work the same.
+    images: std::collections::BTreeMap<u32, StoredImage>,
+    /// What the outer terminal can draw, read once at startup. Decides real
+    /// picture versus placeholder per frame.
+    graphics: crate::graphics::GraphicsCap,
+    /// Image ids currently placed on the outer screen, by terminal. Reconciled
+    /// per frame: anything here and not desired comes down.
+    shown_images: crate::graphics::Shown,
+    /// Outer size the placements were made at. A change reflows cell-anchored
+    /// overlays out from under the text, so all come down and go back up.
+    img_size: (u16, u16),
     /// Terminals this client receives renders for. Always exactly the visible
     /// set of the space on screen: over-subscribing spends daemon and client
     /// work on output nobody sees.
@@ -386,6 +398,10 @@ impl State {
             rows_back: self.rows_back(),
             behind: &self.behind,
             tiles,
+            // Filled by the paint loop when the focused terminal holds a picture
+            // the outer terminal cannot draw. `None` here keeps `frame()` pure:
+            // capability is a client property, not daemon state.
+            image_notice: None,
         }
     }
 
@@ -1373,6 +1389,12 @@ async fn drive(
         focused: 0,
         snapshot: None,
         snapshots: std::collections::BTreeMap::new(),
+        images: std::collections::BTreeMap::new(),
+        // Read once: what this client's outer terminal can draw decides real
+        // picture versus placeholder for the life of the session.
+        graphics: crate::graphics::detect(),
+        shown_images: std::collections::BTreeMap::new(),
+        img_size: (0, 0),
         subs: std::collections::BTreeSet::new(),
         layouts: std::collections::BTreeMap::new(),
         panes: std::collections::BTreeSet::new(),
@@ -1506,7 +1528,45 @@ async fn drive(
                 // One frame for both paints: a single clock for tiers, order
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
-                let frame = state.frame();
+                let mut frame = state.frame();
+                // A picture the outer terminal cannot draw is named on the pane
+                // instead. The notice is computed before the paint; the real
+                // picture never enters the painted text at all. Nothing is named
+                // while scrolled back: the screen shows history, which holds no
+                // pictures, and the reconcile below brings the placement down.
+                let notice = match state.images.get(&state.focused) {
+                    Some(image)
+                        if state.anchor.is_none()
+                            && !state.graphics.allows(image.protocol) =>
+                    {
+                        Some(crate::graphics::placeholder(image))
+                    }
+                    _ => None,
+                };
+                frame.image_notice = notice.as_deref();
+                // Where a real picture lands: the focused pane's last row, in
+                // screen cells, one based. Copied from the cursor arithmetic in
+                // `screen::pane_cursor`, which owns these coordinates.
+                let tile_place_at: Option<(usize, usize)> = {
+                    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+                    if frame.tiles.len() < 2 {
+                        let (_, pane_rows) = screen::pane_size_for(
+                            state.cols,
+                            state.lines,
+                            state.collapsed,
+                            0,
+                            state.sidebar_width,
+                        );
+                        (pane_rows > 0).then_some((screen::TABS + pane_rows as usize, left + 1))
+                    } else {
+                        frame.tiles.iter().find(|t| t.focused).map(|t| {
+                            (
+                                screen::TABS + t.rect.y + t.rect.rows,
+                                left + 1 + t.rect.x,
+                            )
+                        })
+                    }
+                };
                 let mut painted = screen::paint(&frame);
                 // The focus list covers the pane the frame just drew, the way the
                 // palette does. Never over an overlay: an open palette owns the
@@ -1532,6 +1592,39 @@ async fn drive(
                 state.paint_now = paint_now;
                 written.clear();
                 presenter.present(&painted, state.cols, state.lines, &mut written);
+                // Pictures, reconciled per frame. Anything placed on the outer
+                // screen and no longer desired comes down; the current picture
+                // goes up over the pane whose last row the notice names. The
+                // block runs after the text frame in the same flush, with the
+                // cursor restored, so the row diff never sees image bytes.
+                //
+                // A floating overlay suppresses placement the way scrollback
+                // does: the picture would show straight through the palette,
+                // so it comes down while one is open and goes back up after.
+                let suppressed = state.palette.is_some()
+                    || state.prompt.is_some()
+                    || state.menu.is_some()
+                    || state.reading.is_some()
+                    || state.focus;
+                let resized = state.img_size != (state.cols, state.lines);
+                let anchored = state.anchor.is_some() || suppressed;
+                let (image_ops, shown) = crate::graphics::plan(
+                    state.focused,
+                    state.images.get(&state.focused),
+                    &state.shown_images,
+                    state.graphics,
+                    anchored,
+                    resized,
+                    tile_place_at,
+                );
+                state.shown_images = shown;
+                if resized {
+                    state.img_size = (state.cols, state.lines);
+                }
+                let image_block = crate::graphics::block(
+                    &image_ops,
+                    presenter.cursor().unwrap_or(((1, 1), true)),
+                );
                 if state.ring {
                     // After the frame, so the terminal has the new colour on screen when
                     // the person looks up.
@@ -1541,6 +1634,11 @@ async fn drive(
                 // A frame that changed nothing on screen is not a write at all.
                 if !written.is_empty() {
                     out.write_all(written.as_bytes())?;
+                }
+                if !image_block.is_empty() {
+                    out.write_all(&image_block)?;
+                }
+                if !written.is_empty() || !image_block.is_empty() {
                     out.flush()?;
                 }
                 dirty = false;
@@ -1855,11 +1953,21 @@ async fn drive(
                                 }
                                 let focused = state.focused;
                                 if focused != 0 {
-                                    wr.write_all(&client::encode_command_to(
-                                        focused,
-                                        &ClientWire::Input { bytes },
-                                        seqs.entry(focused).or_default(),
-                                    )?).await?;
+                                    // Large pastes travel as several small messages
+                                    // rather than one huge one: one message
+                                    // inflates on the wire and trips the
+                                    // reassembly bound, dropping the whole paste
+                                    // where a streamed one flows.
+                                    for piece in client::split_input(&bytes) {
+                                        wr.write_all(&client::encode_command_to(
+                                            focused,
+                                            &ClientWire::Input {
+                                                bytes: piece.to_vec(),
+                                            },
+                                            seqs.entry(focused).or_default(),
+                                        )?)
+                                        .await?;
+                                    }
                                 }
                             }
                             Action::Detach => return Ok(()),
@@ -2612,6 +2720,13 @@ async fn drive(
                                     }
                                 }
                             }
+                            Incoming::Image { terminal, image } => {
+                                // Stored for the frame painter (overlay or
+                                // placeholder in Faz 3). Newest wins per
+                                // terminal, like snapshots; drawn by image id.
+                                state.images.insert(terminal, image);
+                                dirty = true;
+                            }
                             Incoming::Event(EventMessage::AgentChanged { .. })
                             | Incoming::Event(EventMessage::Resync) => {
                                 // What changed is not in the message on purpose, so the
@@ -2736,6 +2851,21 @@ async fn drive(
 
     // Off in the reverse order, and before leaving the alternate screen: a terminal left
     // in mouse reporting mode sends escape sequences into whatever the person runs next.
+    // Kitty placements outlive the client the same way: the grid goes with the
+    // alternate screen below, but the overlay does not. Best effort on the way out.
+    {
+        let deletes: Vec<crate::graphics::ImageOp> = state
+            .shown_images
+            .values()
+            .filter(|(_, protocol)| *protocol == qoro_runtime::daemon::ImageProtocol::Kitty)
+            .map(|(id, _)| crate::graphics::ImageOp::Delete { id: *id })
+            .collect();
+        let cleanup =
+            crate::graphics::block(&deletes, presenter.cursor().unwrap_or(((1, 1), true)));
+        if !cleanup.is_empty() {
+            let _ = out.write_all(&cleanup);
+        }
+    }
     let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
@@ -3658,6 +3788,13 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .layouts
                 .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
             state.snapshots.remove(&terminal);
+            // The picture with it. A Kitty placement still on the outer screen
+            // comes down on the next painted frame, through the per-frame
+            // reconcile. An iTerm2 one cannot be removed remotely (the protocol
+            // has no delete), so it stays until the outer terminal clears it;
+            // tracking is still dropped here so later frames cannot retry what
+            // cannot work.
+            state.images.remove(&terminal);
             // The daemon ended the terminal, which ends its subscription
             // server-side too: pruning the local set without a goodbye write.
             state.subs.remove(&terminal);
@@ -3922,6 +4059,10 @@ mod tests {
             anchor: None,
             behind: Behind::default(),
             snapshots: std::collections::BTreeMap::new(),
+            images: std::collections::BTreeMap::new(),
+            graphics: crate::graphics::GraphicsCap::off(),
+            shown_images: std::collections::BTreeMap::new(),
+            img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
             panes: std::collections::BTreeSet::new(),
@@ -4171,6 +4312,10 @@ mod tests {
             focused: 1,
             snapshot: None,
             snapshots: std::collections::BTreeMap::new(),
+            images: std::collections::BTreeMap::new(),
+            graphics: crate::graphics::GraphicsCap::off(),
+            shown_images: std::collections::BTreeMap::new(),
+            img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
             panes: std::collections::BTreeSet::new(),
@@ -4233,6 +4378,10 @@ mod tests {
             focused: 1,
             snapshot: Some(snapshot_with_behind(0)),
             snapshots: std::collections::BTreeMap::from([(2, snapshot_with_behind(0))]),
+            images: std::collections::BTreeMap::new(),
+            graphics: crate::graphics::GraphicsCap::off(),
+            shown_images: std::collections::BTreeMap::new(),
+            img_size: (0, 0),
             subs: std::collections::BTreeSet::from([1, 2]),
             layouts: std::collections::BTreeMap::new(),
             panes: std::collections::BTreeSet::new(),

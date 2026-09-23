@@ -21,6 +21,9 @@ use qoro_proto::{Channel, Frame, Reassembler, ServerCapabilities, negotiate};
 use qoro_pty::sys;
 use qoro_pty::teardown::{self, Containment, Step};
 use qoro_pty::writeq::{WritePriority, WriteQueue};
+/// The image protocols the sniffer catches, re-exported where the wire and the
+/// client need them without depending on the terminal crate directly.
+pub use qoro_terminal::ImageProtocol;
 use qoro_terminal::{AlacrittyEngine, Snapshot, TerminalEngine};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -87,6 +90,26 @@ pub enum TerminalUpdate {
     /// teardown works to preserve. Measured as a regression the moment the render lane
     /// started coalescing.
     Ended(Snapshot),
+    /// A completed image envelope (Kitty or iTerm2), verbatim. Sent unthrottled the
+    /// moment it completes: pictures are rare, and holding one for the next snapshot
+    /// would put it on the wrong screen. The render lane keeps only the newest per
+    /// terminal, like snapshots, so a burst of images costs one envelope, not all.
+    Image(StoredImage),
+}
+
+/// One image a terminal's child emitted, kept beside the grid.
+///
+/// Last one wins per terminal. The grid never holds it (the engine strips image
+/// envelopes before parsing), so this is the only place it lives until a client draws
+/// it. Bounded by the sniffer's own cap: at most a few megabytes per terminal.
+#[derive(Clone, Debug)]
+pub struct StoredImage {
+    pub terminal: u32,
+    /// Monotonic per terminal, from the sniffer. What a client deletes by.
+    pub id: u64,
+    pub protocol: qoro_terminal::ImageProtocol,
+    /// The whole envelope, opening `ESC` to terminator, verbatim.
+    pub bytes: Vec<u8>,
 }
 
 /// ADR-004's accepted-connection budget, and the admission queue behind it.
@@ -113,6 +136,16 @@ pub const NO_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// single one megabyte snapshot for a 1000 by 1000 terminal is 190 MB, three times this
 /// budget, with the admission limit never reached and so the eviction policy never run.
 pub const MAX_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many pictures per terminal may publish inside `FLOOD_WINDOW`.
+///
+/// Pictures bypass the snapshot throttle because holding one puts it on the wrong
+/// screen, so a runaway child emitting them in a loop needs its own bound. Eight a
+/// second is orders above any legitimate emitter (an agent pastes one picture, then
+/// stops to talk about it) and far below line rate.
+pub const MAX_IMAGES_PER_WINDOW: usize = 8;
+/// The rolling window the flood guard counts in.
+pub const FLOOD_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How many parse slices run before the terminal task gives the runtime a turn.
 ///
@@ -309,6 +342,19 @@ pub struct TerminalHandle {
     pub token: qoro_domain::CapabilityToken,
     pub commands: mpsc::Sender<ClientCommand>,
     pub updates: watch::Sender<TerminalUpdate>,
+    /// The newest image this terminal's child emitted, if any. Written by the
+    /// terminal's own task, read when a client subscribes late: the watch channel
+    /// holds only the latest update, so a picture published while nobody watched
+    /// would otherwise be gone before the first viewer arrives.
+    pub last_image: Arc<std::sync::Mutex<Option<StoredImage>>>,
+    /// Pictures dropped by the per-terminal flood guard. Counted, like every
+    /// other discard: a missing picture must be sayable.
+    pub image_flood_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// The live pty size, packed cols in the high half and rows in the low half.
+    /// Written on resize, read at teardown: when the last update was a picture
+    /// (which carries no grid), the end still carries a blank screen of the
+    /// right geometry rather than a guessed one.
+    pub last_dims: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The daemon's terminals, addressed by the number that travels in a frame's `stream`
@@ -898,6 +944,10 @@ pub const MAX_CANON: usize = 1024;
 /// intermediate value of the terminal that caused it.
 pub struct RenderQueue {
     pending: std::sync::Mutex<BTreeMap<u32, Snapshot>>,
+    /// One image per terminal at most, replaced by the next. Never coalesced with
+    /// snapshots: a picture is not a screen, and dropping it as a stale screen would
+    /// lose the only copy on its way to the client.
+    images: std::sync::Mutex<BTreeMap<u32, StoredImage>>,
     put_at: std::sync::Mutex<Option<std::time::Instant>>,
     notify: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
@@ -928,6 +978,7 @@ impl RenderQueue {
     pub fn new(global: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         Self {
             pending: std::sync::Mutex::new(BTreeMap::new()),
+            images: std::sync::Mutex::new(BTreeMap::new()),
             put_at: std::sync::Mutex::new(None),
             notify: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -989,11 +1040,38 @@ impl RenderQueue {
         taken
     }
 
+    /// Replace this terminal's pending image. Never awaits, like `put`: the caller
+    /// is the subscription task, which must not block.
+    pub fn put_image(&self, stream: u32, image: StoredImage) {
+        let added = image.bytes.len();
+        let removed = {
+            let mut images = self.images.lock().unwrap();
+            images
+                .insert(stream, image)
+                .as_ref()
+                .map(|old| old.bytes.len())
+                .unwrap_or(0)
+        };
+        self.charge(added as isize - removed as isize);
+        self.notify.notify_one();
+    }
+
+    /// Take every pending image, oldest terminal first. Returns empty when none.
+    pub fn take_images(&self) -> Vec<(u32, StoredImage)> {
+        let taken: Vec<(u32, StoredImage)> = std::mem::take(&mut *self.images.lock().unwrap())
+            .into_iter()
+            .collect();
+        let freed: usize = taken.iter().map(|(_, i)| i.bytes.len()).sum();
+        self.charge(-(freed as isize));
+        taken
+    }
+
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         // Whatever is still held stops counting against the global ceiling, or a closed
         // connection would keep a share of the budget forever.
         let _ = self.take();
+        let _ = self.take_images();
         self.notify.notify_one();
     }
 
@@ -1203,6 +1281,26 @@ async fn serve_client(
                 rendered += 1;
             }
 
+            // Pictures travel after the screens of the same batch, on the same
+            // channel and stream, sharing its sequence numbers. A client that
+            // predates images fails the ImageWire parse and skips them, which is
+            // ADR-010's rule: a newer daemon may say more than an older client
+            // understands.
+            for (stream, image) in writer_renders.take_images() {
+                let wire = ImageWire::from(&image);
+                let body = match serde_json::to_vec(&wire) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let counter = seq.entry(stream).or_default();
+                let frames =
+                    qoro_proto::chunk(Channel::Terminal, stream, *counter, None, Bytes::from(body));
+                *counter = counter.wrapping_add(frames.len() as u32);
+                if frames.iter().any(|f| f.encode(&mut buf).is_err()) {
+                    return;
+                }
+            }
+
             if !buf.is_empty() {
                 if wr.write_all(&buf).await.is_err() {
                     return;
@@ -1396,6 +1494,15 @@ fn subscribe(
     };
     let mut updates = handle.updates.subscribe();
     let queue = renders.clone();
+    // A picture published while nobody watched lives on in the handle, so a late
+    // subscriber still sees it. Seeded before the loop, replaced by anything newer.
+    // A duplicate delivery is harmless: the client draws by image id.
+    let last_image = handle.last_image.clone();
+    let mut sent_image: Option<u64> = None;
+    if let Some(image) = last_image.lock().unwrap().clone() {
+        sent_image = Some(image.id);
+        queue.put_image(stream, image);
+    }
     let task = tokio::spawn(async move {
         loop {
             // Attach delivers the current screen first, before any further update. Without
@@ -1410,6 +1517,19 @@ fn subscribe(
                     queue.put(stream, snapshot);
                     return;
                 }
+                TerminalUpdate::Image(image) => {
+                    sent_image = Some(image.id);
+                    queue.put_image(stream, image);
+                }
+            }
+            // Heal the watch channel's latest-wins loss: an Image overwritten by a
+            // Full between two wakes never reaches the match above, but it is still
+            // in the handle. Forwarded here, at most once per picture.
+            if let Some(image) = last_image.lock().unwrap().clone()
+                && sent_image != Some(image.id)
+            {
+                sent_image = Some(image.id);
+                queue.put_image(stream, image);
             }
             if updates.changed().await.is_err() {
                 return;
@@ -2451,6 +2571,80 @@ pub enum ColourWire {
     Rgb { r: u8, g: u8, b: u8 },
 }
 
+/// One image on the wire, as it crosses the socket.
+///
+/// Deliberately shaped so it parses as neither a snapshot nor anything older: it
+/// carries none of `cols`/`rows`/`cursor`/`lines`, so a client that only knows
+/// snapshots fails the parse and skips it (ADR-010). The envelope rides base64
+/// because it may hold any byte; the sniffer's cap plus a third still fits the
+/// reassembly bound.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageWire {
+    pub v: u32,
+    /// Monotonic per terminal, from the sniffer. What a client deletes by.
+    pub id: u64,
+    pub protocol: String,
+    pub data: String,
+}
+
+impl ImageWire {
+    pub fn protocol_name(protocol: qoro_terminal::ImageProtocol) -> &'static str {
+        match protocol {
+            qoro_terminal::ImageProtocol::Kitty => "kitty",
+            qoro_terminal::ImageProtocol::ITerm2 => "iterm2",
+        }
+    }
+
+    pub fn parse_protocol(name: &str) -> Option<qoro_terminal::ImageProtocol> {
+        match name {
+            "kitty" => Some(qoro_terminal::ImageProtocol::Kitty),
+            "iterm2" => Some(qoro_terminal::ImageProtocol::ITerm2),
+            _ => None,
+        }
+    }
+
+    /// The envelope back out, or `None` when the peer sent what this version cannot
+    /// read. Never panics on hostile input: over-long, wrong version and bad base64
+    /// all read as absent, and the placeholder is what the client draws instead.
+    pub fn decode(&self) -> Option<StoredImage> {
+        use base64::Engine as _;
+        if self.v != 1 {
+            return None;
+        }
+        let protocol = Self::parse_protocol(&self.protocol)?;
+        // Base64 inflates by a third: reject before allocating the decoded bytes.
+        // A body inside the reassembly cap can still decode past the image cap.
+        if self.data.len() > qoro_terminal::MAX_IMAGE_BYTES / 3 * 4 + 4 {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .ok()?;
+        if bytes.len() > qoro_terminal::MAX_IMAGE_BYTES {
+            return None;
+        }
+        // Terminal is the frame's stream, filled in by the decoder, not the peer.
+        Some(StoredImage {
+            terminal: 0,
+            id: self.id,
+            protocol,
+            bytes,
+        })
+    }
+}
+
+impl From<&StoredImage> for ImageWire {
+    fn from(image: &StoredImage) -> Self {
+        use base64::Engine as _;
+        Self {
+            v: 1,
+            id: image.id,
+            protocol: Self::protocol_name(image.protocol).to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+        }
+    }
+}
+
 /// The attribute bits, named once so the client and the daemon cannot disagree.
 pub mod attrs {
     pub const BOLD: u8 = 1;
@@ -2602,6 +2796,9 @@ pub fn open_terminal(
         token: token.clone(),
         commands,
         updates: updates.clone(),
+        last_image: Arc::new(std::sync::Mutex::new(None)),
+        image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        last_dims: Arc::new(std::sync::atomic::AtomicU64::new((80u64 << 32) | 24u64)),
     };
     terminals.insert(stream, handle.clone());
     let registry = terminals.clone();
@@ -3195,6 +3392,10 @@ fn spawn_terminal(
     let fallback_start = i32::try_from(fallback_pid)
         .ok()
         .and_then(|pid| qoro_pty::sys::start_time_of(qoro_pty::teardown::Pid(pid)));
+    // The teardown below runs after the task (and its locals) is gone. When the
+    // last update was a picture, which carries no grid, the end still needs the
+    // live geometry: read it from the handle now, while the registry has it.
+    let end_dims = terminals.get(stream).map(|h| h.last_dims.clone());
     tokio::spawn(async move {
         // A panic in one terminal's task must not take the daemon or its neighbours
         // with it, and must not leave a corpse tab behind either: without the
@@ -3258,6 +3459,26 @@ fn spawn_terminal(
         on_end();
         let last = match updates.borrow().clone() {
             TerminalUpdate::Full(snapshot) | TerminalUpdate::Ended(snapshot) => snapshot,
+            // The last update was a picture, which carries no grid. The client that
+            // watched it still holds the last screen it drew; the end carries a blank
+            // one of the live geometry rather than a guessed one.
+            TerminalUpdate::Image(_) => {
+                let packed = end_dims
+                    .as_ref()
+                    .map(|d| d.load(std::sync::atomic::Ordering::Relaxed));
+                let (cols, rows) = packed
+                    .map(|p| ((p >> 32) as usize, (p as u32) as usize))
+                    .unwrap_or((80, 24));
+                let (cols, rows) = (cols.max(1), rows.max(1));
+                Snapshot {
+                    cols,
+                    rows,
+                    cursor: (0, 0),
+                    lines: vec![String::new(); rows],
+                    styles: Vec::new(),
+                    modes: Default::default(),
+                }
+            }
         };
         let _ = updates.send(TerminalUpdate::Ended(last));
     });
@@ -3639,6 +3860,10 @@ async fn terminal_task(
     // `None` while nothing is held back, so a quiet terminal has no timer.
     let mut published: Option<tokio::time::Instant> = None;
     let mut publish_at: Option<tokio::time::Instant> = None;
+    // When recent pictures arrived, for the flood guard below. Empty while the
+    // terminal draws no pictures, like every other arm in this loop.
+    let mut image_at: std::collections::VecDeque<std::time::Instant> =
+        std::collections::VecDeque::new();
     // When to look again at a foreground leader the read loop's look was held back for.
     let mut relook_at: Option<tokio::time::Instant> = None;
     // When the run of output that `detect_at` is waiting out began, so that waiting it out
@@ -3729,6 +3954,17 @@ async fn terminal_task(
                                     engine.resize(cols, rows);
                                     current_size = size;
                                 }
+                                // The teardown path reads this when the last update
+                                // was a picture: the end then carries a blank of
+                                // the right geometry rather than a guessed one.
+                                // The canonical size, not the transient shrunk
+                                // one a nudge is holding.
+                                if let Some(handle) = terminals.get(stream) {
+                                    handle.last_dims.store(
+                                        ((size.cols as u64) << 32) | (size.rows as u64),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
                                 let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                             }
                         }
@@ -3759,6 +3995,17 @@ async fn terminal_task(
                         // one. Published unconditionally: the subscriber is watching by
                         // definition, so the idle-cost rule is not what this bypasses.
                         ClientCommand::Refresh => {
+                            // Picture first, screen last: the channel keeps only the
+                            // newest, so whatever is sent last is what a slow
+                            // subscriber is guaranteed to see, and the picture is
+                            // healed from the handle on the next wake regardless.
+                            // A doubled delivery only happens when both arrive, and
+                            // the client draws by id.
+                            if let Some(handle) = terminals.get(stream)
+                                && let Some(image) = handle.last_image.lock().unwrap().clone()
+                            {
+                                let _ = updates.send(TerminalUpdate::Image(image));
+                            }
                             let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                         }
                     ClientCommand::GrantOwnership { from, to } => {
@@ -3908,6 +4155,48 @@ async fn terminal_task(
                                 // Replies have their own reserved budget: an application
                                 // that asked a question is blocked until it is answered.
                                 let _ = writes.push(reply, WritePriority::TerminalReply);
+                            }
+                            // Pictures are rare and unthrottled: holding one for the
+                            // next snapshot would put it on the wrong screen. Stored
+                            // beside the watch channel so a late subscriber still
+                            // finds it, and published at once so a watching client
+                            // draws it under the output that follows.
+                            //
+                            // Unthrottled has one guard: a child emitting pictures in
+                            // a loop is a malfunction, and each picture costs every
+                            // subscriber a clone, a base64 and a socket write. Past
+                            // eight a second the excess is dropped and counted on
+                            // the handle, and the last good picture stays put.
+                            for effect in &effects {
+                                if let qoro_terminal::TerminalEffect::Image(captured) = effect {
+                                    let now = std::time::Instant::now();
+                                    while image_at
+                                        .front()
+                                        .is_some_and(|at| now - *at > FLOOD_WINDOW)
+                                    {
+                                        image_at.pop_front();
+                                    }
+                                    if image_at.len() >= MAX_IMAGES_PER_WINDOW {
+                                        if let Some(handle) = terminals.get(stream) {
+                                            handle.image_flood_dropped.fetch_add(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    image_at.push_back(now);
+                                    let image = StoredImage {
+                                        terminal: stream,
+                                        id: captured.id,
+                                        protocol: captured.protocol,
+                                        bytes: captured.bytes.clone(),
+                                    };
+                                    if let Some(handle) = terminals.get(stream) {
+                                        *handle.last_image.lock().unwrap() = Some(image.clone());
+                                    }
+                                    let _ = updates.send(TerminalUpdate::Image(image));
+                                }
                             }
                             // Nothing changed for anyone, so nothing runs. A snapshot
                             // allocates one string per row whether or not a client is
@@ -4479,6 +4768,80 @@ fn write_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod image_wire_tests {
+    use super::{ImageWire, StoredImage};
+
+    fn stored() -> StoredImage {
+        StoredImage {
+            terminal: 7,
+            id: 3,
+            protocol: qoro_terminal::ImageProtocol::Kitty,
+            bytes: b"\x1b_Gf=100,a=T;Zm9v\x1b\\".to_vec(),
+        }
+    }
+
+    /// The envelope survives the wire byte for byte.
+    #[test]
+    fn an_image_round_trips_through_the_wire() {
+        let image = stored();
+        let body = serde_json::to_vec(&ImageWire::from(&image)).expect("serialize");
+        let back: ImageWire = serde_json::from_slice(&body).expect("parse");
+        let decoded = back.decode().expect("decode");
+        assert_eq!(decoded.bytes, image.bytes);
+        assert_eq!(decoded.id, image.id);
+        assert_eq!(decoded.protocol, image.protocol);
+    }
+
+    /// An older client parses snapshots and skips anything else. The image shape
+    /// must fail the snapshot parse, or the old client would draw garbage.
+    #[test]
+    fn an_image_is_not_mistaken_for_a_snapshot() {
+        let body = serde_json::to_vec(&ImageWire::from(&stored())).expect("serialize");
+        assert!(
+            serde_json::from_slice::<super::SnapshotWire>(&body).is_err(),
+            "an old client would render this as a screen"
+        );
+    }
+
+    /// And the reverse: a snapshot must not parse as an image, or a new client
+    /// would drop screens as broken pictures.
+    #[test]
+    fn a_snapshot_is_not_mistaken_for_an_image() {
+        let snap = super::SnapshotWire {
+            cols: 80,
+            rows: 24,
+            cursor: (1, 1),
+            lines: vec!["hi".to_string()],
+            styles: Vec::new(),
+            modes: Default::default(),
+            behind: 0,
+        };
+        let body = serde_json::to_vec(&snap).expect("serialize");
+        assert!(serde_json::from_slice::<ImageWire>(&body).is_err());
+    }
+
+    /// Hostile input decodes to absent, never panics: wrong version, unknown
+    /// protocol, bad base64, over the cap.
+    #[test]
+    fn hostile_images_decode_to_absent() {
+        let mut wire = ImageWire::from(&stored());
+        wire.v = 2;
+        assert!(wire.decode().is_none());
+        let mut wire = ImageWire::from(&stored());
+        wire.protocol = "sixel".to_string();
+        assert!(wire.decode().is_none());
+        let mut wire = ImageWire::from(&stored());
+        wire.data = "!!!not-base64!!!".to_string();
+        assert!(wire.decode().is_none());
+        let mut wire = ImageWire::from(&stored());
+        // Valid base64, but decoding past the cap: twice the cap in chars is half
+        // again the cap in bytes.
+        wire.data = "A".repeat(qoro_terminal::MAX_IMAGE_BYTES * 2);
+        assert!(wire.decode().is_none());
     }
 }
 

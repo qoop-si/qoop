@@ -57,6 +57,10 @@ pub struct AlacrittyEngine {
     filter: ControlStringFilter,
     /// Reused across feeds so that bounding the stream does not allocate on every read.
     filtered: Vec<u8>,
+    /// Image envelopes, caught beside the parser. The parser never sees them.
+    sniffer: crate::images::ImageSniffer,
+    /// The sniffer's output: child bytes with image envelopes removed.
+    unsniffed: Vec<u8>,
     /// A character that a read cut in half, held until the rest of it arrives.
     ///
     /// At most three bytes, because no UTF-8 sequence is longer than four. See `feed` for
@@ -81,6 +85,8 @@ impl AlacrittyEngine {
             events: rx,
             filter: ControlStringFilter::default(),
             filtered: Vec::new(),
+            sniffer: crate::images::ImageSniffer::new(),
+            unsniffed: Vec::new(),
             partial_char: Vec::new(),
             scrolled_off: Vec::new(),
             title: String::new(),
@@ -270,13 +276,19 @@ fn colour_of(c: alacritty_terminal::vte::ansi::Color) -> Colour {
 impl TerminalEngine for AlacrittyEngine {
     fn feed(&mut self, bytes: &[u8]) -> (Damage, Vec<TerminalEffect>) {
         self.term.reset_damage();
+        // Images leave the stream here, before the bound below: a picture is always
+        // larger than a control string may be, and it is a side channel, not grid
+        // cells. What the sniffer holds back is an incomplete envelope tail, exactly
+        // like the split character held back further down.
+        self.unsniffed.clear();
+        self.sniffer.feed(bytes, &mut self.unsniffed);
         // The parser's own control-string buffer is unbounded, so the bound goes in front
         // of it. See `control_string` for the measurement that made this necessary.
         self.filtered.clear();
         // Whatever the last read cut in half goes back on the front, so the parser sees
         // characters and never halves of them.
         self.filtered.append(&mut self.partial_char);
-        self.filter.feed(bytes, &mut self.filtered);
+        self.filter.feed(&self.unsniffed, &mut self.filtered);
 
         // A character split across two reads is held back rather than handed over.
         //
@@ -341,6 +353,9 @@ impl TerminalEngine for AlacrittyEngine {
                 }
                 _ => {}
             }
+        }
+        for img in self.sniffer.take_images() {
+            effects.push(TerminalEffect::Image(img));
         }
         (damage, effects)
     }

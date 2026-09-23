@@ -82,6 +82,7 @@ fn main() {
         rows_back: 0,
         tiles: Vec::new(),
         behind: &behind,
+        image_notice: None,
     });
     print!("{painted}");
     use std::io::Write;

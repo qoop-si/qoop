@@ -92,6 +92,11 @@ pub struct Frame<'a> {
     pub rows_back: u64,
     /// The rows behind the screen this client has been given.
     pub behind: &'a crate::run::Behind,
+    /// A picture the focused terminal emitted that the outer terminal cannot draw,
+    /// as one dim line. `None` when there is no picture or the picture is on screen
+    /// as itself. Painted as an overlay, never as grid, so the snapshot contract
+    /// (plain rows) holds for every gate and the whole corpus.
+    pub image_notice: Option<&'a str>,
     /// The visible terminals and their rectangles, in pane-local cells. Empty
     /// means one terminal filling the pane, drawn from `snapshot` exactly as
     /// before, so a single pane paints pixel for pixel what it always has.
@@ -517,6 +522,25 @@ pub fn paint(frame: &Frame) -> String {
     };
     out.push_str(&width::fit(keys, frame.cols as usize));
     out.push_str(theme::RESET);
+
+    // A picture the outer terminal cannot draw, named on the focused pane's last
+    // row. Before the floating overlays, so an open palette covers it the way it
+    // covers terminal text.
+    if let Some(notice) = frame.image_notice {
+        let (tile_x, tile_y, tile_cols, tile_rows) = if frame.tiles.len() < 2 {
+            (0, 0, pane_cols as usize, pane_rows as usize)
+        } else if let Some(tile) = frame.tiles.iter().find(|t| t.focused) {
+            (tile.rect.x, tile.rect.y, tile.rect.cols, tile.rect.rows)
+        } else {
+            (0, 0, 0, 0)
+        };
+        if tile_cols > 0 && tile_rows > 0 {
+            out.push_str(&at(TABS + tile_y + tile_rows, left + 1 + tile_x));
+            out.push_str(&theme::fg(theme::Role::Faint));
+            out.push_str(&width::fit(notice, tile_cols));
+            out.push_str(theme::RESET);
+        }
+    }
 
     // The palette floats over the terminal, so it is painted last: every row it takes
     // overwrites what the pane and the column drew under it.
@@ -1689,6 +1713,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // The box is centred: ` > ab` starts three cells past its left edge,
         // so the caret lands on the cell right after the `b`.
@@ -1739,6 +1764,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("hello from the shell"));
         // Once on the tab and once in the agents panel: the bar says what is open in this
@@ -1790,6 +1816,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // The tab bar is the first row: between the cursor address and the reset.
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
@@ -1842,6 +1869,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
         let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
@@ -1896,6 +1924,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
         let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
@@ -1941,6 +1970,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("new tab"), "menu missing row: {painted:?}");
         assert!(painted.contains("^a c"), "menu hides its key: {painted:?}");
@@ -2019,6 +2049,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let (pane_cols, _) = pane_size(40, 5);
         // Exactly the pane's width of it, and not one column more.
@@ -2062,6 +2093,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("starting a terminal"));
     }
@@ -2113,6 +2145,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // Bold and red on, the text, and then off again: a run that is not closed leaks its
         // colour into the rest of the screen, which is the whole pane and then the status
@@ -2161,6 +2194,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // The row the shell printed, found by what it printed and then read as bytes. The
         // chrome around it resets after every piece it paints, so the pane's own run
@@ -2223,6 +2257,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
         assert!(painted.contains("\x1b[32mX"), "{painted:?}");
@@ -2285,6 +2320,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // One row down for the tab bar, and the pane starts after the column and its rule.
         let want = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
@@ -2335,6 +2371,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let placed = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
         assert!(!painted.contains(&placed), "hid cursor placed: {painted:?}");
@@ -2378,6 +2415,7 @@ mod tests {
                 rows_back: 0,
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
+                image_notice: None,
             });
             // Every positioned run, measured as a terminal measures it.
             for run in painted.split("\x1b[").skip(1) {
@@ -2432,6 +2470,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("\x1b[?25l"));
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
@@ -2471,6 +2510,7 @@ mod tests {
                 rows_back: 0,
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
+                image_notice: None,
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
@@ -2517,6 +2557,7 @@ mod tests {
                 rows_back: 0,
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
+                image_notice: None,
             });
             // The two status rows own the bottom of the screen, so nothing else may
             // address either of them: the notice is the row above the keys.
@@ -2586,6 +2627,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let ink = theme::fg(theme::space_of(1));
         let raised = theme::selected_in(theme::space_of(1));
@@ -2643,6 +2685,7 @@ mod tests {
                     lines: Vec::new(),
                     total: 0,
                 },
+                image_notice: None,
             })
         };
         let first = paint_at(0);
@@ -2711,6 +2754,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(!painted.contains('\u{fffd}'), "a name was cut in half");
         // Every panel row still ends where the rule begins.
@@ -2797,6 +2841,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(!painted.contains('\u{fffd}'));
     }
@@ -2860,6 +2905,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(
             painted.contains("next: app/codex is blocked"),
@@ -2905,6 +2951,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("d detach"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
@@ -2947,6 +2994,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         assert!(painted.contains("starting a terminal"), "{painted:?}");
     }
@@ -2990,6 +3038,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         // Read as a terminal shows it: the row is painted in pieces now, since the space
         // wears its own colour and the state wears its own.
@@ -3070,6 +3119,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let w = palette_width(80);
         let left = (80usize.saturating_sub(w)) / 2;
@@ -3147,6 +3197,7 @@ mod tests {
                 lines: Vec::new(),
                 total: 0,
             },
+            image_notice: None,
         });
         let shown = strip(&painted);
         assert!(shown.contains("> working"), "{shown:?}");
@@ -3254,6 +3305,7 @@ mod tests {
             rows_back: 0,
             tiles: Vec::new(),
             behind: &crate::run::Behind::default(),
+            image_notice: None,
         });
         // The five columns under the drag are reversed, and the escape is written once at
         // each edge of them rather than around every character.
@@ -3315,6 +3367,7 @@ mod tests {
                 rows_back: 0,
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
+                image_notice: None,
             })
         };
         assert_eq!(
@@ -3366,6 +3419,7 @@ mod tests {
             anchor: 98,
             rows_back: 2,
             behind: &behind,
+            image_notice: None,
             tiles: Vec::new(),
         });
         // Two rows back: the last two rows written, then the screen from its top.
@@ -3424,6 +3478,7 @@ mod tests {
             rows_back: 0,
             tiles: Vec::new(),
             behind: &behind,
+            image_notice: None,
         });
         assert!(painted.contains("live 0") && painted.contains("live 1"));
         assert!(!painted.contains("gone"), "{painted:?}");
@@ -3573,6 +3628,7 @@ mod tests {
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
+            image_notice: None,
         })
     }
 
@@ -3611,6 +3667,7 @@ mod tests {
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
+            image_notice: None,
         });
         let tiled = paint(&Frame {
             rows: &rows,
@@ -3650,8 +3707,68 @@ mod tests {
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
+            image_notice: None,
         });
         assert_eq!(tiled, legacy);
+    }
+
+    /// A picture the outer terminal cannot draw is named on the pane's last row,
+    /// dimmed, and nowhere else. Without a notice the same frame paints no such
+    /// line: the overlay is the notice, not a standing row.
+    #[test]
+    fn an_undrawable_picture_is_named_on_the_pane_last_row() {
+        let rows = [row(1, "zsh", "idle")];
+        let spaces = spaces();
+        let snap = snapshot(&["hello from the shell"]);
+        let behind = crate::run::Behind::default();
+        let panes = std::collections::BTreeSet::new();
+        let seen = sidebar::Seen::new();
+        let unseen = sidebar::Unseen::new();
+        let frame_of = |notice: Option<&'static str>| Frame {
+            rows: &rows,
+            spaces: &spaces,
+            panes: &panes,
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snap),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Grouped,
+            seen: &seen,
+            unseen: &unseen,
+            behind: &behind,
+            image_notice: notice,
+        };
+        let plain = paint(&frame_of(None));
+        assert!(!plain.contains("[image"), "{plain:?}");
+        let named = paint(&frame_of(Some("[image 800x600, 123KB]")));
+        assert!(named.contains("[image 800x600, 123KB]"), "{named:?}");
+        // On the pane's last row, not floating somewhere above the status lines.
+        let (_, pane_rows) = pane_size(80, 24);
+        let left = left_for(80, false, sidebar::WIDTH);
+        let last_cell = format!("\x1b[{};{}H", TABS + pane_rows as usize, left + 1);
+        let at = named.find("[image 800x600, 123KB]").expect("notice drawn");
+        let placed = named.rfind(&last_cell).expect("a placement opens the row");
+        assert!(
+            placed < at,
+            "notice is not on the last pane row: {:?}",
+            &named[placed..at + 30]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use qoro_proto::{Channel, ClientHello, CodecOffers, Frame, Reassembler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::daemon::{ClientWire, SnapshotWire};
+use crate::daemon::{ClientWire, ImageWire, SnapshotWire, StoredImage};
 
 /// Sent on attach. Reconciling unconditionally is cheaper than tracking what a previous
 /// client may have left behind, and a previous client may not have exited cleanly at all.
@@ -261,7 +261,6 @@ pub fn viewport_for(
 pub fn encode_command_seq(cmd: &ClientWire, seq: &mut u32) -> io::Result<BytesMut> {
     encode_command_to(1, cmd, seq)
 }
-
 /// The same, addressed to one terminal. The frame's stream field is the terminal.
 pub fn encode_command_to(stream: u32, cmd: &ClientWire, seq: &mut u32) -> io::Result<BytesMut> {
     let body =
@@ -281,6 +280,47 @@ pub fn encode_command_to(stream: u32, cmd: &ClientWire, seq: &mut u32) -> io::Re
 pub fn encode_command(cmd: &ClientWire) -> io::Result<BytesMut> {
     let mut seq = 0;
     encode_command_seq(cmd, &mut seq)
+}
+
+/// One logical input message may be this large before it is split.
+///
+/// A multi-megabyte paste as one message inflates several times over on the wire
+/// (bytes travel as a JSON number array) and trips the reassembly bound, so the
+/// whole paste is dropped where a streamed one would have flowed. Below the split
+/// the bytes travel as they always have.
+pub const MAX_INPUT_MESSAGE: usize = 32 * 1024;
+
+/// Past this size a piece is emitted mid-sequence rather than held for ground.
+///
+/// A well-formed envelope returns to ground constantly (base64 is ground bytes),
+/// so only a truly unterminated sequence reaches the ceiling, and holding that
+/// is worse than splitting it: the daemon's own chunker applies the same rule.
+pub const MAX_INPUT_RUN: usize = 64 * 1024;
+
+/// Split input into pieces that each fit one logical message, on escape-sequence
+/// boundaries from the shared scanner, so the two directions cannot disagree
+/// about what a sequence is.
+///
+/// Order and bytes are preserved exactly: concatenated, the pieces are the input.
+/// A control byte (`ctrl-a`, `ctrl-q`) is decoded before this runs, so splitting
+/// never creates or hides one.
+pub fn split_input(input: &[u8]) -> Vec<&[u8]> {
+    use qoro_domain::EscapeState;
+    let mut out = Vec::new();
+    let mut state = EscapeState::default();
+    let mut start = 0usize;
+    for (i, b) in input.iter().enumerate() {
+        state = state.step(*b);
+        let len = i + 1 - start;
+        if (state.is_ground() && len >= MAX_INPUT_MESSAGE) || len >= MAX_INPUT_RUN {
+            out.push(&input[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < input.len() {
+        out.push(&input[start..]);
+    }
+    out
 }
 
 /// Read stdin on a dedicated thread and forward it.
@@ -384,6 +424,11 @@ impl RenderStream {
             if let Ok(snapshot) = serde_json::from_slice::<SnapshotWire>(&message.body) {
                 self.received += 1;
                 all.push(snapshot);
+            } else if serde_json::from_slice::<ImageWire>(&message.body).is_ok() {
+                // A picture on a snapshot-only reader: skipped, but counted. The
+                // acknowledgement reports channel traffic, and an uncounted message
+                // reads as a wedged reader to the daemon's deadline.
+                self.received += 1;
             }
         }
         Ok(all)
@@ -419,6 +464,12 @@ pub enum Incoming {
     Render {
         terminal: u32,
         snapshot: SnapshotWire,
+    },
+    /// A picture the terminal's child emitted. Separate from the render because it
+    /// is not grid cells: the client draws it as an overlay or a placeholder.
+    Image {
+        terminal: u32,
+        image: StoredImage,
     },
     Control(crate::control::ControlResponse),
     /// Something changed that nobody asked about. A client that ignores these still works,
@@ -470,6 +521,16 @@ impl Connection {
                     if let Ok(snapshot) = serde_json::from_slice::<SnapshotWire>(&message.body) {
                         self.renders.received += 1;
                         out.push(Incoming::Render { terminal, snapshot });
+                    } else if let Ok(wire) = serde_json::from_slice::<ImageWire>(&message.body) {
+                        // An older daemon never sends this shape; a newer client reads
+                        // it here, an older client fails the snapshot parse above and
+                        // skips it. Hostile or truncated images decode to `None` and
+                        // are skipped the same way.
+                        if let Some(mut image) = wire.decode() {
+                            self.renders.received += 1;
+                            image.terminal = terminal;
+                            out.push(Incoming::Image { terminal, image });
+                        }
                     }
                 }
                 Channel::Control => {
@@ -577,6 +638,55 @@ mod tests {
         );
     }
 
+    /// Small input travels as the one message it always was.
+    #[test]
+    fn small_input_is_not_split() {
+        assert_eq!(split_input(b"hello"), vec![b"hello".as_slice()]);
+        assert!(split_input(b"").is_empty());
+    }
+
+    /// A large paste arrives as several bounded pieces that concatenate back to
+    /// the input, with no piece crossing the hard ceiling.
+    #[test]
+    fn a_large_paste_splits_and_reassembles_exactly() {
+        let mut input = Vec::new();
+        for i in 0..2000 {
+            input.extend_from_slice(format!("line {i:04} of pasted text\r\n").as_bytes());
+        }
+        // An image envelope in the middle, larger than one message: it must
+        // survive the split whole in content, wherever the boundaries land.
+        input.extend_from_slice(b"\x1b_Gf=100,a=T;");
+        input.extend(vec![b'A'; MAX_INPUT_MESSAGE]);
+        input.extend_from_slice(b"\x1b\\");
+        input.extend_from_slice(b"trailing text");
+        let pieces = split_input(&input);
+        assert!(pieces.len() > 2, "only {} pieces", pieces.len());
+        assert!(
+            pieces.iter().all(|p| p.len() <= MAX_INPUT_RUN),
+            "a piece crossed the ceiling"
+        );
+        let back: Vec<u8> = pieces.concat();
+        assert_eq!(back, input);
+    }
+
+    /// A sequence boundary is preferred over a mid-sequence cut: when a sequence
+    /// straddles the target size, the cut waits for its end.
+    #[test]
+    fn pieces_prefer_sequence_boundaries() {
+        let mut input = vec![b'x'; MAX_INPUT_MESSAGE - 8];
+        input.extend_from_slice(b"\x1b]0;title\x07");
+        input.extend(vec![b'y'; 100]);
+        let pieces = split_input(&input);
+        assert_eq!(pieces.len(), 2);
+        assert!(
+            pieces[0].ends_with(b"\x07"),
+            "cut inside the OSC: {:?}",
+            &pieces[0][pieces[0].len().saturating_sub(20)..]
+        );
+        let back: Vec<u8> = pieces.concat();
+        assert_eq!(back, input);
+    }
+
     #[test]
     fn rendering_clears_to_end_of_line_so_a_shorter_line_does_not_leave_debris() {
         let mut out = Vec::new();
@@ -633,6 +743,43 @@ mod tests {
                 String::from_utf8_lossy(ATTACH_PREAMBLE).contains(&seq),
                 "the preamble does not disable mouse mode {mode}"
             );
+        }
+    }
+
+    /// An image on the wire decodes to an `Incoming::Image` carrying the terminal
+    /// and the verbatim envelope, in order between snapshots.
+    #[test]
+    fn an_image_decodes_between_snapshots() {
+        use crate::daemon::{ImageWire, StoredImage};
+        let image = StoredImage {
+            terminal: 0,
+            id: 7,
+            protocol: crate::daemon::ImageProtocol::Kitty,
+            bytes: b"\x1b_Gf=100,a=T;Zm9v\x1b\\".to_vec(),
+        };
+        let snap_body = serde_json::to_vec(&snap(&["hi"])).expect("snapshot");
+        let img_body = serde_json::to_vec(&ImageWire::from(&image)).expect("image");
+        let mut inbuf = BytesMut::new();
+        for (seq, body) in [snap_body, img_body].into_iter().enumerate() {
+            for frame in
+                qoro_proto::chunk(Channel::Terminal, 9, seq as u32, None, Bytes::from(body))
+            {
+                frame.encode(&mut inbuf).expect("encode");
+            }
+        }
+        let mut conn = Connection::new();
+        let got = conn.drain(&mut inbuf).expect("drain");
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], Incoming::Render { terminal: 9, .. }));
+        match &got[1] {
+            Incoming::Image {
+                terminal: 9,
+                image: back,
+            } => {
+                assert_eq!(back.id, 7);
+                assert_eq!(back.bytes, image.bytes);
+            }
+            other => panic!("wrong message: {other:?}"),
         }
     }
 }

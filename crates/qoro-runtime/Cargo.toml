@@ -14,6 +14,7 @@ libc = "0.2"
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 qoro-domain = { path = "../qoro-domain" }
 qoro-proto = { path = "../qoro-proto" }

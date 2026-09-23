@@ -42,6 +42,9 @@ pub enum TerminalEffect {
     Bell,
     /// Policy gated. Never performed automatically.
     ClipboardWrite(Bytes),
+    /// A completed image envelope (Kitty or iTerm2), verbatim. The parser never
+    /// saw it: it is a side channel beside the grid, not cells in it.
+    Image(crate::images::CapturedImage),
 }
 
 /// Authoritative cell state for a client. A client never parses raw bytes; the daemon owns
