@@ -1,0 +1,11 @@
+{
+  "codec_generation": 1,
+  "selected": {
+    "control": "control.json.v1",
+    "event": "event.json.v1",
+    "terminal": "terminal.frame.v1",
+    "blob": "blob.raw.v1"
+  },
+  "capabilities": [],
+  "server_version": "0.0.0"
+}

@@ -16,9 +16,9 @@ use bytes::{Bytes, BytesMut};
 
 use crate::frame::{Channel, Flags, Frame};
 
-/// Maximum reassembled size for one inbound stream, on the control, event and terminal
-/// channels. The blob channel exists precisely so a large artefact does not have to fit
-/// inside this, and it carries its own per-transfer limit.
+/// Maximum reassembled size for one inbound stream, on every channel including
+/// blob. A large artefact travels chunked like everything else; there is no
+/// separate per-transfer blob limit, so this one cap is the whole bound.
 pub const MAX_REASSEMBLED: usize = 8 * 1024 * 1024;
 
 /// Maximum time from the first chunk of a sequence to its END.
