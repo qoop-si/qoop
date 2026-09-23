@@ -236,7 +236,9 @@ pub fn paint(frame: &Frame) -> String {
     for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize, frame.unseen) {
         out.push_str(&match style {
             tabs::Ink::Focused => theme::tab_on(),
-            tabs::Ink::Other => theme::tab_off(),
+            // The bar shows one space's terminals, so one space colour lands on
+            // all of them: identity, not confetti. Focus keeps the pink pill.
+            tabs::Ink::Other => theme::tab_in(theme::space_of(frame.space.unwrap_or_default())),
             tabs::Ink::Quiet => theme::fg(theme::Role::Faint),
         });
         out.push_str(&piece);
@@ -1743,6 +1745,57 @@ mod tests {
         assert!(
             painted.contains("claude"),
             "pane agent left sidebar: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn unfocused_tabs_wear_the_focused_space_while_focus_keeps_the_pill() {
+        // The bar shows one space's terminals: every unfocused tab wears that
+        // space's ink, and only the focused tab wears the pink pill.
+        let rows = [row(1, "zsh", "idle"), row(3, "sh", "idle")];
+        let snapshot = snapshot(&["hello from the shell"]);
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: Some(&snapshot),
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+        });
+        let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
+        let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
+        let bar = &painted[bar_start..bar_start + bar_end];
+        assert!(
+            bar.contains(&crate::theme::tab_in(crate::theme::space_of(1))),
+            "unfocused tab lost its space colour: {bar:?}"
+        );
+        assert!(
+            bar.contains(&crate::theme::tab_on()),
+            "focused tab lost its pill: {bar:?}"
         );
     }
 

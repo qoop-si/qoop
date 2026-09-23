@@ -29,19 +29,21 @@ const MAX_LABEL: usize = 12;
 
 /// The tab bar, painted into exactly `cols` columns.
 ///
-/// One line, so one colour, and therefore no colour: a bar carries several terminals in
-/// several states and a single hint for all of them would be a hint about none of them. The
-/// caller paints the focused tab from the ink [`painted`] marks it with.
+/// One line and one space, so one space colour: the bar carries the terminals of
+/// the focused space, and every unfocused tab wears that space's ink while the
+/// focused tab keeps the pink pill. The caller paints each piece from the ink
+/// [`painted`] marks it with.
 /// How one piece of the bar is painted.
 ///
 /// Three, not a colour per state. A tab bar carries several terminals in several states
 /// and colouring each one turns the bar into a row of confetti: what a person needs from
 /// it is which tab has the keyboard, and the panel on the left is where states live.
+/// The space colour is identity, not state, so it is the one colour the bar spends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ink {
     /// The tab with the keyboard.
     Focused,
-    /// Every other tab.
+    /// Every other tab, in the focused space's own colour.
     Other,
     /// The new tab button and the padding past the last tab.
     Quiet,

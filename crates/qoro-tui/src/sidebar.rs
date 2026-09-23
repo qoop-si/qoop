@@ -98,8 +98,8 @@ const SPACE_NAME_AT: usize = 1;
 /// the painter adds, never a second dot.
 ///
 /// Shape says failed: failed wears a diamond while every other state wears the
-/// circle, because failed's ember red-orange sits one step from blocked's orange
-/// and colour alone would not tell them apart at a glance.
+/// circle, because failed's magenta must read apart from the warm alarm pair
+/// at a glance, with hue and shape together rather than hue alone.
 const DOT: char = '\u{25cf}';
 /// The failed dot: a diamond, the same single column as the circle.
 const FAILED_DOT: char = '\u{25c6}';
@@ -2207,8 +2207,8 @@ mod tests {
     }
 
     /// Shape says failed: the diamond for failed, the circle for the rest, so the
-    /// adjacent oranges never stand on colour alone. Failed is never news
-    /// (`is_new` only fires for done/idle), so the diamond is unconditional.
+    /// magenta alarm never stands on colour alone beside the warm pair. Failed is
+    /// never news (`is_new` only fires for done/idle), so the diamond is unconditional.
     #[test]
     fn failed_wears_the_diamond_and_every_other_state_the_circle() {
         for state in ["working", "starting", "blocked", "done", "idle", "unknown"] {

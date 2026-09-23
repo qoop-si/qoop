@@ -28,8 +28,9 @@ pub enum Role {
     Faint,
     /// The rules between the panels and beside the pane.
     Rule,
-    /// The product's own mark. One thing on the screen wears it, and nothing else does:
-    /// an accent spent twice is an accent that points at nothing.
+    /// The product's own mark: the logo orange, one steady wearer on the screen.
+    /// An accent spent twice is an accent that points at nothing. (The ember
+    /// wheel starts on it transiently while it breathes; that is motion, not a mark.)
     Brand,
     /// An agent's state.
     Working,
@@ -37,14 +38,14 @@ pub enum Role {
     Done,
     Failed,
     Idle,
-    /// The working spinner's head, one step of the brand's own violets and pinks.
+    /// The working spinner's head, one step of the brand's own ambers.
     ///
     /// The sidebar steps these five times per loop while its glyph cycles four
     /// circle frames, so the (glyph, step) combination repeats every twenty ticks.
-    /// Violet-pink and not amber on purpose: amber now belongs to alarm
-    /// ([`Role::Blocked`] and [`Role::Failed`]), and aliveness wants its own
-    /// channel rather than a louder state colour. The wheel starts on the
-    /// brand's own ink and breathes outward toward pink.
+    /// Amber and not violet-pink on purpose: the wheel starts on the brand's own
+    /// orange and breathes outward through gold to tan, and aliveness wants its
+    /// own channel rather than a louder state colour. 208 is skipped: it belongs
+    /// to blocked now, so the wheel steps 216 instead.
     Ember(usize),
     /// A terminal nothing has said anything about yet.
     Unobserved,
@@ -72,36 +73,33 @@ pub fn space_of(id: i64) -> Role {
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
 ///
-/// Anchored in the product palette: 201 is vivid magenta of the `FF8FD9` pink
-/// family (the anchor 212 itself belongs to the selected tab and is spent once),
-/// 191 is `C7F245` lime, 227 is `F7F245` yellow, 27 is a brightened step of the
-/// `0044D7` blue family (the anchor 26 is too dim on dark grounds), 155 is a
-/// lime tint nearer to `C7F245` than its sibling steps, and 81 is a sky tint of
-/// the `00BBFF` family.
-/// Three of the six live in the lemon-yellow family and two sit near working
-/// blue; position carries those adjacencies (a space ink sits on the space name
-/// on the row below, a state sits on the first-row dot), because the palette
-/// gives no sixth far-apart hue.
-const SPACE_INKS: [u8; 6] = [201, 191, 227, 27, 155, 81];
+/// Anchored in the product palette and ordered so neighbours never sit in one
+/// family, round the wheel and back: lime 191, blue 27, yellow 227, sky 81,
+/// lime tint 155, violet tint 99. 27 is a brightened step of the `0044D7` blue
+/// family (the anchor 26 is too dim on dark grounds), 155 is a lime tint nearer
+/// to `C7F245` than its sibling steps, and 99 carries the `5A00EB` violet family
+/// (the anchor 56 itself is unspent: violet has no correct steady seat while the
+/// mark is orange). A space ink always sits on the space name on the row below
+/// while a state sits on the first-row dot, so the two never compete for one slot.
+const SPACE_INKS: [u8; 6] = [191, 27, 227, 81, 155, 99];
 
-/// The spinner's violet-to-pink wheel, from the brand accent out toward pink.
+/// The spinner's amber wheel, from the brand accent out toward tan.
 ///
-/// `5A00EB` is 56, which is also [`Role::Brand`]'s ink: the spinner starts on the
+/// `FD4B03` is 202, which is also [`Role::Brand`]'s ink: the spinner starts on the
 /// product's own mark and breathes outward, and a blocked row wears steady orange
-/// instead. 212 would be the nearest pink (`FF8FD9`, distance 8.2) but belongs to
-/// the selected tab, so the wheel lands on 213 then 218, the next-nearest pinks,
-/// bridged through 57 and 93.
-const EMBER_INKS: [u8; 5] = [56, 57, 93, 213, 218];
+/// beside it. 208 would be the next amber step but belongs to blocked, so the wheel
+/// steps 214, 216, 220 and 222 instead.
+const EMBER_INKS: [u8; 5] = [202, 214, 216, 220, 222];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
 /// Loud on black on purpose: the column is scanned for the one row that needs
-/// a person. Blocked is warm orange (208, `FF7700`); failed is ember red-orange
-/// (202, `FD4B03`, the reddest the palette gives, so the pair is hue-adjacent
-/// and told apart by the dot's shape as well as its colour: see the sidebar).
-/// Working is bright sky (39, `00BBFF`) so it never reads as done's green
-/// (35, `00BB54`). Idle and unobserved stay in the greys, because a colour on
-/// every row is a column with no signal in it.
+/// a person. Blocked is warm orange (208, `FF7700`); failed is vivid magenta
+/// (201), the palette's loudest hue outside the warm alarm pair, and always a
+/// diamond where blocked is a circle (see the sidebar). Working is bright sky
+/// (39, `00BBFF`) so it never reads as done's green (35, `00BB54`). Idle and
+/// unobserved stay in the greys, because a colour on every row is a column
+/// with no signal in it.
 pub fn of(state: &str) -> Role {
     match state {
         "working" | "starting" => Role::Working,
@@ -118,12 +116,15 @@ pub fn of(state: &str) -> Role {
 /// The greys and the accent are the brand's own tokens, matched to the nearest entry in
 /// the 256 colour palette: text `FCF7F1` is 231 (entry 15 is the same white but
 /// belongs to the person, so 231 is the nearest legal one), focused stays 255,
-/// muted `#666666` is 241, and the accent `5A00EB` is 56. The states keep their
-/// own hues, because a state is not brand: working `00BBFF` is 39, blocked
-/// `FF7700` is 208, done `00BB54` is 35, failed `FD4B03` is 202.
+/// muted `#666666` is 241, and the accent is the logo orange: `#FF6600` is 202,
+/// and the palette's `FD4B03` lands on the same 202, so the mark renders exactly
+/// as it always has. The states keep their own hues, because a state is not
+/// brand: working `00BBFF` is 39, blocked `FF7700` is 208, done `00BB54` is 35,
+/// failed is vivid magenta 201, the palette's loudest hue outside the warm pair.
 ///
-/// `5A00EB` is equidistant to 56 and 57; 56 wins for the mark (the deeper violet)
-/// and 57 serves as the ember wheel's second step.
+/// The violet anchor `5A00EB` (56) is unspent: violet has no correct steady seat
+/// while the mark is orange, and the violet family still shows in the space
+/// wheel's 99 step and the tab's pink 212.
 ///
 /// The rule is the one deliberate departure. The brand border is `#1a1a1a`, which is a
 /// line you can only see against the brand's own black; a terminal's background is
@@ -138,11 +139,11 @@ const fn ink(role: Role) -> u8 {
         Role::Detail => 245,
         Role::Faint => 241,
         Role::Rule => 237,
-        Role::Brand => 56,
+        Role::Brand => 202,
         Role::Working => 39,
         Role::Blocked => 208,
         Role::Done => 35,
-        Role::Failed => 202,
+        Role::Failed => 201,
         Role::Idle => 242,
         Role::Unobserved => 238,
         Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
@@ -200,15 +201,18 @@ pub fn status_in(role: Role) -> String {
 ///
 /// Findable without reading it, and never a white pill: a white block is the brightest
 /// thing on the bar, and the selected tab is not the most urgent thing on it.
-/// Pink (212, `FF8FD9`) sits in the brand's own violet-pink family, far from every
-/// state; amber would now read as alarm, so the tab left amber behind.
+/// Pink (212, `FF8FD9`) stands clear of the warm alarm pair and every state;
+/// amber would read as alarm, so the tab left amber behind.
 pub fn tab_on() -> String {
     format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, TAB_ON_FG)
 }
 
-/// Every other tab.
-pub fn tab_off() -> String {
-    fg(Role::Detail)
+/// Every other tab: the focused space's own colour, so the bar reads as that
+/// space's bar. The bar shows one space's terminals, so one colour lands on all
+/// of them and never turns to confetti. The focused tab keeps the pink pill:
+/// focus outranks belonging.
+pub fn tab_in(role: Role) -> String {
+    format!("\x1b[0;38;5;{}m", ink(role))
 }
 
 /// Back to the terminal's own colours.
@@ -270,7 +274,7 @@ mod tests {
             status_key(),
             status_in(Role::Blocked),
             tab_on(),
-            tab_off(),
+            tab_in(Role::Blocked),
         ];
         escapes.extend([Role::Title, Role::Text, Role::Rule].map(fg));
         for escape in escapes {
@@ -316,9 +320,9 @@ mod tests {
         for loud in [Role::Blocked, Role::Failed, Role::Working, Role::Done] {
             assert!(!calm.contains(&ink(loud)), "{loud:?} is painted as calm");
         }
-        // Adjacent by palette constraint, never equal: the palette gives no pure
-        // red, so failed is the reddest orange there is, and the dot's shape
-        // carries what hue cannot (see the sidebar's failed diamond).
+        // Far apart by palette and pinned: failed is vivid magenta against the
+        // warm alarm pair, and the dot's shape carries with the hue (see the
+        // sidebar's failed diamond).
         assert_ne!(ink(Role::Blocked), ink(Role::Failed));
         assert_ne!(ink(Role::Working), ink(Role::Done));
     }
@@ -428,9 +432,28 @@ mod tests {
         }
     }
 
+    /// Neighbouring spaces never sit in one family, round the wheel and back:
+    /// the wheel alternates families so adjacent projects read apart at a glance.
+    #[test]
+    fn neighbouring_spaces_are_never_of_one_family() {
+        fn family(ink: u8) -> &'static str {
+            match ink {
+                191 | 227 | 155 => "lemon",
+                27 | 81 => "blue",
+                99 => "violet",
+                _ => "other",
+            }
+        }
+        for n in 0..SPACE_INKS.len() {
+            let here = family(ink(Role::Space(n)));
+            let next = family(ink(Role::Space(n + 1)));
+            assert_ne!(here, next, "spaces {n} and {} share a family", n + 1);
+        }
+    }
+
     /// The ember wheel is five distinct steps that come back round, so the spinner
-    /// breathes out from violet toward pink and back rather than jumping between
-    /// two hues.
+    /// breathes out from the brand orange toward tan and back rather than jumping
+    /// between two hues.
     #[test]
     fn the_ember_wheel_is_five_distinct_steps_that_wrap() {
         let mut seen = std::collections::BTreeSet::new();
