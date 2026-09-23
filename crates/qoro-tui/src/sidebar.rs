@@ -57,19 +57,28 @@ pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
     }
 }
 
-/// Columns the left column occupies.
+/// Columns the left column occupies, unless the person pulled it wider or
+/// narrower.
 ///
-/// Fixed rather than negotiated: the terminal beside it is a real PTY whose width has to
-/// be decided before its child starts, and a column that grew with the longest space name
-/// would reflow that child every time somebody created a workspace.
+/// Thirty. A comparable multiplexer ships twenty six as a default a
+/// person can drag between eighteen and thirty six, and the wide end of
+/// that range is the right default here: this column carries a space name,
+/// a separator, a mark, a name and a state word flush against the right
+/// edge, and at twenty two the state had nothing left. Thirty leaves a
+/// real project name room to be read rather than recognised from its first
+/// eight characters.
 ///
-/// Thirty. A comparable multiplexer ships twenty six as a default a person can drag
-/// between eighteen and thirty six, and the wide end of that range is the right default
-/// here: this column carries a space name, a separator, a mark, a name and a state word
-/// flush against the right edge, and at twenty two the state had nothing left. Thirty
-/// leaves a real project name room to be read rather than recognised from its first eight
-/// characters.
+/// A pulled width reflows the pane beside it, which is the price the person
+/// pulling asked to pay: explicit drags reflow, arrivals never do.
 pub const WIDTH: usize = 30;
+
+/// The narrowest the open column drags to, and the widest.
+///
+/// Kept to the range (eighteen to thirty six); the default above
+/// stays qoro's own. Below eighteen the place rows are mostly ellipsis,
+/// above thirty six the pane starts paying real columns for furniture.
+pub const SIDEBAR_MIN: usize = 18;
+pub const SIDEBAR_MAX: usize = 36;
 
 /// Columns the left column occupies when it is folded away.
 ///
@@ -371,7 +380,7 @@ pub fn render(
 
 /// Both panels of the left column, painted into `height` rows.
 ///
-/// Same contract as [`render`]: exactly `height` lines of exactly [`WIDTH`]
+/// Same contract as [`render`]: exactly `height` lines of exactly `width`
 /// columns. One flat list: every agent draws its rows, nothing folds and no
 /// group header sits above calm rows.
 ///
@@ -380,6 +389,9 @@ pub fn render(
 ///
 /// Ten with the clock: paint-time unix seconds, read once per frame by the
 /// caller so one paint never disagrees with itself.
+///
+/// Eleven with the width: the live panel width, defaulting to [`WIDTH`] on
+/// the legacy surface below.
 #[allow(clippy::too_many_arguments)]
 pub fn render_folded(
     spaces: &[WorkspaceRow],
@@ -392,6 +404,7 @@ pub fn render_folded(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) -> Vec<Line> {
     rows_folded(
         spaces,
@@ -404,6 +417,7 @@ pub fn render_folded(
         seen,
         unseen,
         now_unix,
+        width,
     )
     .into_iter()
     .map(|(line, _)| line)
@@ -446,6 +460,7 @@ pub fn hit_folded(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) -> Option<Hit> {
     rows_folded(
         spaces,
@@ -459,6 +474,7 @@ pub fn hit_folded(
         seen,
         unseen,
         now_unix,
+        width,
     )
     .into_iter()
     .nth(row)
@@ -485,14 +501,16 @@ fn rows(
     // lines each.
     let wanted = 1 + 2 * agents.iter().filter(|a| a.agent).count();
     let split = spaces_rows(spaces.len(), height, wanted);
-    let mut out = spaces_panel(spaces, focused_space, split);
+    // The legacy surface paints at the default width: production goes
+    // through `rows_folded` with the live width.
+    let mut out = spaces_panel(spaces, focused_space, split, WIDTH);
     // A rule between the panels, glued to both like a border, so the column
     // reads as two stacked boxes. It takes its row from the agents side, and
     // only when the agents side keeps at least its title: a divider that ate
     // the title would divide nothing from nothing.
     let rest = height - split;
     if rest >= 2 {
-        out.push(divider());
+        out.push(divider(WIDTH));
         out.extend(agents_panel(spaces, agents, focused_terminal, rest - 1));
     } else {
         out.extend(agents_panel(spaces, agents, focused_terminal, rest));
@@ -539,11 +557,16 @@ fn spaces_rows(spaces: usize, height: usize, agents_wanted: usize) -> usize {
 ///
 /// The `+` at the title's right corner makes a space directly: the same
 /// naming box `ctrl-a w` opens, without the key first.
-fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Line, Option<Hit>)> {
+fn spaces_panel(
+    spaces: &[WorkspaceRow],
+    focused: i64,
+    height: usize,
+    width: usize,
+) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
     }
-    let mut out = vec![(spaces_title(), None)];
+    let mut out = vec![(spaces_title(width), None)];
     // The last row of this panel is the two things that are not a space: starting one more
     // terminal, and everything else. They sit at the foot of the upper panel rather than in
     // a bar of their own, because the column has two panels and a third strip would be a
@@ -565,7 +588,7 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
                     // No focus mark: the selected row is the raised background
                     // alone, so there is no hollow circle on every row and no
                     // filled white dot on the selected one.
-                    text: fit(&format!(" {}", space.name)),
+                    text: fit(&format!(" {}", space.name), width),
                     colour: None,
                     accent: Some((
                         SPACE_NAME_AT,
@@ -576,11 +599,11 @@ fn spaces_panel(spaces: &[WorkspaceRow], focused: i64, height: usize) -> Vec<(Li
                 },
                 Some(Hit::Space(space.id)),
             ),
-            None => blank(),
+            None => blank(width),
         });
     }
     if footer == 1 {
-        out.push(footer_row());
+        out.push(footer_row(width));
     }
     out
 }
@@ -605,7 +628,7 @@ fn agents_panel(
     if height == 0 {
         return Vec::new();
     }
-    let mut out = vec![(title(AGENTS_TITLE), None)];
+    let mut out = vec![(title(AGENTS_TITLE, WIDTH), None)];
     let body = height - 1;
     if body == 0 {
         return out;
@@ -617,7 +640,7 @@ fn agents_panel(
         // waiting for one.
         out.push((
             Line {
-                text: fit(" no agents yet"),
+                text: fit(" no agents yet", WIDTH),
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
                 indicator: None,
@@ -625,7 +648,7 @@ fn agents_panel(
             None,
         ));
         while out.len() < height {
-            out.push(blank());
+            out.push(blank(WIDTH));
         }
         return out;
     }
@@ -649,6 +672,7 @@ fn agents_panel(
             &Seen::new(),
             &Unseen::new(),
             0,
+            WIDTH,
         );
     }
     let focus_row = content
@@ -663,7 +687,7 @@ fn agents_panel(
     for offset in 0..body {
         match content.get(first + offset) {
             Some(row) => out.push(row.clone()),
-            None => out.push(blank()),
+            None => out.push(blank(WIDTH)),
         }
     }
     out.truncate(height);
@@ -698,6 +722,7 @@ fn push_agent_lines(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) {
     let hit = Some(Hit::Terminal(agent.terminal));
     let tab = label(agent);
@@ -706,7 +731,17 @@ fn push_agent_lines(
     // nothing else. The program never stands beside it: four rows reading
     // `opencode` identify nothing, and the tab below already says what runs
     // where. Static: the dot carries the state so the name keeps the row.
+    //
+    // A session longer than the row ends in an ellipsis rather than a hard
+    // cut, and only then: a session that fits keeps today's bytes exactly.
+    // The name resolves first and the column cut runs after, so an id that
+    // already ends in `…` never grows a second one.
     let session = session_name(agent);
+    // The room the name may take: the dot and its two spaces never shrink,
+    // and a width below the prefix saturates rather than panics (public
+    // callers may pass anything; the live path only ever sends pulled
+    // widths at or above `SIDEBAR_MIN`).
+    let session = shorten_middle(&session, width.saturating_sub(3));
     let fresh = is_new(agent, focused, seen, unseen);
     // A derived idle-after-work keeps the done sage: it is news, not calm.
     let dot = if fresh {
@@ -727,38 +762,24 @@ fn push_agent_lines(
     } else {
         dot
     };
-    // The vendor sigil: one ASCII letter for the canonical program, in the
-    // quiet role beside the dot. Its value is exactly the case a chosen tab
-    // name hides the program, and the second row already names it otherwise.
-    // Wrapper rows and unknown programs keep the dot alone: a letter that
-    // needs explaining is worse than none.
-    let sigil = match (&agent.program, &agent.behind) {
-        (Some(program), None) => qoro_domain::program::sigil(program),
-        _ => None,
-    };
-    let (first_text, first_accent) = match sigil {
-        Some(letter) => (
-            fit(&format!(" {} {letter} {session}", dot_glyph(dot_role))),
-            Some((SIGIL_AT, SIGIL_LEN, crate::theme::Role::Faint)),
-        ),
-        None => (fit(&format!(" {} {session}", dot_glyph(dot_role))), None),
-    };
     out.push((
         Line {
-            text: first_text,
+            text: fit(&format!(" {} {session}", dot_glyph(dot_role)), width),
             colour: first_colour,
             // The space lives on the second row now, so the first row carries
             // no space accent: the keyboard's row is the raised background.
-            accent: first_accent,
+            accent: None,
             indicator: Some((DOT_AT, DOT_LEN, dot_role)),
         },
         hit,
     ));
     // Where it lives, underneath: the space and then the tab, in the quiet
     // colour, so the first row keeps the eye and the second keeps the place.
-    // A space the client has not heard of yet still draws, under the tab
-    // alone, rather than vanishing until the index catches up. The space keeps
-    // its colour here, so it still wears one colour in both panels.
+    // The space name starts where the first row's text starts, one column in
+    // from the dot's own indent. A space the client has not heard of yet
+    // still draws, under the tab alone, rather than vanishing until the
+    // index catches up. The space keeps its colour here, so it still wears
+    // one colour in both panels.
     //
     // When the terminal sits in a directory the space name does not already
     // say, the directory's own basename joins the row between them: the
@@ -768,7 +789,7 @@ fn push_agent_lines(
     let place_middle: Option<String> = space.as_ref().and_then(|space| {
         let base = cwd_basename(agent.cwd.as_deref())?;
         (!base.eq_ignore_ascii_case(&space.name))
-            .then(|| middle_room(&space.name, &tab))
+            .then(|| middle_room(&space.name, &tab, width))
             .flatten()
             .map(|room| shorten_middle(&base, room))
     });
@@ -776,7 +797,7 @@ fn push_agent_lines(
         (Some(space), Some(base)) => (
             format!("{} - {base} - {tab}", space.name),
             Some((
-                2,
+                3,
                 crate::width::width(&space.name),
                 crate::theme::space_of(agent.workspace),
             )),
@@ -784,7 +805,7 @@ fn push_agent_lines(
         (Some(space), None) => (
             format!("{} - {tab}", space.name),
             Some((
-                2,
+                3,
                 crate::width::width(&space.name),
                 crate::theme::space_of(agent.workspace),
             )),
@@ -793,7 +814,7 @@ fn push_agent_lines(
     };
     out.push((
         Line {
-            text: fit_to(&format!("  {place}"), WIDTH),
+            text: fit_to(&format!("   {place}"), width),
             colour: Some(crate::theme::Role::Faint),
             accent: place_accent,
             indicator: None,
@@ -823,12 +844,6 @@ fn session_name(agent: &AgentRow) -> String {
     }
 }
 
-/// Columns the vendor sigil sits at on an agent's first row: after the dot
-/// and its space. One ASCII letter, one column, in the quiet role.
-const SIGIL_AT: usize = 3;
-/// Columns the vendor sigil covers: one letter, one column.
-const SIGIL_LEN: usize = 1;
-
 /// The directory a terminal is in, as its own basename.
 ///
 /// Trailing slashes are not a name, the root has none, and blank is not a
@@ -847,10 +862,10 @@ fn cwd_basename(cwd: Option<&str>) -> Option<String> {
 /// Columns left for the middle of `space - middle - tab` once the parts that
 /// are never cut are paid for, or `None` when even the shortest middle costs
 /// more room than the row has.
-fn middle_room(space: &str, tab: &str) -> Option<usize> {
-    // Two leading spaces and two ` - ` separators around the three names.
-    let fixed = 2 + crate::width::width(space) + 3 + 3 + crate::width::width(tab);
-    let room = WIDTH.checked_sub(fixed)?;
+fn middle_room(space: &str, tab: &str, width: usize) -> Option<usize> {
+    // Three leading spaces and two ` - ` separators around the three names.
+    let fixed = 3 + crate::width::width(space) + 3 + 3 + crate::width::width(tab);
+    let room = width.checked_sub(fixed)?;
     // A middle narrower than an ellipsis and one letter explains nothing;
     // the row without it says more.
     (room >= 2).then_some(room)
@@ -905,7 +920,7 @@ fn short_session(session: Option<&str>) -> Option<String> {
 /// keyboard's own rows: the text alone cannot say which row is selected.
 ///
 /// Eight arguments, like [`render_folded`]: same pieces, same reason, plus
-/// the paint-time clock: ten in total.
+/// the paint-time clock and the live width: twelve in total.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rows_folded(
     spaces: &[WorkspaceRow],
@@ -918,6 +933,7 @@ pub(crate) fn rows_folded(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
@@ -933,10 +949,11 @@ pub(crate) fn rows_folded(
         seen,
         unseen,
         now_unix,
+        width,
     );
     // The mark that folds the column away, at its foot, where the eye lands last.
     if let Some(last) = out.last_mut() {
-        *last = collapse_row(false);
+        *last = collapse_row(false, width);
     }
     out
 }
@@ -1010,7 +1027,7 @@ pub(crate) fn rows_collapsed(
         ));
     }
     if out.len() < height {
-        out.push(collapse_row(true));
+        out.push(collapse_row(true, COLLAPSED));
     }
     out.truncate(height);
     out
@@ -1037,8 +1054,8 @@ fn strip_space(n: usize) -> String {
 }
 
 /// The row that folds the column away, and unfolds it again.
-fn collapse_row(collapsed: bool) -> (Line, Option<Hit>) {
-    let width = if collapsed { COLLAPSED } else { WIDTH };
+fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
+    let width = if collapsed { COLLAPSED } else { width };
     let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
     if collapsed {
         return (
@@ -1112,6 +1129,7 @@ fn rows_open(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) -> Vec<(Line, Option<Hit>)> {
     // What the lower panel wants, asked before the column is divided. The division is a
     // place and not a consequence of how many spaces there happen to be, but a panel that
@@ -1125,12 +1143,13 @@ fn rows_open(
         seen,
         unseen,
         now_unix,
+        width,
     );
     let split = spaces_rows(spaces.len(), height, content.len() + 1);
-    let mut out = spaces_panel(spaces, focused_space, split);
+    let mut out = spaces_panel(spaces, focused_space, split, width);
     let rest = height - split;
     if rest >= 2 {
-        out.push(divider());
+        out.push(divider(width));
         out.extend(lay_out_agents(
             content,
             shown,
@@ -1138,6 +1157,7 @@ fn rows_open(
             focused_terminal,
             rest - 1,
             view,
+            width,
         ));
     } else {
         out.extend(lay_out_agents(
@@ -1147,6 +1167,7 @@ fn rows_open(
             focused_terminal,
             rest,
             view,
+            width,
         ));
     }
     out
@@ -1167,6 +1188,7 @@ fn agents_content(
     seen: &Seen,
     unseen: &Unseen,
     now_unix: i64,
+    width: usize,
 ) -> (Vec<(Line, Option<Hit>)>, usize, usize) {
     let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
     if listed.is_empty() {
@@ -1174,7 +1196,7 @@ fn agents_content(
         return (
             vec![(
                 Line {
-                    text: fit(" no agents yet"),
+                    text: fit(" no agents yet", width),
                     colour: Some(crate::theme::Role::Faint),
                     accent: None,
                     indicator: None,
@@ -1218,6 +1240,7 @@ fn agents_content(
                 seen,
                 unseen,
                 now_unix,
+                width,
             );
         }
         return (content, ordered.len(), listed.len());
@@ -1236,12 +1259,14 @@ fn agents_content(
             seen,
             unseen,
             now_unix,
+            width,
         );
     }
     (content, listed.len(), listed.len())
 }
 
 /// One built agents panel, scrolled and padded into the rows it was given.
+#[allow(clippy::too_many_arguments)]
 fn lay_out_agents(
     content: Vec<(Line, Option<Hit>)>,
     shown: usize,
@@ -1249,14 +1274,15 @@ fn lay_out_agents(
     focused: u32,
     height: usize,
     view: View,
+    width: usize,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
     }
-    let mut out = vec![(agents_title(view, shown, total), None)];
+    let mut out = vec![(agents_title(view, shown, total, width), None)];
     // One breath between the title and the rows: the header is a switch now,
     // and the gap keeps the first agent from reading as part of it.
-    out.push(blank());
+    out.push(blank(width));
     let body = height.saturating_sub(2);
     if body == 0 {
         out.truncate(height);
@@ -1276,7 +1302,7 @@ fn lay_out_agents(
     for offset in 0..body {
         match content.get(first + offset) {
             Some(row) => out.push(row.clone()),
-            None => out.push(blank()),
+            None => out.push(blank(width)),
         }
     }
     out.truncate(height);
@@ -1290,7 +1316,7 @@ fn lay_out_agents(
 /// the window, so a clipped panel still says how much of itself is hidden.
 /// (`shown` always equals `total` today: every listed agent draws. The branch
 /// stays for the day one does not.)
-fn agents_title(view: View, shown: usize, total: usize) -> Line {
+fn agents_title(view: View, shown: usize, total: usize, width: usize) -> Line {
     let mode = title_mode(view);
     let left = if shown == total {
         format!(" {AGENTS_TITLE}")
@@ -1299,7 +1325,7 @@ fn agents_title(view: View, shown: usize, total: usize) -> Line {
     };
     let text = format!(
         "{}{mode}",
-        fit_to(&left, WIDTH.saturating_sub(mode.len() + 1)),
+        fit_to(&left, width.saturating_sub(mode.len() + 1)),
     );
     Line {
         text: format!("{text} "),
@@ -1322,9 +1348,9 @@ fn title_mode(view: View) -> &'static str {
 /// Only the `grouped`/`priority` corner word flips the view: it sits at the
 /// right edge, ahead of the trailing space, both words plain ASCII. A click on
 /// the `agents` word itself is a click on nothing.
-pub fn agents_title_hit(view: View, col: usize) -> Option<Hit> {
+pub fn agents_title_hit(view: View, col: usize, width: usize) -> Option<Hit> {
     let mode = title_mode(view);
-    (col + 1 >= WIDTH.saturating_sub(mode.len())).then_some(Hit::View)
+    (col + 1 >= width.saturating_sub(mode.len())).then_some(Hit::View)
 }
 
 /// What to call the program in the terminal.
@@ -1370,9 +1396,9 @@ fn scrolled(len: usize, focused: Option<usize>, window: usize) -> usize {
 /// rather than the halves of the column: a click on the empty rest is a click
 /// on nothing. The `new` half is gone: the tab bar and the spaces title both
 /// carry their own `+` already.
-fn footer_row() -> (Line, Option<Hit>) {
+fn footer_row(width: usize) -> (Line, Option<Hit>) {
     let right = format!("{MENU_LABEL} ");
-    let gap = WIDTH.saturating_sub(crate::width::width(&right));
+    let gap = width.saturating_sub(crate::width::width(&right));
     (
         Line {
             text: format!("{}{right}", " ".repeat(gap)),
@@ -1390,13 +1416,13 @@ fn footer_row() -> (Line, Option<Hit>) {
 /// Only the `+` cell itself, the last cell of the row: the rule column beside
 /// it and the word beside that are nothing, the way the footer's halves are
 /// exact cells rather than a whole row.
-pub fn spaces_title_hit(col: usize) -> Option<Hit> {
-    (col == WIDTH).then_some(Hit::NewSpace)
+pub fn spaces_title_hit(col: usize, width: usize) -> Option<Hit> {
+    (col == width).then_some(Hit::NewSpace)
 }
 
 /// What a click at one column of the footer row means.
-pub fn footer_hit(col: usize) -> Option<Hit> {
-    if col + 1 >= WIDTH.saturating_sub(crate::width::width(MENU_LABEL)) {
+pub fn footer_hit(col: usize, width: usize) -> Option<Hit> {
+    if col + 1 >= width.saturating_sub(crate::width::width(MENU_LABEL)) {
         return Some(Hit::Menu);
     }
     None
@@ -1405,9 +1431,9 @@ pub fn footer_hit(col: usize) -> Option<Hit> {
 const MENU_LABEL: &str = "menu";
 
 /// A panel title, which is a row like any other and therefore the full width.
-fn title(text: &str) -> Line {
+fn title(text: &str, width: usize) -> Line {
     Line {
-        text: fit(&format!(" {text}")),
+        text: fit(&format!(" {text}"), width),
         colour: Some(crate::theme::Role::Title),
         accent: None,
         indicator: None,
@@ -1420,9 +1446,12 @@ fn title(text: &str) -> Line {
 /// click on the word `spaces` is a no-op rather than a space nobody asked
 /// for. The caller asks again with the column, the way the footer's
 /// `new`/`menu` halves do.
-fn spaces_title() -> Line {
+fn spaces_title(width: usize) -> Line {
     Line {
-        text: format!("{}+", fit_to(&format!(" {SPACES_TITLE}"), WIDTH - 1)),
+        text: format!(
+            "{}+",
+            fit_to(&format!(" {SPACES_TITLE}"), width.saturating_sub(1))
+        ),
         colour: Some(crate::theme::Role::Title),
         accent: None,
         indicator: None,
@@ -1432,10 +1461,10 @@ fn spaces_title() -> Line {
 /// The rule between the spaces panel and the agents panel: one row of box
 /// drawing, clickable as nothing, so a click on it does nothing rather than
 /// something arbitrary.
-fn divider() -> (Line, Option<Hit>) {
+fn divider(width: usize) -> (Line, Option<Hit>) {
     (
         Line {
-            text: "\u{2500}".repeat(WIDTH),
+            text: "\u{2500}".repeat(width),
             colour: Some(crate::theme::Role::Rule),
             accent: None,
             indicator: None,
@@ -1445,10 +1474,10 @@ fn divider() -> (Line, Option<Hit>) {
 }
 
 /// A row with nothing on it, and nothing to do when it is clicked.
-fn blank() -> (Line, Option<Hit>) {
+fn blank(width: usize) -> (Line, Option<Hit>) {
     (
         Line {
-            text: " ".repeat(WIDTH),
+            text: " ".repeat(width),
             colour: None,
             accent: None,
             indicator: None,
@@ -1457,9 +1486,9 @@ fn blank() -> (Line, Option<Hit>) {
     )
 }
 
-/// Cut or pad to exactly [`WIDTH`] columns.
-fn fit(text: &str) -> String {
-    fit_to(text, WIDTH)
+/// Cut or pad to exactly `width` columns.
+fn fit(text: &str, width: usize) -> String {
+    fit_to(text, width)
 }
 
 /// Cut or pad to exactly `cols` columns.
@@ -1611,6 +1640,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<&str> = lines.iter().map(|l| l.text.trim_end()).collect();
         // The spaces title carries its `+` at the right corner; the agents
@@ -1651,7 +1681,7 @@ mod tests {
         // tab and space on the second. The first row answers "what", the
         // second "where".
         assert!(
-            texts.iter().any(|t| t.starts_with(" \u{25cf} X codex")),
+            texts.iter().any(|t| t.starts_with(" \u{25cf} codex")),
             "{texts:?}"
         );
         // And hits still know which rows have the keyboard.
@@ -1672,18 +1702,18 @@ mod tests {
             .collect();
         let head = texts
             .iter()
-            .position(|t| t.starts_with(" \u{25cf} C claude"))
+            .position(|t| t.starts_with(" \u{25cf} claude"))
             .unwrap_or_else(|| panic!("{texts:?}"));
         // Two rows, and together they carry everything: the session behind
         // the state dot, and the tab and space underneath. No state word on
         // the right: the dot at the start says the state in its colour.
-        assert_eq!(texts[head], " \u{25cf} C claude", "{texts:?}");
-        assert_eq!(texts[head + 1], "  app - claude");
+        assert_eq!(texts[head], " \u{25cf} claude", "{texts:?}");
+        assert_eq!(texts[head + 1], "   app - claude");
         // And the dot wears the working colour.
         assert_eq!(
             lines
                 .iter()
-                .find(|l| l.text.trim_end() == " \u{25cf} C claude")
+                .find(|l| l.text.trim_end() == " \u{25cf} claude")
                 .and_then(|l| l.indicator),
             Some((DOT_AT, DOT_LEN, crate::theme::of("working")))
         );
@@ -1803,9 +1833,8 @@ mod tests {
                     Some(Hit::Space(s.id))
                 } else {
                     // Everything left is one agent's two rows: the first names
-                    // the session behind the state dot and the vendor sigil,
-                    // the second the tab and the space under it. Both reach
-                    // the same terminal.
+                    // the session behind the state dot, the second the tab
+                    // and the space under it. Both reach the same terminal.
                     // Either dot glyph opens the first row: the circle for every
                     // state but failed, the diamond for failed.
                     agents
@@ -1816,14 +1845,7 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            let letter: String = match (&a.program, &a.behind) {
-                                (Some(p), None) => qoro_domain::program::sigil(p)
-                                    .map(|s| format!("{s} "))
-                                    .unwrap_or_default(),
-                                _ => String::new(),
-                            };
-                            let first =
-                                |glyph: char| format!(" {glyph} {letter}{}", session_name(a));
+                            let first = |glyph: char| format!(" {glyph} {}", session_name(a));
                             let place = if space.is_empty() {
                                 label(a)
                             } else {
@@ -1831,8 +1853,8 @@ mod tests {
                             };
                             text.starts_with(&first(DOT))
                                 || text.starts_with(&first(FAILED_DOT))
-                                || (text.starts_with("  ")
-                                    && text.trim_end() == format!("  {place}"))
+                                || (text.starts_with("   ")
+                                    && text.trim_end() == format!("   {place}"))
                         })
                         .map(|a| Hit::Terminal(a.terminal))
                 };
@@ -1855,9 +1877,7 @@ mod tests {
         let agents = vec![agent(4, 77, "codex", "blocked")];
         let lines = render(&[], &agents, 1, 4, 8);
         assert!(
-            lines
-                .iter()
-                .any(|l| l.text.starts_with(" \u{25cf} X codex")),
+            lines.iter().any(|l| l.text.starts_with(" \u{25cf} codex")),
             "{:?}",
             lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
@@ -1929,7 +1949,7 @@ mod tests {
             "{texts:?}"
         );
         // And the second row still says where the tab lives.
-        assert!(texts.iter().any(|t| *t == "  app - claude"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "   app - claude"), "{texts:?}");
     }
 
     /// A chosen name picked twice in two spaces is still two pairs that cannot
@@ -1951,16 +1971,10 @@ mod tests {
             "{texts:?}"
         );
         // Without a reported session the first row falls back to the tab's
-        // own label, so both first rows read the chosen name behind the dot,
-        // each with its vendor's sigil beside it.
+        // own label, so both first rows read the chosen name behind the dot.
         assert_eq!(
-            texts.iter().filter(|t| *t == " \u{25cf} O release").count(),
-            1,
-            "{texts:?}"
-        );
-        assert_eq!(
-            texts.iter().filter(|t| *t == " \u{25cf} C release").count(),
-            1,
+            texts.iter().filter(|t| *t == " \u{25cf} release").count(),
+            2,
             "{texts:?}"
         );
     }
@@ -2009,17 +2023,14 @@ mod tests {
         a.name = Some("release".to_string());
         a.agent_session = Some("abc123".to_string());
         let texts = agent_texts(&spaces, &[a], 1);
-        // The first row is the session id behind the dot and the sigil: no program beside
+        // The first row is the session id behind the dot: no program beside
         // it, so four live sessions never all read `opencode`.
-        assert!(
-            texts.iter().any(|t| *t == " \u{25cf} O abc123"),
-            "{texts:?}"
-        );
+        assert!(texts.iter().any(|t| *t == " \u{25cf} abc123"), "{texts:?}");
         assert!(
             !texts.iter().any(|t| t.contains("opencode")),
             "the program leaked onto a reported session row: {texts:?}"
         );
-        assert!(texts.iter().any(|t| *t == "  app - release"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "   app - release"), "{texts:?}");
     }
 
     #[test]
@@ -2065,10 +2076,9 @@ mod tests {
     fn without_a_session_the_first_row_falls_back_to_the_tab() {
         let spaces = vec![space(1, "app")];
         let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
-        // No reported session, so the tab's own label answers behind the dot
-        // and the sigil.
-        assert!(texts.iter().any(|t| *t == " \u{25cf} X codex"), "{texts:?}");
-        assert!(texts.iter().any(|t| *t == "  app - codex"), "{texts:?}");
+        // No reported session, so the tab's own label answers behind the dot.
+        assert!(texts.iter().any(|t| *t == " \u{25cf} codex"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "   app - codex"), "{texts:?}");
     }
 
     #[test]
@@ -2167,7 +2177,7 @@ mod tests {
             .find(|l| l.indicator.is_some())
             .unwrap_or_else(|| panic!("no agent row"));
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        assert_eq!(row.text.trim_end(), " \u{25cf} C claude", "{:?}", row.text);
+        assert_eq!(row.text.trim_end(), " \u{25cf} claude", "{:?}", row.text);
         assert!(!row.text.contains('z'));
     }
 
@@ -2205,6 +2215,7 @@ mod tests {
             &seen,
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2279,6 +2290,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = folded
             .iter()
@@ -2291,7 +2303,7 @@ mod tests {
     }
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_name_and_the_version() {
-        let (line, hit) = collapse_row(false);
+        let (line, hit) = collapse_row(false, WIDTH);
         assert_eq!(
             crate::width::width(&line.text),
             WIDTH,
@@ -2318,7 +2330,7 @@ mod tests {
         assert_eq!(painted, format!("{BRAND_MARK} {BRAND}"), "{:?}", line.text);
 
         // Folded to a strip there is no room for a name, and the fold mark is the row.
-        let (strip, _) = collapse_row(true);
+        let (strip, _) = collapse_row(true, WIDTH);
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
     }
@@ -2332,7 +2344,7 @@ mod tests {
         // SAFETY: the only reader of this variable in this binary is the row below.
         unsafe { std::env::set_var("QORO_RUNTIME_DIR", base.path()) };
         std::fs::write(base.path().join("update-available"), "9.9.9\n").expect("notice");
-        let (line, _) = collapse_row(false);
+        let (line, _) = collapse_row(false, WIDTH);
         assert!(
             line.text.contains("9.9.9"),
             "the waiting release has to be readable off the screen: {:?}",
@@ -2345,7 +2357,7 @@ mod tests {
             line.text
         );
         std::fs::remove_file(base.path().join("update-available")).expect("cleanup");
-        let (plain, _) = collapse_row(false);
+        let (plain, _) = collapse_row(false, WIDTH);
         assert!(
             !plain.text.contains('>'),
             "no notice is the row it always was: {:?}",
@@ -2408,6 +2420,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2434,6 +2447,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -2479,6 +2493,7 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
+                WIDTH,
             )
         };
         let zero: Vec<Line> = at(0).iter().map(|(l, _)| l.clone()).collect();
@@ -2555,6 +2570,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         assert!(
             folded.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
@@ -2575,6 +2591,7 @@ mod tests {
             &Seen::new(),
             &unseen,
             NOW,
+            WIDTH,
         );
         assert!(
             fresh_lines.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
@@ -2633,6 +2650,7 @@ mod tests {
             &Seen::new(),
             &unseen,
             NOW,
+            WIDTH,
         );
         let row = lines
             .iter()
@@ -2686,6 +2704,7 @@ mod tests {
                     &Seen::new(),
                     &Unseen::new(),
                     NOW,
+                    WIDTH,
                 );
                 let terminals: Vec<u32> = rows
                     .iter()
@@ -2714,13 +2733,17 @@ mod tests {
     fn only_the_mode_word_of_the_agents_title_flips_the_view() {
         for view in [View::Grouped, View::Priority] {
             assert_eq!(
-                agents_title_hit(view, 0),
+                agents_title_hit(view, 0, WIDTH),
                 None,
                 "the agents word is nothing"
             );
-            assert_eq!(agents_title_hit(view, 5), None, "mid title is nothing");
             assert_eq!(
-                agents_title_hit(view, WIDTH - 1),
+                agents_title_hit(view, 5, WIDTH),
+                None,
+                "mid title is nothing"
+            );
+            assert_eq!(
+                agents_title_hit(view, WIDTH - 1, WIDTH),
                 Some(Hit::View),
                 "the mode corner flips"
             );
@@ -2740,8 +2763,9 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
-        let laid = lay_out_agents(content, shown, total, 1, 10, View::Grouped);
+        let laid = lay_out_agents(content, shown, total, 1, 10, View::Grouped, WIDTH);
         assert!(
             laid[0].0.text.starts_with(" agents"),
             "{:?}",
@@ -2768,6 +2792,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2800,6 +2825,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2817,13 +2843,14 @@ mod tests {
                 View::Grouped,
                 &Seen::new(),
                 &Unseen::new(),
-                NOW
+                NOW,
+                WIDTH
             ),
             None,
             "the title row must not open a space: {texts:?}"
         );
-        assert_eq!(spaces_title_hit(5), None);
-        assert_eq!(spaces_title_hit(WIDTH), Some(Hit::NewSpace));
+        assert_eq!(spaces_title_hit(5, WIDTH), None);
+        assert_eq!(spaces_title_hit(WIDTH, WIDTH), Some(Hit::NewSpace));
     }
 
     /// The keyboard's rows are always drawn: nothing folds them away, so a
@@ -2845,6 +2872,7 @@ mod tests {
                         &Seen::new(),
                         &Unseen::new(),
                         NOW,
+                        WIDTH,
                     )
                 })
                 .filter_map(|hit| match hit {
@@ -2877,6 +2905,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2902,6 +2931,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -2943,6 +2973,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let order: Vec<String> = priority
             .iter()
@@ -2971,7 +3002,7 @@ mod tests {
         assert_eq!(stale_second.colour, Some(crate::theme::Role::Faint));
         assert_eq!(
             stale_second.accent,
-            Some((2, crate::width::width("app"), crate::theme::space_of(1))),
+            Some((3, crate::width::width("app"), crate::theme::space_of(1))),
             "the space accent never dims with the state"
         );
         // Dim is roles only: the stale row's texts read exactly as its
@@ -2991,6 +3022,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let twin_claude: Vec<String> = twins
             .iter()
@@ -3015,6 +3047,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let gorder: Vec<String> = grouped
             .iter()
@@ -3050,6 +3083,7 @@ mod tests {
             &Seen::new(),
             &unseen,
             NOW,
+            WIDTH,
         );
         assert!(
             lines
@@ -3095,6 +3129,7 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 now,
+                WIDTH,
             )
         };
         assert_eq!(paint(0), paint(NOW));
@@ -3134,6 +3169,7 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 now,
+                WIDTH,
             )
         };
         let before = paint(NOW);
@@ -3207,6 +3243,7 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
+                WIDTH,
             )
             .into_iter()
             .filter_map(|(_, hit)| match hit {
@@ -3258,6 +3295,7 @@ mod tests {
             &seen,
             &Unseen::new(),
             NOW,
+            WIDTH,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3300,6 +3338,7 @@ mod tests {
             &Seen::new(),
             &unseen,
             NOW,
+            WIDTH,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3336,6 +3375,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3353,6 +3393,75 @@ mod tests {
         )
         .0;
         assert_eq!(order, vec![2, 1], "equal stamps keep daemon order");
+    }
+
+    /// A session longer than the row ends in an ellipsis rather than a hard
+    /// cut, and only then: a fitting session keeps today's bytes exactly,
+    /// wide titles never split, and the row still measures thirty columns.
+    #[test]
+    fn a_long_session_ends_in_an_ellipsis() {
+        let spaces = vec![space(1, "app")];
+        let fitting = agent(1, 1, "claude", "working");
+        let long_title = "Implement OAuth scopes and refresh the dispatcher";
+        let mut long = agent(2, 1, "claude", "working");
+        long.agent_title = Some(long_title.into());
+        let mut wide = agent(3, 1, "claude", "working");
+        wide.agent_title = Some("程程程程程程程程程程程程程程程".into());
+        let lines = render_folded(
+            &spaces,
+            &[fitting, long, wide],
+            1,
+            9,
+            20,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+        );
+        let firsts: Vec<String> = lines
+            .iter()
+            .filter(|l| l.indicator.is_some())
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(firsts.len(), 3);
+        for first in &firsts {
+            assert_eq!(crate::width::width(first), WIDTH, "{first:?}");
+            assert!(!first.contains('\u{fffd}'));
+        }
+        // Fitting session: today's bytes, no ellipsis.
+        assert_eq!(firsts[0].trim_end(), " \u{25cf} claude");
+        // Cut sessions: the dot and the ellipsis frame the text.
+        assert!(firsts[1].trim_end().ends_with('…'), "{:?}", firsts[1]);
+        assert!(
+            firsts[1].starts_with(" \u{25cf} Implement"),
+            "{:?}",
+            firsts[1]
+        );
+        assert!(firsts[2].trim_end().ends_with('…'), "{:?}", firsts[2]);
+        // A session that already ends in an ellipsis is cut once, not twice.
+        let mut dotty = agent(4, 1, "claude", "working");
+        dotty.agent_session = Some("abcdefghijklmnop…".into());
+        let lines = render_folded(
+            &spaces,
+            &[dotty],
+            1,
+            9,
+            20,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+        );
+        let first = lines
+            .iter()
+            .find(|l| l.indicator.is_some())
+            .expect("a dot row");
+        assert_eq!(first.text.chars().filter(|c| *c == '…').count(), 1);
+        assert_eq!(crate::width::width(&first.text), WIDTH);
     }
 
     /// G4: the place row shows the worktree basename when the space name
@@ -3374,42 +3483,46 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
+                WIDTH,
             )
             .into_iter()
             .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("  ") && t.contains(" - "))
+            .find(|t| t.starts_with("   ") && t.contains(" - "))
             .expect("a place row")
         }
         // Different: space, worktree, tab.
         assert_eq!(
             second_row("app", Some("/home/u/app-feat-x"), "claude"),
-            "  app - app-feat-x - claude"
+            "   app - app-feat-x - claude"
         );
         // Trailing slash is not a name.
         assert_eq!(
             second_row("app", Some("/home/u/app-feat-x/"), "claude"),
-            "  app - app-feat-x - claude"
+            "   app - app-feat-x - claude"
         );
         // Same name in any case: today's row.
         assert_eq!(
             second_row("app", Some("/home/u/app"), "claude"),
-            "  app - claude"
+            "   app - claude"
         );
         assert_eq!(
             second_row("app", Some("/home/u/app"), "claude"),
-            "  app - claude"
+            "   app - claude"
         );
         // Root, empty, blank: no basename, today's row.
-        assert_eq!(second_row("app", Some("/"), "claude"), "  app - claude");
-        assert_eq!(second_row("app", Some(""), "claude"), "  app - claude");
-        assert_eq!(second_row("app", Some("   "), "claude"), "  app - claude");
+        assert_eq!(second_row("app", Some("/"), "claude"), "   app - claude");
+        assert_eq!(second_row("app", Some(""), "claude"), "   app - claude");
+        assert_eq!(second_row("app", Some("   "), "claude"), "   app - claude");
         // No cwd at all: today's row.
-        assert_eq!(second_row("app", None, "claude"), "  app - claude");
+        assert_eq!(second_row("app", None, "claude"), "   app - claude");
         // A tilde and dots are names and pass through untouched.
-        assert_eq!(second_row("app", Some("~"), "claude"), "  app - ~ - claude");
+        assert_eq!(
+            second_row("app", Some("~"), "claude"),
+            "   app - ~ - claude"
+        );
         assert_eq!(
             second_row("app", Some("/home/u/."), "claude"),
-            "  app - . - claude"
+            "   app - . - claude"
         );
     }
 
@@ -3434,13 +3547,14 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let seconds: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
-            .filter(|t| t.starts_with("  ") && t.contains(" - "))
+            .filter(|t| t.starts_with("   ") && t.contains(" - "))
             .collect();
-        assert_eq!(seconds, vec!["  app - x - claude", "  dub - x - codex"]);
+        assert_eq!(seconds, vec!["   app - x - claude", "   dub - x - codex"]);
     }
 
     /// G4: a long middle shortens tail-first with an ellipsis while the space
@@ -3462,13 +3576,14 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let second = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("  ") && t.contains(" - "))
+            .find(|t| t.starts_with("   ") && t.contains(" - "))
             .expect("a place row");
-        assert!(second.starts_with("  app - "), "{second:?}");
+        assert!(second.starts_with("   app - "), "{second:?}");
         assert!(second.ends_with(" - claude"), "{second:?}");
         assert!(second.contains('…'), "{second:?}");
         assert_eq!(crate::width::width(&second), WIDTH);
@@ -3487,11 +3602,12 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let second = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("  ") && t.contains(" - "))
+            .find(|t| t.starts_with("   ") && t.contains(" - "))
             .expect("a place row");
         assert!(!second.contains("somewhere"), "{second:?}");
     }
@@ -3514,19 +3630,26 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let second = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("  ") && t.contains(" - "))
+            .find(|t| t.starts_with("   ") && t.contains(" - "))
             .expect("a place row");
-        // Room is thirteen columns: six wide letters and the ellipsis.
-        assert_eq!(second, "  app - 程程程程程程… - claude", "{second:?}");
-        assert_eq!(crate::width::width(&second), WIDTH);
+        // Room is twelve columns: five wide letters and the ellipsis, plus
+        // the pad column `fit_to` adds to reach thirty.
+        assert_eq!(second, "   app - 程程程程程… - claude", "{second:?}");
+        assert_eq!(crate::width::width(&second), WIDTH - 1);
+        let raw = lines
+            .iter()
+            .find(|l| l.text.trim_end().starts_with("   ") && l.text.contains(" - "))
+            .expect("a raw place row");
+        assert_eq!(crate::width::width(&raw.text), WIDTH);
         assert!(!second.contains('\u{fffd}'));
     }
 
-    /// G5/G13: sigils, worktree middles, wide names and long names all still
+    /// G5/G13: worktree middles, wide names and long names all still
     /// measure exactly thirty columns, and accents never leave the space name.
     #[test]
     fn every_decorated_row_still_measures_thirty_columns() {
@@ -3554,6 +3677,7 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         for line in &lines {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
@@ -3583,18 +3707,19 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         for line in &lines {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
     }
 
-    /// G7: known programs wear their sigil in the quiet role, wrapper rows
-    /// and unknown programs keep the dot alone with today's bytes.
+    /// Wrapper rows and unknown programs keep the dot alone: the wrapper
+    /// reads as what stands in its way, the unknown program under its own
+    /// name, neither with an accent on the first row.
     #[test]
-    fn vendor_sigils_mark_known_programs_only() {
+    fn wrapper_and_unknown_rows_keep_the_dot_alone() {
         let spaces = vec![space(1, "app")];
-        let known = agent(1, 1, "claude", "working");
         let mut wrapper = agent(2, 1, "sh", "working");
         wrapper.program = None;
         wrapper.behind = Some("docker".into());
@@ -3602,7 +3727,7 @@ mod tests {
         strange.program = Some("Muse".into());
         let lines = render_folded(
             &spaces,
-            &[known, wrapper, strange],
+            &[wrapper, strange],
             1,
             9,
             30,
@@ -3611,40 +3736,29 @@ mod tests {
             &Seen::new(),
             &Unseen::new(),
             NOW,
+            WIDTH,
         );
         let firsts: Vec<&Line> = lines.iter().filter(|l| l.indicator.is_some()).collect();
-        assert_eq!(firsts.len(), 3);
-        assert_eq!(
-            firsts[0].accent,
-            Some((SIGIL_AT, SIGIL_LEN, crate::theme::Role::Faint))
-        );
+        assert_eq!(firsts.len(), 2);
+        for bare in &firsts {
+            assert_eq!(bare.accent, None, "{:?}", bare.text);
+        }
         assert!(
-            firsts[0].text.starts_with(" \u{25cf} C "),
+            firsts[0].text.starts_with(" \u{25cf} behind docker"),
             "{:?}",
             firsts[0].text
         );
-        for bare in &firsts[1..] {
-            assert_eq!(bare.accent, None, "{:?}", bare.text);
-        }
-        // And the bare rows keep today's bytes: the wrapper reads as what
-        // stands in its way, the unknown program under its own name, both
-        // with the dot alone.
         assert!(
-            firsts[1].text.starts_with(" \u{25cf} behind docker"),
+            firsts[1].text.starts_with(" \u{25cf} Muse"),
             "{:?}",
             firsts[1].text
         );
-        assert!(
-            firsts[2].text.starts_with(" \u{25cf} Muse"),
-            "{:?}",
-            firsts[2].text
-        );
     }
 
-    /// G11: the collapsed strip is byte-for-byte what it was: sigils and
-    /// worktrees upstream change nothing in four columns.
+    /// G11: the collapsed strip is byte-for-byte what it was: worktrees
+    /// upstream change nothing in four columns.
     #[test]
-    fn the_collapsed_strip_ignores_sigils_and_worktrees() {
+    fn the_collapsed_strip_ignores_worktrees() {
         let spaces = vec![space(1, "app"), space(2, "dub")];
         let mut a = agent_at(1, 1, "claude", "idle", 10_000);
         a.cwd = Some("/home/u/app-feat-x".into());
@@ -3684,6 +3798,7 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
+                WIDTH,
             );
             // The focused blocked row draws somewhere inside the window.
             assert!(
@@ -3703,9 +3818,99 @@ mod tests {
                         &Seen::new(),
                         &Unseen::new(),
                         NOW,
+                        WIDTH,
                     ),
                     *hit,
                     "hit disagrees with paint at row {row}, height {height}"
+                );
+            }
+        }
+    }
+
+    /// Phase B: the same rows paint at any pulled width and measure exactly
+    /// that, titles and place rows included. The default width reads what it
+    /// always read.
+    #[test]
+    fn the_same_rows_paint_at_any_pulled_width() {
+        let spaces = vec![space(1, "app")];
+        let mut a = agent(1, 1, "claude", "working");
+        a.cwd = Some("/home/u/app-feat-x".into());
+        let mut b = agent(2, 1, "codex", "blocked");
+        b.agent_title = Some("Wire retry budget into dispatcher".into());
+        let agents = vec![a, b];
+        for width in [SIDEBAR_MIN, 22, WIDTH, SIDEBAR_MAX] {
+            let lines = render_folded(
+                &spaces,
+                &agents,
+                1,
+                9,
+                20,
+                0,
+                View::Grouped,
+                &Seen::new(),
+                &Unseen::new(),
+                NOW,
+                width,
+            );
+            for line in &lines {
+                assert_eq!(
+                    crate::width::width(&line.text),
+                    width,
+                    "width {width}: {line:?}"
+                );
+                assert!(!line.text.contains('\u{fffd}'));
+            }
+            // The worktree middle survives at every width; the narrowest
+            // column keeps at least its shortened form.
+            assert!(
+                lines.iter().any(|l| l.text.contains("app")),
+                "width {width}: space name lost"
+            );
+            // Corners and geometry follow the pulled width, not the default.
+            assert_eq!(
+                agents_title_hit(View::Grouped, width, width),
+                Some(Hit::View),
+                "width {width}: mode corner missed"
+            );
+            assert_eq!(
+                spaces_title_hit(width, width),
+                Some(Hit::NewSpace),
+                "width {width}: plus corner missed"
+            );
+            assert_eq!(
+                footer_hit(width - 1, width),
+                Some(Hit::Menu),
+                "width {width}: menu corner missed"
+            );
+        }
+        // Default width reads what the legacy surface always read: every
+        // agent row the legacy panel draws appears verbatim in the live one
+        // (the live panel adds a breath under its title and a fold mark at
+        // its foot, which are chrome, not rows).
+        let live = render_folded(
+            &spaces,
+            &agents,
+            1,
+            9,
+            20,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+        );
+        let legacy = render(&spaces, &agents, 1, 9, 20);
+        for row in &legacy {
+            let text = row.text.trim_end();
+            if text.contains("claude")
+                || text.contains("codex")
+                || text.contains("app -")
+                || text.contains("Wire retry")
+            {
+                assert!(
+                    live.iter().any(|l| l.text == row.text),
+                    "legacy row lost: {text:?}"
                 );
             }
         }

@@ -54,32 +54,6 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["copilot"],
 ];
 
-/// One ASCII letter per known agent, for the sidebar's first row.
-///
-/// Not a logo and deliberately not first letters throughout: C, G and A are
-/// each shared, so the clashes resolve to an unshared letter instead (codex
-/// X, cursor U, copilot P, goose S, grok K, aider E). The input is the
-/// canonical name [`identify`] returns, so aliases never reach here.
-/// `None` for anything outside the canonical set, so the panel never shows
-/// a letter it would have to explain.
-pub fn sigil(canonical: &str) -> Option<char> {
-    match canonical {
-        "aider" => Some('E'),
-        "amp" => Some('A'),
-        "claude" => Some('C'),
-        "codex" => Some('X'),
-        "copilot" => Some('P'),
-        "cursor" => Some('U'),
-        "droid" => Some('D'),
-        "gemini" => Some('G'),
-        "goose" => Some('S'),
-        "grok" => Some('K'),
-        "opencode" => Some('O'),
-        "qwen" => Some('Q'),
-        _ => None,
-    }
-}
-
 /// Flags whose argument is source text rather than a path.
 ///
 /// Everything after one of these is a payload, so the search for a wrapped program stops
@@ -323,22 +297,6 @@ mod tests {
             let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
             assert_eq!(program.name, shown, "{launched} should be shown as {shown}");
             assert!(program.agent);
-        }
-    }
-
-    /// G7: every canonical agent resolves to exactly one sigil, the twelve
-    /// letters are all distinct, and anything else resolves to nothing.
-    #[test]
-    fn every_canonical_agent_has_its_own_sigil() {
-        let mut seen = std::collections::BTreeSet::new();
-        for row in AGENT_ALIASES {
-            let canonical = row[0];
-            let letter = sigil(canonical).unwrap_or_else(|| panic!("{canonical} has no sigil"));
-            assert!(seen.insert(letter), "{canonical} shares its sigil {letter}");
-        }
-        assert_eq!(seen.len(), AGENT_ALIASES.len());
-        for unknown in ["sh", "docker", "node", "", "Claude"] {
-            assert_eq!(sigil(unknown), None, "{unknown} must not resolve");
         }
     }
 

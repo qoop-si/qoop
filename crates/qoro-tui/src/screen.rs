@@ -56,6 +56,11 @@ pub struct Frame<'a> {
     /// Advanced by the run loop while an agent is working, held while none is: a still
     /// panel is a panel with nothing to say, and a ticking one is a repainting one.
     pub tick: u64,
+    /// How wide the open left column paints this frame.
+    ///
+    /// Read once per frame like the clock: every width below derives from
+    /// this, so one paint never disagrees with itself.
+    pub sidebar_width: usize,
     /// Paint-time unix seconds, read once per frame by the run loop.
     ///
     /// What idle tiers and recency order are computed from: one paint never
@@ -117,13 +122,20 @@ pub const STATUS: usize = 2;
 /// second copy of that arithmetic in the caller is how a pane and its child end up
 /// disagreeing about how wide they are.
 pub fn pane_size(cols: u16, lines: u16) -> (u16, u16) {
-    pane_size_for(cols, lines, false, 0)
+    pane_size_for(cols, lines, false, 0, sidebar::WIDTH)
 }
 
-/// The same, for a column that may be folded away to a strip.
-pub fn pane_size_for(cols: u16, lines: u16, collapsed: bool, right: usize) -> (u16, u16) {
+/// The same, for a column that may be folded away to a strip and pulled to
+/// a width.
+pub fn pane_size_for(
+    cols: u16,
+    lines: u16,
+    collapsed: bool,
+    right: usize,
+    sidebar_width: usize,
+) -> (u16, u16) {
     (
-        cols.saturating_sub(left_for(cols, collapsed) as u16)
+        cols.saturating_sub(left_for(cols, collapsed, sidebar_width) as u16)
             .saturating_sub(right as u16)
             .max(1),
         lines.saturating_sub((TABS + STATUS) as u16).max(1),
@@ -133,26 +145,28 @@ pub fn pane_size_for(cols: u16, lines: u16, collapsed: bool, right: usize) -> (u
 /// The columns spent before the pane starts: the left column and the rule beside it, or
 /// nothing at all when the window is too narrow to hold both.
 ///
-/// Dropped rather than squeezed. The left column is a fixed width and the rule is one more,
-/// so a window of twenty three columns or fewer had every row painted wider than the
-/// terminal: each line wrapped, the screen slid up, and every position this module writes
-/// addressed the wrong row, which also puts every click on the wrong thing. Measured at 10,
-/// 20 and 23 columns, all of which painted 24. A narrow window is a real one: two panes
-/// side by side in a tmux split is how it happens.
+/// Dropped rather than squeezed. The column is as wide as the person left
+/// it plus the rule beside it, so a window of twenty three columns or fewer
+/// had every row painted wider than the terminal: each line wrapped, the
+/// screen slid up, and every position this module writes addressed the wrong
+/// row, which also puts every click on the wrong thing. Measured at 10,
+/// 20 and 23 columns, all of which painted 24. A narrow window is a real one:
+/// two panes side by side in a tmux split is how it happens.
 pub fn left(cols: u16) -> usize {
-    left_for(cols, false)
+    left_for(cols, false, sidebar::WIDTH)
 }
 
-/// The same, for a column that may be folded away to a strip.
+/// The same, for a column that may be folded away to a strip, at a pulled
+/// width.
 ///
 /// Folded, it keeps the one thing a glance needs: a state mark and a number per row. The
 /// names come back with the column, and the terminal gets twenty six columns back in the
 /// meantime.
-pub fn left_for(cols: u16, collapsed: bool) -> usize {
+pub fn left_for(cols: u16, collapsed: bool, sidebar_width: usize) -> usize {
     let width = if collapsed {
         sidebar::COLLAPSED
     } else {
-        sidebar::WIDTH
+        sidebar_width
     };
     // One column for the pane, or there is nothing to show and the left column is the whole
     // point of nothing.
@@ -192,7 +206,13 @@ pub(crate) fn at(row: usize, col: usize) -> String {
 /// the legacy arithmetic is byte for byte what it always was. One place, so
 /// the cursor-only fast path cannot drift from the full repaint.
 pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usize, usize)> {
-    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, 0);
+    let (pane_cols, pane_rows) = pane_size_for(
+        frame.cols,
+        frame.lines,
+        frame.collapsed,
+        0,
+        frame.sidebar_width,
+    );
     if frame.tiles.len() < 2 {
         let (row, cell) = snapshot.cursor;
         let col = cursor_column(
@@ -200,7 +220,9 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
             cell,
         );
         let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-        let col = col.min(pane_cols as usize - 1) + left_for(frame.cols, frame.collapsed) + 1;
+        let col = col.min(pane_cols as usize - 1)
+            + left_for(frame.cols, frame.collapsed, frame.sidebar_width)
+            + 1;
         Some((row, col))
     } else {
         let tile = frame.tiles.iter().find(|t| t.focused)?;
@@ -209,7 +231,7 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
             snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
             cell,
         );
-        let pane_left = left_for(frame.cols, frame.collapsed);
+        let pane_left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
         let row = tile.rect.y + row.min(tile.rect.rows.saturating_sub(1)) + 1 + TABS;
         let col = pane_left + tile.rect.x + col.min(tile.rect.cols.saturating_sub(1)) + 1;
         Some((row, col))
@@ -221,9 +243,15 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
 /// Whole, not incremental, so a frame is a pure function a test can read. What actually
 /// reaches the terminal is only the rows that changed: see [`crate::present`].
 pub fn paint(frame: &Frame) -> String {
-    let left = left_for(frame.cols, frame.collapsed);
+    let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
     let right = 0;
-    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, right);
+    let (pane_cols, pane_rows) = pane_size_for(
+        frame.cols,
+        frame.lines,
+        frame.collapsed,
+        right,
+        frame.sidebar_width,
+    );
     let mut out = String::with_capacity(frame.cols as usize * frame.lines as usize + 256);
 
     // Hidden while painting: a cursor walking the screen during a repaint is the flicker
@@ -274,6 +302,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.seen,
             frame.unseen,
             frame.now_unix,
+            frame.sidebar_width,
         )
     } else {
         Vec::new()
@@ -1112,7 +1141,7 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                 if frame.collapsed {
                     sidebar::COLLAPSED
                 } else {
-                    sidebar::WIDTH
+                    frame.sidebar_width
                 },
                 if frame.collapsed { ", folded" } else { "" }
             ),
@@ -1437,9 +1466,15 @@ pub fn paint_focus_list(
 /// left hidden behind it: the list takes no input, and a caret on a
 /// read-only view points at nothing. The next repaint shows it again.
 pub fn paint_focus(frame: &Frame, events: &[FocusEvent], offset: usize, out: &mut String) {
-    let left = left_for(frame.cols, frame.collapsed);
+    let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
     let right = 0;
-    let (pane_cols, pane_rows) = pane_size_for(frame.cols, frame.lines, frame.collapsed, right);
+    let (pane_cols, pane_rows) = pane_size_for(
+        frame.cols,
+        frame.lines,
+        frame.collapsed,
+        right,
+        frame.sidebar_width,
+    );
     let rows = paint_focus_list(events, pane_cols as usize, offset, pane_rows as usize);
     for (i, (text, role)) in rows.iter().enumerate().take(pane_rows as usize) {
         out.push_str(&at(TABS + 1 + i, left + 1));
@@ -1641,6 +1676,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1690,6 +1726,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1740,6 +1777,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1791,6 +1829,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1844,6 +1883,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1888,6 +1928,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1965,6 +2006,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2007,6 +2049,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2057,6 +2100,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2104,6 +2148,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2165,6 +2210,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2226,6 +2272,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2275,6 +2322,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2322,6 +2370,7 @@ mod tests {
                 scroll: 0,
                 tick: 0,
                 now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2370,6 +2419,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2413,6 +2463,7 @@ mod tests {
                 scroll: 0,
                 tick: 0,
                 now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2458,6 +2509,7 @@ mod tests {
                 scroll: 0,
                 tick: 0,
                 now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2521,6 +2573,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2577,6 +2630,7 @@ mod tests {
                 scroll: 0,
                 tick,
                 now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2644,6 +2698,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2729,6 +2784,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2791,6 +2847,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2835,6 +2892,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2876,6 +2934,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2918,6 +2977,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2997,6 +3057,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3073,6 +3134,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3136,6 +3198,7 @@ mod tests {
             &sidebar::Seen::new(),
             &sidebar::Unseen::new(),
             0,
+            sidebar::WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -3183,6 +3246,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3243,6 +3307,7 @@ mod tests {
                 scroll: 0,
                 tick: 0,
                 now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -3292,6 +3357,7 @@ mod tests {
             scroll: 2,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3350,6 +3416,7 @@ mod tests {
             scroll: 0,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3501,6 +3568,7 @@ mod tests {
             tiles,
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3538,6 +3606,7 @@ mod tests {
             tiles: Vec::new(),
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3576,6 +3645,7 @@ mod tests {
             }],
             tick: 0,
             now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3704,9 +3774,16 @@ mod tests {
     #[test]
     fn the_pane_shrinks_from_the_right_exactly_as_it_shrinks_from_the_left() {
         assert_eq!(
-            pane_size_for(120, 24, false, 39),
+            pane_size_for(120, 24, false, 39, sidebar::WIDTH),
             (120 - sidebar::WIDTH as u16 - 1 - 39, 21)
         );
-        assert_eq!(pane_size_for(120, 24, false, 0), pane_size(120, 24));
+        assert_eq!(
+            pane_size_for(120, 24, false, 0, sidebar::WIDTH),
+            pane_size(120, 24)
+        );
+        // Pulled widths move both the rule and the pane with it.
+        assert_eq!(left_for(120, false, 18), 19);
+        assert_eq!(left_for(120, false, 36), 37);
+        assert_eq!(pane_size_for(120, 24, false, 0, 18), (120 - 18 - 1, 21));
     }
 }

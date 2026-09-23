@@ -272,6 +272,21 @@ struct State {
     /// The panel is static and the tick never advances it; it stays zero so a
     /// still screen never repaints.
     tick: u64,
+    /// How wide the open left column paints, clamped to the sidebar range.
+    ///
+    /// The default is the constant; a drag changes this, arrivals never do.
+    /// The collapsed strip keeps its own four columns regardless.
+    sidebar_width: usize,
+    /// A divider drag in progress: the panel width when the press landed.
+    ///
+    /// `None` while the mouse does anything else. The width at the press is
+    /// what tells a motionless press from a pull on release.
+    sidebar_drag: Option<usize>,
+    /// The panel width the focused child was last sized to.
+    ///
+    /// Drag motions repaint every frame but reflow at most once per frame:
+    /// the paint block below sends one resize when these two disagree.
+    sidebar_sized: usize,
     /// The last frame's clock: hit testing reads this rather than a fresh
     /// one, so a click maps onto the rows the paint drew by construction.
     /// Zero before the first paint, which lands on the first loop turn.
@@ -315,7 +330,7 @@ impl State {
     fn frame(&self) -> Frame<'_> {
         // The pane area in its own cells, shared by every tile rect.
         let (pane_cols, pane_rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
         let full = layout::Rect {
             x: 0,
             y: 0,
@@ -356,6 +371,7 @@ impl State {
             seen: &self.seen_done,
             unseen: &self.unseen_finished,
             tick: self.tick,
+            sidebar_width: self.sidebar_width,
             // One clock per frame: tiers, order and hit testing below all
             // read the same second.
             now_unix: sidebar::now_unix(),
@@ -408,8 +424,8 @@ impl State {
     /// coordinates. Divider cells answer `None`.
     fn tile_at_screen(&self, row: u16, col: u16) -> Option<TileHit> {
         let (pane_cols, pane_rows) =
-            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
-        let left = screen::left_for(self.cols, self.collapsed);
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         let first_col = left + 1;
         if (col as usize) < first_col || (col as usize) >= first_col + pane_cols as usize {
             return None;
@@ -447,7 +463,8 @@ impl State {
     /// Derived rather than stored: what is fixed is the row the top of the pane is pinned
     /// to, and how much of the pane that fills changes by itself as the terminal prints.
     fn scrolled_rows(&self) -> usize {
-        let (_, pane_rows) = screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
+        let (_, pane_rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
         let Some(anchor) = self.anchor else {
             return 0;
         };
@@ -500,13 +517,70 @@ impl State {
             .is_some_and(|s| s.modes.application_cursor)
     }
 
+    /// Whether a plain press at a one based screen position arms a divider
+    /// drag, and arm it.
+    ///
+    /// One strict bouncer so tests pin it: the open column actually drawn
+    /// (not collapsed, not dropped on a narrow window), no overlay eating
+    /// the press, exactly the divider column inside the painted rows. The
+    /// caller filters button and shift before asking. Arming consumes the
+    /// press whole: no `Clicked` runs, including `Collapse` on the foot row
+    /// the divider also crosses. A press without motion stays a no-op.
+    fn divider_press(&mut self, col: u16, row: u16) -> bool {
+        let col = col as usize;
+        let row = row as usize;
+        let drawn = crate::screen::left_for(self.cols, self.collapsed, self.sidebar_width) > 0;
+        let column_rows = (self.lines as usize).saturating_sub(crate::screen::STATUS);
+        if self.collapsed
+            || !drawn
+            || self.menu.is_some()
+            || self.prompt.is_some()
+            || self.palette.is_some()
+            || col != self.sidebar_width + 1
+            || row == 0
+            || row > column_rows
+        {
+            return false;
+        }
+        self.sidebar_drag = Some(self.sidebar_width);
+        true
+    }
+
+    /// Move an armed drag to a one based screen column. Equal widths and
+    /// shift-flagged motions do nothing at all: the drag stays armed, and
+    /// the caller paints and reflows only on `true`.
+    fn divider_motion(&mut self, col: u16, shift: bool) -> bool {
+        if self.sidebar_drag.is_none() || shift {
+            return false;
+        }
+        let new = (col as usize)
+            .saturating_sub(1)
+            .clamp(sidebar::SIDEBAR_MIN, sidebar::SIDEBAR_MAX);
+        if new == self.sidebar_width {
+            return false;
+        }
+        self.sidebar_width = new;
+        true
+    }
+
+    /// End an armed drag, anywhere. Answers whether the width moved since
+    /// the press: only then does the caller owe the anchored view a
+    /// scrollback refetch.
+    fn finish_drag(&mut self) -> bool {
+        match self.sidebar_drag.take() {
+            Some(at_press) => self.sidebar_width != at_press,
+            None => false,
+        }
+    }
+
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
         // The last painted frame's clock, not a fresh one: tiers move rows,
         // and a click maps onto what the paint drew by construction. A click
         // before the first paint reads zero, where no positive stamp is stale.
         let now_unix = self.paint_now;
-        let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
-        let left = screen::left_for(self.cols, self.collapsed);
+        let (pane_cols, _) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
             if (row as usize) != screen::TABS {
@@ -553,9 +627,10 @@ impl State {
                 self.view,
                 &self.seen_done,
                 &self.unseen_finished,
-                // Fresh clock, like the frame's: tiers move rows, and a hit
-                // test on a stale clock could aim at the row above.
+                // The last painted frame's clock, not a fresh one: tiers move
+                // rows, and a click maps onto what the paint drew.
                 now_unix,
+                self.sidebar_width,
             )
         };
         // The row between the panels answers by which half was clicked, so the column has
@@ -564,7 +639,8 @@ impl State {
         // itself is a no-op, only the corner cell makes a space.
         let hit = hit
             .or_else(|| {
-                (within == 0 && !self.collapsed).then(|| sidebar::spaces_title_hit(col as usize))?
+                (within == 0 && !self.collapsed)
+                    .then(|| sidebar::spaces_title_hit(col as usize, self.sidebar_width))?
             })
             .or_else(|| {
                 let rows = sidebar::rows_folded(
@@ -579,11 +655,13 @@ impl State {
                     &self.seen_done,
                     &self.unseen_finished,
                     now_unix,
+                    self.sidebar_width,
                 );
                 let is_footer = rows
                     .get(within)
                     .is_some_and(|(line, _)| line.text.contains("menu"));
-                (is_footer && !self.collapsed).then(|| sidebar::footer_hit(col as usize))?
+                (is_footer && !self.collapsed)
+                    .then(|| sidebar::footer_hit(col as usize, self.sidebar_width))?
             })
             .or_else(|| {
                 let rows = sidebar::rows_folded(
@@ -598,12 +676,14 @@ impl State {
                     &self.seen_done,
                     &self.unseen_finished,
                     now_unix,
+                    self.sidebar_width,
                 );
                 let is_agents_title = rows
                     .get(within)
                     .is_some_and(|(line, _)| line.text.starts_with(" agents"));
-                (is_agents_title && !self.collapsed)
-                    .then(|| sidebar::agents_title_hit(self.view, col as usize))?
+                (is_agents_title && !self.collapsed).then(|| {
+                    sidebar::agents_title_hit(self.view, col as usize, self.sidebar_width)
+                })?
             });
         match hit? {
             sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
@@ -1081,6 +1161,10 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
 }
 
 /// The most columns a name may take, which is the column it has to fit in.
+///
+/// Pinned to the default width on purpose: a naming box is a rare,
+/// short-lived overlay, and a budget that follows the pulled panel would
+/// let a wide drag smuggle a name the default column cannot show.
 const NAME_LIMIT: usize = crate::sidebar::WIDTH - 6;
 
 /// What one read of stdin meant while the focus list owns the keyboard.
@@ -1100,7 +1184,13 @@ enum FocusOutcome {
 /// The window is bottom-pinned: offset zero shows the tail, so new events
 /// arrive in view by themselves, and scrolling up hides rows below.
 fn focus_height(state: &State) -> usize {
-    let (_, pane_rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
+    let (_, pane_rows) = screen::pane_size_for(
+        state.cols,
+        state.lines,
+        state.collapsed,
+        0,
+        state.sidebar_width,
+    );
     (pane_rows as usize).max(1)
 }
 
@@ -1300,6 +1390,9 @@ async fn drive(
         // Read now, not zero: the first paint lands on the first loop turn,
         // and a click before it must still test a real clock.
         paint_now: sidebar::now_unix(),
+        sidebar_width: sidebar::WIDTH,
+        sidebar_drag: None,
+        sidebar_sized: sidebar::WIDTH,
         palette: None,
         palette_pending: Vec::new(),
         selection: None,
@@ -1432,6 +1525,16 @@ async fn drive(
                 }
                 dirty = false;
                 presented = tokio::time::Instant::now();
+                // A pulled panel reflows at most once per painted frame, no
+                // matter how many motions the frame coalesced: the width
+                // never changes the row count, so no intermediate width is
+                // worth a reflow of its own.
+                if state.sidebar_width != state.sidebar_sized {
+                    if let Some(resize) = resize_focused_to_tile(&state, &mut seqs)? {
+                        wr.write_all(&resize).await?;
+                    }
+                    state.sidebar_sized = state.sidebar_width;
+                }
             }
 
             // The panel's next tier boundary, if any idle row has one coming.
@@ -1750,6 +1853,18 @@ async fn drive(
                                     close_focus(&mut state);
                                     dirty = true;
                                 }
+                                // The divider first: a press there arms a drag
+                                // and consumes the press whole, so it never
+                                // reaches a tile, the column, or the fold mark
+                                // the divider also crosses.
+                                if !shift && state.divider_press(col, row) {
+                                    // A press anywhere else puts down whatever
+                                    // was selected, divider presses included.
+                                    if state.selection.take().is_some() {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
                                 // A tiled pane first. A click on an unfocused tile only
                                 // focuses it: the click itself goes nowhere, so coordinates
                                 // aimed at one pane are never typed into another. The
@@ -1857,6 +1972,16 @@ async fn drive(
                                     close_focus(&mut state);
                                     dirty = true;
                                 }
+                                // An armed divider drag owns every motion until
+                                // release, wherever the pointer went: latching
+                                // here keeps the pane, selection and forward
+                                // paths below from seeing it.
+                                if state.sidebar_drag.is_some() {
+                                    if state.divider_motion(col, shift) {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
                                     continue;
                                 };
@@ -1880,6 +2005,39 @@ async fn drive(
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
+                                }
+                                // A divider drag ends anywhere and reaches
+                                // neither selection-copy nor mouse-forward.
+                                // Scrollback refetch only when the pull moved
+                                // the panel under an anchored view, in
+                                // sigwinch order: resize first, refetch with
+                                // post-resize rows. The resize is flushed
+                                // here rather than left to the paint block,
+                                // or the refetch would ask with stale rows.
+                                if state.sidebar_drag.is_some() {
+                                    if state.finish_drag()
+                                        && state.anchor.is_some()
+                                        && state.focused != 0
+                                    {
+                                        if state.sidebar_width != state.sidebar_sized {
+                                            if let Some(resize) =
+                                                resize_focused_to_tile(&state, &mut seqs)?
+                                            {
+                                                wr.write_all(&resize).await?;
+                                            }
+                                            state.sidebar_sized = state.sidebar_width;
+                                        }
+                                        let want = behind_request(
+                                            state.focused,
+                                            state.rows_back() as usize,
+                                            focused_rect(&state).rows,
+                                        );
+                                        wr.write_all(&client::encode_control_seq(
+                                            &want, &mut control_seq,
+                                        )?)
+                                        .await?;
+                                    }
+                                    continue;
                                 }
                                 let inside = state.in_pane(row, col);
                                 if let Some(selection) = state.selection {
@@ -2197,6 +2355,7 @@ async fn drive(
                                         state.lines,
                                         state.collapsed,
                                         0,
+                                        state.sidebar_width,
                                     );
                                     wr.write_all(&client::encode_control_seq(
                                         &ControlRequest::ListFocusEvents {
@@ -2496,6 +2655,7 @@ async fn drive(
                             state.lines,
                             state.collapsed,
                             0,
+                            state.sidebar_width,
                         );
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::ListFocusEvents {
@@ -2752,7 +2912,13 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
 ///
 /// The pane area in its own cells, shared by every tile rect.
 fn pane_area(state: &State) -> layout::Rect {
-    let (cols, rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
+    let (cols, rows) = screen::pane_size_for(
+        state.cols,
+        state.lines,
+        state.collapsed,
+        0,
+        state.sidebar_width,
+    );
     layout::Rect {
         x: 0,
         y: 0,
@@ -3029,7 +3195,13 @@ fn focus(
     // The list refetches on the same bytes as the subscribe above: on an
     // idle daemon nothing else arrives to drain a flag on.
     if state.focus {
-        let (_, pane_rows) = screen::pane_size_for(state.cols, state.lines, state.collapsed, 0);
+        let (_, pane_rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
         // The id only has to name the family for the refusal arm; the answer
         // is matched on its terminal, never on this string.
         let id = format!("focus-term-{to}-{}", *control_seq);
@@ -3572,6 +3744,81 @@ mod tests {
         }
     }
 
+    /// A divider drag arms only on the divider: the open column actually
+    /// drawn, no overlay, exactly the rule column inside the painted rows.
+    /// The foot row arms too, so the press never falls through to the fold
+    /// mark the divider also crosses.
+    #[test]
+    fn a_divider_drag_arms_only_on_the_divider() {
+        let mut s = state();
+        s.palette = None;
+        // Divider at width + 1, one based, rows 1 through lines - STATUS.
+        assert!(s.divider_press(31, 5));
+        assert!(s.divider_press(31, 22));
+        assert_eq!(s.sidebar_drag, Some(sidebar::WIDTH));
+
+        // Pane, titles, and outside the painted rows: nothing arms.
+        let mut s = state();
+        assert!(!s.divider_press(32, 5));
+        assert!(!s.divider_press(30, 5));
+        assert!(!s.divider_press(31, 0));
+        assert!(!s.divider_press(31, 23));
+        assert_eq!(s.sidebar_drag, None);
+
+        // Folded, overlaid, or too narrow to draw the column: nothing arms.
+        let mut s = state();
+        s.collapsed = true;
+        assert!(!s.divider_press(5, 5));
+        let mut s = state();
+        s.menu = Some(0);
+        assert!(!s.divider_press(31, 5));
+        let mut s = state();
+        s.cols = 10;
+        assert!(!s.divider_press(31, 5));
+    }
+
+    /// Motions clamp to the sidebar range, latch past the pane, ignore
+    /// shift, and report whether anything moved: equal widths repaint and
+    /// reflow nothing.
+    #[test]
+    fn divider_motions_clamp_latch_and_report_movement() {
+        let mut s = state();
+        s.palette = None;
+        assert!(s.divider_press(31, 5));
+        // Pull left past the end: clamps, and says so.
+        assert!(s.divider_motion(5, false));
+        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MIN);
+        // Stuck at the clamp: same width reports nothing.
+        assert!(!s.divider_motion(1, false));
+        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MIN);
+        // Past the pane edge the drag stays latched.
+        assert!(s.divider_motion(70, false));
+        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MAX);
+        // Shift motions are ignored while the drag stays armed.
+        assert!(!s.divider_motion(20, true));
+        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MAX);
+        assert!(s.sidebar_drag.is_some());
+        // Back inside: moves again.
+        assert!(s.divider_motion(25, false));
+        assert_eq!(s.sidebar_width, 24);
+    }
+
+    /// Release ends the drag anywhere and answers whether the pull moved
+    /// the panel: only then is a refetch owed. Without an arm there is
+    /// nothing to finish.
+    #[test]
+    fn divider_release_reports_movement_only() {
+        let mut s = state();
+        s.palette = None;
+        assert!(!s.finish_drag());
+        assert!(s.divider_press(31, 5));
+        assert!(!s.finish_drag(), "a motionless press moved nothing");
+        assert!(s.divider_press(31, 5));
+        assert!(s.divider_motion(40, false));
+        assert!(s.finish_drag());
+        assert!(s.sidebar_drag.is_none());
+    }
+
     /// The panel wakes the loop only for a tier boundary, never to animate:
     /// rows without a stamp and rows past every boundary ask for nothing.
     #[test]
@@ -3638,6 +3885,9 @@ mod tests {
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             paint_now: 0,
+            sidebar_width: sidebar::WIDTH,
+            sidebar_drag: None,
+            sidebar_sized: sidebar::WIDTH,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
             selection: None,
@@ -3804,7 +4054,8 @@ mod tests {
         let mut state = bare_state();
         state.cols = 80;
         state.lines = 26;
-        let (_, pane_rows) = crate::screen::pane_size_for(state.cols, state.lines, false, 0);
+        let (_, pane_rows) =
+            crate::screen::pane_size_for(state.cols, state.lines, false, 0, state.sidebar_width);
         let pane_rows = pane_rows as u64;
 
         // A hundred rows behind the screen, and the person pins the pane ten back.
@@ -3873,6 +4124,9 @@ mod tests {
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             paint_now: 0,
+            sidebar_width: sidebar::WIDTH,
+            sidebar_drag: None,
+            sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,
@@ -3932,6 +4186,9 @@ mod tests {
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
             paint_now: 0,
+            sidebar_width: sidebar::WIDTH,
+            sidebar_drag: None,
+            sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,
@@ -4034,7 +4291,7 @@ mod tests {
     #[test]
     fn clicks_find_their_tile_and_dividers_find_none() {
         let state = tiled_state();
-        let left = screen::left_for(80, false);
+        let left = screen::left_for(80, false, sidebar::WIDTH);
         let first_col = left + 1;
         // Top-left cell of the pane is terminal 1's tile.
         let hit = state.tile_at_screen((screen::TABS + 1) as u16, first_col as u16);
@@ -4058,7 +4315,7 @@ mod tests {
     fn an_empty_pane_names_no_tile() {
         let mut state = tiled_state();
         state.focused = 0;
-        let left = screen::left_for(80, false);
+        let left = screen::left_for(80, false, sidebar::WIDTH);
         assert_eq!(
             state.tile_at_screen((screen::TABS + 1) as u16, (left + 1) as u16),
             None

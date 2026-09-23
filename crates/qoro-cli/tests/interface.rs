@@ -761,6 +761,18 @@ impl Interface {
         self.type_in(format!("\x1b[<0;{col};{row}m").as_bytes());
     }
 
+    /// A press, a motion through each column, and the release: a drag.
+    /// Buttons as a terminal reports them: plain left press, motion with
+    /// the button held, plain release.
+    fn drag(&mut self, col: u16, row: u16, through: &[u16]) {
+        self.type_in(format!("\x1b[<0;{col};{row}M").as_bytes());
+        for &at in through {
+            self.type_in(format!("\x1b[<32;{at};{row}M").as_bytes());
+        }
+        let last = through.last().copied().unwrap_or(col);
+        self.type_in(format!("\x1b[<0;{last};{row}m").as_bytes());
+    }
+
     /// Make a terminal the way a person does: ask for one, then answer the naming box.
     ///
     /// An empty answer is a real one, and it means the default name.
@@ -2037,17 +2049,14 @@ fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
     );
 }
 
-/// Radar G10: vendor sigils paint on live rows, and the grouped view keeps
-/// creation order.
+/// Radar G10: the grouped view keeps creation order on live rows.
 ///
 /// Two stand-in agents, because real ones cannot be installed by a test. The
-/// first rows read `C claude` and `X codex`: the quiet letter beside the dot
-/// is the whole of the vendor mark, no font and no colour of its own. The
 /// stale dim cannot be driven live (two hours is not a test), so it stays
-/// pinned at the unit level by G1; what is live here is the sigil paint plus
-/// a grouped-order snapshot with both agents settled.
+/// pinned at the unit level by G1; what is live here is a grouped-order
+/// snapshot with both agents settled.
 #[test]
-fn radar_sigils_paint_and_grouped_order_holds_creation_order() {
+fn radar_grouped_order_holds_creation_order() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
@@ -2067,8 +2076,8 @@ fn radar_sigils_paint_and_grouped_order_holds_creation_order() {
 
     ui.type_in(format!("{}\n", dir.join("claude").display()).as_bytes());
     assert!(
-        ui.wait_for_agents(|line| line.contains("C claude"), Duration::from_secs(15)),
-        "the agents panel does not paint the claude sigil: {:?}",
+        ui.wait_for_agents(|line| line.contains("● claude"), Duration::from_secs(15)),
+        "the agents panel does not name the agent: {:?}",
         agents_panel(&ui.screen)
     );
 
@@ -2080,21 +2089,94 @@ fn radar_sigils_paint_and_grouped_order_holds_creation_order() {
     );
     ui.type_in(format!("{}\n", dir.join("codex").display()).as_bytes());
     assert!(
-        ui.wait_for_agents(|line| line.contains("X codex"), Duration::from_secs(15)),
-        "the agents panel does not paint the codex sigil: {:?}",
+        ui.wait_for_agents(|line| line.contains("● codex"), Duration::from_secs(15)),
+        "the agents panel does not name the agent: {:?}",
         agents_panel(&ui.screen)
     );
 
     // Grouped is daemon order: the first created agent draws first, whatever
-    // the two have done since.
+    // the two have done since. The dot pins the match to first rows, so a
+    // place row naming the program cannot satisfy it.
     let panel = agents_panel(&ui.screen);
     let claude = panel
         .iter()
-        .position(|line| line.contains("C claude"))
+        .position(|line| line.contains("● claude"))
         .unwrap_or_else(|| panic!("claude left the panel: {panel:?}"));
     let codex = panel
         .iter()
-        .position(|line| line.contains("X codex"))
+        .position(|line| line.contains("● codex"))
         .unwrap_or_else(|| panic!("codex left the panel: {panel:?}"));
     assert!(claude < codex, "grouped order moved a row: {panel:?}");
+}
+
+/// Radar G12: dragging the divider resizes the panel, clamps at both ends,
+/// and a motionless press changes nothing.
+///
+/// The rule column is read off the live screen: it sits one past the panel
+/// width, so its index is the width. A press and release with no motion in
+/// between must leave it exactly where it was.
+#[test]
+fn radar_dragging_the_divider_resizes_the_panel() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    // The rule column of a sidebar row, as a zero based index into the row.
+    // Only the sidebar columns count: the pane beside it may print rules
+    // of its own, and those live further right.
+    fn rule_at(ui: &Interface) -> Option<usize> {
+        for row in 1..=22usize {
+            if let Some(at) = ui
+                .screen
+                .text(row)
+                .and_then(|line| line.chars().position(|c| c == '│' || c == '┤'))
+                .filter(|at| *at < 45)
+            {
+                return Some(at);
+            }
+        }
+        None
+    }
+    fn wait_for_rule(ui: &mut Interface, want: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let _ = ui.wait_for("this needle never appears", Duration::from_millis(100));
+            if rule_at(ui) == Some(want) {
+                return true;
+            }
+        }
+        rule_at(ui) == Some(want)
+    }
+
+    assert_eq!(rule_at(&ui), Some(30), "the panel does not start at 30");
+
+    // A motionless press and release: no-op, not even a refetch flicker.
+    ui.drag(31, 5, &[]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(rule_at(&ui), Some(30), "a motionless press moved the panel");
+
+    // Pull right: the panel widens to the dragged column minus one. The
+    // first drag ends at width 34 (motion column 35), so the divider sits
+    // at 35 for the next press.
+    ui.drag(31, 5, &[33, 35]);
+    assert!(
+        wait_for_rule(&mut ui, 34),
+        "the panel did not widen to 34: {:?}",
+        rule_at(&ui)
+    );
+
+    // Pull past the end: clamps at 36, never further.
+    ui.drag(35, 5, &[60, 90]);
+    assert!(
+        wait_for_rule(&mut ui, 36),
+        "the panel did not clamp at 36: {:?}",
+        rule_at(&ui)
+    );
+
+    // Pull left past the start: clamps at 18.
+    ui.drag(37, 5, &[20, 10]);
+    assert!(
+        wait_for_rule(&mut ui, 18),
+        "the panel did not clamp at 18: {:?}",
+        rule_at(&ui)
+    );
 }

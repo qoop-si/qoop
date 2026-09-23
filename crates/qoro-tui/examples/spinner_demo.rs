@@ -77,6 +77,7 @@ fn main() {
         scroll: 0,
         tick: 0,
         now_unix: 0,
+        sidebar_width: sidebar::WIDTH,
         anchor: 0,
         rows_back: 0,
         tiles: Vec::new(),
