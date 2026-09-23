@@ -3089,7 +3089,7 @@ fn spawn_terminal(
     let started_in = cwd.clone().unwrap_or_else(here);
     let shell = shell.as_path();
     let cwd = cwd.as_deref();
-    let pty = sys::open_pty(80, 24)?;
+    let pty = sys::open_pty(INITIAL_SIZE.cols, INITIAL_SIZE.rows)?;
     let master_fd = pty.master;
     let slave_fd = pty.slave;
 
@@ -3517,6 +3517,46 @@ pub fn arbitrate_resize(
     }
 }
 
+/// The size every terminal is born with: the PTY, the engine and the tracked
+/// current size below all start here, from this one constant, so changing the
+/// default cannot silently desynchronise the equal-size decision.
+pub const INITIAL_SIZE: PtySize = PtySize { cols: 80, rows: 24 };
+
+/// How long the shrunken size stays before the canonical size is restored.
+///
+/// Short on purpose: the shrink exists only to make the kernel deliver two
+/// SIGWINCHs. Here the wait is an
+/// event-driven timer arm in the terminal task, cancelled by a real resize.
+pub const NUDGE_RESTORE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(30);
+
+/// Whether an applied resize needs the shrink-then-restore nudge.
+///
+/// A same-size `TIOCSWINSZ` is a no-op for the child: the kernel only
+/// delivers SIGWINCH on change. A reattaching client whose size already
+/// matches the terminal would therefore never force a repaint in a
+/// full-screen app that redraws only on SIGWINCH. The nudge answers that by
+/// shrinking one row (or column) and restoring on a timer.
+pub fn needs_nudge(current: PtySize, requested: PtySize) -> bool {
+    current == requested
+}
+
+/// The shrunken size for the nudge: one row fewer, or one column fewer when
+/// there is no row to give. Keeps a minimum width, so a tiny
+/// terminal never nudges to zero.
+pub fn nudged_size(size: PtySize) -> PtySize {
+    if size.rows > 2 {
+        PtySize {
+            cols: size.cols,
+            rows: size.rows - 1,
+        }
+    } else {
+        PtySize {
+            cols: size.cols.saturating_sub(1).max(4),
+            rows: size.rows,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn terminal_task(
     master: OwnedFd,
@@ -3538,7 +3578,7 @@ async fn terminal_task(
     let child_pid = child.id() as i32;
 
     let afd = AsyncFd::with_interest(MasterIo(master), Interest::READABLE | Interest::WRITABLE)?;
-    let mut engine = AlacrittyEngine::new(80, 24);
+    let mut engine = AlacrittyEngine::new(INITIAL_SIZE.cols, INITIAL_SIZE.rows);
     let mut buf = vec![0u8; 64 * 1024];
     let mut policy = SizePolicy::Unowned;
     // Bounded by bytes, with capacity reserved for terminal replies so a saturated input
@@ -3570,6 +3610,14 @@ async fn terminal_task(
     // the tick is recovery, not polling.
     let mut blocker_at: Option<tokio::time::Instant> = None;
     let mut pending_input: Option<std::time::Instant> = None;
+    // A pending nudge restore: the canonical size to return to, and when.
+    // `None` while no nudge is in flight, so a terminal that never needed one
+    // has no timer, like every other arm in this loop.
+    let mut nudge_restore: Option<(PtySize, tokio::time::Instant)> = None;
+    // The size the PTY and the engine agree on. Seeded with the size both
+    // are constructed with above, and updated on every applied resize, so
+    // the equal-size decision never reads a converted snapshot.
+    let mut current_size = INITIAL_SIZE;
     // How far this terminal's history has reached, so the log can say where to read from.
     let mut history_to = 0u64;
     let trace = trace_latency();
@@ -3617,8 +3665,31 @@ async fn terminal_task(
                             if arbitrate_resize(&mut policy, &from, writable, size)
                                 == ResizeOutcome::Applied
                             {
-                                sys::resize(master_raw, cols, rows)?;
-                                engine.resize(cols, rows);
+                                if needs_nudge(current_size, size) {
+                                    // Same size, so the ioctl below would be a
+                                    // no-op for the child and a reattaching
+                                    // client would never force a repaint.
+                                    // Shrink once, restore on the timer arm.
+                                    // A refused resize never reaches here, so
+                                    // a non-owner or observer attaches zero
+                                    // resizes by construction.
+                                    let shrunk = nudged_size(size);
+                                    sys::resize(master_raw, shrunk.cols, shrunk.rows)?;
+                                    engine.resize(shrunk.cols, shrunk.rows);
+                                    current_size = shrunk;
+                                    nudge_restore = Some((
+                                        size,
+                                        tokio::time::Instant::now() + NUDGE_RESTORE_DELAY,
+                                    ));
+                                } else {
+                                    // A real size change cancels a pending
+                                    // restore: the new size is canonical now,
+                                    // and restoring the old one would fight it.
+                                    nudge_restore = None;
+                                    sys::resize(master_raw, cols, rows)?;
+                                    engine.resize(cols, rows);
+                                    current_size = size;
+                                }
                                 let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                             }
                         }
@@ -3864,6 +3935,29 @@ async fn terminal_task(
                         let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                         published = Some(tokio::time::Instant::now());
                     }
+                }
+                _ = async {
+                    match nudge_restore {
+                        Some((_, at)) => tokio::time::sleep_until(at).await,
+                        // Disabled: `select!` polls this arm only when the guard holds, and
+                        // the guard is what keeps a terminal that never nudged at no timer.
+                        None => std::future::pending().await,
+                    }
+                }, if nudge_restore.is_some() => {
+                    // Back to the canonical size, never the attacher's: the
+                    // shrink was a redraw trick, not a geometry decision, and
+                    // the owner arbitration that approved it is unchanged.
+                    // Best effort, never fatal: this arm is a cosmetic retry,
+                    // and killing the terminal over a failed redraw ioctl
+                    // would turn it into a destroyed session. On failure the
+                    // shrunken size stands and the next real resize repairs it.
+                    if let Some((size, _)) = nudge_restore.take()
+                        && sys::resize(master_raw, size.cols, size.rows).is_ok()
+                    {
+                        engine.resize(size.cols, size.rows);
+                        current_size = size;
+                    }
+                    let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                 }
                 _ = async {
                     match detect_at {
@@ -4327,6 +4421,47 @@ fn write_fd(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::{NUDGE_RESTORE_DELAY, needs_nudge, nudged_size};
+    use qoro_domain::PtySize;
+
+    /// Only an equal size needs the trick: a real change already delivers
+    /// SIGWINCH through the ordinary ioctl, and nudging there would triple
+    /// the resizes for no reason.
+    #[test]
+    fn only_an_equal_size_needs_the_nudge() {
+        let current = PtySize { cols: 80, rows: 24 };
+        assert!(needs_nudge(current, current));
+        assert!(!needs_nudge(current, PtySize { cols: 81, rows: 24 }));
+        assert!(!needs_nudge(current, PtySize { cols: 80, rows: 25 }));
+    }
+
+    /// One row fewer, so the kernel sees a change and the child repaints.
+    /// The restore arm returns to the canonical size, which the timer test
+    /// below pins through the attach path instead of here.
+    #[test]
+    fn the_nudge_shrinks_one_row_and_never_to_zero() {
+        let shrunk = nudged_size(PtySize { cols: 80, rows: 24 });
+        assert_eq!((shrunk.cols, shrunk.rows), (80, 23));
+        // No row to give: one column fewer, floored at a usable width.
+        let tiny = nudged_size(PtySize { cols: 5, rows: 2 });
+        assert_eq!((tiny.cols, tiny.rows), (4, 2));
+        let floor = nudged_size(PtySize { cols: 4, rows: 1 });
+        assert_eq!((floor.cols, floor.rows), (4, 1));
+    }
+
+    /// The restore delay is a redraw beat, not a settle: short enough that a
+    /// reattaching client never perceives the shrunken frame.
+    #[test]
+    fn the_restore_delay_is_shorter_than_any_settle_schedule() {
+        assert!(
+            NUDGE_RESTORE_DELAY < std::time::Duration::from_secs(1),
+            "a {NUDGE_RESTORE_DELAY:?} gap would be visible"
+        );
     }
 }
 

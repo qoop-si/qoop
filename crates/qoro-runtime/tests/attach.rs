@@ -262,3 +262,176 @@ async fn a_peer_from_another_uid_is_refused() {
         "our own uid must be accepted"
     );
 }
+
+/// Collect terminal snapshots for `within`, so a test can assert something
+/// never appeared rather than only that something did.
+async fn collect_screens(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    inbuf: &mut BytesMut,
+    within: Duration,
+) -> Vec<SnapshotWire> {
+    let deadline = Instant::now() + within;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let n = match tokio::time::timeout(remaining, rd.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => break,
+        };
+        inbuf.extend_from_slice(&buf[..n]);
+        while let Some(frame) = Frame::decode(inbuf).expect("decode") {
+            if frame.channel != Channel::Terminal {
+                continue;
+            }
+            if let Ok(s) = serde_json::from_slice::<SnapshotWire>(&frame.body) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
+    // A same-size ioctl is a no-op for the child, so a reattaching client at
+    // the current size would never force a repaint in an app that redraws
+    // only on SIGWINCH. The daemon answers with a shrink plus restore. The
+    // trap marker is computed by the shell (`W$((6*7))` becomes `W42` only in
+    // output), so the command echo itself can never match.
+    let dir = runtime_dir();
+    let socket = start_daemon(dir.path()).await;
+    let (stream, mut inbuf) = client::connect(&socket, "test").await.expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+
+    wr.write_all(
+        &client::encode_command(&ClientWire::Input {
+            bytes: b"trap 'echo W$((6*7))' WINCH\n".to_vec(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    // First resize claims ownership; 80x24 equals the initial size, so this
+    // is the nudge path rather than a real change.
+    wr.write_all(&client::encode_command(&ClientWire::Resize { cols: 80, rows: 24 }).unwrap())
+        .await
+        .unwrap();
+
+    let got = wait_for_screen(
+        &mut rd,
+        &mut inbuf,
+        |s| screen(s).contains("W42"),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        got.is_some(),
+        "equal-size resize produced no SIGWINCH; the nudge did not run"
+    );
+
+    // And the terminal is back at canonical size and alive: the shrink was a
+    // redraw trick, not a geometry decision.
+    wr.write_all(
+        &client::encode_command(&ClientWire::Input {
+            bytes: b"stty size\n".to_vec(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let sized = wait_for_screen(
+        &mut rd,
+        &mut inbuf,
+        |s| screen(s).contains("24 80"),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        sized.is_some(),
+        "terminal did not restore to 24 80 after the nudge"
+    );
+}
+
+#[tokio::test]
+async fn a_real_size_change_resizes_once_without_a_nudge() {
+    // The nudge is only for the equal-size case. A real change already
+    // delivers SIGWINCH, so no rows-1 frame may ever appear.
+    let dir = runtime_dir();
+    let socket = start_daemon(dir.path()).await;
+    let (stream, mut inbuf) = client::connect(&socket, "test").await.expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+
+    wr.write_all(
+        &client::encode_command(&ClientWire::Resize {
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let screens = collect_screens(&mut rd, &mut inbuf, Duration::from_secs(2)).await;
+    assert!(
+        screens.iter().any(|s| (s.cols, s.rows) == (100, 30)),
+        "the resize never reached the client"
+    );
+    assert!(
+        screens.iter().all(|s| (s.cols, s.rows) != (100, 29)),
+        "a real change must not pass through the nudge size"
+    );
+}
+
+#[tokio::test]
+async fn a_non_owner_resize_emits_no_winsize_change_at_all() {
+    // The first client owns the geometry. A second client's resize is
+    // refused by arbitration, so zero ioctls happen: not even the nudge.
+    let dir = runtime_dir();
+    let socket = start_daemon(dir.path()).await;
+    let (stream, mut inbuf) = client::connect(&socket, "owner").await.expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+    wr.write_all(
+        &client::encode_command(&ClientWire::Resize {
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let got = wait_for_screen(
+        &mut rd,
+        &mut inbuf,
+        |s| (s.cols, s.rows) == (100, 30),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(got.is_some(), "the owner resize never applied");
+    // The owner stays connected: if it left, ownership would lapse and the
+    // second client would become the owner, which is a different case.
+    let (_owner_rd, _owner_wr) = (rd, wr);
+
+    let (stream, mut inbuf) = client::connect(&socket, "second").await.expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+    wr.write_all(
+        &client::encode_command(&ClientWire::Resize {
+            cols: 100,
+            rows: 30,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let screens = collect_screens(&mut rd, &mut inbuf, Duration::from_secs(2)).await;
+    // Non-vacuous: the subscription itself delivers the current screen, so
+    // an empty collection would mean the harness heard nothing at all.
+    assert!(
+        screens.iter().any(|s| (s.cols, s.rows) == (100, 30)),
+        "the second client never even saw the current screen"
+    );
+    assert!(
+        screens.iter().all(|s| (s.cols, s.rows) != (100, 29)),
+        "a refused resize must not nudge, shrink, or otherwise touch winsize"
+    );
+}
