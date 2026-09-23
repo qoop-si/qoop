@@ -2036,3 +2036,65 @@ fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
         ui.painted.len()
     );
 }
+
+/// Radar G10: vendor sigils paint on live rows, and the grouped view keeps
+/// creation order.
+///
+/// Two stand-in agents, because real ones cannot be installed by a test. The
+/// first rows read `C claude` and `X codex`: the quiet letter beside the dot
+/// is the whole of the vendor mark, no font and no colour of its own. The
+/// stale dim cannot be driven live (two hours is not a test), so it stays
+/// pinned at the unit level by G1; what is live here is the sigil paint plus
+/// a grouped-order snapshot with both agents settled.
+#[test]
+fn radar_sigils_paint_and_grouped_order_holds_creation_order() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+
+    let dir = ui.runtime_dir().join("bin");
+    std::fs::create_dir_all(&dir).expect("dir");
+    for (name, body) in [
+        ("claude", "printf 'working\\n'; sleep 30\n"),
+        ("codex", "printf 'working\\n'; sleep 30\n"),
+    ] {
+        std::fs::write(dir.join(name), format!("#!/bin/sh\n{body}")).expect("write");
+        std::fs::set_permissions(
+            dir.join(name),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod");
+    }
+
+    ui.type_in(format!("{}\n", dir.join("claude").display()).as_bytes());
+    assert!(
+        ui.wait_for_agents(|line| line.contains("C claude"), Duration::from_secs(15)),
+        "the agents panel does not paint the claude sigil: {:?}",
+        agents_panel(&ui.screen)
+    );
+
+    ui.create_terminal("");
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second terminal never appeared: {:?}",
+        ui.tab_bar()
+    );
+    ui.type_in(format!("{}\n", dir.join("codex").display()).as_bytes());
+    assert!(
+        ui.wait_for_agents(|line| line.contains("X codex"), Duration::from_secs(15)),
+        "the agents panel does not paint the codex sigil: {:?}",
+        agents_panel(&ui.screen)
+    );
+
+    // Grouped is daemon order: the first created agent draws first, whatever
+    // the two have done since.
+    let panel = agents_panel(&ui.screen);
+    let claude = panel
+        .iter()
+        .position(|line| line.contains("C claude"))
+        .unwrap_or_else(|| panic!("claude left the panel: {panel:?}"));
+    let codex = panel
+        .iter()
+        .position(|line| line.contains("X codex"))
+        .unwrap_or_else(|| panic!("codex left the panel: {panel:?}"));
+    assert!(claude < codex, "grouped order moved a row: {panel:?}");
+}

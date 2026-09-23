@@ -246,6 +246,8 @@ mod tests {
             manifest: None,
             agent_session: None,
             agent_title: None,
+            last_active_at_unix: None,
+            cwd: None,
         }
     }
 
@@ -265,6 +267,8 @@ mod tests {
             manifest: None,
             agent_session: None,
             agent_title: None,
+            last_active_at_unix: None,
+            cwd: None,
         }
     }
 

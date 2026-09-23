@@ -36,6 +36,8 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         manifest: None,
         agent_session: None,
         agent_title: None,
+        last_active_at_unix: None,
+        cwd: None,
     }
 }
 
@@ -74,6 +76,7 @@ fn main() {
         selection: None,
         scroll: 0,
         tick: 0,
+        now_unix: 0,
         anchor: 0,
         rows_back: 0,
         tiles: Vec::new(),

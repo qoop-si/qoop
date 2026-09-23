@@ -272,6 +272,10 @@ struct State {
     /// The panel is static and the tick never advances it; it stays zero so a
     /// still screen never repaints.
     tick: u64,
+    /// The last frame's clock: hit testing reads this rather than a fresh
+    /// one, so a click maps onto the rows the paint drew by construction.
+    /// Zero before the first paint, which lands on the first loop turn.
+    paint_now: i64,
     /// The open search palette, or `None` when the terminal has the keyboard.
     palette: Option<Palette>,
     /// The start of a palette key sequence the read ended in the middle of.
@@ -352,6 +356,9 @@ impl State {
             seen: &self.seen_done,
             unseen: &self.unseen_finished,
             tick: self.tick,
+            // One clock per frame: tiers, order and hit testing below all
+            // read the same second.
+            now_unix: sidebar::now_unix(),
             palette: self.palette.as_ref(),
             prompt: self.prompt.as_ref(),
             menu: self.menu,
@@ -494,6 +501,10 @@ impl State {
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
+        // The last painted frame's clock, not a fresh one: tiers move rows,
+        // and a click maps onto what the paint drew by construction. A click
+        // before the first paint reads zero, where no positive stamp is stale.
+        let now_unix = self.paint_now;
         let (pane_cols, _) = screen::pane_size_for(self.cols, self.lines, self.collapsed, 0);
         let left = screen::left_for(self.cols, self.collapsed);
         // Right of the column, which is the pane and the bar above it.
@@ -542,6 +553,9 @@ impl State {
                 self.view,
                 &self.seen_done,
                 &self.unseen_finished,
+                // Fresh clock, like the frame's: tiers move rows, and a hit
+                // test on a stale clock could aim at the row above.
+                now_unix,
             )
         };
         // The row between the panels answers by which half was clicked, so the column has
@@ -564,6 +578,7 @@ impl State {
                     self.view,
                     &self.seen_done,
                     &self.unseen_finished,
+                    now_unix,
                 );
                 let is_footer = rows
                     .get(within)
@@ -582,6 +597,7 @@ impl State {
                     self.view,
                     &self.seen_done,
                     &self.unseen_finished,
+                    now_unix,
                 );
                 let is_agents_title = rows
                     .get(within)
@@ -1281,6 +1297,9 @@ async fn drive(
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
         tick: 0,
+        // Read now, not zero: the first paint lands on the first loop turn,
+        // and a click before it must still test a real clock.
+        paint_now: sidebar::now_unix(),
         palette: None,
         palette_pending: Vec::new(),
         selection: None,
@@ -1371,7 +1390,11 @@ async fn drive(
             // at once, so a keystroke echoes with no added wait; renders arriving closer
             // together than that wait for the timer arm below and go out as one frame.
             if dirty && presented.elapsed() >= FRAME {
-                let mut painted = screen::paint(&state.frame());
+                // One frame for both paints: a single clock for tiers, order
+                // and the hit testing below, and its time remembered for the
+                // clicks that land between paints.
+                let frame = state.frame();
+                let mut painted = screen::paint(&frame);
                 // The focus list covers the pane the frame just drew, the way the
                 // palette does. Never over an overlay: an open palette owns the
                 // keyboard first, and the list never covers it.
@@ -1383,12 +1406,17 @@ async fn drive(
                     && state.reading.is_none()
                 {
                     screen::paint_focus(
-                        &state.frame(),
+                        &frame,
                         &state.focus_events,
                         state.focus_offset,
                         &mut painted,
                     );
                 }
+                // The borrow ends here: the clock is copied out before the
+                // state is touched again below.
+                let paint_now = frame.now_unix;
+                drop(frame);
+                state.paint_now = paint_now;
                 written.clear();
                 presenter.present(&painted, state.cols, state.lines, &mut written);
                 if state.ring {
@@ -1405,6 +1433,21 @@ async fn drive(
                 dirty = false;
                 presented = tokio::time::Instant::now();
             }
+
+            // The panel's next tier boundary, if any idle row has one coming.
+            // One shot and not an interval: the arm below sleeps until it and
+            // then goes back to never. Folded away, the strip shows no tiers,
+            // so nothing is armed. See `sidebar::wants_tick`.
+            let tier_at = if state.collapsed {
+                None
+            } else {
+                let now_wall = sidebar::now_unix();
+                sidebar::wants_tick(&state.rows, now_wall).and_then(|at| {
+                    let wait = (at - now_wall).max(0) as u64;
+                    tokio::time::Instant::now()
+                        .checked_add(std::time::Duration::from_secs(wait))
+                })
+            };
 
             tokio::select! {
                 biased;
@@ -2484,6 +2527,20 @@ async fn drive(
                 // Last, so it never goes ahead of input: it only wakes the loop to send
                 // the frame that the renders above held back.
                 _ = tokio::time::sleep_until(presented + FRAME), if dirty => {}
+                // Last beside it, for the same reason: a tier boundary arrived
+                // with nothing else happening only marks the frame dirty, and
+                // the FRAME arm above still decides when it goes out. Minute
+                // granularity, so the row dims and sinks within a minute of
+                // its boundary. Any other arm firing first repaints anyway
+                // and re-arms this one.
+                _ = async {
+                    match tier_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    dirty = true;
+                }
             }
         }
     }
@@ -3510,31 +3567,39 @@ mod tests {
             manifest: None,
             agent_session: None,
             agent_title: None,
+            last_active_at_unix: None,
+            cwd: None,
         }
     }
 
-    /// The panel is static: no state ever asks for a tick, so the loop
-    /// never repaints without an arrival.
+    /// The panel wakes the loop only for a tier boundary, never to animate:
+    /// rows without a stamp and rows past every boundary ask for nothing.
     #[test]
-    fn nothing_ever_asks_for_a_tick() {
-        let seen = sidebar::Seen::new();
+    fn only_a_future_tier_boundary_asks_for_a_tick() {
+        // No stamp anywhere: nothing to cross, no deadline.
         for state in ["working", "starting", "idle", "blocked", "failed", "done"] {
-            assert!(!sidebar::wants_tick(
-                &[agent(1, 1, "claude", state)],
-                0,
-                &seen,
-                &sidebar::Unseen::new()
-            ));
+            assert_eq!(
+                sidebar::wants_tick(&[agent(1, 1, "claude", state)], 1_750_000_000),
+                None,
+                "{state} without a stamp must not arm the loop"
+            );
         }
-        assert!(!sidebar::wants_tick(&[], 0, &seen, &sidebar::Unseen::new()));
+        assert_eq!(sidebar::wants_tick(&[], 1_750_000_000), None);
         let mut shell = agent(2, 1, "sh", "working");
         shell.agent = false;
-        assert!(!sidebar::wants_tick(
-            &[shell],
-            0,
-            &seen,
-            &sidebar::Unseen::new()
-        ));
+        assert_eq!(
+            sidebar::wants_tick(&[shell], 1_750_000_000),
+            None,
+            "a non-agent row must not arm the loop"
+        );
+        // Stamped long ago, every boundary past: nothing left to cross.
+        let mut old = agent(3, 1, "claude", "idle");
+        old.last_active_at_unix = Some(1_000_000);
+        assert_eq!(
+            sidebar::wants_tick(&[old], 1_750_000_000),
+            None,
+            "a row past every boundary must not arm the loop"
+        );
     }
 
     fn state() -> State {
@@ -3572,6 +3637,7 @@ mod tests {
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
+            paint_now: 0,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
             selection: None,
@@ -3806,6 +3872,7 @@ mod tests {
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
+            paint_now: 0,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,
@@ -3864,6 +3931,7 @@ mod tests {
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
+            paint_now: 0,
             palette: None,
             palette_pending: Vec::new(),
             selection: None,

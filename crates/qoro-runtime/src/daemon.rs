@@ -291,6 +291,12 @@ pub struct TerminalHandle {
     /// Memory only, like the name: the store keeps a copy for resume, but
     /// the index reads this so every poll stays off the disk.
     pub session: Option<String>,
+    /// Where this terminal is, last known. Written by the terminal's own
+    /// task whenever its throttled read sees a change, read by the index,
+    /// so a repaint never waits on the store and never syscalls. Lags the
+    /// shell by the containment scan interval at most, which is the bound
+    /// the row documents rather than a promise of now.
+    pub cwd: Option<String>,
     pub id: TerminalId,
     /// How many rows of this terminal have gone behind the screen and been written down.
     ///
@@ -331,6 +337,24 @@ impl TerminalRegistry {
     /// The agent's conversation id, last reported by hook, if any.
     pub fn session_of(&self, stream: u32) -> Option<String> {
         self.inner.lock().unwrap().get(&stream)?.session.clone()
+    }
+
+    /// Where the terminal is, last known to its own task, if any.
+    pub fn cwd_of(&self, stream: u32) -> Option<String> {
+        self.inner.lock().unwrap().get(&stream)?.cwd.clone()
+    }
+
+    /// Remember where the terminal is. Called by the terminal's own task,
+    /// which is the single writer, so values arrive in the order they were
+    /// read. False when there is no such terminal.
+    fn set_cwd(&self, stream: u32, cwd: Option<String>) -> bool {
+        match self.inner.lock().unwrap().get_mut(&stream) {
+            Some(handle) => {
+                handle.cwd = cwd;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remember a reported conversation id. False when there is no such terminal.
@@ -687,7 +711,7 @@ impl Daemon {
                     let Ok(mut ready) = afd.readable().await else {
                         return;
                     };
-                    let touched = watched_agents.apply_events();
+                    let touched = watched_agents.apply_events(crate::agents::now_unix());
                     ready.clear_ready();
                     settle_queue.mark(touched);
                 }
@@ -695,7 +719,7 @@ impl Daemon {
                 let mut interval = qoro_pty::procwatch::PROBE_FAST;
                 loop {
                     tokio::time::sleep(interval).await;
-                    let touched = watched_agents.apply_events();
+                    let touched = watched_agents.apply_events(crate::agents::now_unix());
                     let changed = !touched.is_empty();
                     // The probe platform re-reads every terminal, because it has no event
                     // to tell it which one moved.
@@ -1983,6 +2007,11 @@ async fn handle_control(
                             )
                         })
                         .unwrap_or((None, None, None));
+                    // Arrival-stamped by the daemon, read off the registry:
+                    // no timestamp until the first accepted observation, no
+                    // cwd until the terminal's own task has seen one.
+                    let last_active_at_unix = agent.as_ref().and_then(|a| a.last_active_at_unix);
+                    let cwd = terminals.cwd_of(terminal);
                     // Read before the row moves the strings: the mapping only
                     // borrows, and the literal below owns.
                     let readiness = crate::control::readiness_of(
@@ -2024,6 +2053,8 @@ async fn handle_control(
                         manifest,
                         agent_session,
                         agent_title,
+                        last_active_at_unix,
+                        cwd,
                     }
                 })
                 .collect();
@@ -2103,6 +2134,7 @@ async fn handle_control(
                 reported,
                 visible_blocker,
                 visible_idle,
+                crate::agents::now_unix(),
             ) {
                 Err(_) => ControlResponse::Failed {
                     id,
@@ -2115,10 +2147,7 @@ async fn handle_control(
                     // store. An absent or out-of-set kind means "a state
                     // report with nothing to show": no row, still a success.
                     if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
-                        let at_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
+                        let at_unix = crate::agents::now_unix();
                         agents.push_focus_event(
                             terminal,
                             crate::control::FocusEvent {
@@ -2564,6 +2593,9 @@ pub fn open_terminal(
     let handle = TerminalHandle {
         name,
         session: None,
+        // Seeded with what the terminal was asked for: the task writes the
+        // registry whenever its throttled read sees a change after this.
+        cwd: cwd.map(|p| p.display().to_string()),
         workspace,
         history: behind.clone(),
         id: terminal_id,
@@ -2586,6 +2618,7 @@ pub fn open_terminal(
             stream,
             agents,
             events,
+            terminals: terminals.clone(),
             books: books.clone(),
         },
         from_clients,
@@ -3059,6 +3092,9 @@ pub struct TerminalSpawn {
     pub stream: u32,
     pub agents: Arc<crate::agents::AgentRegistry>,
     pub events: crate::eventlog::EventLog,
+    /// The live index, so the terminal's own task can publish where it is
+    /// without going through the store. The task is the single writer.
+    pub terminals: Arc<TerminalRegistry>,
     /// Where what this terminal is and where it is get recorded, so a restart knows what
     /// to bring back. Absent for a daemon told not to persist.
     pub books: Option<Bookkeeping>,
@@ -3081,6 +3117,7 @@ fn spawn_terminal(
         stream,
         agents,
         events,
+        terminals,
         books,
     } = spawn;
     let register_master = agents.clone();
@@ -3177,6 +3214,7 @@ fn spawn_terminal(
             agents.clone(),
             stream,
             events.clone(),
+            terminals,
             books,
             started_in,
         ))
@@ -3448,7 +3486,7 @@ async fn settle_loop(agents: Arc<crate::agents::AgentRegistry>, queue: Arc<Settl
                 // The registry announces the ones that moved. `refresh_foreground` answers
                 // `None` for a terminal whose leader is what it was, so a settle step that
                 // finds nothing tells nobody.
-                agents.refresh_foreground(*stream);
+                agents.refresh_foreground(*stream, crate::agents::now_unix());
             }
         }
     }
@@ -3570,6 +3608,7 @@ async fn terminal_task(
     agents: Arc<crate::agents::AgentRegistry>,
     stream: u32,
     events: crate::eventlog::EventLog,
+    terminals: Arc<TerminalRegistry>,
     books: Option<Bookkeeping>,
     // Where this terminal was started, which is what its row already says.
     started_in: PathBuf,
@@ -3702,15 +3741,17 @@ async fn terminal_task(
                             // which is the last moment it can be read at all. This is the
                             // path a stop takes, and a stop is exactly when the directory
                             // has to be right: the next start opens the tab here.
-                            if let Some(books) = books.clone()
-                                && let Some(now) =
-                                    qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
+                            if let Some(now) =
+                                qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
                                 && last_cwd.as_deref() != Some(now.as_path())
                             {
-                                let _ = books
-                                    .store
-                                    .set_cwd(stream as i64, now.display().to_string())
-                                    .await;
+                                terminals.set_cwd(stream, Some(now.display().to_string()));
+                                if let Some(books) = books.clone() {
+                                    let _ = books
+                                        .store
+                                        .set_cwd(stream as i64, now.display().to_string())
+                                        .await;
+                                }
                             }
                             break;
                         }
@@ -3764,6 +3805,7 @@ async fn terminal_task(
                                 .note_foreground(
                                     stream,
                                     qoro_pty::sys::foreground_leader(master_raw),
+                                    crate::agents::now_unix(),
                                 )
                                 .is_some()
                             {
@@ -3795,18 +3837,25 @@ async fn terminal_task(
                                 // tab was born in stops being where it is within a minute
                                 // of real use. One syscall, and only written when it
                                 // actually changed.
-                                if let Some(books) = books.clone()
-                                    && let Some(now) =
-                                        qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
+                                if let Some(now) =
+                                    qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
                                     && last_cwd.as_deref() != Some(now.as_path())
                                 {
                                     last_cwd = Some(now.clone());
-                                    tokio::spawn(async move {
-                                        let _ = books
-                                            .store
-                                            .set_cwd(stream as i64, now.display().to_string())
-                                            .await;
-                                    });
+                                    // The index reads the registry, not the store: one
+                                    // synchronous write from the single writer, ordered
+                                    // with every later read by construction. Outside
+                                    // the `books` gate below on purpose: the row is
+                                    // live even for a daemon told not to persist.
+                                    terminals.set_cwd(stream, Some(now.display().to_string()));
+                                    if let Some(books) = books.clone() {
+                                        tokio::spawn(async move {
+                                            let _ = books
+                                                .store
+                                                .set_cwd(stream as i64, now.display().to_string())
+                                                .await;
+                                        });
+                                    }
                                 }
                             }
                             // Fed a slice at a time, yielding between them.
@@ -3918,7 +3967,11 @@ async fn terminal_task(
                 }, if relook_at.is_some() => {
                     relook_at = None;
                     if agents
-                        .note_foreground(stream, qoro_pty::sys::foreground_leader(master_raw))
+                        .note_foreground(
+                            stream,
+                            qoro_pty::sys::foreground_leader(master_raw),
+                            crate::agents::now_unix(),
+                        )
                         .is_some()
                     {
                         engine.clear_title();
@@ -4015,7 +4068,12 @@ async fn terminal_task(
                             }
                         };
                         if let Some(verdict) = verdict
-                            && agents.observe_screen(stream, &manifest.id, &verdict)
+                            && agents.observe_screen(
+                                stream,
+                                &manifest.id,
+                                &verdict,
+                                crate::agents::now_unix(),
+                            )
                         {
                         // Recorded when it changed, not on every look. The log is what a
                         // client that was not connected reads to find out what happened

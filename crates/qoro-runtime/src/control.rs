@@ -457,6 +457,26 @@ pub struct AgentRow {
     /// predates the field.
     #[serde(default)]
     pub manifest: Option<String>,
+    /// When the agent in this terminal last did something, as unix seconds.
+    ///
+    /// Stamped by the daemon at arrival, from its own clock, on every
+    /// accepted belief change and generation bump. Never copied from a
+    /// hook's advisory clock. Absent until the first accepted observation
+    /// (including after a restart, which must not paint a fleet as fresh),
+    /// and absent on rows from a daemon that predates the field. What the
+    /// client's idle tiers are computed from.
+    #[serde(default)]
+    pub last_active_at_unix: Option<i64>,
+    /// Where this terminal is, last known, as an absolute path.
+    ///
+    /// Best effort with a documented bound: the per-terminal task writes it
+    /// to the registry whenever its throttled read sees a change, so it can
+    /// lag the shell by the containment scan interval plus spawn lag. Unknown is `None`,
+    /// never an empty string; a client treats missing and blank alike.
+    /// Absent on rows from a daemon that predates the field. What the
+    /// client's place line disambiguates with.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -641,6 +661,25 @@ mod tests {
         assert_eq!(explained.source.as_deref(), Some("ScreenHeuristic"));
         assert_eq!(explained.rule.as_deref(), Some("needs_approval"));
         assert_eq!(explained.manifest.as_deref(), Some("claude"));
+    }
+
+    /// G8: activity and place fields cross old daemons both ways. A row from
+    /// an older daemon parses with both absent; a row that carries them keeps
+    /// them. `future_key` stands in for the next version's field: no
+    /// `deny_unknown_fields` anywhere on the struct, so an older client
+    /// reading a newer daemon's rows ignores what it does not know.
+    #[test]
+    fn activity_and_place_fields_parse_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"idle"}"#).expect("decode");
+        assert_eq!(old.last_active_at_unix, None);
+        assert_eq!(old.cwd, None);
+        let new: AgentRow = serde_json::from_str(
+            r#"{"terminal":2,"workspace":1,"state":"idle","last_active_at_unix":1750000000,"cwd":"/tmp/work","future_key":"ignored"}"#,
+        )
+        .expect("decode");
+        assert_eq!(new.last_active_at_unix, Some(1_750_000_000));
+        assert_eq!(new.cwd.as_deref(), Some("/tmp/work"));
     }
 
     #[test]

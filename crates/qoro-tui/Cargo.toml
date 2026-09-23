@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+qoro-domain = { path = "../qoro-domain" }
 qoro-proto = { path = "../qoro-proto" }
 qoro-runtime = { path = "../qoro-runtime" }
 bytes = { workspace = true }

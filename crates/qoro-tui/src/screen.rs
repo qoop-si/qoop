@@ -56,6 +56,12 @@ pub struct Frame<'a> {
     /// Advanced by the run loop while an agent is working, held while none is: a still
     /// panel is a panel with nothing to say, and a ticking one is a repainting one.
     pub tick: u64,
+    /// Paint-time unix seconds, read once per frame by the run loop.
+    ///
+    /// What idle tiers and recency order are computed from: one paint never
+    /// disagrees with itself, and hit testing re-reads the clock for the
+    /// same reason.
+    pub now_unix: i64,
     /// The open search palette, drawn over the terminal when present.
     pub palette: Option<&'a Palette>,
     /// The open naming box, drawn over everything when a person is being asked what to
@@ -267,6 +273,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.view,
             frame.seen,
             frame.unseen,
+            frame.now_unix,
         )
     } else {
         Vec::new()
@@ -1491,6 +1498,11 @@ fn colour(c: ColourWire, foreground: bool) -> String {
 mod tests {
     use super::*;
 
+    /// Paint-time clock for frame tests: every row here is unstamped, so
+    /// tiers never apply, but the clock is named rather than zero so a
+    /// stamped row added later reads a real tier instead of a silent Fresh.
+    const TEST_NOW: i64 = 1_750_000_000;
+
     fn spaces() -> Vec<WorkspaceRow> {
         vec![WorkspaceRow {
             id: 1,
@@ -1515,6 +1527,8 @@ mod tests {
             manifest: None,
             agent_session: None,
             agent_title: None,
+            last_active_at_unix: None,
+            cwd: None,
         }
     }
 
@@ -1626,6 +1640,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1674,6 +1689,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1723,6 +1739,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1773,6 +1790,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1825,6 +1843,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1868,6 +1887,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1944,6 +1964,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -1985,6 +2006,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2034,6 +2056,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2080,6 +2103,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2140,6 +2164,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2200,6 +2225,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2248,6 +2274,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2294,6 +2321,7 @@ mod tests {
                 selection: None,
                 scroll: 0,
                 tick: 0,
+                now_unix: TEST_NOW,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2341,6 +2369,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2383,6 +2412,7 @@ mod tests {
                 selection: None,
                 scroll: 0,
                 tick: 0,
+                now_unix: TEST_NOW,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2427,6 +2457,7 @@ mod tests {
                 selection: None,
                 scroll: 0,
                 tick: 0,
+                now_unix: TEST_NOW,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2489,6 +2520,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2544,6 +2576,7 @@ mod tests {
                 selection: None,
                 scroll: 0,
                 tick,
+                now_unix: TEST_NOW,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -2610,6 +2643,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2694,6 +2728,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2726,6 +2761,8 @@ mod tests {
             manifest: None,
             agent_session: None,
             agent_title: None,
+            last_active_at_unix: None,
+            cwd: None,
         }
     }
 
@@ -2753,6 +2790,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2796,6 +2834,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2836,6 +2875,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2877,6 +2917,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -2955,6 +2996,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3030,6 +3072,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3076,6 +3119,8 @@ mod tests {
                 manifest: None,
                 agent_session: None,
                 agent_title: None,
+                last_active_at_unix: None,
+                cwd: None,
             })
             .collect();
         // Nothing folds: all nine agents draw their pairs, no headers and no
@@ -3090,6 +3135,7 @@ mod tests {
             sidebar::View::Grouped,
             &sidebar::Seen::new(),
             &sidebar::Unseen::new(),
+            0,
         );
         let texts: Vec<String> = lines
             .iter()
@@ -3136,6 +3182,7 @@ mod tests {
             selection: Some(selection),
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3195,6 +3242,7 @@ mod tests {
                 selection,
                 scroll: 0,
                 tick: 0,
+                now_unix: TEST_NOW,
                 view: sidebar::View::Grouped,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
@@ -3243,6 +3291,7 @@ mod tests {
             selection: None,
             scroll: 2,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3300,6 +3349,7 @@ mod tests {
             selection: None,
             scroll: 0,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3450,6 +3500,7 @@ mod tests {
             rows_back: 0,
             tiles,
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3486,6 +3537,7 @@ mod tests {
             rows_back: 0,
             tiles: Vec::new(),
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
@@ -3523,6 +3575,7 @@ mod tests {
                 focused: true,
             }],
             tick: 0,
+            now_unix: TEST_NOW,
             view: sidebar::View::Grouped,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),

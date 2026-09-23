@@ -51,6 +51,12 @@ pub struct TerminalAgent {
     pub capability: TerminalCapability,
     pub identity: AgentIdentity,
     pub belief: AgentBelief,
+    /// When this agent last did something, as unix seconds on the daemon's
+    /// own clock. Stamped beside every accepted belief change and generation
+    /// bump, never inside the domain belief and never from a hook's advisory
+    /// clock. `None` until the first accepted observation, so a restart
+    /// paints no row as fresh.
+    pub last_active_at_unix: Option<i64>,
     /// A startup gate is on screen: answering it creates the session rather
     /// than continuing one. Set from the matched manifest rule, never
     /// inferred, and cleared by any later screen reading without one.
@@ -165,6 +171,18 @@ fn fresh_belief(generation: GenerationId) -> AgentBelief {
     }
 }
 
+/// The daemon's own wall clock, as unix seconds.
+///
+/// The single source for activity stamps. The hook's wire clock is advisory
+/// and stays that way: stamping from it would let a report backdate or
+/// predate a row, and the acceptance order would stop meaning anything.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Settle a terminal whose foreground process just exited.
 ///
 /// The identity is gone with the process. The belief is reset and becomes Idle
@@ -172,7 +190,7 @@ fn fresh_belief(generation: GenerationId) -> AgentBelief {
 /// offered to the previous Hook-held blocker would be `Outranked` and the dead
 /// terminal would stick on `blocked` forever. Reset first, then synthesize, is
 /// the composition the test below pins.
-fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
+fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     agent.identity = AgentIdentity::None;
     agent.leader = None;
     agent.belief = fresh_belief(agent.capability.generation);
@@ -195,6 +213,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32) {
     };
     if let Ok(next) = agent.belief.clone().accept(&idle) {
         agent.belief = next;
+        agent.last_active_at_unix = Some(now_unix);
     }
 }
 
@@ -225,11 +244,16 @@ impl AgentRegistry {
     /// child into the foreground, and the fork is the only notice we get that the second
     /// step is coming: the child may not have been moved yet when the event arrives, which
     /// is why the caller re-reads over a short settle window rather than once.
-    pub fn refresh_foreground(&self, stream: u32) -> Option<GenerationId> {
+    pub fn refresh_foreground(&self, stream: u32, now_unix: i64) -> Option<GenerationId> {
         let master = self.masters.lock().unwrap().get(&stream).copied()?;
         // Never held back by `RELOOK`: this runs because a process event said the group
         // changed, and the look it makes is the one that finds an agent a wrapper forked.
-        self.look(stream, qoro_pty::sys::foreground_leader(master), false)
+        self.look(
+            stream,
+            qoro_pty::sys::foreground_leader(master),
+            false,
+            now_unix,
+        )
     }
 
     /// Start tracking a terminal, and mint the token its child will carry.
@@ -245,6 +269,7 @@ impl AgentRegistry {
                 },
                 identity: AgentIdentity::None,
                 belief: fresh_belief(generation),
+                last_active_at_unix: None,
                 setup_gate: false,
                 screen_rule: None,
                 screen_manifest: None,
@@ -307,8 +332,13 @@ impl AgentRegistry {
     ///
     /// This is the read loop's call, on every chunk of output, so a leader that is not an
     /// agent is looked into at most once per `RELOOK` from here.
-    pub fn note_foreground(&self, stream: u32, leader: Option<Pid>) -> Option<GenerationId> {
-        self.look(stream, leader, true)
+    pub fn note_foreground(
+        &self,
+        stream: u32,
+        leader: Option<Pid>,
+        now_unix: i64,
+    ) -> Option<GenerationId> {
+        self.look(stream, leader, true, now_unix)
     }
 
     /// When the look `note_foreground` last held back is due, if one is owed.
@@ -325,7 +355,13 @@ impl AgentRegistry {
     }
 
     /// `note_foreground`, with the look into a same leader held back only when `throttled`.
-    fn look(&self, stream: u32, leader: Option<Pid>, throttled: bool) -> Option<GenerationId> {
+    fn look(
+        &self,
+        stream: u32,
+        leader: Option<Pid>,
+        throttled: bool,
+        now_unix: i64,
+    ) -> Option<GenerationId> {
         let mut terminals = self.terminals.lock().unwrap();
         let agent = terminals.get_mut(&stream)?;
         if agent.leader == leader {
@@ -380,6 +416,7 @@ impl AgentRegistry {
             // generation by definition.
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
+            agent.last_active_at_unix = Some(now_unix);
             // The gate belonged to the old generation's screen: a new process
             // means the old dialog reading is void, not held. The old rule
             // reading is void with it.
@@ -400,6 +437,9 @@ impl AgentRegistry {
         }
         let generation = agent.capability.advance();
         agent.belief = fresh_belief(generation);
+        // A new foreground generation is activity even before anything is
+        // known about the process: something replaced what was there.
+        agent.last_active_at_unix = Some(now_unix);
         // A new foreground generation voids the old screen's gate with the
         // old belief: whatever dialog was showing belonged to a process that
         // is no longer there. The old rule reading belonged to it too.
@@ -429,7 +469,7 @@ impl AgentRegistry {
 
     /// Apply whatever the platform has reported. Returns the terminals whose generation
     /// changed, so a caller can tell clients.
-    pub fn apply_events(&self) -> Vec<u32> {
+    pub fn apply_events(&self, now_unix: i64) -> Vec<u32> {
         let mut changed = Vec::new();
         for event in self.watch.drain() {
             let (pid, exited) = match event {
@@ -454,6 +494,13 @@ impl AgentRegistry {
             };
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
+            // An exec replaced the program: activity. An exit settles below,
+            // and `settle_exit` stamps the idle it synthesizes, so the exit
+            // path stamps nothing here: one stamp per event, at the belief
+            // that actually holds afterwards.
+            if !exited {
+                agent.last_active_at_unix = Some(now_unix);
+            }
             // The gate belonged to the exited or execed process: a new
             // generation voids the old screen's reading with the old belief.
             // The old rule reading goes with it.
@@ -462,7 +509,7 @@ impl AgentRegistry {
             agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
-                settle_exit(agent, stream);
+                settle_exit(agent, stream, now_unix);
             } else {
                 // The same pid, a different program. This is the case a pid keyed identity
                 // gets wrong, and it is the common one: a shell that becomes an agent.
@@ -492,6 +539,7 @@ impl AgentRegistry {
         stream: u32,
         manifest: &str,
         verdict: &qoro_detect::Verdict,
+        now_unix: i64,
     ) -> bool {
         let mut terminals = self.terminals.lock().unwrap();
         let Some(agent) = terminals.get_mut(&stream) else {
@@ -536,6 +584,11 @@ impl AgentRegistry {
         let changed = agent.belief.state != before
             || agent.belief.visible_blocker != before_blocker
             || agent.setup_gate != before_gate;
+        // An accepted change is activity; a refused observation stamps
+        // nothing, and the rule recording above stays stamp-free with it.
+        if changed {
+            agent.last_active_at_unix = Some(now_unix);
+        }
         drop(terminals);
         if changed {
             self.announce(stream);
@@ -569,6 +622,7 @@ impl AgentRegistry {
     /// generation and anything older would be refused as stale anyway.
     ///
     /// Answers whether anything changed, or why the report was refused.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe_hook(
         &self,
         stream: u32,
@@ -577,6 +631,7 @@ impl AgentRegistry {
         state: AgentRuntimeState,
         visible_blocker: bool,
         visible_idle: bool,
+        now_unix: i64,
     ) -> Result<bool, ClaimRefusal> {
         let mut terminals = self.terminals.lock().unwrap();
         let Some(agent) = terminals.get_mut(&stream) else {
@@ -610,6 +665,11 @@ impl AgentRegistry {
         let changed = agent.belief.state != before
             || agent.belief.visible_blocker != before_blocker
             || before_gate;
+        // An admitted report that changed something is activity; a refused
+        // or outranked one stamps nothing.
+        if changed {
+            agent.last_active_at_unix = Some(now_unix);
+        }
         drop(terminals);
         if changed {
             self.announce(stream);
@@ -719,6 +779,11 @@ pub fn mint_token(stream: u32) -> CapabilityToken {
 mod tests {
     use super::*;
 
+    /// A fixed wall clock for activity stamps: tests pin behavior, never time.
+    const NOW: i64 = 1_750_000_000;
+    /// A second reading of the same clock: a stamp that must not move stays put.
+    const LATER: i64 = 1_750_000_100;
+
     fn registry() -> AgentRegistry {
         AgentRegistry::new().expect("registry")
     }
@@ -738,7 +803,7 @@ mod tests {
         assert_eq!(before.capability.generation, GenerationId::FIRST);
 
         let me = Pid(std::process::id() as i32);
-        let generation = r.note_foreground(1, Some(me)).expect("a change");
+        let generation = r.note_foreground(1, Some(me), NOW).expect("a change");
         assert!(generation > before.capability.generation);
         let after = r.agent(1).expect("agent");
         assert_eq!(after.belief.state, AgentRuntimeState::Unknown);
@@ -747,7 +812,7 @@ mod tests {
 
         // The same leader again is not a change, and must not mint a generation: a
         // generation per read would reject every observation ever sampled.
-        assert_eq!(r.note_foreground(1, Some(me)), None);
+        assert_eq!(r.note_foreground(1, Some(me), NOW), None);
     }
 
     /// A leader that is not an agent is looked into once per `RELOOK`, not on every read:
@@ -757,20 +822,20 @@ mod tests {
         let r = registry();
         r.register(1, TerminalId::new("1"), mint_token(1));
         let me = Pid(std::process::id() as i32);
-        r.note_foreground(1, Some(me)).expect("a change");
+        r.note_foreground(1, Some(me), NOW).expect("a change");
         assert_eq!(r.agent(1).expect("agent").relooked, None);
 
-        assert_eq!(r.note_foreground(1, Some(me)), None);
+        assert_eq!(r.note_foreground(1, Some(me), NOW), None);
         let first = r.agent(1).expect("agent").relooked.expect("looked into");
         for _ in 0..100 {
-            assert_eq!(r.note_foreground(1, Some(me)), None);
+            assert_eq!(r.note_foreground(1, Some(me), NOW), None);
         }
         assert_eq!(r.agent(1).expect("agent").relooked, Some(first));
         // Held back, not dropped: the read loop is told when to ask again.
         assert_eq!(r.relook_due(1), Some(first + RELOOK));
         // A process event's look is never held back: it is the one that finds the agent a
         // wrapper just forked.
-        assert_eq!(r.look(1, Some(me), false), None);
+        assert_eq!(r.look(1, Some(me), false, NOW), None);
         assert!(r.agent(1).expect("agent").relooked > Some(first));
         assert_eq!(r.relook_due(1), None, "a look pays what was owed");
     }
@@ -782,16 +847,16 @@ mod tests {
         let r = registry();
         r.register(1, TerminalId::new("1"), mint_token(1));
         let me = Pid(std::process::id() as i32);
-        r.note_foreground(1, Some(me)).expect("a change");
-        r.note_foreground(1, Some(me));
-        r.note_foreground(1, Some(me));
+        r.note_foreground(1, Some(me), NOW).expect("a change");
+        r.note_foreground(1, Some(me), NOW);
+        r.note_foreground(1, Some(me), NOW);
         assert!(r.relook_due(1).is_some());
         // Settled into an agent by another path.
         r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
             program: "claude".into(),
             generation: GenerationId::FIRST,
         };
-        assert_eq!(r.note_foreground(1, Some(me)), None);
+        assert_eq!(r.note_foreground(1, Some(me), NOW), None);
         assert_eq!(r.relook_due(1), None);
     }
 
@@ -811,12 +876,14 @@ mod tests {
             AgentRuntimeState::Blocked,
             true,
             false,
+            NOW,
         )
         .expect("applies");
         assert!(!r.observe_screen(
             1,
             "claude",
-            &screen_verdict(AgentRuntimeState::Working, false)
+            &screen_verdict(AgentRuntimeState::Working, false),
+            NOW
         ));
         // ...but the explanation still says what the screen claimed.
         let seen = r.agent(1).expect("agent");
@@ -826,7 +893,7 @@ mod tests {
         // A new foreground generation voids the old screen's reading with the
         // old belief: the rule described a process that is no longer there.
         let me = Pid(std::process::id() as i32);
-        r.note_foreground(1, Some(me)).expect("a change");
+        r.note_foreground(1, Some(me), NOW).expect("a change");
         let after = r.agent(1).expect("agent");
         assert_eq!(after.screen_rule, None);
         assert_eq!(after.screen_manifest, None);
@@ -888,7 +955,8 @@ mod tests {
         assert!(r.observe_screen(
             1,
             "test-manifest",
-            &screen_verdict(AgentRuntimeState::Working, false)
+            &screen_verdict(AgentRuntimeState::Working, false),
+            NOW
         ));
         let changed = r
             .observe_hook(
@@ -898,6 +966,7 @@ mod tests {
                 AgentRuntimeState::Idle,
                 false,
                 false,
+                NOW,
             )
             .expect("an admitted report applies");
         assert!(changed);
@@ -923,6 +992,7 @@ mod tests {
             AgentRuntimeState::Working,
             false,
             false,
+            NOW,
         )
         .expect("applies");
         let held = r.agent(1).expect("agent");
@@ -933,7 +1003,8 @@ mod tests {
         assert!(r.observe_screen(
             1,
             "test-manifest",
-            &screen_verdict(AgentRuntimeState::Blocked, true)
+            &screen_verdict(AgentRuntimeState::Blocked, true),
+            NOW
         ));
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
@@ -950,7 +1021,7 @@ mod tests {
         r.register(1, TerminalId::new("1"), token.clone());
         let first = r.agent(1).expect("agent").capability.generation;
         let me = Pid(std::process::id() as i32);
-        r.note_foreground(1, Some(me)).expect("a change");
+        r.note_foreground(1, Some(me), NOW).expect("a change");
         assert_eq!(
             r.admit(1, &TerminalId::new("1"), Some(&token), first),
             Err(ClaimRefusal::StaleGeneration)
@@ -975,6 +1046,7 @@ mod tests {
                 AgentRuntimeState::Blocked,
                 true,
                 false,
+                NOW,
             )
             .expect("applies");
         assert!(changed);
@@ -991,7 +1063,8 @@ mod tests {
                 &forged,
                 AgentRuntimeState::Idle,
                 false,
-                false
+                false,
+                NOW
             ),
             Err(ClaimRefusal::WrongTerminal)
         );
@@ -1002,7 +1075,8 @@ mod tests {
                 &token,
                 AgentRuntimeState::Idle,
                 false,
-                false
+                false,
+                NOW
             ),
             Err(ClaimRefusal::WrongTerminal)
         );
@@ -1027,6 +1101,7 @@ mod tests {
             AgentRuntimeState::Blocked,
             true,
             false,
+            NOW,
         )
         .expect("applies");
         let mut rx = r.subscribe();
@@ -1061,11 +1136,11 @@ mod tests {
         let _ = rx.try_recv(); // the registration announcement
 
         let working = screen_verdict(AgentRuntimeState::Working, false);
-        assert!(r.observe_screen(1, "test-manifest", &working));
+        assert!(r.observe_screen(1, "test-manifest", &working, NOW));
         rx.try_recv().expect("the change announces");
         for _ in 0..10 {
             assert!(
-                !r.observe_screen(1, "test-manifest", &working),
+                !r.observe_screen(1, "test-manifest", &working, NOW),
                 "no change, no publish"
             );
         }
@@ -1075,13 +1150,15 @@ mod tests {
         assert!(r.observe_screen(
             1,
             "test-manifest",
-            &screen_verdict(AgentRuntimeState::Working, true)
+            &screen_verdict(AgentRuntimeState::Working, true),
+            NOW
         ));
         rx.try_recv().expect("the new blocker announces");
         assert!(!r.observe_screen(
             1,
             "test-manifest",
-            &screen_verdict(AgentRuntimeState::Working, true)
+            &screen_verdict(AgentRuntimeState::Working, true),
+            NOW
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -1103,6 +1180,7 @@ mod tests {
             AgentRuntimeState::Blocked,
             true,
             false,
+            NOW,
         )
         .expect("applies");
         assert_eq!(
@@ -1131,7 +1209,7 @@ mod tests {
         {
             let mut terminals = r.terminals.lock().unwrap();
             let agent = terminals.get_mut(&1).expect("agent");
-            settle_exit(agent, 1);
+            settle_exit(agent, 1, NOW);
         }
         let after = r.agent(1).expect("agent");
         assert_eq!(after.belief.state, AgentRuntimeState::Idle);
@@ -1153,6 +1231,7 @@ mod tests {
             AgentRuntimeState::Working,
             false,
             false,
+            NOW,
         )
         .expect("applies");
         assert_eq!(
@@ -1168,7 +1247,7 @@ mod tests {
             visible_working: false,
             setup_gate: false,
         };
-        assert!(r.observe_screen(1, "test-manifest", &composer));
+        assert!(r.observe_screen(1, "test-manifest", &composer, NOW));
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Idle
@@ -1191,12 +1270,13 @@ mod tests {
             visible_working: false,
             setup_gate: true,
         };
-        assert!(r.observe_screen(1, "test-manifest", &trust));
+        assert!(r.observe_screen(1, "test-manifest", &trust, NOW));
         assert!(r.agent(1).expect("agent").setup_gate);
         assert!(r.observe_screen(
             1,
             "test-manifest",
-            &screen_verdict(AgentRuntimeState::Working, false)
+            &screen_verdict(AgentRuntimeState::Working, false),
+            NOW
         ));
         assert!(!r.agent(1).expect("agent").setup_gate);
     }
@@ -1217,7 +1297,7 @@ mod tests {
             visible_working: false,
             setup_gate: true,
         };
-        assert!(r.observe_screen(1, "test-manifest", &trust));
+        assert!(r.observe_screen(1, "test-manifest", &trust, NOW));
         assert!(r.agent(1).expect("agent").setup_gate);
         r.observe_hook(
             1,
@@ -1226,6 +1306,7 @@ mod tests {
             AgentRuntimeState::Working,
             false,
             false,
+            NOW,
         )
         .expect("a hook from the live session applies");
         assert!(!r.agent(1).expect("agent").setup_gate);
@@ -1271,5 +1352,132 @@ mod tests {
         assert_eq!(r.focus_events(1).len(), 1);
         r.forget(1);
         assert!(r.focus_events(1).is_empty());
+    }
+
+    /// G8: the activity stamp moves on accepted change only. Registration
+    /// starts unstamped (restore walks the same path, so a restarted fleet
+    /// paints nothing as fresh); an accepted hook stamps; a repeat that
+    /// changes nothing and a refused screen reading leave the stamp alone;
+    /// a new foreground generation stamps even before anything is known.
+    #[test]
+    fn the_activity_stamp_moves_on_accepted_change_only() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        assert_eq!(
+            r.agent(1).expect("agent").last_active_at_unix,
+            None,
+            "registration is not activity"
+        );
+        // Accepted hook: stamps.
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Working,
+            false,
+            false,
+            NOW,
+        )
+        .expect("applies");
+        assert_eq!(r.agent(1).expect("agent").last_active_at_unix, Some(NOW));
+        // Same report again: admitted but unchanged, so the stamp stays.
+        assert_eq!(
+            r.observe_hook(
+                1,
+                &TerminalId::new("1"),
+                &token,
+                AgentRuntimeState::Working,
+                false,
+                false,
+                LATER,
+            ),
+            Ok(false),
+            "a repeat changes nothing"
+        );
+        assert_eq!(
+            r.agent(1).expect("agent").last_active_at_unix,
+            Some(NOW),
+            "a repeat is not activity"
+        );
+        // A screen reading that changes nothing, refused or outranked or
+        // identical, leaves the stamp alone.
+        assert!(!r.observe_screen(
+            1,
+            "claude",
+            &screen_verdict(AgentRuntimeState::Idle, false),
+            LATER,
+        ));
+        assert_eq!(r.agent(1).expect("agent").last_active_at_unix, Some(NOW));
+        // An accepted screen reading stamps: fresh belief, first screen.
+        let r2 = registry();
+        r2.register(2, TerminalId::new("2"), mint_token(2));
+        assert!(r2.observe_screen(
+            2,
+            "claude",
+            &screen_verdict(AgentRuntimeState::Working, false),
+            LATER,
+        ));
+        assert_eq!(
+            r2.agent(2).expect("agent").last_active_at_unix,
+            Some(LATER),
+            "an accepted screen reading is activity"
+        );
+        // The same screen again: accepted but unchanged, stamp stays.
+        assert!(!r2.observe_screen(
+            2,
+            "claude",
+            &screen_verdict(AgentRuntimeState::Working, false),
+            LATER + 1,
+        ));
+        assert_eq!(
+            r2.agent(2).expect("agent").last_active_at_unix,
+            Some(LATER),
+            "an identical screen is not activity"
+        );
+        // Same leader again: no generation, no stamp.
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me), LATER).expect("a change");
+        assert_eq!(
+            r.agent(1).expect("agent").last_active_at_unix,
+            Some(LATER),
+            "a new generation is activity"
+        );
+        assert_eq!(r.note_foreground(1, Some(me), LATER + 1), None);
+        assert_eq!(
+            r.agent(1).expect("agent").last_active_at_unix,
+            Some(LATER),
+            "the same leader again is not activity"
+        );
+    }
+
+    /// G8: settling an exit stamps the idle it synthesizes, through the
+    /// acceptance rule like every other stamp.
+    #[test]
+    fn settling_an_exit_stamps_the_synthesized_idle() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Blocked,
+            true,
+            false,
+            NOW,
+        )
+        .expect("applies");
+        {
+            // Called directly because process events are not injectable in a
+            // unit test; the composition stamps the same value twice, so
+            // there is no observable difference to pin through `apply_events`.
+            let mut terminals = r.terminals.lock().unwrap();
+            let agent = terminals.get_mut(&1).expect("agent");
+            settle_exit(agent, 1, LATER);
+        }
+        let after = r.agent(1).expect("agent");
+        assert_eq!(after.belief.state, AgentRuntimeState::Idle);
+        assert_eq!(after.last_active_at_unix, Some(LATER));
     }
 }
