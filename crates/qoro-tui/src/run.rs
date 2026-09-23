@@ -856,6 +856,26 @@ enum MenuSend {
     Zoom,
 }
 
+/// Where a new terminal starts: the focused terminal's directory, as last reported.
+///
+/// A new tab opens where the
+/// person already is rather than where the daemon started. The daemon cannot do this
+/// itself: focus lives in this client, so the row's last known cwd travels on the
+/// request. A stale, relative or vanished directory falls back to `None`, which is the
+/// daemon's own directory, rather than failing the create.
+fn focused_cwd(state: &State) -> Option<String> {
+    let cwd = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == state.focused)?
+        .cwd
+        .clone()?;
+    (!cwd.is_empty()
+        && std::path::Path::new(&cwd).is_absolute()
+        && std::path::Path::new(&cwd).is_dir())
+    .then_some(cwd)
+}
+
 /// Run one menu row: prompts, messages and state changes happen here, and the
 /// caller only sends the returned request. One function for the keyboard and
 /// the mouse, so the two cannot disagree about what a row does.
@@ -951,7 +971,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     }
                     MenuSend::Control(ControlRequest::CreateTerminal {
                         id: format!("split-{request}"),
-                        cwd: None,
+                        cwd: focused_cwd(state),
                         workspace: space,
                         name: None,
                     })
@@ -1753,7 +1773,9 @@ async fn drive(
                                     }
                                     Naming::Terminal => ControlRequest::CreateTerminal {
                                         id: format!("new-{request}"),
-                                        cwd: None,
+                                        // The new tab follows the
+                                        // focused terminal's directory.
+                                        cwd: focused_cwd(&state),
                                         // The space the person is looking at.
                                         workspace: state.space,
                                         name,
@@ -2408,7 +2430,9 @@ async fn drive(
                                         wr.write_all(&client::encode_control_seq(
                                             &ControlRequest::CreateTerminal {
                                                 id: format!("split-{request}"),
-                                                cwd: None,
+                                                // The split follows
+                                                // the focused pane's directory.
+                                                cwd: focused_cwd(&state),
                                                 workspace: space,
                                                 name: None,
                                             },
@@ -2628,12 +2652,16 @@ async fn drive(
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
+                    // A new space's first terminal follows the
+                    // focused terminal's directory, which still names the space
+                    // the person came from at this point.
+                    let cwd = focused_cwd(&state);
                     for space in std::mem::take(&mut state.wants_terminal_in) {
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::CreateTerminal {
                                 id: format!("new-{request}"),
-                                cwd: None,
+                                cwd: cwd.clone(),
                                 workspace: Some(space),
                                 // The terminal a new space comes up with, which nobody
                                 // was asked about: they named the space.
@@ -3899,6 +3927,57 @@ mod tests {
             panes: std::collections::BTreeSet::new(),
             split_origin: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// A new tab follows the focused terminal's directory,
+    /// so it opens where the person is rather than where the daemon started.
+    #[test]
+    fn a_new_terminal_follows_the_focused_terminal_directory() {
+        let mut s = state();
+        let dir = std::env::temp_dir().display().to_string();
+        s.rows
+            .iter_mut()
+            .find(|r| r.terminal == s.focused)
+            .expect("focused row")
+            .cwd = Some(dir.clone());
+        assert_eq!(focused_cwd(&s), Some(dir));
+    }
+
+    #[test]
+    fn a_new_terminal_without_a_focused_directory_falls_back_to_the_daemon() {
+        // Nothing focused: no row to follow.
+        let mut s = state();
+        s.focused = 0;
+        assert_eq!(focused_cwd(&s), None);
+        // Focused but unknown: the index has not reported a directory yet.
+        let s = state();
+        assert_eq!(focused_cwd(&s), None);
+    }
+
+    #[test]
+    fn a_new_terminal_ignores_a_stale_or_relative_directory() {
+        // Vanished: sending it would fail the create instead of opening a tab.
+        let mut s = state();
+        s.rows
+            .iter_mut()
+            .find(|r| r.terminal == s.focused)
+            .expect("focused row")
+            .cwd = Some(
+            std::env::temp_dir()
+                .join("qoro-no-such-dir")
+                .display()
+                .to_string(),
+        );
+        assert_eq!(focused_cwd(&s), None);
+        // Relative: it would resolve against the daemon's directory, which is
+        // where the fallback already starts.
+        let mut s = state();
+        s.rows
+            .iter_mut()
+            .find(|r| r.terminal == s.focused)
+            .expect("focused row")
+            .cwd = Some("relative/path".to_string());
+        assert_eq!(focused_cwd(&s), None);
     }
 
     #[test]
