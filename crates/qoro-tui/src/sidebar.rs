@@ -96,11 +96,28 @@ const SPACE_NAME_AT: usize = 1;
 /// then the dot. The dot says the state in the state's own colour, so no
 /// state word is drawn on the right. Selection stays the raised background
 /// the painter adds, never a second dot.
+///
+/// Shape says failed: failed wears a diamond while every other state wears the
+/// circle, because failed's ember red-orange sits one step from blocked's orange
+/// and colour alone would not tell them apart at a glance.
 const DOT: char = '\u{25cf}';
+/// The failed dot: a diamond, the same single column as the circle.
+const FAILED_DOT: char = '\u{25c6}';
 /// The column the state dot sits at: one leading space.
 const DOT_AT: usize = 1;
 /// Columns the state dot covers: one glyph, one column.
 const DOT_LEN: usize = 1;
+
+/// Which mark a state dot wears: the diamond for failed, the circle for the rest.
+///
+/// Colour still rides the indicator beside the text; shape rides the text itself,
+/// so the pair survives colour blindness and light terminals alike.
+fn dot_glyph(role: crate::theme::Role) -> char {
+    match role {
+        crate::theme::Role::Failed => FAILED_DOT,
+        _ => DOT,
+    }
+}
 
 /// The state a terminal has when nothing has been able to say what it is doing.
 const UNKNOWN: &str = "unknown";
@@ -592,10 +609,11 @@ fn agents_panel(
 /// lands on the agent.
 ///
 /// Static: the state is the dot at the start of the first row, in the
-/// state's own colour, and no state word is drawn on the right. An unread
-/// done keeps the done sage on its dot. `tick` is ignored so a still panel
-/// is byte for byte the panel it was. The keyboard's row is the raised
-/// background the painter adds; no filled dot ever marks selection.
+/// state's own colour (and failed's own diamond: shape tells failed from
+/// blocked where their oranges will not), and no state word is drawn on the
+/// right. An unread done keeps the done sage on its dot. `tick` is ignored so
+/// a still panel is byte for byte the panel it was. The keyboard's row is the
+/// raised background the painter adds; no filled dot ever marks selection.
 ///
 /// One helper and not the same pushes at each caller, because the unfolded
 /// panel and the folded one have to draw the same rows for the same agent.
@@ -625,7 +643,7 @@ fn push_agent_lines(
     };
     out.push((
         Line {
-            text: fit(&format!(" {DOT} {session}")),
+            text: fit(&format!(" {} {session}", dot_glyph(dot))),
             colour: None,
             // The space lives on the second row now, so the first row carries
             // no space accent: the keyboard's row is the raised background.
@@ -786,11 +804,15 @@ pub(crate) fn rows_collapsed(
         if out.len() + 2 > height {
             break;
         }
+        let role = colour_for(&agent.state).unwrap_or(crate::theme::Role::Idle);
         out.push((
             Line {
-                text: strip_agent(),
+                text: strip_agent(role),
                 colour: colour_for(&agent.state),
-                accent: Some((1, 1, crate::theme::space_of(agent.workspace))),
+                // The space mark sits on the first pad cell, never on the glyph:
+                // the glyph column keeps the state colour, so the strip carries
+                // state and space side by side instead of painting one over the other.
+                accent: Some((2, 1, crate::theme::space_of(agent.workspace))),
                 indicator: None,
             },
             Some(Hit::Terminal(agent.terminal)),
@@ -814,11 +836,14 @@ pub(crate) fn rows_collapsed(
     out
 }
 
-/// One row of the folded strip for an agent: a middle dot, in the row's state
-/// colour. No circle, no filled dot for the selected row.
-fn strip_agent() -> String {
-    let text = " \u{b7}";
-    let pad = COLLAPSED.saturating_sub(crate::width::width(text));
+/// One row of the folded strip for an agent: the state mark, then the space's
+/// own middle dot, side by side. The painter only ever changes the foreground,
+/// so a space accent on a padding blank would be invisible: the space needs its
+/// own visible mark. Failed is the diamond, every other state the circle, and
+/// the middle dot always the space. No filled dot for the selected row.
+fn strip_agent(role: crate::theme::Role) -> String {
+    let text = format!(" {}\u{b7}", dot_glyph(role));
+    let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
     format!("{text}{}", " ".repeat(pad))
 }
 
@@ -1593,6 +1618,8 @@ mod tests {
                     // Everything left is one agent's two rows: the first names
                     // the session behind the state dot, the second the tab
                     // and the space under it. Both reach the same terminal.
+                    // Either dot glyph opens the first row: the circle for every
+                    // state but failed, the diamond for failed.
                     agents
                         .iter()
                         .find(|a| {
@@ -1601,13 +1628,14 @@ mod tests {
                                 .find(|s| s.id == a.workspace)
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("");
-                            let first = format!(" \u{25cf} {}", session_name(a));
+                            let first = |glyph: char| format!(" {glyph} {}", session_name(a));
                             let place = if space.is_empty() {
                                 label(a)
                             } else {
                                 format!("{space} - {}", label(a))
                             };
-                            text.starts_with(&first)
+                            text.starts_with(&first(DOT))
+                                || text.starts_with(&first(FAILED_DOT))
                                 || (text.starts_with("  ")
                                     && text.trim_end() == format!("  {place}"))
                         })
@@ -2259,6 +2287,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Shape says failed: the diamond for failed, the circle for the rest, so the
+    /// adjacent oranges never stand on colour alone. Failed is never news
+    /// (`is_new` only fires for done/idle), so the diamond is unconditional.
+    #[test]
+    fn failed_wears_the_diamond_and_every_other_state_the_circle() {
+        for state in ["working", "starting", "blocked", "done", "idle", "unknown"] {
+            assert_eq!(dot_glyph(crate::theme::of(state)), DOT, "{state}");
+        }
+        assert_eq!(dot_glyph(crate::theme::of("failed")), FAILED_DOT);
+        // And a failed agent renders the diamond in its row text, steady,
+        // carrying the failed colour on its indicator.
+        let agents = vec![agent(2, 2, "claude", "failed")];
+        let lines = render(&[space(2, "webshop")], &agents, 2, 2, 8);
+        let row = lines
+            .iter()
+            .find(|l| l.text.starts_with(" \u{25c6} "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no diamond row: {:?}",
+                    lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row.indicator,
+            Some((DOT_AT, DOT_LEN, crate::theme::of("failed")))
+        );
+        // Hitting the diamond row reaches the failed terminal.
+        let at = lines
+            .iter()
+            .position(|l| l.text.starts_with(" \u{25c6} "))
+            .unwrap();
+        assert_eq!(
+            hit(&[space(2, "webshop")], &agents, 2, 2, 8, at),
+            Some(Hit::Terminal(2))
+        );
+        // The folded panel draws the same diamond.
+        let folded = render_folded(
+            &[space(2, "webshop")],
+            &agents,
+            2,
+            2,
+            40,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+        );
+        assert!(
+            folded.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
+            "no folded diamond: {:?}",
+            folded.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        // An unseen failed finish keeps the diamond: failed is never news.
+        let mut unseen = Unseen::new();
+        unseen.insert((2, gen_of(&agents[0])));
+        let fresh_lines = render_folded(
+            &[space(2, "webshop")],
+            &agents,
+            2,
+            1,
+            40,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &unseen,
+        );
+        assert!(
+            fresh_lines.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
+            "unseen failed lost its diamond: {:?}",
+            fresh_lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// The collapsed strip keeps both channels visible too: the state mark
+    /// (diamond for failed, circle for the rest) in the state colour, then the
+    /// space's middle dot in the space colour, so neither signal paints over
+    /// the other and neither sits on an invisible blank.
+    #[test]
+    fn the_collapsed_strip_draws_a_diamond_for_failed() {
+        let agents = vec![
+            agent(1, 1, "codex", "blocked"),
+            agent(2, 2, "claude", "failed"),
+        ];
+        let lines = rows_collapsed(&[space(1, "app"), space(2, "webshop")], &agents, 1, 1, 12);
+        let texts: Vec<String> = lines.iter().map(|(l, _)| l.text.clone()).collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with(" \u{25c6}\u{b7}")),
+            "no strip diamond: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with(" \u{25cf}\u{b7}")),
+            "no strip circle: {texts:?}"
+        );
+        // The painted result, not just the text: the state mark keeps the
+        // state colour while the space dot carries the space.
+        let failed = lines
+            .iter()
+            .find(|(l, _)| l.text.starts_with(" \u{25c6}"))
+            .map(|(l, _)| l)
+            .expect("no strip diamond line");
+        assert_eq!(failed.colour, Some(crate::theme::of("failed")));
+        assert_eq!(failed.accent, Some((2, 1, crate::theme::space_of(2))));
+    }
+
+    /// Freshness points at done: an idle agent finished while the keyboard was
+    /// away wears the done circle, never a diamond, because failed is never news.
+    #[test]
+    fn a_fresh_idle_wears_the_done_circle() {
+        let agents = vec![agent(6, 1, "claude", "idle")];
+        let mut unseen = Unseen::new();
+        unseen.insert((6, gen_of(&agents[0])));
+        assert!(is_new(&agents[0], 1, &Seen::new(), &unseen));
+        let lines = render_folded(
+            &[space(1, "app")],
+            &agents,
+            1,
+            1,
+            40,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &unseen,
+        );
+        let row = lines
+            .iter()
+            .find(|l| l.indicator.is_some())
+            .expect("no agent row");
+        assert!(
+            row.text.starts_with(" \u{25cf} "),
+            "fresh idle is not a circle: {:?}",
+            row.text
+        );
+        assert_eq!(
+            row.indicator,
+            Some((DOT_AT, DOT_LEN, crate::theme::of("done")))
+        );
     }
 
     #[test]

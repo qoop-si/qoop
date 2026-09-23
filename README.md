@@ -20,7 +20,7 @@ terminal 2 is blocked
 ```
 
 The index says which terminal each agent is in and what it is doing. An agent waiting for an
-answer turns its row yellow and rings the bell, so you find out without looking. The name is
+answer lights its row and rings the bell, so you find out without looking. The name is
 the one you would say, not the runtime underneath it: an agent installed as a node package
 reads as itself, not as `node`.
 

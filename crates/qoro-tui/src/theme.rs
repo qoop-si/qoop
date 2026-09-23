@@ -37,12 +37,14 @@ pub enum Role {
     Done,
     Failed,
     Idle,
-    /// The working spinner's head, one step of the brand's own ambers.
+    /// The working spinner's head, one step of the brand's own violets and pinks.
     ///
-    /// The sidebar steps these eight times per loop while its glyph cycles four
-    /// circle frames, so the (glyph, step) combination repeats every eight ticks.
-    /// Amber and not teal on purpose: the row already wears [`Role::Working`],
-    /// and aliveness wants its own channel rather than a louder state colour.
+    /// The sidebar steps these five times per loop while its glyph cycles four
+    /// circle frames, so the (glyph, step) combination repeats every twenty ticks.
+    /// Violet-pink and not amber on purpose: amber now belongs to alarm
+    /// ([`Role::Blocked`] and [`Role::Failed`]), and aliveness wants its own
+    /// channel rather than a louder state colour. The wheel starts on the
+    /// brand's own ink and breathes outward toward pink.
     Ember(usize),
     /// A terminal nothing has said anything about yet.
     Unobserved,
@@ -69,23 +71,37 @@ pub fn space_of(id: i64) -> Role {
 /// The identity palette. Six, because a seventh distinct hue that is neither a state nor
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
-const SPACE_INKS: [u8; 6] = [111, 176, 215, 150, 117, 181];
-
-/// The spinner's ember wheel, from the brand accent out to pale amber and back.
 ///
-/// `#FF6600` is 202, which is also [`Role::Brand`]'s ink: the spinner starts on the
-/// product's own mark and breathes outward, and a blocked row wears it steady. `#f59e0b` is 214, `#FFD166` is 222,
-/// and the midpoints 208 and 220 are the nearest 256 entries between them.
-const EMBER_INKS: [u8; 5] = [202, 208, 214, 220, 222];
+/// Anchored in the product palette: 201 is vivid magenta of the `FF8FD9` pink
+/// family (the anchor 212 itself belongs to the selected tab and is spent once),
+/// 191 is `C7F245` lime, 227 is `F7F245` yellow, 27 is a brightened step of the
+/// `0044D7` blue family (the anchor 26 is too dim on dark grounds), 155 is a
+/// lime tint nearer to `C7F245` than its sibling steps, and 81 is a sky tint of
+/// the `00BBFF` family.
+/// Three of the six live in the lemon-yellow family and two sit near working
+/// blue; position carries those adjacencies (a space ink sits on the space name
+/// on the row below, a state sits on the first-row dot), because the palette
+/// gives no sixth far-apart hue.
+const SPACE_INKS: [u8; 6] = [201, 191, 227, 27, 155, 81];
+
+/// The spinner's violet-to-pink wheel, from the brand accent out toward pink.
+///
+/// `5A00EB` is 56, which is also [`Role::Brand`]'s ink: the spinner starts on the
+/// product's own mark and breathes outward, and a blocked row wears steady orange
+/// instead. 212 would be the nearest pink (`FF8FD9`, distance 8.2) but belongs to
+/// the selected tab, so the wheel lands on 213 then 218, the next-nearest pinks,
+/// bridged through 57 and 93.
+const EMBER_INKS: [u8; 5] = [56, 57, 93, 213, 218];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
 /// Loud on black on purpose: the column is scanned for the one row that needs
-/// a person, and that row wears the brand's own orange. Warm alarm: blocked is
-/// the accent (202), failed is full red (196), working is bright blue (75) so
-/// it never reads as done's green (82), done is bright green (82). Idle and
-/// unobserved stay in the greys, because a colour on every row is a column
-/// with no signal in it.
+/// a person. Blocked is warm orange (208, `FF7700`); failed is ember red-orange
+/// (202, `FD4B03`, the reddest the palette gives, so the pair is hue-adjacent
+/// and told apart by the dot's shape as well as its colour: see the sidebar).
+/// Working is bright sky (39, `00BBFF`) so it never reads as done's green
+/// (35, `00BB54`). Idle and unobserved stay in the greys, because a colour on
+/// every row is a column with no signal in it.
 pub fn of(state: &str) -> Role {
     match state {
         "working" | "starting" => Role::Working,
@@ -100,9 +116,14 @@ pub fn of(state: &str) -> Role {
 /// The 256 colour entry a role is painted in.
 ///
 /// The greys and the accent are the brand's own tokens, matched to the nearest entry in
-/// the 256 colour palette: text `#e5e5e5` is 254, muted `#666666` is 241, and the accent
-/// `#FF6600` is 202, which is `#ff5f00` and the closest there is. The states keep their
-/// own hues, because a state is not brand.
+/// the 256 colour palette: text `FCF7F1` is 231 (entry 15 is the same white but
+/// belongs to the person, so 231 is the nearest legal one), focused stays 255,
+/// muted `#666666` is 241, and the accent `5A00EB` is 56. The states keep their
+/// own hues, because a state is not brand: working `00BBFF` is 39, blocked
+/// `FF7700` is 208, done `00BB54` is 35, failed `FD4B03` is 202.
+///
+/// `5A00EB` is equidistant to 56 and 57; 56 wins for the mark (the deeper violet)
+/// and 57 serves as the ember wheel's second step.
 ///
 /// The rule is the one deliberate departure. The brand border is `#1a1a1a`, which is a
 /// line you can only see against the brand's own black; a terminal's background is
@@ -112,16 +133,16 @@ pub fn of(state: &str) -> Role {
 const fn ink(role: Role) -> u8 {
     match role {
         Role::Title => 244,
-        Role::Text => 254,
+        Role::Text => 231,
         Role::Focused => 255,
         Role::Detail => 245,
         Role::Faint => 241,
         Role::Rule => 237,
-        Role::Brand => 202,
-        Role::Working => 75,
-        Role::Blocked => 202,
-        Role::Done => 82,
-        Role::Failed => 196,
+        Role::Brand => 56,
+        Role::Working => 39,
+        Role::Blocked => 208,
+        Role::Done => 35,
+        Role::Failed => 202,
         Role::Idle => 242,
         Role::Unobserved => 238,
         Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
@@ -175,10 +196,12 @@ pub fn status_in(role: Role) -> String {
     format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(role))
 }
 
-/// The tab with the keyboard: bold amber on the raised background.
+/// The tab with the keyboard: bold pink on the raised background.
 ///
 /// Findable without reading it, and never a white pill: a white block is the brightest
 /// thing on the bar, and the selected tab is not the most urgent thing on it.
+/// Pink (212, `FF8FD9`) sits in the brand's own violet-pink family, far from every
+/// state; amber would now read as alarm, so the tab left amber behind.
 pub fn tab_on() -> String {
     format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, TAB_ON_FG)
 }
@@ -196,10 +219,11 @@ const SELECTED_BG: u8 = 236;
 /// The raised background of the status bar, a shade below the selected row so the two do
 /// not read as the same thing.
 const STATUS_BG: u8 = 233;
-/// The focused tab's ink: amber, on the selected row's background. White lives nowhere
+/// The focused tab's ink: pink, on the selected row's background. Worn exactly
+/// once: neither pool holds 212, and no state does. White lives nowhere
 /// on the selected chrome: the selected row wears detail ink and a state row wears its
 /// state's ink (see [`selected`] and [`selected_in`]).
-const TAB_ON_FG: u8 = 214;
+const TAB_ON_FG: u8 = 212;
 
 #[cfg(test)]
 mod tests {
@@ -256,15 +280,32 @@ mod tests {
     }
 
     /// The selected chrome is never white: neither the selected row nor the
-    /// selected tab may paint the brightest thing on the screen.
+    /// selected tab may paint the brightest thing on the screen. 231 counts as
+    /// white here too: it is the text ink, and text never leads selection.
     #[test]
     fn nothing_selected_is_white() {
         for escape in [selected(), tab_on()] {
             assert!(
-                !escape.contains("38;5;255") && !escape.contains("38;5;254"),
+                !escape.contains("38;5;255")
+                    && !escape.contains("38;5;254")
+                    && !escape.contains("38;5;231"),
                 "white leaked into the selected chrome: {escape:?}"
             );
         }
+    }
+
+    /// Ordinary text and keyboard focus are two different whites: 231 is the
+    /// nearest legal `FCF7F1` (entry 15 is the same white but user-themed) and
+    /// 255 already means focused. A stateless row keeps quiet detail ink on the
+    /// raised background either way; the background, not the tint, says focus.
+    /// 231 reads a touch brighter than 255 in isolation, but the two never
+    /// compete without the raised background between them, which is the actual
+    /// focus signal on dark and light grounds alike.
+    #[test]
+    fn text_and_focused_are_not_the_same_white() {
+        assert_ne!(ink(Role::Text), ink(Role::Focused));
+        assert_eq!(ink(Role::Text), 231);
+        assert_eq!(ink(Role::Focused), 255);
     }
 
     /// A state a person has to act on has to look different from one they do not, or the
@@ -275,14 +316,87 @@ mod tests {
         for loud in [Role::Blocked, Role::Failed, Role::Working, Role::Done] {
             assert!(!calm.contains(&ink(loud)), "{loud:?} is painted as calm");
         }
+        // Adjacent by palette constraint, never equal: the palette gives no pure
+        // red, so failed is the reddest orange there is, and the dot's shape
+        // carries what hue cannot (see the sidebar's failed diamond).
         assert_ne!(ink(Role::Blocked), ink(Role::Failed));
         assert_ne!(ink(Role::Working), ink(Role::Done));
     }
 
+    /// The mark is not a state and the tab is not an identity: brand must differ
+    /// from every state ink (the old suite passed even with Brand == Blocked),
+    /// and the pools below assert the rest.
+    #[test]
+    fn brand_is_not_the_colour_of_any_state() {
+        let states = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Unobserved,
+        ]
+        .map(ink);
+        assert!(
+            !states.contains(&ink(Role::Brand)),
+            "brand wears a state colour"
+        );
+    }
+
     /// A space colour that is also a state colour would have a person reading a project as
     /// a state, which is the one confusion this palette exists to prevent.
+    /// The mark and the selected tab count as taken too: an identity must never
+    /// become the brand or the tab.
     #[test]
     fn a_space_is_never_the_colour_of_a_state_or_of_the_chrome() {
+        let mut taken = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Unobserved,
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+            Role::Rule,
+            Role::Brand,
+        ]
+        .map(ink)
+        .to_vec();
+        taken.push(TAB_ON_FG);
+        for n in 0..SPACE_INKS.len() {
+            assert!(
+                !taken.contains(&ink(Role::Space(n))),
+                "space {n} wears a colour that already means something"
+            );
+        }
+    }
+
+    /// Identity and aliveness share no ink: a spinner step the colour of a space
+    /// would read as a project, and a space the colour of a spinner step as motion.
+    /// The selected tab is neither pool's nor any state's: it must not read as
+    /// a project, a spinner step, or a state from the bar.
+    #[test]
+    fn a_space_is_never_an_ember_step_and_the_tab_is_neither() {
+        let ember: Vec<u8> = (0..EMBER_INKS.len()).map(|n| ink(Role::Ember(n))).collect();
+        for n in 0..SPACE_INKS.len() {
+            assert!(
+                !ember.contains(&ink(Role::Space(n))),
+                "space {n} wears an ember step"
+            );
+        }
+        for (name, pool) in [
+            ("space", SPACE_INKS.to_vec()),
+            ("ember", EMBER_INKS.to_vec()),
+        ] {
+            assert!(
+                !pool.contains(&TAB_ON_FG),
+                "the selected tab wears a {name} pool colour"
+            );
+        }
         let taken = [
             Role::Working,
             Role::Blocked,
@@ -296,14 +410,13 @@ mod tests {
             Role::Detail,
             Role::Faint,
             Role::Rule,
+            Role::Brand,
         ]
         .map(ink);
-        for n in 0..SPACE_INKS.len() {
-            assert!(
-                !taken.contains(&ink(Role::Space(n))),
-                "space {n} wears a colour that already means something"
-            );
-        }
+        assert!(
+            !taken.contains(&TAB_ON_FG),
+            "the selected tab wears a taken colour"
+        );
     }
 
     /// A space keeps its colour for as long as it exists, and neighbours differ.
@@ -316,7 +429,8 @@ mod tests {
     }
 
     /// The ember wheel is five distinct steps that come back round, so the spinner
-    /// breathes out to pale amber and back rather than jumping between two hues.
+    /// breathes out from violet toward pink and back rather than jumping between
+    /// two hues.
     #[test]
     fn the_ember_wheel_is_five_distinct_steps_that_wrap() {
         let mut seen = std::collections::BTreeSet::new();
@@ -332,18 +446,26 @@ mod tests {
     }
 
     /// An ember is never a state colour: the spinner's aliveness must not read as
-    /// blocked, failed, working or done.
+    /// blocked, failed, working or done. Nor as chrome: a spinner step in a panel
+    /// grey would read as furniture instead of motion.
     #[test]
     fn an_ember_is_never_the_colour_of_a_state() {
-        let states = [
+        let taken = [
             Role::Working,
             Role::Blocked,
             Role::Done,
             Role::Failed,
             Role::Idle,
             Role::Unobserved,
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+            Role::Rule,
         ]
-        .map(ink);
+        .map(ink)
+        .to_vec();
         for n in 0..EMBER_INKS.len() {
             // Ember(0) is Brand's own ink by design (see above); the rest of the
             // wheel must belong to nobody else.
@@ -351,8 +473,8 @@ mod tests {
                 continue;
             }
             assert!(
-                !states.contains(&ink(Role::Ember(n))),
-                "ember {n} wears a state colour"
+                !taken.contains(&ink(Role::Ember(n))),
+                "ember {n} wears a taken colour"
             );
         }
     }
