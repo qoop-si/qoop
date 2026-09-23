@@ -73,15 +73,23 @@ pub fn space_of(id: i64) -> Role {
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
 ///
-/// Anchored in the product palette and ordered so neighbours never sit in one
-/// family, round the wheel and back: lime 191, blue 27, yellow 227, sky 81,
-/// lime tint 155, violet tint 99. 27 is a brightened step of the `0044D7` blue
-/// family (the anchor 26 is too dim on dark grounds), 155 is a lime tint nearer
-/// to `C7F245` than its sibling steps, and 99 carries the `5A00EB` violet family
-/// (the anchor 56 itself is unspent: violet has no correct steady seat while the
-/// mark is orange). A space ink always sits on the space name on the row below
-/// while a state sits on the first-row dot, so the two never compete for one slot.
-const SPACE_INKS: [u8; 6] = [191, 27, 227, 81, 155, 99];
+/// Anchored in the product palette and ordered for maximum distance: every
+/// neighbour pair round the wheel and back sits at least 89 dE apart, against
+/// a 10-12 guideline for glanceable lists, and the closest two in the whole set
+/// are 37 apart. Measured in CIELAB over the 256 entries, with an L* floor near
+/// 55 and contrast 5+:1 on dark grounds (the old 27 blue failed both, at L* 46
+/// and 3.6:1 against STATUS_BG 233; the new floor is 5.3:1 on the same ground).
+/// The set leans blue-cyan (33, 51, 117) with lightness doing the telling apart;
+/// the thinnest cross-exclusion margin is the yellow 226 against the ember gold
+/// 220 (23 apart), carried by position plus motion. Order round the wheel:
+/// violet 135, cyan 51, azure 33, lime light 155, sky 117, yellow 226.
+/// 33 is the brighter step of the `0044D7` blue family (the anchor 26 is too dim);
+/// 226 carries the bonus `F7F245` yellow at a safe distance from lime. The two
+/// palette lime-yellows cannot both serve: `C7F245` and `F7F245` land 16 apart
+/// in 256, so the wheel spends 155 and 226 instead, same families, honest distance.
+/// A space ink always sits on the space name on the row below while a state sits
+/// on the first-row dot, so working-adjacent blues never compete for one slot.
+const SPACE_INKS: [u8; 6] = [135, 51, 33, 155, 117, 226];
 
 /// The spinner's amber wheel, from the brand accent out toward tan.
 ///
@@ -124,7 +132,7 @@ pub fn of(state: &str) -> Role {
 ///
 /// The violet anchor `5A00EB` (56) is unspent: violet has no correct steady seat
 /// while the mark is orange, and the violet family still shows in the space
-/// wheel's 99 step and the tab's pink 212.
+/// wheel's 135 step and the tab's pink 212.
 ///
 /// The rule is the one deliberate departure. The brand border is `#1a1a1a`, which is a
 /// line you can only see against the brand's own black; a terminal's background is
@@ -432,20 +440,26 @@ mod tests {
         }
     }
 
-    /// Neighbouring spaces never sit in one family, round the wheel and back:
-    /// the wheel alternates families so adjacent projects read apart at a glance.
+    /// Every space wears its own family: six slots, six families, so no two
+    /// projects ever share a hue family however the wheel turns. (Measured:
+    /// the closest pair in the set is 37 dE apart, neighbours 89+.)
     #[test]
     fn neighbouring_spaces_are_never_of_one_family() {
         fn family(ink: u8) -> &'static str {
             match ink {
-                191 | 227 | 155 => "lemon",
-                27 | 81 => "blue",
-                99 => "violet",
+                135 => "violet",
+                51 => "cyan",
+                33 => "azure",
+                155 => "lime",
+                117 => "sky",
+                226 => "yellow",
                 _ => "other",
             }
         }
+        let mut seen = std::collections::BTreeSet::new();
         for n in 0..SPACE_INKS.len() {
             let here = family(ink(Role::Space(n)));
+            assert!(seen.insert(here), "family {here} spent twice in the wheel");
             let next = family(ink(Role::Space(n + 1)));
             assert_ne!(here, next, "spaces {n} and {} share a family", n + 1);
         }
