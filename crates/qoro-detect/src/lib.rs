@@ -218,6 +218,19 @@ struct Gate {
 }
 
 impl Gate {
+    /// Whether evaluating this gate can read the lowercased region copy.
+    ///
+    /// Only `contains` leaves touch `RegionView::lower`; every other leaf
+    /// reads `text` or `lines`. The region materialises the lowercase copy
+    /// only when this is true, so regex-only rules never pay for a second
+    /// string they never read.
+    fn needs_lower(&self) -> bool {
+        self.contains.is_some()
+            || self.all.iter().any(Gate::needs_lower)
+            || self.any.iter().any(Gate::needs_lower)
+            || self.not.iter().any(Gate::needs_lower)
+    }
+
     fn matches(&self, view: &RegionView<'_>) -> bool {
         if let Some(needle) = &self.contains
             && !view.lower.contains(needle.as_str())
@@ -514,7 +527,10 @@ impl Manifest {
             if best.is_some_and(|b| b.priority >= rule.priority) {
                 continue;
             }
-            if rule.gate.matches(&rule.region.view(capped, osc)) {
+            if rule
+                .gate
+                .matches(&rule.region.view(capped, osc, rule.gate.needs_lower()))
+            {
                 best = Some(rule);
             }
         }
@@ -768,6 +784,53 @@ mod tests {
         assert!(matched(&m, &["a"]));
         assert!(!matched(&m, &["a b"]));
         assert!(matched(&m, &["a b c"]));
+    }
+
+    #[test]
+    fn needs_lower_is_true_only_when_a_contains_leaf_exists() {
+        // `contains` is the only leaf that reads the lowercased copy. This
+        // proves the allocation is skipped, not just that results match:
+        // a regex-only gate must report false here.
+        let regex_only = Gate {
+            regex: Some(Regex::new("proceed").expect("test regex")),
+            ..Gate::default()
+        };
+        assert!(!regex_only.needs_lower());
+        let line_regex_only = Gate {
+            line_regex: Some(Regex::new("proceed").expect("test regex")),
+            ..Gate::default()
+        };
+        assert!(!line_regex_only.needs_lower());
+        let nested_no_contains = Gate {
+            any: vec![regex_only],
+            not: vec![line_regex_only],
+            ..Gate::default()
+        };
+        assert!(!nested_no_contains.needs_lower());
+        let nested_contains = Gate {
+            any: vec![
+                Gate {
+                    regex: Some(Regex::new("x").expect("test regex")),
+                    ..Gate::default()
+                },
+                Gate {
+                    not: vec![Gate {
+                        contains: Some("transcript".into()),
+                        ..Gate::default()
+                    }],
+                    ..Gate::default()
+                },
+            ],
+            ..Gate::default()
+        };
+        assert!(nested_contains.needs_lower());
+    }
+
+    #[test]
+    fn contains_matches_whatever_case_the_screen_uses() {
+        let m = one_rule("contains = \"Do You Want To Proceed\"\n");
+        assert!(matched(&m, &["do you want to proceed?"]));
+        assert!(matched(&m, &["DO YOU WANT TO PROCEED?"]));
     }
 
     #[test]

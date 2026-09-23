@@ -68,7 +68,16 @@ impl Region {
     }
 
     /// Materialise this region out of the (already capped) screen.
-    pub fn view<'a>(self, screen: &'a [String], osc: &OscContext<'a>) -> RegionView<'a> {
+    ///
+    /// `needs_lower` decides whether the lowercased copy is built. The caller
+    /// passes `Gate::needs_lower`: only `contains` leaves read it, so a
+    /// regex-only rule skips a whole second string allocation per evaluation.
+    pub fn view<'a>(
+        self,
+        screen: &'a [String],
+        osc: &OscContext<'a>,
+        needs_lower: bool,
+    ) -> RegionView<'a> {
         let lines: Vec<&'a str> = match self {
             // The side channel, never the screen: a title is not drawn as text,
             // and an empty title is no lines rather than a blank one, so a
@@ -112,7 +121,7 @@ impl Region {
                 screen[start..].iter().map(String::as_str).collect()
             }
         };
-        RegionView::new(lines)
+        RegionView::new(lines, needs_lower)
     }
 }
 
@@ -140,15 +149,22 @@ pub struct RegionView<'a> {
     pub lines: Vec<&'a str>,
     /// The same lines joined with newlines, for a whole region `regex`.
     pub text: String,
-    /// `text` lowercased, because `contains` is case insensitive and lowercasing the needle
-    /// at parse time only helps if the haystack is lowercased too.
+    /// `text` lowercased, for case-insensitive `contains`.
+    ///
+    /// Built only when the caller asked for it, because `contains` is the
+    /// only leaf that reads it. When the gate has no `contains` leaf this is
+    /// empty rather than a second allocated copy of `text`.
     pub lower: String,
 }
 
 impl<'a> RegionView<'a> {
-    fn new(lines: Vec<&'a str>) -> Self {
+    fn new(lines: Vec<&'a str>, needs_lower: bool) -> Self {
         let text = lines.join("\n");
-        let lower = text.to_lowercase();
+        let lower = if needs_lower {
+            text.to_lowercase()
+        } else {
+            String::new()
+        };
         Self { lines, text, lower }
     }
 }
@@ -182,20 +198,23 @@ mod tests {
         let osc = OscContext {
             title: "working title",
         };
-        assert_eq!(Region::OscTitle.view(&s, &osc).lines, vec!["working title"]);
+        assert_eq!(
+            Region::OscTitle.view(&s, &osc, true).lines,
+            vec!["working title"]
+        );
     }
 
     #[test]
     fn an_unset_title_is_no_lines_so_no_contains_leaf_can_match_it() {
         let s = screen(&["anything"]);
-        assert!(Region::OscTitle.view(&s, &no_osc()).lines.is_empty());
+        assert!(Region::OscTitle.view(&s, &no_osc(), true).lines.is_empty());
     }
 
     #[test]
     fn whole_screen_is_every_line() {
         let s = screen(&["a", "", "b"]);
         assert_eq!(
-            Region::WholeScreen.view(&s, &no_osc()).lines,
+            Region::WholeScreen.view(&s, &no_osc(), true).lines,
             vec!["a", "", "b"]
         );
     }
@@ -204,7 +223,7 @@ mod tests {
     fn bottom_lines_keeps_the_blank_padding() {
         let s = screen(&["a", "b", "", ""]);
         assert_eq!(
-            Region::BottomLines(3).view(&s, &no_osc()).lines,
+            Region::BottomLines(3).view(&s, &no_osc(), true).lines,
             vec!["b", "", ""]
         );
     }
@@ -213,7 +232,9 @@ mod tests {
     fn bottom_non_empty_lines_skips_the_padding_and_keeps_screen_order() {
         let s = screen(&["a", "b", "", "c", "   ", ""]);
         assert_eq!(
-            Region::BottomNonEmptyLines(2).view(&s, &no_osc()).lines,
+            Region::BottomNonEmptyLines(2)
+                .view(&s, &no_osc(), true)
+                .lines,
             vec!["b", "c"]
         );
     }
@@ -222,7 +243,7 @@ mod tests {
     fn top_non_empty_lines_skips_leading_blanks() {
         let s = screen(&["", "a", "", "b", "c"]);
         assert_eq!(
-            Region::TopNonEmptyLines(2).view(&s, &no_osc()).lines,
+            Region::TopNonEmptyLines(2).view(&s, &no_osc(), true).lines,
             vec!["a", "b"]
         );
     }
@@ -236,7 +257,9 @@ mod tests {
             "Allow command?",
         ]);
         assert_eq!(
-            Region::AfterLastPromptMarker.view(&s, &no_osc()).lines,
+            Region::AfterLastPromptMarker
+                .view(&s, &no_osc(), true)
+                .lines,
             vec!["Allow command?"]
         );
     }
@@ -248,7 +271,9 @@ mod tests {
         // than reading a little too much.
         let s = screen(&["Allow command?", "  1. Yes"]);
         assert_eq!(
-            Region::AfterLastPromptMarker.view(&s, &no_osc()).lines,
+            Region::AfterLastPromptMarker
+                .view(&s, &no_osc(), true)
+                .lines,
             vec!["Allow command?", "  1. Yes"]
         );
     }
@@ -257,8 +282,22 @@ mod tests {
     fn a_region_view_carries_a_lowercased_copy_for_contains() {
         let s = screen(&["Do You Want To Proceed?"]);
         assert_eq!(
-            Region::WholeScreen.view(&s, &no_osc()).lower,
+            Region::WholeScreen.view(&s, &no_osc(), true).lower,
             "do you want to proceed?"
+        );
+    }
+
+    #[test]
+    fn a_view_that_nothing_lowercases_skips_the_second_string() {
+        // `contains` is the only leaf that reads `lower`. A gate without one
+        // must not pay for a copy of the whole region text on every rule.
+        let s = screen(&["Do You Want To Proceed?"]);
+        let view = Region::WholeScreen.view(&s, &no_osc(), false);
+        assert_eq!(view.text, "Do You Want To Proceed?");
+        assert!(
+            view.lower.is_empty(),
+            "no contains leaf, so no lowercase copy: {:?}",
+            view.lower
         );
     }
 }
