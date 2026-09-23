@@ -20,6 +20,7 @@ members = [
     "crates/qoro-attention",
     "crates/qoro-bench",
     "crates/qoro-detect",
+    "crates/qoro-history",
     "spikes/spike-runtime",
 ]
 

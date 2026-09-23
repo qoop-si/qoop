@@ -476,6 +476,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "libc",
+ "qoro-history",
  "qoro-proto",
  "qoro-pty",
  "qoro-runtime",
@@ -522,6 +523,18 @@ name = "qoro-events"
 version = "0.2.0"
 dependencies = [
  "qoro-domain",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "qoro-history"
+version = "0.2.0"
+dependencies = [
+ "qoro-detect",
  "rusqlite",
  "serde",
  "serde_json",

@@ -71,6 +71,7 @@ fn main() -> std::io::Result<()> {
         Some("send") => run_send(&args),
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
+        Some("history") => run_history(&args),
         Some("agents") => run_agents(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
@@ -99,6 +100,9 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
+                  \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
+                  \x20                 print another agent's recent transcript window,\n\
+                  \x20                 local files only; --json prints the full window\n\
                   \x20 qoro agents [--json]  list every terminal and what it is doing\n\
                   \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
@@ -1241,6 +1245,175 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
     })
 }
 
+/// `qoro history`: print another agent's recent transcript window.
+///
+/// Resolution reuses `resolve_target` and the single `ListAgents` round
+/// trip, like `prompt`. The transcript itself is read from the agent
+/// product's own store by `qoro-history`, never through the daemon: local
+/// files only, newest last. Every refusal names the product and the id (or
+/// the missing hook report), never a filesystem path.
+fn run_history(args: &[String]) -> std::io::Result<()> {
+    use qoro_runtime::control::{ControlRequest, ControlResponse};
+
+    let opts = parse_history_args(args).map_err(std::io::Error::other)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let socket = paths::socket_path(&dir);
+        let (stream, mut inbuf) = client::connect(&socket, "qoro-history").await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let mut connection = client::Connection::new();
+        let mut seq = 0u32;
+        let id = format!(
+            "history-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let agents = match control_roundtrip(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            &ControlRequest::ListAgents { id },
+            Duration::from_secs(10),
+        )
+        .await?
+        .0
+        {
+            ControlResponse::Agents { agents, .. } => agents,
+            ControlResponse::Failed { reason, .. } => {
+                return Err(std::io::Error::other(reason));
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "unexpected answer to the agent listing",
+                ));
+            }
+        };
+        // The listing is the only reader of the registry, so history filters
+        // it rather than asking a second question: two answers to "what is
+        // there" would be two answers.
+        let row = resolve_target(&agents, &opts.target).map_err(std::io::Error::other)?;
+        let program = row.program.clone().unwrap_or_default();
+        let base = qoro_history::BaseDirs::from_home()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let window = qoro_history::history(
+            &program,
+            row.agent_session.as_deref(),
+            &base,
+            opts.last,
+            opts.role,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if opts.json {
+            println!(
+                "{}",
+                serde_json::to_string(&window).map_err(std::io::Error::other)?
+            );
+        } else {
+            let rendered = render_window_text(&window);
+            eprint!("{}", rendered.stderr);
+            print!("{}", rendered.stdout);
+        }
+        Ok(())
+    })
+}
+
+/// Parsed `qoro history` arguments, pure so the refusals are testable.
+struct HistoryOpts {
+    target: String,
+    last: usize,
+    role: Option<qoro_history::Role>,
+    json: bool,
+}
+
+/// History reads at most this many messages per call.
+const HISTORY_LAST_MAX: usize = 200;
+
+fn parse_history_args(args: &[String]) -> Result<HistoryOpts, String> {
+    let usage = "usage: qoro history <target> [--last N] [--role user|assistant] [--json]";
+    let target = args.get(2).cloned().ok_or_else(|| usage.to_string())?;
+    let mut last = 20usize;
+    let mut role = None;
+    let mut json = false;
+    let mut rest = args.iter().skip(3).peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--last" {
+            let n = rest.next().ok_or_else(|| usage.to_string())?;
+            last = n.parse::<usize>().map_err(|_| usage.to_string())?;
+            if last == 0 || last > HISTORY_LAST_MAX {
+                return Err(usage.to_string());
+            }
+        } else if arg == "--role" {
+            let r = rest.next().ok_or_else(|| usage.to_string())?;
+            role = Some(match r.as_str() {
+                "user" => qoro_history::Role::User,
+                "assistant" => qoro_history::Role::Assistant,
+                _ => return Err(usage.to_string()),
+            });
+        } else if arg == "--json" {
+            json = true;
+        } else {
+            return Err(format!("unknown flag {arg}; {usage}"));
+        }
+    }
+    Ok(HistoryOpts {
+        target,
+        last,
+        role,
+        json,
+    })
+}
+
+/// Text rendering of a window, pure so the pin line, the skipped warning
+/// and the truncation footnote are testable without a daemon.
+struct TextRender {
+    stdout: String,
+    stderr: String,
+}
+
+fn render_window_text(window: &qoro_history::Window) -> TextRender {
+    // The pin travels in --json inside the schema; text mode names it up
+    // front so the output is attributable without it.
+    let mut stdout = format!(
+        "session product={} id={}\n",
+        window.session.product.as_str(),
+        window.session.id
+    );
+    for m in &window.messages {
+        let role = match m.role {
+            qoro_history::Role::User => "user",
+            qoro_history::Role::Assistant => "assistant",
+        };
+        stdout.push_str(&format!("{role}: {}\n", truncate_text(&m.text)));
+    }
+    let mut stderr = String::new();
+    if window.skipped_lines > 0 {
+        stderr.push_str(&format!(
+            "warning: skipped {} corrupt transcript lines\n",
+            window.skipped_lines
+        ));
+    }
+    if window.truncated {
+        stderr.push_str("(older messages were not scanned)\n");
+    }
+    TextRender { stdout, stderr }
+}
+
+/// Cap one message for text output, marked. `--json` stays full fidelity.
+fn truncate_text(text: &str) -> String {
+    const CAP: usize = 4000;
+    for (count, (i, _)) in text.char_indices().enumerate() {
+        if count == CAP {
+            return format!("{}[…truncated]", &text[..i]);
+        }
+    }
+    text.to_string()
+}
+
 /// `qoro agents`: the live index, one row per terminal.
 ///
 /// Read only: one `ListAgents` round trip, no subscription, no input. The
@@ -1585,7 +1758,11 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{explain_row, prompt_refusal, resolve_target, take_session};
+    use super::{
+        explain_row, parse_history_args, prompt_refusal, render_window_text, resolve_target,
+        take_session, truncate_text,
+    };
+    use qoro_history::{Message, Role, SessionId, Window};
     use qoro_runtime::control::AgentRow;
     use qoro_runtime::paths;
 
@@ -1729,5 +1906,106 @@ mod tests {
         );
         let shell = row(3, None, Some("sh"));
         assert_eq!(prompt_refusal(&shell), None);
+    }
+
+    fn history_argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn history_defaults_to_twenty_newest() {
+        let opts = parse_history_args(&history_argv(&["qoro", "history", "2"])).unwrap();
+        assert_eq!(opts.target, "2");
+        assert_eq!(opts.last, 20);
+        assert!(opts.role.is_none());
+        assert!(!opts.json);
+    }
+
+    #[test]
+    fn history_parses_last_role_and_json() {
+        let opts = parse_history_args(&history_argv(&[
+            "qoro", "history", "claude", "--last", "5", "--role", "user", "--json",
+        ]))
+        .unwrap();
+        assert_eq!(opts.last, 5);
+        assert_eq!(opts.role, Some(qoro_history::Role::User));
+        assert!(opts.json);
+    }
+
+    #[test]
+    fn history_rejects_zero_over_max_bad_role_and_unknown_flags() {
+        assert!(
+            parse_history_args(&history_argv(&["qoro", "history", "2", "--last", "0"])).is_err()
+        );
+        assert!(
+            parse_history_args(&history_argv(&["qoro", "history", "2", "--last", "201"])).is_err()
+        );
+        assert!(parse_history_args(&history_argv(&["qoro", "history", "2", "--last"])).is_err());
+        assert!(
+            parse_history_args(&history_argv(&["qoro", "history", "2", "--role", "tool"])).is_err()
+        );
+        assert!(parse_history_args(&history_argv(&["qoro", "history", "2", "--bogus"])).is_err());
+        assert!(parse_history_args(&history_argv(&["qoro", "history"])).is_err());
+    }
+
+    #[test]
+    fn text_truncation_is_marked() {
+        assert_eq!(truncate_text("short"), "short");
+        let long = "x".repeat(4001);
+        let cut = truncate_text(&long);
+        assert!(cut.ends_with("[…truncated]"), "the cap is marked");
+        assert!(cut.starts_with(&"x".repeat(4000)));
+    }
+
+    fn window(messages: Vec<Message>, truncated: bool, skipped_lines: usize) -> Window {
+        Window {
+            session: SessionId {
+                product: qoro_history::Product::Claude,
+                id: "sid-1".to_string(),
+            },
+            messages,
+            truncated,
+            skipped_lines,
+        }
+    }
+
+    #[test]
+    fn text_render_pins_names_and_footnotes() {
+        let rendered = render_window_text(&window(
+            vec![Message {
+                role: Role::User,
+                text: "hi".to_string(),
+                ts: None,
+            }],
+            true,
+            2,
+        ));
+        assert!(
+            rendered
+                .stdout
+                .starts_with("session product=claude id=sid-1\n"),
+            "the pin line comes first: {:?}",
+            rendered.stdout
+        );
+        assert!(rendered.stdout.contains("user: hi\n"));
+        assert!(
+            rendered
+                .stderr
+                .contains("skipped 2 corrupt transcript lines"),
+            "skipped count on stderr: {:?}",
+            rendered.stderr
+        );
+        assert!(
+            rendered.stderr.contains("older messages were not scanned"),
+            "truncation footnote on stderr: {:?}",
+            rendered.stderr
+        );
+    }
+
+    #[test]
+    fn text_render_is_quiet_when_nothing_to_report() {
+        let rendered = render_window_text(&window(vec![], false, 0));
+        assert!(rendered.stderr.is_empty());
+        assert_eq!(rendered.stdout, "session product=claude id=sid-1\n");
     }
 }

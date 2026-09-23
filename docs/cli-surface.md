@@ -30,6 +30,7 @@ a claim nobody has to keep.
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
 | `qoro read <terminal>` | print another terminal's current screen | no |
 | `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt | no |
+| `qoro history <target> [--last N] [--role user|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
 | `qoro agents explain <target>` | one terminal: state, the source holding it, the screen rule that last matched and its manifest | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
