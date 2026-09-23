@@ -340,7 +340,8 @@ fn gemini_file_matches(path: &Path, id: &str) -> Result<bool, Error> {
     if len > crate::read::TAIL_WINDOW_BYTES {
         return Ok(false);
     }
-    let text = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
+    let text = String::from_utf8_lossy(&bytes);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Ok(false);
     };

@@ -145,7 +145,11 @@ fn load_gemini(path: &std::path::Path) -> Result<(Vec<Message>, usize, bool), Er
     if len > read::TAIL_WINDOW_BYTES {
         return Err(Error::TooLarge);
     }
-    let text = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
+    // Chats docs are JSON but not guaranteed UTF-8; decode lossy like the
+    // line readers do. Undecodable spans fail value parsing downstream and
+    // are counted, never fatal.
+    let text = String::from_utf8_lossy(&bytes);
     match gemini::parse_file(&text) {
         // The file matched at locate time but no longer parses (a writer
         // raced us): count it skipped rather than failing the whole call.
@@ -167,5 +171,18 @@ mod tests {
             .set_len(read::TAIL_WINDOW_BYTES + 1)
             .unwrap();
         assert!(matches!(load_gemini(&path), Err(Error::TooLarge)));
+    }
+
+    #[test]
+    fn non_utf8_gemini_bytes_decode_lossy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut raw = br#"{"sessionId":"g1","messages":[{"id":"m","timestamp":"2026-03-24T11:21:49.937Z","type":"user","content":"hi "#.to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        raw.extend_from_slice(br#""}]}"#);
+        std::fs::write(&path, raw).unwrap();
+        let (msgs, _, _) = load_gemini(&path).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
     }
 }
