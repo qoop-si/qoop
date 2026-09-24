@@ -16,6 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod hooks;
+mod skills;
 mod update;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
@@ -78,6 +79,7 @@ fn main() -> std::io::Result<()> {
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
+        Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
         Some("ls") => run_list_sessions(),
         Some("stop") => run_stop(&args, &session),
@@ -112,8 +114,10 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
-                 \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
-                 \x20                 doing and which conversation it is having\n\
+                  \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
+                  \x20                 doing and which conversation it is having\n\
+                  \x20 qoro skills ...  teach an agent what qoro is for, so it looks\n\
+                  \x20                 before it writes\n\
                  \x20 qoro ls         list the sessions and say which are running\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
                  \x20 qoro update [--check]  fetch the newest release, and install it when\n\

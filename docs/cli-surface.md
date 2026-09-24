@@ -38,6 +38,9 @@ a claim nobody has to keep.
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |
 | `qoro hooks uninstall [agent...]` | take out exactly what was installed | no |
+| `qoro skills status` | which agents' skills are installed, and whether they are current | no |
+| `qoro skills install [agent...]` | teach an agent what qoro is for, beside whatever skills it already has | no |
+| `qoro skills uninstall [agent...]` | take out exactly what was installed | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
 | `qoro update [--check]` | ask GitHub Releases for the newest macOS arm64 binary and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
