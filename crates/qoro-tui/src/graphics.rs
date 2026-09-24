@@ -52,7 +52,8 @@ impl GraphicsCap {
 /// multiplexer rather than the emulator behind it, and a wrong positive prints raw
 /// base64. Without an override, a conservative allowlist: Kitty where the
 /// variables say kitty or Ghostty (both document the protocol), iTerm2 inline
-/// where they say iTerm. WezTerm is off by default, its graphics support being
+/// where they say iTerm, and Kitty there too, because iTerm2 documents the Kitty
+/// protocol beside its own. WezTerm is off by default, its graphics support being
 /// unverified; one variable turns it on.
 pub fn detect() -> GraphicsCap {
     match std::env::var("QORO_GRAPHICS")
@@ -85,9 +86,13 @@ pub fn detect() -> GraphicsCap {
     let program = std::env::var("TERM_PROGRAM")
         .unwrap_or_default()
         .to_lowercase();
+    let iterm = program.contains("iterm");
     GraphicsCap {
-        kitty: term.contains("kitty") || program.contains("kitty") || program.contains("ghostty"),
-        iterm2: program.contains("iterm"),
+        kitty: term.contains("kitty")
+            || program.contains("kitty")
+            || program.contains("ghostty")
+            || iterm,
+        iterm2: iterm,
     }
 }
 
@@ -522,8 +527,10 @@ mod tests {
         assert!(out.ends_with(b"\x1b[3;7H\x1b[?25h\x1b[?2026l"));
     }
 
+    /// Capability detection reads the override first and the allowlist second,
+    /// in one test because both mutate the process environment.
     #[test]
-    fn capability_detection_honours_the_override() {
+    fn capability_detection_honours_override_then_allowlist() {
         let key = "QORO_GRAPHICS";
         for (value, want) in [
             ("off", GraphicsCap::off()),
@@ -553,5 +560,40 @@ mod tests {
             assert_eq!(detect(), want, "override {value}");
         }
         unsafe { std::env::remove_var(key) };
+        // Without an override the allowlist decides. iTerm2 speaks both protocols
+        // (its own inline images and Kitty graphics), so it gets both; anything
+        // unrecognised gets nothing rather than base64 garbage.
+        for (term, program, want) in [
+            (
+                "xterm-256color",
+                "iTerm.app",
+                GraphicsCap {
+                    kitty: true,
+                    iterm2: true,
+                },
+            ),
+            (
+                "xterm-ghostty",
+                "ghostty",
+                GraphicsCap {
+                    kitty: true,
+                    iterm2: false,
+                },
+            ),
+            (
+                "xterm-kitty",
+                "",
+                GraphicsCap {
+                    kitty: true,
+                    iterm2: false,
+                },
+            ),
+            ("xterm-256color", "", GraphicsCap::off()),
+        ] {
+            unsafe { std::env::set_var("TERM", term) };
+            unsafe { std::env::set_var("TERM_PROGRAM", program) };
+            assert_eq!(detect(), want, "terminal {term}/{program}");
+        }
+        unsafe { std::env::remove_var("TERM_PROGRAM") };
     }
 }
