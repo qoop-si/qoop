@@ -17,6 +17,7 @@ qoro-tui = { path = "../qoro-tui" }
 qoro-history = { path = "../qoro-history" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 bytes = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 qoro-proto = { path = "../qoro-proto" }
 qoro-store = { path = "../qoro-store" }

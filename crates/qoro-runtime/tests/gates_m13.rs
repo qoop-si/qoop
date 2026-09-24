@@ -331,6 +331,114 @@ async fn a_restart_reports_resumed_agents_shell_fallbacks_and_moved_directories(
     assert_eq!(report.cwd_fallback, 1, "{report:?}");
 }
 
+/// A restart repopulates the in-memory conversation id from the stored row.
+///
+/// The DB keeps the id (COALESCE preserves it); `open_terminal` starts memory
+/// at `None`. Without repopulating, `agents --json` shows `agent_session: null`
+/// and `history` fails with `MissingId` until the next hook report.
+#[tokio::test]
+async fn a_restart_repopulates_the_memory_conversation_id_from_the_stored_row() {
+    let dir = runtime_dir();
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        let tab = terminals.mint();
+        store
+            .create_terminal(tab as i64, workspace, "/tmp".into(), "/bin/sh".into())
+            .await
+            .expect("a row");
+        store
+            .set_agent(
+                tab as i64,
+                Some("claude".to_string()),
+                Some("ses_abc123".to_string()),
+            )
+            .await
+            .expect("an agent with a session");
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        assert!(
+            until(|| terminals.streams().len() == 2).await,
+            "the session came back with {} tabs rather than two: {:?}",
+            terminals.streams().len(),
+            terminals.streams()
+        );
+        // The daemon opens one of its own; the restored tab is the other one.
+        let restored: Vec<u32> = terminals
+            .streams()
+            .into_iter()
+            .filter(|s| terminals.session_of(*s).is_some())
+            .collect();
+        assert_eq!(
+            restored.len(),
+            1,
+            "exactly the restored tab carries a session: {:?}",
+            terminals.streams()
+        );
+        assert_eq!(
+            terminals.session_of(restored[0]),
+            Some("ses_abc123".to_string()),
+            "memory lost the stored conversation id across the restart"
+        );
+    })
+    .await;
+}
+
+/// An empty stored session stays empty in memory after a restart.
+///
+/// The restore skips blank ids like the live report path does, so a tab
+/// that never had a conversation does not gain a phantom one.
+#[tokio::test]
+async fn a_restart_leaves_a_blank_stored_session_blank_in_memory() {
+    let dir = runtime_dir();
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        let tab = terminals.mint();
+        store
+            .create_terminal(tab as i64, workspace, "/tmp".into(), "/bin/sh".into())
+            .await
+            .expect("a row");
+        store
+            .set_agent(
+                tab as i64,
+                Some("claude".to_string()),
+                Some("   ".to_string()),
+            )
+            .await
+            .expect("an agent with a blank session");
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        assert!(
+            until(|| terminals.streams().len() == 2).await,
+            "the session came back with {} tabs rather than two: {:?}",
+            terminals.streams().len(),
+            terminals.streams()
+        );
+        assert!(
+            terminals
+                .streams()
+                .iter()
+                .all(|s| terminals.session_of(*s).is_none()),
+            "a blank stored session became a memory session: {:?}",
+            terminals
+                .streams()
+                .iter()
+                .map(|s| terminals.session_of(*s))
+                .collect::<Vec<_>>()
+        );
+    })
+    .await;
+}
+
 /// The shutdown request answers before it goes, and says what it is ending.
 ///
 /// Not run against a daemon that would exit the test process: what is asserted is that the

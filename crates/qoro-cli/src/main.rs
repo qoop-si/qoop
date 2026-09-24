@@ -72,6 +72,7 @@ fn main() -> std::io::Result<()> {
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
         Some("history") => run_history(&args),
+        Some("context") => run_context(&args),
         Some("agents") => run_agents(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
@@ -103,6 +104,10 @@ fn main() -> std::io::Result<()> {
                   \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
                   \x20                 local files only; --json prints the full window\n\
+                  \x20 qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
+                  \x20                 understand another agent before writing to it:\n\
+                  \x20                 who it is, whether it is writable, its live screen\n\
+                  \x20                 and its recent transcript window\n\
                   \x20 qoro agents [--json]  list every terminal and what it is doing\n\
                   \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
@@ -969,13 +974,129 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     })
 }
 
+/// Fetch one terminal's live screen: subscribe, settle, keep the last snapshot.
+///
+/// The same lane `run_read` uses. The daemon publishes the live screen on
+/// subscribe, so settle briefly and keep the last snapshot rather than the
+/// first. Shared by `read` and `context` so the two cannot disagree about
+/// what "the screen" means.
+async fn fetch_snapshot(
+    terminal: u32,
+    who: &str,
+) -> std::io::Result<qoro_runtime::daemon::SnapshotWire> {
+    use qoro_runtime::control::{ControlRequest, ControlResponse};
+    use tokio::io::AsyncReadExt;
+
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    let (stream, mut inbuf) = client::connect(&socket, who).await?;
+    let (mut rd, mut wr) = stream.into_split();
+    let mut connection = client::Connection::new();
+    let mut seq = 0u32;
+    let id = format!(
+        "read-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let (subscribed, mut stashed) = control_roundtrip(
+        &mut rd,
+        &mut wr,
+        &mut inbuf,
+        &mut connection,
+        &mut seq,
+        &ControlRequest::Subscribe {
+            id,
+            terminals: vec![terminal],
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
+    match subscribed {
+        ControlResponse::Subscribed { terminals, .. } if terminals.contains(&terminal) => {}
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "no such terminal: {terminal}"
+            )));
+        }
+    }
+    let mut read = [0u8; 64 * 1024];
+    // The first snapshot for the terminal can predate the subscription: output
+    // printed while nobody watched was never published.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut latest: Option<qoro_runtime::daemon::SnapshotWire> = None;
+        let settle = std::time::Instant::now() + Duration::from_millis(500);
+        for incoming in stashed.drain(..) {
+            if let client::Incoming::Render {
+                terminal: t,
+                snapshot,
+            } = incoming
+                && t == terminal
+            {
+                latest = Some(snapshot);
+            }
+        }
+        loop {
+            for incoming in connection.drain(&mut inbuf)? {
+                if let client::Incoming::Render {
+                    terminal: t,
+                    snapshot,
+                } = incoming
+                    && t == terminal
+                {
+                    latest = Some(snapshot);
+                }
+            }
+            let now = std::time::Instant::now();
+            if latest.is_some() && now >= settle {
+                break;
+            }
+            if latest.is_none() {
+                // Nothing yet: wait for the first snapshot, bounded by the
+                // outer timeout rather than by the settle window.
+                let n = rd.read(&mut read).await?;
+                if n == 0 {
+                    break;
+                }
+                inbuf.extend_from_slice(&read[..n]);
+            } else {
+                // Settling: wait at most the remaining window for a newer
+                // snapshot, then keep what arrived last.
+                match tokio::time::timeout(settle - now, rd.read(&mut read)).await {
+                    Err(_) => break,
+                    Ok(Err(e)) => return Err::<_, std::io::Error>(e),
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => inbuf.extend_from_slice(&read[..n]),
+                }
+            }
+        }
+        latest.ok_or_else(|| {
+            std::io::Error::other("the daemon closed the connection before sending a snapshot")
+        })
+    })
+    .await
+    .map_err(|_| std::io::Error::other(format!("no output from terminal {terminal} within 10s")))?
+}
+
+/// Trim trailing blank rows, then keep the last N when asked.
+fn trim_rows(mut rows: Vec<String>, lines: Option<usize>) -> Vec<String> {
+    while rows.last().is_some_and(|l| l.trim().is_empty()) {
+        rows.pop();
+    }
+    if let Some(n) = lines
+        && rows.len() > n
+    {
+        rows = rows[rows.len() - n..].to_vec();
+    }
+    rows
+}
+
 /// `qoro read`: print another terminal's current screen.
 ///
 /// Subscribes, takes the first snapshot for that terminal and prints it.
 /// Trailing blank rows are trimmed; `--lines N` keeps the last N rows.
 fn run_read(args: &[String]) -> std::io::Result<()> {
-    use qoro_runtime::control::{ControlRequest, ControlResponse};
-
     let usage = "usage: qoro read <terminal> [--lines N]";
     let terminal: u32 = args
         .get(2)
@@ -999,112 +1120,8 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        use tokio::io::AsyncReadExt;
-
-        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-        let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-read").await?;
-        let (mut rd, mut wr) = stream.into_split();
-        let mut connection = client::Connection::new();
-        let mut seq = 0u32;
-        let id = format!(
-            "read-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let (subscribed, mut stashed) = control_roundtrip(
-            &mut rd,
-            &mut wr,
-            &mut inbuf,
-            &mut connection,
-            &mut seq,
-            &ControlRequest::Subscribe {
-                id,
-                terminals: vec![terminal],
-            },
-            Duration::from_secs(10),
-        )
-        .await?;
-        match subscribed {
-            ControlResponse::Subscribed { terminals, .. } if terminals.contains(&terminal) => {}
-            _ => {
-                return Err(std::io::Error::other(format!(
-                    "no such terminal: {terminal}"
-                )));
-            }
-        }
-        let mut read = [0u8; 64 * 1024];
-        // The first snapshot for the terminal can predate the subscription: output
-        // printed while nobody watched was never published. The daemon publishes the
-        // live screen on subscribe, so settle briefly and keep the last snapshot
-        // rather than the first.
-        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut latest: Option<qoro_runtime::daemon::SnapshotWire> = None;
-            let settle = std::time::Instant::now() + Duration::from_millis(500);
-            for incoming in stashed.drain(..) {
-                if let client::Incoming::Render {
-                    terminal: t,
-                    snapshot,
-                } = incoming
-                    && t == terminal
-                {
-                    latest = Some(snapshot);
-                }
-            }
-            loop {
-                for incoming in connection.drain(&mut inbuf)? {
-                    if let client::Incoming::Render {
-                        terminal: t,
-                        snapshot,
-                    } = incoming
-                        && t == terminal
-                    {
-                        latest = Some(snapshot);
-                    }
-                }
-                let now = std::time::Instant::now();
-                if latest.is_some() && now >= settle {
-                    break;
-                }
-                if latest.is_none() {
-                    // Nothing yet: wait for the first snapshot, bounded by the
-                    // outer timeout rather than by the settle window.
-                    let n = rd.read(&mut read).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    inbuf.extend_from_slice(&read[..n]);
-                } else {
-                    // Settling: wait at most the remaining window for a newer
-                    // snapshot, then keep what arrived last.
-                    match tokio::time::timeout(settle - now, rd.read(&mut read)).await {
-                        Err(_) => break,
-                        Ok(Err(e)) => return Err::<_, std::io::Error>(e),
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => inbuf.extend_from_slice(&read[..n]),
-                    }
-                }
-            }
-            latest.ok_or_else(|| {
-                std::io::Error::other("the daemon closed the connection before sending a snapshot")
-            })
-        })
-        .await
-        .map_err(|_| {
-            std::io::Error::other(format!("no output from terminal {terminal} within 10s"))
-        })??;
-        let mut rows = snapshot.lines;
-        while rows.last().is_some_and(|l| l.trim().is_empty()) {
-            rows.pop();
-        }
-        if let Some(n) = lines
-            && rows.len() > n
-        {
-            rows = rows[rows.len() - n..].to_vec();
-        }
-        for row in &rows {
+        let snapshot = fetch_snapshot(terminal, "qoro-read").await?;
+        for row in &trim_rows(snapshot.lines, lines) {
             println!("{row}");
         }
         Ok(())
@@ -1422,6 +1439,267 @@ fn truncate_text(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+/// `qoro context`: understand another agent before writing to it.
+///
+/// One `ListAgents` round trip resolves the target and answers who it is
+/// and whether it is writable; the live screen comes down the same lane
+/// `read` uses; the transcript window is read from the agent product's own
+/// store like `history`, local files only. Read-only composition: no new
+/// control method, no bytes to any child.
+///
+/// The transcript section never hard-fails the command: a terminal with no
+/// reported session id still shows its row, its screen and its writability,
+/// with the history refusal as a line rather than an exit status.
+fn run_context(args: &[String]) -> std::io::Result<()> {
+    use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse};
+
+    let opts = parse_context_args(args).map_err(std::io::Error::other)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let socket = paths::socket_path(&dir);
+        let (stream, mut inbuf) = client::connect(&socket, "qoro-context").await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let mut connection = client::Connection::new();
+        let mut seq = 0u32;
+        let id = format!(
+            "context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let agents = match control_roundtrip(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            &ControlRequest::ListAgents { id },
+            Duration::from_secs(10),
+        )
+        .await?
+        .0
+        {
+            ControlResponse::Agents { agents, .. } => agents,
+            ControlResponse::Failed { reason, .. } => {
+                return Err(std::io::Error::other(reason));
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "unexpected answer to the agent listing",
+                ));
+            }
+        };
+        let row: AgentRow = resolve_target(&agents, &opts.target)
+            .map_err(std::io::Error::other)?
+            .clone();
+        let refusal = prompt_refusal(&row);
+        let screen = trim_rows(
+            fetch_snapshot(row.terminal, "qoro-context").await?.lines,
+            opts.lines,
+        );
+        let program = row.program.clone().unwrap_or_default();
+        let history: Result<qoro_history::Window, String> = qoro_history::BaseDirs::from_home()
+            .map_err(|e| e.to_string())
+            .and_then(|base| {
+                qoro_history::history(
+                    &program,
+                    row.agent_session.as_deref(),
+                    &base,
+                    opts.last,
+                    opts.role,
+                )
+                .map_err(|e| e.to_string())
+            });
+        if opts.json {
+            println!(
+                "{}",
+                serde_json::to_string(&ContextJson::new(
+                    &row,
+                    refusal.as_deref(),
+                    &screen,
+                    history
+                ))
+                .map_err(std::io::Error::other)?
+            );
+        } else {
+            print!(
+                "{}",
+                render_context_text(&row, refusal.as_deref(), &screen, history)
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Parsed `qoro context` arguments, pure so the refusals are testable.
+struct ContextOpts {
+    target: String,
+    last: usize,
+    role: Option<qoro_history::Role>,
+    lines: Option<usize>,
+    json: bool,
+}
+
+fn parse_context_args(args: &[String]) -> Result<ContextOpts, String> {
+    let usage =
+        "usage: qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]";
+    let target = args.get(2).cloned().ok_or_else(|| usage.to_string())?;
+    let mut last = 20usize;
+    let mut role = None;
+    let mut lines: Option<usize> = None;
+    let mut json = false;
+    let mut rest = args.iter().skip(3).peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--last" {
+            let n = rest.next().ok_or_else(|| usage.to_string())?;
+            last = n.parse::<usize>().map_err(|_| usage.to_string())?;
+            if last == 0 || last > HISTORY_LAST_MAX {
+                return Err(usage.to_string());
+            }
+        } else if arg == "--role" {
+            let r = rest.next().ok_or_else(|| usage.to_string())?;
+            role = Some(match r.as_str() {
+                "user" => qoro_history::Role::User,
+                "assistant" => qoro_history::Role::Assistant,
+                _ => return Err(usage.to_string()),
+            });
+        } else if arg == "--lines" {
+            lines = Some(
+                rest.next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| usage.to_string())?,
+            );
+        } else if arg == "--json" {
+            json = true;
+        } else {
+            return Err(format!("unknown flag {arg}; {usage}"));
+        }
+    }
+    Ok(ContextOpts {
+        target,
+        last,
+        role,
+        lines,
+        json,
+    })
+}
+
+/// Machine form of one context: the row subset an agent polls, writability,
+/// the trimmed screen and either the transcript window or the refusal.
+#[derive(serde::Serialize)]
+struct ContextJson<'a> {
+    terminal: u32,
+    workspace: i64,
+    name: Option<&'a str>,
+    program: Option<&'a str>,
+    state: &'a str,
+    readiness: &'a str,
+    agent: bool,
+    agent_session: Option<&'a str>,
+    agent_title: Option<&'a str>,
+    generation: Option<u64>,
+    source: Option<&'a str>,
+    cwd: Option<&'a str>,
+    last_active_at_unix: Option<i64>,
+    writable: bool,
+    refusal: Option<&'a str>,
+    screen: &'a [String],
+    #[serde(flatten)]
+    history: ContextHistory,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ContextHistory {
+    Window { history: qoro_history::Window },
+    Refused { history_error: String },
+}
+
+impl<'a> ContextJson<'a> {
+    fn new(
+        row: &'a qoro_runtime::control::AgentRow,
+        refusal: Option<&'a str>,
+        screen: &'a [String],
+        history: Result<qoro_history::Window, String>,
+    ) -> Self {
+        Self {
+            terminal: row.terminal,
+            workspace: row.workspace,
+            name: row.name.as_deref(),
+            program: row.program.as_deref(),
+            state: &row.state,
+            readiness: &row.readiness,
+            agent: row.agent,
+            agent_session: row.agent_session.as_deref(),
+            agent_title: row.agent_title.as_deref(),
+            generation: row.generation,
+            source: row.source.as_deref(),
+            cwd: row.cwd.as_deref(),
+            last_active_at_unix: row.last_active_at_unix,
+            writable: refusal.is_none(),
+            refusal,
+            screen,
+            history: match history {
+                Ok(history) => ContextHistory::Window { history },
+                Err(history_error) => ContextHistory::Refused { history_error },
+            },
+        }
+    }
+}
+
+/// Human form of one context: who, writable, screen, transcript.
+fn render_context_text(
+    row: &qoro_runtime::control::AgentRow,
+    refusal: Option<&str>,
+    screen: &[String],
+    history: Result<qoro_history::Window, String>,
+) -> String {
+    let mut out = String::new();
+    let who = row
+        .name
+        .clone()
+        .or_else(|| row.program.clone())
+        .unwrap_or_else(|| format!("terminal {}", row.terminal));
+    out.push_str(&format!(
+        "terminal={} workspace={} who={} state={} readiness={} session={} cwd={}\n",
+        row.terminal,
+        row.workspace,
+        who,
+        row.state,
+        row.readiness,
+        row.agent_session.as_deref().unwrap_or("-"),
+        row.cwd.as_deref().unwrap_or("-"),
+    ));
+    match refusal {
+        None => out.push_str("writable=yes\n"),
+        Some(reason) => out.push_str(&format!("writable=no ({reason})\n")),
+    }
+    out.push_str("--- screen ---\n");
+    for line in screen {
+        out.push_str(line);
+        out.push('\n');
+    }
+    match history {
+        Ok(window) => {
+            let rendered = render_window_text(&window);
+            if !rendered.stderr.is_empty() {
+                out.push_str(&rendered.stderr);
+                if !rendered.stderr.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.push_str("--- history ---\n");
+            out.push_str(&rendered.stdout);
+        }
+        Err(e) => {
+            out.push_str(&format!("--- history: {e}\n"));
+        }
+    }
+    out
 }
 
 /// `qoro agents`: the live index, one row per terminal.
@@ -1769,8 +2047,9 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        explain_row, parse_history_args, prompt_refusal, render_window_text, resolve_target,
-        take_session, truncate_text,
+        ContextJson, explain_row, parse_context_args, parse_history_args, prompt_refusal,
+        render_context_text, render_window_text, resolve_target, take_session, trim_rows,
+        truncate_text,
     };
     use qoro_history::{Message, Role, SessionId, Window};
     use qoro_runtime::control::AgentRow;
@@ -2019,5 +2298,146 @@ mod tests {
         let rendered = render_window_text(&window(vec![], false, 0));
         assert!(rendered.stderr.is_empty());
         assert_eq!(rendered.stdout, "session product=claude id=sid-1\n");
+    }
+
+    fn context_argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn context_defaults_to_twenty_newest_and_full_screen() {
+        let opts = parse_context_args(&context_argv(&["qoro", "context", "2"])).unwrap();
+        assert_eq!(opts.target, "2");
+        assert_eq!(opts.last, 20);
+        assert!(opts.role.is_none());
+        assert_eq!(opts.lines, None);
+        assert!(!opts.json);
+    }
+
+    #[test]
+    fn context_parses_last_role_lines_and_json() {
+        let opts = parse_context_args(&context_argv(&[
+            "qoro", "context", "claude", "--last", "5", "--role", "user", "--lines", "10", "--json",
+        ]))
+        .unwrap();
+        assert_eq!(opts.last, 5);
+        assert_eq!(opts.role, Some(qoro_history::Role::User));
+        assert_eq!(opts.lines, Some(10));
+        assert!(opts.json);
+    }
+
+    #[test]
+    fn context_rejects_zero_over_max_bad_role_and_unknown_flags() {
+        assert!(
+            parse_context_args(&context_argv(&["qoro", "context", "2", "--last", "0"])).is_err()
+        );
+        assert!(
+            parse_context_args(&context_argv(&["qoro", "context", "2", "--last", "201"])).is_err()
+        );
+        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--last"])).is_err());
+        assert!(
+            parse_context_args(&context_argv(&["qoro", "context", "2", "--role", "tool"])).is_err()
+        );
+        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--bogus"])).is_err());
+        assert!(parse_context_args(&context_argv(&["qoro", "context"])).is_err());
+        // --lines takes a number, like read.
+        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--lines"])).is_err());
+        assert!(
+            parse_context_args(&context_argv(&["qoro", "context", "2", "--lines", "x"])).is_err()
+        );
+    }
+
+    #[test]
+    fn context_text_names_writability_screen_and_history() {
+        let mut blocked = row(2, None, Some("claude"));
+        blocked.state = "blocked".into();
+        let text = render_context_text(
+            &blocked,
+            prompt_refusal(&blocked).as_deref(),
+            &["$ cargo test".to_string()],
+            Ok(window(
+                vec![Message {
+                    role: Role::User,
+                    text: "do it".to_string(),
+                    ts: None,
+                }],
+                false,
+                0,
+            )),
+        );
+        assert!(text.contains("terminal=2"), "{text}");
+        assert!(text.contains("state=blocked"), "{text}");
+        assert!(text.contains("writable=no"), "{text}");
+        assert!(text.contains("--- screen ---"), "{text}");
+        assert!(text.contains("$ cargo test"), "{text}");
+        assert!(text.contains("--- history ---"), "{text}");
+        assert!(text.contains("user: do it"), "{text}");
+    }
+
+    #[test]
+    fn context_text_keeps_a_history_refusal_as_a_line() {
+        let idle = row(1, None, Some("opencode"));
+        let text = render_context_text(&idle, None, &[], Err("no session id reported".into()));
+        assert!(text.contains("writable=yes"), "{text}");
+        assert!(
+            text.contains("--- history: no session id reported"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn context_json_marks_writability_and_refusals() {
+        let idle = row(1, None, Some("opencode"));
+        let refused: Result<Window, String> = Err("no session id reported".into());
+        let value =
+            serde_json::to_value(ContextJson::new(&idle, None, &[], refused)).expect("encode");
+        assert_eq!(value["terminal"], 1);
+        assert_eq!(value["writable"], true);
+        assert_eq!(value["history_error"], "no session id reported");
+    }
+
+    #[test]
+    fn context_json_carries_a_window_and_a_refusal_reason() {
+        let mut blocked = row(2, None, Some("claude"));
+        blocked.state = "blocked".into();
+        let screen = vec!["$ cargo test".to_string()];
+        let won = window(
+            vec![Message {
+                role: Role::Assistant,
+                text: "done".to_string(),
+                ts: Some(1000),
+            }],
+            false,
+            0,
+        );
+        let value = serde_json::to_value(ContextJson::new(
+            &blocked,
+            prompt_refusal(&blocked).as_deref(),
+            &screen,
+            Ok(won),
+        ))
+        .expect("encode");
+        assert_eq!(value["writable"], false);
+        assert!(
+            value["refusal"]
+                .as_str()
+                .is_some_and(|r| r.contains("blocked")),
+            "the reason travels with the flag: {value}"
+        );
+        assert_eq!(value["screen"], serde_json::json!(["$ cargo test"]));
+        assert_eq!(value["history"]["messages"][0]["text"], "done");
+        assert!(value.get("history_error").is_none());
+    }
+
+    #[test]
+    fn trim_rows_drops_blank_tails_then_keeps_the_tail() {
+        let rows = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+        ];
+        assert_eq!(trim_rows(rows.clone(), None), vec!["a", "b"]);
+        assert_eq!(trim_rows(rows, Some(1)), vec!["b"]);
     }
 }

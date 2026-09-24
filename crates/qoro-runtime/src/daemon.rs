@@ -3068,6 +3068,17 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
                 continue;
             };
             report.brought_back += 1;
+            // The DB row kept the conversation id (COALESCE preserves it),
+            // but `open_terminal` starts memory at `None`. Repopulate it so
+            // `agents --json` and `history` work right after a restart, before
+            // the next hook report. Fresh registry, no token to admit with,
+            // so this is a restore not a claim; first hook corrects staleness.
+            if let Some(session) = row.agent_session.as_deref()
+                && !session.trim().is_empty()
+            {
+                into.terminals
+                    .set_session(stream, Some(session.to_string()));
+            }
             let resume = row
                 .agent
                 .as_deref()

@@ -484,6 +484,7 @@ dependencies = [
  "qoro-store",
  "qoro-testkit",
  "qoro-tui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
