@@ -57,6 +57,15 @@ pub enum Role {
     /// agent belongs to is something the eye gets for free instead of a word it has to read
     /// on every one of nine rows.
     Space(usize),
+    /// The picked avatar's own two inks, worn only on the foot of the column.
+    ///
+    /// The payload is a 256-palette entry the avatar file vouched for: loading
+    /// clamps to the curated product tokens, all at or above 16, so these can
+    /// never spend a colour the person themed. Two roles and not one because
+    /// the avatar is two inks, hair beside body, and one run cannot wear both.
+    AvatarHair(u8),
+    /// The body's ink; see [`Role::AvatarHair`].
+    AvatarBody(u8),
 }
 
 /// The colour a space is given, from its own number, so it keeps it for as long as it
@@ -154,6 +163,8 @@ const fn ink(role: Role) -> u8 {
         Role::Failed => 201,
         Role::Idle => 242,
         Role::Unobserved => 238,
+        Role::AvatarHair(ink) => ink,
+        Role::AvatarBody(ink) => ink,
         Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
     }

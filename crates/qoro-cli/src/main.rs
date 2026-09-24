@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod avatar;
 mod hooks;
 mod skills;
 mod update;
@@ -79,6 +80,7 @@ fn main() -> std::io::Result<()> {
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
+        Some("avatar") => avatar::run(&args),
         Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
         Some("ls") => run_list_sessions(),
@@ -118,7 +120,9 @@ fn main() -> std::io::Result<()> {
                   \x20                 doing and which conversation it is having\n\
                   \x20 qoro skills ...  teach an agent what qoro is for, so it looks\n\
                   \x20                 before it writes\n\
-                 \x20 qoro ls         list the sessions and say which are running\n\
+                  \x20 qoro ls         list the sessions and say which are running\n\
+                  \x20 qoro avatar pick  choose a terminal pet from a batch\n\
+                  \x20 qoro avatar show  print the picked pet\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
                  \x20 qoro update [--check]  fetch the newest release, and install it when\n\
                  \x20                 nothing is live\n\

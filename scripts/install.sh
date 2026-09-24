@@ -122,3 +122,12 @@ echo "installed $($DEST --version) to $DEST"
 # The rest is the CLI's own verbs, never a copy of their logic.
 "$DEST" hooks install
 "$DEST" skills install
+
+# The one question the install asks, and only when there is a person to answer
+# it: pick the terminal pet. Piped runs and CI stay non-interactive by
+# construction, and quitting keeps the install just done.
+if [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
+    "$DEST" avatar pick || true
+else
+    echo "pick an avatar when ready: qoro avatar pick"
+fi

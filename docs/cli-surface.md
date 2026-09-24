@@ -41,6 +41,9 @@ a claim nobody has to keep.
 | `qoro skills status` | which agents' skills are installed, and whether they are current | no |
 | `qoro skills install [agent...]` | teach an agent what qoro is for, beside whatever skills it already has | no |
 | `qoro skills uninstall [agent...]` | take out exactly what was installed | no |
+| `qoro avatar` | show the picked avatar, or pick one when on a terminal | no |
+| `qoro avatar pick` | choose a terminal pet from a batch: a number keeps one, `r` deals again | no |
+| `qoro avatar show` | print the picked avatar | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
 | `qoro update [--check]` | ask GitHub Releases for the newest macOS arm64 binary and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |

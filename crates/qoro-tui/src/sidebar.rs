@@ -1055,6 +1055,33 @@ fn strip_space(n: usize) -> String {
 
 /// The row that folds the column away, and unfolds it again.
 fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
+    collapse_row_with(collapsed, width, avatar_marks())
+}
+
+/// The picked avatar's two inks, hair first and body second, when one is picked.
+///
+/// Reads the file on every paint like the update notice below it: the picker
+/// runs in a process outside the interface, so anything held would be stale by
+/// construction. Under test this is always none, so the thirty-odd paints the
+/// suite asserts never depend on the developer's own home directory.
+fn avatar_marks() -> Option<(u8, u8)> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        qoro_runtime::avatar::load().map(|found| qoro_runtime::avatar::marks(&found))
+    }
+}
+
+/// [`collapse_row`] with the avatar passed in, so tests can paint both feet
+/// without touching a home directory.
+fn collapse_row_with(
+    collapsed: bool,
+    width: usize,
+    avatar: Option<(u8, u8)>,
+) -> (Line, Option<Hit>) {
     let width = if collapsed { COLLAPSED } else { width };
     let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
     if collapsed {
@@ -1073,7 +1100,14 @@ fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
     // than taking a row of its own: the column is worth more to a person as list than as
     // furniture. When `qoro update --check` saw something newer, the row says where this
     // build stands against it, so the update is found rather than remembered.
-    let brand = format!(" {BRAND_MARK} {BRAND}");
+    //
+    // When an avatar is picked the single brand dot becomes its two dots, hair beside
+    // body, so the foot reads as the person's own pet. The name and version stay put:
+    // a person reporting a bug still reads both off the same row.
+    let brand = match avatar {
+        Some(_) => format!(" {BRAND_MARK}{BRAND_MARK} {BRAND}"),
+        None => format!(" {BRAND_MARK} {BRAND}"),
+    };
     let version = match update_available() {
         Some(new) => format!("{VERSION}>{new} "),
         None => format!("{VERSION} "),
@@ -1082,14 +1116,26 @@ fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
     // its own trailing space.
     let gap =
         width.saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&version) + 2);
+    let (accent, indicator) = match avatar {
+        // Two inks need two runs: the hair dot opens the row, the body dot closes
+        // the opening, and the painter never overlaps them by construction.
+        Some((hair, body)) => (
+            Some((1, 1, crate::theme::Role::AvatarHair(hair))),
+            Some((2, 1, crate::theme::Role::AvatarBody(body))),
+        ),
+        None => (
+            // The mark and the name together, so the accent reads as one wordmark rather
+            // than as a coloured bullet next to grey text.
+            Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand)),
+            None,
+        ),
+    };
     (
         Line {
             text: format!("{brand} {version}{}{mark} ", " ".repeat(gap)),
             colour: Some(crate::theme::Role::Faint),
-            // The mark and the name together, so the accent reads as one wordmark rather
-            // than as a coloured bullet next to grey text.
-            accent: Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand)),
-            indicator: None,
+            accent,
+            indicator,
         },
         Some(Hit::Collapse),
     )
@@ -2333,6 +2379,52 @@ mod tests {
         let (strip, _) = collapse_row(true, WIDTH);
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
+    }
+
+    /// A picked avatar signs the foot with its own two dots, hair beside body,
+    /// and the name, version and fold mark stay where they always were.
+    #[test]
+    fn a_picked_avatar_wears_its_two_inks_on_the_foot() {
+        let (line, hit) = collapse_row_with(false, WIDTH, Some((212, 33)));
+        assert_eq!(
+            crate::width::width(&line.text),
+            WIDTH,
+            "the row has to fill the column exactly: {:?}",
+            line.text
+        );
+        assert!(line.text.contains(BRAND), "{:?}", line.text);
+        assert!(line.text.contains(VERSION), "{:?}", line.text);
+        assert!(line.text.contains('\u{ab}'), "{:?}", line.text);
+        let marks: String = line.text.chars().skip(1).take(2).collect();
+        assert_eq!(
+            marks,
+            format!("{BRAND_MARK}{BRAND_MARK}"),
+            "hair dot beside body dot: {:?}",
+            line.text
+        );
+        assert_eq!(
+            line.accent,
+            Some((1, 1, crate::theme::Role::AvatarHair(212))),
+            "{line:?}"
+        );
+        assert_eq!(
+            line.indicator,
+            Some((2, 1, crate::theme::Role::AvatarBody(33))),
+            "{line:?}"
+        );
+        assert_eq!(hit, Some(Hit::Collapse));
+    }
+
+    /// Without an avatar the foot is byte for byte what it always was.
+    #[test]
+    fn without_an_avatar_the_foot_is_unchanged() {
+        let (line, _) = collapse_row_with(false, WIDTH, None);
+        assert_eq!(
+            line.accent,
+            Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand))
+        );
+        assert_eq!(line.indicator, None);
+        assert!(line.text.contains(&format!("{BRAND_MARK} {BRAND}")));
     }
 
     /// A seen update signs the foot of the column with where this build stands.

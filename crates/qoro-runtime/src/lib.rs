@@ -3,6 +3,7 @@
 #![cfg(unix)]
 
 pub mod agents;
+pub mod avatar;
 pub mod blocking;
 pub mod client;
 pub mod control;
