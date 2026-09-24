@@ -112,11 +112,6 @@ pub fn load() -> Option<Avatar> {
     load_from(&avatar_path())
 }
 
-/// The two inks the sidebar signs itself with: hair first, body second.
-pub fn marks(avatar: &Avatar) -> (u8, u8) {
-    (avatar.hair_ink, avatar.body_ink)
-}
-
 /// Write, creating the directory. The file is small enough to write whole.
 pub fn save_to(path: &std::path::Path, avatar: &Avatar) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {

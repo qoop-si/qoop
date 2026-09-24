@@ -1058,20 +1058,20 @@ fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
     collapse_row_with(collapsed, width, avatar_marks())
 }
 
-/// The picked avatar's two inks, hair first and body second, when one is picked.
+/// The picked avatar, when one is picked.
 ///
 /// Reads the file on every paint like the update notice below it: the picker
 /// runs in a process outside the interface, so anything held would be stale by
 /// construction. Under test this is always none, so the thirty-odd paints the
 /// suite asserts never depend on the developer's own home directory.
-fn avatar_marks() -> Option<(u8, u8)> {
+fn avatar_marks() -> Option<qoro_runtime::avatar::Avatar> {
     #[cfg(test)]
     {
         None
     }
     #[cfg(not(test))]
     {
-        qoro_runtime::avatar::load().map(|found| qoro_runtime::avatar::marks(&found))
+        qoro_runtime::avatar::load()
     }
 }
 
@@ -1080,7 +1080,7 @@ fn avatar_marks() -> Option<(u8, u8)> {
 fn collapse_row_with(
     collapsed: bool,
     width: usize,
-    avatar: Option<(u8, u8)>,
+    avatar: Option<qoro_runtime::avatar::Avatar>,
 ) -> (Line, Option<Hit>) {
     let width = if collapsed { COLLAPSED } else { width };
     let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
@@ -1102,8 +1102,10 @@ fn collapse_row_with(
     // build stands against it, so the update is found rather than remembered.
     //
     // When an avatar is picked the single brand dot becomes its two dots, hair beside
-    // body, so the foot reads as the person's own pet. The name and version stay put:
-    // a person reporting a bug still reads both off the same row.
+    // body, followed by the pet's name, so the foot reads as the person's own pet
+    // at a glance and not as two dots in similar blues. The product name and
+    // version stay put: a person reporting a bug still reads both off the same row.
+    // A narrow column drops the name first; the dots always fit.
     let brand = match avatar {
         Some(_) => format!(" {BRAND_MARK}{BRAND_MARK} {BRAND}"),
         None => format!(" {BRAND_MARK} {BRAND}"),
@@ -1112,16 +1114,38 @@ fn collapse_row_with(
         Some(new) => format!("{VERSION}>{new} "),
         None => format!("{VERSION} "),
     };
-    // The row is the mark and name, a space, the version, the gap, then the fold mark and
-    // its own trailing space.
-    let gap =
-        width.saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&version) + 2);
+    let name = avatar
+        .as_ref()
+        .map(|found| found.name())
+        .unwrap_or_default();
+    let room = width
+        .saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&version) + 2 + 1);
+    let shown = if name.is_empty() || room < 5 {
+        String::new()
+    } else if crate::width::width(&name) <= room {
+        name
+    } else {
+        let mut short = name;
+        while crate::width::width(&short) + 1 > room {
+            short.pop();
+        }
+        short.push('\u{2026}');
+        short
+    };
+    // The row is the mark and name, a space, the version and the pet name, the
+    // gap, then the fold mark and its own trailing space.
+    let mid = if shown.is_empty() {
+        version
+    } else {
+        format!("{version}{shown} ")
+    };
+    let gap = width.saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&mid) + 2);
     let (accent, indicator) = match avatar {
         // Two inks need two runs: the hair dot opens the row, the body dot closes
         // the opening, and the painter never overlaps them by construction.
-        Some((hair, body)) => (
-            Some((1, 1, crate::theme::Role::AvatarHair(hair))),
-            Some((2, 1, crate::theme::Role::AvatarBody(body))),
+        Some(found) => (
+            Some((1, 1, crate::theme::Role::AvatarHair(found.hair_ink))),
+            Some((2, 1, crate::theme::Role::AvatarBody(found.body_ink))),
         ),
         None => (
             // The mark and the name together, so the accent reads as one wordmark rather
@@ -1132,7 +1156,7 @@ fn collapse_row_with(
     };
     (
         Line {
-            text: format!("{brand} {version}{}{mark} ", " ".repeat(gap)),
+            text: format!("{brand} {mid}{}{mark} ", " ".repeat(gap)),
             colour: Some(crate::theme::Role::Faint),
             accent,
             indicator,
@@ -2382,10 +2406,17 @@ mod tests {
     }
 
     /// A picked avatar signs the foot with its own two dots, hair beside body,
-    /// and the name, version and fold mark stay where they always were.
+    /// its name beside the version, and the fold mark stays where it always was.
     #[test]
     fn a_picked_avatar_wears_its_two_inks_on_the_foot() {
-        let (line, hit) = collapse_row_with(false, WIDTH, Some((212, 33)));
+        let pet = qoro_runtime::avatar::Avatar {
+            body: qoro_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "big".into(),
+            hair_ink: 212,
+            body_ink: 33,
+        };
+        let (line, hit) = collapse_row_with(false, WIDTH, Some(pet));
         assert_eq!(
             crate::width::width(&line.text),
             WIDTH,
@@ -2402,6 +2433,11 @@ mod tests {
             "hair dot beside body dot: {:?}",
             line.text
         );
+        assert!(
+            line.text.contains("Mohawk Pink"),
+            "the pet name reads off the foot: {:?}",
+            line.text
+        );
         assert_eq!(
             line.accent,
             Some((1, 1, crate::theme::Role::AvatarHair(212))),
@@ -2413,6 +2449,34 @@ mod tests {
             "{line:?}"
         );
         assert_eq!(hit, Some(Hit::Collapse));
+    }
+
+    /// A long pet name is cut with an ellipsis rather than pushing the fold
+    /// mark off the row, and a narrow column drops the name before the dots.
+    #[test]
+    fn a_long_name_is_cut_and_a_narrow_column_drops_it() {
+        let pet = qoro_runtime::avatar::Avatar {
+            body: qoro_runtime::avatar::BODY.into(),
+            hair: "thin4".into(),
+            eyes: "big".into(),
+            hair_ink: 208,
+            body_ink: 33,
+        };
+        assert_eq!(pet.name(), "Thin 4 Blocked");
+        let (wide, _) = collapse_row_with(false, WIDTH, Some(pet.clone()));
+        assert_eq!(crate::width::width(&wide.text), WIDTH);
+        assert!(
+            wide.text.contains('\u{2026}'),
+            "fourteen characters never fit at thirty columns: {wide:?}"
+        );
+        assert!(wide.text.contains("Thin 4 Bloc"), "{wide:?}");
+        let (narrow, _) = collapse_row_with(false, 18, Some(pet));
+        assert_eq!(crate::width::width(&narrow.text), 18);
+        assert!(
+            !narrow.text.contains("Thin"),
+            "no smudge at eighteen columns: {narrow:?}"
+        );
+        assert!(narrow.text.contains(BRAND), "{narrow:?}");
     }
 
     /// Without an avatar the foot is byte for byte what it always was.
