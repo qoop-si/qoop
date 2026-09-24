@@ -50,18 +50,24 @@ cargo build --release
 ./target/release/qoro
 ```
 
-Put it somewhere on your path and install the hooks for the agents you use:
+Put it somewhere on your path and install the hooks and the skill for the agents you use:
 
 ```
 qoro hooks install
+qoro skills install
 ```
 
 That writes each agent's hook and adds one entry to that agent's own configuration, beside
-whatever is already in it. It is optional: every agent is read from its screen without one.
-What a hook buys is a state known the moment it changes rather than after it is drawn, and
-the agent's own id for its conversation, which is what lets a stopped session come back to
-that conversation rather than to whichever one in the directory is newest. `qoro hooks
-status` says what is installed and `qoro hooks uninstall` takes out exactly what was added.
+whatever is already in it. The skill lands beside the agent's own skills the same way.
+Both are optional: every agent is read from its screen without a hook, and the skill
+only teaches an agent what the commands are for. What a hook buys is a state known
+the moment it changes rather than after it is drawn, and the agent's own id for its
+conversation, which is what lets a stopped session come back to that conversation
+rather than to whichever one in the directory is newest. `qoro hooks status` says
+what is installed and `qoro hooks uninstall` takes out exactly what was added;
+`qoro skills status` and `qoro skills uninstall` do the same for the skill.
+
+On a fresh Mac, `scripts/install.sh` does all three in one go: binary, hooks, skill.
 
 Sessions are named, and a stopped one comes back as itself:
 
