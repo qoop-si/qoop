@@ -7,6 +7,7 @@
 //! viewport from ever following another client's navigation.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -491,6 +492,9 @@ pub struct Daemon {
     workspace: i64,
     /// Set by a shutdown, read by every terminal that ends after one.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Which terminals live connections currently watch. The idle reaper
+    /// never closes a watched tab.
+    watched: crate::idle::WatchCounts,
     /// What the last restart brought back, counted by kind. Kept so a gate, a
     /// client, or a startup line can read what survived without reopening tabs.
     restore_report: RestoreReport,
@@ -626,6 +630,7 @@ impl Daemon {
             agents,
             events,
             stopping,
+            watched: crate::idle::WatchCounts::default(),
             restore_report: report,
         })
     }
@@ -739,6 +744,41 @@ impl Daemon {
             }
         });
 
+        // The idle reaper. Spawned only when armed: disabled (the default)
+        // means no task and zero wakeups, which is what keeps ADR-009's
+        // macOS literal-zero-idle claim intact. Armed, it parks while the
+        // terminal set is empty and while stopping, and otherwise wakes on
+        // an adaptive tick to close what has been idle past the timeout.
+        let idle_raw = std::env::var(crate::idle::IDLE_TIMEOUT_ENV).ok();
+        match crate::idle::parse_idle_timeout(idle_raw.as_deref()) {
+            None => {
+                // Unset, empty and all-zeros disable quietly; anything else
+                // that fails to parse names itself, so a typo does not
+                // silently mean disabled.
+                let raw = idle_raw.as_deref().unwrap_or("");
+                let quiet = raw.trim().is_empty() || raw.trim().bytes().all(|b| b == b'0');
+                if quiet {
+                    eprintln!("qorod: idle reap: disabled");
+                } else {
+                    eprintln!(
+                        "qorod: idle reap: disabled (ignoring invalid {}={raw:?})",
+                        crate::idle::IDLE_TIMEOUT_ENV,
+                    );
+                }
+            }
+            Some(timeout) => {
+                eprintln!("qorod: idle reap: armed: {}m", timeout.as_secs() / 60);
+                tokio::spawn(idle_reap_loop(
+                    self.terminals.clone(),
+                    self.agents.clone(),
+                    self.events.clone(),
+                    self.stopping.clone(),
+                    self.watched.clone(),
+                    timeout,
+                ));
+            }
+        }
+
         // Process changes. On macOS the kqueue descriptor is itself pollable, so this is a
         // subscription and costs nothing while nothing happens. On Linux there is no
         // unprivileged way to be told about an `exec`, so the same task runs ADR-009's
@@ -814,6 +854,7 @@ impl Daemon {
             let served_scanner = self.scanner.clone();
             let served_agents = self.agents.clone();
             let served_events = self.events.clone();
+            let served_watched = self.watched.clone();
             tokio::spawn(async move {
                 // Milestone 1 has one attach mode and it is writable. Read-only observers
                 // are a milestone 2 surface; the arbitration below already refuses them.
@@ -835,6 +876,7 @@ impl Daemon {
                         scanner: served_scanner,
                         agents: served_agents,
                         events: served_events,
+                        watched: served_watched,
                     },
                 )
                 .await;
@@ -1125,6 +1167,9 @@ pub struct ServeContext {
     pub scanner: Arc<ContainmentScanner>,
     pub agents: Arc<crate::agents::AgentRegistry>,
     pub events: crate::eventlog::EventLog,
+    /// Which terminals live connections watch. Incremented on subscribe,
+    /// decremented on unsubscribe and disconnect; the idle reaper reads it.
+    pub watched: crate::idle::WatchCounts,
 }
 
 async fn serve_client(
@@ -1147,6 +1192,7 @@ async fn serve_client(
         scanner,
         agents,
         events,
+        watched,
     } = context;
     // Filesystem permissions are the first gate, not the only one. A peer from another uid
     // is closed with no protocol response at all.
@@ -1208,7 +1254,7 @@ async fn serve_client(
     // of what a client with no arguments wants and is what milestone 1 shipped. Everything
     // else is a subscription request on the control channel.
     if let Some(first) = terminals.streams().first().copied() {
-        subscribe(&terminals, &subscriptions, &renders, first);
+        subscribe(&terminals, &subscriptions, &renders, &watched, first);
     }
 
     // News for this connection, on its own channel. One task per connection rather than a
@@ -1381,6 +1427,7 @@ async fn serve_client(
                                 &scanner,
                                 &agents,
                                 &events,
+                                &watched,
                             )
                             .await
                         }
@@ -1449,7 +1496,11 @@ async fn serve_client(
     // it has to happen however the loop ended.
     events_task.abort();
     renders.close();
-    for (_, task) in std::mem::take(&mut *subscriptions.lock().unwrap()) {
+    // This connection stops watching: drop its subscriptions from the
+    // daemon-wide watch counts the idle reaper reads, and stop the tasks.
+    let held = std::mem::take(&mut *subscriptions.lock().unwrap());
+    watched.unwatch_all(&held.keys().copied().collect());
+    for (_, task) in held {
         task.abort();
     }
     writer.abort();
@@ -1483,6 +1534,7 @@ fn subscribe(
     terminals: &Arc<TerminalRegistry>,
     subscriptions: &Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>>,
     renders: &Arc<RenderQueue>,
+    watched: &crate::idle::WatchCounts,
     stream: u32,
 ) -> bool {
     if subscriptions.lock().unwrap().contains_key(&stream) {
@@ -1540,6 +1592,9 @@ fn subscribe(
         .lock()
         .unwrap()
         .insert(stream, task.abort_handle());
+    // A new watcher for the daemon-wide counts the idle reaper reads: a
+    // watched tab is never reaped while somebody looks at it.
+    watched.watch(stream);
     // The borrowed screen above can predate the subscription: anything the terminal
     // printed while nobody watched was never published. Ask for the live one; the
     // render lane keeps only the newest per terminal, so this supersedes the stale
@@ -1655,6 +1710,164 @@ fn state_name(state: qoro_domain::AgentRuntimeState) -> &'static str {
     }
 }
 
+/// The idle reaper: close terminals idle past the configured timeout.
+///
+/// One task for the whole daemon, spawned only when armed. It parks while
+/// the terminal set is empty (zero wakeups: creation announces, which ends
+/// the wait) and while stopping, and otherwise wakes on an adaptive tick.
+/// Each pass snapshots every terminal under one lock each, vets candidates
+/// against the fail-closed eligibility table plus a foreground-group check,
+/// journals the reap for forensics, and asks the terminal to close the same
+/// way `Shutdown` does (`try_send`, never blocking). A full command queue
+/// or a failed journal write means skip this round and retry the next.
+async fn idle_reap_loop(
+    terminals: Arc<TerminalRegistry>,
+    agents: Arc<crate::agents::AgentRegistry>,
+    events: crate::eventlog::EventLog,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    watched: crate::idle::WatchCounts,
+    timeout: std::time::Duration,
+) {
+    // One startup delay under 30 seconds, from the wall clock rather than a
+    // new dependency, so a fleet armed together does not reap in one herd.
+    // Reaps already spread by differing idle stamps after this.
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() % 30)
+        .unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_secs(jitter as u64)).await;
+    let tick = crate::idle::reap_tick(timeout);
+    let timeout_secs = timeout.as_secs().min(i64::MAX as u64) as i64;
+    let mut changes = agents.subscribe();
+    let mut in_flight: BTreeSet<u32> = BTreeSet::new();
+    loop {
+        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        if agents.streams().is_empty() {
+            // Parked: creation registers and announces, which ends this
+            // wait. Clears the in-flight set: a vanished stream stays gone,
+            // and a stream number is never reused within a run.
+            in_flight.clear();
+            // A lagged wait is a nudge like any other: the set is re-read
+            // below either way. A closed channel cannot happen while this
+            // task holds the registry, but break rather than spin if it
+            // ever does.
+            match changes.recv().await {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        tokio::time::sleep(tick).await;
+        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        reap_pass(
+            &terminals,
+            &agents,
+            &events,
+            &watched,
+            timeout_secs,
+            &mut in_flight,
+        )
+        .await;
+    }
+}
+
+/// One reap pass over every tracked terminal. See `idle_reap_loop`.
+async fn reap_pass(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<crate::agents::AgentRegistry>,
+    events: &crate::eventlog::EventLog,
+    watched: &crate::idle::WatchCounts,
+    timeout_secs: i64,
+    in_flight: &mut BTreeSet<u32>,
+) {
+    let streams = agents.streams();
+    in_flight.retain(|s| streams.contains(s));
+    let now = crate::agents::now_unix();
+    for stream in streams {
+        if in_flight.contains(&stream) {
+            // Asked last pass and still tearing down (ADR-014 escalation
+            // takes up to seconds): never ask twice, never log twice.
+            continue;
+        }
+        let Some(snap) = agents.reap_snapshot(stream) else {
+            continue;
+        };
+        // Always seeded at spawn in production; `None` is only reachable
+        // in unit tests that register without spawning.
+        let Some(since) = snap.idle_since else {
+            continue;
+        };
+        let idle_secs = now.saturating_sub(since);
+        let foreground = crate::idle::classify_program(snap.program.as_deref());
+        if !crate::idle::eligible_for_reap(
+            snap.state,
+            foreground,
+            snap.boundary,
+            snap.setup_gate,
+            watched.watched(stream),
+            idle_secs,
+            timeout_secs,
+        ) {
+            continue;
+        }
+        // Candidate-only foreground-group check: a task under a shell
+        // leader that the snapshot program alone reports as the shell. No
+        // master known means just-created or a race: fail closed and retry
+        // next pass.
+        let Some(master) = agents.master_of(stream) else {
+            continue;
+        };
+        if crate::idle::group_holds_task(master) {
+            continue;
+        }
+        // Journal first, in the same shape as a manual close, so post-hoc
+        // forensics can tell a reap from a crash or a kill. A journal that
+        // will not write vetoes the reap: retry next pass.
+        let key = format!("idle-reap-{stream}-{now}");
+        if events
+            .append_durable(vec![
+                (
+                    qoro_events::Stream::Command(key.clone()),
+                    qoro_events::Body::Command {
+                        idempotency_key: key.clone(),
+                        operation: "IdleReap".into(),
+                        detail: serde_json::json!({ "terminal": stream }),
+                    },
+                ),
+                (
+                    qoro_events::Stream::Command(key.clone()),
+                    qoro_events::Body::Outcome {
+                        idempotency_key: key.clone(),
+                        ok: true,
+                        detail: serde_json::json!({ "terminal": stream }),
+                    },
+                ),
+            ])
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(handle) = terminals.get(stream)
+            && handle.commands.try_send(ClientCommand::Close).is_ok()
+        {
+            // Logged only on accepted send: `try_send` succeeding while the
+            // tab lingers through teardown is normal. A full queue is one
+            // being pasted into: skip this round, retry the next.
+            in_flight.insert(stream);
+            eprintln!(
+                "qorod: idle reap: closed terminal {stream} after {}m idle ({})",
+                idle_secs / 60,
+                state_name(snap.state),
+            );
+        }
+    }
+}
+
 /// Answer one control request.
 ///
 /// Synchronous on purpose: every operation here is a registry edit or a spawn, and none of
@@ -1676,6 +1889,7 @@ async fn handle_control(
     scanner: &Arc<ContainmentScanner>,
     agents: &Arc<crate::agents::AgentRegistry>,
     events: &crate::eventlog::EventLog,
+    watched: &crate::idle::WatchCounts,
 ) -> ControlResponse {
     let id = request.request_id().to_string();
 
@@ -1793,7 +2007,7 @@ async fn handle_control(
                     // Subscribed on creation. A client that asked for a terminal wants to
                     // see it, and a separate round trip to say so is a race in which the
                     // first output is lost.
-                    subscribe(terminals, subscriptions, renders, stream);
+                    subscribe(terminals, subscriptions, renders, watched, stream);
                     // The outcome, durable before the client is told. ADR-005 rule 2: a
                     // client is told it succeeded only once the log says so, which is what
                     // makes its retry idempotent rather than a second terminal.
@@ -2185,7 +2399,7 @@ async fn handle_control(
         } => {
             let subscribed: Vec<u32> = wanted
                 .into_iter()
-                .filter(|s| subscribe(terminals, subscriptions, renders, *s))
+                .filter(|s| subscribe(terminals, subscriptions, renders, watched, *s))
                 .collect();
             ControlResponse::Subscribed {
                 id,
@@ -2400,6 +2614,7 @@ async fn handle_control(
                 .filter_map(|s| held.remove(&s).map(|t| (s, t)))
                 .map(|(s, task)| {
                     task.abort();
+                    watched.unwatch(s);
                     s
                 })
                 .collect();
@@ -2783,6 +2998,9 @@ pub fn open_terminal(
     let token = crate::agents::mint_token(stream);
     let terminal_id = TerminalId::new(stream.to_string());
     agents.register(stream, terminal_id.clone(), token.clone());
+    // Creation counts as activity on both clocks: a tab that never produces
+    // an accepted observation ages from here rather than living forever.
+    agents.note_spawn(stream, crate::agents::now_unix());
     let behind = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let handle = TerminalHandle {
         name,
@@ -3908,9 +4126,15 @@ async fn terminal_task(
                 cmd = from_clients.recv() => {
                     let Some(cmd) = cmd else { break };
                     match cmd {
-                        ClientCommand::Input { bytes, .. } => {
+                        ClientCommand::Input { bytes, from } => {
                         let arrived = std::time::Instant::now();
                         pending_input = Some(arrived);
+                            // Live input is traffic; restore replay is not:
+                            // replayed bytes must not refresh the idle clock
+                            // of a tab that has been quiet for hours.
+                            if crate::idle::is_live_input(from.as_str()) {
+                                agents.note_io(stream, crate::agents::now_unix());
+                            }
                             // A large paste with no line terminator, to a child in canonical
                             // mode, is discarded by the line discipline past its limit while
                             // every write reports success. Measured: 1 MiB written, 0 received.
@@ -4055,6 +4279,10 @@ async fn terminal_task(
                             // when the user typed `exit`, which is the common case. Throttled,
                             // and never runs while the terminal is idle.
                             scanner.note_activity();
+                            // Output is traffic: one stamp per chunk, reusing a
+                            // single clock read for the foreground look below.
+                            let now_unix = crate::agents::now_unix();
+                            agents.note_io(stream, now_unix);
                             // One ioctl, measured in microseconds, so it is cheap enough to
                             // ask on every read. A change of foreground process is a new
                             // generation, and everything believed about the old one is
@@ -4063,7 +4291,7 @@ async fn terminal_task(
                                 .note_foreground(
                                     stream,
                                     qoro_pty::sys::foreground_leader(master_raw),
-                                    crate::agents::now_unix(),
+                                    now_unix,
                                 )
                                 .is_some()
                             {
@@ -5041,5 +5269,204 @@ mod restore_report_tests {
         .await
         .expect("an empty tree kills nothing and waits for nothing");
         assert_eq!(seen, 0, "nothing was tracked on an empty tty");
+    }
+}
+
+#[cfg(test)]
+mod idle_reap_tests {
+    //! The reaper harness: `reap_pass` against a registry with scripted
+    //! terminals, asserting what gets a `Close` and what does not. Narrow on
+    //! purpose (no full daemon boot): the eligibility table itself is pinned
+    //! in `idle.rs`, and this pins the wiring around it.
+    use super::*;
+    use crate::agents::{AgentRegistry, mint_token, now_unix};
+
+    /// One scripted terminal: registered, spawn-seeded, given a foreground
+    /// identity and a bogus master (no group to protect), and inserted with
+    /// a command channel the test reads. Returns the channel, the token,
+    /// and a spare sender for filling the queue.
+    fn add_terminal(
+        terminals: &Arc<TerminalRegistry>,
+        agents: &Arc<AgentRegistry>,
+        stream: u32,
+    ) -> (
+        mpsc::Receiver<ClientCommand>,
+        qoro_domain::CapabilityToken,
+        mpsc::Sender<ClientCommand>,
+    ) {
+        let token = mint_token(stream);
+        let terminal_id = TerminalId::new(stream.to_string());
+        agents.register(stream, terminal_id.clone(), token.clone());
+        let (tx, rx) = mpsc::channel(8);
+        let engine = AlacrittyEngine::new(80, 24);
+        let (updates, _) = watch::channel(TerminalUpdate::Full(engine.snapshot()));
+        terminals.insert(
+            stream,
+            TerminalHandle {
+                workspace: 1,
+                name: None,
+                session: None,
+                cwd: None,
+                id: terminal_id,
+                history: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                token: token.clone(),
+                commands: tx.clone(),
+                updates,
+                last_image: Arc::new(std::sync::Mutex::new(None)),
+                image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+        (rx, token, tx)
+    }
+
+    fn harness() -> (
+        Arc<TerminalRegistry>,
+        Arc<AgentRegistry>,
+        crate::eventlog::EventLog,
+        crate::idle::WatchCounts,
+    ) {
+        (
+            Arc::new(TerminalRegistry::default()),
+            Arc::new(AgentRegistry::new().expect("registry")),
+            crate::eventlog::EventLog::new(qoro_events::EventStore::in_memory().expect("open")),
+            crate::idle::WatchCounts::default(),
+        )
+    }
+
+    /// An idle shell is asked to close exactly once; a second pass while it
+    /// lingers finds the in-flight set, not the channel.
+    #[tokio::test]
+    async fn an_idle_shell_is_closed_once_and_never_twice() {
+        let (terminals, agents, events, watched) = harness();
+        let (mut rx, _token, _tx) = add_terminal(&terminals, &agents, 1);
+        let ancient = now_unix() - 7200;
+        agents.note_spawn(1, ancient);
+        agents.test_set_foreground(1, Some("zsh"), false);
+        agents.attach_master(1, -1);
+        let mut in_flight = BTreeSet::new();
+        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientCommand::Close)),
+            "an idle shell gets one Close"
+        );
+        assert!(in_flight.contains(&1));
+        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the in-flight set suppresses the second ask"
+        );
+    }
+
+    /// Everything that must survive a pass: a working agent, a blocked one,
+    /// a tab with fresh output, a watched tab, a boundary tab, and a task in
+    /// the foreground. None gets a `Close`.
+    #[tokio::test]
+    async fn busy_watched_and_unreadable_tabs_survive_a_pass() {
+        let (terminals, agents, events, watched) = harness();
+        let now = now_unix();
+        let ancient = now - 7200;
+        // Working agent, idle for two hours: the state vetoes.
+        let (mut working_rx, working_token, _tx1) = add_terminal(&terminals, &agents, 1);
+        agents.note_spawn(1, ancient);
+        agents.test_set_foreground(1, Some("claude"), false);
+        agents
+            .observe_hook(
+                1,
+                &TerminalId::new("1"),
+                &working_token,
+                qoro_domain::AgentRuntimeState::Working,
+                false,
+                false,
+                ancient,
+            )
+            .expect("applies");
+        agents.attach_master(1, -1);
+        // Blocked agent: the state vetoes, whatever the screen says.
+        let (mut blocked_rx, blocked_token, _tx2) = add_terminal(&terminals, &agents, 2);
+        agents.note_spawn(2, ancient);
+        agents.test_set_foreground(2, Some("codex"), false);
+        agents
+            .observe_hook(
+                2,
+                &TerminalId::new("2"),
+                &blocked_token,
+                qoro_domain::AgentRuntimeState::Blocked,
+                true,
+                false,
+                ancient,
+            )
+            .expect("applies");
+        agents.attach_master(2, -1);
+        // Idle shell with fresh output: the IO clock vetoes.
+        let (mut fresh_rx, _fresh_token, _tx3) = add_terminal(&terminals, &agents, 3);
+        agents.note_spawn(3, ancient);
+        agents.test_set_foreground(3, Some("bash"), false);
+        agents.note_io(3, now);
+        agents.attach_master(3, -1);
+        // Idle shell somebody watches: the watcher vetoes.
+        let (mut watched_rx, _watched_token, _tx4) = add_terminal(&terminals, &agents, 4);
+        agents.note_spawn(4, ancient);
+        agents.test_set_foreground(4, Some("sh"), false);
+        agents.attach_master(4, -1);
+        watched.watch(4);
+        // Idle behind a wrapper the daemon cannot see through: vetoes.
+        let (mut boundary_rx, _boundary_token, _tx5) = add_terminal(&terminals, &agents, 5);
+        agents.note_spawn(5, ancient);
+        agents.test_set_foreground(5, None, true);
+        agents.attach_master(5, -1);
+        // Idle belief with a task in the foreground: vetoes.
+        let (mut task_rx, task_token, _tx6) = add_terminal(&terminals, &agents, 6);
+        agents.note_spawn(6, ancient);
+        agents.test_set_foreground(6, Some("cargo"), false);
+        agents
+            .observe_hook(
+                6,
+                &TerminalId::new("6"),
+                &task_token,
+                qoro_domain::AgentRuntimeState::Idle,
+                false,
+                false,
+                ancient,
+            )
+            .expect("applies");
+        agents.attach_master(6, -1);
+
+        let mut in_flight = BTreeSet::new();
+        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
+        for (name, rx) in [
+            ("working", &mut working_rx),
+            ("blocked", &mut blocked_rx),
+            ("fresh output", &mut fresh_rx),
+            ("watched", &mut watched_rx),
+            ("boundary", &mut boundary_rx),
+            ("task foreground", &mut task_rx),
+        ] {
+            assert!(rx.try_recv().is_err(), "{name} survives the pass");
+        }
+        assert!(in_flight.is_empty(), "nothing was asked");
+    }
+
+    /// A full command queue is one being pasted into: the pass skips the
+    /// terminal this round, sends nothing, and retries the next.
+    #[tokio::test]
+    async fn a_full_command_queue_defers_the_reap() {
+        let (terminals, agents, events, watched) = harness();
+        let (mut rx, _token, tx) = add_terminal(&terminals, &agents, 1);
+        agents.note_spawn(1, now_unix() - 7200);
+        agents.test_set_foreground(1, Some("zsh"), false);
+        agents.attach_master(1, -1);
+        for _ in 0..8 {
+            tx.try_send(ClientCommand::Close)
+                .expect("filling the queue");
+        }
+        let mut in_flight = BTreeSet::new();
+        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
+        assert!(in_flight.is_empty(), "a full queue is asked nothing");
+        let mut buffered = 0;
+        while rx.try_recv().is_ok() {
+            buffered += 1;
+        }
+        assert_eq!(buffered, 8, "only what the test filled is there");
     }
 }

@@ -57,6 +57,17 @@ pub struct TerminalAgent {
     /// clock. `None` until the first accepted observation, so a restart
     /// paints no row as fresh.
     pub last_active_at_unix: Option<i64>,
+    /// When this terminal last saw live traffic, as unix seconds on the
+    /// daemon's own clock: PTY output, live client input, or any of the
+    /// events that stamp `last_active_at_unix`.
+    ///
+    /// The belief stamp alone cannot tell idle from busy: a build streaming
+    /// for an hour without changing the belief looks idle on that clock.
+    /// Seeded together with it at spawn (see `note_spawn`), so no terminal
+    /// is ever stamp-`None` past creation and the reaper has no immortal
+    /// class. Restore replay input never stamps this: replayed bytes are
+    /// not live activity.
+    pub last_io_unix: Option<i64>,
     /// A startup gate is on screen: answering it creates the session rather
     /// than continuing one. Set from the matched manifest rule, never
     /// inferred, and cleared by any later screen reading without one.
@@ -78,6 +89,19 @@ pub struct TerminalAgent {
     /// can be the last for a long time, an agent a wrapper started drawing once and then
     /// waiting, and nothing else would ever look again.
     pub relook_owed: bool,
+}
+
+/// One atomic snapshot for the idle reaper. See `reap_snapshot()`.
+#[derive(Clone, Debug)]
+pub struct ReapSnapshot {
+    pub generation: GenerationId,
+    pub state: AgentRuntimeState,
+    pub program: Option<String>,
+    /// The identity is `Unavailable` (a wrapper the daemon cannot see
+    /// through): reads as no program, but must veto, never close.
+    pub boundary: bool,
+    pub setup_gate: bool,
+    pub idle_since: Option<i64>,
 }
 
 /// The least time between two looks into a leader that is not an agent.
@@ -214,6 +238,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     if let Ok(next) = agent.belief.clone().accept(&idle) {
         agent.belief = next;
         agent.last_active_at_unix = Some(now_unix);
+        agent.last_io_unix = Some(now_unix);
     }
 }
 
@@ -270,6 +295,7 @@ impl AgentRegistry {
                 identity: AgentIdentity::None,
                 belief: fresh_belief(generation),
                 last_active_at_unix: None,
+                last_io_unix: None,
                 setup_gate: false,
                 screen_rule: None,
                 screen_manifest: None,
@@ -279,6 +305,117 @@ impl AgentRegistry {
             },
         );
         self.announce_new(stream);
+    }
+
+    /// Seed both activity clocks at spawn. Creation counts as activity, so a
+    /// terminal that never produces an accepted observation still ages from
+    /// a known point instead of living forever stamp-`None`. Only fills
+    /// clocks that are still `None`: seeding must never move a live stamp
+    /// backwards. Every creation path (first boot, `CreateTerminal`,
+    /// restore) flows through `open_terminal`, which calls this right after
+    /// `register`, so restored fleets get one full fresh grace period after
+    /// every restart.
+    pub fn note_spawn(&self, stream: u32, now_unix: i64) {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return;
+        };
+        if agent.last_active_at_unix.is_none() {
+            agent.last_active_at_unix = Some(now_unix);
+        }
+        if agent.last_io_unix.is_none() {
+            agent.last_io_unix = Some(now_unix);
+        }
+    }
+
+    /// Record live traffic on a terminal: PTY output or live client input.
+    ///
+    /// Once per PTY read chunk, never per byte, on paths that already hold
+    /// no lock (this takes its own). Restore replay input must not call
+    /// this: replayed bytes are not live activity.
+    pub fn note_io(&self, stream: u32, now_unix: i64) {
+        if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
+            agent.last_io_unix = Some(now_unix);
+        }
+    }
+
+    /// When this terminal was last live, the later of the two clocks, or
+    /// `None` before the spawn seeding. Test only: production reads the
+    /// same value through `reap_snapshot`, which holds the lock once for
+    /// the whole snapshot rather than pairing two lock reads across a
+    /// generation change.
+    #[cfg(test)]
+    pub fn idle_since(&self, stream: u32) -> Option<i64> {
+        let terminals = self.terminals.lock().unwrap();
+        let agent = terminals.get(&stream)?;
+        match (agent.last_active_at_unix, agent.last_io_unix) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// One atomic snapshot for the idle reaper: state, program, boundary,
+    /// gate and clocks read under a single lock hold, so a generation
+    /// change cannot slip between two reads and pair a state from one
+    /// generation with a program from the next. The reaper must never call
+    /// `program_of` plus `agent()` separately for this reason.
+    pub fn reap_snapshot(&self, stream: u32) -> Option<ReapSnapshot> {
+        let terminals = self.terminals.lock().unwrap();
+        let agent = terminals.get(&stream)?;
+        let (program, boundary) = match &agent.identity {
+            AgentIdentity::Known { program, .. } => (Some(program.clone()), false),
+            AgentIdentity::Unavailable { .. } => (None, true),
+            AgentIdentity::None => (None, false),
+        };
+        let idle_since = match (agent.last_active_at_unix, agent.last_io_unix) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        Some(ReapSnapshot {
+            generation: agent.belief.generation,
+            state: agent.belief.state,
+            program,
+            boundary,
+            setup_gate: agent.setup_gate,
+            idle_since,
+        })
+    }
+
+    /// A copy of this terminal's master fd for the reaper's foreground-group
+    /// check. Copied under the lock; the syscalls run outside it.
+    pub fn master_of(&self, stream: u32) -> Option<std::os::fd::RawFd> {
+        self.masters.lock().unwrap().get(&stream).copied()
+    }
+
+    /// Set a terminal's foreground identity directly, for reaper harness
+    /// tests that cannot spawn a real process group. Test only.
+    #[cfg(test)]
+    pub fn test_set_foreground(&self, stream: u32, program: Option<&str>, boundary: bool) {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return;
+        };
+        let generation = agent.belief.generation;
+        agent.identity = if boundary {
+            AgentIdentity::Unavailable {
+                boundary: Boundary::Namespace {
+                    wrapper: "docker".into(),
+                },
+                generation,
+            }
+        } else {
+            match program {
+                Some(name) => AgentIdentity::Known {
+                    program: name.into(),
+                    generation,
+                },
+                None => AgentIdentity::None,
+            }
+        };
     }
 
     pub fn forget(&self, stream: u32) {
@@ -417,6 +554,7 @@ impl AgentRegistry {
             let generation = agent.capability.advance();
             agent.belief = fresh_belief(generation);
             agent.last_active_at_unix = Some(now_unix);
+            agent.last_io_unix = Some(now_unix);
             // The gate belonged to the old generation's screen: a new process
             // means the old dialog reading is void, not held. The old rule
             // reading is void with it.
@@ -440,6 +578,7 @@ impl AgentRegistry {
         // A new foreground generation is activity even before anything is
         // known about the process: something replaced what was there.
         agent.last_active_at_unix = Some(now_unix);
+        agent.last_io_unix = Some(now_unix);
         // A new foreground generation voids the old screen's gate with the
         // old belief: whatever dialog was showing belonged to a process that
         // is no longer there. The old rule reading belonged to it too.
@@ -500,6 +639,7 @@ impl AgentRegistry {
             // that actually holds afterwards.
             if !exited {
                 agent.last_active_at_unix = Some(now_unix);
+                agent.last_io_unix = Some(now_unix);
             }
             // The gate belonged to the exited or execed process: a new
             // generation voids the old screen's reading with the old belief.
@@ -588,6 +728,7 @@ impl AgentRegistry {
         // nothing, and the rule recording above stays stamp-free with it.
         if changed {
             agent.last_active_at_unix = Some(now_unix);
+            agent.last_io_unix = Some(now_unix);
         }
         drop(terminals);
         if changed {
@@ -669,6 +810,7 @@ impl AgentRegistry {
         // or outranked one stamps nothing.
         if changed {
             agent.last_active_at_unix = Some(now_unix);
+            agent.last_io_unix = Some(now_unix);
         }
         drop(terminals);
         if changed {
@@ -1479,5 +1621,50 @@ mod tests {
         let after = r.agent(1).expect("agent");
         assert_eq!(after.belief.state, AgentRuntimeState::Idle);
         assert_eq!(after.last_active_at_unix, Some(LATER));
+    }
+
+    /// Spawn seeding: creation counts as activity on both clocks, so a
+    /// terminal that never produces an accepted observation still ages from
+    /// a known point. Seeding never moves a live stamp.
+    #[test]
+    fn spawn_seeds_both_clocks_and_never_moves_a_live_stamp() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        assert_eq!(r.idle_since(1), None, "register alone stamps nothing");
+        r.note_spawn(1, NOW);
+        assert_eq!(r.idle_since(1), Some(NOW));
+        // Live traffic moves the IO clock; the idle point follows the later.
+        r.note_io(1, LATER);
+        assert_eq!(r.idle_since(1), Some(LATER));
+        // A second seed (e.g. a repeated call) never moves anything.
+        r.note_spawn(1, LATER + 1000);
+        assert_eq!(r.agent(1).expect("agent").last_active_at_unix, Some(NOW));
+        assert_eq!(r.agent(1).expect("agent").last_io_unix, Some(LATER));
+        assert_eq!(r.idle_since(1), Some(LATER));
+        // Unknown terminal: silent no-op, never a panic.
+        r.note_spawn(9, NOW);
+        r.note_io(9, NOW);
+        assert_eq!(r.idle_since(9), None);
+    }
+
+    /// The reaper snapshot reads state, program, boundary, gate and clocks
+    /// together: a boundary identity reads as no program but still vetoes.
+    #[test]
+    fn the_reap_snapshot_carries_boundary_gate_and_clocks_together() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.note_spawn(1, NOW);
+        let snap = r.reap_snapshot(1).expect("snapshot");
+        assert_eq!(snap.state, AgentRuntimeState::Unknown);
+        assert_eq!(snap.program, None);
+        assert!(!snap.boundary);
+        assert!(!snap.setup_gate);
+        assert_eq!(snap.idle_since, Some(NOW));
+        assert!(
+            r.reap_snapshot(9).is_none(),
+            "gone terminal has no snapshot"
+        );
+        assert!(r.master_of(1).is_none(), "no master attached in tests");
     }
 }
