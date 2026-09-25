@@ -647,6 +647,9 @@ impl State {
                 // rows, and a click maps onto what the paint drew.
                 now_unix,
                 self.sidebar_width,
+                // The paint reserves art rows above the foot when a pet is
+                // picked, so the click maps onto the same layout it drew.
+                sidebar::current_avatar().as_ref(),
             )
         };
         // The row between the panels answers by which half was clicked, so the column has
@@ -672,6 +675,7 @@ impl State {
                     &self.unseen_finished,
                     now_unix,
                     self.sidebar_width,
+                    sidebar::current_avatar().as_ref(),
                 );
                 let is_footer = rows
                     .get(within)
@@ -693,6 +697,7 @@ impl State {
                     &self.unseen_finished,
                     now_unix,
                     self.sidebar_width,
+                    sidebar::current_avatar().as_ref(),
                 );
                 let is_agents_title = rows
                     .get(within)

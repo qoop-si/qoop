@@ -203,6 +203,38 @@ pub(crate) fn at(row: usize, col: usize) -> String {
     format!("\x1b[{row};{col}H")
 }
 
+/// The picked pet stamped above the foot of the column, as raw output.
+///
+/// Pure so tests stamp the same bytes the paint does: same fits gate, same
+/// rows, same escapes. Empty whenever the pet does not fit, the column is
+/// folded, or colour is off.
+pub(crate) fn avatar_overlay_paint(
+    column_rows: usize,
+    sidebar_width: usize,
+    collapsed: bool,
+    wide_enough: bool,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+    colour: bool,
+) -> String {
+    let Some(pet) = avatar else {
+        return String::new();
+    };
+    if !wide_enough || collapsed {
+        return String::new();
+    }
+    if !sidebar::avatar_fits(column_rows, sidebar_width, true) {
+        return String::new();
+    }
+    let art = sidebar::avatar_overlay(pet, colour);
+    let rows = sidebar::avatar_overlay_rows(SIDEBAR_TOP, column_rows);
+    let mut out = String::new();
+    for (i, row) in art.iter().enumerate() {
+        out.push_str(&at(rows[i], 2));
+        out.push_str(row);
+    }
+    out
+}
+
 /// Where the host cursor goes for the focused snapshot, one-based, or `None`
 /// when no tile carries it.
 ///
@@ -287,6 +319,9 @@ pub fn paint(frame: &Frame) -> String {
     // The column runs the whole height, from the top row to the status line. It is taller
     // than the pane by the tab bar's row, which is the row the bar no longer takes from it.
     let column_rows = (frame.lines as usize).saturating_sub(STATUS);
+    // The pet stands on the foot of the column. Read once per frame so the
+    // reservation below and the overlay further down paint the same pet.
+    let avatar = sidebar::current_avatar();
     let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
         sidebar::rows_collapsed(
             frame.spaces,
@@ -308,6 +343,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.unseen,
             frame.now_unix,
             frame.sidebar_width,
+            avatar.as_ref(),
         )
     } else {
         Vec::new()
@@ -541,6 +577,20 @@ pub fn paint(frame: &Frame) -> String {
             out.push_str(theme::RESET);
         }
     }
+
+    // The picked pet, as itself, on the reserved rows above the foot. An
+    // overlay like the picture notice: never grid, so the snapshot contract
+    // (plain rows) holds for every gate and the whole corpus. Before the
+    // floating overlays, so an open palette covers it the way it covers
+    // terminal text.
+    out.push_str(&avatar_overlay_paint(
+        column_rows,
+        frame.sidebar_width,
+        frame.collapsed,
+        wide_enough,
+        avatar.as_ref(),
+        std::env::var("NO_COLOR").is_err(),
+    ));
 
     // The palette floats over the terminal, so it is painted last: every row it takes
     // overwrites what the pane and the column drew under it.
@@ -1614,6 +1664,49 @@ mod tests {
         // Never zero and never a panic: a person dragging a window narrow is not an error.
         let (cols, rows) = pane_size(4, 1);
         assert!(cols >= 1 && rows >= 1);
+    }
+
+    fn sky_pet() -> qoro_runtime::avatar::Avatar {
+        qoro_runtime::avatar::Avatar {
+            body: qoro_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "squint".into(),
+            hair_ink: 39,
+            body_ink: 33,
+        }
+    }
+
+    /// The overlay stamps the pet itself: cursor moves plus art rows, in the
+    /// pet's own inks, directly above the foot.
+    #[test]
+    fn the_overlay_stamps_the_pet_above_the_foot() {
+        let pet = sky_pet();
+        let out = avatar_overlay_paint(38, sidebar::WIDTH, false, true, Some(&pet), true);
+        assert!(out.starts_with("\x1b[33;2H"), "{out:?}");
+        assert!(out.contains("\x1b[34;2H"), "{out:?}");
+        assert!(out.contains("\x1b[38;5;39m"), "hair ink: {out:?}");
+        assert!(out.contains("\x1b[38;5;33m"), "body ink: {out:?}");
+        assert!(out.contains("\x1b[38;5;16m"), "dark slits: {out:?}");
+        // Five rows of sixteen cells: half blocks where the pet is, spaces
+        // where it is not. Escapes carry no spaces, so the count is exact.
+        let cells = out.matches('\u{2580}').count() + out.matches(' ').count();
+        assert_eq!(cells, 5 * 16, "{out:?}");
+    }
+
+    /// Folded, narrow, short, colourless, or petless: no overlay bytes at all.
+    #[test]
+    fn the_overlay_stays_quiet_when_the_pet_does_not_fit() {
+        let pet = sky_pet();
+        assert!(avatar_overlay_paint(38, sidebar::WIDTH, true, true, Some(&pet), true).is_empty());
+        assert!(avatar_overlay_paint(38, 10, false, true, Some(&pet), true).is_empty());
+        assert!(avatar_overlay_paint(8, sidebar::WIDTH, false, true, Some(&pet), true).is_empty());
+        assert!(
+            avatar_overlay_paint(38, sidebar::WIDTH, false, false, Some(&pet), true).is_empty()
+        );
+        assert!(avatar_overlay_paint(38, sidebar::WIDTH, false, true, None, true).is_empty());
+        assert!(
+            avatar_overlay_paint(38, sidebar::WIDTH, false, true, Some(&pet), false).is_empty()
+        );
     }
 
     /// An agent TUI survives the paint byte for byte: truecolour runs, box

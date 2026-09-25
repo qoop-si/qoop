@@ -40,6 +40,98 @@ pub const HAIR_INK_TITLES: [&str; 8] = [
 /// The eyes the setup screen offers, in picker order.
 pub const EYE_STYLES: [&str; 5] = ["small", "big", "bigsmall", "squint", "squintw"];
 
+/// The pixel grid every pet is drawn on, same as the design mock.
+pub const GRID_W: i32 = 16;
+pub const GRID_H: i32 = 12;
+/// Half-block art rows the sidebar paints: pairs 0 to 4. Pair 5 is always
+/// empty, and leading empty pairs stay blank so the pet stands on the foot.
+pub const ART_ROWS: usize = 5;
+/// Art columns: the full grid width, which is why the panel needs a wide column.
+pub const ART_COLS: usize = 16;
+
+/// A filled rect on the grid, end-exclusive like every other range here.
+pub type Rect = (i32, i32, i32, i32);
+
+/// The head every avatar shares: the darko box, no nose, two feet.
+pub const HEAD: Rect = (5, 4, 11, 9);
+/// The feet, worn at the bottom row.
+pub const FEET: [Rect; 2] = [(6, 9, 7, 10), (9, 9, 10, 10)];
+
+/// Hair by style, same shapes as the mock. A sweeping fringe may touch the
+/// head's edge; eyes are painted last and always win.
+pub fn hair_rects(hair: &str) -> Vec<Rect> {
+    match hair {
+        "block" => vec![(6, 1, 9, 4), (9, 2, 12, 4)],
+        "mohawk" => vec![(7, 0, 9, 4), (9, 3, 13, 5), (10, 5, 13, 7)],
+        "spikes" => vec![(6, 2, 11, 4), (6, 1, 7, 2), (8, 1, 9, 2), (10, 1, 11, 2)],
+        "flat" => vec![(5, 2, 11, 4)],
+        "thin4" => vec![(6, 1, 8, 4), (9, 1, 11, 4)],
+        "beacon" => vec![(7, 3, 10, 4), (8, 2, 9, 3), (8, 1, 9, 2)],
+        "cap" => vec![(8, 2, 12, 4), (6, 3, 9, 4)],
+        _ => vec![],
+    }
+}
+
+/// Eyes by style: position rects plus the ink they wear.
+pub fn eye_rects(eyes: &str) -> (Vec<Rect>, u8) {
+    match eyes {
+        "big" => (vec![(6, 5, 7, 7), (8, 5, 9, 7)], EYE_CREAM),
+        "bigsmall" => (vec![(6, 5, 7, 7), (9, 6, 10, 7)], EYE_CREAM),
+        "squint" => (vec![(6, 6, 8, 7), (9, 6, 11, 7)], EYE_INK),
+        "squintw" => (vec![(6, 6, 8, 7), (9, 6, 11, 7)], EYE_CREAM),
+        _ => (vec![(6, 6, 7, 7), (9, 6, 10, 7)], EYE_CREAM),
+    }
+}
+
+fn in_rect(x: i32, y: i32, rect: Rect) -> bool {
+    x >= rect.0 && x < rect.2 && y >= rect.1 && y < rect.3
+}
+
+/// The ink at one pixel, if any.
+pub fn pixel(pet: &Avatar, x: i32, y: i32) -> Option<u8> {
+    let (rects, ink) = eye_rects(&pet.eyes);
+    if in_rect(x, y, HEAD) && rects.iter().any(|r| in_rect(x, y, *r)) {
+        return Some(ink);
+    }
+    if hair_rects(&pet.hair).iter().any(|r| in_rect(x, y, *r)) {
+        return Some(pet.hair_ink);
+    }
+    if in_rect(x, y, HEAD) || FEET.iter().any(|r| in_rect(x, y, *r)) {
+        return Some(pet.body_ink);
+    }
+    None
+}
+
+/// One terminal cell of half-block art: the two pixels it wears, top first.
+pub type Cell = (Option<u8>, Option<u8>);
+
+/// Foreground and background escapes for one ink, shared by the picker and
+/// the sidebar overlay so the same pet paints the same everywhere.
+pub fn fg(ink: u8) -> String {
+    format!("\x1b[38;5;{ink}m")
+}
+
+/// See [`fg`].
+pub fn bg(ink: u8) -> String {
+    format!("\x1b[48;5;{ink}m")
+}
+
+/// The pet as five rows of sixteen half-block cells, top row first. Fixed
+/// size so the sidebar can reserve exactly this much room every frame.
+pub fn art_cells(pet: &Avatar) -> [[Cell; ART_COLS]; ART_ROWS] {
+    let mut out = [[(None, None); ART_COLS]; ART_ROWS];
+    for (pair, row) in out.iter_mut().enumerate() {
+        for (x, cell) in row.iter_mut().enumerate() {
+            let x = x as i32;
+            *cell = (
+                pixel(pet, x, pair as i32 * 2),
+                pixel(pet, x, pair as i32 * 2 + 1),
+            );
+        }
+    }
+    out
+}
+
 /// What `qoro avatar pick` writes and the sidebar reads.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Avatar {
@@ -188,5 +280,68 @@ mod tests {
         let mut bare = sample();
         bare.hair = "none".into();
         assert_eq!(bare.name(), "Bare");
+    }
+
+    /// Every shape stays on the 16 by 12 grid.
+    #[test]
+    fn every_shape_stays_on_the_grid() {
+        let mut rects = vec![HEAD];
+        rects.extend(FEET);
+        for hair in HAIR_STYLES {
+            rects.extend(hair_rects(hair));
+        }
+        for eyes in EYE_STYLES {
+            rects.extend(eye_rects(eyes).0);
+        }
+        for (x0, y0, x1, y1) in rects {
+            assert!(0 <= x0 && x0 < x1 && x1 <= GRID_W, "x out of grid");
+            assert!(0 <= y0 && y0 < y1 && y1 <= GRID_H, "y out of grid");
+        }
+    }
+
+    /// Art is always five rows of sixteen cells, and every ink on it comes
+    /// from the curated sets, whatever the picker dealt.
+    #[test]
+    fn art_cells_are_fixed_size_and_curated_inks() {
+        for hair in HAIR_STYLES {
+            for ink in HAIR_INKS {
+                for eyes in EYE_STYLES {
+                    let pet = Avatar {
+                        body: BODY.into(),
+                        hair: hair.into(),
+                        eyes: eyes.into(),
+                        hair_ink: ink,
+                        body_ink: BODY_INK,
+                    };
+                    let art = art_cells(&pet);
+                    assert_eq!(art.len(), ART_ROWS);
+                    let mut filled = 0;
+                    for row in &art {
+                        assert_eq!(row.len(), ART_COLS);
+                        for (top, bottom) in row {
+                            for cell in [top, bottom].into_iter().flatten() {
+                                filled += 1;
+                                assert!(
+                                    HAIR_INKS.contains(cell)
+                                        || *cell == BODY_INK
+                                        || *cell == EYE_CREAM
+                                        || *cell == EYE_INK,
+                                    "ink {cell} escaped the curated sets"
+                                );
+                            }
+                        }
+                    }
+                    assert!(filled > 0, "{hair}/{eyes} paints nothing");
+                }
+            }
+        }
+    }
+
+    /// The sample pet wears its mohawk on top and its feet at the bottom.
+    #[test]
+    fn the_sample_pet_reads_top_to_bottom() {
+        let art = art_cells(&sample());
+        assert!(art[0].iter().any(|(top, _)| *top == Some(212)));
+        assert!(art[4].iter().any(|cell| cell.0 == Some(BODY_INK)));
     }
 }

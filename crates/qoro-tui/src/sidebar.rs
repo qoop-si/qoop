@@ -418,6 +418,7 @@ pub fn render_folded(
         unseen,
         now_unix,
         width,
+        None,
     )
     .into_iter()
     .map(|(line, _)| line)
@@ -461,6 +462,7 @@ pub fn hit_folded(
     unseen: &Unseen,
     now_unix: i64,
     width: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
 ) -> Option<Hit> {
     rows_folded(
         spaces,
@@ -475,6 +477,7 @@ pub fn hit_folded(
         unseen,
         now_unix,
         width,
+        avatar,
     )
     .into_iter()
     .nth(row)
@@ -934,6 +937,7 @@ pub(crate) fn rows_folded(
     unseen: &Unseen,
     now_unix: i64,
     width: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
 ) -> Vec<(Line, Option<Hit>)> {
     if height == 0 {
         return Vec::new();
@@ -951,9 +955,29 @@ pub(crate) fn rows_folded(
         now_unix,
         width,
     );
+    // The pet stands on the foot: five blank rows for the overlay to stamp,
+    // taken off the list above rather than off the foot. Short or narrow
+    // columns keep every row for the list and show dots and name only.
+    if avatar_fits(height, width, avatar.is_some()) {
+        let blank = || {
+            (
+                Line {
+                    text: " ".repeat(width),
+                    colour: None,
+                    accent: None,
+                    indicator: None,
+                },
+                None,
+            )
+        };
+        let n = out.len();
+        for line in out.iter_mut().skip(n.saturating_sub(6)).take(5) {
+            *line = blank();
+        }
+    }
     // The mark that folds the column away, at its foot, where the eye lands last.
     if let Some(last) = out.last_mut() {
-        *last = collapse_row(false, width);
+        *last = collapse_row_with(false, width, avatar);
     }
     out
 }
@@ -1055,7 +1079,7 @@ fn strip_space(n: usize) -> String {
 
 /// The row that folds the column away, and unfolds it again.
 fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
-    collapse_row_with(collapsed, width, avatar_marks())
+    collapse_row_with(collapsed, width, current_avatar().as_ref())
 }
 
 /// The picked avatar, when one is picked.
@@ -1064,7 +1088,7 @@ fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
 /// runs in a process outside the interface, so anything held would be stale by
 /// construction. Under test this is always none, so the thirty-odd paints the
 /// suite asserts never depend on the developer's own home directory.
-fn avatar_marks() -> Option<qoro_runtime::avatar::Avatar> {
+pub(crate) fn current_avatar() -> Option<qoro_runtime::avatar::Avatar> {
     #[cfg(test)]
     {
         None
@@ -1075,12 +1099,70 @@ fn avatar_marks() -> Option<qoro_runtime::avatar::Avatar> {
     }
 }
 
+/// Whether the pet itself fits above the foot: open column, wide enough for
+/// sixteen art columns plus a margin each side, tall enough that five art
+/// rows still leave six rows of list.
+pub(crate) fn avatar_fits(height: usize, width: usize, present: bool) -> bool {
+    present
+        && width >= qoro_runtime::avatar::ART_COLS + 2
+        && height >= qoro_runtime::avatar::ART_ROWS + 7
+}
+
+/// The pet as itself: five pre-escaped half-block rows, sixteen columns each,
+/// for the overlay to stamp above the foot. Empty without colour, because dots
+/// and name already say it then.
+pub(crate) fn avatar_overlay(avatar: &qoro_runtime::avatar::Avatar, colour: bool) -> Vec<String> {
+    if !colour {
+        return Vec::new();
+    }
+    use qoro_runtime::avatar::{ART_COLS, art_cells};
+    art_cells(avatar)
+        .iter()
+        .map(|row| {
+            let mut line = String::new();
+            let mut cur: (Option<u8>, Option<u8>) = (None, None);
+            for (top, bottom) in row.iter().take(ART_COLS) {
+                if *top != cur.0 {
+                    line.push_str(
+                        &top.map(qoro_runtime::avatar::fg)
+                            .unwrap_or_else(|| "\x1b[39m".to_string()),
+                    );
+                    cur.0 = *top;
+                }
+                if *bottom != cur.1 {
+                    line.push_str(
+                        &bottom
+                            .map(qoro_runtime::avatar::bg)
+                            .unwrap_or_else(|| "\x1b[49m".to_string()),
+                    );
+                    cur.1 = *bottom;
+                }
+                line.push(if top.is_some() || bottom.is_some() {
+                    '\u{2580}'
+                } else {
+                    ' '
+                });
+            }
+            line.push_str("\x1b[0m");
+            line
+        })
+        .collect()
+}
+
+/// Screen rows the overlay stamps, top first, for a column of `height` rows
+/// starting at `top`. Pure so the paint and the tests agree on arithmetic.
+pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
+    (0..qoro_runtime::avatar::ART_ROWS)
+        .map(|i| top + height - 1 - qoro_runtime::avatar::ART_ROWS + i)
+        .collect()
+}
+
 /// [`collapse_row`] with the avatar passed in, so tests can paint both feet
 /// without touching a home directory.
 fn collapse_row_with(
     collapsed: bool,
     width: usize,
-    avatar: Option<qoro_runtime::avatar::Avatar>,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
 ) -> (Line, Option<Hit>) {
     let width = if collapsed { COLLAPSED } else { width };
     let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
@@ -2416,7 +2498,7 @@ mod tests {
             hair_ink: 212,
             body_ink: 33,
         };
-        let (line, hit) = collapse_row_with(false, WIDTH, Some(pet));
+        let (line, hit) = collapse_row_with(false, WIDTH, Some(&pet));
         assert_eq!(
             crate::width::width(&line.text),
             WIDTH,
@@ -2463,14 +2545,14 @@ mod tests {
             body_ink: 33,
         };
         assert_eq!(pet.name(), "Thin 4 Blocked");
-        let (wide, _) = collapse_row_with(false, WIDTH, Some(pet.clone()));
+        let (wide, _) = collapse_row_with(false, WIDTH, Some(&pet));
         assert_eq!(crate::width::width(&wide.text), WIDTH);
         assert!(
             wide.text.contains('\u{2026}'),
             "fourteen characters never fit at thirty columns: {wide:?}"
         );
         assert!(wide.text.contains("Thin 4 Bloc"), "{wide:?}");
-        let (narrow, _) = collapse_row_with(false, 18, Some(pet));
+        let (narrow, _) = collapse_row_with(false, 18, Some(&pet));
         assert_eq!(crate::width::width(&narrow.text), 18);
         assert!(
             !narrow.text.contains("Thin"),
@@ -2489,6 +2571,119 @@ mod tests {
         );
         assert_eq!(line.indicator, None);
         assert!(line.text.contains(&format!("{BRAND_MARK} {BRAND}")));
+    }
+
+    fn art_pet() -> qoro_runtime::avatar::Avatar {
+        qoro_runtime::avatar::Avatar {
+            body: qoro_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "big".into(),
+            hair_ink: 212,
+            body_ink: 33,
+        }
+    }
+
+    /// The art fits an open column of decent size, and nothing else.
+    #[test]
+    fn art_fits_an_open_column_of_decent_size_only() {
+        assert!(avatar_fits(30, 30, true));
+        assert!(avatar_fits(12, 30, true));
+        assert!(!avatar_fits(30, 30, false));
+        assert!(!avatar_fits(30, 17, true));
+        assert!(!avatar_fits(11, 30, true));
+    }
+
+    /// With a pet the five rows above the foot go blank for the overlay, the
+    /// foot keeps its dots and name, and the column keeps its exact height.
+    #[test]
+    fn a_pet_reserves_five_blank_rows_above_the_foot() {
+        let pet = art_pet();
+        let spaces = vec![space(1, "app")];
+        let agents: Vec<AgentRow> = (1..=10u32)
+            .map(|i| agent(i, 1, "claude", "working"))
+            .collect();
+        let rows = rows_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            30,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+            Some(&pet),
+        );
+        assert_eq!(rows.len(), 30);
+        for (line, hit) in rows[24..29].iter() {
+            assert_eq!(line.text, " ".repeat(WIDTH), "{line:?}");
+            assert_eq!(*hit, None);
+        }
+        let (foot, _) = &rows[29];
+        assert!(foot.text.contains("Mohawk Pink"), "{foot:?}");
+    }
+
+    /// The reservation eats list rows, not padding: without a pet those rows
+    /// carry agents.
+    #[test]
+    fn without_a_pet_those_rows_carry_agents() {
+        let spaces = vec![space(1, "app")];
+        let agents: Vec<AgentRow> = (1..=10u32)
+            .map(|i| agent(i, 1, "claude", "working"))
+            .collect();
+        let plain = rows_folded(
+            &spaces,
+            &agents,
+            1,
+            1,
+            30,
+            0,
+            View::Grouped,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+            None,
+        );
+        assert!(
+            plain[24..29]
+                .iter()
+                .any(|(line, _)| line.text.trim().len() > 1),
+            "ten agents must reach rows 24 to 28"
+        );
+    }
+
+    /// Overlay rows sit directly above the foot, top first.
+    #[test]
+    fn overlay_rows_sit_directly_above_the_foot() {
+        assert_eq!(avatar_overlay_rows(1, 30), vec![25, 26, 27, 28, 29]);
+    }
+
+    /// The overlay paints the pet in its own inks: five sixteen-cell rows,
+    /// each reset at the end, empty without colour.
+    #[test]
+    fn the_overlay_paints_the_pet_in_its_inks() {
+        let rows = avatar_overlay(&art_pet(), true);
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert!(row.ends_with("\x1b[0m"), "{row:?}");
+            let cells = row
+                .replace("\x1b[38;5;212m", "")
+                .replace("\x1b[38;5;33m", "")
+                .replace("\x1b[38;5;231m", "")
+                .replace("\x1b[48;5;212m", "")
+                .replace("\x1b[48;5;33m", "")
+                .replace("\x1b[48;5;231m", "")
+                .replace("\x1b[39m", "")
+                .replace("\x1b[49m", "")
+                .replace("\x1b[0m", "")
+                .replace(['\u{2580}', ' '], "");
+            assert!(cells.is_empty(), "unaccounted cells: {row:?}");
+        }
+        assert!(rows[0].contains("38;5;212"), "hair on top: {:?}", rows[0]);
+        assert!(avatar_overlay(&art_pet(), false).is_empty());
     }
 
     /// A seen update signs the foot of the column with where this build stands.
@@ -2604,6 +2799,7 @@ mod tests {
             &Unseen::new(),
             NOW,
             WIDTH,
+            None,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -2650,6 +2846,7 @@ mod tests {
                 &Unseen::new(),
                 NOW,
                 WIDTH,
+                None,
             )
         };
         let zero: Vec<Line> = at(0).iter().map(|(l, _)| l.clone()).collect();
@@ -2861,6 +3058,7 @@ mod tests {
                     &Unseen::new(),
                     NOW,
                     WIDTH,
+                    None,
                 );
                 let terminals: Vec<u32> = rows
                     .iter()
@@ -3000,7 +3198,8 @@ mod tests {
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
-                WIDTH
+                WIDTH,
+                None,
             ),
             None,
             "the title row must not open a space: {texts:?}"
@@ -3029,6 +3228,7 @@ mod tests {
                         &Unseen::new(),
                         NOW,
                         WIDTH,
+                        None,
                     )
                 })
                 .filter_map(|hit| match hit {
@@ -3400,6 +3600,7 @@ mod tests {
                 &Unseen::new(),
                 NOW,
                 WIDTH,
+                None,
             )
             .into_iter()
             .filter_map(|(_, hit)| match hit {
@@ -3452,6 +3653,7 @@ mod tests {
             &Unseen::new(),
             NOW,
             WIDTH,
+            None,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3495,6 +3697,7 @@ mod tests {
             &unseen,
             NOW,
             WIDTH,
+            None,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3532,6 +3735,7 @@ mod tests {
             &Unseen::new(),
             NOW,
             WIDTH,
+            None,
         )
         .into_iter()
         .filter_map(|(_, hit)| match hit {
@@ -3955,6 +4159,7 @@ mod tests {
                 &Unseen::new(),
                 NOW,
                 WIDTH,
+                None,
             );
             // The focused blocked row draws somewhere inside the window.
             assert!(
@@ -3975,6 +4180,7 @@ mod tests {
                         &Unseen::new(),
                         NOW,
                         WIDTH,
+                        None,
                     ),
                     *hit,
                     "hit disagrees with paint at row {row}, height {height}"

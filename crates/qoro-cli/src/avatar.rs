@@ -15,12 +15,10 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qoro_runtime::avatar::{
-    self, Avatar, BODY, BODY_INK, EYE_CREAM, EYE_INK, EYE_STYLES, HAIR_INKS, HAIR_STYLES,
+    self, Avatar, BODY, BODY_INK, EYE_STYLES, GRID_H, GRID_W, HAIR_INKS, HAIR_STYLES, art_cells,
+    bg, fg, pixel,
 };
 
-/// Grid the pets are drawn on, same as the mock.
-const W: i32 = 16;
-const H: i32 = 12;
 /// How many pets a batch holds.
 const BATCH: usize = 6;
 
@@ -243,99 +241,38 @@ impl Rng {
     }
 }
 
-/// A filled rect on the grid, end-exclusive like every other range here.
-type Rect = (i32, i32, i32, i32);
-
-/// The head every avatar shares: the darko box, no nose, two feet.
-const HEAD: Rect = (5, 4, 11, 9);
-const FEET: [Rect; 2] = [(6, 9, 7, 10), (9, 9, 10, 10)];
-
-/// Hair by style, same shapes as the mock.
-fn hair_rects(hair: &str) -> Vec<Rect> {
-    match hair {
-        "block" => vec![(6, 1, 9, 4), (9, 2, 12, 4)],
-        "mohawk" => vec![(7, 0, 9, 4), (9, 3, 13, 5), (10, 5, 13, 7)],
-        "spikes" => vec![(6, 2, 11, 4), (6, 1, 7, 2), (8, 1, 9, 2), (10, 1, 11, 2)],
-        "flat" => vec![(5, 2, 11, 4)],
-        "thin4" => vec![(6, 1, 8, 4), (9, 1, 11, 4)],
-        "beacon" => vec![(7, 3, 10, 4), (8, 2, 9, 3), (8, 1, 9, 2)],
-        "cap" => vec![(8, 2, 12, 4), (6, 3, 9, 4)],
-        _ => vec![],
-    }
-}
-
-/// Eyes by style: position rects plus whether they wear the dark slit ink.
-fn eye_rects(eyes: &str) -> (Vec<Rect>, u8) {
-    match eyes {
-        "big" => (vec![(6, 5, 7, 7), (8, 5, 9, 7)], EYE_CREAM),
-        "bigsmall" => (vec![(6, 5, 7, 7), (9, 6, 10, 7)], EYE_CREAM),
-        "squint" => (vec![(6, 6, 8, 7), (9, 6, 11, 7)], EYE_INK),
-        "squintw" => (vec![(6, 6, 8, 7), (9, 6, 11, 7)], EYE_CREAM),
-        _ => (vec![(6, 6, 7, 7), (9, 6, 10, 7)], EYE_CREAM),
-    }
-}
-
-fn in_rect(x: i32, y: i32, rect: Rect) -> bool {
-    x >= rect.0 && x < rect.2 && y >= rect.1 && y < rect.3
-}
-
-/// The ink at one pixel, if any. Eyes win over a sweeping fringe: the mock
-/// paints them last, so a side lock may touch the head's edge but never an eye.
-fn pixel(pet: &Avatar, x: i32, y: i32) -> Option<u8> {
-    let (rects, ink) = eye_rects(&pet.eyes);
-    if in_rect(x, y, HEAD) && rects.iter().any(|r| in_rect(x, y, *r)) {
-        return Some(ink);
-    }
-    if hair_rects(&pet.hair).iter().any(|r| in_rect(x, y, *r)) {
-        return Some(pet.hair_ink);
-    }
-    if in_rect(x, y, HEAD) || FEET.iter().any(|r| in_rect(x, y, *r)) {
-        return Some(pet.body_ink);
-    }
-    None
-}
-
-fn fg(ink: u8) -> String {
-    format!("\x1b[38;5;{ink}m")
-}
-
-fn bg(ink: u8) -> String {
-    format!("\x1b[48;5;{ink}m")
-}
-
-/// Six terminal rows: each cell wears two pixels through the upper half block.
+/// Terminal rows for the picker: the shared cells with escapes, trimmed of
+/// all-empty pairs at both ends like the mock's own padding.
 fn art_lines(pet: &Avatar) -> Vec<String> {
     if std::env::var("NO_COLOR").is_ok() {
         return ascii_lines(pet);
     }
-    let mut out: Vec<(String, bool)> = Vec::new();
-    for pair in 0..H / 2 {
-        let mut line = String::new();
-        let mut cur: (Option<u8>, Option<u8>) = (None, None);
-        let mut filled = false;
-        for x in 0..W {
-            let top = pixel(pet, x, pair * 2);
-            let bottom = pixel(pet, x, pair * 2 + 1);
-            filled = filled || top.is_some() || bottom.is_some();
-            if top != cur.0 {
-                line.push_str(&top.map(fg).unwrap_or_else(|| "\x1b[39m".to_string()));
-                cur.0 = top;
+    let mut out: Vec<(String, bool)> = art_cells(pet)
+        .iter()
+        .map(|row| {
+            let mut line = String::new();
+            let mut cur: (Option<u8>, Option<u8>) = (None, None);
+            let mut filled = false;
+            for (top, bottom) in row {
+                filled = filled || top.is_some() || bottom.is_some();
+                if *top != cur.0 {
+                    line.push_str(&(*top).map(fg).unwrap_or_else(|| "\x1b[39m".to_string()));
+                    cur.0 = *top;
+                }
+                if *bottom != cur.1 {
+                    line.push_str(&(*bottom).map(bg).unwrap_or_else(|| "\x1b[49m".to_string()));
+                    cur.1 = *bottom;
+                }
+                line.push(if top.is_some() || bottom.is_some() {
+                    '\u{2580}'
+                } else {
+                    ' '
+                });
             }
-            if bottom != cur.1 {
-                line.push_str(&bottom.map(bg).unwrap_or_else(|| "\x1b[49m".to_string()));
-                cur.1 = bottom;
-            }
-            line.push(if top.is_some() || bottom.is_some() {
-                '\u{2580}'
-            } else {
-                ' '
-            });
-        }
-        line.push_str("\x1b[0m");
-        out.push((line, filled));
-    }
-    // The grid is 12 tall but content lives up top: trim the all-empty pairs
-    // at both ends like the mock's own padding, keeping at least one row.
+            line.push_str("\x1b[0m");
+            (line, filled)
+        })
+        .collect();
     while out.len() > 1 && !out.first().map(|(_, f)| *f).unwrap_or(true) {
         out.remove(0);
     }
@@ -348,9 +285,9 @@ fn art_lines(pet: &Avatar) -> Vec<String> {
 /// The honest fallback: one hash per filled pixel, no colour.
 fn ascii_lines(pet: &Avatar) -> Vec<String> {
     let mut out = Vec::new();
-    for y in 0..H {
+    for y in 0..GRID_H {
         let mut line = String::new();
-        for x in 0..W {
+        for x in 0..GRID_W {
             line.push(if pixel(pet, x, y).is_some() { '#' } else { ' ' });
         }
         out.push(line);
@@ -369,55 +306,6 @@ fn render(pet: &Avatar, _colour: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every rect the picker draws stays on the 16 by 12 grid.
-    #[test]
-    fn every_shape_stays_on_the_grid() {
-        let mut rects = vec![HEAD];
-        rects.extend(FEET);
-        for hair in HAIR_STYLES {
-            rects.extend(hair_rects(hair));
-        }
-        for eyes in EYE_STYLES {
-            rects.extend(eye_rects(eyes).0);
-        }
-        for (x0, y0, x1, y1) in rects {
-            assert!(0 <= x0 && x0 < x1 && x1 <= W, "x out of grid");
-            assert!(0 <= y0 && y0 < y1 && y1 <= H, "y out of grid");
-        }
-    }
-
-    /// A sweeping fringe may touch the head's edge, but never an eye: eyes are
-    /// painted last, like the mock.
-    #[test]
-    fn hair_never_covers_an_eye() {
-        for hair in HAIR_STYLES {
-            for rect in hair_rects(hair) {
-                for x in rect.0..rect.2 {
-                    for y in rect.1..rect.3 {
-                        for eyes in EYE_STYLES {
-                            let (erects, _) = eye_rects(eyes);
-                            assert!(
-                                !erects.iter().any(|r| in_rect(x, y, *r))
-                                    || pixel(
-                                        &Avatar {
-                                            body: BODY.into(),
-                                            hair: hair.into(),
-                                            eyes: eyes.into(),
-                                            hair_ink: HAIR_INKS[0],
-                                            body_ink: BODY_INK,
-                                        },
-                                        x,
-                                        y
-                                    ) == Some(eye_rects(eyes).1),
-                                "{hair} covers {eyes} eyes at {x},{y}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     /// The curated batch is six valid avatars with six different names.
     #[test]
