@@ -307,6 +307,10 @@ async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
                     wr.write_all(&client::encode_command_seq(
                         &ClientWire::Input {
                             bytes: piece.to_vec(),
+                            // Attach typing is the person's own hands on
+                            // this terminal, never a wait edge: no claim.
+                            from_terminal: None,
+                            from_token: None,
                         },
                         &mut seq,
                     )?)
@@ -968,10 +972,15 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
             }
         }
         let mut term_seq = 0u32;
+        // Who sends, when the sender runs inside a terminal: binds the
+        // daemon-side wait edge to its sender. Absent outside one.
+        let (from_terminal, from_token) = cli_sender();
         wr.write_all(&client::encode_command_to(
             terminal,
             &ClientWire::Input {
                 bytes: text.into_bytes(),
+                from_terminal,
+                from_token,
             },
             &mut term_seq,
         )?)
@@ -980,6 +989,33 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         println!("sent to terminal {terminal}");
         Ok(())
     })
+}
+
+/// Who this CLI call runs as, when it runs inside a qoro terminal: the
+/// terminal number plus its token, for binding a send/prompt's
+/// `from_terminal` claim to its sender. Both come from the environment the
+/// daemon put around everything the session starts; a half claim (number
+/// without token) sends nothing, and outside a terminal both are absent
+/// and the daemon treats the input as unattributed, exactly like before.
+fn cli_sender() -> (Option<u32>, Option<String>) {
+    cli_sender_from(
+        std::env::var("QORO_TERMINAL").ok(),
+        std::env::var("QORO_TOKEN").ok(),
+    )
+}
+
+/// `cli_sender` over explicit values, so the mapping is table-testable
+/// without touching the process environment.
+fn cli_sender_from(
+    terminal: Option<String>,
+    token: Option<String>,
+) -> (Option<u32>, Option<String>) {
+    let terminal: Option<u32> = terminal.and_then(|v| v.parse().ok());
+    let token: Option<String> = token.filter(|v| !v.is_empty());
+    match (terminal, token) {
+        (Some(t), Some(tok)) => (Some(t), Some(tok)),
+        _ => (None, None),
+    }
 }
 
 /// Fetch one terminal's live screen: subscribe, settle, keep the last snapshot.
@@ -1192,6 +1228,11 @@ fn prompt_refusal(row: &qoro_runtime::control::AgentRow) -> Option<String> {
             "agent {who} is blocked and requires interactive input"
         ));
     }
+    if row.state == "sleeping" {
+        return Some(format!(
+            "terminal {who} is sleeping: it was reaped for idleness and takes no input"
+        ));
+    }
     None
 }
 
@@ -1259,10 +1300,15 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         }
         let terminal = row.terminal;
         let mut term_seq = 0u32;
+        // Both frames carry the sender: either one records the wait edge,
+        // and the daemon dedupes by waiter.
+        let (from_terminal, from_token) = cli_sender();
         wr.write_all(&client::encode_command_to(
             terminal,
             &ClientWire::Input {
                 bytes: text.into_bytes(),
+                from_terminal,
+                from_token: from_token.clone(),
             },
             &mut term_seq,
         )?)
@@ -1270,7 +1316,11 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
         wr.write_all(&client::encode_command_to(
             terminal,
-            &ClientWire::Input { bytes: vec![b'\r'] },
+            &ClientWire::Input {
+                bytes: vec![b'\r'],
+                from_terminal,
+                from_token,
+            },
             &mut term_seq,
         )?)
         .await?;
@@ -2055,9 +2105,9 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextJson, explain_row, parse_context_args, parse_history_args, prompt_refusal,
-        render_context_text, render_window_text, resolve_target, take_session, trim_rows,
-        truncate_text,
+        ContextJson, cli_sender_from, explain_row, parse_context_args, parse_history_args,
+        prompt_refusal, render_context_text, render_window_text, resolve_target, take_session,
+        trim_rows, truncate_text,
     };
     use qoro_history::{Message, Role, SessionId, Window};
     use qoro_runtime::control::AgentRow;
@@ -2081,6 +2131,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -2205,6 +2256,45 @@ mod tests {
         );
         let shell = row(3, None, Some("sh"));
         assert_eq!(prompt_refusal(&shell), None);
+    }
+
+    #[test]
+    fn a_sleeping_terminal_refuses_a_prompt_by_name() {
+        let mut slept = row(4, None, Some("claude"));
+        slept.state = "sleeping".into();
+        let reason = prompt_refusal(&slept).expect("a slept tab takes no input");
+        assert!(
+            reason.contains("sleeping"),
+            "the refusal names the state: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_sender_claim_needs_both_a_number_and_a_token() {
+        let both = |t: &str, k: &str| cli_sender_from(Some(t.to_string()), Some(k.to_string()));
+        assert_eq!(both("3", "tok"), (Some(3), Some("tok".to_string())));
+        // Every half or mangled claim sends nothing.
+        assert_eq!(
+            cli_sender_from(Some("3".to_string()), None),
+            (None, None),
+            "number without token"
+        );
+        assert_eq!(
+            cli_sender_from(None, Some("tok".to_string())),
+            (None, None),
+            "token without number"
+        );
+        assert_eq!(
+            cli_sender_from(Some("abc".to_string()), Some("tok".to_string())),
+            (None, None),
+            "unnumbered terminal"
+        );
+        assert_eq!(
+            cli_sender_from(Some("3".to_string()), Some(String::new())),
+            (None, None),
+            "empty token"
+        );
+        assert_eq!(cli_sender_from(None, None), (None, None));
     }
 
     fn history_argv(words: &[&str]) -> Vec<String> {

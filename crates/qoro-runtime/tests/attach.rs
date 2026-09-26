@@ -88,6 +88,8 @@ async fn a_client_attaches_and_a_real_shell_answers_a_real_command() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"echo QORO_READY_$((6*7))\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )
@@ -122,6 +124,8 @@ async fn attaching_delivers_the_current_screen_not_only_later_updates() {
         wr.write_all(
             &client::encode_command(&ClientWire::Input {
                 bytes: b"echo LEFT_BEHIND_MARKER\n".to_vec(),
+                from_terminal: None,
+                from_token: None,
             })
             .unwrap(),
         )
@@ -169,6 +173,8 @@ async fn a_client_disconnect_does_not_kill_the_shell() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"QORO_SURVIVOR=alive; echo SET_$QORO_SURVIVOR\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )
@@ -195,6 +201,8 @@ async fn a_client_disconnect_does_not_kill_the_shell() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"echo STILL_$QORO_SURVIVOR\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )
@@ -235,6 +243,8 @@ async fn a_resize_reaches_the_child() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"stty size\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )
@@ -308,6 +318,8 @@ async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"trap 'echo W$((6*7))' WINCH\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )
@@ -336,6 +348,8 @@ async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
             bytes: b"stty size\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .unwrap(),
     )

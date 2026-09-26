@@ -38,6 +38,12 @@ pub enum Role {
     Done,
     Failed,
     Idle,
+    /// A tab the idle reaper slept: the process is gone, the marker stays.
+    ///
+    /// Calm-bottom, below idle, never attention: the only thing it has to
+    /// say is "this one is not running any more". A settled state with a
+    /// hue, like done: idle stays the uncoloured background.
+    Sleeping,
     /// The working spinner's head, one step of the brand's own ambers.
     ///
     /// The sidebar steps these five times per loop while its glyph cycles four
@@ -124,6 +130,7 @@ pub fn of(state: &str) -> Role {
         "done" => Role::Done,
         "failed" => Role::Failed,
         "idle" => Role::Idle,
+        "sleeping" => Role::Sleeping,
         _ => Role::Unobserved,
     }
 }
@@ -139,9 +146,11 @@ pub fn of(state: &str) -> Role {
 /// brand: working `00BBFF` is 39, blocked `FF7700` is 208, done `00BB54` is 35,
 /// failed is vivid magenta 201, the palette's loudest hue outside the warm pair.
 ///
-/// The violet anchor `5A00EB` (56) is unspent: violet has no correct steady seat
-/// while the mark is orange, and the violet family still shows in the space
-/// wheel's 135 step and the tab's pink 212.
+/// Sleeping wears 140 (`AF87D7`), a muted mauve: measured L* 63 against the
+/// L* 55 floor, 7.3:1 on black (inside the states' 4 to 8.7 band), and 42 dE
+/// from the closest state ink, the working sky. The violet anchor `5A00EB`
+/// (56) stays unspent: at 2.5:1 it fails the contrast the job needs, and a
+/// dimmer violet would read as chrome grey rather than as a state.
 ///
 /// The rule is the one deliberate departure. The brand border is `#1a1a1a`, which is a
 /// line you can only see against the brand's own black; a terminal's background is
@@ -162,6 +171,7 @@ const fn ink(role: Role) -> u8 {
         Role::Done => 35,
         Role::Failed => 201,
         Role::Idle => 242,
+        Role::Sleeping => 140,
         Role::Unobserved => 238,
         Role::AvatarHair(ink) => ink,
         Role::AvatarBody(ink) => ink,
@@ -269,6 +279,7 @@ mod tests {
             Role::Done,
             Role::Failed,
             Role::Idle,
+            Role::Sleeping,
             Role::Unobserved,
         ]
         .into_iter()
@@ -335,7 +346,12 @@ mod tests {
     /// column is decoration.
     #[test]
     fn the_states_that_want_a_person_are_not_the_colour_of_the_ones_that_do_not() {
-        let calm = [ink(Role::Idle), ink(Role::Unobserved), ink(Role::Detail)];
+        let calm = [
+            ink(Role::Idle),
+            ink(Role::Sleeping),
+            ink(Role::Unobserved),
+            ink(Role::Detail),
+        ];
         for loud in [Role::Blocked, Role::Failed, Role::Working, Role::Done] {
             assert!(!calm.contains(&ink(loud)), "{loud:?} is painted as calm");
         }
@@ -344,6 +360,45 @@ mod tests {
         // sidebar's failed diamond).
         assert_ne!(ink(Role::Blocked), ink(Role::Failed));
         assert_ne!(ink(Role::Working), ink(Role::Done));
+    }
+
+    /// Sleeping is a state with a measured seat: muted mauve 140 (L* 63,
+    /// 7.3:1 on black, 42 dE from the closest state ink, the working sky),
+    /// named by `of`, distinct from every state, chrome and space ink.
+    /// An unknown state still falls back to Unobserved: a newer daemon may
+    /// say more than this build understands.
+    #[test]
+    fn sleeping_has_its_own_measured_colour_and_the_unknown_falls_back() {
+        assert_eq!(of("sleeping"), Role::Sleeping);
+        assert_eq!(ink(Role::Sleeping), 140);
+        assert_eq!(of("whatever-comes-next"), Role::Unobserved);
+        let taken = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Unobserved,
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+            Role::Rule,
+            Role::Brand,
+        ]
+        .map(ink);
+        assert!(
+            !taken.contains(&ink(Role::Sleeping)),
+            "sleeping wears a taken colour"
+        );
+        for n in 0..SPACE_INKS.len() {
+            assert_ne!(
+                ink(Role::Space(n)),
+                ink(Role::Sleeping),
+                "space {n} wears the sleeping colour"
+            );
+        }
     }
 
     /// The mark is not a state and the tab is not an identity: brand must differ
@@ -357,6 +412,7 @@ mod tests {
             Role::Done,
             Role::Failed,
             Role::Idle,
+            Role::Sleeping,
             Role::Unobserved,
         ]
         .map(ink);
@@ -378,6 +434,7 @@ mod tests {
             Role::Done,
             Role::Failed,
             Role::Idle,
+            Role::Sleeping,
             Role::Unobserved,
             Role::Title,
             Role::Text,
@@ -426,6 +483,7 @@ mod tests {
             Role::Done,
             Role::Failed,
             Role::Idle,
+            Role::Sleeping,
             Role::Unobserved,
             Role::Title,
             Role::Text,
@@ -504,6 +562,7 @@ mod tests {
             Role::Done,
             Role::Failed,
             Role::Idle,
+            Role::Sleeping,
             Role::Unobserved,
             Role::Title,
             Role::Text,

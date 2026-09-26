@@ -184,6 +184,40 @@ pub fn is_live_input(from: &str) -> bool {
     from != "qoro-restore"
 }
 
+/// Apply waiter→target edges to a snapshot eligibility map.
+///
+/// `eligible` is the pure per-stream verdict at pass start, before any
+/// reap in the pass runs: evaluating against the snapshot keeps the
+/// outcome independent of pass order. A waiter is vetoed while its wait is
+/// observably alive: it has shown no activity since asking
+/// (`idle_since <= since`) and its target is tracked and not itself
+/// eligible. Both idle together sleep together, cycles included; a target
+/// that is gone vetoes nothing, because nothing is being waited on any
+/// more.
+pub fn apply_edge_vetoes(
+    eligible: &BTreeMap<u32, bool>,
+    edges: &[(u32, u32, i64)],
+    idle_since: &BTreeMap<u32, i64>,
+) -> BTreeMap<u32, bool> {
+    let mut out = eligible.clone();
+    for (waiter, target, since) in edges {
+        if !eligible.get(waiter).copied().unwrap_or(false) {
+            continue;
+        }
+        let quiet_since_asking = idle_since.get(waiter).is_some_and(|idle| *idle <= *since);
+        if !quiet_since_asking {
+            continue;
+        }
+        // The target is alive but busy: the wait is alive, the waiter stays.
+        // Eligible target: both sleep together. Absent target: gone, and a
+        // wait on nothing is not a wait.
+        if eligible.get(target).is_some_and(|e| !e) {
+            out.insert(*waiter, false);
+        }
+    }
+    out
+}
+
 /// Per-terminal watcher refcounts: how many live connections hold a render
 /// subscription on each terminal.
 ///
@@ -291,7 +325,9 @@ mod tests {
         for shell in ["sh", "bash", "zsh", "fish", "/bin/zsh", "nu", "pwsh"] {
             assert!(is_shell_program(shell), "{shell}");
         }
-        for task in ["claude", "cargo", "sleep", "python3", "node", "docker"] {
+        for task in [
+            "claude", "cargo", "sleep", "python3", "node", "docker", "tail", "watch",
+        ] {
             assert!(!is_shell_program(task), "{task}");
         }
         assert_eq!(classify_program(None), ForegroundKind::Absent);
@@ -423,6 +459,33 @@ mod tests {
         for live in ["c1", "", "qoro-restore2", "QORO-RESTORE"] {
             assert!(is_live_input(live), "{live:?} is live");
         }
+    }
+
+    #[test]
+    fn waiter_edges_veto_only_while_the_wait_is_observably_alive() {
+        // X waits on Y. Y busy: X stays. Y idle too: both sleep together.
+        let live = BTreeMap::from([(1, true), (2, false)]);
+        let idle = BTreeMap::from([(1, 100), (2, 50)]);
+        let out = apply_edge_vetoes(&live, &[(1, 2, 100)], &idle);
+        assert!(!out[&1], "waiter vetoed while target busy");
+        assert!(!out[&2]);
+        let both_idle = BTreeMap::from([(1, true), (2, true)]);
+        let out = apply_edge_vetoes(&both_idle, &[(1, 2, 100)], &idle);
+        assert!(out[&1], "both idle sleep together");
+        // A cycle idle on both ends sleeps together, never immortal.
+        let out = apply_edge_vetoes(&both_idle, &[(1, 2, 100), (2, 1, 100)], &idle);
+        assert!(out[&1] && out[&2], "an idle cycle sleeps together");
+        // Target gone: nothing waited on, waiter eligible.
+        let out = apply_edge_vetoes(&both_idle, &[(1, 9, 100)], &idle);
+        assert!(out[&1]);
+        // Waiter active since asking: the wait is over, edge inert.
+        let busy_waiter = BTreeMap::from([(1, 200), (2, 50)]);
+        let out = apply_edge_vetoes(&both_idle, &[(1, 2, 100)], &busy_waiter);
+        assert!(out[&1], "activity since asking ends the wait");
+        // An ineligible waiter stays ineligible: edges only veto.
+        let ineligible = BTreeMap::from([(1, false), (2, false)]);
+        let out = apply_edge_vetoes(&ineligible, &[(1, 2, 100)], &idle);
+        assert!(!out[&1]);
     }
 
     #[test]

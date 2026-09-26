@@ -1223,7 +1223,11 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             format!(" terminals       {}", frame.rows.len()),
             format!(
                 " agents          {}",
-                frame.rows.iter().filter(|r| r.agent).count()
+                frame
+                    .rows
+                    .iter()
+                    .filter(|r| r.agent && r.state != "sleeping")
+                    .count()
             ),
             format!(
                 " waiting         {}",
@@ -1638,6 +1642,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -2957,6 +2962,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -3327,6 +3333,7 @@ mod tests {
                 agent_title: None,
                 last_active_at_unix: None,
                 cwd: None,
+                slept_at_unix: None,
             })
             .collect();
         // Nothing folds: all nine agents draw their pairs, no headers and no
@@ -3995,5 +4002,54 @@ mod tests {
         assert_eq!(left_for(120, false, 18), 19);
         assert_eq!(left_for(120, false, 36), 37);
         assert_eq!(pane_size_for(120, 24, false, 0, 18), (120 - 18 - 1, 21));
+    }
+
+    /// The settings census counts live agents: a sleeping tomb is listed,
+    /// not counted.
+    #[test]
+    fn the_settings_census_counts_live_agents_not_sleepers() {
+        let rows = [row(1, "claude", "working"), row(2, "claude", "sleeping")];
+        let mut out = String::new();
+        paint_reading(
+            &Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols: 100,
+                lines: 24,
+                message: None,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: Some(crate::run::Reading::Settings),
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &crate::run::Behind {
+                    terminal: 0,
+                    from: 0,
+                    lines: Vec::new(),
+                    total: 0,
+                },
+                image_notice: None,
+            },
+            crate::run::Reading::Settings,
+            &mut out,
+        );
+        assert!(out.contains(" agents          1"), "{out:?}");
+        assert!(out.contains(" terminals       2"), "{out:?}");
     }
 }

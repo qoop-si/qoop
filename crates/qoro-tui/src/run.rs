@@ -161,7 +161,12 @@ async fn send_to_pane(
     }
     let frame = client::encode_command_to(
         focused,
-        &ClientWire::Input { bytes },
+        // Local typing is the person's own hands, never a wait edge.
+        &ClientWire::Input {
+            bytes,
+            from_terminal: None,
+            from_token: None,
+        },
         seqs.entry(focused).or_default(),
     )?;
     wr.write_all(&frame).await
@@ -1966,8 +1971,12 @@ async fn drive(
                                     for piece in client::split_input(&bytes) {
                                         wr.write_all(&client::encode_command_to(
                                             focused,
+                                            // A paste is still the person's own
+                                            // hands: no wait edge, like typing.
                                             &ClientWire::Input {
                                                 bytes: piece.to_vec(),
+                                                from_terminal: None,
+                                                from_token: None,
                                             },
                                             seqs.entry(focused).or_default(),
                                         )?)
@@ -3911,6 +3920,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 

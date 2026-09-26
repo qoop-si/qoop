@@ -47,10 +47,14 @@ pub struct Line {
 /// Deliberately few: a person scanning this column is looking for the one row that needs
 /// them, and a column where every row is a different colour is a column with no signal in
 /// it. Blocked and failed are the two that mean "come here", so they are the two that are
-/// warm.
+/// warm. The settled states, done and sleeping, earn quiet hues of their own; idle stays
+/// the uncoloured background, because a colour on every row is still forbidden and idle
+/// is every other row.
 pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
     match state {
-        "blocked" | "failed" | "working" | "starting" | "done" => Some(crate::theme::of(state)),
+        "blocked" | "failed" | "working" | "starting" | "done" | "sleeping" => {
+            Some(crate::theme::of(state))
+        }
         // Idle and unobserved rows are the background of this column, and a colour on
         // every row is a column with no signal in it.
         _ => None,
@@ -267,6 +271,8 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> 
         "starting" => 4,
         "done" => 5,
         "idle" => 6,
+        // Slept tabs sink below idle: settled, visible, never attention.
+        "sleeping" => 7,
         _ => 7,
     }
 }
@@ -1707,6 +1713,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -1728,6 +1735,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -2053,6 +2061,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -2252,6 +2261,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2283,6 +2293,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -4276,5 +4287,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Sleeping earns the violet indicator and sinks below idle: settled,
+    /// visible, never attention. And it is never news: no bell, no unread,
+    /// no "new" tab mark, even with an unseen entry sitting there.
+    #[test]
+    fn a_sleeping_row_is_violet_calm_bottom_and_never_news() {
+        assert_eq!(colour_for("sleeping"), Some(crate::theme::Role::Sleeping));
+        let mut slept = agent(7, 1, "claude", "sleeping");
+        slept.generation = Some(3);
+        let focused = 1;
+        let seen = Seen::new();
+        let mut unseen = Unseen::new();
+        unseen.insert((7, 3));
+        assert!(!is_unread(&slept, focused, &seen));
+        assert!(!is_new(&slept, focused, &seen, &unseen));
+        assert!(!tab_is_new(&slept, focused, &unseen));
+        assert_eq!(
+            priority_of(&slept, focused, &seen, &unseen),
+            7,
+            "calm bottom, below idle"
+        );
+        let idle = agent(8, 1, "claude", "idle");
+        assert_eq!(priority_of(&idle, focused, &seen, &unseen), 6);
     }
 }

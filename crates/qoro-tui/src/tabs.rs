@@ -210,12 +210,17 @@ fn tab(row: &AgentRow, position: usize, focus: u32, unseen: &crate::sidebar::Uns
 /// leaving the top line. Same glyphs as the agents panel, minus idle: every
 /// calm tab ending in `o` is a row of marks that mean nothing is happening,
 /// competing with the ones that mean something. Silence is drawn as silence.
+///
+/// A slept tab keeps its `z`: sleeping is a persistent calm state, not news
+/// and never a bell, but unlike idle it is a change worth one quiet mark.
+/// `z` collides with no other tab mark.
 fn dot(state: &str) -> char {
     match state {
         "working" | "starting" => '*',
         "blocked" => '!',
         "failed" => 'x',
         "done" => '+',
+        "sleeping" => 'z',
         _ => '.',
     }
 }
@@ -319,6 +324,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -342,6 +348,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -556,5 +563,28 @@ mod tests {
             hit(&[], 1, 10, 1, &crate::sidebar::Unseen::new()),
             Some(Hit::New)
         );
+    }
+
+    /// A slept tab carries a `z`: its own mark, colliding with nothing, and
+    /// an unknown state still draws silence for old rows.
+    #[test]
+    fn a_slept_tab_carries_its_own_mark() {
+        assert_eq!(dot("sleeping"), 'z');
+        for (state, mark) in [
+            ("working", '*'),
+            ("starting", '*'),
+            ("blocked", '!'),
+            ("failed", 'x'),
+            ("done", '+'),
+        ] {
+            assert_eq!(dot(state), mark);
+            assert_ne!(mark, 'z', "{state} collides with sleeping");
+        }
+        assert_eq!(dot("idle"), UNOBSERVED);
+        assert_eq!(dot("whatever-comes-next"), UNOBSERVED);
+        let mut rows = sample();
+        rows[1].state = "sleeping".to_string();
+        let line = render(&rows, 9, 60, &crate::sidebar::Unseen::new());
+        assert!(line.text.contains("2 tue z"), "{:?}", line.text);
     }
 }

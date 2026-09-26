@@ -38,6 +38,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         agent_title: None,
         last_active_at_unix: None,
         cwd: None,
+        slept_at_unix: None,
     }
 }
 

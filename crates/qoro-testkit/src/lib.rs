@@ -275,6 +275,8 @@ impl TestClient {
             stream,
             &ClientWire::Input {
                 bytes: bytes.to_vec(),
+                from_terminal: None,
+                from_token: None,
             },
         )
         .await;

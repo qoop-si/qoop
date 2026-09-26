@@ -121,10 +121,16 @@ impl Palette {
         {
             out.push(terminal_entry(agent, spaces, "finished"));
         }
+        // Slept tabs get their own calm bucket, named, between finished and
+        // idle: folding them into "idle" would lie about whether anything
+        // runs there, and the catch-all below must not list them twice.
+        for agent in listed.iter().filter(|a| a.state == "sleeping") {
+            out.push(terminal_entry(agent, spaces, "sleeping"));
+        }
         for agent in listed.iter().filter(|a| {
             !matches!(
                 a.state.as_str(),
-                "blocked" | "failed" | "working" | "starting" | "done"
+                "blocked" | "failed" | "working" | "starting" | "done" | "sleeping"
             ) && !crate::sidebar::is_new(a, focused, seen, unseen)
         }) {
             out.push(terminal_entry(agent, spaces, "idle"));
@@ -248,6 +254,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -269,6 +276,7 @@ mod tests {
             agent_title: None,
             last_active_at_unix: None,
             cwd: None,
+            slept_at_unix: None,
         }
     }
 
@@ -467,5 +475,25 @@ mod tests {
             &crate::sidebar::Unseen::new(),
         );
         assert!(entries[0].text.contains("77"), "{entries:?}");
+    }
+
+    /// A slept tab gets its own calm bucket, named, exactly once: the idle
+    /// catch-all must not list it a second time.
+    #[test]
+    fn a_sleeping_terminal_is_listed_once_as_sleeping() {
+        let rows = vec![agent(7, 1, "claude", "sleeping")];
+        let entries = Palette::open().items(
+            &rows,
+            &[],
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        let hits: Vec<_> = entries
+            .iter()
+            .filter(|e| e.item == Item::Terminal(7))
+            .collect();
+        assert_eq!(hits.len(), 1, "listed exactly once: {entries:?}");
+        assert_eq!(hits[0].section, "sleeping");
     }
 }

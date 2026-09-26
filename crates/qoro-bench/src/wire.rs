@@ -41,6 +41,8 @@ impl BenchClient {
     pub async fn input(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.send(&ClientWire::Input {
             bytes: bytes.to_vec(),
+            from_terminal: None,
+            from_token: None,
         })
         .await
     }

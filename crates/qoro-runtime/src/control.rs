@@ -467,6 +467,14 @@ pub struct AgentRow {
     /// client's idle tiers are computed from.
     #[serde(default)]
     pub last_active_at_unix: Option<i64>,
+    /// When this terminal was slept by the idle reaper, as unix seconds on
+    /// the daemon's own clock. Present only on rows with `state:
+    /// "sleeping"`: a tombstone kept so a slept tab stays visible instead
+    /// of vanishing. The process is gone; the agent's own conversation
+    /// survives in the agent's own store. Absent on every live row and on
+    /// rows from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slept_at_unix: Option<i64>,
     /// Where this terminal is, last known, as an absolute path.
     ///
     /// Best effort with a documented bound: the per-terminal task writes it
@@ -661,6 +669,44 @@ mod tests {
         assert_eq!(explained.source.as_deref(), Some("ScreenHeuristic"));
         assert_eq!(explained.rule.as_deref(), Some("needs_approval"));
         assert_eq!(explained.manifest.as_deref(), Some("claude"));
+    }
+
+    /// A sleeping row carries when it slept; a row from an older daemon
+    /// parses with it absent, and an older client ignores what it does not
+    /// know (no `deny_unknown_fields` on the struct).
+    #[test]
+    fn a_sleeping_row_carries_when_it_slept_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"sleeping"}"#)
+                .expect("decode");
+        assert_eq!(old.slept_at_unix, None);
+        let new: AgentRow = serde_json::from_str(
+            r#"{"terminal":2,"workspace":1,"state":"sleeping","slept_at_unix":1750000000,"future_key":"ignored"}"#,
+        )
+        .expect("decode");
+        assert_eq!(new.slept_at_unix, Some(1_750_000_000));
+        // Skipped on the wire when absent: live rows say nothing new.
+        let live = AgentRow {
+            terminal: 3,
+            workspace: 1,
+            name: None,
+            program: Some("zsh".into()),
+            behind: None,
+            state: "idle".into(),
+            readiness: "ready".into(),
+            agent: false,
+            agent_session: None,
+            agent_title: None,
+            generation: None,
+            source: None,
+            rule: None,
+            manifest: None,
+            last_active_at_unix: None,
+            cwd: None,
+            slept_at_unix: None,
+        };
+        let encoded = serde_json::to_string(&live).expect("encode");
+        assert!(!encoded.contains("slept_at_unix"), "{encoded}");
     }
 
     /// G8: activity and place fields cross old daemons both ways. A row from

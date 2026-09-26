@@ -56,7 +56,7 @@ a claim nobody has to keep.
 | Option | What it does |
 |---|---|
 | `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once. The flag wins over the environment, which wins over the session last opened, which wins over the `default` session: a bare `qoro` reopens whatever was opened last. |
-| `QORO_IDLE_TIMEOUT_MINUTES` | idle auto-sleep: when set to a whole number of minutes N (recommended: `30`), the daemon closes terminals idle past N minutes with no background task running, through the same path as closing the tab by hand. Unset, `0` or invalid means disabled, which is the default. A reaped tab does not come back on the next start; the agent's own conversation survives in the agent's own store. |
+| `QORO_IDLE_TIMEOUT_MINUTES` | idle auto-sleep: when set to a whole number of minutes N (recommended: `30`), the daemon closes terminals idle past N minutes with no background task running, through the same path as closing the tab by hand. Unset, `0` or invalid means disabled, which is the default. A reaped tab stays listed as a `sleeping` row until dismissed with `qoro`'s close; the agent's own conversation survives in the agent's own store. An agent that asked another terminal stays awake while the wait is observably alive. |
 
 The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
 `qoro send --session work 2 "x"` are the same thing. It is put into the environment of

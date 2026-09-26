@@ -724,6 +724,45 @@ mod tests {
         }
     }
 
+    /// An input frame from before the sender claim decodes with no claim:
+    /// old clients keep today's unattributed behavior, and a claimed input
+    /// round-trips with its claim.
+    #[test]
+    fn an_input_without_a_sender_claim_decodes_unattributed() {
+        let old: ClientWire =
+            serde_json::from_str(r#"{"t":"input","bytes":[104,105]}"#).expect("old input decodes");
+        match old {
+            ClientWire::Input {
+                bytes,
+                from_terminal,
+                from_token,
+            } => {
+                assert_eq!(bytes, b"hi");
+                assert_eq!(from_terminal, None);
+                assert_eq!(from_token, None);
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+        let claimed = ClientWire::Input {
+            bytes: b"hi".to_vec(),
+            from_terminal: Some(3),
+            from_token: Some("tok".into()),
+        };
+        let back: ClientWire =
+            serde_json::from_slice(&serde_json::to_vec(&claimed).expect("encode")).expect("decode");
+        match back {
+            ClientWire::Input {
+                from_terminal,
+                from_token,
+                ..
+            } => {
+                assert_eq!(from_terminal, Some(3));
+                assert_eq!(from_token.as_deref(), Some("tok"));
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+    }
+
     #[test]
     fn restore_is_idempotent() {
         // It runs from a Drop guard, from a signal follow-up and from a panic hook, and any
