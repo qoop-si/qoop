@@ -67,7 +67,8 @@ rather than to whichever one in the directory is newest. `qoro hooks status` say
 what is installed and `qoro hooks uninstall` takes out exactly what was added;
 `qoro skills status` and `qoro skills uninstall` do the same for the skill.
 
-On a fresh Mac, `scripts/install.sh` does all three in one go: binary, hooks, skill.
+On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
+skill.
 The releases are private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or
 `GITHUB_TOKEN`, or a `gh` login.
 
@@ -123,11 +124,11 @@ still speak only to this machine's daemon.
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
-Prebuilt macOS arm64 binaries live on GitHub Releases, published from this machine
-with `./scripts/release.sh 0.1.0`: GitHub only hosts the files, nothing is compiled
-there. `qoro update --check` notes what is newest, the sidebar signs itself
-`0.3.0>0.4.0` while something is, `ctrl-a U` says how it installs, and `qoro update`
-installs it once no session is running.
+Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc
+2.17 and newer) live on GitHub Releases, all built on one Mac with `./scripts/release.sh
+0.1.0`: GitHub only hosts the files, nothing is compiled there. `qoro update --check` notes
+what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
+how it installs, and `qoro update` installs it once no session is running.
 
 ## What is measured
 

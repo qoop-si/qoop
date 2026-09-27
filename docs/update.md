@@ -1,23 +1,38 @@
 # Releases and updates
 
 No build ever runs on GitHub here, because private Actions minutes are gone.
-GitHub only hosts the tarball. The build runs on this Mac, and the update runs
+GitHub only hosts the tarballs. Every build runs on this Mac, and the update runs
 wherever the person reading it sits.
 
 ## Shipping a release
 
-macOS arm64 only, from a clean tree on this machine:
+From a clean tree on this Mac (Apple silicon):
 
 ```
 ./scripts/release.sh 0.4.0
 ```
 
-The script stamps the version into every workspace member, builds the release
-binary, refuses unless the binary reports the stamped version, packs
-`qoro-aarch64-apple-darwin.tar.gz` with its sha256, commits the bump, tags
-`v0.4.0`, pushes, and creates the GitHub release with notes from the commits
-since the previous tag. The asset name is the contract: `qoro update` looks
-for exactly it.
+One-time setup:
+
+```
+rustup target add x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+cargo install cargo-zigbuild        # and zig itself: brew install zig
+softwareupdate --install-rosetta --agree-to-license
+```
+
+and Docker running. The script checks all of that before it stamps anything.
+
+It stamps the version into every workspace member and builds four binaries:
+`aarch64-apple-darwin` and `x86_64-apple-darwin` with cargo, and
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with cargo-zigbuild against
+glibc 2.17 (debug info dropped on Linux, symbols kept). Each one is started before anything
+is published and must report the stamped version: the Intel Mac build under Rosetta, the
+Linux builds in a CentOS 7 container of their own architecture, which is the oldest glibc
+the build promises. Each is packed as `qoro-<triple>.tar.gz` with its sha256; then the bump
+is committed, `v0.4.0` tagged and pushed, and the GitHub release created with notes from
+the commits since the previous tag. The asset names are the contract: `qoro update` and
+`scripts/install.sh` look for exactly `qoro-<triple>.tar.gz` for the machine they run on
+(an Apple silicon Mac gets the arm64 build even from a Rosetta shell).
 
 ## Checking and installing
 
@@ -35,9 +50,14 @@ The repository is private, so a GitHub token is needed: `GH_TOKEN` or
 `GITHUB_TOKEN` from the environment, else whatever `gh auth token` prints. The
 assets are fetched by their API URL with `Accept: application/octet-stream`
 (the browser download URL 404s for a private repository, token or not). The
-token is handed to curl on stdin, never on its command line, and only for
-`api.github.com`; curl drops it at the redirect to the storage host.
-`scripts/install.sh` fetches the same way.
+token is handed to curl on stdin as a config line (`-K -`, which every curl understands),
+never on its command line, and only for `api.github.com`. The redirect to the storage host
+is followed by a second request without the token, because curl older than 7.58 forwarded
+a custom Authorization header on redirects. `scripts/install.sh` fetches the same way,
+needs no python (Linux boxes often have none), and falls back to `sha256sum` where
+`shasum` is missing. `QORO_RELEASE_BASE` points both at a mirror or at a local directory
+(`file:///path` holding a `latest` file in the API's shape), which is how the platform pick
+is tested with no network; the token never goes there.
 
 The install refuses while any session is running and names what is live, so no
 agent dies to a routine upgrade. Stop the named sessions first
