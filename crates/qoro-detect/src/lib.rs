@@ -1534,8 +1534,130 @@ contains = "esc to interrupt"
         )
         .expect("a verdict");
         assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
-        assert_eq!(v.rule, "live_prompt_box");
+        assert_eq!(v.rule, "turn_over_idle");
         assert!(v.visible_idle);
+    }
+
+    /// Frames captured from a live Claude Code turn at 110 columns. `RULE` is the box's
+    /// horizontal rule; the footer loses its interrupt hint whenever a draft is typed.
+    const RULE: &str =
+        "──────────────────────────────────────────────────────────────────────────────";
+    const DRAFT_FOOTER: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
+
+    /// A draft typed while the answer streams: no spinner, no interrupt hint. 103 of 120
+    /// frames looked like this and read as a visible idle, so the tab flickered.
+    #[test]
+    fn a_claude_draft_under_a_streaming_answer_is_not_visible_idle() {
+        let v = verdict(
+            "claude",
+            &[
+                "  were pressed in quick succession, they could jam. Sholes and his partners rearranged",
+                "  collisions and let typists work faster without jams.",
+                "                                              You've used 75% of your weekly limit",
+                RULE,
+                "\u{276F} taslak",
+                RULE,
+                DRAFT_FOOTER,
+            ],
+        )
+        .expect("a verdict");
+        assert!(!v.visible_idle, "{v:?}");
+    }
+
+    /// The prompt just sent sits in the transcript between the last turn's summary and the
+    /// box, so the summary is the previous turn's and says nothing about this one.
+    #[test]
+    fn a_claude_summary_above_a_prompt_just_sent_is_not_the_end_of_the_turn() {
+        let v = verdict(
+            "claude",
+            &[
+                "\u{273B} Brewed for 32s \u{00B7} done 6:46 PM",
+                "\u{276F} Write a 1500 word essay about pianos. No tools.",
+                RULE,
+                "\u{276F} taslak",
+                RULE,
+                DRAFT_FOOTER,
+            ],
+        )
+        .expect("a verdict");
+        assert!(!v.visible_idle, "{v:?}");
+    }
+
+    /// The turn's summary right above a draft, with a notice between: the turn is over.
+    #[test]
+    fn a_finished_claude_turn_is_visible_idle_under_a_draft() {
+        let v = verdict(
+            "claude",
+            &[
+                "\u{273B} Crunched for 16m 31s \u{00B7} done 6:31 PM",
+                "                              You've used 75% of your weekly limit",
+                RULE,
+                "\u{276F} evet kapat hepsini",
+                RULE,
+                "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7} \u{2190} 5 agents",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert_eq!(v.rule, "turn_over_idle");
+        assert!(v.visible_idle);
+    }
+
+    /// An early Esc puts the prompt back in the box, and notices can stack above it.
+    #[test]
+    fn a_claude_interrupt_under_several_notices_is_visible_idle() {
+        let v = verdict(
+            "claude",
+            &[
+                "  \u{23BF}  Interrupted \u{00B7} What should Claude do instead?",
+                "                    tmux focus-events off \u{00B7} add 'set -g focus-events on'",
+                "                    You've used 75% of your weekly limit",
+                "                    tmux detected \u{00B7} scroll with PgUp/PgDn",
+                RULE,
+                "\u{276F} Write a 1500 word essay about pianos. No tools.",
+                RULE,
+                DRAFT_FOOTER,
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.rule, "turn_over_idle", "{v:?}");
+        assert!(v.visible_idle);
+    }
+
+    /// Esc in the middle of a streamed answer: the note, and an empty box.
+    #[test]
+    fn a_claude_turn_interrupted_mid_answer_is_visible_idle() {
+        let v = verdict(
+            "claude",
+            &[
+                "  violin's design through constant experimentation.",
+                "  \u{23BF}  Interrupted \u{00B7} What should Claude do instead?",
+                RULE,
+                "\u{276F} ",
+                RULE,
+                "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle) \u{00B7} \u{2190} 5 agents",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert!(v.visible_idle);
+    }
+
+    /// The same answer streaming with the box empty: the footer's interrupt hint holds it.
+    #[test]
+    fn a_claude_answer_streaming_over_an_empty_box_is_working() {
+        let v = verdict(
+            "claude",
+            &[
+                "  Stradivari worked in Cremona for most of his long life, from the 1660s until",
+                RULE,
+                "\u{276F} ",
+                RULE,
+                "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle) \u{00B7} esc to interrupt \u{00B7} \u{2190} 5 agents",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Working, "{v:?}");
     }
 
     #[test]
@@ -1588,6 +1710,42 @@ contains = "esc to interrupt"
         // A picker waiting on the person, read by the form rule and never as a draft.
         assert_eq!(v.rule, "live_blocked_form", "{v:?}");
         assert_eq!(v.state, AgentRuntimeState::Blocked);
+    }
+
+    /// Captured from a live turn with a draft in the composer: the interrupt hint is gone
+    /// from the footer, so the spinner line is the only working evidence, and every glyph
+    /// it cycles through has to count. This frame read as the idle prompt box.
+    #[test]
+    fn every_claude_spinner_frame_holds_working_over_a_draft() {
+        for glyph in [
+            '\u{00B7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}', '\u{273D}',
+        ] {
+            let spinner =
+                format!("{glyph} Stewing\u{2026} (6s \u{00B7} thinking with high effort)");
+            let v = verdict(
+                "claude",
+                &[
+                    "\u{276F} Write a 2500 word essay about the history of terminals. No tools.",
+                    &spinner,
+                    "────────────────────────────────────────────────────────────────────────────────",
+                    "\u{276F} taslak metin burada",
+                    "────────────────────────────────────────────────────────────────────────────────",
+                    "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
+                ],
+            )
+            .expect("a verdict");
+            assert_eq!(v.state, AgentRuntimeState::Working, "{glyph}: {v:?}");
+        }
+    }
+
+    /// Claude keeps the same `\u{2733}` title while it works, so the title may say idle
+    /// but never as visible evidence that outranks a hook.
+    #[test]
+    fn claudes_title_is_not_visible_idle() {
+        let v = verdict_with_title("claude", &["some output"], "\u{2733} Terminal essay")
+            .expect("the title rule");
+        assert_eq!(v.state, AgentRuntimeState::Idle);
+        assert!(!v.visible_idle, "{v:?}");
     }
 
     #[test]
