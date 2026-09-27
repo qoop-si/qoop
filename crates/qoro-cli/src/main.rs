@@ -1036,13 +1036,23 @@ async fn control_roundtrip(
                 );
             }
             inbuf.extend_from_slice(&read[..n]);
+            // The whole batch is looked at before returning: what arrived in the same read
+            // after the answer (a screen, a state change) is already out of the buffer, and
+            // returning at the answer threw it away. A screen sent just after `Subscribed`
+            // was lost that way, so `wait --match` missed text already on the screen.
+            let mut answer = None;
             for incoming in connection.drain(inbuf)? {
                 match incoming {
-                    client::Incoming::Control(response) if response.request_id() == want => {
-                        return Ok(response);
+                    client::Incoming::Control(response)
+                        if answer.is_none() && response.request_id() == want =>
+                    {
+                        answer = Some(response);
                     }
                     other => stashed.push(other),
                 }
+            }
+            if let Some(response) = answer {
+                return Ok(response);
             }
         }
     })

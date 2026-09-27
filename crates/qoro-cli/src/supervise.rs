@@ -992,6 +992,51 @@ mod tests {
         );
     }
 
+    /// The same race from the other side: the screen lands in the same read as the
+    /// answer, just after it, which the round trip used to drop along with everything
+    /// else it had already taken out of the buffer.
+    #[tokio::test]
+    async fn a_screen_that_lands_just_after_the_answer_is_read() {
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (rd, wr) = ours.into_split();
+        let mut link = Link {
+            rd,
+            wr,
+            inbuf: bytes::BytesMut::new(),
+            connection: client::Connection::new(),
+            seq: 0,
+            input_seq: BTreeMap::new(),
+            screen_text: Some((3, "STATIC_MARK_7".to_string())),
+            on_screen: false,
+        };
+        let mut wire = frames(
+            qoro_proto::Channel::Control,
+            0,
+            r#"{"op":"Subscribed","id":"sub-1","terminals":[3]}"#,
+        );
+        wire.extend(frames(
+            qoro_proto::Channel::Terminal,
+            3,
+            r#"{"cols":80,"rows":24,"cursor":[0,0],"lines":["$ echo STATIC_MARK_7","STATIC_MARK_7"]}"#,
+        ));
+        theirs
+            .write_all(&wire)
+            .await
+            .expect("the daemon's side writes");
+        let (answer, _) = link
+            .ask(&ControlRequest::Subscribe {
+                id: "sub-1".to_string(),
+                terminals: vec![3],
+            })
+            .await
+            .expect("an answer");
+        assert!(matches!(answer, ControlResponse::Subscribed { .. }));
+        assert!(
+            link.on_screen,
+            "the screen that came right after the answer was dropped"
+        );
+    }
+
     #[test]
     fn keys_spell_arrows_by_cursor_mode() {
         assert_eq!(key_bytes("up", false).unwrap(), b"\x1b[A");
