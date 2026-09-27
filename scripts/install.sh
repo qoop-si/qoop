@@ -11,13 +11,37 @@
 set -eu
 
 REPO="pat/qoro"
-ASSET="qoro-aarch64-apple-darwin.tar.gz"
 DEST="${QORO_DEST:-/usr/local/bin/qoro}"
+# A mirror, or a local directory as file:///path holding a `latest` file in the API's own
+# shape: how the platform pick is tested with no network. `qoro update` reads the same.
+BASE="${QORO_RELEASE_BASE:-https://api.github.com/repos/$REPO/releases}"
 
-if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
-    echo "qoro install: macOS arm64 only ($(uname -s) $(uname -m))" >&2
+# The tarball scripts/release.sh packs for this machine, by target triple.
+MACHINE="$(uname -m)"
+# A shell running under Rosetta reports x86_64 on an Apple silicon Mac; the machine
+# itself is arm64, and that is the binary that runs natively.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+    MACHINE="arm64"
+fi
+case "$(uname -s) $MACHINE" in
+    "Darwin arm64") TRIPLE="aarch64-apple-darwin" ;;
+    "Darwin x86_64") TRIPLE="x86_64-apple-darwin" ;;
+    "Linux x86_64") TRIPLE="x86_64-unknown-linux-gnu" ;;
+    "Linux aarch64" | "Linux arm64") TRIPLE="aarch64-unknown-linux-gnu" ;;
+    *)
+        echo "qoro install: no prebuilt binary for $(uname -s) $(uname -m);" \
+            "build from source: cargo build --release -p qoro-cli" >&2
+        exit 1
+        ;;
+esac
+# The Linux binaries link glibc. On musl (Alpine) they cannot start at all, so say that
+# here rather than after a download that could never run.
+if [ "$(uname -s)" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
+    echo "qoro install: this is a musl system; the prebuilt Linux binary needs glibc." \
+        "Build from source: cargo build --release -p qoro-cli" >&2
     exit 1
 fi
+ASSET="qoro-$TRIPLE.tar.gz"
 
 if command -v qoro >/dev/null 2>&1; then
     echo "qoro is already on PATH: $(command -v qoro)" >&2
@@ -25,12 +49,21 @@ if command -v qoro >/dev/null 2>&1; then
     exit 0
 fi
 
-for tool in curl python3 shasum tar; do
+for tool in curl tar awk sed; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "qoro install: missing required tool: $tool" >&2
         exit 1
     }
 done
+# Every Mac has shasum; slim Linux images have sha256sum and no perl.
+if command -v shasum >/dev/null 2>&1; then
+    SHA256="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then
+    SHA256="sha256sum"
+else
+    echo "qoro install: missing required tool: shasum or sha256sum" >&2
+    exit 1
+fi
 
 # The repository is private, so without a token nothing is found at all. The
 # environment first, then the token `gh` logged in with.
@@ -42,41 +75,58 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK" "$DEST.qoro-new"' EXIT INT TERM
 
-# GET an api.github.com URL into a file: accept type, max seconds, file, URL.
-# The token goes to curl on stdin (`-H @-`, printf is a shell builtin), never in
-# an argv any process listing shows. `-L` follows an asset's redirect to the
-# storage host and curl drops the header there, so the token stays with the API.
+# GET a URL into a file: accept type, max seconds, file, URL.
+# The token goes only to api.github.com, never to a mirror named by QORO_RELEASE_BASE, and
+# only on stdin as a curl config line (`-K -`, printf is a shell builtin), never in an argv
+# any process listing shows; `-K` is understood by every curl, unlike `-H @-` (7.55). A
+# redirect to the storage host is followed by hand and without the token, because curl
+# older than 7.58 sent a custom Authorization header on to the redirected host.
 api_get() {
-    if [ -n "$TOKEN" ]; then
-        printf 'Authorization: Bearer %s\n' "$TOKEN" |
-            curl -fsSL --max-time "$2" -H "Accept: $1" -H @- -o "$3" "$4"
+    case "$4" in
+        https://api.github.com/*) with_token="$TOKEN" ;;
+        *) with_token="" ;;
+    esac
+    if [ -n "$with_token" ]; then
+        next="$(printf 'header = "Authorization: Bearer %s"\n' "$with_token" |
+            curl -fsS --max-time "$2" -H "Accept: $1" -K - -o "$3" -w '%{redirect_url}' "$4")" ||
+            return 1
+        [ -z "$next" ] || curl -fsSL --max-time "$2" -o "$3" "$next"
     else
         curl -fsSL --max-time "$2" -H "Accept: $1" -o "$3" "$4"
     fi
 }
 
 release_json="$WORK/release.json"
-api_get application/vnd.github+json 25 "$release_json" \
-    "https://api.github.com/repos/$REPO/releases/latest" || {
+api_get application/vnd.github+json 25 "$release_json" "$BASE/latest" || {
     echo "qoro install: cannot reach GitHub Releases" >&2
     exit 1
 }
 
-version="$(python3 -c "
-import json
-tag = json.load(open('$release_json'))['tag_name']
-print(tag[1:] if tag.startswith('v') else tag)
-")"
-# The API `url` of an asset, found by name. Not `browser_download_url`, which
-# 404s for a private repository even with a token.
+# Read with sed and awk rather than a JSON library, because a fresh Linux box has no
+# python; plain `[ \t]` rather than character classes, which mawk 1.3.3 (Debian 10,
+# Ubuntu 18.04) does not know. The API's own `url` of an asset, found by name: not `browser_download_url`,
+# which 404s for a private repository even with a token. In the API's answer an asset's
+# `url` comes before its `name`, so the last asset url seen is the one a matching name
+# belongs to.
+version="$(tr -d '\n' <"$release_json" |
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p')"
 asset_url_of() {
-    python3 -c "
-import json
-for a in json.load(open('$release_json'))['assets']:
-    if a['name'] == '$1':
-        print(a['url'])
-        break
-"
+    tr ',{}' '\n\n\n' <"$release_json" | awk -v want="$1" '
+        /"url"[ \t]*:/ && /\/releases\/assets\/[0-9]+"/ {
+            url = $0
+            sub(/.*"url"[ \t]*:[ \t]*"/, "", url)
+            sub(/".*/, "", url)
+        }
+        /"name"[ \t]*:/ {
+            name = $0
+            sub(/.*"name"[ \t]*:[ \t]*"/, "", name)
+            sub(/".*/, "", name)
+            if (name == want && url != "") { print url; exit }
+        }'
+}
+[ -n "$version" ] || {
+    echo "qoro install: the newest release names no version" >&2
+    exit 1
 }
 asset_url="$(asset_url_of "$ASSET")"
 checksum_url="$(asset_url_of "$ASSET.sha256")"
@@ -98,7 +148,7 @@ api_get application/octet-stream 120 "$WORK/$ASSET.sha256" "$checksum_url" || {
     exit 1
 }
 
-(cd "$WORK" && shasum -a 256 -c "$ASSET.sha256") || {
+(cd "$WORK" && $SHA256 -c "$ASSET.sha256") || {
     echo "qoro install: checksum mismatch" >&2
     exit 1
 }

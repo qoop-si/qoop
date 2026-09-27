@@ -311,6 +311,8 @@ pub fn scan_all_pids() -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// Every process on the terminal `dev`, on either platform: the reporting scan with its
+/// count of processes that could not be looked at dropped.
 pub fn enumerate_tty(dev: u64) -> Vec<Member> {
     enumerate_tty_reporting(dev).0
 }
@@ -409,9 +411,60 @@ pub fn program_of(pid: Pid) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn program_of(pid: Pid) -> Option<String> {
-    std::fs::read_link(format!("/proc/{}/exe", pid.0))
-        .ok()
-        .map(|p| p.display().to_string())
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.0))
+        .ok()?
+        .display()
+        .to_string();
+    Some(
+        emulated_argv(&exe, &raw_argv_of(pid))
+            .and_then(|argv| argv.into_iter().next())
+            .unwrap_or(exe),
+    )
+}
+
+/// The argument vector of the program a binfmt emulator is running, when `exe` is one.
+///
+/// A foreign-architecture process on Linux has the emulator as its `/proc/pid/exe`: every
+/// x86_64 program in a container on an Apple silicon Mac reads as `rosetta`, and under
+/// qemu-user as `qemu-x86_64`. Rosetta rewrites the argument vector to the program's own;
+/// qemu puts itself and the program's path in front of it (`qemu-riscv64 /usr/bin/sleep
+/// sleep 3`, measured), so both are taken off. A qemu tool run for its own sake
+/// (`qemu-img convert ...`, `qemu-system-x86_64 -enable-kvm`) is left as itself. `None` for anything that is not an emulator, which is
+/// every process on a machine running its own architecture.
+#[cfg(not(target_os = "macos"))]
+fn emulated_argv(exe: &str, argv: &[String]) -> Option<Vec<String>> {
+    let name = std::path::Path::new(exe).file_name()?.to_str()?;
+    if name == "rosetta" {
+        return (!argv.is_empty()).then(|| argv.to_vec());
+    }
+    // qemu's own tools share the prefix with its user-mode emulators (`qemu-x86_64`,
+    // `qemu-riscv64-static`), so the tools are named and everything else is an emulator.
+    let tool = |rest: &str| {
+        rest.starts_with("system-")
+            || matches!(
+                rest,
+                "img" | "nbd" | "io" | "ga" | "pr-helper" | "storage-daemon" | "edid" | "keymap"
+            )
+    };
+    if !name.strip_prefix("qemu-").is_some_and(|rest| !tool(rest)) {
+        return None;
+    }
+    let program = argv.get(1)?;
+    let base = |p: &str| {
+        std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_os_string())
+    };
+    // With binfmt's preserve-argv0 flag the program's own argv[0] follows its path.
+    let rest = match argv.get(2) {
+        Some(zero) if base(zero) == base(program) => &argv[3..],
+        _ => &argv[2..],
+    };
+    Some(
+        std::iter::once(program.clone())
+            .chain(rest.iter().cloned())
+            .collect(),
+    )
 }
 
 /// The directory a process is in now.
@@ -682,6 +735,16 @@ pub fn argv_of(pid: Pid) -> Vec<String> {
 /// A process's argument vector. See the macOS version for what this is for.
 #[cfg(not(target_os = "macos"))]
 pub fn argv_of(pid: Pid) -> Vec<String> {
+    let argv = raw_argv_of(pid);
+    std::fs::read_link(format!("/proc/{}/exe", pid.0))
+        .ok()
+        .and_then(|exe| emulated_argv(&exe.display().to_string(), &argv))
+        .unwrap_or(argv)
+}
+
+/// `/proc/pid/cmdline` as it is, emulator and all.
+#[cfg(not(target_os = "macos"))]
+fn raw_argv_of(pid: Pid) -> Vec<String> {
     std::fs::read(format!("/proc/{}/cmdline", pid.0))
         .map(|raw| {
             raw.split(|b| *b == 0)
@@ -1241,5 +1304,65 @@ mod cwd_tests {
         let _ = child.wait();
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(cwd_of(pid), None);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod emulated_tests {
+    use super::emulated_argv;
+
+    fn argv(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_emulated_process_reads_as_the_program_it_runs_not_the_emulator() {
+        assert_eq!(
+            emulated_argv("/run/rosetta/rosetta", &argv(&["bash", "-l"])),
+            Some(argv(&["bash", "-l"]))
+        );
+        // binfmt with preserve-argv0: emulator, program path, argv0, arguments.
+        assert_eq!(
+            emulated_argv(
+                "/usr/bin/qemu-riscv64",
+                &argv(&["/usr/bin/qemu-riscv64", "/usr/bin/sleep", "sleep", "3"])
+            ),
+            Some(argv(&["/usr/bin/sleep", "3"]))
+        );
+        // Without it: emulator, program path, arguments.
+        assert_eq!(
+            emulated_argv(
+                "/usr/bin/qemu-x86_64",
+                &argv(&["/usr/bin/qemu-x86_64", "/usr/local/bin/node", "gemini.js"])
+            ),
+            Some(argv(&["/usr/local/bin/node", "gemini.js"]))
+        );
+        // Started by a relative path: the program path is relative too.
+        assert_eq!(
+            emulated_argv(
+                "/usr/bin/qemu-riscv64-static",
+                &argv(&["/usr/bin/qemu-riscv64-static", "./sleep", "./sleep", "3"])
+            ),
+            Some(argv(&["./sleep", "3"]))
+        );
+    }
+
+    #[test]
+    fn a_qemu_tool_run_for_itself_is_not_taken_for_an_emulator() {
+        assert_eq!(
+            emulated_argv(
+                "/usr/bin/qemu-img",
+                &argv(&["/usr/bin/qemu-img", "convert", "a.img"])
+            ),
+            None
+        );
+        assert_eq!(
+            emulated_argv(
+                "/usr/bin/qemu-system-x86_64",
+                &argv(&["qemu-system-x86_64", "-enable-kvm"])
+            ),
+            None
+        );
+        assert_eq!(emulated_argv("/usr/bin/bash", &argv(&["bash"])), None);
     }
 }

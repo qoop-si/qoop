@@ -15,10 +15,35 @@ use std::process::Command;
 
 use qoro_runtime::paths;
 
-/// The repository whose Releases carry the binaries, and the one asset this updater
-/// knows: macOS arm64, the only prebuilt binary `scripts/release.sh` ships.
-const RELEASES_LATEST: &str = "https://api.github.com/repos/pat/qoro/releases/latest";
-const ASSET: &str = "qoro-aarch64-apple-darwin.tar.gz";
+/// The repository whose Releases carry the binaries.
+const RELEASES: &str = "https://api.github.com/repos/pat/qoro/releases";
+
+/// Where the releases are read from instead, when set: a mirror, or a directory given as a
+/// `file://` URL holding a `latest` file in the API's own shape. The same variable
+/// `scripts/install.sh` reads, so a platform pick can be tested with no network at all.
+const RELEASE_BASE_ENV: &str = "QORO_RELEASE_BASE";
+
+/// Whether this process runs under Rosetta.
+fn translated() -> bool {
+    Command::new("sysctl")
+        .args(["-in", "sysctl.proc_translated"])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
+/// The tarball `scripts/release.sh` packs for a platform, named by its target triple.
+///
+/// `None` is a platform no binary is built for, which is refused with the way to build
+/// one rather than with a download that could never run.
+fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
+    Some(match (os, arch) {
+        ("macos", "aarch64") => "qoro-aarch64-apple-darwin.tar.gz",
+        ("macos", "x86_64") => "qoro-x86_64-apple-darwin.tar.gz",
+        ("linux", "x86_64") => "qoro-x86_64-unknown-linux-gnu.tar.gz",
+        ("linux", "aarch64") => "qoro-aarch64-unknown-linux-gnu.tar.gz",
+        _ => return None,
+    })
+}
 
 /// `qoro update` checks GitHub Releases and installs the newest binary;
 /// `qoro update --check` only leaves what it saw in the notice file the interface reads.
@@ -44,14 +69,21 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         return Ok(());
     }
     let current = env!("CARGO_PKG_VERSION");
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    if platform != "macos-aarch64" {
+    let os = std::env::consts::OS;
+    // An Intel build running under Rosetta on an Apple silicon Mac: the machine is arm64,
+    // and updating to the Intel build again would keep it translated forever.
+    let arch = if os == "macos" && translated() {
+        "aarch64"
+    } else {
+        std::env::consts::ARCH
+    };
+    let Some(asset) = asset_for(os, arch) else {
         return Err(std::io::Error::other(format!(
-            "no prebuilt binary for {platform}; only macos-aarch64 ships one, \
-             elsewhere build from source: cargo build --release -p qoro-cli"
+            "no prebuilt binary for {os}-{arch}; build from source: \
+             cargo build --release -p qoro-cli"
         )));
-    }
-    let latest = fetch_latest().map_err(|detail| {
+    };
+    let latest = fetch_latest(asset).map_err(|detail| {
         std::io::Error::other(format!("cannot reach GitHub Releases: {detail}"))
     })?;
     if !qoro_runtime::paths::is_newer_version(&latest.version, current) {
@@ -85,9 +117,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     install(&latest, current)
 }
 
-/// What the newest release is: its version and where its macOS arm64 asset lives.
+/// What the newest release is: its version and where this platform's asset lives.
 struct Release {
     version: String,
+    /// The tarball's own name, which is also the name its checksum file is written for.
+    asset: String,
     asset_url: String,
     checksum_url: Option<String>,
 }
@@ -95,16 +129,20 @@ struct Release {
 /// Read the newest release off the GitHub API with curl, which is what keeps this
 /// updater free of HTTP dependencies. curl honours the proxy environment, so a
 /// blackholed network fails here rather than hanging.
-fn fetch_latest() -> Result<Release, String> {
-    let body = curl(RELEASES_LATEST)?;
+fn fetch_latest(asset: &str) -> Result<Release, String> {
+    let base = std::env::var(RELEASE_BASE_ENV)
+        .ok()
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| RELEASES.to_string());
+    let body = curl(&format!("{}/latest", base.trim_end_matches('/')))?;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("the releases API answered what is not JSON: {e}"))?;
-    fetch_latest_parsing(&json)
+    fetch_latest_parsing(&json, asset)
 }
 
 /// The version and the asset URL out of one releases API answer, so the parsing is
 /// testable without the network.
-fn fetch_latest_parsing(json: &serde_json::Value) -> Result<Release, String> {
+fn fetch_latest_parsing(json: &serde_json::Value, asset: &str) -> Result<Release, String> {
     let tag = json
         .get("tag_name")
         .and_then(|t| t.as_str())
@@ -132,13 +170,14 @@ fn fetch_latest_parsing(json: &serde_json::Value) -> Result<Release, String> {
             }
         })
     };
-    let Some(asset_url) = url_of(ASSET) else {
-        return Err(format!("the newest release carries no {ASSET}"));
+    let Some(asset_url) = url_of(asset) else {
+        return Err(format!("the newest release carries no {asset}"));
     };
     Ok(Release {
         version,
+        asset: asset.to_string(),
         asset_url,
-        checksum_url: url_of(&format!("{ASSET}.sha256")),
+        checksum_url: url_of(&format!("{asset}.sha256")),
     })
 }
 
@@ -158,9 +197,11 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 ///
 /// A token rides along when there is one, and only to `api.github.com`: the repository
 /// is private, so without one nothing is found at all, and anonymous calls also share
-/// 60 requests an hour per IP. It goes to curl on stdin (`-H @-`), never in argv where
-/// any process listing shows it. `-L` follows the asset's redirect to the storage
-/// host and curl drops the header there, so the token never leaves GitHub's API.
+/// 60 requests an hour per IP. It goes to curl on stdin as a config line (`-K -`), never in
+/// argv where any process listing shows it; `-K` is understood by every curl, unlike
+/// `-H @-` (7.55 and later). A redirect to the storage host is followed here, without the
+/// token, because curl older than 7.58 sent a custom Authorization header on to the host
+/// it was redirected to.
 fn fetch(url: &str, accept: &str, max_time: &str, dest: Option<&Path>) -> Result<Vec<u8>, String> {
     use std::process::Stdio;
     let token = if url.starts_with("https://api.github.com/") {
@@ -168,34 +209,71 @@ fn fetch(url: &str, accept: &str, max_time: &str, dest: Option<&Path>) -> Result
     } else {
         None
     };
-    let mut command = Command::new("curl");
-    command.args(["-fsSL", "--max-time", max_time, "-H"]);
-    command.arg(format!("Accept: {accept}"));
-    if token.is_some() {
-        command.args(["-H", "@-"]);
-    }
-    if let Some(dest) = dest {
-        command.arg("-o").arg(dest);
-    }
-    command
+    let Some(token) = token else {
+        let mut command = Command::new("curl");
+        command.args(["-fsSL", "--max-time", max_time, "-H"]);
+        command.arg(format!("Accept: {accept}"));
+        if let Some(dest) = dest {
+            command.arg("-o").arg(dest);
+        }
+        let out = command
+            .arg(url)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("curl is not installed or cannot run: {e}"))?;
+        return curl_result(out);
+    };
+    // The body lands in a file either way, so the redirect, if any, is all stdout says.
+    static SPARES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SPARES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let spare = std::env::temp_dir().join(format!("qoro-fetch-{}-{n}", std::process::id()));
+    let body = dest.unwrap_or(&spare);
+    let mut child = Command::new("curl")
+        .args([
+            "-fsS",
+            "--max-time",
+            max_time,
+            "-K",
+            "-",
+            "-w",
+            "%{redirect_url}",
+            "-H",
+        ])
+        .arg(format!("Accept: {accept}"))
+        .arg("-o")
+        .arg(body)
         .arg(url)
-        .stdin(if token.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("curl is not installed or cannot run: {e}"))?;
-    if let (Some(token), Some(mut stdin)) = (token, child.stdin.take()) {
+    if let Some(mut stdin) = child.stdin.take() {
         // A failed write shows up as curl failing, with its own words.
-        let _ = writeln!(stdin, "Authorization: Bearer {token}");
+        let _ = writeln!(stdin, "header = \"Authorization: Bearer {token}\"");
     }
     let out = child
         .wait_with_output()
         .map_err(|e| format!("curl did not finish: {e}"))?;
+    let redirect = String::from_utf8_lossy(&curl_result(out)?)
+        .trim()
+        .to_string();
+    if !redirect.is_empty() {
+        // Not api.github.com, so this request carries no token.
+        fetch(&redirect, accept, max_time, Some(body))?;
+    }
+    match dest {
+        Some(_) => Ok(Vec::new()),
+        None => {
+            let read = std::fs::read(body).map_err(|e| format!("cannot read the answer: {e}"));
+            let _ = std::fs::remove_file(body);
+            read
+        }
+    }
+}
+
+/// What curl printed, or what it said went wrong.
+fn curl_result(out: std::process::Output) -> Result<Vec<u8>, String> {
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if detail.is_empty() {
@@ -271,12 +349,12 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
         std::io::Error::other(message)
     };
 
-    let tarball = work.join(ASSET);
+    let tarball = work.join(&latest.asset);
     if let Err(detail) = download(&latest.asset_url, &tarball) {
         return Err(failed(format!("the download failed: {detail}")));
     }
     if let Some(url) = &latest.checksum_url {
-        let checksum_file = work.join(format!("{ASSET}.sha256"));
+        let checksum_file = work.join(format!("{}.sha256", latest.asset));
         match download(url, &checksum_file) {
             Ok(()) => {
                 if let Err(detail) = check_sha256(&tarball, &checksum_file) {
@@ -342,7 +420,11 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
     Ok(())
 }
 
-/// Compare the tarball against its `.sha256` file with shasum, when there is one.
+/// Compare the tarball against its `.sha256` file, when there is one.
+///
+/// `shasum` where it exists (every Mac), `sha256sum` where it does not (the slim Linux
+/// images, which ship coreutils and no perl): a missing tool is not a mismatch, and
+/// reading it as one refused every update on those machines.
 fn check_sha256(tarball: &Path, checksum_file: &Path) -> Result<(), String> {
     let text =
         std::fs::read_to_string(checksum_file).map_err(|e| format!("cannot read it: {e}"))?;
@@ -354,9 +436,10 @@ fn check_sha256(tarball: &Path, checksum_file: &Path) -> Result<(), String> {
         .args(["-a", "256"])
         .arg(tarball)
         .output()
-        .map_err(|e| format!("shasum is not installed: {e}"))?;
+        .or_else(|_| Command::new("sha256sum").arg(tarball).output())
+        .map_err(|e| format!("neither shasum nor sha256sum is installed: {e}"))?;
     if !out.status.success() {
-        return Err("shasum failed".to_string());
+        return Err("the checksum tool failed".to_string());
     }
     let got = String::from_utf8_lossy(&out.stdout);
     let got = got.split_whitespace().next().unwrap_or("");
@@ -389,7 +472,46 @@ fn clear_notice() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Release, fetch_latest_parsing, install_to};
+    use super::{Release, asset_for, fetch_latest_parsing, install_to};
+
+    const MAC_ARM: &str = "qoro-aarch64-apple-darwin.tar.gz";
+
+    #[test]
+    fn every_platform_a_binary_is_built_for_names_its_own_tarball() {
+        assert_eq!(asset_for("macos", "aarch64"), Some(MAC_ARM));
+        assert_eq!(
+            asset_for("macos", "x86_64"),
+            Some("qoro-x86_64-apple-darwin.tar.gz")
+        );
+        assert_eq!(
+            asset_for("linux", "x86_64"),
+            Some("qoro-x86_64-unknown-linux-gnu.tar.gz")
+        );
+        assert_eq!(
+            asset_for("linux", "aarch64"),
+            Some("qoro-aarch64-unknown-linux-gnu.tar.gz")
+        );
+        assert_eq!(asset_for("windows", "x86_64"), None);
+        assert_eq!(asset_for("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn a_linux_machine_picks_the_linux_tarball_out_of_the_same_release() {
+        let body = serde_json::json!({
+            "tag_name": "v0.4.0",
+            "assets": [
+                {"name": MAC_ARM, "url": "https://example.invalid/mac.tgz"},
+                {"name": "qoro-x86_64-unknown-linux-gnu.tar.gz", "url": "https://example.invalid/linux.tgz"},
+            ],
+        });
+        let release =
+            fetch_latest_parsing(&body, "qoro-x86_64-unknown-linux-gnu.tar.gz").expect("linux");
+        assert_eq!(release.asset_url, "https://example.invalid/linux.tgz");
+        assert!(
+            release.checksum_url.is_none(),
+            "no checksum was published for it"
+        );
+    }
 
     #[test]
     fn the_release_json_yields_a_version_and_an_asset_url() {
@@ -404,7 +526,7 @@ mod tests {
                  "browser_download_url": "https://example.invalid/qoro.tgz.sha256"},
             ],
         });
-        let release = fetch_latest_parsing(&body).expect("the fixture is well formed");
+        let release = fetch_latest_parsing(&body, MAC_ARM).expect("the fixture is well formed");
         assert_eq!(release.version, "0.4.0");
         // The API url, because the browser one 404s for a private repository even
         // with a token.
@@ -421,13 +543,13 @@ mod tests {
     #[test]
     fn a_release_without_the_macos_asset_is_refused() {
         let body = serde_json::json!({"tag_name": "v0.4.0", "assets": []});
-        assert!(fetch_latest_parsing(&body).is_err());
+        assert!(fetch_latest_parsing(&body, MAC_ARM).is_err());
     }
 
     #[test]
     fn a_non_version_tag_is_refused() {
         let body = serde_json::json!({"tag_name": "nightly", "assets": []});
-        assert!(fetch_latest_parsing(&body).is_err());
+        assert!(fetch_latest_parsing(&body, MAC_ARM).is_err());
     }
 
     /// A stand-in release tarball: a script answering `--version` the way the
@@ -458,6 +580,7 @@ mod tests {
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
+            asset: MAC_ARM.to_string(),
             asset_url: fake_release(&pack, "9.9.9"),
             checksum_url: None,
         };
@@ -484,6 +607,7 @@ mod tests {
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
+            asset: MAC_ARM.to_string(),
             asset_url: fake_release(&pack, "9.9.9"),
             checksum_url: Some(format!("file://{}/missing.sha256", pack.display())),
         };
@@ -509,6 +633,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).expect("link");
         let latest = Release {
             version: "9.9.9".to_string(),
+            asset: MAC_ARM.to_string(),
             asset_url: fake_release(&pack, "9.9.9"),
             checksum_url: None,
         };
@@ -536,6 +661,7 @@ mod tests {
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
+            asset: MAC_ARM.to_string(),
             asset_url: fake_release(&pack, "0.0.0"),
             checksum_url: None,
         };
