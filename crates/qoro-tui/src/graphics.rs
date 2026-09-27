@@ -175,18 +175,35 @@ fn number(raw: &[u8]) -> Option<u32> {
 /// is checked again at the last moment: anything else reads as absent, and the
 /// placeholder is what the client draws instead.
 fn is_placeable(image: &StoredImage) -> bool {
-    match image.protocol {
-        ImageProtocol::Kitty => {
-            image.bytes.len() >= 7
-                && image.bytes.starts_with(b"\x1b_G")
-                && image.bytes.ends_with(b"\x1b\\")
-                && image.bytes[3..image.bytes.len() - 2].contains(&b';')
+    // Between the introducer and the terminator only printable ASCII: base64 and the
+    // `key=value;` arguments are nothing else. A CAN or SUB there aborts the sequence in the
+    // outer terminal and prints the rest, and an 8-bit C1 byte can open one the control
+    // string filter never saw. CR and LF are allowed: `base64` wraps its output, and a
+    // terminal ignores them inside the string.
+    let (open, close) = match image.protocol {
+        ImageProtocol::Kitty => (3, 2),
+        ImageProtocol::ITerm2 => (2, if image.bytes.ends_with(b"\x07") { 1 } else { 2 }),
+    };
+    let printable = image
+        .bytes
+        .get(open..image.bytes.len().saturating_sub(close))
+        .is_some_and(|body| {
+            body.iter()
+                .all(|b| (0x20..0x7f).contains(b) || *b == b'\r' || *b == b'\n')
+        });
+    printable
+        && match image.protocol {
+            ImageProtocol::Kitty => {
+                image.bytes.len() >= 7
+                    && image.bytes.starts_with(b"\x1b_G")
+                    && image.bytes.ends_with(b"\x1b\\")
+                    && image.bytes[3..image.bytes.len() - 2].contains(&b';')
+            }
+            ImageProtocol::ITerm2 => {
+                image.bytes.starts_with(b"\x1b]1337;File=")
+                    && (image.bytes.ends_with(b"\x07") || image.bytes.ends_with(b"\x1b\\"))
+            }
         }
-        ImageProtocol::ITerm2 => {
-            image.bytes.starts_with(b"\x1b]1337;File=")
-                && (image.bytes.ends_with(b"\x07") || image.bytes.ends_with(b"\x1b\\"))
-        }
-    }
 }
 
 /// One thing the image block must do on the outer terminal.
@@ -507,6 +524,27 @@ mod tests {
             Some((20, 5)),
         );
         assert!(ops.is_empty());
+        // A control byte in the body would abort the sequence in the outer terminal and
+        // print what follows, or open one of its own.
+        for inside in [b'\x18', b'\x1a', 0x9d] {
+            let mut hostile = iterm(6);
+            hostile.bytes = [
+                b"\x1b]1337;File=inline=1:Zm9v".as_slice(),
+                &[inside],
+                b"x\x07",
+            ]
+            .concat();
+            let (ops, _) = plan(
+                1,
+                Some(&hostile),
+                &Shown::new(),
+                cap(),
+                false,
+                false,
+                Some((20, 5)),
+            );
+            assert!(ops.is_empty(), "{inside:#x} reached the outer terminal");
+        }
     }
 
     #[test]
