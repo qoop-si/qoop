@@ -66,6 +66,9 @@ mod imp {
         kq: OwnedFd,
     }
 
+    /// Events taken per `kevent` call in [`ProcWatch::drain`].
+    pub(super) const DRAIN_BATCH: usize = 512;
+
     impl ProcWatch {
         pub fn new() -> io::Result<Self> {
             // SAFETY: kqueue takes no arguments and returns a descriptor or -1.
@@ -160,43 +163,50 @@ mod imp {
                 fflags: 0,
                 data: 0,
                 udata: std::ptr::null_mut(),
-            }; 512];
+            }; DRAIN_BATCH];
             let zero = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            // SAFETY: kq is live, events is a valid array of its stated length, and the
-            // timeout is a valid zero timespec.
-            let n = unsafe {
-                libc::kevent(
-                    self.kq.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    events.as_mut_ptr(),
-                    events.len() as i32,
-                    &zero,
-                )
-            };
-            if n <= 0 {
-                return Vec::new();
-            }
             let mut out = Vec::new();
-            for ev in events.iter().take(n as usize) {
-                let pid = Pid(ev.ident as i32);
-                // Exit and exec can arrive together when both happened since the last
-                // drain. Exit is reported last, because a caller that stops watching on
-                // exit would otherwise drop the exec that preceded it.
-                if ev.fflags & libc::NOTE_FORK != 0 {
-                    out.push(ProcEvent::Fork(pid));
+            // Read until a call comes back short of a full buffer. The caller clears the
+            // descriptor's readiness after this returns, so whatever a full read left in
+            // the queue would otherwise wait for some unrelated event to be noticed.
+            loop {
+                // SAFETY: kq is live, events is a valid array of its stated length, and the
+                // timeout is a valid zero timespec.
+                let n = unsafe {
+                    libc::kevent(
+                        self.kq.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        events.as_mut_ptr(),
+                        events.len() as i32,
+                        &zero,
+                    )
+                };
+                if n <= 0 {
+                    return out;
                 }
-                if ev.fflags & libc::NOTE_EXEC != 0 {
-                    out.push(ProcEvent::Exec(pid));
+                for ev in events.iter().take(n as usize) {
+                    let pid = Pid(ev.ident as i32);
+                    // Exit and exec can arrive together when both happened since the last
+                    // drain. Exit is reported last, because a caller that stops watching on
+                    // exit would otherwise drop the exec that preceded it.
+                    if ev.fflags & libc::NOTE_FORK != 0 {
+                        out.push(ProcEvent::Fork(pid));
+                    }
+                    if ev.fflags & libc::NOTE_EXEC != 0 {
+                        out.push(ProcEvent::Exec(pid));
+                    }
+                    if ev.fflags & libc::NOTE_EXIT != 0 {
+                        out.push(ProcEvent::Exit(pid));
+                    }
                 }
-                if ev.fflags & libc::NOTE_EXIT != 0 {
-                    out.push(ProcEvent::Exit(pid));
+                if (n as usize) < events.len() {
+                    return out;
                 }
             }
-            out
         }
     }
 }
@@ -322,6 +332,58 @@ mod tests {
         }
         let _ = child.wait();
         assert!(saw_exec, "an in place exec was not reported");
+    }
+
+    /// More pending events than one read holds, and the one that matters queued last.
+    ///
+    /// A burst that size needs more foreground leaders changing at once than a test should
+    /// start, so user events stand in for them: they sit in the same queue and take the
+    /// same slots in a read, and carry no process flags, so they report nothing
+    /// themselves. The caller clears readiness after one drain, so an exit left behind by
+    /// a full read would wait for some unrelated event to come back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exit_behind_a_full_read_is_still_drained() {
+        let watch = ProcWatch::new().expect("watch");
+        let filler: Vec<libc::kevent> = (0..imp::DRAIN_BATCH)
+            .map(|ident| libc::kevent {
+                ident,
+                filter: libc::EVFILT_USER,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_TRIGGER,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            })
+            .collect();
+        // SAFETY: the descriptor is the watcher's live kqueue, the changelist is a valid
+        // array of its stated length, and no output is requested.
+        let rc = unsafe {
+            libc::kevent(
+                watch.raw_fd(),
+                filler.as_ptr(),
+                filler.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2"])
+            .spawn()
+            .expect("spawn");
+        let pid = Pid(child.id() as i32);
+        assert!(
+            watch.watch(pid).expect("watch"),
+            "the child was already gone"
+        );
+        let _ = child.wait();
+
+        assert!(
+            watch.drain().contains(&ProcEvent::Exit(pid)),
+            "an exit queued behind a full read was left for a later, unrelated event"
+        );
     }
 
     #[test]
