@@ -2,8 +2,8 @@
 //!
 //! Pure readers over the agent products' own stores (Claude Code, Codex CLI,
 //! opencode, Gemini CLI). No daemon, no socket, no stdout, no network: the
-//! caller resolves `(program, session id)` — in the CLI via one `ListAgents`
-//! roundtrip — and this crate maps it to messages. Reads are bounded (see
+//! caller resolves `(program, session id)` (in the CLI via one `ListAgents`
+//! roundtrip) and this crate maps it to messages. Reads are bounded (see
 //! `read`), ids are allowlisted (see `locate`), and a missing id is always
 //! an error, never a "newest file" guess.
 

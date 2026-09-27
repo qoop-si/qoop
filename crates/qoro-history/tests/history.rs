@@ -1,5 +1,5 @@
 //! End-to-end over scratch product stores: locate + parse + window.
-//! Hermetic — tempdirs only, never `$HOME`.
+//! Hermetic: tempdirs only, never `$HOME`.
 
 use qoro_history::{BaseDirs, Located, Product, Role, history, locate};
 use std::path::Path;
@@ -101,8 +101,14 @@ fn claude_window_last_and_role() {
 #[test]
 fn codex_locates_by_in_file_id() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("codex")).unwrap();
-    std::fs::write(dir.path().join("codex/rollout.jsonl"), codex_fixture()).unwrap();
+    // The real layout: day directories, and the session id as the name suffix.
+    let day = dir.path().join("codex/2026/09/04");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join("rollout-2026-09-04T13-24-40-abc-1.jsonl"),
+        codex_fixture(),
+    )
+    .unwrap();
     let d = dirs(dir.path());
 
     let found = locate::locate(Product::Codex, "abc-1", &d).unwrap();
@@ -281,15 +287,16 @@ fn oversize_gemini_file_is_not_a_match() {
     );
 }
 
+/// Gemini is the one scan left with a cap: its id lives only inside the file.
 #[test]
 fn scan_caps_are_loud() {
     let dir = tempfile::tempdir().unwrap();
-    let projects = dir.path().join("projects");
+    let gemini = dir.path().join("gemini");
     for i in 0..210 {
-        std::fs::create_dir_all(projects.join(format!("slug-{i}"))).unwrap();
+        std::fs::create_dir_all(gemini.join(format!("h{i}"))).unwrap();
     }
     let d = dirs(dir.path());
-    let err = history("claude", Some("whatever"), &d, 10, None).unwrap_err();
+    let err = history("gemini", Some("whatever"), &d, 10, None).unwrap_err();
     assert!(
         matches!(err, qoro_history::Error::ScanCap { .. }),
         "{err:?}"
@@ -303,11 +310,51 @@ fn codex_first_line_beyond_probe_is_not_a_match() {
     // A 2 MiB first line with no newline: not a rollout session_meta.
     let mut data = vec![b'x'; 2 * 1024 * 1024];
     data.push(b'\n');
-    std::fs::write(dir.path().join("codex/huge.jsonl"), data).unwrap();
+    std::fs::write(
+        dir.path()
+            .join("codex/rollout-2026-01-01T00-00-00-whatever.jsonl"),
+        data,
+    )
+    .unwrap();
     let d = dirs(dir.path());
     let err = history("codex", Some("whatever"), &d, 10, None).unwrap_err();
     assert!(
         matches!(err, qoro_history::Error::NotFound { .. }),
         "{err:?}"
     );
+}
+
+/// A long history is not a reason to lose the session: past the old limits of
+/// 200 directories, the lookup still finds an id that is in an old corner of it.
+#[test]
+fn a_long_history_still_locates_old_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    for i in 0..210 {
+        std::fs::create_dir_all(projects.join(format!("slug-{i:03}"))).unwrap();
+    }
+    // The slug a listing returns last, which a scan that stops at a cap never reaches.
+    let last = std::fs::read_dir(&projects)
+        .unwrap()
+        .last()
+        .unwrap()
+        .unwrap();
+    std::fs::write(last.path().join("sid-1.jsonl"), claude_fixture()).unwrap();
+    let codex = dir.path().join("codex/2026");
+    for month in 1..=7 {
+        for day in 1..=30 {
+            std::fs::create_dir_all(codex.join(format!("{month:02}/{day:02}"))).unwrap();
+        }
+    }
+    std::fs::write(
+        codex.join("01/01/rollout-2026-01-01T09-00-00-abc-1.jsonl"),
+        codex_fixture(),
+    )
+    .unwrap();
+    let d = dirs(dir.path());
+
+    let claude = history("claude", Some("sid-1"), &d, 10, None).unwrap();
+    assert_eq!(claude.messages.len(), 2);
+    let codex = history("codex", Some("abc-1"), &d, 10, None).unwrap();
+    assert_eq!(codex.messages[0].text, "fix it");
 }

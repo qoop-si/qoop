@@ -1235,6 +1235,27 @@ contains = "do you want to proceed"
         );
     }
 
+    /// A finished answer that ends in a numbered summary, with the composer under it. The
+    /// list is two numbered lines inside the menu rule's window, and without the marker a
+    /// numbered option carries it reads as blocked: the row lights up and the bell rings for
+    /// an agent that is done and waiting to be typed to.
+    #[test]
+    fn a_finished_answer_ending_in_a_numbered_list_is_idle() {
+        let v = verdict(
+            "codex",
+            &[
+                "\u{2022} Done. Two changes:",
+                "  1. the parser keeps the trailing byte",
+                "  2. a test covers the split read",
+                "\u{203A} Ask Codex to do anything",
+                "  gpt-6-astra medium \u{b7} ~/coding/qoro",
+            ],
+        )
+        .expect("codex is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert_eq!(v.rule, "composer_idle");
+    }
+
     /// One numbered line is ordinary model output. Two is somebody being asked to choose.
     /// Without the second, a running agent reads as waiting, and `visible_blocker` makes
     /// that reading outrank everything weaker under ADR-008.

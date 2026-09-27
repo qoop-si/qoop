@@ -1,6 +1,8 @@
 //! Finding the transcript file for a `(product, session id)` pair.
 //!
-//! One strategy per product, no guessing, all bounded. A missing id is
+//! One strategy per product, no guessing. Claude and Codex look an id up by
+//! name, which costs one stat per project or one name test per file however
+//! much history there is; Gemini still scans, and its scan is bounded. A missing id is
 //! always a refusal upstream, never a "newest file" pick: this module only
 //! answers exact ids. Every returned path is canonicalized and checked
 //! against its product base directory, so a smuggled symlink cannot escape.
@@ -10,9 +12,9 @@ use std::path::{Path, PathBuf};
 use crate::Error;
 use crate::model::Product;
 
-/// How many project dirs (Claude/Gemini) a scan may enter.
+/// How many directories the Gemini scan may enter.
 const MAX_SCAN_DIRS: usize = 200;
-/// How many candidate files (Claude/Codex/Gemini) a scan may visit.
+/// How many candidate files the Gemini scan may visit.
 const MAX_SCAN_FILES: usize = 2000;
 /// Upper bound for reading a Codex first line: `session_meta` is small, but
 /// a pathological first line must not grow the probe without limit.
@@ -107,10 +109,10 @@ pub fn locate(product: Product, id: &str, dirs: &BaseDirs) -> Result<Located, Er
     })
 }
 
-/// `<projects>/<slug>/<id>.jsonl`, one level, bounded.
+/// `<projects>/<slug>/<id>.jsonl`. The id is the file name, so each project
+/// dir costs one stat and nothing is listed inside it: no cap to trip, however
+/// many projects and transcripts pile up.
 fn locate_claude(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
-    let mut slugs = 0;
-    let mut files = 0;
     let projects = match std::fs::read_dir(&dirs.claude) {
         Ok(e) => e,
         Err(_) => return Err(not_found()),
@@ -120,49 +122,39 @@ fn locate_claude(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
         if !is_plain_dir(&dir) {
             continue;
         }
-        slugs += 1;
-        if slugs > MAX_SCAN_DIRS {
-            return Err(Error::ScanCap { cap: MAX_SCAN_DIRS });
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for f in entries.flatten() {
-            let p = f.path();
-            if !p.is_file() || p.extension().is_some_and(|e| e != "jsonl") {
-                continue;
-            }
-            files += 1;
-            if files > MAX_SCAN_FILES {
-                return Err(Error::ScanCap {
-                    cap: MAX_SCAN_FILES,
-                });
-            }
-            if p.file_stem().is_some_and(|s| s == id) {
-                return Ok(Located::File(checked(&p, &dirs.claude)?));
-            }
+        let p = dir.join(format!("{id}.jsonl"));
+        if p.is_file() {
+            return Ok(Located::File(checked(&p, &dirs.claude)?));
         }
     }
     Err(not_found())
 }
 
-/// Rollout files carry the id inside (`session_meta`), newest first.
+/// `YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`. The file name picks the
+/// candidate and the `session_meta` inside confirms it, so only a file that
+/// already names the id is ever opened. Day directories sort by name, and the
+/// walk takes the newest first: the live session is found in the first one or
+/// two, however many months of history sit behind it, and nothing is capped.
 pub fn locate_codex(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
-    let mut files = collect_jsonl(&dirs.codex)?;
-    // Newest first: a reused name resolves to the live session, and the scan
-    // usually stops early.
-    files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-    let mut visited = 0;
-    for (_, path) in files {
-        visited += 1;
-        if visited > MAX_SCAN_FILES {
-            return Err(Error::ScanCap {
-                cap: MAX_SCAN_FILES,
-            });
+    let suffix = format!("-{id}.jsonl");
+    let mut stack = vec![dirs.codex.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths.iter().rev() {
+            let named = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix));
+            if named && p.is_file() && codex_head_matches(p, id)? {
+                return Ok(Located::File(checked(p, &dirs.codex)?));
+            }
         }
-        if codex_head_matches(&path, id)? {
-            return Ok(Located::File(checked(&path, &dirs.codex)?));
-        }
+        // Pushed oldest first, so the newest directory is popped next.
+        stack.extend(paths.into_iter().filter(|p| is_plain_dir(p)));
     }
     Err(not_found())
 }
@@ -252,52 +244,6 @@ fn checked(path: &Path, base: &Path) -> Result<PathBuf, Error> {
             }
         }
     }
-}
-
-/// Recursive `*.jsonl` collection with modification times. Bounded on both
-/// axes: past either cap is a loud error, never a slow crawl.
-fn collect_jsonl(dir: &Path) -> Result<Vec<(i64, PathBuf)>, Error> {
-    let mut out = Vec::new();
-    let mut dirs_seen = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    let mut first = true;
-    while let Some(d) = stack.pop() {
-        let entries = match std::fs::read_dir(&d) {
-            Ok(e) => e,
-            Err(_) => {
-                if first {
-                    return Ok(out);
-                }
-                continue;
-            }
-        };
-        first = false;
-        for f in entries.flatten() {
-            let p = f.path();
-            if is_plain_dir(&p) {
-                dirs_seen += 1;
-                if dirs_seen > MAX_SCAN_DIRS {
-                    return Err(Error::ScanCap { cap: MAX_SCAN_DIRS });
-                }
-                stack.push(p);
-            } else if p.is_file() && p.extension().is_some_and(|e| e == "jsonl") {
-                if out.len() >= MAX_SCAN_FILES {
-                    return Err(Error::ScanCap {
-                        cap: MAX_SCAN_FILES,
-                    });
-                }
-                let mtime = p
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                out.push((mtime, p));
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Bounded head probe for the Codex in-file session id. The id lives in
