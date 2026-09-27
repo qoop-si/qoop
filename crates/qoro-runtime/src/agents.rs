@@ -89,6 +89,37 @@ pub struct TerminalAgent {
     /// can be the last for a long time, an agent a wrapper started drawing once and then
     /// waiting, and nothing else would ever look again.
     pub relook_owed: bool,
+    /// When the current generation was minted by a foreground change, which starts
+    /// ADR-008's startup grace. `None` only until the first look finds a foreground
+    /// process: that look is a change from no leader, so even a terminal spawned straight
+    /// into an agent gets the grace.
+    pub born: Option<std::time::Instant>,
+}
+
+/// How long after a foreground change the weak idle fallback stays quiet: ADR-008's
+/// startup grace. Claude Code draws its first frame in pieces, a trust dialog included,
+/// well inside this, and a half drawn dialog matches no rule; read as idle, a task typed
+/// at it chose the dialog's default, which exits. A program that has matched no rule by
+/// the end reads as idle, as before.
+pub const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl TerminalAgent {
+    /// A new generation: the old belief described a process that is gone.
+    ///
+    /// The one place a foreground change is applied, so the grace starts wherever one is
+    /// seen: the read loop's look, the process watcher's exec, the relook.
+    fn advance(&mut self) -> GenerationId {
+        let generation = self.capability.advance();
+        self.belief = fresh_belief(generation);
+        self.born = Some(std::time::Instant::now());
+        generation
+    }
+
+    /// When this generation's startup grace ends, if it has not yet.
+    pub fn grace_ends(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let ends = self.born? + STARTUP_GRACE;
+        (now < ends).then_some(ends)
+    }
 }
 
 /// Why a terminal ended, decided once at teardown by `take_ending`.
@@ -371,6 +402,7 @@ impl AgentRegistry {
                 leader: None,
                 relooked: None,
                 relook_owed: false,
+                born: None,
             },
         );
         self.announce_new(stream);
@@ -817,8 +849,7 @@ impl AgentRegistry {
             // A different program is in this terminal than the one we had been reading, so
             // what was believed about the old one does not carry over, and that is a new
             // generation by definition.
-            let generation = agent.capability.advance();
-            agent.belief = fresh_belief(generation);
+            let generation = agent.advance();
             agent.last_active_at_unix = Some(now_unix);
             agent.last_io_unix = Some(now_unix);
             // The gate belonged to the old generation's screen: a new process
@@ -839,8 +870,7 @@ impl AgentRegistry {
             self.watch.unwatch(old);
             self.by_pid.lock().unwrap().remove(&old.0);
         }
-        let generation = agent.capability.advance();
-        agent.belief = fresh_belief(generation);
+        let generation = agent.advance();
         // A new foreground generation is activity even before anything is
         // known about the process: something replaced what was there.
         agent.last_active_at_unix = Some(now_unix);
@@ -897,8 +927,7 @@ impl AgentRegistry {
             let Some(agent) = terminals.get_mut(&stream) else {
                 continue;
             };
-            let generation = agent.capability.advance();
-            agent.belief = fresh_belief(generation);
+            let generation = agent.advance();
             // An exec replaced the program: activity. An exit settles below,
             // and `settle_exit` stamps the idle it synthesizes, so the exit
             // path stamps nothing here: one stamp per event, at the belief
@@ -1211,6 +1240,26 @@ mod tests {
         assert!(boundary_for("/usr/local/bin/docker").is_some());
         assert!(boundary_for("/opt/homebrew/bin/nsenter").is_some());
         assert!(boundary_for("/usr/bin/claude").is_none());
+    }
+
+    /// Measured on a real Claude Code start: the idle fallback read a half drawn trust
+    /// dialog as idle, and a task typed at the "idle" agent chose the dialog's default,
+    /// which exits. A foreground change opens the grace; the first generation does not.
+    #[test]
+    fn a_foreground_change_opens_the_startup_grace() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let now = std::time::Instant::now();
+        assert_eq!(r.agent(1).expect("agent").grace_ends(now), None);
+
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me), NOW).expect("a change");
+        let agent = r.agent(1).expect("agent");
+        let ends = agent
+            .grace_ends(std::time::Instant::now())
+            .expect("inside the grace");
+        assert!(ends <= std::time::Instant::now() + STARTUP_GRACE);
+        assert_eq!(agent.grace_ends(ends), None, "over at its end");
     }
 
     #[test]

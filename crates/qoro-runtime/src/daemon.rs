@@ -4964,7 +4964,19 @@ async fn terminal_task(
                                 let known = qoro_detect::for_program(&program).is_some_and(
                                     |m| m.id.to_lowercase() != "generic",
                                 );
-                                if known {
+                                // A program inside its startup grace is still
+                                // drawing: claiming idle from a half drawn first
+                                // frame is what let a task be typed at Claude Code
+                                // over a trust dialog that exits by default. The
+                                // screen is read again when the grace ends, since a
+                                // quiet program would give no other reason to look.
+                                let grace = agents
+                                    .agent(stream)
+                                    .and_then(|a| a.grace_ends(std::time::Instant::now()));
+                                if known && let Some(at) = grace {
+                                    detect_at = Some(tokio::time::Instant::from_std(at));
+                                    None
+                                } else if known {
                                     fallback = qoro_detect::Verdict {
                                         state: qoro_domain::AgentRuntimeState::Idle,
                                         rule: "known_agent_idle_fallback".into(),
