@@ -215,3 +215,36 @@ async fn a_terminal_started_without_a_directory_is_where_the_daemon_is() {
         "a terminal made without a directory has none on its row"
     );
 }
+
+/// A `cd` on a quiet prompt reaches the row. The shell prints its prompt within the
+/// throttle window of the echo before it, and nothing after that: a read skipped by the
+/// throttle has to happen once the window lapses, or the row keeps the old directory for
+/// good, which is what let `qoro worktree rm` believe a worktree was empty.
+#[tokio::test]
+async fn a_fast_cd_on_a_quiet_prompt_reaches_the_row() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let mut client = d.attach("cd").await;
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let wanted = dir
+        .path()
+        .canonicalize()
+        .expect("canonical scratch")
+        .display()
+        .to_string();
+    client
+        .input_to(terminal, format!("cd '{wanted}'\n").as_bytes())
+        .await;
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let mut seen = None;
+    while std::time::Instant::now() < deadline {
+        seen = row_of(&agents_of(&mut client, "poll").await, terminal)
+            .cwd
+            .clone();
+        if seen.as_deref() == Some(wanted.as_str()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the row still says {seen:?} after a quiet cd to {wanted}");
+}

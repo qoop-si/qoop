@@ -3564,6 +3564,35 @@ fn here() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// Read where a terminal's shell is, and write it to the registry and the store when it
+/// moved. The index reads the registry, not the store: one synchronous write from the
+/// single writer, ordered with every later read by construction, and live even for a
+/// daemon told not to persist.
+fn note_cwd(
+    child_pid: i32,
+    last_cwd: &mut Option<PathBuf>,
+    terminals: &TerminalRegistry,
+    stream: u32,
+    books: &Option<Bookkeeping>,
+) {
+    let Some(now) = qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid)) else {
+        return;
+    };
+    if last_cwd.as_deref() == Some(now.as_path()) {
+        return;
+    }
+    *last_cwd = Some(now.clone());
+    terminals.set_cwd(stream, Some(now.display().to_string()));
+    if let Some(books) = books.clone() {
+        tokio::spawn(async move {
+            let _ = books
+                .store
+                .set_cwd(stream as i64, now.display().to_string())
+                .await;
+        });
+    }
+}
+
 /// Everything bringing a session back needs.
 /// What a terminal writes down, and whether writing it down still means anything.
 #[derive(Clone)]
@@ -4525,6 +4554,12 @@ async fn terminal_task(
     // read writes the same value back and a daemon that has done nothing has still
     // written to its database.
     let mut last_cwd: Option<PathBuf> = Some(started_in);
+    // When to read the directory once more, because the throttle below skipped a read.
+    // A `cd` prints its prompt within the throttle window of the output before it, and
+    // with nothing printed after that a quiet tab kept its old directory for good: the
+    // index, the place line and `qoro worktree` all read the stale one. Armed only by
+    // output, so an idle terminal still has no timer (ADR-009).
+    let mut cwd_at: Option<tokio::time::Instant> = None;
     // When to read the screen for what the agent is doing. `None` while nothing has
     // happened, which is what keeps an idle terminal at no wakeups at all.
     let mut detect_at: Option<tokio::time::Instant> = None;
@@ -4766,26 +4801,13 @@ async fn terminal_task(
                                 // tab was born in stops being where it is within a minute
                                 // of real use. One syscall, and only written when it
                                 // actually changed.
-                                if let Some(now) =
-                                    qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
-                                    && last_cwd.as_deref() != Some(now.as_path())
-                                {
-                                    last_cwd = Some(now.clone());
-                                    // The index reads the registry, not the store: one
-                                    // synchronous write from the single writer, ordered
-                                    // with every later read by construction. Outside
-                                    // the `books` gate below on purpose: the row is
-                                    // live even for a daemon told not to persist.
-                                    terminals.set_cwd(stream, Some(now.display().to_string()));
-                                    if let Some(books) = books.clone() {
-                                        tokio::spawn(async move {
-                                            let _ = books
-                                                .store
-                                                .set_cwd(stream as i64, now.display().to_string())
-                                                .await;
-                                        });
-                                    }
-                                }
+                                cwd_at = None;
+                                note_cwd(child_pid, &mut last_cwd, &terminals, stream, &books);
+                            } else if cwd_at.is_none() {
+                                // Skipped by the throttle: read once more when it lapses.
+                                cwd_at = Some(tokio::time::Instant::from_std(
+                                    last_scan + CONTAINMENT_SCAN_INTERVAL,
+                                ));
                             }
                             // Fed a slice at a time, yielding between them.
                             //
@@ -4929,6 +4951,15 @@ async fn terminal_task(
                             }
                         }
                     }
+                }
+                _ = async {
+                    match cwd_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if cwd_at.is_some() => {
+                    cwd_at = None;
+                    note_cwd(child_pid, &mut last_cwd, &terminals, stream, &books);
                 }
                 _ = async {
                     match relook_at {
