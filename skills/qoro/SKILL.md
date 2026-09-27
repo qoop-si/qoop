@@ -126,6 +126,21 @@ worktree. The branch is kept.
    finished -> `prompt <n> "next task" --generation G`.
 5. Back to 2.
 
+When you supervise for a person:
+
+* Read only until they approve: `agents`, `context`, `history`, `read`,
+  `wait`. Report each worker that finished with its answer, and each one
+  that is blocked with exactly what it asks and every option it offers.
+* Propose the exact command, with `--generation`, and write nothing to a
+  worker until the person approves that action.
+* Before writing, read that worker again; after writing, confirm with
+  `wait` and `context` and report what you saw, not what you expected.
+* Never `stop` a session, and `close` a worker only when asked. Sit in
+  your own session, so ending the workers' cannot end you.
+* This skill pre-approves `qoro` for one turn only; a supervisor runs for
+  many. Start it with `claude --allowedTools "Bash(qoro *)"` and run each
+  `qoro` command on its own, without pipes, so that rule covers it.
+
 ## Sessions
 
 ```bash
