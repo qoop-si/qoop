@@ -32,8 +32,12 @@ a claim nobody has to keep.
 | `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
 | `qoro hook-report --session-id <id>` | report only the agent's conversation id, without claiming a state | no |
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
+| `qoro send <terminal> --key <name>` | press named keys in another terminal, one frame each: `enter esc tab shift-tab backspace space up down left right home end pageup pagedown ctrl-a..ctrl-z`; arrows follow the program's cursor key mode | no |
 | `qoro read <terminal>` | print another terminal's current screen | no |
 | `qoro prompt <target> <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt | no |
+| `qoro wait [target...] [--until STATE,...] [--timeout SECS] [--json]` | block until a target reaches a state (default `idle,done,blocked,failed`; no target means every agent terminal but the caller's), print the matching rows; exits 124 on timeout and 1 when a target closes | no |
+| `qoro new [--name N] [--cwd DIR] [--space ID] [-- command...]` | open a terminal in the caller's directory, print its number, and type the command into its shell once it has drawn a prompt | no |
+| `qoro close <terminal>` | end a terminal and everything it started, as `ctrl-a x` does; refused for the terminal the command runs in | no |
 | `qoro history <target> [--last N] [--role user|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
@@ -61,6 +65,11 @@ a claim nobody has to keep.
 |---|---|
 | `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once. The flag wins over the environment, which wins over the session last opened, which wins over the `default` session: a bare `qoro` reopens whatever was opened last. |
 | `QORO_IDLE_TIMEOUT_MINUTES` | idle auto-sleep: when set to a whole number of minutes N (recommended: `30`), the daemon closes terminals idle past N minutes with no background task running, through the same path as closing the tab by hand. Unset, `0` or invalid means disabled, which is the default. A reaped tab stays listed as a `sleeping` row until dismissed with `qoro`'s close; the agent's own conversation survives in the agent's own store. An agent that sent to another terminal with `qoro send` or `qoro prompt` stays awake while that terminal is still busy, for at most a day. |
+
+`send`, `prompt` and `close` take `--generation G`, the number `qoro agents` prints: the
+write is refused unless the terminal still runs that generation, so an answer meant for one
+process never reaches the one that replaced it. A sleeping row has no generation, so close
+it without the flag.
 
 The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
 `qoro send --session work 2 "x"` are the same thing. It is put into the environment of

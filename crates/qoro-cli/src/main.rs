@@ -19,6 +19,7 @@ mod avatar;
 mod hooks;
 mod remote;
 mod skills;
+mod supervise;
 mod update;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
@@ -59,6 +60,9 @@ fn run() -> std::io::Result<()> {
     // against. Held in one place rather than passed down twelve call sites, and inherited
     // by anything this process starts, which is what makes a shell inside a session able
     // to say `qoro send` and reach its own daemon rather than the default one.
+    // The session this process was started in, before `--session` replaces it: what
+    // tells "my own terminal" apart from the same number in another session.
+    let home_session = std::env::var(paths::SESSION_ENV).ok();
     let session = match take_session(&mut args) {
         Ok(name) => name,
         Err(e) => {
@@ -95,6 +99,9 @@ fn run() -> std::io::Result<()> {
         Some("history") => run_history(&args),
         Some("context") => run_context(&args),
         Some("agents") => run_agents(&args),
+        Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
+        Some("new") => supervise::run_new(&args),
+        Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
@@ -127,8 +134,19 @@ fn run() -> std::io::Result<()> {
                    \x20 qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
+                  \x20 qoro send <terminal> --key NAME...  press named keys: enter esc tab\n\
+                  \x20                 shift-tab backspace space up down left right home end\n\
+                  \x20                 pageup pagedown ctrl-a..ctrl-z\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
                   \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
+                  \x20                 send, prompt and close take --generation G: refused\n\
+                  \x20                 when the process is no longer the one that was read\n\
+                  \x20 qoro wait [target...] [--until STATE,...] [--timeout SECS] [--json]\n\
+                  \x20                 block until a terminal reaches a state; exits 124 on\n\
+                  \x20                 timeout\n\
+                  \x20 qoro new [--name N] [--cwd DIR] [--space ID] [-- command...]  open a\n\
+                  \x20                 terminal, print its number, type the command into it\n\
+                  \x20 qoro close <terminal>  end a terminal and what it started\n\
                   \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
                   \x20                 local files only; --json prints the full window\n\
@@ -1014,16 +1032,26 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let usage = "usage: qoro send <terminal> <text...> [--enter]";
+    let usage = "usage: qoro send <terminal> <text...> [--enter] [--generation G]\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| std::io::Error::other(usage))?;
     let mut enter = false;
     let mut parts = Vec::new();
-    for arg in args.iter().skip(3) {
+    let mut keys = Vec::new();
+    let mut args = args.to_vec();
+    let generation = supervise::take_generation(&mut args);
+    let mut rest = args.iter().skip(3);
+    while let Some(arg) = rest.next() {
         if arg == "--enter" {
             enter = true;
+        } else if arg == "--key" {
+            keys.push(
+                rest.next()
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other(usage))?,
+            );
         } else if arg.starts_with("--") {
             return Err(std::io::Error::other(format!(
                 "unknown flag {arg}; {usage}"
@@ -1031,6 +1059,18 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         } else {
             parts.push(arg.clone());
         }
+    }
+    // Keys and text in one call would have to agree on an order nobody wrote down.
+    if !keys.is_empty() && (!parts.is_empty() || enter) {
+        return Err(std::io::Error::other(format!(
+            "send either text or --key, not both; {usage}"
+        )));
+    }
+    supervise::check_generation(terminal, generation)?;
+    if !keys.is_empty() {
+        supervise::send_keys(terminal, &keys)?;
+        println!("sent to terminal {terminal}");
+        return Ok(());
     }
     let mut text = parts.join(" ");
     if text.is_empty() {
@@ -1353,8 +1393,13 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let usage = "usage: qoro prompt <target> <text...>";
-    let target = args.get(2).ok_or_else(|| std::io::Error::other(usage))?;
+    let usage = "usage: qoro prompt <target> <text...> [--generation G]";
+    let mut args = args.to_vec();
+    let generation = supervise::take_generation(&mut args);
+    let target = args
+        .get(2)
+        .ok_or_else(|| std::io::Error::other(usage))?
+        .clone();
     let text = args[3..].join(" ");
     if text.is_empty() {
         return Err(std::io::Error::other(format!(
@@ -1399,8 +1444,13 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
                 ));
             }
         };
-        let row = resolve_target(&rows, target).map_err(std::io::Error::other)?;
+        let row = resolve_target(&rows, &target).map_err(std::io::Error::other)?;
         if let Some(reason) = prompt_refusal(row) {
+            return Err(std::io::Error::other(reason));
+        }
+        if let Some(reason) =
+            generation.and_then(|g| supervise::generation_refusal(&rows, row.terminal, g))
+        {
             return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
