@@ -3014,6 +3014,14 @@ pub struct SnapshotWire {
     /// nothing is styled, which is most of a screen and all of a shell prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub styles: Vec<Vec<SpanWire>>,
+    /// Every link target the runs point at, once each.
+    ///
+    /// A table rather than a target per run, because a program chooses its links: one
+    /// four kilobyte address repeated per cell made a snapshot of more than eight
+    /// megabytes, past what any client reassembles, and the session could no longer be
+    /// attached to. The engine also caps what goes in here (`qoro_terminal::MAX_LINKS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
     /// Whether the program in this terminal asked for the mouse, and whether it is on the
     /// alternate screen.
     ///
@@ -3107,11 +3115,11 @@ pub struct SpanWire {
     /// bit set: six booleans would be six fields on every run.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attrs: u8,
-    /// Where the run points, when the program linked it with `OSC 8`. As the program wrote
-    /// it: a client cleans it where it writes it into an escape again. Absent on almost
-    /// every run, and an older client ignores it and draws the text unlinked (ADR-010).
+    /// Where the run points, when the program linked it with `OSC 8`: its place in the
+    /// snapshot's `links`. Absent on almost every run, and an older client ignores it and
+    /// draws the text unlinked (ADR-010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub link: Option<String>,
+    pub link: Option<u32>,
 }
 
 fn is_zero(v: &u8) -> bool {
@@ -3212,16 +3220,19 @@ pub mod attrs {
 
 impl From<&Snapshot> for SnapshotWire {
     fn from(s: &Snapshot) -> Self {
+        let mut links = Vec::new();
+        let styles = s
+            .styles
+            .iter()
+            .map(|row| row.iter().map(|span| span_wire(span, &mut links)).collect())
+            .collect();
         Self {
             cols: s.cols,
             rows: s.rows,
             cursor: s.cursor,
             lines: s.lines.clone(),
-            styles: s
-                .styles
-                .iter()
-                .map(|row| row.iter().map(SpanWire::from).collect())
-                .collect(),
+            styles,
+            links,
             behind: 0,
             modes: ModesWire {
                 alt_screen: s.modes.alt_screen,
@@ -3234,30 +3245,40 @@ impl From<&Snapshot> for SnapshotWire {
     }
 }
 
-impl From<&qoro_terminal::Span> for SpanWire {
-    fn from(s: &qoro_terminal::Span) -> Self {
-        let st = &s.style;
-        let mut bits = 0;
-        for (on, bit) in [
-            (st.bold, attrs::BOLD),
-            (st.italic, attrs::ITALIC),
-            (st.underline, attrs::UNDERLINE),
-            (st.inverse, attrs::INVERSE),
-            (st.dim, attrs::DIM),
-            (st.strike, attrs::STRIKE),
-        ] {
-            if on {
-                bits |= bit;
-            }
+/// One run as it crosses the socket, its link named by its place in `links`, which gains the
+/// target the first time a run points at it.
+fn span_wire(s: &qoro_terminal::Span, links: &mut Vec<String>) -> SpanWire {
+    let st = &s.style;
+    let mut bits = 0;
+    for (on, bit) in [
+        (st.bold, attrs::BOLD),
+        (st.italic, attrs::ITALIC),
+        (st.underline, attrs::UNDERLINE),
+        (st.inverse, attrs::INVERSE),
+        (st.dim, attrs::DIM),
+        (st.strike, attrs::STRIKE),
+    ] {
+        if on {
+            bits |= bit;
         }
-        Self {
-            at: s.at,
-            len: s.len,
-            fg: colour_wire(st.fg),
-            bg: colour_wire(st.bg),
-            attrs: bits,
-            link: st.link.as_deref().map(str::to_string),
-        }
+    }
+    let link = st.link.as_deref().map(|uri| {
+        let at = links
+            .iter()
+            .position(|known| known == uri)
+            .unwrap_or_else(|| {
+                links.push(uri.to_string());
+                links.len() - 1
+            });
+        at as u32
+    });
+    SpanWire {
+        at: s.at,
+        len: s.len,
+        fg: colour_wire(st.fg),
+        bg: colour_wire(st.bg),
+        attrs: bits,
+        link,
     }
 }
 
@@ -5560,10 +5581,8 @@ mod image_wire_tests {
         assert_eq!(body.matches("\"link\"").count(), 1, "{body}");
         let back: super::SnapshotWire = serde_json::from_str(&body).expect("parse");
         assert_eq!(back, wire);
-        assert_eq!(
-            back.styles[0][0].link.as_deref(),
-            Some("https://example.com")
-        );
+        assert_eq!(back.links, vec!["https://example.com".to_string()]);
+        assert_eq!(back.styles[0][0].link, Some(0));
         let old: super::SpanWire = serde_json::from_str(r#"{"at":0,"len":3}"#).expect("old");
         assert_eq!(old.link, None);
     }
@@ -5589,6 +5608,7 @@ mod image_wire_tests {
             cursor: (1, 1),
             lines: vec!["hi".to_string()],
             styles: Vec::new(),
+            links: Vec::new(),
             modes: Default::default(),
             behind: 0,
         };

@@ -265,10 +265,10 @@ const TAB_ON_FG: u8 = 212;
 /// painter, so a frame is always drawn in one palette.
 static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Draw for a light background, or a dark one. Whether that changed anything, so the
-/// caller knows the screen has to be painted again.
-pub fn set_light(on: bool) -> bool {
-    LIGHT.swap(on, std::sync::atomic::Ordering::Relaxed) != on
+/// Draw for a light background, or a dark one. The frame that follows repaints every row
+/// whose escapes changed, which is all of them when this did.
+pub fn set_light(on: bool) {
+    LIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the chrome is drawn for a light background.
@@ -324,10 +324,10 @@ fn tab_on_fg() -> u8 {
 /// blue, blocked a burnt orange, done a green, failed a magenta, sleeping a mauve.
 const fn light_ink(role: Role) -> u8 {
     match role {
-        Role::Title => 240,
+        Role::Title => 241,
         Role::Text => 235,
         Role::Focused => 16,
-        Role::Detail => 241,
+        Role::Detail => 240,
         Role::Faint => 243,
         Role::Rule => 250,
         Role::Brand => 202,

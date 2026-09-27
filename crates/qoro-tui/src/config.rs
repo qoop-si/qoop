@@ -2,7 +2,7 @@
 //! directory.
 //!
 //! ```toml
-//! prefix = "ctrl-a"   # ctrl- and one of b e f g k l n o p r t u v w x y
+//! prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
 //! theme = "auto"      # auto | dark | light
 //! [notify]
 //! desktop = true
@@ -14,18 +14,24 @@
 //! how long an idle terminal lives stays `QORO_IDLE_TIMEOUT_MINUTES`, because that is the
 //! daemon's decision and a client's file would be one more place to look for it.
 //!
-//! Nothing here is ever fatal. A value this cannot use keeps that key's default and is
-//! said, with the file and the line, so a typo costs a person one setting and a sentence,
-//! never the interface. Only these keys and this much of TOML are read: `key = value`
-//! lines, a `[notify]` table, comments, quoted strings and booleans. That is the whole
-//! file, and a parser for the rest of TOML would be a dependency to read four values.
+//! Read as TOML by the `toml` crate, so dotted keys (`notify.desktop = false`), inline
+//! tables and quoting behave the way the format says. Nothing here is ever fatal: a value
+//! this cannot use keeps that key's default and is said, so a typo costs a person one
+//! setting and a sentence, never the interface. A line that is not TOML at all is said
+//! with its number and left out, and the rest of the file is still read.
 
 use std::path::{Path, PathBuf};
 
 /// The keys a prefix may be. The others are taken: `c d h i j m q s z` are either
 /// commands after the prefix, backspace, tab, enter, detach or the shell's own job
 /// control, and a prefix on one of them would take that key away from the program.
-const PREFIX_LETTERS: &str = "befgklnoprtuvwxy";
+const PREFIX_LETTERS: &str = "abefgklnoprtuvwxy";
+
+/// What a person is told a prefix may be.
+const PREFIX_SAID: &str = "ctrl- and one of a b e f g k l n o p r t u v w x y";
+
+/// Lines left out of a file that is not TOML before the rest is given up on.
+const MAX_BAD_LINES: usize = 16;
 
 /// Which palette the chrome is drawn in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,12 +76,47 @@ impl Default for Config {
     }
 }
 
-/// A read of the file: what it says, and what in it could not be used.
+/// One thing in the file that could not be used, and the line it is on when that is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub line: Option<usize>,
+    pub what: String,
+}
+
+impl Problem {
+    /// As the settings box says it, beside the file's own path.
+    pub fn short(&self) -> String {
+        match self.line {
+            Some(line) => format!("line {line}: {}", self.what),
+            None => self.what.clone(),
+        }
+    }
+}
+
+/// A read of the file: what it says, what in it could not be used, and where it is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Read {
     pub config: Config,
-    /// One sentence per line that kept a default, each naming the file and the line.
-    pub problems: Vec<String>,
+    pub problems: Vec<Problem>,
+    pub path: PathBuf,
+    /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
+    pub exists: bool,
+}
+
+impl Read {
+    /// The first problem, as the hint row says it: the file, the line, and what was kept.
+    pub fn hint(&self) -> Option<String> {
+        let first = self.problems.first()?;
+        let more = match self.problems.len() {
+            1 => String::new(),
+            n => format!(" (and {} more, see settings)", n - 1),
+        };
+        Some(format!(
+            "{} {}, kept the default{more}",
+            self.path.display(),
+            first.short()
+        ))
+    }
 }
 
 /// Where the file is.
@@ -90,94 +131,119 @@ pub fn read() -> Read {
 
 /// Read a file by its path, so a test never touches a home directory.
 pub fn read_from(path: &Path) -> Read {
-    match std::fs::read_to_string(path) {
+    let (config, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
             let (config, problems) = parse(&text);
-            Read {
-                config,
-                problems: problems
-                    .into_iter()
-                    .map(|(line, what)| {
-                        format!("{} line {line}: {what}, kept the default", path.display())
-                    })
-                    .collect(),
-            }
+            (config, problems, true)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Read::default(),
-        Err(error) => Read {
-            config: Config::default(),
-            problems: vec![format!(
-                "{} could not be read ({error}), using the defaults",
-                path.display()
-            )],
-        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (Config::default(), Vec::new(), false)
+        }
+        Err(error) => (
+            Config::default(),
+            vec![Problem {
+                line: None,
+                what: format!("could not be read ({error})"),
+            }],
+            true,
+        ),
+    };
+    Read {
+        config,
+        problems,
+        path: path.to_path_buf(),
+        exists,
     }
 }
 
-/// The settings, and for every line that could not be used its number and why.
-pub fn parse(text: &str) -> (Config, Vec<(usize, String)>) {
-    let mut config = Config::default();
+/// The settings, and everything that could not be used.
+pub fn parse(text: &str) -> (Config, Vec<Problem>) {
     let mut problems = Vec::new();
-    let mut table = String::new();
-    for (index, raw) in text.lines().enumerate() {
-        let line = index + 1;
-        // A `#` is never part of a value this file can hold, so it always starts a comment.
-        let text = raw.split('#').next().unwrap_or("").trim();
-        if text.is_empty() {
-            continue;
-        }
-        if let Some(name) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-            table = name.trim().to_string();
-            continue;
-        }
-        let Some((key, value)) = text.split_once('=') else {
-            problems.push((line, format!("`{text}` is not `key = value`")));
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
-        let wrong = |what: &str| format!("{key} = {value} is not {what}");
-        match (table.as_str(), key) {
-            ("", "prefix") => match quoted(value).and_then(prefix_byte) {
-                Some(byte) => config.prefix = byte,
-                None => problems.push((
+    let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
+    let table = loop {
+        match text.parse::<toml::Table>() {
+            Ok(table) => break table,
+            Err(error) => {
+                let line = error
+                    .span()
+                    .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
+                problems.push(Problem {
                     line,
-                    wrong("ctrl- and one of b e f g k l n o p r t u v w x y"),
-                )),
+                    what: unreadable(&text, line, error.message()),
+                });
+                // Leave the line out and read the rest, so one bad line costs one setting.
+                match line {
+                    Some(line) if problems.len() < MAX_BAD_LINES => {
+                        text = text
+                            .lines()
+                            .enumerate()
+                            .map(|(at, l)| if at + 1 == line { "" } else { l })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    _ => break toml::Table::new(),
+                }
+            }
+        }
+    };
+    let mut config = Config::default();
+    let mut refuse = |what: String| problems.push(Problem { line: None, what });
+    for (key, value) in &table {
+        match (key.as_str(), value) {
+            ("prefix", toml::Value::String(name)) => match prefix_byte(name) {
+                Some(byte) => config.prefix = byte,
+                None => refuse(format!("prefix = {value} is not {PREFIX_SAID}")),
             },
-            ("", "theme") => match quoted(value) {
-                Some("auto") => config.theme = Theme::Auto,
-                Some("dark") => config.theme = Theme::Dark,
-                Some("light") => config.theme = Theme::Light,
-                _ => problems.push((line, wrong("\"auto\", \"dark\" or \"light\""))),
-            },
-            ("notify", "desktop") => match boolean(value) {
-                Some(on) => config.desktop = on,
-                None => problems.push((line, wrong("true or false"))),
-            },
-            ("notify", "sound") => match boolean(value) {
-                Some(on) => config.sound = on,
-                None => problems.push((line, wrong("true or false"))),
-            },
-            ("", _) => problems.push((line, format!("there is no setting `{key}`"))),
-            _ => problems.push((line, format!("there is no setting `{table}.{key}`"))),
+            ("theme", toml::Value::String(name)) if name == "auto" => config.theme = Theme::Auto,
+            ("theme", toml::Value::String(name)) if name == "dark" => config.theme = Theme::Dark,
+            ("theme", toml::Value::String(name)) if name == "light" => {
+                config.theme = Theme::Light;
+            }
+            ("prefix", _) => refuse(format!("prefix = {value} is not {PREFIX_SAID}")),
+            ("theme", _) => refuse(format!(
+                "theme = {value} is not \"auto\", \"dark\" or \"light\""
+            )),
+            ("notify", toml::Value::Table(notify)) => {
+                for (key, value) in notify {
+                    let slot = match key.as_str() {
+                        "desktop" => &mut config.desktop,
+                        "sound" => &mut config.sound,
+                        _ => {
+                            refuse(format!("there is no setting notify.{key}"));
+                            continue;
+                        }
+                    };
+                    match value {
+                        toml::Value::Boolean(on) => *slot = *on,
+                        _ => refuse(format!("notify.{key} = {value} is not true or false")),
+                    }
+                }
+            }
+            ("notify", _) => refuse("notify is a table: [notify] then desktop = true".into()),
+            _ => refuse(format!("there is no setting {key}")),
         }
     }
     (config, problems)
 }
 
-/// A TOML string in either quote.
-fn quoted(value: &str) -> Option<&str> {
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-}
-
-fn boolean(value: &str) -> Option<bool> {
-    match value {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+/// What to say about a line that is not TOML. The mistake a person actually makes is a
+/// bare word where a string goes, and for that the fix is spelled out.
+fn unreadable(text: &str, line: Option<usize>, message: &str) -> String {
+    let bare = line
+        .and_then(|line| text.lines().nth(line - 1))
+        .and_then(|l| l.split('#').next())
+        .and_then(|l| l.split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(key, value)| {
+            !key.is_empty()
+                && !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    match bare {
+        Some((key, value)) => format!("needs quotes: {key} = \"{value}\""),
+        None => format!("not TOML ({})", message.trim()),
     }
 }
 
@@ -193,50 +259,60 @@ fn prefix_byte(name: &str) -> Option<u8> {
         .then(|| byte - b'a' + 1)
 }
 
-/// The read in effect, for the settings box to describe.
+/// The settings box's rows, computed once when the file is read.
 ///
 /// Held here for the reason `keys::show_prefix` holds the prefix: the box is painted from
-/// the frame, and threading one more value through every frame for a box that is open a
-/// few seconds a week is a larger change than the box.
-static SHOWN: std::sync::Mutex<Option<Read>> = std::sync::Mutex::new(None);
+/// the frame, and every frame test in the interface builds a `Frame` by hand, so a field
+/// there for a box that is open a few seconds a week is a larger change than the box.
+static SHOWN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Say which read is in effect. Set where the interface starts and wherever it reads again.
-pub fn show(read: &Read) {
-    *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(read.clone());
+/// Say what the settings box should show. Set wherever the file is read.
+pub fn show(rows: Vec<String>) {
+    *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = rows;
 }
 
-/// The read in effect, or the defaults before anything was read.
-pub fn shown() -> Read {
-    SHOWN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_default()
+/// The settings box's rows about the file, as last shown.
+pub fn shown() -> Vec<String> {
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// What the settings box says about the file: where it is and what is in effect.
-pub fn describe(read: &Read) -> Vec<String> {
+/// The rows about the file, in its own syntax, so what the box shows is what a person
+/// would write: where the file is, each setting in effect with what it may be, where a
+/// notification goes (`notes`), and what could not be used.
+pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
     let config = read.config;
-    let file = path();
+    // Each setting as it is written in the file, then what it may be, in one column.
+    let row = |written: String, about: &str| format!(" {written:<20}{about}");
+    let theme_now = match config.theme {
+        Theme::Auto if light => "auto | dark | light, light now",
+        Theme::Auto => "auto | dark | light, dark now",
+        _ => "auto | dark | light",
+    };
+    let notes = if config.desktop {
+        format!("notes go to {notes}")
+    } else {
+        "no desktop notes".to_string()
+    };
     let mut rows = vec![
         format!(
-            " config          {}{}",
-            file.display(),
-            if file.exists() {
+            " {}{}",
+            read.path.display(),
+            if read.exists {
                 ""
             } else {
-                " (none, defaults)"
+                "  (no file: defaults)"
             }
         ),
-        format!(" prefix          {}", crate::keys::name_of(config.prefix)),
-        format!(" theme           {}", config.theme.name()),
-        format!(
-            " notify          desktop {}, sound {}",
-            if config.desktop { "on" } else { "off" },
-            if config.sound { "on" } else { "off" }
+        row(
+            format!("prefix = \"{}\"", crate::keys::name_of(config.prefix)),
+            PREFIX_SAID,
         ),
+        row(format!("theme = \"{}\"", config.theme.name()), theme_now),
+        " [notify]".to_string(),
+        row(format!("desktop = {}", config.desktop), &notes),
+        row(format!("sound = {}", config.sound), "true | false"),
     ];
-    rows.extend(read.problems.iter().map(|problem| format!(" ! {problem}")));
+    rows.extend(read.problems.iter().map(|p| format!(" ! {}", p.short())));
     rows
 }
 
@@ -248,16 +324,28 @@ mod tests {
     fn no_file_is_every_default_and_nothing_to_say() {
         let dir = tempfile::tempdir().expect("tempdir");
         let read = read_from(&dir.path().join("config.toml"));
-        assert_eq!(read, Read::default());
+        assert_eq!(read.config, Config::default());
+        assert!(read.problems.is_empty() && !read.exists);
         assert_eq!(read.config.prefix, 0x01);
         assert_eq!(read.config.theme, Theme::Auto);
         assert!(read.config.desktop && !read.config.sound);
     }
 
+    /// The file as the README writes it reads with nothing to say, the default prefix
+    /// included.
     #[test]
-    fn every_key_is_read() {
+    fn the_documented_file_reads_cleanly() {
         let (config, problems) = parse(
-            "# mine\nprefix = \"ctrl-b\"\ntheme = 'light'  # bright room\n\n[notify]\ndesktop = false\nsound = true\n",
+            "prefix = \"ctrl-a\"   # ctrl- and one letter\ntheme = \"auto\"\n[notify]\ndesktop = true\nsound = false\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn every_key_is_read_in_every_toml_spelling() {
+        let (config, problems) = parse(
+            "\u{feff}# mine\nprefix = \"ctrl-b\"\ntheme = 'light'  # bright room\n\n[notify]\ndesktop = false\nsound = true\n",
         );
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
@@ -269,6 +357,11 @@ mod tests {
                 sound: true,
             }
         );
+        let dotted = parse("notify.desktop = false\n").0;
+        assert!(!dotted.desktop, "the hint's own advice has to work");
+        let inline = parse("notify = { sound = true }\n\"theme\" = \"dark\"\n").0;
+        assert!(inline.sound);
+        assert_eq!(inline.theme, Theme::Dark);
     }
 
     #[test]
@@ -288,12 +381,12 @@ mod tests {
         }
     }
 
-    /// A bad line costs that one setting and is said with its line; everything around it
-    /// is still read.
+    /// A bad value costs that one setting and is said; a line that is not TOML is said
+    /// with its number and the rest of the file is still read.
     #[test]
-    fn each_refusal_keeps_its_default_and_names_its_line() {
+    fn each_refusal_keeps_its_default_and_the_rest_is_still_read() {
         let (config, problems) = parse(
-            "prefix = ctrl-b\ntheme = \"blue\"\ncolour = \"red\"\n[notify]\nsound = yes\ndesktop = false\nloud = true\njunk\n",
+            "prefix = ctrl-b\ntheme = \"blue\"\ncolour = \"red\"\n[notify]\nsound = \"yes\"\ndesktop = false\nloud = true\n",
         );
         assert_eq!(
             config,
@@ -302,23 +395,63 @@ mod tests {
                 ..Config::default()
             }
         );
-        let lines: Vec<usize> = problems.iter().map(|(line, _)| *line).collect();
-        assert_eq!(lines, vec![1, 2, 3, 5, 7, 8], "{problems:?}");
-        assert!(problems[2].1.contains("`colour`"), "{problems:?}");
-        assert!(problems[4].1.contains("`notify.loud`"), "{problems:?}");
+        let said: Vec<String> = problems.iter().map(Problem::short).collect();
+        assert_eq!(said.len(), 5, "{said:?}");
+        assert_eq!(said[0], "line 1: needs quotes: prefix = \"ctrl-b\"");
+        for needle in [
+            "theme = \"blue\"",
+            "no setting colour",
+            "notify.sound = \"yes\"",
+            "no setting notify.loud",
+        ] {
+            assert!(
+                said.iter().any(|s| s.contains(needle)),
+                "{needle}: {said:?}"
+            );
+        }
     }
 
     #[test]
-    fn the_message_names_the_file_and_the_line() {
+    fn a_repeated_key_is_said_and_the_first_one_stands() {
+        let (config, problems) = parse("theme = \"light\"\ntheme = \"dark\"\n");
+        assert_eq!(config.theme, Theme::Light);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].line, Some(2), "{problems:?}");
+    }
+
+    #[test]
+    fn the_hint_names_the_file_and_the_line() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("config.toml");
-        std::fs::write(&file, "\n\ntheme = \"blue\"\n").expect("write");
+        std::fs::write(&file, "\n\ntheme = blue\n").expect("write");
         let read = read_from(&file);
         assert_eq!(read.config, Config::default());
-        assert_eq!(read.problems.len(), 1);
-        let said = &read.problems[0];
-        assert!(said.contains(&file.display().to_string()), "{said}");
-        assert!(said.contains("line 3"), "{said}");
-        assert!(said.contains("kept the default"), "{said}");
+        let hint = read.hint().expect("something to say");
+        assert!(hint.contains(&file.display().to_string()), "{hint}");
+        assert!(hint.contains("line 3"), "{hint}");
+        assert!(hint.contains("kept the default"), "{hint}");
+    }
+
+    /// The settings box shows each setting as it is written in the file, where a note goes,
+    /// and each problem by its line without the path again.
+    #[test]
+    fn the_settings_rows_read_like_the_file() {
+        let (config, problems) = parse("theme = blue\n[notify]\nsound = true\n");
+        let read = Read {
+            config,
+            problems,
+            path: PathBuf::from("/c/config.toml"),
+            exists: true,
+        };
+        let rows = describe(&read, true, "terminal-notifier");
+        assert_eq!(rows[0], " /c/config.toml");
+        assert!(rows[1].starts_with(" prefix = \"ctrl-a\""), "{rows:?}");
+        assert!(rows[2].ends_with("light now"), "{rows:?}");
+        assert!(
+            rows[4].contains("notes go to terminal-notifier"),
+            "{rows:?}"
+        );
+        assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
+        assert_eq!(rows[6], " ! line 1: needs quotes: theme = \"blue\"");
     }
 }

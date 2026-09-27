@@ -466,7 +466,13 @@ pub fn paint(frame: &Frame) -> String {
             let selected = frame
                 .selection
                 .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
-            out.push_str(&paint_row(line, spans, pane_cols as usize, selected));
+            out.push_str(&paint_row(
+                line,
+                spans,
+                links_of(frame.snapshot),
+                pane_cols as usize,
+                selected,
+            ));
         } else {
             paint_tiled_row(frame, pane_row, pane_cols as usize, left, &mut out);
         }
@@ -1265,15 +1271,15 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
             ),
         ]
         .into_iter()
-        .chain(crate::config::describe(&crate::config::shown()))
+        .chain(crate::config::shown())
         .collect(),
     };
     let title = match reading {
         crate::run::Reading::Keybinds => " keybinds",
         crate::run::Reading::Settings => " settings",
     };
-    // The keys are written with ctrl-a and named here, so the list says the prefix this
-    // interface was started with.
+    // The keys are written with ctrl-a and named here, so the list says the prefix in
+    // effect, including one the settings box just read.
     let lines: Vec<String> = match reading {
         crate::run::Reading::Keybinds => {
             lines.iter().map(|line| crate::keys::named(line)).collect()
@@ -1380,6 +1386,11 @@ pub fn window_row<'a>(
     )
 }
 
+/// The link targets a screen's runs point into.
+fn links_of(snapshot: Option<&SnapshotWire>) -> &[String] {
+    snapshot.map(|s| s.links.as_slice()).unwrap_or(&[])
+}
+
 /// Whether a tile covers a pane-local cell.
 fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
     frame.tiles.iter().any(|t| {
@@ -1438,7 +1449,12 @@ fn paint_tiled_row(
             None
         };
         out.push_str(&at(screen_row, pane_left + 1 + tile.rect.x));
-        out.push_str(&paint_row(line, spans, tile.rect.cols, selected));
+        let links = links_of(if tile.focused {
+            frame.snapshot
+        } else {
+            tile.snapshot
+        });
+        out.push_str(&paint_row(line, spans, links, tile.rect.cols, selected));
     }
     let mut x = 0;
     while x < pane_cols {
@@ -1476,6 +1492,7 @@ fn paint_tiled_row(
 pub(crate) fn paint_row(
     line: &str,
     spans: &[SpanWire],
+    links: &[String],
     cols: usize,
     selected: Option<std::ops::Range<usize>>,
 ) -> String {
@@ -1533,8 +1550,9 @@ pub(crate) fn paint_row(
                 out.push_str("\x1b[7m");
             }
             if let Some(uri) = span
-                .and_then(|s| s.link.as_deref())
-                .and_then(crate::hyperlink::clean_uri)
+                .and_then(|s| s.link)
+                .and_then(|at| links.get(at as usize))
+                .and_then(|uri| crate::hyperlink::clean_uri(uri))
             {
                 out.push_str(&crate::hyperlink::open(uri));
                 linked = true;
@@ -1720,6 +1738,7 @@ mod tests {
             cursor: (0, 0),
             lines: lines.iter().map(|l| l.to_string()).collect(),
             styles: Vec::new(),
+            links: Vec::new(),
         }
     }
 
@@ -1783,7 +1802,7 @@ mod tests {
     /// draws cells one by one, and it must drop it as the plain path does.
     #[test]
     fn a_relayed_screen_cannot_smuggle_an_escape() {
-        let out = paint_row("a\x1b]52;c;aGk=\x07b", &[], 20, Some(0..3));
+        let out = paint_row("a\x1b]52;c;aGk=\x07b", &[], &[], 20, Some(0..3));
         assert!(!out.contains('\x07'), "{out:?}");
         assert!(!out.contains("\x1b]"), "{out:?}");
         assert!(out.contains('b'), "{out:?}");
@@ -1817,7 +1836,7 @@ mod tests {
                 link: None,
             },
         ];
-        let painted = paint_row(line, &spans, 40, None);
+        let painted = paint_row(line, &spans, &[], 40, None);
         // Truecolour arrives as truecolour, inverse as inverse, and a reset
         // closes every run so no style bleeds into the next cell.
         assert!(painted.contains("38;2;92;156;245"), "{painted:?}");
@@ -1843,14 +1862,14 @@ mod tests {
         assert_eq!(crate::width::width(&plain), 40, "{plain:?}");
     }
 
-    fn linked(at: usize, len: usize, uri: &str) -> SpanWire {
+    fn linked(at: usize, len: usize, link: u32) -> SpanWire {
         SpanWire {
             at,
             len,
             fg: None,
             bg: None,
             attrs: 0,
-            link: Some(uri.to_string()),
+            link: Some(link),
         }
     }
 
@@ -1865,11 +1884,15 @@ mod tests {
                 fg: Some(ColourWire::Indexed { i: 1 }),
                 bg: None,
                 attrs: 0,
-                link: Some("https://a.example".to_string()),
+                link: Some(0),
             },
-            linked(2, 2, "https://b.example"),
+            linked(2, 2, 1),
         ];
-        let painted = paint_row("abcd tail", &spans, 20, None);
+        let links = [
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ];
+        let painted = paint_row("abcd tail", &spans, &links, 20, None);
         let open_a = "\x1b]8;;https://a.example\x1b\\";
         let open_b = "\x1b]8;;https://b.example\x1b\\";
         let expected = format!(
@@ -1885,8 +1908,9 @@ mod tests {
     /// divider and the next tile are not part of the link.
     #[test]
     fn a_link_cut_by_the_tile_edge_is_closed_at_the_edge() {
-        let spans = vec![linked(0, 30, "https://example.com")];
-        let painted = paint_row(&"x".repeat(30), &spans, 10, None);
+        let spans = vec![linked(0, 30, 0)];
+        let links = ["https://example.com".to_string()];
+        let painted = paint_row(&"x".repeat(30), &spans, &links, 10, None);
         assert!(
             painted.ends_with(&format!("{}\x1b[0m", crate::hyperlink::CLOSE)),
             "{painted:?}"
@@ -1894,11 +1918,13 @@ mod tests {
         assert_eq!(painted.matches(crate::hyperlink::CLOSE).count(), 1);
     }
 
-    /// A target that could end the escape early paints its text unlinked.
+    /// A target that could end the escape early, or an index past the table, paints its
+    /// text unlinked.
     #[test]
     fn a_hostile_link_target_paints_its_text_unlinked() {
-        let spans = vec![linked(0, 4, "https://x\x07\x1b]2;owned")];
-        let painted = paint_row("link", &spans, 10, None);
+        let spans = vec![linked(0, 4, 0), linked(4, 4, 7)];
+        let links = ["https://x\x07\x1b]2;owned".to_string()];
+        let painted = paint_row("linklink", &spans, &links, 10, None);
         assert!(!painted.contains("\x1b]"), "{painted:?}");
         assert!(painted.contains("link"), "{painted:?}");
     }

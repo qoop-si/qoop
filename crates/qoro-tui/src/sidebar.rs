@@ -1528,7 +1528,7 @@ pub fn agents_title_hit(view: View, col: usize, width: usize) -> Option<Hit> {
 /// because a column this narrow renders `/opt/homebrew/bin/claude` as `/opt/homebre`,
 /// which identifies nothing. A wrapper is announced as a wrapper: a person shown
 /// `docker` would conclude their agent is called docker.
-fn label(agent: &AgentRow) -> String {
+pub(crate) fn label(agent: &AgentRow) -> String {
     if let Some(name) = agent.name.as_deref().filter(|n| !n.is_empty()) {
         return name.to_string();
     }

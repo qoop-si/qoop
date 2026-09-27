@@ -14,8 +14,9 @@
 //! What is said is a tab's name or program, what happened, and the space: names this
 //! machine gave, never anything read from a pane. It still passes one choke point,
 //! [`clean`], because a tab name is typed by a person and ends up inside an escape sequence
-//! or another program's arguments. The system path hands it over as an argument, never as
-//! AppleScript source or shell text, so no name can become code.
+//! or another program's arguments. The system path hands it over as data (an argument after
+//! `--`, or the program's input), never as AppleScript source, shell text or an option, so
+//! no name can become code.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,8 +46,18 @@ pub enum Route {
     Escape { escape: Escape, tmux: bool },
     /// A program this machine has, by name from `PATH`.
     System(Program),
-    /// Nothing here can show one.
-    Nowhere,
+    /// Nothing here can show one, and why.
+    Nowhere(Why),
+}
+
+/// Why a note has nowhere to go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// The system here is another machine's.
+    Ssh,
+    /// Inside tmux, which does not let an escape through to the terminal outside.
+    Tmux,
+    NoProgram,
 }
 
 /// The system programs a note can go through.
@@ -92,7 +103,12 @@ impl Env {
 }
 
 /// Whether tmux lets an escape through to the terminal around it.
+///
+/// Asked with a deadline: this runs before the first frame, and a tmux server that does
+/// not answer must cost the interface a quarter of a second at most, never its start. No
+/// answer in time reads as no.
 fn tmux_passes_escapes(pane: Option<&str>) -> bool {
+    use std::io::Read as _;
     let mut ask = Command::new("tmux");
     ask.args(["show", "-Apv"]);
     if let Some(pane) = pane {
@@ -100,10 +116,35 @@ fn tmux_passes_escapes(pane: Option<&str>) -> bool {
     }
     ask.arg("allow-passthrough")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    ask.output()
-        .is_ok_and(|out| matches!(String::from_utf8_lossy(&out.stdout).trim(), "on" | "all"))
+    let Ok(mut child) = ask.spawn() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + TMUX_PATIENCE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let mut said = String::new();
+    let _ = child
+        .stdout
+        .take()
+        .map(|mut out| out.read_to_string(&mut said));
+    matches!(said.trim(), "on" | "all")
 }
+
+/// How long tmux is given to say whether it passes escapes through.
+const TMUX_PATIENCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The escape a terminal understands, from what it says about itself.
 fn escape_for(env: &Env) -> Option<Escape> {
@@ -133,22 +174,44 @@ pub fn route(env: &Env) -> Route {
     }
     // The system here is the far machine's when this runs over ssh.
     if env.ssh {
-        return Route::Nowhere;
+        return Route::Nowhere(Why::Ssh);
     }
-    let program = if env.macos {
-        if (env.has)("terminal-notifier") {
-            Program::TerminalNotifier
-        } else if (env.has)("osascript") {
-            Program::Osascript
-        } else {
-            return Route::Nowhere;
-        }
-    } else if (env.has)("notify-send") {
-        Program::NotifySend
+    let found = if env.macos {
+        ["terminal-notifier", "osascript"]
+            .into_iter()
+            .find(|name| (env.has)(name))
     } else {
-        return Route::Nowhere;
+        ["notify-send"].into_iter().find(|name| (env.has)(name))
     };
-    Route::System(program)
+    match found {
+        Some("terminal-notifier") => Route::System(Program::TerminalNotifier),
+        Some("osascript") => Route::System(Program::Osascript),
+        Some(_) => Route::System(Program::NotifySend),
+        // Inside tmux the terminal outside may well show one: tmux is what is in the way.
+        None if env.tmux => Route::Nowhere(Why::Tmux),
+        None => Route::Nowhere(Why::NoProgram),
+    }
+}
+
+/// Where a note goes, as the settings box says it.
+pub fn describe(route: Route) -> String {
+    match route {
+        Route::Escape { escape, tmux } => {
+            let kind = match escape {
+                Escape::Osc9 => "OSC 9",
+                Escape::Osc99 => "OSC 99",
+                Escape::Osc777 => "OSC 777",
+            };
+            let through = if tmux { ", through tmux" } else { "" };
+            format!("the terminal ({kind}{through})")
+        }
+        Route::System(Program::TerminalNotifier) => "terminal-notifier".into(),
+        Route::System(Program::Osascript) => "osascript".into(),
+        Route::System(Program::NotifySend) => "notify-send".into(),
+        Route::Nowhere(Why::Ssh) => "nowhere: ssh".into(),
+        Route::Nowhere(Why::Tmux) => "nowhere: tmux allow-passthrough is off".into(),
+        Route::Nowhere(Why::NoProgram) => "nowhere: no notifier here".into(),
+    }
 }
 
 /// A state change waiting out [`DELAY`] before it is said.
@@ -159,39 +222,54 @@ pub struct Note {
     /// when the note is due is dropped rather than said.
     pub state: String,
     pub generation: u64,
-    /// The tab's name, else its program.
+    /// What the tab bar and the panel call the terminal.
     pub label: String,
     /// What happened, as the end of a sentence: "finished", "is blocked".
     pub what: &'static str,
     pub space: String,
     /// Waiting on a person (blocked, failed) rather than only done.
     pub urgent: bool,
+    /// When it has waited its full [`DELAY`].
+    pub due: std::time::Instant,
 }
 
-/// One sentence for everything that came due together.
+/// One sentence for everything that came due together: what happened to each, by name.
+/// Two terminals with one name are told apart by their number, as `qoro agents` shows it.
 pub fn say(notes: &[Note]) -> String {
+    let name = |note: &Note| {
+        let shared = notes
+            .iter()
+            .any(|other| other.label == note.label && other.terminal != note.terminal);
+        if shared {
+            format!("{} ({})", note.label, note.terminal)
+        } else {
+            note.label.clone()
+        }
+    };
     match notes {
-        [] => String::new(),
-        [one] if one.space.is_empty() => format!("{} {}", one.label, one.what),
-        [one] => format!("{} {} in {}", one.label, one.what, one.space),
-        many => format!(
-            "{} agents need you: {}",
-            many.len(),
-            many.iter()
-                .map(|note| note.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        [one] if !one.space.is_empty() => format!("{} {} in {}", name(one), one.what, one.space),
+        many => many
+            .iter()
+            .map(|note| format!("{} {}", name(note), note.what))
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
-/// What the hint row says when nothing here can show a note.
-pub fn nowhere_hint(env: &Env) -> &'static str {
-    if env.tmux {
-        "desktop notifications: enable tmux allow-passthrough, or set notify.desktop = false"
-    } else {
-        "desktop notifications: nothing here can show one, set notify.desktop = false"
-    }
+/// What the hint row says, once, when a note had nowhere to go: why, and the exact lines
+/// that turn the notes off in the file at `config`.
+pub fn nowhere_hint(why: Why, config: &Path) -> String {
+    let reason = match why {
+        Why::Ssh => "desktop notes cannot reach you over ssh",
+        Why::Tmux => {
+            "tmux drops desktop notes (tmux set -g allow-passthrough on lets them through)"
+        }
+        Why::NoProgram => "nothing here can show a desktop note",
+    };
+    format!(
+        "{reason}; to stop trying, put [notify] then desktop = false in {}",
+        config.display()
+    )
 }
 
 /// A note, safe to put inside an escape sequence or hand to another program.
@@ -242,19 +320,29 @@ pub fn escape(kind: Escape, tmux: bool, body: &str) -> Vec<u8> {
     wrapped
 }
 
-/// The argv that shows `body` through a system program. `body` must have come through
-/// [`clean`]. It is always its own argument: `osascript` runs a fixed script that reads it
-/// from `argv`, so nothing in a tab name is ever read as AppleScript.
-pub fn argv(program: Program, body: &str) -> (&'static str, Vec<String>) {
-    match program {
+/// A program to start: its name on `PATH`, its arguments, and what to write to its input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    pub stdin: Option<String>,
+}
+
+/// How `body` reaches a system program. `body` must have come through [`clean`], and it is
+/// never where a program looks for an option or for code, whatever it starts with:
+///
+/// - `terminal-notifier` gets it on its input. Its own parser reads a `-message` value
+///   that starts with `-` as the next option, so a tab named `-x` lost its note; the input
+///   is read as the message with no parsing at all.
+/// - `osascript` runs a fixed script that reads it from `argv`, after a `--`: without it,
+///   a body starting with `-` is read as an option, and `-e` is an option that runs code.
+/// - `notify-send` gets it after a `--` for the same reason.
+pub fn call(program: Program, body: &str) -> Call {
+    let (program, args, stdin) = match program {
         Program::TerminalNotifier => (
             "terminal-notifier",
-            vec![
-                "-title".into(),
-                "qoro".into(),
-                "-message".into(),
-                body.into(),
-            ],
+            vec!["-title".into(), "qoro".into()],
+            Some(body.to_string()),
         ),
         Program::Osascript => (
             "osascript",
@@ -265,25 +353,41 @@ pub fn argv(program: Program, body: &str) -> (&'static str, Vec<String>) {
                 "display notification (item 1 of argv) with title (item 2 of argv)".into(),
                 "-e".into(),
                 "end run".into(),
+                "--".into(),
                 body.into(),
                 "qoro".into(),
             ],
+            None,
         ),
-        Program::NotifySend => ("notify-send", vec!["--".into(), "qoro".into(), body.into()]),
+        Program::NotifySend => (
+            "notify-send",
+            vec!["--".into(), "qoro".into(), body.into()],
+            None,
+        ),
+    };
+    Call {
+        program,
+        args,
+        stdin,
     }
 }
 
 /// The sound for a note: louder for something that is waiting on a person. Off by default,
 /// so this is only reached when `sound = true`. `None` when this machine has no player or
 /// no sound file to give it.
-pub fn sound(urgent: bool, macos: bool) -> Option<(&'static str, Vec<String>)> {
+pub fn sound(urgent: bool, macos: bool) -> Option<Call> {
+    let play = |program: &'static str, file: &str| Call {
+        program,
+        args: vec![file.to_string()],
+        stdin: None,
+    };
     if macos {
         let file = if urgent {
             "/System/Library/Sounds/Funk.aiff"
         } else {
             "/System/Library/Sounds/Glass.aiff"
         };
-        return on_path("afplay").map(|_| ("afplay", vec![file.to_string()]));
+        return on_path("afplay").map(|_| play("afplay", file));
     }
     let file = if urgent {
         "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
@@ -296,20 +400,30 @@ pub fn sound(urgent: bool, macos: bool) -> Option<(&'static str, Vec<String>)> {
     ["paplay", "pw-play"]
         .into_iter()
         .find(|player| on_path(player).is_some())
-        .map(|player| (player, vec![file.to_string()]))
+        .map(|player| play(player, file))
 }
 
-/// Start a program by name from `PATH`, with nothing attached to it, and reap it on a
-/// thread of its own so it never becomes a zombie and never holds the loop up.
-pub fn spawn(program: &str, args: &[String]) {
-    let started = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+/// Start a program by name from `PATH`, with nothing attached to it but what it is given to
+/// read, and reap it on a thread of its own so it never becomes a zombie and never holds the
+/// loop up. The input is written on that thread too, then closed.
+pub fn spawn(call: &Call) {
+    let started = Command::new(call.program)
+        .args(&call.args)
+        .stdin(if call.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
     if let Ok(mut child) = started {
+        let input = call.stdin.clone();
         std::thread::spawn(move || {
+            if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
+                use std::io::Write as _;
+                let _ = pipe.write_all(text.as_bytes());
+            }
             let _ = child.wait();
         });
     }
@@ -425,8 +539,17 @@ mod tests {
             has: |_| false,
             ..closed
         };
-        assert_eq!(route(&nothing), Route::Nowhere);
-        assert!(nowhere_hint(&nothing).contains("allow-passthrough"));
+        assert_eq!(route(&nothing), Route::Nowhere(Why::Tmux));
+        let hint = nowhere_hint(Why::Tmux, Path::new("/c/config.toml"));
+        assert!(hint.contains("allow-passthrough"), "{hint}");
+        assert!(
+            hint.contains("[notify] then desktop = false in /c/config.toml"),
+            "{hint}"
+        );
+        assert_eq!(
+            describe(route(&nothing)),
+            "nowhere: tmux allow-passthrough is off"
+        );
     }
 
     #[test]
@@ -437,7 +560,8 @@ mod tests {
             has: |_| true,
             ..env()
         };
-        assert_eq!(route(&far), Route::Nowhere);
+        assert_eq!(route(&far), Route::Nowhere(Why::Ssh));
+        assert_eq!(describe(route(&far)), "nowhere: ssh");
         // A terminal escape is still fine: it travels back to the person's own terminal.
         let far_kitty = Env { kitty: true, ..far };
         assert!(matches!(route(&far_kitty), Route::Escape { .. }));
@@ -463,16 +587,38 @@ mod tests {
     #[test]
     fn an_applescript_injection_stays_one_argument() {
         let body = clean(r#"x" & do shell script "touch /tmp/pwned" & ""#);
-        let (program, args) = argv(Program::Osascript, &body);
-        assert_eq!(program, "osascript");
-        assert_eq!(args.iter().filter(|a| a.contains("pwned")).count(), 1);
-        assert_eq!(args[6], body);
-        assert!(args[..6].iter().all(|a| !a.contains("pwned")));
-        let (_, args) = argv(Program::NotifySend, "-u critical");
+        let osa = call(Program::Osascript, &body);
+        assert_eq!(osa.program, "osascript");
+        assert_eq!(osa.args.iter().filter(|a| a.contains("pwned")).count(), 1);
+        assert_eq!(osa.args[7], body);
+        assert!(osa.args[..7].iter().all(|a| !a.contains("pwned")));
+    }
+
+    /// A tab named like an option stays the note in every sink. Measured before this:
+    /// `osascript` read a leading `-e` as code to run, and `terminal-notifier` delivered an
+    /// empty note for `-x hi`.
+    #[test]
+    fn a_note_starting_with_a_dash_stays_data_for_every_sink() {
+        let body = clean("-e do shell script \"touch pwned\" -x");
+        assert!(body.starts_with('-'));
+        let osa = call(Program::Osascript, &body);
+        let at = osa
+            .args
+            .iter()
+            .position(|a| *a == body)
+            .expect("the note is there");
+        assert_eq!(osa.args[at - 1], "--", "{:?}", osa.args);
+        let send = call(Program::NotifySend, &body);
         assert_eq!(
-            args[0], "--",
-            "a note starting with a dash is not an option"
+            send.args,
+            vec!["--".to_string(), "qoro".into(), body.clone()]
         );
+        let tn = call(Program::TerminalNotifier, &body);
+        assert!(
+            tn.args.iter().all(|a| *a != body),
+            "no argument to misparse"
+        );
+        assert_eq!(tn.stdin.as_deref(), Some(body.as_str()));
     }
 
     #[test]
@@ -486,32 +632,44 @@ mod tests {
     }
 
     #[test]
-    fn notes_due_together_are_said_as_one() {
-        let note = |label: &str| Note {
-            terminal: 1,
+    fn notes_due_together_are_said_as_one_saying_what_happened_to_each() {
+        let note = |terminal: u32, label: &str, what: &'static str| Note {
+            terminal,
             state: "done".into(),
             generation: 0,
             label: label.into(),
-            what: "finished",
+            what,
             space: "api".into(),
             urgent: false,
+            due: std::time::Instant::now(),
         };
-        assert_eq!(say(&[note("claude")]), "claude finished in api");
         assert_eq!(
-            say(&[note("claude"), note("codex"), note("aider")]),
-            "3 agents need you: claude, codex, aider"
+            say(&[note(1, "claude", "finished")]),
+            "claude finished in api"
+        );
+        assert_eq!(
+            say(&[note(1, "codex", "is blocked"), note(2, "aider", "finished")]),
+            "codex is blocked, aider finished"
+        );
+        assert_eq!(
+            say(&[
+                note(3, "claude", "is blocked"),
+                note(7, "claude", "finished")
+            ]),
+            "claude (3) is blocked, claude (7) finished",
+            "two tabs of one name are told apart"
         );
     }
 
     #[test]
     fn a_sound_is_the_calm_one_or_the_urgent_one() {
         // Whether a player is installed differs by machine; the files named do not.
-        if let Some((player, args)) = sound(false, true) {
-            assert_eq!(player, "afplay");
-            assert!(args[0].ends_with("Glass.aiff"));
+        if let Some(play) = sound(false, true) {
+            assert_eq!(play.program, "afplay");
+            assert!(play.args[0].ends_with("Glass.aiff"));
         }
-        if let Some((_, args)) = sound(true, true) {
-            assert!(args[0].ends_with("Funk.aiff"));
+        if let Some(play) = sound(true, true) {
+            assert!(play.args[0].ends_with("Funk.aiff"));
         }
     }
 }

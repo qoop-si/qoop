@@ -13,7 +13,7 @@
 /// The prefix a decoder starts with when nobody chose another: ctrl-a, as in screen.
 pub(crate) const PREFIX: u8 = 0x01;
 
-/// The prefix this interface was started with, for the words on the screen.
+/// The prefix in effect, for the words on the screen.
 ///
 /// Held apart from the decoder on purpose. The decoder is a value, one per client, and its
 /// tests build as many as they like; the text that names the key ("ctrl-a c starts a
@@ -21,7 +21,8 @@ pub(crate) const PREFIX: u8 = 0x01;
 /// byte through all of them to spell one word is a larger change than the word.
 static SHOWN_PREFIX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PREFIX);
 
-/// Say which prefix the screen should name. Set once, where the interface starts.
+/// Say which prefix the screen should name. Set where the interface starts and again
+/// whenever the settings box reads `config.toml`.
 pub fn show_prefix(byte: u8) {
     SHOWN_PREFIX.store(byte, std::sync::atomic::Ordering::Relaxed);
 }

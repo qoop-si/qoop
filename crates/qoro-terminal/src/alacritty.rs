@@ -122,7 +122,10 @@ impl AlacrittyEngine {
     ///
     /// Trailing plain cells are dropped for the same reason the text is trimmed: the rest
     /// of the line is the terminal's default, and saying so is not information.
-    fn row(&self, line: i32) -> (String, Vec<Span>) {
+    ///
+    /// Links come from `links`, which holds each distinct target once for the whole
+    /// snapshot and refuses any past its budget; `None` reads the text alone.
+    fn row(&self, line: i32, mut links: Option<&mut Links>) -> (String, Vec<Span>) {
         let grid = self.term.grid();
         let mut text = String::with_capacity(grid.columns());
         let mut spans: Vec<Span> = Vec::new();
@@ -137,7 +140,10 @@ impl AlacrittyEngine {
                 Some(span) if last.as_ref() == Some(&here) => span.len += 1,
                 _ => {
                     let mut style = here.0.clone();
-                    style.link = here.1.as_ref().map(|link| Arc::from(link.uri()));
+                    style.link = match (links.as_deref_mut(), here.1.as_ref()) {
+                        (Some(links), Some(link)) => links.intern(link.uri()),
+                        _ => None,
+                    };
                     spans.push(Span {
                         at: col,
                         len: 1,
@@ -205,7 +211,7 @@ impl AlacrittyEngine {
             // History rows sit at negative line numbers, oldest most negative.
             // History keeps the text alone: what goes to disk as scrollback is rows of
             // text, and colour there would be a second format nobody reads back.
-            self.scrolled_off.push(self.row(-(i as i32) - 1).0);
+            self.scrolled_off.push(self.row(-(i as i32) - 1, None).0);
         }
         if history >= SCROLLBACK_ROWS {
             // The ring was full when we looked, so rows may have been evicted before we
@@ -221,6 +227,46 @@ impl AlacrittyEngine {
     /// evicted rows this adapter could not observe. Reported, never silently zero.
     pub fn evicted_unobserved(&self) -> u64 {
         self.evicted_unobserved
+    }
+}
+
+/// The most distinct link targets one snapshot carries, and the most bytes of them.
+///
+/// A snapshot crosses the socket on every render and has to fit the reassembly bound, and a
+/// program chooses its links: a screen of cells each linked to its own four kilobyte
+/// address was measured over eight megabytes, which no client could take, so the session
+/// could not be attached to at all. A real screen holds a handful of links. Past either
+/// bound a link is dropped and its text shows unlinked.
+pub const MAX_LINKS: usize = 64;
+pub const MAX_LINK_BYTES: usize = 16 * 1024;
+/// The longest target kept, the same line a client draws at: anything longer would only
+/// be dropped on the far side after crossing the socket.
+pub const MAX_LINK_LEN: usize = 2048;
+
+/// Each distinct link target in a snapshot, once, within the budget above.
+#[derive(Default)]
+struct Links {
+    seen: Vec<Arc<str>>,
+    bytes: usize,
+}
+
+impl Links {
+    /// The shared target for `uri`, or `None` when it is not one a client would write
+    /// (not visible ASCII, or too long) or the snapshot has spent its budget.
+    fn intern(&mut self, uri: &str) -> Option<Arc<str>> {
+        if let Some(known) = self.seen.iter().find(|known| ***known == *uri) {
+            return Some(known.clone());
+        }
+        let writable = !uri.is_empty()
+            && uri.len() <= MAX_LINK_LEN
+            && uri.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if !writable || self.seen.len() >= MAX_LINKS || self.bytes + uri.len() > MAX_LINK_BYTES {
+            return None;
+        }
+        let shared: Arc<str> = Arc::from(uri);
+        self.bytes += uri.len();
+        self.seen.push(shared.clone());
+        Some(shared)
     }
 }
 
@@ -404,8 +450,9 @@ impl TerminalEngine for AlacrittyEngine {
         // twice doubled the cost of a snapshot, and a snapshot is what a streaming terminal
         // produces on every read.
         let (mut lines, mut styles) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+        let mut links = Links::default();
         for line in 0..rows {
-            let (text, spans) = self.row(line as i32);
+            let (text, spans) = self.row(line as i32, Some(&mut links));
             lines.push(text);
             styles.push(spans);
         }
@@ -421,7 +468,7 @@ impl TerminalEngine for AlacrittyEngine {
 
     fn visible_text(&self) -> Vec<String> {
         let rows = self.term.grid().screen_lines();
-        (0..rows).map(|l| self.row(l as i32).0).collect()
+        (0..rows).map(|l| self.row(l as i32, None).0).collect()
     }
 
     fn title(&self) -> &str {
@@ -940,6 +987,43 @@ mod tests {
         assert!(
             replies(&mut e, b"\x1b]4;1;?\x07").is_empty(),
             "palette questions stay as they were"
+        );
+    }
+
+    /// A program that links every cell to its own long address gets a snapshot that still
+    /// crosses the socket: each distinct target is held once, within the budget, and the
+    /// rest paint unlinked. Measured before this, 1920 cells of a 4 KB address each made a
+    /// snapshot of more than eight megabytes.
+    #[test]
+    fn links_past_the_budget_are_dropped_and_each_target_is_held_once() {
+        let mut e = AlacrittyEngine::new(80, 24);
+        let mut out = Vec::new();
+        for i in 0..1920u32 {
+            let uri = format!("https://e.example/{}{}", "a".repeat(200), i % 300);
+            out.extend_from_slice(format!("\x1b]8;;{uri}\x1b\\x").as_bytes());
+        }
+        e.feed(&out);
+        let s = e.snapshot();
+        let mut distinct: Vec<&str> = s
+            .styles
+            .iter()
+            .flatten()
+            .filter_map(|span| span.style.link.as_deref())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() <= MAX_LINKS, "{} targets", distinct.len());
+        let bytes: usize = distinct.iter().map(|uri| uri.len()).sum();
+        assert!(bytes <= MAX_LINK_BYTES, "{bytes} bytes of targets");
+        assert!(!distinct.is_empty(), "the budget left no link at all");
+        let mut long = engine();
+        let uri = format!("https://e.example/{}", "a".repeat(MAX_LINK_LEN));
+        long.feed(format!("\x1b]8;;{uri}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+        assert!(
+            long.snapshot().styles[0]
+                .iter()
+                .all(|span| span.style.link.is_none()),
+            "a target no client would write is not carried"
         );
     }
 }

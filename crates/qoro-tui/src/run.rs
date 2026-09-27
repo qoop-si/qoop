@@ -370,8 +370,9 @@ struct State {
     notes_due: Option<std::time::Instant>,
     /// Where a desktop note goes, decided once at start.
     route: crate::notify::Route,
-    /// What to say, once, the first time a note had nowhere to go.
-    nowhere: Option<&'static str>,
+    /// Whether the hint row still owes the person why notes have nowhere to go: said once,
+    /// the first time one had.
+    nowhere: bool,
     /// What `config.toml` said when it was last read: at start, and whenever the settings
     /// box opens. Every overlay that hands the prefix back to the decoder reads it here.
     config: crate::config::Config,
@@ -1679,28 +1680,20 @@ where
         host_refused: false,
         notes: Vec::new(),
         notes_due: None,
-        route: crate::notify::Route::Nowhere,
-        nowhere: None,
+        route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+        nowhere: false,
         config: crate::config::Config::default(),
     };
+    // Where a desktop note would go, decided once: the environment does not change under a
+    // running interface, and inside tmux it costs asking tmux.
+    state.route = crate::notify::route(&crate::notify::Env::read());
+    state.nowhere = matches!(state.route, crate::notify::Route::Nowhere(_));
     // The file is read before the first frame, so the first frame already names the
     // prefix the person chose. What in it could not be used is said once, on the hint row,
     // beside whatever the caller wanted said.
     let read = crate::config::read();
     use_config(&mut state, &read);
-    // Where a desktop note would go, decided once: the environment does not change under a
-    // running interface, and inside tmux it costs asking tmux.
-    let env = crate::notify::Env::read();
-    state.route = crate::notify::route(&env);
-    if state.route == crate::notify::Route::Nowhere {
-        state.nowhere = Some(crate::notify::nowhere_hint(&env));
-    }
-    if let Some(first) = read.problems.first() {
-        let more = match read.problems.len() {
-            1 => String::new(),
-            n => format!(" (and {} more, see settings)", n - 1),
-        };
-        let said = format!("{first}{more}");
+    if let Some(said) = read.hint() {
         state.hint = Some(match state.hint.take() {
             Some(notice) => format!("{notice}; {said}"),
             None => said,
@@ -2000,6 +1993,7 @@ where
                     // Reports first, before any overlay or the key decoder sees the bytes:
                     // each of those reads an escape as a cancel.
                     let (bytes, said) = reports.strip(&raw);
+                    let reported = !said.is_empty();
                     let mut window_focus = None;
                     let mut ask_again = false;
                     for report in said {
@@ -2009,7 +2003,9 @@ where
                         ask_again |= note_report(&mut state, report);
                         dirty = true;
                     }
-                    retheme(&state);
+                    if reported {
+                        retheme(&state);
+                    }
                     if ask_again && may_ask_terminal() {
                         out.write_all(ASK_COLORS)?;
                         out.flush()?;
@@ -3309,8 +3305,12 @@ where
 fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
-    crate::config::show(read);
     retheme(state);
+    crate::config::show(crate::config::describe(
+        read,
+        crate::theme::light(),
+        &crate::notify::describe(state.route),
+    ));
 }
 
 /// Keep what the terminal said about itself.
@@ -3351,9 +3351,8 @@ fn may_ask_terminal() -> bool {
 }
 
 /// Pick the palette from what is known, most certain first: the file, then the background
-/// the terminal answered with, then the scheme it said, then `COLORFGBG`, then dark. True
-/// when that changed the palette, and every row has to be painted again.
-fn retheme(state: &State) -> bool {
+/// the terminal answered with, then the scheme it said, then `COLORFGBG`, then dark.
+fn retheme(state: &State) {
     use crate::config::Theme;
     let light = match state.config.theme {
         Theme::Dark => false,
@@ -3368,7 +3367,7 @@ fn retheme(state: &State) -> bool {
             })
             .unwrap_or(false),
     };
-    crate::theme::set_light(light)
+    crate::theme::set_light(light);
 }
 
 /// The colours to tell the daemon, when both are known, they are not what it was last
@@ -3393,8 +3392,8 @@ fn host_colors_request(state: &mut State, request: &mut u64) -> Option<ControlRe
 /// looking at it: another tab has the keyboard, or the whole window lost the focus.
 ///
 /// `qoro_attention` decides whether the change is worth it and how urgent it is, the same
-/// rule a push to a phone follows. The note waits out `notify::DELAY` with any others, and
-/// is checked again then (see [`fire_notes`]). True when it will reach the desktop, so the
+/// rule a push to a phone follows. Each note waits out its own `notify::DELAY`, and is
+/// checked again then (see [`fire_notes`]). True when it will reach the desktop, so the
 /// bell for the same change stays quiet; with nowhere to send it, the bell rings as it
 /// always did and the hint row says why, once.
 fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
@@ -3412,15 +3411,12 @@ fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
         .iter()
         .any(|n| n.terminal == row.terminal && n.generation == generation && n.state == row.state);
     if !held {
+        let due = std::time::Instant::now() + crate::notify::DELAY;
         state.notes.push(crate::notify::Note {
             terminal: row.terminal,
             state: row.state.clone(),
             generation,
-            label: row
-                .name
-                .clone()
-                .or_else(|| row.program.clone())
-                .unwrap_or_else(|| format!("terminal {}", row.terminal)),
+            label: sidebar::label(row),
             what: match push.reason {
                 qoro_attention::Reason::AgentBlocked => "is blocked",
                 qoro_attention::Reason::AgentFailed => "failed",
@@ -3433,27 +3429,32 @@ fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
             urgent: push.priority == qoro_attention::Priority::Urgent,
+            due,
         });
-        state
-            .notes_due
-            .get_or_insert_with(|| std::time::Instant::now() + crate::notify::DELAY);
+        state.notes_due = Some(state.notes_due.map_or(due, |at| at.min(due)));
     }
-    let reaches = state.config.desktop && state.route != crate::notify::Route::Nowhere;
-    if state.config.desktop
-        && !reaches
-        && let Some(hint) = state.nowhere.take()
-    {
-        state.hint = Some(hint.to_string());
+    match state.route {
+        crate::notify::Route::Nowhere(why) if state.config.desktop => {
+            if std::mem::take(&mut state.nowhere) {
+                state.hint = Some(crate::notify::nowhere_hint(why, &crate::config::path()));
+            }
+            false
+        }
+        _ => state.config.desktop,
     }
-    reaches
 }
 
-/// Say what came due, as one note: whatever is still true of it. A row that went back to
-/// work, or that the person has since come to look at, is dropped, so a blip says nothing.
+/// Say the notes that have waited their full second, as one note: whatever is still true
+/// of them. A row that went back to work, or that the person has since come to look at,
+/// is dropped, so a blip says nothing. Notes still waiting keep the timer armed.
 fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
-    state.notes_due = None;
-    let held = std::mem::take(&mut state.notes);
-    let due: Vec<crate::notify::Note> = held
+    let now = std::time::Instant::now();
+    let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.notes)
+        .into_iter()
+        .partition(|note| note.due <= now);
+    state.notes_due = waiting.iter().map(|note| note.due).min();
+    state.notes = waiting;
+    let due: Vec<crate::notify::Note> = ready
         .into_iter()
         .filter(|note| {
             let still = state.rows.iter().any(|r| {
@@ -3476,21 +3477,20 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
                 out.flush()?;
             }
             crate::notify::Route::System(program) => {
-                let (name, args) = crate::notify::argv(program, &body);
-                crate::notify::spawn(name, &args);
+                crate::notify::spawn(&crate::notify::call(program, &body));
             }
-            crate::notify::Route::Nowhere => {}
+            crate::notify::Route::Nowhere(_) => {}
         }
     }
     // Played here and not on the far side of an ssh session, where nobody is listening.
     if state.config.sound
         && std::env::var_os("SSH_CONNECTION").is_none()
-        && let Some((player, args)) = crate::notify::sound(
+        && let Some(play) = crate::notify::sound(
             due.iter().any(|note| note.urgent),
             cfg!(target_os = "macos"),
         )
     {
-        crate::notify::spawn(player, &args);
+        crate::notify::spawn(&play);
     }
     Ok(())
 }
@@ -4374,7 +4374,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     if !note(state, row, runtime) {
                         state.ring = true;
                     }
-                    state.message = Some(format!("terminal {} is {}", row.terminal, row.state));
+                    state.message = Some(format!("{} is {}", sidebar::label(row), row.state));
                 }
                 // A screen agent that worked and now sits idle while the
                 // keyboard is elsewhere finished without ever reporting done.
@@ -4395,7 +4395,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                         if !note(state, row, AgentRuntimeState::Done) {
                             state.ring = true;
                         }
-                        state.message = Some(format!("terminal {} finished", row.terminal));
+                        state.message = Some(format!("{} finished", sidebar::label(row)));
                     }
                 }
                 // The one under the keyboard, finishing while the person is in another
@@ -4958,8 +4958,8 @@ mod tests {
             host_refused: false,
             notes: Vec::new(),
             notes_due: None,
-            route: crate::notify::Route::Nowhere,
-            nowhere: None,
+            route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            nowhere: false,
             config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
             images: std::collections::BTreeMap::new(),
@@ -5399,8 +5399,8 @@ mod tests {
             host_refused: false,
             notes: Vec::new(),
             notes_due: None,
-            route: crate::notify::Route::Nowhere,
-            nowhere: None,
+            route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            nowhere: false,
             config: crate::config::Config::default(),
         }
     }
@@ -5412,6 +5412,7 @@ mod tests {
             cursor: (0, 0),
             lines: Vec::new(),
             styles: Vec::new(),
+            links: Vec::new(),
             modes: Default::default(),
             behind,
         }
@@ -5480,8 +5481,8 @@ mod tests {
             host_refused: false,
             notes: Vec::new(),
             notes_due: None,
-            route: crate::notify::Route::Nowhere,
-            nowhere: None,
+            route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            nowhere: false,
             config: crate::config::Config::default(),
         };
         let area = pane_area(&state);
@@ -5985,6 +5986,50 @@ mod tests {
         );
     }
 
+    /// Every held note, as if its second were up.
+    fn age_notes(state: &mut State) {
+        let past = std::time::Instant::now() - crate::notify::DELAY;
+        for note in &mut state.notes {
+            note.due = past;
+        }
+        state.notes_due = Some(past);
+    }
+
+    /// A note that arrived after another waits its own full second: it is not said with
+    /// the first one early, and the timer stays armed for it.
+    #[test]
+    fn a_later_note_waits_its_own_second() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        let working = |t| agent(t, 1, "claude", "working");
+        index(&mut state, vec![working(1), working(2), working(3)]);
+        index(
+            &mut state,
+            vec![working(1), agent(2, 1, "codex", "blocked"), working(3)],
+        );
+        age_notes(&mut state);
+        index(
+            &mut state,
+            vec![
+                working(1),
+                agent(2, 1, "codex", "blocked"),
+                agent(3, 1, "aider", "failed"),
+            ],
+        );
+        let mut out = Vec::new();
+        fire_notes(&mut state, &mut out).expect("fire");
+        assert_eq!(out, b"\x1b]9;codex is blocked\x1b\\".to_vec());
+        assert_eq!(state.notes.len(), 1, "the later one is still held");
+        assert!(
+            state.notes_due.is_some(),
+            "and the timer stays armed for it"
+        );
+    }
+
     /// Changes while the person is not looking are held, said together once due, and
     /// the bell for them stays quiet when the desktop will say it instead.
     #[test]
@@ -6013,9 +6058,13 @@ mod tests {
         assert!(!state.ring, "the desktop says it, so the bell does not");
         let mut out = Vec::new();
         fire_notes(&mut state, &mut out).expect("fire");
+        assert!(out.is_empty(), "said before its second was up: {out:?}");
+        assert_eq!(state.notes.len(), 2, "still held");
+        age_notes(&mut state);
+        fire_notes(&mut state, &mut out).expect("fire");
         assert_eq!(
             out,
-            b"\x1b]9;2 agents need you: codex, aider\x1b\\".to_vec()
+            b"\x1b]9;codex is blocked, aider finished\x1b\\".to_vec()
         );
         assert!(
             state.notes.is_empty() && state.notes_due.is_none(),
@@ -6047,6 +6096,7 @@ mod tests {
             vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "working")],
         );
         let mut out = Vec::new();
+        age_notes(&mut state);
         fire_notes(&mut state, &mut out).expect("fire");
         assert!(out.is_empty(), "a blip was said: {out:?}");
         // The window lost the focus: the focused one finishing is news after all.
@@ -6068,7 +6118,7 @@ mod tests {
     fn with_nowhere_to_send_it_the_bell_rings_and_the_hint_says_why_once() {
         let mut state = bare_state();
         state.focused = 1;
-        state.nowhere = Some("desktop notifications: nothing here can show one");
+        state.nowhere = true;
         index(
             &mut state,
             vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "working")],
@@ -6082,9 +6132,9 @@ mod tests {
             state
                 .hint
                 .as_deref()
-                .is_some_and(|h| h.starts_with("desktop"))
+                .is_some_and(|h| h.contains("[notify] then desktop = false"))
         );
-        assert_eq!(state.nowhere, None, "said once");
+        assert!(!state.nowhere, "said once");
         state.config.desktop = false;
         state.ring = false;
         state.notes.clear();

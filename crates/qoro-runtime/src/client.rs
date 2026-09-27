@@ -644,6 +644,7 @@ mod tests {
             cursor: (1, 3),
             lines: lines.iter().map(|s| s.to_string()).collect(),
             styles: Vec::new(),
+            links: Vec::new(),
         }
     }
 
