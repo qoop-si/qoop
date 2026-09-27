@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 mod avatar;
 mod hooks;
 mod mobile;
+mod notch;
 mod remote;
 mod skills;
 mod supervise;
@@ -122,6 +123,8 @@ fn run() -> std::io::Result<()> {
         Some("history") => run_history(&args),
         Some("context") => run_context(&args),
         Some("agents") => run_agents(&args),
+        Some("focus") => run_focus(&args),
+        Some("notch") => notch::run(&args),
         Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
         Some("new") => supervise::run_new(&args),
         Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),
@@ -189,8 +192,11 @@ fn run() -> std::io::Result<()> {
                   \x20                 who it is, whether it is writable, its live screen\n\
                   \x20                 and its recent transcript window\n\
                   \x20 qoro agents [--json]  list every terminal and what it is doing\n\
+                  \x20 qoro agents --watch [--json]  the list again each time it changes\n\
                   \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
+                  \x20 qoro focus <terminal> [--json]  show that terminal in every\n\
+                  \x20                 attached interface\n\
                  \x20 qoro reload-manifests  re-read agent-detection overrides\n\
                   \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
                   \x20                 doing and which conversation it is having\n\
@@ -198,7 +204,9 @@ fn run() -> std::io::Result<()> {
                   \x20                 before it writes\n\
                   \x20 qoro ls         list the sessions and say which are running\n\
                   \x20 qoro avatar pick  choose a terminal pet from a batch\n\
-                  \x20 qoro avatar show  print the picked pet\n\
+                  \x20 qoro avatar show [--json]  print the picked pet\n\
+                  \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
+                  \x20                 the notch, started at login\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
                  \x20 qoro pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
                  \x20 qoro devices ls  the phones paired with this machine\n\
@@ -1369,6 +1377,39 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
     })
 }
 
+/// `qoro focus <terminal> [--json]`: every attached interface shows that terminal.
+///
+/// `--json` answers `{"clients":[pid,...]}`, the interface processes that were asked,
+/// which is what a notch or a launcher needs to raise the window one of them runs in.
+fn run_focus(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro focus <terminal> [--json]";
+    let terminal: u32 = args
+        .get(2)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| usage(help))?;
+    let mut json = false;
+    for arg in args.iter().skip(3) {
+        if arg == "--json" {
+            json = true;
+        } else {
+            return Err(usage(format!("unknown flag {arg}; {help}")));
+        }
+    }
+    let clients = supervise::run_focus(terminal)?;
+    if json {
+        println!("{}", serde_json::json!({ "clients": clients }));
+    } else if clients.is_empty() {
+        println!("no interface is attached, so nothing was shown");
+    } else {
+        println!(
+            "terminal {terminal} shown in {} interface{}",
+            clients.len(),
+            if clients.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a prompt target against the live index: a terminal number first,
 /// then an exact terminal name, then an exact program name.
 fn resolve_target<'a>(
@@ -2054,12 +2095,13 @@ fn render_context_text(
 fn run_agents(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
-    let help = "usage: qoro agents [--json]\n       qoro agents explain <target> [--json]";
+    let help = "usage: qoro agents [--json]\n       qoro agents --watch [--json]\n       qoro agents explain <target> [--json]";
     enum Mode<'a> {
         List { json: bool },
         Explain { target: &'a str, json: bool },
     }
     let mut mode = Mode::List { json: false };
+    let mut watch = false;
     let mut rest = args.iter().skip(2);
     if rest.clone().next().is_some_and(|a| a == "explain") {
         rest.next();
@@ -2079,10 +2121,24 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
         for arg in rest {
             if arg == "--json" {
                 mode = Mode::List { json: true };
+            } else if arg == "--watch" {
+                watch = true;
             } else {
                 return Err(usage(format!("unknown flag {arg}; {help}")));
             }
         }
+    }
+    if watch {
+        let json = matches!(mode, Mode::List { json: true });
+        return supervise::run_watch(|agents| {
+            if json {
+                serde_json::to_string(agents).map_err(std::io::Error::other)
+            } else {
+                // A blank line between listings, so a person reading along sees where
+                // one ends.
+                Ok(agents.iter().map(agent_line).collect::<Vec<_>>().join("\n") + "\n")
+            }
+        });
     }
 
     let rt = tokio::runtime::Runtime::new()?;

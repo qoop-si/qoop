@@ -4,9 +4,11 @@ Owned by `qoro-cli` and grown with it from milestone 1 onward, so that the enume
 exists before a gate needs it rather than being invented when one does.
 
 Gate G9.1 reads this file: with the control-plane host blackholed, every subcommand here
-produces the same result as when it is reachable. Five rows are listed but not run by it:
-`qoro`, `qoro attach`, `qoro daemon` and `qoro bridge` do not return, and `qoro relay` starts a daemon and then prints
-whatever that daemon says to a client rather than a result of its own. They are still
+produces the same result as when it is reachable. Some rows are listed but not run by it:
+`qoro`, `qoro attach`, `qoro daemon` and `qoro bridge` do not return, `qoro relay` starts a daemon and then prints
+whatever that daemon says to a client rather than a result of its own, and the `qoro notch`
+rows start a window or change what the person's login starts, which a comparison run twice
+must not do to the machine it runs on. They are still
 required to be here, and the gate asserts that this table and `qoro --help` name the same
 set, which is what stopped `relay` from staying undocumented after milestone 6 added it.
 
@@ -44,7 +46,9 @@ a claim nobody has to keep.
 | `qoro history <target> [--last N] [--role user\|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user\|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
+| `qoro agents --watch [--json]` | the same list now and again each time it reads differently, woken by the daemon's own news on one connection, never by a timer; ends when the daemon does | no |
 | `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest, and what its screen discarded when anything was | no |
+| `qoro focus <terminal> [--json]` | show that terminal in every attached interface, as a click on its row would; `--json` answers `{"clients":[pid,...]}`, the interface processes asked, so a launcher can raise the window one runs in | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |
@@ -54,7 +58,11 @@ a claim nobody has to keep.
 | `qoro skills uninstall [agent...]` | take out exactly what was installed | no |
 | `qoro avatar` | show the picked avatar, or pick one when on a terminal | no |
 | `qoro avatar pick` | choose a terminal pet from a batch: a number keeps one, `r` deals again | no |
-| `qoro avatar show` | print the picked avatar | no |
+| `qoro avatar show [--json]` | print the picked avatar; `--json` prints its pixels, each a `#rrggbb` or `null`, rows top first, or `null` with none picked | no |
+| `qoro notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoro notch run` at login: your agents in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
+| `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
+| `qoro notch status` | whether the notch is installed and running | no |
+| `qoro notch run` | write this build's notch app out when missing and run it against this binary | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
 | `qoro pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |

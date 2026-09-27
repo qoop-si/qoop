@@ -135,6 +135,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x22".into(),
             tree: qoro_runtime::control::Pane::Leaf { terminal },
         },
+        // Shows a terminal in the attached interfaces: which one is looked at, never
+        // anything typed into it.
+        ControlRequest::Focus {
+            id: "x23".into(),
+            terminal,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -143,6 +149,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::CloseTerminal { .. }
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
+            | ControlRequest::Focus { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }

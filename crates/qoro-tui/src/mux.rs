@@ -888,6 +888,15 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     .map_err(io::Error::other)?;
                 self.write(Channel::Event, 0, body).await
             }
+            // Renumbered like a change, or a remote's terminal 3 would show the local one.
+            Incoming::Event(EventMessage::Focus { terminal }) => {
+                let Some(terminal) = terminal_out(link, terminal) else {
+                    return Ok(());
+                };
+                let body = serde_json::to_vec(&EventMessage::Focus { terminal })
+                    .map_err(io::Error::other)?;
+                self.write(Channel::Event, 0, body).await
+            }
             Incoming::Event(event) => {
                 let body = serde_json::to_vec(&event).map_err(io::Error::other)?;
                 self.write(Channel::Event, 0, body).await

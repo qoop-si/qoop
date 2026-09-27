@@ -132,6 +132,12 @@ pub enum ControlRequest {
     ListAgents {
         id: String,
     },
+    /// Show this terminal in every attached interface, the way a click on its row does.
+    /// What a notch or another launcher sends so that picking an agent there lands on it.
+    Focus {
+        id: String,
+        terminal: TerminalStream,
+    },
     /// Receive renders for these terminals. Subscribing to a terminal twice is not an
     /// error and does not double the traffic: the set is a set.
     Subscribe {
@@ -297,6 +303,7 @@ impl ControlRequest {
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
+            | Self::Focus { id, .. }
             | Self::ListWorkspaces { id }
             | Self::CreateWorkspace { id, .. }
             | Self::CloseWorkspace { id, .. }
@@ -331,6 +338,12 @@ pub enum ControlResponse {
     Terminals {
         id: String,
         terminals: Vec<TerminalStream>,
+    },
+    /// The interfaces told to show a terminal, by the pid of each one's process, so the
+    /// sender can raise the window the interface runs in. Empty when nobody is attached.
+    Focused {
+        id: String,
+        clients: Vec<u32>,
     },
     Agents {
         id: String,
@@ -782,6 +795,7 @@ impl ControlResponse {
             | Self::TerminalClosed { id, .. }
             | Self::Terminals { id, .. }
             | Self::Agents { id, .. }
+            | Self::Focused { id, .. }
             | Self::Workspaces { id, .. }
             | Self::WorkspaceCreated { id, .. }
             | Self::WorkspaceClosed { id, .. }
@@ -1339,6 +1353,10 @@ pub enum EventMessage {
     /// of truth that can arrive out of order with the first. This says where to look, and
     /// `ListAgents` says what is there.
     AgentChanged { terminal: TerminalStream },
+    /// Show this terminal, asked for by `qoro focus`. An interface switches to it as if
+    /// its row were clicked; every other client ignores it, and so does an older
+    /// interface, the event lane being lenient.
+    Focus { terminal: TerminalStream },
     /// Some news for this connection was dropped before it arrived. Re-read the whole
     /// index rather than waiting for the next change: the missed change may be the last
     /// one for a while, and waiting would leave the client behind silently.

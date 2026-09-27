@@ -193,6 +193,11 @@ echo "installed $($DEST --version) to $DEST"
 # The rest is the CLI's own verbs, never a copy of their logic.
 "$DEST" hooks install
 "$DEST" skills install
+# On a Mac, the agents in the notch, started at login. Never the reason an install
+# fails: a Mac older than 14 says so, and everything above stays installed.
+if [ "$(uname -s)" = "Darwin" ]; then
+    "$DEST" notch install || echo "the notch was not turned on; the rest of qoro is installed"
+fi
 
 # The one question the install asks, and only when there is a person to answer
 # it: pick the terminal pet. Piped runs and CI stay non-interactive by

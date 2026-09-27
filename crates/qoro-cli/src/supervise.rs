@@ -4,7 +4,8 @@
 //!
 //! Every verb here is a client of something the daemon already serves: the
 //! event lane, `ListAgents`, `CreateTerminal`, `CloseTerminal` and the
-//! terminal input lane. None of them adds a control method.
+//! terminal input lane. The one control method added for them is `Focus`, since
+//! which terminal an interface shows was never the daemon's to know before.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -250,6 +251,8 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
     events.iter().any(|event| match event {
         EventMessage::AgentChanged { terminal } => watched.contains(terminal),
         EventMessage::Resync => true,
+        // Which terminal an interface shows says nothing about any agent.
+        EventMessage::Focus { .. } => false,
     })
 }
 
@@ -263,6 +266,91 @@ fn stashed_touches(stashed: Vec<client::Incoming>, watched: &[u32]) -> bool {
         })
         .collect();
     touches(&events, watched)
+}
+
+/// `qoro agents --watch`: the index now, then again each time it reads differently.
+///
+/// Woken by the daemon's own news on this connection, never by a timer: a watcher over
+/// a quiet session costs nothing. What it prints is the whole index each time, since a
+/// reader that missed a line would otherwise hold a row that is no longer true. Ends when
+/// the daemon does, so a caller that wants to outlive a session starts it again.
+pub(crate) fn run_watch(
+    line: impl Fn(&[AgentRow]) -> std::io::Result<String>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut link = Link::open("qoro-watch").await?;
+        let mut last = String::new();
+        let mut unsubscribed = false;
+        loop {
+            let (agents, mut stashed) = link.agents().await?;
+            // The daemon subscribes every new connection to its lowest terminal. A watcher
+            // draws no screen, so the renders go back before they start to cost anything.
+            // What arrived meanwhile is kept: a change during this round trip is news too.
+            if !unsubscribed {
+                unsubscribed = true;
+                let (_, meanwhile) = link
+                    .ask(&ControlRequest::Unsubscribe {
+                        id: super::request_id("watch"),
+                        terminals: agents.iter().map(|r| r.terminal).collect(),
+                    })
+                    .await?;
+                stashed.extend(meanwhile);
+            }
+            let text = line(&agents)?;
+            if text != last {
+                let mut out = std::io::stdout().lock();
+                // A reader that went away ends the watch, rather than a panic on write.
+                if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
+                    return Ok(());
+                }
+                last = text;
+            }
+            // A change that landed while asking is news already had: ask again at once.
+            if stashed.iter().any(|i| {
+                matches!(
+                    i,
+                    client::Incoming::Event(
+                        EventMessage::AgentChanged { .. } | EventMessage::Resync
+                    )
+                )
+            }) {
+                continue;
+            }
+            loop {
+                let events = link.next_events(None).await?.unwrap_or_default();
+                if events
+                    .iter()
+                    .any(|e| !matches!(e, EventMessage::Focus { .. }))
+                {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// `qoro focus <terminal>`: every attached interface shows that terminal, and the pids of
+/// the ones that were asked are handed back for whoever wants to raise their windows.
+pub(crate) fn run_focus(terminal: u32) -> std::io::Result<Vec<u32>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut link = Link::open("qoro-focus").await?;
+        match link
+            .ask(&ControlRequest::Focus {
+                id: super::request_id("focus"),
+                terminal,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Focused { clients, .. } => Ok(clients),
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to focus")),
+        }
+    })
 }
 
 /// Why a write must not go to this terminal under this generation, if not.

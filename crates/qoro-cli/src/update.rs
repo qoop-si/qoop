@@ -114,7 +114,10 @@ fn live_sessions() -> Vec<String> {
 fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| std::io::Error::other(format!("cannot find this binary: {e}")))?;
-    install_to(latest, current, &exe)
+    install_to(latest, current, &exe)?;
+    // A running notch is the old build's; launchd starts the new one in its place.
+    crate::notch::restart_if_installed();
+    Ok(())
 }
 
 /// The same swap onto an explicit path, so tests drive the whole chain without

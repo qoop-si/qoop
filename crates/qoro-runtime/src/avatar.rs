@@ -116,6 +116,21 @@ pub fn bg(ink: u8) -> String {
     format!("\x1b[48;5;{ink}m")
 }
 
+/// The colour xterm paints an ink in, as `#rrggbb`, for whatever draws the pet
+/// outside a terminal. Every ink here is at or above 16, the part of the palette
+/// with one agreed formula: a 6x6x6 cube, then a 24 step grey ramp.
+pub fn ink_hex(ink: u8) -> String {
+    let (r, g, b) = if ink >= 232 {
+        let v = 8 + (ink - 232) * 10;
+        (v, v, v)
+    } else {
+        let step = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+        let n = ink.saturating_sub(16);
+        (step(n / 36), step(n / 6 % 6), step(n % 6))
+    };
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
 /// The pet as five rows of sixteen half-block cells, top row first. Fixed
 /// size so the sidebar can reserve exactly this much room every frame.
 pub fn art_cells(pet: &Avatar) -> [[Cell; ART_COLS]; ART_ROWS] {
@@ -212,6 +227,18 @@ pub fn save(avatar: &Avatar) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inks come out the colours xterm paints them: cube corners, a mid step, the
+    /// grey ramp at both ends.
+    #[test]
+    fn inks_are_the_colours_xterm_paints() {
+        assert_eq!(ink_hex(16), "#000000");
+        assert_eq!(ink_hex(33), "#0087ff");
+        assert_eq!(ink_hex(35), "#00af5f");
+        assert_eq!(ink_hex(231), "#ffffff");
+        assert_eq!(ink_hex(232), "#080808");
+        assert_eq!(ink_hex(255), "#eeeeee");
+    }
 
     fn sample() -> Avatar {
         Avatar {

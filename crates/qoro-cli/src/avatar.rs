@@ -36,11 +36,12 @@ const CURATED: [(&str, u8, &str); BATCH] = [
 pub fn run(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("pick") => pick(),
+        Some("show") if args.get(3).map(String::as_str) == Some("--json") => show_json(),
         Some("show") => show(),
         None if !std::io::stdin().is_terminal() => show(),
         None => pick(),
         Some(other) => Err(std::io::Error::other(format!(
-            "unknown command {other}; usage: qoro avatar [pick|show]"
+            "unknown command {other}; usage: qoro avatar [pick|show [--json]]"
         ))),
     }
 }
@@ -58,6 +59,24 @@ fn show() -> std::io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The picked avatar as pixels, for whatever draws it outside a terminal: `pixels` is
+/// the whole grid, rows top first, each pixel a `#rrggbb` or `null`. With none picked
+/// yet it prints `null`, so a reader tells "no pet" from "could not ask".
+fn show_json() -> std::io::Result<()> {
+    let value = avatar::load().map(|pet| {
+        let pixels: Vec<Vec<Option<String>>> = (0..GRID_H)
+            .map(|y| {
+                (0..GRID_W)
+                    .map(|x| pixel(&pet, x, y).map(avatar::ink_hex))
+                    .collect()
+            })
+            .collect();
+        serde_json::json!({ "name": pet.name(), "pixels": pixels })
+    });
+    println!("{}", value.unwrap_or(serde_json::Value::Null));
+    Ok(())
 }
 
 /// The picker loop: batches until a number is kept or it is quit.

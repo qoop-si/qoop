@@ -434,6 +434,10 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
+    /// A terminal `qoro focus` named before this interface listed it: a launcher that
+    /// opens one and shows it at once gets there first. Shown once an index has it; a
+    /// few seconds on, a terminal that never came is forgotten rather than jumped to.
+    show_when_listed: Option<(u32, std::time::Instant)>,
     /// The workspaces this daemon holds, and which one is on screen.
     spaces: Vec<qoro_runtime::control::WorkspaceRow>,
     space: Option<i64>,
@@ -2860,6 +2864,7 @@ where
         message: Some(CONNECTING.to_string()),
         hint: notice,
         pending_focus: None,
+        show_when_listed: None,
         spaces: Vec::new(),
         space: None,
         was: std::collections::BTreeMap::new(),
@@ -4695,6 +4700,21 @@ where
                                 // client did, and re-reading the index converges it.
                                 refresh = true;
                             }
+                            // `qoro focus`, from a notch or a launcher: the same switch a
+                            // click on the row makes. A terminal this interface does not
+                            // list yet waits for the index that names it.
+                            Incoming::Event(EventMessage::Focus { terminal }) => {
+                                if !state.rows.iter().any(|r| r.terminal == terminal) {
+                                    state.show_when_listed =
+                                        Some((terminal, std::time::Instant::now()));
+                                    refresh = true;
+                                } else if let Some(bytes) =
+                                    focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                                {
+                                    wr.write_all(&bytes).await?;
+                                    dirty = true;
+                                }
+                            }
                             Incoming::Control(response) => {
                                 // Only the answers that change what terminals exist ask for
                                 // a new index. Asking after every answer includes asking
@@ -6445,6 +6465,15 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            if let Some((terminal, asked)) = state.show_when_listed.take()
+                && asked.elapsed() < std::time::Duration::from_secs(5)
+            {
+                if state.rows.iter().any(|r| r.terminal == terminal) {
+                    state.pending_focus = Some(terminal);
+                } else {
+                    state.show_when_listed = Some((terminal, asked));
+                }
+            }
             // A slept tab never renders, so the first render that clears
             // "connecting" never comes for it: drop the word and let the
             // notice row name the tomb and its way out.
@@ -6990,6 +7019,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            show_when_listed: None,
             spaces: vec![space(1, "app"), space(2, "webshop")],
             space: Some(2),
             was: std::collections::BTreeMap::new(),
@@ -7532,6 +7562,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            show_when_listed: None,
             spaces: Vec::new(),
             space: None,
             was: Default::default(),
@@ -7637,6 +7668,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            show_when_listed: None,
             spaces: vec![space(1, "app")],
             space: Some(1),
             was: Default::default(),
@@ -8752,6 +8784,62 @@ mod tests {
             "the keyboard comes back to its space: {:?}",
             state.pending_focus
         );
+    }
+
+    /// `qoro focus` for a terminal not listed yet: waited for, shown once an index names
+    /// it, and not jumped to when it arrives long after the ask.
+    #[test]
+    fn a_focus_ahead_of_the_index_lands_when_the_index_catches_up() {
+        let index = |agents| ControlResponse::Agents {
+            id: "index".to_string(),
+            splits: Vec::new(),
+            agents,
+        };
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.adopted = true;
+        state.focused = 1;
+        state.rows = vec![agent(1, 1, "zsh", "working")];
+        state.show_when_listed = Some((9, std::time::Instant::now()));
+        let mut dirty = false;
+        // An index from before the new terminal: still waiting.
+        apply(
+            &mut state,
+            index(vec![agent(1, 1, "zsh", "working")]),
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, None);
+        assert!(state.show_when_listed.is_some());
+        apply(
+            &mut state,
+            index(vec![
+                agent(1, 1, "zsh", "working"),
+                agent(9, 1, "claude", "idle"),
+            ]),
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, Some(9));
+        assert_eq!(state.show_when_listed, None);
+
+        // Asked too long ago: forgotten, not shown.
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.adopted = true;
+        state.focused = 1;
+        state.show_when_listed = Some((
+            9,
+            std::time::Instant::now() - std::time::Duration::from_secs(6),
+        ));
+        apply(
+            &mut state,
+            index(vec![
+                agent(1, 1, "zsh", "working"),
+                agent(9, 1, "claude", "idle"),
+            ]),
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, None);
+        assert_eq!(state.show_when_listed, None);
     }
 
     /// Requests are numbered from the clock, not from zero: a run from zero

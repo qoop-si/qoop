@@ -184,9 +184,20 @@ pub const HISTORY_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// The registry exists so that overload has an honest answer to "who is not reading".
 /// Choosing by buffered size answers a different question and picks the client with the
 /// biggest terminal.
-#[derive(Default)]
 pub struct ConnectionRegistry {
     inner: std::sync::Mutex<Vec<Connection>>,
+    /// `qoro focus`, fanned out to every connection's event task. Bounded and lossy on
+    /// purpose: a focus nobody drained in time is a click the person has moved past.
+    focus: tokio::sync::broadcast::Sender<u32>,
+}
+
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::default(),
+            focus: tokio::sync::broadcast::channel(16).0,
+        }
+    }
 }
 
 pub struct Connection {
@@ -200,6 +211,11 @@ pub struct Connection {
     /// process held 64 sockets. Measured: an evicted peer went on reading renders.
     shutdown: Arc<tokio::sync::Notify>,
     admitted: std::time::Instant,
+    /// The peer process, from the kernel rather than from anything it said.
+    pid: Option<u32>,
+    /// Whether the peer introduced itself as an interface, the one kind of client that
+    /// shows a terminal to a person and so the one `qoro focus` is for.
+    interface: std::sync::atomic::AtomicBool,
 }
 
 impl ConnectionRegistry {
@@ -229,6 +245,27 @@ impl ConnectionRegistry {
 
     fn register(&self, connection: Connection) {
         self.inner.lock().unwrap().push(connection);
+    }
+
+    fn mark_interface(&self, client: &ClientId) {
+        for c in self.inner.lock().unwrap().iter() {
+            if &c.client == client {
+                c.interface.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Ask every attached interface to show `terminal`, and say which processes those are.
+    pub fn focus(&self, terminal: u32) -> Vec<u32> {
+        // No receiver is not an error: nothing is attached, and the empty answer says so.
+        let _ = self.focus.send(terminal);
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.interface.load(Ordering::Relaxed))
+            .filter_map(|c| c.pid)
+            .collect()
     }
 
     fn remove(&self, client: &ClientId) {
@@ -980,6 +1017,8 @@ impl Daemon {
                 progress,
                 shutdown,
                 admitted: std::time::Instant::now(),
+                pid: peer_pid(&stream),
+                interface: std::sync::atomic::AtomicBool::new(false),
             });
             tokio::spawn(async move {
                 // Milestone 1 has one attach mode and it is writable. Read-only observers
@@ -1043,6 +1082,46 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
 /// uid cannot be created, which is everywhere that is not root.
 pub fn peer_is_ours(uid: u32) -> bool {
     uid == paths::current_uid()
+}
+
+/// The peer's pid, which is how `qoro focus` names the interfaces it moved: a launcher
+/// raises the window the process runs in. `None` when the kernel will not say.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: fd is a live connected unix socket; pid and len are valid out-params
+        // and len is the size of pid.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        (rc == 0 && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: zeroed ucred is a valid out-param and len matches its size.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: fd is a live connected socket; cred and len are valid out-params.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+    }
 }
 
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
@@ -1390,6 +1469,14 @@ async fn serve_client(
     Frame::new(Channel::Handshake, 0, Bytes::from(body))
         .encode(&mut out)
         .map_err(to_io)?;
+    // Known as an interface, and listening for `qoro focus`, before the welcome goes out:
+    // a focus sent the moment the interface is in must neither miss it nor leave its pid
+    // out of the answer.
+    let mut focus = connections.focus.subscribe();
+    if hello.client_id == "qoro-tui" && matches!(outcome, qoro_proto::HandshakeOutcome::Welcome(_))
+    {
+        connections.mark_interface(&client);
+    }
     stream.write_all(&out).await?;
     if matches!(outcome, qoro_proto::HandshakeOutcome::Refuse(_)) {
         return Ok(());
@@ -1423,7 +1510,12 @@ async fn serve_client(
     let mut changes = agents.subscribe();
     let events_task = tokio::spawn(async move {
         loop {
-            let Some(event) = pump_agent_event(&mut changes).await else {
+            let event = tokio::select! {
+                event = pump_agent_event(&mut changes) => event,
+                // A lagged or closed focus lane is not news: the next click is.
+                Ok(terminal) = focus.recv() => Some(crate::control::EventMessage::Focus { terminal }),
+            };
+            let Some(event) = event else {
                 return;
             };
             let body = match serde_json::to_vec(&event) {
@@ -2953,6 +3045,16 @@ async fn handle_control(
             Err(e) => ControlResponse::Failed {
                 id,
                 reason: format!("the split could not be recorded: {e}"),
+            },
+        },
+        ControlRequest::Focus { terminal, .. } => match terminals.get(terminal) {
+            Some(_) => ControlResponse::Focused {
+                id,
+                clients: connections.focus(terminal),
+            },
+            None => ControlResponse::Failed {
+                id,
+                reason: format!("no terminal {terminal}"),
             },
         },
         ControlRequest::Subscribe {
