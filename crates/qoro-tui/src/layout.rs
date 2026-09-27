@@ -226,7 +226,6 @@ impl Layout {
             let next = self
                 .prev_focus
                 .filter(|p| leaves.contains(p))
-                .or_else(|| neighbour_in_order(&leaves, terminal))
                 .unwrap_or(leaves[0]);
             self.prev_focus = None;
             self.focus = next;
@@ -555,19 +554,26 @@ fn remove_first_placeholder(node: &mut Node) -> bool {
     }
 }
 
-fn remove_terminal(node: &mut Node, terminal: u32) {
+/// True when `terminal` was in this subtree. Only splits on that path
+/// collapse: a pending placeholder anywhere else looks exactly like a removed
+/// slot, and collapsing it would kill a split still waiting for its terminal.
+fn remove_terminal(node: &mut Node, terminal: u32) -> bool {
     match node {
         // A single bare leaf removes to a bare root only when it is the one
         // being removed; a placeholder beside a dying leaf dies with it, or
         // every failed split resurrects as a pending zombie (see below).
         Node::Leaf { terminal: slot } => {
-            if *slot == Some(terminal) {
+            let hit = *slot == Some(terminal);
+            if hit {
                 *slot = None;
             }
+            hit
         }
         Node::Split { first, second, .. } => {
-            remove_terminal(first, terminal);
-            remove_terminal(second, terminal);
+            let removed = remove_terminal(first, terminal) | remove_terminal(second, terminal);
+            if !removed {
+                return false;
+            }
             let first_dead = matches!(first.as_ref(), Node::Leaf { terminal: None });
             let second_dead = matches!(second.as_ref(), Node::Leaf { terminal: None });
             if first_dead && second_dead {
@@ -579,24 +585,13 @@ fn remove_terminal(node: &mut Node, terminal: u32) {
             } else if second_dead {
                 *node = (**first).clone();
             }
+            true
         }
     }
 }
 
 fn is_empty_leaf(node: &Node) -> bool {
     matches!(node, Node::Leaf { terminal: None })
-}
-
-/// The visible leaf after `terminal` in tree order, wrapping. Used when the
-/// previous focus is gone: the neighbour closest to the closed pane.
-fn neighbour_in_order(leaves: &[u32], closed: u32) -> Option<u32> {
-    if leaves.is_empty() {
-        return None;
-    }
-    // Without positions of the closed leaf, fall back to the first leaf.
-    // Callers with geometry should prefer `neighbour_in_dir`.
-    let _ = closed;
-    Some(leaves[0])
 }
 
 fn fits(rect: Rect, dir: Dir) -> bool {
@@ -975,6 +970,15 @@ mod tests {
         assert!(layout.remove(1));
         assert!(layout.is_empty());
         assert!(!layout.has_pending());
+    }
+
+    #[test]
+    fn closing_a_terminal_elsewhere_keeps_a_pending_split() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
+        assert!(!layout.remove(9));
+        assert!(layout.has_pending());
+        assert!(layout.bind_placeholder(2));
     }
 
     #[test]

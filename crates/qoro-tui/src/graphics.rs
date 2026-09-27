@@ -556,9 +556,12 @@ mod tests {
                 },
             ),
         ] {
+            // SAFETY: only this test reads or writes QORO_GRAPHICS, TERM and
+            // TERM_PROGRAM in this binary, so no other thread sees them change.
             unsafe { std::env::set_var(key, value) };
             assert_eq!(detect(), want, "override {value}");
         }
+        // SAFETY: as above, no other test touches this variable.
         unsafe { std::env::remove_var(key) };
         // Without an override the allowlist decides. iTerm2 speaks both protocols
         // (its own inline images and Kitty graphics), so it gets both; anything
@@ -590,10 +593,12 @@ mod tests {
             ),
             ("xterm-256color", "", GraphicsCap::off()),
         ] {
+            // SAFETY: as above, no other test touches these variables.
             unsafe { std::env::set_var("TERM", term) };
             unsafe { std::env::set_var("TERM_PROGRAM", program) };
             assert_eq!(detect(), want, "terminal {term}/{program}");
         }
+        // SAFETY: as above, no other test touches this variable.
         unsafe { std::env::remove_var("TERM_PROGRAM") };
     }
 }

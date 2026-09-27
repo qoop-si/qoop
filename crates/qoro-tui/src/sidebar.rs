@@ -544,8 +544,10 @@ pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
     pinned + 1 + content(c).len() <= room
 }
 
-/// The open column as lines alone, for a caller that paints and never clicks.
-pub fn render_folded(c: &Column, height: usize) -> Vec<Line> {
+/// The open column as lines alone, for a test that reads and never clicks. The paint
+/// and the hit tests both go through [`rows_folded`].
+#[cfg(test)]
+pub(crate) fn render_folded(c: &Column, height: usize) -> Vec<Line> {
     rows_folded(c, height, None)
         .into_iter()
         .map(|(line, _)| line)
@@ -1402,21 +1404,43 @@ fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
     )
 }
 
-/// The picked avatar, when one is picked.
+/// What [`FILES`] holds: the picked pet, and a newer version when one was seen.
+type Files = (Option<qoro_runtime::avatar::Avatar>, Option<String>);
+
+/// The pet and the update notice as last read off disk.
 ///
-/// Reads the file on every paint like the update notice below it: the picker
-/// runs in a process outside the interface, so anything held would be stale by
-/// construction. Under test this is always none, so the thirty-odd paints the
-/// suite asserts never depend on the developer's own home directory.
+/// Held, not read per paint: two file reads and a JSON parse on every frame was
+/// the render thread's cost while an agent streamed. Both files are written by
+/// processes outside the interface (`qoro avatar pick`, `qoro update --check`),
+/// so the run loop re-reads them on the acknowledgement tick it already has,
+/// and a new pet or notice shows up to one tick late.
+// ponytail: process-wide, the interface has one render loop; a State field would
+// thread two more arguments through rows_folded and every hit test.
+static FILES: std::sync::RwLock<Files> = std::sync::RwLock::new((None, None));
+
+/// Re-read the pet and the update notice. True when either changed, so the
+/// caller repaints. Never under test, so the thirty-odd paints the suite asserts
+/// never depend on the developer's own home directory.
+pub(crate) fn refresh_files() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    hold(&FILES, (qoro_runtime::avatar::load(), notice_from_disk()))
+}
+
+/// Keep `now` in `held`; true when it differs from what was there.
+fn hold(held: &std::sync::RwLock<Files>, now: Files) -> bool {
+    let mut held = held.write().unwrap_or_else(|e| e.into_inner());
+    if *held == now {
+        return false;
+    }
+    *held = now;
+    true
+}
+
+/// The picked avatar, when one is picked, as [`refresh_files`] last read it.
 pub(crate) fn current_avatar() -> Option<qoro_runtime::avatar::Avatar> {
-    #[cfg(test)]
-    {
-        None
-    }
-    #[cfg(not(test))]
-    {
-        qoro_runtime::avatar::load()
-    }
+    FILES.read().unwrap_or_else(|e| e.into_inner()).0.clone()
 }
 
 /// Whether the pet itself fits above the foot: open column, wide enough for
@@ -1591,13 +1615,15 @@ const BRAND_MARK: char = '\u{25cf}';
 /// Which build this is, read from the crate rather than written down twice.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A newer version `qoro update --check` saw, when it saw one.
-///
-/// Read off the notice file on every paint rather than held in state: the check runs in
-/// a process outside the interface, so anything held would be stale by construction. A
-/// missing file, garbage in it, or nothing newer is no notice, and the row is byte for
-/// byte what it always was.
+/// A newer version `qoro update --check` saw, when it saw one, as [`refresh_files`]
+/// last read it.
 fn update_available() -> Option<String> {
+    FILES.read().unwrap_or_else(|e| e.into_inner()).1.clone()
+}
+
+/// The notice file, read now. A missing file, garbage in it, or nothing newer is no
+/// notice, and the row is byte for byte what it always was.
+fn notice_from_disk() -> Option<String> {
     let seen = qoro_runtime::paths::read_update_notice()?;
     qoro_runtime::paths::is_newer_version(&seen, VERSION).then_some(seen)
 }
@@ -1677,6 +1703,34 @@ mod tests {
 
     /// A fixed paint-time clock: tests pin behavior at exact ages, never time.
     const NOW: i64 = 1_750_000_000;
+
+    /// The pet and the notice are held between re-reads, and only a change asks the
+    /// loop for a repaint: an idle acknowledgement tick that finds the same files
+    /// paints nothing.
+    #[test]
+    fn the_held_files_ask_for_a_repaint_only_when_they_change() {
+        let held = std::sync::RwLock::new((None, None));
+        assert!(!hold(&held, (None, None)), "nothing changed");
+        assert!(
+            hold(&held, (None, Some("9.9.9".to_string()))),
+            "a new notice"
+        );
+        assert!(
+            !hold(&held, (None, Some("9.9.9".to_string()))),
+            "the same notice"
+        );
+        assert_eq!(held.read().unwrap().1.as_deref(), Some("9.9.9"));
+        assert!(hold(&held, (None, None)), "the notice went away");
+    }
+
+    /// Under test nothing is read off disk: every paint the suite asserts is the same
+    /// on any machine, whatever pet or update notice its home directory holds.
+    #[test]
+    fn a_test_paint_never_reads_the_pet_or_the_notice() {
+        assert!(!refresh_files());
+        assert_eq!(current_avatar(), None);
+        assert_eq!(update_available(), None);
+    }
 
     /// The pieces of a column, spelled out: every test names what it varies.
     #[allow(clippy::too_many_arguments)]

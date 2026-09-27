@@ -459,6 +459,22 @@ pub(crate) fn avatar_overlay_paint(
     out
 }
 
+/// Where a real picture's top-left cell goes: the focused pane's first row, one based.
+/// Pictures draw downward, so anchored anywhere lower they cover the status rows.
+pub(crate) fn picture_cell(frame: &Frame) -> Option<(usize, usize)> {
+    // A window too short to hold a pane has nowhere to put one: placed anyway, it lands
+    // on the status rows.
+    if (frame.lines as usize) <= TABS + STATUS {
+        return None;
+    }
+    let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
+    if frame.tiles.len() < 2 {
+        return Some((TABS + 1, left + 1));
+    }
+    let t = frame.tiles.iter().find(|t| t.focused)?;
+    Some((TABS + 1 + t.rect.y, left + 1 + t.rect.x))
+}
+
 /// Where the host cursor goes for the focused snapshot, one-based, or `None`
 /// when no tile carries it.
 ///
@@ -1103,7 +1119,12 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                 };
                 let state_ink = entry.state.as_deref().map(theme::of);
                 let space_ink = entry.space.map(theme::space_of);
-                let sub = entry.sub.clone();
+                // Cut to the box: on the narrowest windows a state word alone is wider
+                // than the room beside its two spaces, and the row ran off the screen.
+                let sub = width::text(
+                    &entry.sub,
+                    width::width(&entry.sub).min(inner.saturating_sub(2)),
+                );
                 let head = entry.text.clone();
                 let room = inner.saturating_sub(width::width(&sub) + 2);
                 // Composed text, so every space in it is meant: the grid fitter would drop
@@ -4144,6 +4165,146 @@ mod tests {
             );
         }
         assert!(found >= 3, "the palette drew {found} rows");
+    }
+
+    /// On a window a few columns wider than the smallest palette, a long state word
+    /// is cut to the box. Uncut, the row ran past the right border and off the screen.
+    #[test]
+    fn a_palette_row_never_runs_past_its_box_on_a_narrow_window() {
+        let rows = [blocked_row(1, "codex"), row(2, "claude", "sleeping")];
+        let palette = Palette::open();
+        let behind = crate::run::Behind::default();
+        for cols in 10..=13u16 {
+            let painted = paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                panes: std::collections::BTreeSet::new(),
+                space: Some(1),
+                focused: 2,
+                snapshot: None,
+                cols,
+                lines: 24,
+                message: None,
+                hint: None,
+                palette: Some(&palette),
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Tree,
+                seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &behind,
+                image_notice: None,
+                chrome: Default::default(),
+            });
+            let w = palette_width(cols);
+            let left = (cols as usize - w) / 2;
+            let mut found = 0;
+            for row in TABS + 1..24 {
+                // The last move to the box's edge: the overlay paints after the pane,
+                // which on a window this narrow starts at the same column.
+                let Some(cut) = painted.rfind(&at(row, left + 1)) else {
+                    continue;
+                };
+                found += 1;
+                let rest = &painted[cut + at(row, left + 1).len()..];
+                // This row alone: up to the next cursor move.
+                let end = rest
+                    .match_indices("\x1b[")
+                    .find(|(i, _)| {
+                        rest[i + 2..].chars().find(|c| c.is_ascii_alphabetic()) == Some('H')
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                let text = strip(&rest[..end]);
+                assert_eq!(
+                    width::width(&text),
+                    w,
+                    "{cols} columns, row {row} is not the box width: {text:?}"
+                );
+            }
+            assert!(found >= 4, "{cols} columns: the palette drew {found} rows");
+        }
+    }
+
+    /// A real picture draws downward from its anchor, so the anchor is the
+    /// focused pane's first row. Anchored on the last row, it covered the
+    /// status rows and ran past the bottom of the screen.
+    #[test]
+    fn a_picture_is_anchored_at_the_focused_pane_first_row() {
+        let rows = [row(1, "zsh", "idle"), row(2, "zsh", "idle")];
+        let spaces = spaces();
+        let behind = crate::run::Behind::default();
+        let seen = sidebar::Seen::new();
+        let unseen = sidebar::Unseen::new();
+        let rect = |x, y| crate::layout::Rect {
+            x,
+            y,
+            cols: 20,
+            rows: 8,
+        };
+        let frame_of = |tiles: Vec<Tile<'static>>| Frame {
+            rows: &rows,
+            spaces: &spaces,
+            panes: std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 2,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            anchor: 0,
+            rows_back: 0,
+            tiles,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &seen,
+            unseen: &unseen,
+            behind: &behind,
+            image_notice: None,
+            chrome: Default::default(),
+        };
+        let left = left_for(80, false, sidebar::WIDTH);
+        assert_eq!(
+            picture_cell(&frame_of(Vec::new())),
+            Some((TABS + 1, left + 1))
+        );
+        let tiles = vec![
+            Tile {
+                terminal: 1,
+                rect: rect(0, 0),
+                snapshot: None,
+                focused: false,
+            },
+            Tile {
+                terminal: 2,
+                rect: rect(21, 9),
+                snapshot: None,
+                focused: true,
+            },
+        ];
+        assert_eq!(
+            picture_cell(&frame_of(tiles)),
+            Some((TABS + 1 + 9, left + 1 + 21))
+        );
     }
 
     #[test]

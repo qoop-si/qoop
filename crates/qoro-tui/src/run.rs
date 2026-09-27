@@ -2891,6 +2891,9 @@ where
         out.write_all(ASK_SCHEME)?;
     }
     out.flush()?;
+    // The pet and the update notice, read once so the first frame has them; the
+    // acknowledgement tick below re-reads them, with no wakeup of their own.
+    sidebar::refresh_files();
     let mut dirty = true;
     let mut presenter = present::Presenter::default();
     let mut written = String::new();
@@ -2986,29 +2989,9 @@ where
                     _ => None,
                 };
                 frame.image_notice = notice.as_deref();
-                // Where a real picture lands: the focused pane's last row, in
-                // screen cells, one based. Copied from the cursor arithmetic in
-                // `screen::pane_cursor`, which owns these coordinates.
-                let tile_place_at: Option<(usize, usize)> = {
-                    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-                    if frame.tiles.len() < 2 {
-                        let (_, pane_rows) = screen::pane_size_for(
-                            state.cols,
-                            state.lines,
-                            state.collapsed,
-                            0,
-                            state.sidebar_width,
-                        );
-                        (pane_rows > 0).then_some((screen::TABS + pane_rows as usize, left + 1))
-                    } else {
-                        frame.tiles.iter().find(|t| t.focused).map(|t| {
-                            (
-                                screen::TABS + t.rect.y + t.rect.rows,
-                                left + 1 + t.rect.x,
-                            )
-                        })
-                    }
-                };
+                // Where a real picture lands: the focused pane's first row, in
+                // screen cells, one based.
+                let tile_place_at = screen::picture_cell(&frame);
                 let mut painted = screen::paint(&frame);
                 // The focus list covers the pane the frame just drew, the way the
                 // palette does. Never over an overlay: an open palette owns the
@@ -3051,7 +3034,7 @@ where
                 presenter.present(&painted, state.cols, state.lines, &mut written);
                 // Pictures, reconciled per frame. Anything placed on the outer
                 // screen and no longer desired comes down; the current picture
-                // goes up over the pane whose last row the notice names. The
+                // goes up at the focused pane's first row, drawing down. The
                 // block runs after the text frame in the same flush, with the
                 // cursor restored, so the row diff never sees image bytes.
                 //
@@ -3156,6 +3139,9 @@ where
                         wr.write_all(&ack).await?;
                     }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                    if sidebar::refresh_files() {
+                        dirty = true;
+                    }
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),

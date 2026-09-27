@@ -10,7 +10,6 @@
 //! every tab keeps the same text with or without it, so the bar never shifts
 //! sideways when the focus moves.
 
-use crate::sidebar::Line;
 use qoro_runtime::control::AgentRow;
 
 /// The tab that makes a new terminal.
@@ -53,7 +52,7 @@ pub enum Ink {
 ///
 /// The painter needs the pieces and not one string, because the focused tab is a pill: a
 /// background that starts and stops, which one string with one colour cannot express. The
-/// same segments [`render`] and [`hit`] use, so all three agree by construction.
+/// same segments [`hit`] uses, so the two agree by construction.
 pub fn painted(
     terminals: &[AgentRow],
     focused: u32,
@@ -77,25 +76,6 @@ pub fn painted(
         out.push((" ".repeat(cols - used), Ink::Quiet));
     }
     out
-}
-
-pub fn render(
-    terminals: &[AgentRow],
-    focused: u32,
-    cols: usize,
-    unseen: &crate::sidebar::Unseen,
-) -> Line {
-    let bar: String = segments(terminals, focused, cols, unseen)
-        .into_iter()
-        .map(|(text, _)| text)
-        .collect();
-    Line {
-        text: exactly(&bar, cols),
-        colour: None,
-        accent: None,
-        indicator: None,
-        runs: Vec::new(),
-    }
 }
 
 /// What a click on the tab bar means.
@@ -133,7 +113,7 @@ pub fn hit(
 
 /// The pieces of the bar, left to right, each with the terminal a click on it means.
 ///
-/// One function and not two, because [`render`] and [`hit`] have to agree about where every
+/// One function and not two, because [`painted`] and [`hit`] have to agree about where every
 /// tab starts, and the same running total written out twice is how a click opens the tab
 /// next to the one a person aimed at.
 ///
@@ -164,7 +144,10 @@ fn segments(
         used += wide;
         out.push((text, Some(Hit::Terminal(row.terminal))));
     }
-    out.push((NEW.to_string(), Some(Hit::New)));
+    // Cut to the columns there are: on a bar narrower than the button, a whole button
+    // autowraps its last cell into the pane below.
+    let new = crate::width::text(NEW, cols.min(crate::width::width(NEW)));
+    out.push((new, Some(Hit::New)));
     out
 }
 
@@ -280,15 +263,30 @@ fn clip(text: &str) -> String {
     crate::width::fit(text, MAX_LABEL.min(crate::width::width(text)))
 }
 
-/// Cut or pad to exactly `cols` columns, keeping every space: this bar is text this
-/// module composed, and dropping one would move every tab after it off where [`hit`] says.
-fn exactly(text: &str, cols: usize) -> String {
-    crate::width::text(text, cols)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::Line;
+
+    /// The bar exactly as [`painted`] hands it to the screen, as one line: the tests
+    /// pin what is painted, not a copy of it that cuts where the painted bar did not.
+    fn render(
+        terminals: &[AgentRow],
+        focused: u32,
+        cols: usize,
+        unseen: &crate::sidebar::Unseen,
+    ) -> Line {
+        Line {
+            text: painted(terminals, focused, cols, unseen)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect(),
+            colour: None,
+            accent: None,
+            indicator: None,
+            runs: Vec::new(),
+        }
+    }
 
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
