@@ -3880,10 +3880,29 @@ fn spawn_history_writer(
             }
             // A burst becomes one batch. Waking on every notify makes the batches as small
             // as the reads that produced them, and a batch is a blocking dispatch and a set
-            // of syscalls however few rows are in it.
-            tokio::time::sleep(HISTORY_BATCH_WINDOW).await;
-            let (mut rows, _) = (rows, ());
-            rows.extend(spill.take().0);
+            // of syscalls however few rows are in it. Unless the burst is already filling
+            // the ring: then waiting is how rows get displaced, so the writer drains now.
+            if !spill.pressed()
+                && rows.iter().map(String::len).sum::<usize>() < crate::spill::SPILL_PRESSURE
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(HISTORY_BATCH_WINDOW) => {}
+                    _ = spill.wait_pressure() => {}
+                }
+            }
+            let mut rows = rows;
+            let (more, later) = spill.take();
+            rows.extend(more);
+            if later.rows > 0 {
+                // The same record as above: a loss inside the window is still a loss.
+                eprintln!(
+                    "qorod: history for {} lost {} rows between {} and {}",
+                    dir.display(),
+                    later.rows,
+                    later.first_unix,
+                    later.last_unix
+                );
+            }
             let written = crate::blocking::run(move || {
                 let truncated = history.append(&rows);
                 (history, truncated)

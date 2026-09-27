@@ -420,6 +420,55 @@ async fn g2_7_rows_that_scroll_off_reach_the_disk_in_order() {
     }
 }
 
+/// G2.7b: a burst larger than the spill ring still reaches the disk whole.
+///
+/// G2.7 prints fewer rows than the ring holds, so it cannot see the ring overflow. A burst
+/// of short lines scrolls tens of thousands of rows in the time the writer used to spend
+/// waiting for a batch to gather, and those rows were displaced before it looked. Measured
+/// before the fix: of 50,000 lines, 26,608 reached the disk.
+#[tokio::test]
+async fn g2_7b_a_burst_larger_than_the_spill_ring_reaches_the_disk_whole() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("burst").await;
+    let terminal = d.terminals().streams()[0];
+
+    // Sixty blank rows after the numbers push the last of them off the screen, so every
+    // number is history and none is still being drawn.
+    c.input_to(
+        terminal,
+        b"seq 1 100000; yes '' | head -n 60; echo BURST_$((6*7))\n",
+    )
+    .await;
+    assert!(
+        c.wait_for_text_on(terminal, "BURST_42", PATIENCE).await,
+        "the shell never finished printing"
+    );
+    let dir = d.dir().join("history").join(terminal.to_string());
+    // Every number, in order, with no hole: wait for the writer rather than guess a delay.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let numbers = loop {
+        let history = qoro_store::History::open(&dir).expect("history");
+        let rows = history.read(0, history.len() as usize).expect("read");
+        let numbers: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.trim().parse::<i64>().ok())
+            .collect();
+        if numbers.last() == Some(&100_000) || std::time::Instant::now() > deadline {
+            break numbers;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        numbers.len(),
+        100_000,
+        "{} of 100000 rows reached the disk",
+        numbers.len()
+    );
+    for pair in numbers.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "history has a hole");
+    }
+}
+
 /// G2.8's rule, at the level it is actually enforced: the read loop hands rows over and
 /// never waits, so a stalled disk costs history and not the terminal.
 #[tokio::test]

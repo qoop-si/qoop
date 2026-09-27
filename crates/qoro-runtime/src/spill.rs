@@ -14,11 +14,29 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-/// Rows held between the read loop and the writer.
+/// How much the ring holds between the read loop and the writer, in bytes.
 ///
-/// One 64 KiB read can scroll more than the whole in-memory window, so this is sized well
-/// above the engine's 1000 row scrollback rather than to a round number.
-pub const SPILL_CAPACITY: usize = 8192;
+/// A budget in bytes and not a count of rows, because what a flood costs is its size: a
+/// burst of short lines scrolls millions of rows a second, and a ring of 8192 rows (the
+/// first sizing) overflowed within about a millisecond of the writer looking away, so
+/// 100,000 lines of `seq` reached the disk as 8,192. Eight MiB absorbs such a burst of
+/// short lines whole (about 150,000 of them) and still bounds a terminal that floods for
+/// longer; what it cannot hold is dropped and recorded, never waited for.
+pub const SPILL_BYTES: usize = 8 * 1024 * 1024;
+
+/// What a row costs besides its text: the `String` and the slot it sits in.
+const ROW_OVERHEAD: usize = 48;
+
+/// How full the ring may get before the writer stops waiting for a burst to gather.
+///
+/// The writer waits a short window after the first rows of a burst so that the burst
+/// becomes one batch. Past this mark it drains at once instead, so the ring empties long
+/// before it could overflow while the read loop still never waits.
+pub const SPILL_PRESSURE: usize = SPILL_BYTES / 4;
+
+fn cost(row: &str) -> usize {
+    row.len() + ROW_OVERHEAD
+}
 
 /// What was lost, and when. Never a bare count: a gap with no time range cannot be placed
 /// against anything else in the record.
@@ -32,6 +50,8 @@ pub struct Gap {
 #[derive(Default)]
 struct Inner {
     rows: VecDeque<String>,
+    /// What `rows` costs against [`SPILL_BYTES`].
+    bytes: usize,
     gap: Gap,
 }
 
@@ -40,6 +60,9 @@ struct Inner {
 pub struct SpillRing {
     inner: Arc<Mutex<Inner>>,
     notify: Arc<tokio::sync::Notify>,
+    /// Woken when the ring passes [`SPILL_PRESSURE`], so a writer waiting out its batch
+    /// window drains now.
+    pressure: Arc<tokio::sync::Notify>,
 }
 
 fn now_unix() -> i64 {
@@ -63,24 +86,32 @@ impl SpillRing {
         let mut inner = self.inner.lock().unwrap();
         let now = now_unix();
         for row in rows {
-            if inner.rows.len() >= SPILL_CAPACITY {
-                inner.rows.pop_front();
+            inner.bytes += cost(&row);
+            inner.rows.push_back(row);
+            while inner.bytes > SPILL_BYTES
+                && let Some(oldest) = inner.rows.pop_front()
+            {
+                inner.bytes -= cost(&oldest);
                 if inner.gap.rows == 0 {
                     inner.gap.first_unix = now;
                 }
                 inner.gap.rows += 1;
                 inner.gap.last_unix = now;
             }
-            inner.rows.push_back(row);
         }
+        let pressed = inner.bytes >= SPILL_PRESSURE;
         drop(inner);
         self.notify.notify_one();
+        if pressed {
+            self.pressure.notify_one();
+        }
     }
 
     /// Take everything waiting, and the gap accumulated since the last take.
     pub fn take(&self) -> (Vec<String>, Gap) {
         let mut inner = self.inner.lock().unwrap();
         let rows = inner.rows.drain(..).collect();
+        inner.bytes = 0;
         let gap = std::mem::take(&mut inner.gap);
         (rows, gap)
     }
@@ -89,12 +120,23 @@ impl SpillRing {
         self.inner.lock().unwrap().rows.len()
     }
 
+    /// Whether this many bytes of rows are waiting: the writer's cue to stop gathering.
+    pub fn pressed(&self) -> bool {
+        self.inner.lock().unwrap().bytes >= SPILL_PRESSURE
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     pub async fn wait(&self) {
         self.notify.notified().await
+    }
+
+    /// Wait until the ring is past [`SPILL_PRESSURE`]. A stale wake left by an earlier
+    /// burst only makes the next batch smaller.
+    pub async fn wait_pressure(&self) {
+        self.pressure.notified().await
     }
 
     pub fn wake(&self) {
@@ -146,15 +188,20 @@ mod tests {
         assert_eq!(gap.rows, 0);
     }
 
+    /// How many eight character rows fit in the ring.
+    fn fitting() -> usize {
+        SPILL_BYTES / cost("00000000")
+    }
+
     #[test]
     fn overflowing_drops_the_oldest_and_counts_it() {
         let ring = SpillRing::new();
-        ring.push((0..SPILL_CAPACITY + 100).map(|i| i.to_string()));
+        ring.push((0..fitting() + 100).map(|i| format!("{i:08}")));
         let (rows, gap) = ring.take();
-        assert_eq!(rows.len(), SPILL_CAPACITY);
+        assert_eq!(rows.len(), fitting());
         assert_eq!(gap.rows, 100, "the loss was not counted");
         assert_eq!(
-            rows[0], "100",
+            rows[0], "00000100",
             "the newest rows were dropped instead of the oldest"
         );
         assert!(gap.first_unix > 0 && gap.last_unix >= gap.first_unix);
@@ -163,7 +210,7 @@ mod tests {
     #[test]
     fn a_gap_is_reported_once_and_then_cleared() {
         let ring = SpillRing::new();
-        ring.push((0..SPILL_CAPACITY + 5).map(|i| i.to_string()));
+        ring.push((0..fitting() + 5).map(|i| format!("{i:08}")));
         assert_eq!(ring.take().1.rows, 5);
         ring.push(["after".to_string()]);
         assert_eq!(
@@ -174,9 +221,28 @@ mod tests {
     }
 
     #[test]
-    fn pushing_more_than_the_capacity_at_once_is_bounded_not_grown() {
+    fn pushing_more_than_the_budget_at_once_is_bounded_not_grown() {
         let ring = SpillRing::new();
-        ring.push((0..SPILL_CAPACITY * 4).map(|i| i.to_string()));
-        assert_eq!(ring.len(), SPILL_CAPACITY);
+        ring.push((0..fitting() * 4).map(|i| format!("{i:08}")));
+        assert_eq!(ring.len(), fitting());
+    }
+
+    #[test]
+    fn the_budget_counts_bytes_so_long_rows_fit_fewer() {
+        let ring = SpillRing::new();
+        let long = "x".repeat(1000);
+        ring.push((0..SPILL_BYTES).map(|_| long.clone()).take(20_000));
+        assert_eq!(ring.len(), SPILL_BYTES / cost(&long));
+    }
+
+    #[test]
+    fn a_quarter_full_ring_presses_the_writer_and_a_take_releases_it() {
+        let ring = SpillRing::new();
+        ring.push((0..fitting() / 4 - 1).map(|i| format!("{i:08}")));
+        assert!(!ring.pressed());
+        ring.push(["00000000".to_string(), "00000000".to_string()]);
+        assert!(ring.pressed());
+        ring.take();
+        assert!(!ring.pressed());
     }
 }
