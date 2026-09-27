@@ -1361,6 +1361,118 @@ contains = "do you want to proceed"
         assert!(v.visible_blocker);
     }
 
+    /// The folder trust dialog as Claude Code draws it now, captured from a
+    /// real start in a new directory. Its default option exits.
+    const CLAUDE_TRUST: &[&str] = &[
+        "────────────────────────────────────────────────────────────────────────────────",
+        " Accessing workspace:",
+        " /private/tmp/drill",
+        " Quick safety check: Is this a project you created or one you trust? (Like your",
+        " own code, a well-known open source project, or work from your team). If not,",
+        " take a moment to review what's in this folder first.",
+        " Claude Code'll be able to read, edit, and execute files here.",
+        " Security guide",
+        " \u{276F} No, exit",
+        "   Yes, I trust this folder",
+        " Enter to confirm · Esc to cancel",
+    ];
+
+    #[test]
+    fn the_claude_manifest_reads_the_trust_dialog_as_a_setup_gate() {
+        let v = verdict("claude", CLAUDE_TRUST).expect("the trust dialog blocks startup");
+        assert_eq!(v.state, AgentRuntimeState::Blocked, "{v:?}");
+        assert_eq!(v.rule, "trust_folder");
+        assert!(v.setup_gate, "answering it creates the session: {v:?}");
+    }
+
+    #[test]
+    fn claude_quoting_the_trust_dialog_is_not_the_dialog() {
+        // The manifest itself on screen, as `cat claude.toml` in a Claude session
+        // draws it: every phrase is there, none of them as the dialog's own line.
+        let manifest = include_str!("../manifests/claude.toml");
+        let lines: Vec<&str> = manifest.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("id = \"trust_folder\""))
+            .expect("the rule is in the manifest");
+        let shown = &lines[at.saturating_sub(6)..(at + 12).min(lines.len())];
+        let v = verdict("claude", shown);
+        assert!(v.as_ref().is_none_or(|v| v.rule != "trust_folder"), "{v:?}");
+    }
+
+    #[test]
+    fn an_interrupted_claude_turn_reads_as_a_visible_idle_composer() {
+        // Captured after Esc: the turn is over and Claude has put the prompt
+        // back in the composer. No Stop hook runs on an interrupt, so this
+        // screen is the only thing that can say the agent is idle.
+        let v = verdict(
+            "claude",
+            &[
+                "\u{273B} Crunched for 1s · done 1:16 PM",
+                "────────────────────────────────────────────────────────────────────────────────",
+                "\u{276F} Write a 3000 word essay about the history of terminals. Do not use tools.",
+                "────────────────────────────────────────────────────────────────────────────────",
+                "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert_eq!(v.rule, "composer_draft_idle");
+        assert!(v.visible_idle);
+    }
+
+    #[test]
+    fn a_claude_draft_does_not_hide_a_running_turn() {
+        let v = verdict(
+            "claude",
+            &[
+                "\u{273B} Cogitating… (12s · esc to interrupt)",
+                "────────────────────────────────────────────────────────────────────────────────",
+                "\u{276F} and then run the tests",
+                "────────────────────────────────────────────────────────────────────────────────",
+                "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
+            ],
+        )
+        .expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Working, "{v:?}");
+    }
+
+    #[test]
+    fn a_past_claude_prompt_in_the_transcript_is_not_a_composer() {
+        // The transcript marks past prompts with the composer's own marker,
+        // but outside the ruled box.
+        let v = verdict(
+            "claude",
+            &[
+                "\u{276F} Reply with exactly the text DRILL_OK_42",
+                "",
+                "\u{23FA} DRILL_OK_42",
+            ],
+        );
+        assert!(
+            v.as_ref().is_none_or(|v| v.rule != "composer_draft_idle"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_form_between_rules_is_not_a_draft() {
+        let v = verdict(
+            "claude",
+            &[
+                "────────────────────────────────────────────────────────────────────────────────",
+                "\u{276F} Sonnet",
+                "  Opus",
+                "────────────────────────────────────────────────────────────────────────────────",
+                " Enter to select · Esc to cancel",
+            ],
+        );
+        assert!(
+            v.as_ref().is_none_or(|v| v.rule != "composer_draft_idle"),
+            "{v:?}"
+        );
+    }
+
     #[test]
     fn the_opencode_manifest_reads_an_interrupt_hint_as_working() {
         let v = verdict("opencode", &["esc to interrupt"]).expect("an interrupt hint");
