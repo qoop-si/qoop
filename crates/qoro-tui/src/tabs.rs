@@ -309,6 +309,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -335,6 +336,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 

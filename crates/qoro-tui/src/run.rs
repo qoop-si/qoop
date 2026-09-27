@@ -2613,7 +2613,7 @@ fn size_moved_tile(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    size_terminals(state, seqs, false)
+    size_terminals(state, seqs)
 }
 
 /// Where copy mode's cursor is drawn, one based on the screen, when it is in view.
@@ -3089,7 +3089,7 @@ where
                 // never changes the row count, so no intermediate width is
                 // worth a reflow of its own.
                 if state.sidebar_width != state.sidebar_sized {
-                    if let Some(resize) = size_terminals(&mut state, &mut seqs, false)? {
+                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
                         wr.write_all(&resize).await?;
                     }
                     state.sidebar_sized = state.sidebar_width;
@@ -3155,7 +3155,7 @@ where
                     // has.
                     // Every terminal to its own tile, or to the whole pane for a tab not on
                     // screen, the way it would be drawn.
-                    if let Some(resize) = size_terminals(&mut state, &mut seqs, false)? {
+                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
                         wr.write_all(&resize).await?;
                     }
                     // A taller window reads further back, and what was fetched for the
@@ -3717,7 +3717,7 @@ where
                                         // child that is not told reflows its output against
                                         // a width it no longer has.
                                         if let Some(resize) =
-                                            size_terminals(&mut state, &mut seqs, false)?
+                                            size_terminals(&mut state, &mut seqs)?
                                         {
                                             wr.write_all(&resize).await?;
                                         }
@@ -3793,7 +3793,7 @@ where
                                     {
                                         if state.sidebar_width != state.sidebar_sized {
                                             if let Some(resize) =
-                                                size_terminals(&mut state, &mut seqs, false)?
+                                                size_terminals(&mut state, &mut seqs)?
                                             {
                                                 wr.write_all(&resize).await?;
                                             }
@@ -4083,7 +4083,7 @@ where
                                 // that is not told reflows its output against a width it no
                                 // longer has. Every tile is told its own.
                                 if let Some(resize) =
-                                    size_terminals(&mut state, &mut seqs, false)?
+                                    size_terminals(&mut state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
@@ -4462,7 +4462,7 @@ where
                                         // default), so without this the first paint shows
                                         // a small screen until anything moves the focus.
                                         if let Some(resize) =
-                                            size_terminals(&mut state, &mut seqs, false)?
+                                            size_terminals(&mut state, &mut seqs)?
                                         {
                                             wr.write_all(&resize).await?;
                                         }
@@ -5443,7 +5443,7 @@ async fn drain_adopt_resize(
         if let Some(subscribe) = sync_subs(state, control_seq)? {
             wr.write_all(&subscribe).await?;
         }
-        if let Some(resize) = size_terminals(state, seqs, true)? {
+        if let Some(resize) = size_terminals(state, seqs)? {
             wr.write_all(&resize).await?;
             *dirty = true;
         }
@@ -5476,7 +5476,7 @@ fn zoom_flip(
     if let Some(sync) = sync_subs(state, control_seq)? {
         out.extend_from_slice(&sync);
     }
-    if let Some(resize) = size_terminals(state, seqs, false)? {
+    if let Some(resize) = size_terminals(state, seqs)? {
         out.extend_from_slice(&resize);
     }
     Ok((true, if out.is_empty() { None } else { Some(out) }))
@@ -5534,13 +5534,15 @@ fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<Byte
 /// back.
 ///
 /// A terminal is sent its size only when it changed: to the daemon an equal size is a
-/// repaint nudge, one row short for 30 ms. `nudge_focused` asks for that repaint on the
-/// focused one, which only adopting a terminal on attach wants. A pane hidden by zoom keeps its last size. A terminal
+/// repaint nudge, one row short for 30 ms. That covers an attach too: the first size a
+/// run sends a terminal always goes out, and when it equals the one the terminal already
+/// has, the daemon nudges it. Forcing a second one on adoption shrank the child a row for
+/// 30 ms after it had been sized, and a shell asked its size in that window read the
+/// wrong one. A pane hidden by zoom keeps its last size. A terminal
 /// another client owns is refused by the daemon and stays viewport-cropped (ADR-007).
 fn size_terminals(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
-    nudge_focused: bool,
 ) -> io::Result<Option<BytesMut>> {
     let area = pane_area(state);
     let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
@@ -5594,8 +5596,7 @@ fn size_terminals(
     }
     let mut out = BytesMut::new();
     for (&terminal, &(cols, rows)) in &want {
-        let nudge = nudge_focused && terminal == state.focused;
-        if cols == 0 || rows == 0 || (!nudge && state.sized.get(&terminal) == Some(&(cols, rows))) {
+        if cols == 0 || rows == 0 || state.sized.get(&terminal) == Some(&(cols, rows)) {
             continue;
         }
         out.extend_from_slice(&client::encode_command_to(
@@ -5706,7 +5707,7 @@ fn focus(
             )?);
         }
     }
-    if let Some(resize) = size_terminals(state, seqs, false)? {
+    if let Some(resize) = size_terminals(state, seqs)? {
         out.extend_from_slice(&resize);
     }
     // The list refetches on the same bytes as the subscribe above: on an
@@ -5775,7 +5776,7 @@ fn enter_space(
             if let Some(sync) = sync_subs(state, control_seq)? {
                 out.extend_from_slice(&sync);
             }
-            if let Some(resize) = size_terminals(state, seqs, false)? {
+            if let Some(resize) = size_terminals(state, seqs)? {
                 out.extend_from_slice(&resize);
             }
             Ok(Some(out))
@@ -6092,6 +6093,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // Pictures too, up to 4 MiB each, or every terminal that exited on its own
             // kept its last one for the life of this client.
             state.images.retain(|t, _| live.contains(t));
+            // And what each was last sized to: one that comes back (a remote daemon that
+            // restarted while its link was down restores its tabs at 80x24) has to be
+            // sized again, and an equal cached size would send it nothing.
+            state.sized.retain(|t, _| live.contains(t));
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 state.focused = 0;
                 state.snapshot = None;
@@ -6626,6 +6631,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -9030,34 +9036,26 @@ mod tests {
     }
 
     /// Every tile is sized to its own rectangle, the unfocused one included, and asking
-    /// again with nothing changed nudges only the focused one.
+    /// again with nothing changed sends nothing, the focused one included: an equal size
+    /// is the daemon's one-row-short nudge, and a shell reading its size then is wrong.
     #[test]
     fn every_tile_is_sized_and_an_unchanged_one_is_not_sent_again() {
         let mut state = tiled_state();
         let mut seqs = std::collections::BTreeMap::new();
-        assert!(
-            size_terminals(&mut state, &mut seqs, true)
-                .unwrap()
-                .is_some()
-        );
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
         assert_eq!(sent(&seqs), vec![(1, 1), (2, 1)]);
         let right = layout_rect(&state, 2);
         assert_eq!(state.sized[&2], (right.cols as u16, right.rows as u16));
         assert!(right.cols < pane_area(&state).cols, "a tile, not the pane");
-        size_terminals(&mut state, &mut seqs, true).unwrap();
-        assert_eq!(sent(&seqs), vec![(1, 2), (2, 1)], "only the focused nudge");
-        assert!(
-            size_terminals(&mut state, &mut seqs, false)
-                .unwrap()
-                .is_none()
-        );
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_none());
+        assert_eq!(sent(&seqs), vec![(1, 1), (2, 1)], "nothing sent twice");
         // Moving the focus to a tile already at its size sends it nothing: an equal size
         // would be the daemon's one-row-short repaint nudge.
         let mut control_seq = 0;
         focus(&mut state, 2, &mut control_seq, &mut seqs).unwrap();
         assert_eq!(
             sent(&seqs),
-            vec![(1, 2), (2, 1)],
+            vec![(1, 1), (2, 1)],
             "no resize on a focus move"
         );
     }
@@ -9071,7 +9069,7 @@ mod tests {
         state.rows.push(agent(4, 2, "codex", "working"));
         state.rows.push(agent(5, 2, "claude", "sleeping"));
         let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut state, &mut seqs, true).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         let area = pane_area(&state);
         let whole = (area.cols as u16, area.rows as u16);
         assert_eq!(state.sized.get(&3), Some(&whole));
@@ -9080,7 +9078,7 @@ mod tests {
         assert!(!seqs.contains_key(&5));
         // Gone from the index: forgotten, so it is sized again if it comes back.
         state.rows.retain(|r| r.terminal != 3);
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         assert_eq!(state.sized.get(&3), None);
     }
 
@@ -9091,11 +9089,11 @@ mod tests {
         let mut state = tiled_state();
         state.rows.push(agent(3, 1, "zsh", "idle"));
         let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         let before = state.sized[&3];
         state.sidebar_drag = Some(state.sidebar_width);
         state.sidebar_width += 6;
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         assert_eq!(
             state.sized[&3], before,
             "an off-screen tab followed the drag"
@@ -9103,7 +9101,7 @@ mod tests {
         assert_eq!(seqs[&3], 1);
         assert_ne!(seqs[&1], 1, "the tiles on screen follow it");
         state.sidebar_drag = None;
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         assert_eq!(seqs[&3], 2, "sized once the drag let go");
         assert_ne!(state.sized[&3], before);
     }
@@ -9114,16 +9112,16 @@ mod tests {
     fn zoom_sizes_the_zoomed_pane_and_leaves_the_hidden_one_alone() {
         let mut state = tiled_state();
         let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut state, &mut seqs, true).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         let tile = state.sized[&2];
         assert!(state.layouts.get_mut(&1).unwrap().toggle_zoom());
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         let area = pane_area(&state);
         assert_eq!(state.sized[&1], (area.cols as u16, area.rows as u16));
         assert_eq!(state.sized[&2], tile, "kept while hidden");
         assert_eq!(seqs[&2], 1, "the hidden pane was not sent anything");
         assert!(state.layouts.get_mut(&1).unwrap().toggle_zoom());
-        size_terminals(&mut state, &mut seqs, false).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
         assert_eq!(seqs[&2], 1, "back at the size it kept");
         assert_eq!(seqs[&1], 3, "the focused one sized back to its tile");
     }

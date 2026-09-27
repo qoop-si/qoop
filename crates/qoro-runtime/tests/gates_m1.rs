@@ -208,6 +208,30 @@ async fn g1_22_an_unterminated_control_string_does_not_grow_memory() {
         c.wait_for_text("ALIVE_42", PATIENCE).await,
         "the parser did not recover from an unterminated control string"
     );
+    // Discarded whole, and said so where the terminal is explained: a counter nobody
+    // outside the parser can read is a silent discard with extra steps.
+    use qoro_runtime::control::{ControlRequest, ControlResponse};
+    let terminal = d.terminals().streams()[0];
+    let agents = match c
+        .control(&ControlRequest::ListAgents { id: "g1.22".into() }, PATIENCE)
+        .await
+    {
+        Some(ControlResponse::Agents { agents, .. }) => agents,
+        other => panic!("an agents listing was expected: {other:?}"),
+    };
+    let discards = agents
+        .iter()
+        .find(|row| row.terminal == terminal)
+        .and_then(|row| row.discards)
+        .unwrap_or_default();
+    assert_eq!(
+        discards.control_strings, 1,
+        "the discard is not on the terminal's row: {discards:?}"
+    );
+    assert!(
+        discards.control_string_bytes >= 600_000,
+        "the discarded bytes are not all counted: {discards:?}"
+    );
 }
 
 /// G1.10: many simultaneous attaches all succeed and are all served.

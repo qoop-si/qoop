@@ -359,6 +359,9 @@ pub struct TerminalHandle {
     /// Pictures dropped by the per-terminal flood guard. Counted, like every
     /// other discard: a missing picture must be sayable.
     pub image_flood_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// What the engine has discarded, as of its last read that changed it. Written by the
+    /// terminal's own task, which owns the engine, and read by the index.
+    pub discards: Arc<std::sync::Mutex<qoro_terminal::Discards>>,
     /// The live pty size, packed cols in the high half and rows in the low half.
     /// Written on resize, read at teardown: when the last update was a picture
     /// (which carries no grid), the end still carries a blank screen of the
@@ -1088,6 +1091,19 @@ pub enum Warning {
     /// discipline discards everything past its limit while every write returns success, so
     /// "it arrived" is not something we can honestly report.
     CanonicalPasteWithoutNewline { bytes: usize, limit: usize },
+}
+
+/// The most warnings kept: plenty for a gate to find the one it caused, and a ceiling for a
+/// daemon that runs for weeks with nothing in production reading them.
+const MAX_WARNINGS: usize = 64;
+
+/// Record a warning, dropping the oldest past `MAX_WARNINGS`.
+fn warn(warnings: &std::sync::Mutex<Vec<Warning>>, warning: Warning) {
+    let mut warnings = warnings.lock().unwrap();
+    if warnings.len() >= MAX_WARNINGS {
+        warnings.remove(0);
+    }
+    warnings.push(warning);
 }
 
 /// The tty line discipline's canonical input limit. POSIX puts the floor at 255 and every
@@ -2238,6 +2254,7 @@ fn tomb_row(tomb: &crate::agents::Tombstone) -> crate::control::AgentRow {
         slept_at_unix: Some(tomb.slept_at_unix),
         activity: None,
         pgid: None,
+        discards: None,
     }
 }
 
@@ -2882,6 +2899,24 @@ async fn handle_control(
                         slept_at_unix: None,
                         activity,
                         pgid,
+                        // Present once anything was thrown away, so the ordinary row
+                        // does not grow by a block of zeros.
+                        discards: terminals
+                            .get(terminal)
+                            .map(|handle| {
+                                let engine = *handle.discards.lock().unwrap();
+                                crate::control::Discards {
+                                    control_strings: engine.control_strings,
+                                    control_string_bytes: engine.control_string_bytes,
+                                    images: engine.images,
+                                    image_bytes: engine.image_bytes,
+                                    evicted_unobserved: engine.evicted_unobserved,
+                                    images_flooded: handle
+                                        .image_flood_dropped
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                }
+                            })
+                            .filter(|discards| *discards != crate::control::Discards::default()),
                     }
                 })
                 .collect();
@@ -3646,6 +3681,7 @@ pub fn open_terminal(
         updates: updates.clone(),
         last_image: Arc::new(std::sync::Mutex::new(None)),
         image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        discards: Arc::default(),
         last_dims: Arc::new(std::sync::atomic::AtomicU64::new((80u64 << 32) | 24u64)),
     };
     terminals.insert(stream, handle.clone());
@@ -4037,11 +4073,25 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
     // failed read must never make an open row look like it has no history to keep.
     let mut open = std::collections::BTreeSet::new();
     let mut read_all = true;
+    let mut listed = Vec::new();
     for space in spaces {
         let Ok(rows) = into.books.store.open_terminals(space.id).await else {
             read_all = false;
             continue;
         };
+        listed.push((space, rows));
+    }
+    // A directory that is gone is not a reason to lose the tab. The shell starts where the
+    // daemon is instead, which is visible and recoverable, unlike a tab that silently did
+    // not come back. Every directory is asked about before any tab opens, at once, because
+    // this runs before the socket is served: see `existing_dirs`.
+    let dirs = existing_dirs(
+        listed
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|row| PathBuf::from(&row.cwd))),
+    )
+    .await;
+    for (space, rows) in listed {
         for row in rows {
             report.terminals += 1;
             let stream = row.id as u32;
@@ -4049,17 +4099,9 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
             // The registry has to keep minting above what came back, or the next new
             // terminal takes the number of one already on screen.
             into.terminals.mint_above(stream);
+            // The row keeps its directory either way.
             let cwd = PathBuf::from(&row.cwd);
-            // A directory that is gone is not a reason to lose the tab. The shell starts
-            // where the daemon is instead, which is visible and recoverable, unlike a tab
-            // that silently did not come back. Probed with a deadline, because this runs
-            // before the socket is served and a hung mount held the whole start. A busy
-            // pool counts as unchecked, and an unchecked path is not spawned into: its
-            // `chdir` would run on this thread. The row keeps its directory either way.
-            let cwd = match is_dir_probed(&cwd).await {
-                Ok(true) => Some(cwd),
-                _ => None,
-            };
+            let cwd = dirs.contains(&cwd).then_some(cwd);
             let opened = open_terminal(
                 &into.terminals,
                 stream,
@@ -4227,6 +4269,33 @@ const SEARCH_CHUNK: u64 = 16_384;
 
 /// How long a check of a directory the user chose may take before it is abandoned.
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Which of `paths` are directories, every one probed at once under the same deadline.
+///
+/// Restore runs before the socket is served, and a client's handshake deadline
+/// (`SEQUENCE_DEADLINE`, ten seconds) covers all of it. One probe after another cost a
+/// `PROBE_DEADLINE` per tab on a dead mount, so a handful of such tabs failed the attach of
+/// a daemon that was only busy; at once, the start waits one deadline however many there
+/// are. Each distinct path is probed once, so tabs sharing a dead directory hold one probe
+/// thread between them, not one each.
+///
+/// A path left out is gone, or did not answer in time, or found the pool busy. None of
+/// those is spawned into: an unchecked path's `chdir` would run on this thread.
+async fn existing_dirs(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut probes = tokio::task::JoinSet::new();
+    for path in paths.into_iter().collect::<std::collections::BTreeSet<_>>() {
+        probes.spawn(async move { matches!(is_dir_probed(&path).await, Ok(true)).then_some(path) });
+    }
+    let mut found = std::collections::BTreeSet::new();
+    while let Some(probed) = probes.join_next().await {
+        if let Ok(Some(path)) = probed {
+            found.insert(path);
+        }
+    }
+    found
+}
 
 /// Whether a path the user chose is a directory, asked on the probe pool (ADR-011).
 ///
@@ -5177,6 +5246,8 @@ async fn terminal_task(
 
     let afd = AsyncFd::with_interest(MasterIo(master), Interest::READABLE | Interest::WRITABLE)?;
     let mut engine = AlacrittyEngine::new(INITIAL_SIZE.cols, INITIAL_SIZE.rows);
+    // The engine's discards as last handed to the index.
+    let mut discarded = qoro_terminal::Discards::default();
     let mut buf = vec![0u8; 64 * 1024];
     let mut policy = SizePolicy::Unowned;
     // Writable clients refused a size while another owned the terminal, oldest first, with
@@ -5257,7 +5328,8 @@ async fn terminal_task(
                             // The only honest thing to do is say so.
                             let longest = longest_line(&bytes);
                             if longest > MAX_CANON && is_canonical(master_raw) {
-                                warnings.lock().unwrap().push(
+                                warn(
+                                    &warnings,
                                     Warning::CanonicalPasteWithoutNewline {
                                         bytes: longest,
                                         limit: MAX_CANON,
@@ -5521,6 +5593,17 @@ async fn terminal_task(
                                 // carries the measurement that chose the number.
                                 if index % SLICES_PER_TURN == SLICES_PER_TURN - 1 {
                                     tokio::task::yield_now().await;
+                                }
+                            }
+                            // What the engine threw away, handed to the index once it
+                            // changes: before this read's screen is published, so a client
+                            // that sees the output after a discard also sees it counted.
+                            // Compared first, so the ordinary read takes no lock.
+                            let now = engine.discards();
+                            if now != discarded {
+                                discarded = now;
+                                if let Some(handle) = terminals.get(stream) {
+                                    *handle.discards.lock().unwrap() = now;
                                 }
                             }
                             for reply in replies(&effects) {
@@ -6246,6 +6329,33 @@ mod image_wire_tests {
 }
 
 #[cfg(test)]
+mod warning_tests {
+    use super::{MAX_WARNINGS, Warning, warn};
+
+    fn paste(bytes: usize) -> Warning {
+        Warning::CanonicalPasteWithoutNewline { bytes, limit: 0 }
+    }
+
+    /// Nothing in production drains the list, so recording is what has to bound it, and
+    /// what it drops is the oldest: a gate reads the warning it just caused.
+    #[test]
+    fn warnings_keep_the_newest_and_stop_growing() {
+        let warnings = std::sync::Mutex::new(Vec::new());
+        for bytes in 0..MAX_WARNINGS + 10 {
+            warn(&warnings, paste(bytes));
+        }
+        let kept = warnings.into_inner().unwrap();
+        assert_eq!(kept.len(), MAX_WARNINGS, "the list grew past its bound");
+        assert_eq!(
+            kept.first(),
+            Some(&paste(10)),
+            "the oldest were not the ones dropped"
+        );
+        assert_eq!(kept.last(), Some(&paste(MAX_WARNINGS + 9)));
+    }
+}
+
+#[cfg(test)]
 mod nudge_tests {
     use super::{NUDGE_RESTORE_DELAY, needs_nudge, nudged_size};
     use qoro_domain::PtySize;
@@ -6506,6 +6616,7 @@ mod idle_reap_tests {
                 updates,
                 last_image: Arc::new(std::sync::Mutex::new(None)),
                 image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                discards: Arc::default(),
                 last_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );

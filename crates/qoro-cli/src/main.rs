@@ -2186,7 +2186,7 @@ fn explain_row(row: &qoro_runtime::control::AgentRow) -> String {
     let source = row.source.as_deref().unwrap_or("unobserved");
     let rule = row.rule.as_deref().unwrap_or("-");
     let manifest = row.manifest.as_deref().unwrap_or("-");
-    format!(
+    let mut text = format!(
         "terminal={} state={} source={} program={} generation={} readiness={} workspace={}\nrule={} manifest={}\n",
         row.terminal,
         row.state,
@@ -2197,7 +2197,22 @@ fn explain_row(row: &qoro_runtime::control::AgentRow) -> String {
         row.workspace,
         rule,
         manifest,
-    )
+    );
+    // Only when something was thrown away: a screen missing a sequence, a picture or some
+    // scrollback can read wrong, and this is where a person asking why finds out.
+    if let Some(d) = row.discards {
+        text.push_str(&format!(
+            "discarded: control_strings={} ({} bytes) images={} ({} bytes) images_flooded={} \
+             evicted_unobserved={}\n",
+            d.control_strings,
+            d.control_string_bytes,
+            d.images,
+            d.image_bytes,
+            d.images_flooded,
+            d.evicted_unobserved,
+        ));
+    }
+    text
 }
 
 /// Start the daemon if there is not one, and wait for its socket.
@@ -2418,6 +2433,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -2442,6 +2458,30 @@ mod tests {
         assert!(
             text.contains("rule=needs_approval") && text.contains("manifest=claude"),
             "then what the screen matched: {text}"
+        );
+    }
+
+    #[test]
+    fn an_explanation_says_what_the_screen_is_missing() {
+        let mut row = row(3, None, Some("claude"));
+        assert!(
+            !explain_row(&row).contains("discarded"),
+            "a terminal that lost nothing says nothing about it"
+        );
+        row.discards = Some(qoro_runtime::control::Discards {
+            control_strings: 2,
+            control_string_bytes: 9000,
+            evicted_unobserved: 1,
+            images_flooded: 3,
+            ..Default::default()
+        });
+        let text = explain_row(&row);
+        assert!(
+            text.contains(
+                "discarded: control_strings=2 (9000 bytes) images=0 (0 bytes) images_flooded=3 \
+                 evicted_unobserved=1"
+            ),
+            "the discards are named with their counts: {text}"
         );
     }
 

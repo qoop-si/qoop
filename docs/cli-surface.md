@@ -44,7 +44,7 @@ a claim nobody has to keep.
 | `qoro history <target> [--last N] [--role user\|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user\|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
-| `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest | no |
+| `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest, and what its screen discarded when anything was | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |

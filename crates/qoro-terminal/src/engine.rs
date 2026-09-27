@@ -154,6 +154,24 @@ impl Default for TerminalModes {
     }
 }
 
+/// What the engine has thrown away rather than parsed or kept, counted since it started.
+///
+/// Each count is the one its own module keeps; this is how they leave the crate, so a
+/// discard is sayable by whoever reports on the terminal rather than only by a test here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Discards {
+    /// Control strings over `MAX_CONTROL_STRING`, dropped whole.
+    pub control_strings: u64,
+    /// The bytes that went with them.
+    pub control_string_bytes: u64,
+    /// Image envelopes over `MAX_IMAGE_BYTES` or past `IMAGE_DEADLINE`, dropped whole.
+    pub images: u64,
+    /// The bytes that went with them.
+    pub image_bytes: u64,
+    /// Feeds that found the scrollback ring full, and so may have lost rows unseen.
+    pub evicted_unobserved: u64,
+}
+
 pub trait TerminalEngine: Send {
     /// Feed bytes. Returns what changed and what the caller must do about it.
     fn feed(&mut self, bytes: &[u8]) -> (Damage, Vec<TerminalEffect>);
@@ -198,4 +216,7 @@ pub trait TerminalEngine: Send {
     /// in-memory window, so this must be drained between parse sub-slices rather than once
     /// per read. Draining it per read loses history silently.
     fn take_scrolled_off(&mut self) -> Vec<String>;
+    /// Everything discarded so far. Not defaulted: an engine that answered zero without
+    /// counting would make every discard silent again.
+    fn discards(&self) -> Discards;
 }

@@ -26,7 +26,7 @@ use bytes::Bytes;
 
 use crate::control_string::ControlStringFilter;
 use crate::engine::{
-    Colour, Damage, LineDamage, Snapshot, Span, Style, TerminalEffect, TerminalEngine,
+    Colour, Damage, Discards, LineDamage, Snapshot, Span, Style, TerminalEffect, TerminalEngine,
     TerminalModes,
 };
 
@@ -498,6 +498,18 @@ impl TerminalEngine for AlacrittyEngine {
     fn take_scrolled_off(&mut self) -> Vec<String> {
         std::mem::take(&mut self.scrolled_off)
     }
+
+    fn discards(&self) -> Discards {
+        let (control_strings, control_string_bytes) = self.filter.discarded();
+        let (images, image_bytes) = self.sniffer.discarded();
+        Discards {
+            control_strings,
+            control_string_bytes,
+            images,
+            image_bytes,
+            evicted_unobserved: self.evicted_unobserved,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +518,28 @@ mod tests {
 
     fn engine() -> AlacrittyEngine {
         AlacrittyEngine::new(80, 24)
+    }
+
+    #[test]
+    fn every_discard_leaves_the_crate_through_the_engine() {
+        // The counters live in the filter, the sniffer and the adapter; nothing outside
+        // this crate can reach the first two, so the engine is the one way out.
+        let mut e = engine();
+        assert_eq!(e.discards(), Discards::default());
+        let mut osc = b"\x1b]0;".to_vec();
+        osc.extend(std::iter::repeat_n(b'A', crate::MAX_CONTROL_STRING * 2));
+        osc.push(0x07);
+        e.feed(&osc);
+        let burst: String = std::iter::repeat_n("x\r\n", SCROLLBACK_ROWS * 3).collect();
+        e.feed(burst.as_bytes());
+        let d = e.discards();
+        assert_eq!(d.control_strings, 1, "{d:?}");
+        assert!(
+            d.control_string_bytes > crate::MAX_CONTROL_STRING as u64,
+            "{d:?}"
+        );
+        assert!(d.evicted_unobserved > 0, "{d:?}");
+        assert_eq!(d.evicted_unobserved, e.evicted_unobserved());
     }
 
     /// The byte sequence and the split that lose a character in the pinned parser.

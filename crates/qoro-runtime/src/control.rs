@@ -584,6 +584,26 @@ pub struct WorkspaceRow {
     pub terminals: usize,
 }
 
+/// What a terminal threw away rather than drew, as an index row carries it.
+///
+/// Its own shape and not the engine's, for the reason every type here is: a counter
+/// renamed in the engine must not change what crosses the socket. Counters only, so a
+/// field added later reads as zero from an older daemon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Discards {
+    /// Control strings over their bound, dropped whole, and their bytes.
+    pub control_strings: u64,
+    pub control_string_bytes: u64,
+    /// Image envelopes over their bound or deadline, dropped whole, and their bytes.
+    pub images: u64,
+    pub image_bytes: u64,
+    /// Feeds that found the scrollback ring full, and so may have lost rows unseen.
+    pub evicted_unobserved: u64,
+    /// Pictures the daemon's flood guard dropped before any client was sent them.
+    pub images_flooded: u64,
+}
+
 /// One terminal, as an index shows it.
 ///
 /// Strings on the wire and not the domain's own enums, deliberately. ADR-010 freezes the
@@ -713,6 +733,13 @@ pub struct AgentRow {
     /// client's place line disambiguates with.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// What this terminal's engine threw away rather than parsed or kept, counted since
+    /// the terminal started: control strings over their bound, image envelopes over theirs,
+    /// feeds that may have lost scrollback unseen. Present only once something was, which
+    /// is what lets `qoro agents explain` say a screen is missing something rather than
+    /// leave the discard silent. Absent on rows from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discards: Option<Discards>,
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -1068,6 +1095,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");

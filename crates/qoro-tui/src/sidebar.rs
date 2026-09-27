@@ -2041,6 +2041,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -2065,6 +2066,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -2566,6 +2568,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }
     }
 
@@ -2812,6 +2815,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2846,6 +2850,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            discards: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
