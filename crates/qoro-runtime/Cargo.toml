@@ -10,7 +10,7 @@ publish = false
 qoro-events = { path = "../qoro-events" }
 qoro-store = { path = "../qoro-store" }
 bytes = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,11 +21,10 @@ qoro-proto = { path = "../qoro-proto" }
 qoro-pty = { path = "../qoro-pty" }
 qoro-terminal = { path = "../qoro-terminal" }
 qoro-detect = { path = "../qoro-detect" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { workspace = true }
 unicode-width = "0.2"
 tempfile = { workspace = true }
 
 [dev-dependencies]
-libc = { workspace = true }
 qoro-store = { path = "../qoro-store" }
 qoro-testkit = { path = "../qoro-testkit" }

@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 """Gate G1.23: no `unsafe` outside qoro-pty without a SAFETY comment.
 
 `unsafe` is not banned, it is accounted for. A block with no stated reason is one nobody can
 review, and the crates that are supposed to have none say so in their own source with
 `forbid(unsafe_code)`, which the compiler enforces. This checks the rest: every remaining
-`unsafe` has a SAFETY comment on the lines immediately above it.
+`unsafe` has a SAFETY comment on the lines immediately above it, or anywhere in the
+comment block that ends directly above it (a long reason is still one reason).
 """
 
 import pathlib
@@ -27,7 +29,12 @@ def main() -> int:
                 continue
             counted += 1
             window = lines[max(0, i - LOOKBACK) : i]
-            if not any("SAFETY:" in w for w in window):
+            ok = any("SAFETY:" in w for w in window)
+            j = i - 1
+            while not ok and j >= 0 and lines[j].strip().startswith("//"):
+                ok = "SAFETY:" in lines[j]
+                j -= 1
+            if not ok:
                 rel = path.relative_to(ROOT)
                 problems.append(f"{rel}:{i + 1}: {line.strip()}")
 

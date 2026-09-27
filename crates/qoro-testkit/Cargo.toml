@@ -8,9 +8,9 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 serde_json = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 qoro-proto = { path = "../qoro-proto" }
 qoro-runtime = { path = "../qoro-runtime" }

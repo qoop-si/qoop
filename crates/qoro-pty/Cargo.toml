@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
 thiserror = { workspace = true }
 qoro-domain = { path = "../qoro-domain" }
 

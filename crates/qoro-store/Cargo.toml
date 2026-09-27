@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 qoro-domain = { path = "../qoro-domain" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

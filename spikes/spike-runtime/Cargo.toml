@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-libc = "0.2"
+libc = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 alacritty_terminal = "0.26"
 

@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 qoro-domain = { path = "../qoro-domain" }
 serde = { workspace = true }
-toml = "0.8"
+toml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
