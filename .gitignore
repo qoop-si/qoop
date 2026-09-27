@@ -8,3 +8,5 @@
 perf.data*
 /plans/
 /reviews/
+__pycache__/
+*.pyc
