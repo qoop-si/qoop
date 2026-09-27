@@ -130,7 +130,8 @@ pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, 
     // something else) otherwise hangs every caller, a hook inside an agent's turn included.
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
-        handshake(UnixStream::connect(socket).await?, client_id).await
+        let stream = UnixStream::connect(socket).await.map_err(not_running)?;
+        handshake(stream, client_id).await
     })
     .await
     .map_err(|_| {
@@ -139,6 +140,17 @@ pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, 
             "the daemon did not answer the handshake",
         )
     })?
+}
+
+/// A missing or dead socket is a session nobody started, said as such: "No such file or
+/// directory" names no fix. The kind is kept for callers that start a daemon on it.
+fn not_running(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+            io::Error::new(e.kind(), "no session running: `qoro` starts one")
+        }
+        _ => e,
+    }
 }
 
 /// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`

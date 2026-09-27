@@ -70,16 +70,8 @@ impl Link {
     async fn open(who: &str) -> std::io::Result<Self> {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        // A missing or dead socket is a session nobody started, said as such: these
-        // verbs never start a daemon, and "No such file or directory" names no fix.
-        let (stream, inbuf) = client::connect(&socket, who)
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                    std::io::Error::other("no session running: `qoro` starts one")
-                }
-                _ => e,
-            })?;
+        // These verbs never start a daemon; `connect` says when there is none.
+        let (stream, inbuf) = client::connect(&socket, who).await?;
         let (rd, wr) = stream.into_split();
         Ok(Self {
             rd,

@@ -200,20 +200,23 @@ fn wait_match_sees_text_already_on_the_screen() {
 }
 
 #[test]
-fn new_refuses_without_a_session_and_starts_none() {
+fn verbs_refuse_without_a_session_and_start_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let out = Command::new(env!("CARGO_BIN_EXE_qoro"))
-        .args(["new", "--", "true"])
-        .env("QORO_RUNTIME_DIR", dir.path())
-        .output()
-        .expect("run qoro");
-    assert_eq!(out.status.code(), Some(1));
-    // One line, the same shape for every command, never Rust's debug form.
-    assert_eq!(
-        text(&out.stderr),
-        "qoro: no session running: `qoro` starts one\n"
-    );
+    for args in [&["new", "--", "true"][..], &["read", "1"], &["agents"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_qoro"))
+            .args(args)
+            .env("QORO_RUNTIME_DIR", dir.path())
+            .output()
+            .expect("run qoro");
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        // One line, the same shape for every command, never Rust's debug form.
+        assert_eq!(
+            text(&out.stderr),
+            "qoro: no session running: `qoro` starts one\n",
+            "{args:?}"
+        );
+    }
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !qoro_testkit::socket_in(dir.path()).exists(),
