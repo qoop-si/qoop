@@ -227,16 +227,9 @@ pub struct Cost {
 /// terminals: their process groups mean nothing here.
 pub type Usage = std::collections::BTreeMap<u32, Cost>;
 
-/// The first line of a finished agent's last answer, by terminal, beside the
-/// `last_active_at_unix` it was read for: a newer turn makes it stale.
-pub type Heads = std::collections::BTreeMap<u32, (Option<i64>, String)>;
-
-/// The narrowest column that frames each waiting agent as a card; below it the pin keeps
-/// one row per agent.
-const CARD_MIN_WIDTH: usize = 20;
-
-/// Rows one card takes: its top edge, the name, the reason, its bottom edge.
-const CARD_ROWS: usize = 4;
+/// The narrowest column that boxes the pin's agents by kind; below it the pin keeps one
+/// row per agent.
+const BOX_MIN_WIDTH: usize = 20;
 
 /// The narrowest column that shows costs: below it the numbers would take the name's
 /// room, and the name is what the row is for.
@@ -431,8 +424,6 @@ pub struct Column<'a> {
     pub shut: &'a Shut,
     /// What each local agent costs, when the person asked to see it.
     pub usage: Option<&'a Usage>,
-    /// The first line of each finished agent's last answer, once read.
-    pub heads: Option<&'a Heads>,
 }
 
 /// One row of the column, and what a click on it means.
@@ -570,12 +561,14 @@ pub(crate) fn render_folded(c: &Column, height: usize) -> Vec<Line> {
 /// The pin: who needs a person, most urgent first, with the space each one is in.
 ///
 /// Nothing at all while nobody does, so a calm fleet gives the whole column to the tree.
-/// At most half the rows it is offered and at most [`PIN_MOST`] agents; past that it
-/// counts the rest. Every agent listed here is also a row under its own space.
+/// At most half the rows it is offered; past that it counts the rest. Every agent listed
+/// here is also a row under its own space.
 ///
-/// Each agent is a card framed in its state's colour: what it is waiting on and for how
-/// long in the top edge, its name, why it wants a person, and where it lives in the
-/// bottom edge. A column too narrow or too short for one card lists one row per agent.
+/// One box per kind, framed in that kind's colour and named in its top edge: everyone
+/// who wants something, then everyone who failed, then everyone who finished unread.
+/// Inside, each agent opens on its dot the way its row in the tree does, with how long
+/// it has waited on the right, and what it wants or how it failed under it. A column
+/// too narrow or too short for a box lists one row per agent.
 fn pin(c: &Column, room: usize) -> Vec<Row> {
     let mut needing: Vec<&AgentRow> = c
         .agents
@@ -594,38 +587,69 @@ fn pin(c: &Column, room: usize) -> Vec<Row> {
     }
     // Stable, so the daemon's order breaks every tie and rows do not trade places.
     needing.sort_by_key(|a| priority_of(a, c.focused_terminal, c.seen, c.unseen));
-    let total = needing.len();
-    let cards = c.width >= CARD_MIN_WIDTH && budget >= 2 + CARD_ROWS;
-    let each = if cards { CARD_ROWS } else { 1 };
-    let fits = ((budget - 2) / each).min(PIN_MOST);
-    // Past what fits, the last slot counts the rest, unless the pin has room for one
-    // agent only: then it shows that agent and the title's count says the rest.
-    let shown = if total <= fits || fits == 1 {
-        total.min(fits)
-    } else {
-        fits - 1
-    };
     let mut out = vec![(pin_title(c, &needing), None)];
-    for agent in needing.iter().take(shown) {
-        if cards {
-            out.extend(
-                card(c, agent)
-                    .into_iter()
-                    .map(|line| (line, Some(Hit::Pinned(agent.terminal)))),
-            );
+    let kinds: Vec<(&str, Vec<&AgentRow>)> = ["wants", "failed", "done"]
+        .into_iter()
+        .map(|word| {
+            let kind = needing
+                .iter()
+                .copied()
+                .filter(|a| wait_word(a).0 == word)
+                .collect();
+            (word, kind)
+        })
+        .filter(|(_, kind): &(&str, Vec<&AgentRow>)| !kind.is_empty())
+        .collect();
+    // The rows a box needs to name at least one agent: its edges, that agent, and the
+    // count of the rest when there is a rest. The title and the rule take two more.
+    let floor = |kind: &[&AgentRow]| 2 + box_rows(kind[0]) + usize::from(kind.len() > 1);
+    if c.width >= BOX_MIN_WIDTH && budget >= 2 + floor(&kinds[0].1) {
+        let mut left = budget - 2;
+        let mut unboxed = 0;
+        for (word, kind) in &kinds {
+            if left < floor(kind) {
+                unboxed += kind.len();
+                continue;
+            }
+            let rows = pin_box(c, word, kind, left - 2);
+            left -= rows.len();
+            out.extend(rows);
+        }
+        // A kind with no room for its box is counted under the boxes, and in the title
+        // when not even that row is left.
+        if unboxed > 0 && left > 0 {
+            out.push((
+                Line {
+                    text: fit(&format!("   +{unboxed} more"), c.width),
+                    colour: Some(crate::theme::Role::Faint),
+                    ..Line::default()
+                },
+                None,
+            ));
+        }
+    } else {
+        let total = needing.len();
+        let fits = (budget - 2).min(PIN_MOST);
+        // Past what fits, the last row counts the rest, unless the pin has room for one
+        // agent only: then it shows that agent and the title's count says the rest.
+        let shown = if total <= fits || fits == 1 {
+            total.min(fits)
         } else {
+            fits - 1
+        };
+        for agent in needing.iter().take(shown) {
             out.push((flat_line(c, agent, true), Some(Hit::Pinned(agent.terminal))));
         }
-    }
-    if shown < total && fits > 1 {
-        out.push((
-            Line {
-                text: fit(&format!("   +{} more", total - shown), c.width),
-                colour: Some(crate::theme::Role::Faint),
-                ..Line::default()
-            },
-            None,
-        ));
+        if shown < total && fits > 1 {
+            out.push((
+                Line {
+                    text: fit(&format!("   +{} more", total - shown), c.width),
+                    colour: Some(crate::theme::Role::Faint),
+                    ..Line::default()
+                },
+                None,
+            ));
+        }
     }
     out.push(divider(c.width));
     out
@@ -643,8 +667,8 @@ fn wait_word(agent: &AgentRow) -> (&'static str, crate::theme::Role) {
 }
 
 /// The pin's title: ` needs you`, then how many want what, each count in its colour, in
-/// the pin's own order: `▲1 wants  ✗1 failed  ✓2 done`. The words go first when the column is narrow, then
-/// the kinds, leaving the plain total.
+/// the pin's own order: `▲1 wants  ✗1 failed  ✓2 done`. The words go first when the
+/// column is narrow, then the kinds, leaving the plain total.
 fn pin_title(c: &Column, needing: &[&AgentRow]) -> Line {
     use crate::theme::Role;
     let count = |word: &str| needing.iter().filter(|a| wait_word(a).0 == word).count();
@@ -686,7 +710,7 @@ fn pin_title(c: &Column, needing: &[&AgentRow]) -> Line {
         .find(|(parts, gap)| wide(parts, *gap) < room)
         .unwrap_or_else(|| (vec![(needing.len().to_string(), Role::Title)], 1));
     let right = wide(&parts, gap);
-    let mut at = c.width - 1 - right;
+    let mut at = c.width.saturating_sub(1 + right);
     let mut text = fit_to(&head, at);
     let mut runs = Vec::new();
     for (i, (part, ink)) in parts.iter().enumerate() {
@@ -718,25 +742,21 @@ fn waited(c: &Column, agent: &AgentRow) -> Option<String> {
     })
 }
 
-/// Why a waiting agent wants a person: what it asked to do, how it failed, or the first
-/// line of the answer it finished with.
-fn wait_reason(c: &Column, agent: &AgentRow) -> String {
-    let activity = agent
+/// What a blocked agent asked to do or how a failed one failed, when it said. A finished
+/// agent has its dot and its name, and that is the whole of the news.
+fn wait_reason(agent: &AgentRow) -> Option<String> {
+    agent
         .activity
         .as_deref()
         .map(str::trim)
         .filter(|a| !a.is_empty() && *a != "thinking")
-        .map(humanize);
-    match agent.state.as_str() {
-        "blocked" => activity.unwrap_or_else(|| "waiting for you".to_string()),
-        "failed" => activity.unwrap_or_else(|| "stopped with an error".to_string()),
-        _ => c
-            .heads
-            .and_then(|heads| heads.get(&agent.terminal))
-            .filter(|(stamp, _)| *stamp == agent.last_active_at_unix)
-            .map(|(_, head)| head.clone())
-            .unwrap_or_else(|| "finished".to_string()),
-    }
+        .filter(|_| matches!(agent.state.as_str(), "blocked" | "failed"))
+        .map(humanize)
+}
+
+/// The rows an agent takes inside its box: its name, and why when it said why.
+fn box_rows(agent: &AgentRow) -> usize {
+    1 + usize::from(wait_reason(agent).is_some())
 }
 
 /// A line drawn from pieces, each in its own colour, cut to the column.
@@ -757,97 +777,103 @@ fn pieces(parts: &[(&str, Option<crate::theme::Role>)], width: usize) -> Line {
     }
 }
 
-/// One waiting agent as a card framed in its state's colour, one column in from each
-/// edge:
+/// One kind's box in the pin, at most `inside` rows between its edges, framed in the
+/// kind's colour one column in from each side of the column:
 ///
 /// ```text
-///  ╭─ wants ─────────── 12s ─╮
-///  │ Claude Code TUI tasarı… │
-///  │ Wait 8 seconds, then s… │
-///  ╰─ default · claude ──────╯
+///  ╭─ done ──────────────────╮
+///  │ ● 79fd9154…         23s │
+///  │ ● Agent mesajlaşm…   2m │
+///  ╰─────────────────────────╯
 /// ```
-fn card(c: &Column, agent: &AgentRow) -> [Line; CARD_ROWS] {
+///
+/// A blocked or failed agent says why on a second row, under its name. When not
+/// everyone fits, the last row inside counts the rest.
+fn pin_box(c: &Column, word: &str, kind: &[&AgentRow], inside: usize) -> Vec<Row> {
     use crate::theme::Role;
-    let (word, ink) = wait_word(agent);
+    let ink = Some(wait_word(kind[0]).1);
     let frame = c.width.saturating_sub(2);
     let inner = frame.saturating_sub(4);
-    let ink = Some(ink);
-    // The top edge: the word on the left, the time on the right.
-    let left = format!(" \u{256d}\u{2500} {word} ");
-    let right = waited(c, agent).map_or_else(
-        || "\u{2500}\u{256e}".to_string(),
-        |t| format!(" {t} \u{2500}\u{256e}"),
-    );
-    let dashes =
-        (frame + 1).saturating_sub(crate::width::width(&left) + crate::width::width(&right));
-    let top = match waited(c, agent) {
-        Some(t) => pieces(
-            &[
-                (&left, ink),
-                (&"\u{2500}".repeat(dashes), ink),
-                (&format!(" {t}"), Some(Role::Faint)),
-                (" \u{2500}\u{256e}", ink),
-            ],
-            c.width,
-        ),
-        None => pieces(
-            &[
-                (&left, ink),
-                (&"\u{2500}".repeat(dashes), ink),
-                (&right, ink),
-            ],
-            c.width,
-        ),
+    let all: usize = kind.iter().map(|a| box_rows(a)).sum();
+    // Everyone, when everyone fits; otherwise whoever fits above a row counting the rest.
+    let room = if all <= inside && kind.len() <= PIN_MOST {
+        inside
+    } else {
+        inside.saturating_sub(1)
     };
-    // Inside: the name, then the reason, each cut to the frame.
-    let inside = |text: &str, role: Role| {
-        let text = fit(&shorten_middle(text, inner), inner);
+    // Five at most; past that four and the count, as in the one-row list.
+    let cap = if kind.len() <= PIN_MOST {
+        PIN_MOST
+    } else {
+        PIN_MOST - 1
+    };
+    let mut shown = 0;
+    let mut used = 0;
+    for a in kind.iter().take(cap) {
+        if used + box_rows(a) > room {
+            break;
+        }
+        used += box_rows(a);
+        shown += 1;
+    }
+    let edge = |open: &str, close: &str, name: Option<&str>| {
+        let lead = match name {
+            Some(name) => format!(" {open}\u{2500} {name} "),
+            None => format!(" {open}"),
+        };
+        let dashes = (frame + 1).saturating_sub(crate::width::width(&lead) + 1);
         pieces(
-            &[(" \u{2502} ", ink), (&text, Some(role)), (" \u{2502}", ink)],
+            &[
+                (&lead, ink),
+                (&"\u{2500}".repeat(dashes), ink),
+                (close, ink),
+            ],
             c.width,
         )
     };
-    let name = inside(&session_name(agent), Role::Text);
-    let reason = inside(&wait_reason(c, agent), Role::Detail);
-    // The bottom edge: the space in its own colour and the tab, the tab giving way first.
-    let space = c
-        .spaces
-        .iter()
-        .find(|s| s.id == agent.workspace)
-        .map(|s| s.name.clone());
-    let tab = label(agent);
-    let open = " \u{2570}\u{2500} ";
-    let room = (frame + 1).saturating_sub(crate::width::width(open) + 2);
-    // The space keeps its name unless the tab would be left under eight columns.
-    let tab_keeps = crate::width::width(&tab).min(8) + 3;
-    let space_text = space
-        .as_deref()
-        .map(|s| shorten_middle(s, room.saturating_sub(tab_keeps).max(4)));
-    let space_w = space_text.as_deref().map_or(0, crate::width::width);
-    let tab_room = room.saturating_sub(space_w + if space_text.is_some() { 3 } else { 0 });
-    let tab_text = (tab_room >= 2).then(|| shorten_middle(&tab, tab_room));
-    let mut parts: Vec<(String, Option<Role>)> = vec![(open.to_string(), ink)];
-    if let Some(space) = &space_text {
-        parts.push((space.clone(), Some(crate::theme::space_of(agent.workspace))));
-    }
-    if let Some(tab) = &tab_text {
-        if space_text.is_some() {
-            parts.push((" \u{b7} ".to_string(), Some(Role::Faint)));
+    let inside_row = |parts: &[(&str, Option<Role>)]| {
+        let mut all = vec![(" \u{2502} ", ink)];
+        all.extend_from_slice(parts);
+        let body: usize = parts.iter().map(|(p, _)| crate::width::width(p)).sum();
+        let pad = " ".repeat(inner.saturating_sub(body));
+        all.push((&pad, None));
+        all.push((" \u{2502}", ink));
+        pieces(&all, c.width)
+    };
+    let mut out = vec![(edge("\u{256d}", "\u{256e}", Some(word)), None)];
+    for agent in kind.iter().take(shown) {
+        let (role, _) = dot_of(c, agent);
+        let mark = mark_of(c, agent, role).to_string();
+        let time = waited(c, agent).unwrap_or_default();
+        let time_w = crate::width::width(&time);
+        let name_room = inner.saturating_sub(2 + if time_w > 0 { time_w + 1 } else { 0 });
+        let name = shorten_middle(&session_name(agent), name_room);
+        let gap = " ".repeat(inner.saturating_sub(2 + crate::width::width(&name) + time_w));
+        let mut line = inside_row(&[
+            (&mark, None),
+            (" ", None),
+            (&name, None),
+            (&gap, None),
+            (&time, Some(Role::Faint)),
+        ]);
+        // The dot is the tree's own sign, so the painter treats both the same.
+        line.indicator = Some((3, 1, role));
+        out.push((line, Some(Hit::Pinned(agent.terminal))));
+        if let Some(reason) = wait_reason(agent) {
+            let reason = shorten_middle(&reason, inner.saturating_sub(4));
+            let line = inside_row(&[
+                ("  \u{2514} ", Some(Role::Rule)),
+                (&reason, Some(Role::Detail)),
+            ]);
+            out.push((line, Some(Hit::Pinned(agent.terminal))));
         }
-        parts.push((tab.clone(), Some(Role::Faint)));
     }
-    let used: usize = parts.iter().map(|(p, _)| crate::width::width(p)).sum();
-    parts.push((
-        format!(
-            " {}",
-            "\u{2500}".repeat((frame + 1).saturating_sub(used + 2))
-        ),
-        ink,
-    ));
-    parts.push(("\u{256f}".to_string(), ink));
-    let refs: Vec<(&str, Option<Role>)> = parts.iter().map(|(p, r)| (p.as_str(), *r)).collect();
-    let bottom = pieces(&refs, c.width);
-    [top, name, reason, bottom]
+    if shown < kind.len() {
+        let more = format!("  +{} more", kind.len() - shown);
+        out.push((inside_row(&[(&more, Some(Role::Faint))]), None));
+    }
+    out.push((edge("\u{2570}", "\u{256f}", None), None));
+    out
 }
 
 /// The title: `spaces` on the left, the order word and the `+` on the right.
@@ -2086,7 +2112,6 @@ mod tests {
             width,
             shut,
             usage: None,
-            heads: None,
         }
     }
 
@@ -2744,31 +2769,32 @@ mod tests {
                             Some(Hit::Terminal(_)) => above,
                             _ => Some(Hit::Terminal(3)),
                         }
-                    } else if text.starts_with([' '])
-                        && text[1..].starts_with(['\u{256d}', '\u{2502}', '\u{2570}'])
-                    {
-                        // A card row in the pin reaches the agent its name row names: the
-                        // row under the card's top edge.
-                        let top = (0..=row)
-                            .rev()
-                            .find(|r| lines[*r].text.starts_with(" \u{256d}"))
-                            .expect("a card row under a top edge");
-                        let named = lines
-                            .get(top + 1)
-                            .map(|l| {
-                                l.text
-                                    .trim_start_matches(" \u{2502} ")
-                                    .trim_end()
-                                    .trim_end_matches('\u{2502}')
-                                    .trim_end()
-                                    .trim_end_matches('\u{2026}')
-                                    .to_string()
-                            })
-                            .unwrap_or_default();
-                        agents
-                            .iter()
-                            .find(|a| !named.is_empty() && session_name(a).starts_with(&named))
-                            .map(|a| Hit::Pinned(a.terminal))
+                    } else if text.starts_with(" \u{256d}") || text.starts_with(" \u{2570}") {
+                        // A box's edges in the pin reach nothing.
+                        None
+                    } else if let Some(inside) = text.strip_prefix(" \u{2502} ") {
+                        // Inside a box: the reason under an agent reaches that agent, the
+                        // count of the rest reaches nothing, and an agent's row reaches the
+                        // agent its name names.
+                        let inside = inside.trim_end_matches('\u{2502}').trim();
+                        if inside.starts_with('\u{2514}') {
+                            above
+                        } else if inside.starts_with('+') {
+                            None
+                        } else {
+                            let named = inside
+                                .trim_start_matches([DOT, FAILED_DOT])
+                                .trim()
+                                .split("  ")
+                                .next()
+                                .unwrap_or("")
+                                .trim_end_matches('\u{2026}')
+                                .to_string();
+                            agents
+                                .iter()
+                                .find(|a| !named.is_empty() && session_name(a).starts_with(&named))
+                                .map(|a| Hit::Pinned(a.terminal))
+                        }
                     } else if text.is_empty()
                         || text.chars().all(|c| c == '\u{2500}')
                         || text.starts_with(&format!(" {PIN_TITLE}"))
@@ -3877,11 +3903,11 @@ mod tests {
         );
     }
 
-    /// Each agent that needs a person is a card framed in its state's colour: what it
-    /// waits on and for how long, its name, why, and where it lives. The title counts
-    /// each kind in its colour.
+    /// Everyone who needs a person sits in one box per kind, framed in the kind's colour:
+    /// each opens on its dot like its row in the tree, with how long it has waited on the
+    /// right, and a blocked one says what it wants under its name.
     #[test]
-    fn the_pin_frames_each_agent_as_a_card() {
+    fn the_pin_boxes_each_kind_and_dots_every_agent_like_the_tree() {
         let spaces = vec![space(1, "default"), space(2, "test space")];
         let mut blocked = agent(1, 1, "claude", "blocked");
         blocked.agent_title = Some("Claude Code TUI tasar\u{131}m ve bes".into());
@@ -3890,14 +3916,15 @@ mod tests {
         let mut done = agent(2, 2, "claude", "idle");
         done.agent_session = Some("0d140105-aaaa".into());
         done.last_active_at_unix = Some(NOW - 150);
+        let mut other = agent(3, 1, "codex", "idle");
+        other.agent_title = Some("Agent mesajla\u{15f}mas\u{131} ve kontrol".into());
+        other.last_active_at_unix = Some(NOW - 30);
         let mut unseen = Unseen::new();
         unseen.insert((2, gen_of(&done)));
-        let agents = vec![blocked, done];
-        let mut heads = Heads::new();
-        heads.insert(2, (Some(NOW - 150), "Tests pass: 1618 ok".into()));
-        let shut = Shut::new();
-        let seen = Seen::new();
-        let mut c = column(
+        unseen.insert((3, gen_of(&other)));
+        let agents = vec![blocked, done, other];
+        let (seen, shut) = (Seen::new(), Shut::new());
+        let c = column(
             &spaces,
             &agents,
             1,
@@ -3910,35 +3937,51 @@ mod tests {
             WIDTH,
             &shut,
         );
-        c.heads = Some(&heads);
         let rows = rows_folded(&c, 40, None);
         let texts: Vec<String> = rows
             .iter()
             .map(|(l, _)| l.text.trim_end().to_string())
             .collect();
+        let edge = |n: usize| "\u{2500}".repeat(n);
         assert_eq!(
             texts[..10],
             [
-                " needs you  \u{25b2}1 wants  \u{2713}1 done",
-                " \u{256d}\u{2500} wants \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} 12s \u{2500}\u{256e}",
-                " \u{2502} Claude Code TUI tasar\u{131}m\u{2026} \u{2502}",
-                " \u{2502} Wait 8 seconds, then sh\u{2026} \u{2502}",
-                " \u{2570}\u{2500} default \u{b7} claude \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
-                " \u{256d}\u{2500} done \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} 2m \u{2500}\u{256e}",
-                " \u{2502} 0d140105\u{2026}                \u{2502}",
-                " \u{2502} Tests pass: 1618 ok      \u{2502}",
-                " \u{2570}\u{2500} test space \u{b7} claude \u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
-                &"\u{2500}".repeat(WIDTH),
+                " needs you  \u{25b2}1 wants  \u{2713}2 done".to_string(),
+                format!(" \u{256d}\u{2500} wants {}\u{256e}", edge(18)),
+                " \u{2502} \u{25cf} Claude Code TUI t\u{2026} 12s \u{2502}".to_string(),
+                " \u{2502}   \u{2514} Wait 8 seconds, the\u{2026} \u{2502}".to_string(),
+                format!(" \u{2570}{}\u{256f}", edge(26)),
+                format!(" \u{256d}\u{2500} done {}\u{256e}", edge(19)),
+                " \u{2502} \u{25cf} 0d140105\u{2026}           2m \u{2502}".to_string(),
+                " \u{2502} \u{25cf} Agent mesajla\u{15f}mas\u{2026} 30s \u{2502}".to_string(),
+                format!(" \u{2570}{}\u{256f}", edge(26)),
+                edge(WIDTH),
             ],
             "{texts:#?}"
         );
-        // Every card row reaches its agent, and nothing else in the pin does.
+        // Agent rows and the row under one reach it; edges, title and rule reach nothing.
         let hits: Vec<Option<Hit>> = rows[..10].iter().map(|(_, h)| *h).collect();
-        assert_eq!(hits[0], None);
-        assert!(hits[1..5].iter().all(|h| *h == Some(Hit::Pinned(1))));
-        assert!(hits[5..9].iter().all(|h| *h == Some(Hit::Pinned(2))));
-        assert_eq!(hits[9], None);
-        // The frame wears its state's colour, the count its kind's, the time stays quiet.
+        assert_eq!(
+            hits,
+            [
+                None,
+                None,
+                Some(Hit::Pinned(1)),
+                Some(Hit::Pinned(1)),
+                None,
+                None,
+                Some(Hit::Pinned(2)),
+                Some(Hit::Pinned(3)),
+                None,
+                None,
+            ]
+        );
+        // Each agent opens on the same dot, in the same colour, as its row in the tree.
+        use crate::theme::Role;
+        assert_eq!(rows[2].0.indicator, Some((3, 1, Role::Blocked)));
+        assert_eq!(rows[6].0.indicator, Some((3, 1, crate::theme::of("done"))));
+        assert_eq!(rows[7].0.indicator, Some((3, 1, crate::theme::of("done"))));
+        // The frame wears its kind's colour, the counts theirs, the time stays quiet.
         let role_at = |row: usize, col: usize| {
             rows[row]
                 .0
@@ -3947,18 +3990,12 @@ mod tests {
                 .find(|(at, len, _)| (*at..at + len).contains(&col))
                 .map(|(_, _, r)| *r)
         };
-        use crate::theme::Role;
         assert_eq!(role_at(1, 1), Some(Role::Blocked));
         assert_eq!(role_at(5, 1), Some(crate::theme::of("done")));
-        assert_eq!(role_at(1, 23), Some(Role::Faint));
+        assert_eq!(role_at(8, 28), Some(crate::theme::of("done")));
+        assert_eq!(role_at(2, 25), Some(Role::Faint));
         assert_eq!(role_at(0, 12), Some(Role::Blocked));
-        assert_eq!(role_at(4, 5), Some(crate::theme::space_of(1)));
-        // A newer finish than the head was read for says `finished`, never a stale answer.
-        let stale = Heads::from([(2, (Some(NOW - 900), "old answer".to_string()))]);
-        c.heads = Some(&stale);
-        let rows = rows_folded(&c, 40, None);
-        assert!(rows[7].0.text.contains("finished"), "{:?}", rows[7].0.text);
-        // Too narrow for a frame: one row per agent, as before.
+        // Too narrow for a box: one row per agent, as before.
         let narrow = column(
             &spaces,
             &agents,
@@ -4152,25 +4189,14 @@ mod tests {
             WIDTH,
             None,
         );
-        // Its card in the pin is framed in the done colour...
-        let (top, _) = rows
-            .iter()
-            .find(|(_, h)| *h == Some(Hit::Pinned(6)))
-            .expect("a card");
-        assert!(
-            top.runs
-                .iter()
-                .any(|(at, len, r)| (*at..at + len).contains(&1) && *r == crate::theme::of("done")),
-            "{top:?}"
-        );
-        // ...and its row in the tree wears the done circle.
+        // Both its dotted rows, the pin's and the tree's, wear the done circle.
         let mine: Vec<&Line> = rows
             .iter()
             .filter(|(l, _)| l.indicator.is_some())
             .filter(|(_, h)| matches!(h, Some(Hit::Terminal(6) | Hit::Pinned(6))))
             .map(|(l, _)| l)
             .collect();
-        assert_eq!(mine.len(), 1);
+        assert_eq!(mine.len(), 2);
         for row in mine {
             let (at, _, role) = row.indicator.expect("a dot");
             assert_eq!(
@@ -4384,24 +4410,23 @@ mod tests {
             "{:?}",
             rows[0].0
         );
-        // Each card is framed in its state's colour and names its space in the space's.
-        let top = &rows[1].0;
-        assert!(
-            top.runs
-                .iter()
-                .any(|(at, len, role)| (*at..at + len).contains(&1)
-                    && *role == crate::theme::Role::Blocked),
-            "{top:?}"
-        );
-        let bottom = &rows[CARD_ROWS].0;
-        assert!(
-            bottom.text.starts_with(" \u{2570}\u{2500} dub"),
-            "{bottom:?}"
-        );
-        assert!(
-            bottom.runs.contains(&(4, 3, crate::theme::space_of(2))),
-            "{bottom:?}"
-        );
+        // One box per kind, in that order, each framed in its kind's colour.
+        let framed = |row: usize, word: &str, role: crate::theme::Role| {
+            let line = &rows[row].0;
+            assert!(
+                line.text.starts_with(&format!(" \u{256d}\u{2500} {word} ")),
+                "{line:?}"
+            );
+            assert!(
+                line.runs
+                    .iter()
+                    .any(|(at, len, r)| (*at..at + len).contains(&1) && *r == role),
+                "{line:?}"
+            );
+        };
+        framed(1, "wants", crate::theme::Role::Blocked);
+        framed(4, "failed", crate::theme::Role::Failed);
+        framed(7, "done", crate::theme::of("done"));
         // Calm the fleet down and the pin is gone: the title opens the column.
         let mut calm = agents.clone();
         calm[1].state = "idle".into();
@@ -4438,6 +4463,15 @@ mod tests {
             })
             .collect();
         agents.push(agent(500, 2, "codex", "failed"));
+        // Finished while nobody looked, so the done box is swept too, with a wide name.
+        let mut unseen = Unseen::new();
+        for t in 600..604 {
+            let mut done = agent(t, 2, "claude", "idle");
+            done.agent_title = Some("\u{4e2d}\u{6587}\u{4e2d}\u{6587} finished a long job".into());
+            done.last_active_at_unix = Some(NOW - 90_000);
+            unseen.insert((t, gen_of(&done)));
+            agents.push(done);
+        }
         let pet = qoro_runtime::avatar::Avatar {
             body: qoro_runtime::avatar::BODY.into(),
             hair: "mohawk".into(),
@@ -4445,7 +4479,7 @@ mod tests {
             hair_ink: 212,
             body_ink: 33,
         };
-        let (seen, unseen) = (Seen::new(), Unseen::new());
+        let seen = Seen::new();
         for shut in [Shut::new(), Shut::from([1])] {
             for width in SIDEBAR_MIN..=SIDEBAR_MAX {
                 for height in 0..=40 {
@@ -4594,7 +4628,10 @@ mod tests {
         // The pin's card says what the waiting agent wants, without the word its top edge
         // already says.
         assert!(texts[1].contains(" wants "), "{texts:?}");
-        assert!(texts[3].starts_with(" \u{2502} bun test "), "{texts:?}");
+        assert!(
+            texts[3].starts_with(" \u{2502}   \u{2514} bun test "),
+            "{texts:?}"
+        );
         for (line, _) in &rows {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{line:?}");
         }
@@ -4856,21 +4893,64 @@ mod tests {
             "{:?}",
             rows[0].0
         );
-        let more = &rows[1 + 4 * CARD_ROWS];
-        assert_eq!(more.0.text.trim_end(), "   +4 more");
-        assert_eq!(more.0.colour, Some(crate::theme::Role::Faint));
-        assert_eq!(more.1, None);
-        assert_eq!(
-            rows[2 + 4 * CARD_ROWS].0.colour,
-            Some(crate::theme::Role::Rule)
+        // Title, the box's top edge, four agents, then the count inside the box.
+        let more = &rows[6];
+        assert!(
+            more.0.text.starts_with(" \u{2502}   +4 more "),
+            "{:?}",
+            more.0.text
         );
+        assert!(more.0.runs.contains(&(3, 9, crate::theme::Role::Faint)));
+        assert_eq!(more.1, None);
+        assert!(rows[7].0.text.starts_with(" \u{2570}"), "{:?}", rows[7].0);
+        assert_eq!(rows[8].0.colour, Some(crate::theme::Role::Rule));
         assert_eq!(order(&rows), (1..=8).collect::<Vec<u32>>());
 
-        // A shorter column holds the pin to half its rows: two cards and the count.
-        let rows = tree_rows(&spaces, &eight, 9, 34, &Seen::new(), &Shut::new());
+        // A shorter column holds the pin to half its rows: two agents and the count.
+        let rows = tree_rows(&spaces, &eight, 9, 16, &Seen::new(), &Shut::new());
         assert_eq!(pinned(&rows), vec![1, 2]);
-        assert!(rows.iter().any(|(l, _)| l.text.trim_end() == "   +6 more"));
-        // Too short for one card: one row per agent, as before.
+        assert!(rows.iter().any(|(l, _)| l.text.contains("+6 more")));
+        // A kind whose box no longer fits is counted under the boxes above it.
+        let mut mixed = blocked(3);
+        for a in &mut mixed {
+            a.activity = Some("Bash cargo test".into());
+        }
+        let mut unseen = Unseen::new();
+        for t in 10..13 {
+            let done = agent(t, 1, "claude", "idle");
+            unseen.insert((t, gen_of(&done)));
+            mixed.push(done);
+        }
+        let (seen, shut) = (Seen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &mixed,
+            1,
+            99,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        // Somewhere between a short and a tall column the wants box fills the pin's half
+        // with a row to spare: that row counts the finished three.
+        let counted = (10..40).any(|h| {
+            let rows = rows_folded(&c, h, None);
+            let boxed = rows
+                .iter()
+                .any(|(l, _)| l.text.starts_with(" \u{256d}\u{2500} wants "));
+            boxed && rows.iter().any(|(l, _)| l.text.trim_end() == "   +3 more")
+        });
+        assert!(counted, "no height counted the unboxed kind");
+        // Every height names somebody: a box with only a count in it is never drawn.
+        for h in 8..40 {
+            let rows = tree_rows(&spaces, &eight, 9, h, &Seen::new(), &Shut::new());
+            assert!(!pinned(&rows).is_empty(), "height {h}: {rows:?}");
+        }
+        // Too short for one box: one row per agent, as before.
         let rows = tree_rows(&spaces, &eight, 9, 10, &Seen::new(), &Shut::new());
         assert_eq!(pinned(&rows), vec![1]);
         assert!(!rows.iter().any(|(l, _)| l.text.contains('\u{256d}')));

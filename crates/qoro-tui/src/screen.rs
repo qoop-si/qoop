@@ -119,14 +119,11 @@ pub struct Chrome<'a> {
     pub usage: &'a sidebar::Usage,
     /// An agent's last answer is open over the pane, and the key row says how to read it.
     pub answer: bool,
-    /// The first line of each finished agent's last answer, for its card in the pin.
-    pub heads: &'a sidebar::Heads,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
 static NO_SHUT: sidebar::Shut = sidebar::Shut::new();
 static NO_USAGE: sidebar::Usage = sidebar::Usage::new();
-static NO_HEADS: sidebar::Heads = sidebar::Heads::new();
 
 impl Default for Chrome<'_> {
     fn default() -> Self {
@@ -135,7 +132,6 @@ impl Default for Chrome<'_> {
             keys: KeyContext::default(),
             usage: &NO_USAGE,
             answer: false,
-            heads: &NO_HEADS,
         }
     }
 }
@@ -156,7 +152,6 @@ impl Frame<'_> {
             width: self.sidebar_width,
             shut: self.chrome.shut,
             usage: Some(self.chrome.usage),
-            heads: Some(self.chrome.heads),
         }
     }
 }
@@ -4417,7 +4412,6 @@ mod tests {
                 width: sidebar::WIDTH,
                 shut: &shut,
                 usage: None,
-                heads: None,
             },
             39,
         );
