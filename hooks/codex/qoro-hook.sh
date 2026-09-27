@@ -42,6 +42,9 @@ set -eu
 
 [ -n "${QORO_TERMINAL:-}" ] || exit 0
 [ -n "${QORO_TOKEN:-}" ] || exit 0
+# The installer puts qoro in ~/.local/bin, which a stock Mac does not have on PATH until
+# the person adds it: looked for there too, rather than every hook going quiet.
+command -v qoro >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
 command -v qoro >/dev/null 2>&1 || exit 0
 
 state="${1:-}"

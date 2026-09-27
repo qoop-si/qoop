@@ -190,9 +190,10 @@ chmod 0755 "$tmp"
 mv "$tmp" "$DEST"
 echo "installed $($DEST --version) to $DEST"
 
-# The rest is the CLI's own verbs, never a copy of their logic.
-"$DEST" hooks install
-"$DEST" skills install
+# The rest is the CLI's own verbs, never a copy of their logic. Each one on its own: a
+# hooks directory the CLI refuses is no reason to leave the skill and the PATH hint out.
+"$DEST" hooks install || echo "qoro install: hooks were not installed; see the message above" >&2
+"$DEST" skills install || echo "qoro install: the skill was not installed; see the message above" >&2
 # On a Mac, the agents in the notch, started at login. Never the reason an install
 # fails: a Mac older than 14 says so, and everything above stays installed.
 if [ "$(uname -s)" = "Darwin" ]; then
