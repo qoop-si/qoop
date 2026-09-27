@@ -139,6 +139,16 @@ for another platform is checked against its checksum first. A qoro already there
 replaced. `qoro agents`, `send` and `read` still
 speak only to this machine's daemon.
 
+### Your phone
+
+`qoro pair --hub wss://your-hub` prints a QR code; the qoro app scans it, shows the six
+digits you type back on the Mac, and from then on lists every agent on that Mac with the one
+waiting for you first. You can answer it, type into any terminal, and open or close one, and
+the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
+end encrypted through a relay, `qoro-hub`, that sees neither the screens nor the keys, and a
+push carries a fixed sentence and four numbers, nothing from a screen. Setup, the hub and
+what it can see: [docs/mobile.md](docs/mobile.md).
+
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
