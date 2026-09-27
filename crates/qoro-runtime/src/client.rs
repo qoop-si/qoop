@@ -24,9 +24,12 @@ use crate::daemon::{ClientWire, ImageWire, SnapshotWire, StoredImage};
 
 /// Sent on attach. Reconciling unconditionally is cheaper than tracking what a previous
 /// client may have left behind, and a previous client may not have exited cleanly at all.
-const ATTACH_PREAMBLE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h";
-const RESTORE_SEQUENCE: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l";
+/// Focus reports (`1004`) and scheme reports (`2031`) are included: an interface that died
+/// with them on leaves a terminal typing `ESC [ I` into the next program whenever the
+/// window is clicked.
+const ATTACH_PREAMBLE: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h";
+const RESTORE_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[?1049l";
 
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
@@ -831,6 +834,16 @@ mod tests {
                 String::from_utf8_lossy(ATTACH_PREAMBLE).contains(&seq),
                 "the preamble does not disable mouse mode {mode}"
             );
+        }
+    }
+
+    /// Focus and scheme reports go off with the mouse, on attach and on the way out, so a
+    /// client that died with them on never leaves the next program receiving them.
+    #[test]
+    fn focus_and_scheme_reports_are_turned_off_on_attach_and_on_restore() {
+        for seq in ["\x1b[?1004l", "\x1b[?2031l"] {
+            assert!(String::from_utf8_lossy(ATTACH_PREAMBLE).contains(seq));
+            assert!(String::from_utf8_lossy(RESTORE_SEQUENCE).contains(seq));
         }
     }
 

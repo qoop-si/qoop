@@ -113,6 +113,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             target: "me@devbox".into(),
             session: "default".into(),
         },
+        ControlRequest::HostColors {
+            id: "x20".into(),
+            fg: [0, 0, 0],
+            bg: [255, 255, 255],
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -134,6 +139,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
+            | ControlRequest::HostColors { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

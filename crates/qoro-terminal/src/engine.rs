@@ -180,6 +180,12 @@ pub trait TerminalEngine: Send {
     /// Forget the retained title: the foreground process changed, and the title
     /// described a process that is no longer there.
     fn clear_title(&mut self) {}
+    /// The foreground and background of the terminal a person is looking at, when a client
+    /// has said, so a program asking `OSC 10 ?` or `OSC 11 ?` learns the real ones.
+    ///
+    /// Defaulted so an engine that answers nothing keeps the seam: the question goes
+    /// unanswered, which is what every program already copes with.
+    fn set_host_colors(&mut self, _colors: Option<([u8; 3], [u8; 3])>) {}
     fn modes(&self) -> TerminalModes;
     /// Lines that have scrolled out of the visible region since the last call, oldest
     /// first, for the disk spill.

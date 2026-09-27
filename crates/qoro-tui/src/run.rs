@@ -354,15 +354,15 @@ struct State {
     /// there are in total.
     behind: Behind,
     /// The outer window's focus as the terminal last reported it; `None` until it says.
-    // ponytail: recorded here for the notification and theme work that reads them.
-    #[allow(dead_code)]
     outer_focus: Option<bool>,
     /// The outer terminal's own foreground and background, as it last answered `OSC 10/11`.
-    #[allow(dead_code)]
     host_colors: [Option<[u8; 3]>; 2],
     /// Whether the outer terminal last said its scheme is light (`CSI ? 997 ; 2 n`).
-    #[allow(dead_code)]
     host_light: Option<bool>,
+    /// The colours last told to the daemon, so an unchanged answer is not sent again.
+    host_sent: Option<([u8; 3], [u8; 3])>,
+    /// The daemon predates `HostColors` and said so: not asked again this session.
+    host_refused: bool,
     /// What `config.toml` said when it was last read: at start, and whenever the settings
     /// box opens. Every overlay that hands the prefix back to the decoder reads it here.
     config: crate::config::Config,
@@ -1666,6 +1666,8 @@ where
         outer_focus: None,
         host_colors: [None, None],
         host_light: None,
+        host_sent: None,
+        host_refused: false,
         config: crate::config::Config::default(),
     };
     // The file is read before the first frame, so the first frame already names the
@@ -1763,6 +1765,13 @@ where
     // `1006` asks for those reports in the extended form, because the original one cannot
     // express a column past 223 and this interface is regularly wider than that.
     out.write_all(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h")?;
+    // Focus reports (`CSI ? 1004 h`), so the interface knows when the person looked away,
+    // and the questions about the terminal's own colours. See `input`.
+    out.write_all(b"\x1b[?1004h")?;
+    if may_ask_terminal() {
+        out.write_all(ASK_COLORS)?;
+        out.write_all(ASK_SCHEME)?;
+    }
     out.flush()?;
     let mut dirty = true;
     let mut presenter = present::Presenter::default();
@@ -1969,9 +1978,19 @@ where
                     // Reports first, before any overlay or the key decoder sees the bytes:
                     // each of those reads an escape as a cancel.
                     let (bytes, said) = reports.strip(&raw);
+                    let mut ask_again = false;
                     for report in said {
-                        note_report(&mut state, report);
+                        ask_again |= note_report(&mut state, report);
                         dirty = true;
+                    }
+                    retheme(&state);
+                    if ask_again && may_ask_terminal() {
+                        out.write_all(ASK_COLORS)?;
+                        out.flush()?;
+                    }
+                    if let Some(tell) = host_colors_request(&mut state, &mut request) {
+                        wr.write_all(&client::encode_control_seq(&tell, &mut control_seq)?)
+                            .await?;
                     }
                     if bytes.is_empty() {
                         continue;
@@ -3236,7 +3255,7 @@ where
             let _ = out.write_all(&cleanup);
         }
     }
-    let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
+    let _ = out.write_all(b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
 }
@@ -3248,20 +3267,84 @@ fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
     crate::config::show(read);
+    retheme(state);
 }
 
 /// Keep what the terminal said about itself.
-fn note_report(state: &mut State, report: crate::input::Report) {
+///
+/// True when its colours are worth asking for again: it came back into focus, which is
+/// how a terminal that never reports its scheme is caught having switched while the
+/// person was away, or it said its scheme changed, and the background changed with it.
+fn note_report(state: &mut State, report: crate::input::Report) -> bool {
     use crate::input::Report;
     match report {
-        Report::Focus(focused) => state.outer_focus = Some(focused),
+        Report::Focus(focused) => {
+            state.outer_focus = Some(focused);
+            focused
+        }
         Report::Color { background, rgb } => {
             state.host_colors[usize::from(background)] = Some(rgb);
+            false
         }
-        Report::Scheme { light } => state.host_light = Some(light),
+        Report::Scheme { light } => {
+            let switched = state.host_light.is_some_and(|was| was != light);
+            state.host_light = Some(light);
+            switched
+        }
     }
 }
 
+/// What the interface asks the terminal about itself: its foreground and background, then
+/// to say whenever its light or dark scheme changes (`CSI ? 2031 h`) and what it is now
+/// (`CSI ? 996 n`). The answers come back on the keyboard stream and `input` takes them
+/// out of it. Terminals that know none of these ignore them.
+const ASK_COLORS: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+const ASK_SCHEME: &[u8] = b"\x1b[?2031h\x1b[?996n";
+
+/// Whether the terminal may be asked at all. The Linux console answers none of these and
+/// has been seen to print the question instead.
+fn may_ask_terminal() -> bool {
+    std::env::var("TERM").map_or(true, |term| term != "linux")
+}
+
+/// Pick the palette from what is known, most certain first: the file, then the background
+/// the terminal answered with, then the scheme it said, then `COLORFGBG`, then dark. True
+/// when that changed the palette, and every row has to be painted again.
+fn retheme(state: &State) -> bool {
+    use crate::config::Theme;
+    let light = match state.config.theme {
+        Theme::Dark => false,
+        Theme::Light => true,
+        Theme::Auto => state.host_colors[1]
+            .map(crate::theme::is_light_background)
+            .or(state.host_light)
+            .or_else(|| {
+                std::env::var("COLORFGBG")
+                    .ok()
+                    .and_then(|value| crate::theme::colorfgbg_is_light(&value))
+            })
+            .unwrap_or(false),
+    };
+    crate::theme::set_light(light)
+}
+
+/// The colours to tell the daemon, when both are known, they are not what it was last
+/// told, and it has not already said it does not know how to hear them.
+fn host_colors_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> {
+    let (Some(fg), Some(bg)) = (state.host_colors[0], state.host_colors[1]) else {
+        return None;
+    };
+    if state.host_refused || state.host_sent == Some((fg, bg)) {
+        return None;
+    }
+    state.host_sent = Some((fg, bg));
+    *request += 1;
+    Some(ControlRequest::HostColors {
+        id: format!("host-{request}"),
+        fg,
+        bg,
+    })
+}
 /// Whether a fresh client's first render may adopt its terminal: only what
 /// is on screen. The daemon subscribes a fresh client to whatever is already
 /// open, which may be another space's terminal; adopting that paints it under
@@ -4325,6 +4408,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if id.starts_with("space-") {
                 state.creating = state.creating.saturating_sub(1);
             }
+            // A daemon older than this client, refusing the colours it was told. It has
+            // nothing to do with them anyway: said once, silently, and never again.
+            if id.is_empty() && reason.contains("`HostColors`") {
+                state.host_refused = true;
+                return;
+            }
             // A split whose spawn failed rolls its tree entry back where it
             // was asked for: one failure must not clear another space's
             // split still on its way, and a rollback on screen only would
@@ -4673,6 +4762,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            host_sent: None,
+            host_refused: false,
             config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
             images: std::collections::BTreeMap::new(),
@@ -4812,6 +4903,78 @@ mod tests {
             other => panic!("a detach closed nothing: {other:?}"),
         }
         assert_eq!(state.palette, None);
+    }
+
+    /// The colours go to the daemon once both are known and again only when they change;
+    /// an older daemon's refusal is swallowed and ends the telling for the session.
+    #[test]
+    fn host_colours_are_told_once_and_an_old_daemons_refusal_is_swallowed() {
+        use crate::input::Report;
+        let mut state = state();
+        let mut request = 0;
+        note_report(
+            &mut state,
+            Report::Color {
+                background: true,
+                rgb: [255, 255, 255],
+            },
+        );
+        assert!(
+            host_colors_request(&mut state, &mut request).is_none(),
+            "half known"
+        );
+        note_report(
+            &mut state,
+            Report::Color {
+                background: false,
+                rgb: [0, 0, 0],
+            },
+        );
+        assert!(matches!(
+            host_colors_request(&mut state, &mut request),
+            Some(ControlRequest::HostColors {
+                fg: [0, 0, 0],
+                bg: [255, 255, 255],
+                ..
+            })
+        ));
+        assert!(
+            host_colors_request(&mut state, &mut request).is_none(),
+            "unchanged"
+        );
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: String::new(),
+                reason: old_daemon_refusal(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.message, None, "the refusal is not news to a person");
+        state.host_colors[1] = Some([0, 0, 0]);
+        assert!(
+            host_colors_request(&mut state, &mut request).is_none(),
+            "never again"
+        );
+        assert!(
+            note_report(&mut state, Report::Focus(true)),
+            "focus-in asks again"
+        );
+        assert!(!note_report(&mut state, Report::Scheme { light: true }));
+        assert!(
+            note_report(&mut state, Report::Scheme { light: false }),
+            "a switch asks again"
+        );
+    }
+
+    /// What a daemon from before `HostColors` answers it with, word for word.
+    fn old_daemon_refusal() -> String {
+        "this daemon is older than the client that called it: it does not know the method \
+         that was asked for (unknown variant `HostColors`, expected one of `CreateTerminal`, \
+         `ListFocusEvents` at line 1 column 18). stop the session and open it again to pick \
+         up the new daemon; what is open comes back."
+            .to_string()
     }
 
     /// With another prefix, every overlay hands that one back and treats ctrl-a as the
@@ -5036,6 +5199,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            host_sent: None,
+            host_refused: false,
             config: crate::config::Config::default(),
         }
     }
@@ -5111,6 +5276,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            host_sent: None,
+            host_refused: false,
             config: crate::config::Config::default(),
         };
         let area = pane_area(&state);

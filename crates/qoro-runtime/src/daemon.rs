@@ -2925,7 +2925,33 @@ async fn handle_control(
                 terminals: dropped,
             }
         }
+        ControlRequest::HostColors { fg, bg, .. } => {
+            set_host_colors(fg, bg);
+            ControlResponse::HostColorsNoted { id }
+        }
     }
+}
+
+/// The outer terminal's foreground and background, as the latest client reported them:
+/// a presence bit over two packed rgb triples, so every terminal task reads it with one
+/// load before it feeds its engine and no lock sits on the read path.
+static HOST_COLORS: AtomicU64 = AtomicU64::new(0);
+
+const HOST_COLORS_SET: u64 = 1 << 48;
+
+fn set_host_colors(fg: [u8; 3], bg: [u8; 3]) {
+    let pack = |[r, g, b]: [u8; 3]| (u64::from(r) << 16) | (u64::from(g) << 8) | u64::from(b);
+    HOST_COLORS.store(
+        HOST_COLORS_SET | (pack(fg) << 24) | pack(bg),
+        Ordering::Relaxed,
+    );
+}
+
+/// What a program asking `OSC 10 ?` or `OSC 11 ?` is told, once any client has said.
+fn host_colors() -> Option<([u8; 3], [u8; 3])> {
+    let packed = HOST_COLORS.load(Ordering::Relaxed);
+    let unpack = |v: u64| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    (packed & HOST_COLORS_SET != 0).then(|| (unpack(packed >> 24), unpack(packed)))
 }
 
 /// Whether a control request changes anything. Only these are journalled and only these
@@ -4828,6 +4854,9 @@ async fn terminal_task(
                             // same twenty terminals quiet and the daemon at a quarter of
                             // the machine.
                             let mut effects = Vec::new();
+                            // One load a read: a program asking for the background mid read is
+                            // answered with what the person is looking at now.
+                            engine.set_host_colors(host_colors());
                             for (index, slice) in buf[..n].chunks(PARSE_SLICE).enumerate() {
                                 let (_damage, mut fx) = engine.feed(slice);
                                 effects.append(&mut fx);
@@ -5496,6 +5525,19 @@ mod image_wire_tests {
         assert_eq!(decoded.bytes, image.bytes);
         assert_eq!(decoded.id, image.id);
         assert_eq!(decoded.protocol, image.protocol);
+    }
+
+    /// The host colours come back as they went in, every channel at both ends of its range.
+    #[test]
+    fn host_colours_come_back_as_they_were_reported() {
+        super::set_host_colors([255, 0, 18], [0, 255, 1]);
+        assert_eq!(super::host_colors(), Some(([255, 0, 18], [0, 255, 1])));
+        super::set_host_colors([0, 0, 0], [0, 0, 0]);
+        assert_eq!(
+            super::host_colors(),
+            Some(([0, 0, 0], [0, 0, 0])),
+            "black is said"
+        );
     }
 
     /// A link crosses the wire both ways, costs nothing on a run without one, and a span

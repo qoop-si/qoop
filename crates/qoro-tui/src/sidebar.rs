@@ -1135,7 +1135,7 @@ pub(crate) fn avatar_overlay(avatar: &qoro_runtime::avatar::Avatar, colour: bool
             for (top, bottom) in row.iter().take(ART_COLS) {
                 if *top != cur.0 {
                     line.push_str(
-                        &top.map(qoro_runtime::avatar::fg)
+                        &top.map(|ink| qoro_runtime::avatar::fg(crate::theme::pet(ink)))
                             .unwrap_or_else(|| "\x1b[39m".to_string()),
                     );
                     cur.0 = *top;
@@ -1143,7 +1143,7 @@ pub(crate) fn avatar_overlay(avatar: &qoro_runtime::avatar::Avatar, colour: bool
                 if *bottom != cur.1 {
                     line.push_str(
                         &bottom
-                            .map(qoro_runtime::avatar::bg)
+                            .map(|ink| qoro_runtime::avatar::bg(crate::theme::pet(ink)))
                             .unwrap_or_else(|| "\x1b[49m".to_string()),
                     );
                     cur.1 = *bottom;

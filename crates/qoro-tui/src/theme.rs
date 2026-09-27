@@ -157,7 +157,7 @@ pub fn of(state: &str) -> Role {
 /// whatever the person set, and at that value the sections of the left column disappear on
 /// most of them. 237 is the same intent, a line that is there and never loud, at a value
 /// that survives not knowing what is behind it.
-const fn ink(role: Role) -> u8 {
+const fn dark_ink(role: Role) -> u8 {
     match role {
         Role::Title => 244,
         Role::Text => 231,
@@ -201,29 +201,29 @@ pub fn fg(role: Role) -> String {
 /// [`selected_in`]). White text would make the selected row the brightest thing on the
 /// screen, which is exactly what the background was chosen not to do.
 pub fn selected() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", SELECTED_BG, ink(Role::Detail))
+    format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(Role::Detail))
 }
 
 /// A selected row that also has a state to say, so the state keeps its colour on the
 /// raised background.
 pub fn selected_in(role: Role) -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", SELECTED_BG, ink(role))
+    format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(role))
 }
 
 /// The bar at the bottom: raised, like the selected row, and never reverse.
 pub fn status() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(Role::Detail))
+    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Detail))
 }
 
 /// A key name inside the status bar, which is the part a person is looking for.
 pub fn status_key() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(Role::Focused))
+    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Focused))
 }
 
 /// Something in the status bar that wants a person, which is the one thing there allowed
 /// to be loud.
 pub fn status_in(role: Role) -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", STATUS_BG, ink(role))
+    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(role))
 }
 
 /// The tab with the keyboard: bold pink on the raised background.
@@ -233,7 +233,7 @@ pub fn status_in(role: Role) -> String {
 /// Pink (212, `FF8FD9`) stands clear of the warm alarm pair and every state;
 /// amber would read as alarm, so the tab left amber behind.
 pub fn tab_on() -> String {
-    format!("\x1b[0;1;48;5;{};38;5;{}m", SELECTED_BG, TAB_ON_FG)
+    format!("\x1b[0;1;48;5;{};38;5;{}m", raised().0, tab_on_fg())
 }
 
 /// Every other tab: the focused space's own colour, so the bar reads as that
@@ -258,9 +258,137 @@ const STATUS_BG: u8 = 233;
 /// state's ink (see [`selected`] and [`selected_in`]).
 const TAB_ON_FG: u8 = 212;
 
+/// Whether the chrome is drawn for a light background.
+///
+/// One switch for the whole interface, read by every escape above. Set where the interface
+/// decides which background it is on (the config, then what the terminal says), never by a
+/// painter, so a frame is always drawn in one palette.
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw for a light background, or a dark one. Whether that changed anything, so the
+/// caller knows the screen has to be painted again.
+pub fn set_light(on: bool) -> bool {
+    LIGHT.swap(on, std::sync::atomic::Ordering::Relaxed) != on
+}
+
+/// Whether the chrome is drawn for a light background.
+pub fn light() -> bool {
+    LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a background the terminal reported is a light one: its luminance over a half.
+pub fn is_light_background([r, g, b]: [u8; 3]) -> bool {
+    (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0 > 0.5
+}
+
+/// The first guess, from `COLORFGBG` (`fg;bg`, sometimes `fg;default;bg`), which some
+/// terminals set and which costs no round trip: a background of 7 or 9 to 15 is a light
+/// one, 0 to 6 or 8 a dark one, anything else says nothing.
+pub fn colorfgbg_is_light(value: &str) -> Option<bool> {
+    match value.rsplit(';').next()?.trim().parse::<u8>().ok()? {
+        7 | 9..=15 => Some(true),
+        0..=6 | 8 => Some(false),
+        _ => None,
+    }
+}
+
+/// The entry a role is painted in, in the palette in effect.
+fn ink(role: Role) -> u8 {
+    if light() {
+        light_ink(role)
+    } else {
+        dark_ink(role)
+    }
+}
+
+/// The raised backgrounds, selected row then status bar, in the palette in effect.
+fn raised() -> (u8, u8) {
+    if light() {
+        (LIGHT_SELECTED_BG, LIGHT_STATUS_BG)
+    } else {
+        (SELECTED_BG, STATUS_BG)
+    }
+}
+
+fn tab_on_fg() -> u8 {
+    if light() { LIGHT_TAB_ON_FG } else { TAB_ON_FG }
+}
+
+/// The same roles for a light background.
+///
+/// Chosen by measuring each candidate in the 256 palette against white rather than by
+/// darkening the dark table: text at least 4.5 to 1, a state, a space, an ember step, the
+/// mark and the tab at least 3 to 1 (they are glyphs a person finds, not sentences they
+/// read), the rule exempt because a rule is only there to be barely seen. The dark table's
+/// hue for each job is kept where the palette has a dark enough step of it: working a
+/// blue, blocked a burnt orange, done a green, failed a magenta, sleeping a mauve.
+const fn light_ink(role: Role) -> u8 {
+    match role {
+        Role::Title => 240,
+        Role::Text => 235,
+        Role::Focused => 16,
+        Role::Detail => 241,
+        Role::Faint => 243,
+        Role::Rule => 250,
+        Role::Brand => 202,
+        Role::Working => 32,
+        Role::Blocked => 130,
+        Role::Done => 28,
+        Role::Failed => 164,
+        Role::Idle => 242,
+        Role::Sleeping => 97,
+        Role::Unobserved => 244,
+        Role::AvatarHair(ink) => light_pet(ink),
+        Role::AvatarBody(ink) => light_pet(ink),
+        Role::Ember(n) => LIGHT_EMBER_INKS[n % LIGHT_EMBER_INKS.len()],
+        Role::Space(n) => LIGHT_SPACE_INKS[n % LIGHT_SPACE_INKS.len()],
+    }
+}
+
+/// The identity wheel on white: the same six families, one step darker each (violet,
+/// teal, pure blue, olive green, deep sky, olive gold), so no space reads as a state.
+const LIGHT_SPACE_INKS: [u8; 6] = [92, 30, 20, 64, 24, 100];
+
+/// The amber wheel on white: the brand orange, then darker ambers out to brown. 130 is
+/// blocked's here, the way 208 is in the dark wheel.
+const LIGHT_EMBER_INKS: [u8; 5] = [202, 166, 136, 137, 94];
+
+/// Raised backgrounds on white: the selected row a shade under the page, the status bar
+/// a shade lighter still, the same order of depth as the dark table.
+const LIGHT_SELECTED_BG: u8 = 254;
+const LIGHT_STATUS_BG: u8 = 255;
+
+/// The focused tab: a deep pink, still apart from failed's magenta and every pool.
+const LIGHT_TAB_ON_FG: u8 = 162;
+
+/// An avatar ink as it should be drawn in the palette in effect.
+///
+/// The pet's hair is picked from light, loud inks (a yellow, a lime) that vanish on white,
+/// so on a light background each is drawn one step darker in its own family. The body's
+/// azure and the eyes (cream on the body, a black slit) sit on the body and not on the
+/// page, so they keep their inks.
+pub fn pet(ink: u8) -> u8 {
+    if light() { light_pet(ink) } else { ink }
+}
+
+const fn light_pet(ink: u8) -> u8 {
+    match ink {
+        212 => 162,
+        214 => 136,
+        226 => 100,
+        155 => 64,
+        208 => 166,
+        35 => 28,
+        135 => 92,
+        39 => 32,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qoro_runtime::avatar;
 
     /// The first sixteen entries are the ones a person has themed, and they belong to the
     /// program in the pane. Furniture that used them would change colour with somebody's
@@ -584,5 +712,149 @@ mod tests {
                 "ember {n} wears a taken colour"
             );
         }
+    }
+
+    /// A 256 palette entry as rgb, the way xterm defines the cube and the greys.
+    fn rgb(entry: u8) -> [f64; 3] {
+        if entry >= 232 {
+            let v = f64::from(8 + 10 * (entry - 232));
+            return [v, v, v];
+        }
+        let levels = [0.0, 95.0, 135.0, 175.0, 215.0, 255.0];
+        let i = usize::from(entry - 16);
+        [levels[i / 36], levels[(i / 6) % 6], levels[i % 6]]
+    }
+
+    /// WCAG contrast between two palette entries.
+    fn contrast(a: u8, b: u8) -> f64 {
+        let luminance = |entry: u8| {
+            let [r, g, b] = rgb(entry).map(|c| {
+                let c = c / 255.0;
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// The light table, measured against white (231): text at least 4.5 to 1, everything
+    /// a person finds rather than reads at least 3 to 1, the rule exempt by name. And on
+    /// the raised backgrounds, each ink that is painted on one holds the same line there.
+    #[test]
+    fn every_light_ink_reads_on_a_white_background() {
+        const WHITE: u8 = 231;
+        let text = [
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+        ];
+        for role in text {
+            let ratio = contrast(light_ink(role), WHITE);
+            assert!(ratio >= 4.5, "{role:?} is {ratio:.2}:1 on white");
+        }
+        let states = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Sleeping,
+            Role::Unobserved,
+        ];
+        let found = states
+            .into_iter()
+            .chain([Role::Brand])
+            .chain((0..LIGHT_SPACE_INKS.len()).map(Role::Space))
+            .chain((0..LIGHT_EMBER_INKS.len()).map(Role::Ember))
+            .chain(avatar::HAIR_INKS.map(Role::AvatarHair));
+        for role in found {
+            let ratio = contrast(light_ink(role), WHITE);
+            assert!(ratio >= 3.0, "{role:?} is {ratio:.2}:1 on white");
+        }
+        for (ink, on, floor) in [
+            (light_ink(Role::Detail), LIGHT_SELECTED_BG, 4.5),
+            (light_ink(Role::Detail), LIGHT_STATUS_BG, 4.5),
+            (light_ink(Role::Focused), LIGHT_STATUS_BG, 4.5),
+            (LIGHT_TAB_ON_FG, LIGHT_SELECTED_BG, 3.0),
+        ] {
+            let ratio = contrast(ink, on);
+            assert!(ratio >= floor, "{ink} on {on} is {ratio:.2}:1");
+        }
+        for role in states {
+            let ratio = contrast(light_ink(role), LIGHT_SELECTED_BG);
+            assert!(ratio >= 3.0, "{role:?} on the selected row is {ratio:.2}:1");
+        }
+    }
+
+    /// The light table keeps the dark one's rules: nothing themed, the states that want a
+    /// person apart from the calm ones, spaces apart from states, chrome, the tab and the
+    /// ember wheel, and the wheel starting on the mark.
+    #[test]
+    fn the_light_table_keeps_the_rules_of_the_dark_one() {
+        let chrome = [
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+            Role::Rule,
+            Role::Brand,
+        ];
+        let states = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Sleeping,
+            Role::Unobserved,
+        ];
+        let mut taken: Vec<u8> = chrome.into_iter().chain(states).map(light_ink).collect();
+        for &ink in &taken {
+            assert!(ink >= 16, "{ink} is a themed colour");
+        }
+        let mut distinct = states.map(light_ink).to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), states.len(), "two states share an ink");
+        taken.push(LIGHT_TAB_ON_FG);
+        let ember: Vec<u8> = LIGHT_EMBER_INKS.to_vec();
+        for space in LIGHT_SPACE_INKS {
+            assert!(
+                !taken.contains(&space),
+                "space {space} already means something"
+            );
+            assert!(!ember.contains(&space), "space {space} is an ember step");
+        }
+        assert!(!ember.contains(&LIGHT_TAB_ON_FG));
+        assert_eq!(light_ink(Role::Ember(0)), light_ink(Role::Brand));
+        for step in &ember[1..] {
+            assert!(!taken.contains(step), "ember {step} wears a taken colour");
+        }
+    }
+
+    #[test]
+    fn a_background_is_light_by_its_luminance_and_colorfgbg_is_a_first_guess() {
+        assert!(is_light_background([255, 255, 255]));
+        assert!(is_light_background([250, 244, 230]));
+        assert!(!is_light_background([0, 0, 0]));
+        assert!(!is_light_background([40, 42, 54]));
+        assert!(
+            !is_light_background([0, 0, 255]),
+            "a saturated blue is dark"
+        );
+        assert_eq!(colorfgbg_is_light("0;15"), Some(true));
+        assert_eq!(colorfgbg_is_light("0;default;7"), Some(true));
+        assert_eq!(colorfgbg_is_light("15;0"), Some(false));
+        assert_eq!(colorfgbg_is_light("7;8"), Some(false));
+        assert_eq!(colorfgbg_is_light("default;default"), None);
+        assert_eq!(colorfgbg_is_light(""), None);
     }
 }

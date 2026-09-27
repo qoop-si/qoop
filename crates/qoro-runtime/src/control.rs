@@ -235,6 +235,19 @@ pub enum ControlRequest {
         target: String,
         session: String,
     },
+    /// The foreground and background of the terminal a person is looking at, as the
+    /// interface read them from it, so a program inside that asks for them (`OSC 10 ?`,
+    /// `OSC 11 ?`) learns the real ones and picks a readable palette.
+    ///
+    /// Three bytes each and nothing else, so this can never carry anything to a child
+    /// but an answer the engine formats itself. One pair for the whole daemon: the
+    /// latest client to report wins, which with two windows on different backgrounds
+    /// is the one the person most recently came back to.
+    HostColors {
+        id: String,
+        fg: [u8; 3],
+        bg: [u8; 3],
+    },
 }
 
 impl ControlRequest {
@@ -257,6 +270,7 @@ impl ControlRequest {
             | Self::ReportAgentState { id, .. }
             | Self::ReportAgentSession { id, .. }
             | Self::ListFocusEvents { id, .. }
+            | Self::HostColors { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ListRemoteSessions { id, .. }
             | Self::ConnectRemote { id, .. }
@@ -368,6 +382,10 @@ pub enum ControlResponse {
     RemoteAdded {
         id: String,
         name: String,
+    },
+    /// `HostColors` was taken: programs asking from now on get these.
+    HostColorsNoted {
+        id: String,
     },
 }
 
@@ -575,6 +593,7 @@ impl ControlResponse {
             | Self::FocusEvents { id, .. }
             | Self::RemoteSessions { id, .. }
             | Self::RemoteAdded { id, .. }
+            | Self::HostColorsNoted { id }
             | Self::Failed { id, .. } => id,
         }
     }

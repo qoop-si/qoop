@@ -21,7 +21,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Hyperlink;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use bytes::Bytes;
 
 use crate::control_string::ControlStringFilter;
@@ -33,6 +33,11 @@ use crate::engine::{
 /// The engine allocates scrollback in 1000 row chunks, so this is the cheapest non-zero
 /// setting. See ADR-003 for the measurements.
 pub const SCROLLBACK_ROWS: usize = 1000;
+
+/// Where the engine keeps the default foreground and background in its colour table: the
+/// indices an `OSC 10 ?` and an `OSC 11 ?` ask about.
+const FOREGROUND: usize = alacritty_terminal::vte::ansi::NamedColor::Foreground as usize;
+const BACKGROUND: usize = alacritty_terminal::vte::ansi::NamedColor::Background as usize;
 
 /// Collects the engine's outbound events so they can be returned as effects rather than
 /// dropped. Dropping them is how an application waiting for a cursor position report hangs.
@@ -68,6 +73,8 @@ pub struct AlacrittyEngine {
     /// At most three bytes, because no UTF-8 sequence is longer than four. See `feed` for
     /// why the parser is never allowed to see one of these.
     partial_char: Vec<u8>,
+    /// The outer terminal's foreground and background, as a client last reported them.
+    host_colors: Option<([u8; 3], [u8; 3])>,
 }
 
 impl AlacrittyEngine {
@@ -93,6 +100,7 @@ impl AlacrittyEngine {
             scrolled_off: Vec::new(),
             title: String::new(),
             evicted_unobserved: 0,
+            host_colors: None,
         }
     }
 
@@ -363,6 +371,17 @@ impl TerminalEngine for AlacrittyEngine {
                 Event::ClipboardStore(_, s) => {
                     effects.push(TerminalEffect::ClipboardWrite(Bytes::from(s)))
                 }
+                // `OSC 10 ?` and `OSC 11 ?`: the colour the program set itself if it did, else
+                // the one the person is looking at, else no answer, as before any client said.
+                Event::ColorRequest(index @ (FOREGROUND | BACKGROUND), answer) => {
+                    let host = self.host_colors.map(|(fg, bg)| {
+                        let [r, g, b] = if index == FOREGROUND { fg } else { bg };
+                        Rgb { r, g, b }
+                    });
+                    if let Some(rgb) = self.term.colors()[index].or(host) {
+                        effects.push(TerminalEffect::Reply(Bytes::from(answer(rgb))));
+                    }
+                }
                 _ => {}
             }
         }
@@ -411,6 +430,10 @@ impl TerminalEngine for AlacrittyEngine {
 
     fn clear_title(&mut self) {
         self.title.clear();
+    }
+
+    fn set_host_colors(&mut self, colors: Option<([u8; 3], [u8; 3])>) {
+        self.host_colors = colors;
     }
 
     fn modes(&self) -> TerminalModes {
@@ -869,6 +892,47 @@ mod tests {
                 .all(|sp| sp.at + sp.len <= 8 || sp.style.link.is_none()),
             "the link ran past its text: {:?}",
             s.styles[0]
+        );
+    }
+
+    /// A program asking for the background is answered with the one the person is looking
+    /// at once a client has said it, in the terminator it asked with; before that, and for
+    /// a colour the program set itself, it gets what it would have got anyway.
+    #[test]
+    fn a_background_question_is_answered_from_the_host_colours() {
+        let replies = |e: &mut AlacrittyEngine, bytes: &[u8]| -> Vec<Bytes> {
+            e.feed(bytes)
+                .1
+                .into_iter()
+                .filter_map(|fx| match fx {
+                    TerminalEffect::Reply(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut e = engine();
+        assert!(
+            replies(&mut e, b"\x1b]11;?\x1b\\").is_empty(),
+            "nobody said yet"
+        );
+        e.set_host_colors(Some(([0, 0, 0], [255, 255, 255])));
+        assert_eq!(
+            replies(&mut e, b"\x1b]11;?\x1b\\"),
+            vec![Bytes::from_static(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\")]
+        );
+        assert_eq!(
+            replies(&mut e, b"\x1b]10;?\x07"),
+            vec![Bytes::from_static(b"\x1b]10;rgb:0000/0000/0000\x07")]
+        );
+        e.feed(b"\x1b]11;rgb:12/34/56\x1b\\");
+        assert_eq!(
+            replies(&mut e, b"\x1b]11;?\x07"),
+            vec![Bytes::from_static(b"\x1b]11;rgb:1212/3434/5656\x07")],
+            "the program's own background wins"
+        );
+        assert!(
+            replies(&mut e, b"\x1b]4;1;?\x07").is_empty(),
+            "palette questions stay as they were"
         );
     }
 }

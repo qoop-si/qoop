@@ -230,6 +230,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "report the outer terminal's colours",
+            method: || {
+                Method::Control(ControlRequest::HostColors {
+                    id: "a".into(),
+                    fg: [255; 3],
+                    bg: [0; 3],
+                })
+            },
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -375,6 +385,11 @@ fn every_control_method_is_reachable_from_some_action() {
             target: String::new(),
             session: String::new(),
         },
+        ControlRequest::HostColors {
+            id: String::new(),
+            fg: [0; 3],
+            bg: [0; 3],
+        },
     ];
     for request in &all {
         match request {
@@ -395,6 +410,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
+            | ControlRequest::HostColors { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
