@@ -2186,6 +2186,7 @@ fn tomb_row(tomb: &crate::agents::Tombstone) -> crate::control::AgentRow {
         cwd: None,
         slept_at_unix: Some(tomb.slept_at_unix),
         activity: None,
+        pgid: None,
     }
 }
 
@@ -2736,6 +2737,15 @@ async fn handle_control(
                     let last_active_at_unix = agent.as_ref().and_then(|a| a.last_active_at_unix);
                     // What it is doing, only while it is doing something: a calm agent
                     // has no activity, whatever its last tool was.
+                    // The foreground job's group, which a client on this machine samples for
+                    // its cost; one syscall on the master already held open.
+                    let pgid = agents
+                        .master_of(terminal)
+                        .and_then(qoro_pty::sys::foreground_pgrp)
+                        .map(|group| group.0)
+                        // Linux answers zero when nothing holds the foreground, and zero is
+                        // every kernel thread's group: no group rather than theirs.
+                        .filter(|group| *group > 0);
                     let activity = matches!(
                         state.as_str(),
                         "working" | "starting" | "blocked" | "failed"
@@ -2785,6 +2795,7 @@ async fn handle_control(
                         cwd,
                         slept_at_unix: None,
                         activity,
+                        pgid,
                     }
                 })
                 .collect();

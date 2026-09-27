@@ -211,6 +211,23 @@ impl View {
 /// not fold it for another client. Pruned by the caller when a space goes away.
 pub type Shut = std::collections::BTreeSet<i64>;
 
+/// What one local agent costs, sampled by the client: CPU over the last interval as a
+/// percent of one core (`None` until there are two samples to compare), and the memory
+/// resident now, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cost {
+    pub cpu_percent: Option<u32>,
+    pub rss: u64,
+}
+
+/// Costs by terminal. Empty unless `QORO_USAGE=1`, and never holding another machine's
+/// terminals: their process groups mean nothing here.
+pub type Usage = std::collections::BTreeMap<u32, Cost>;
+
+/// The narrowest column that shows costs: below it the numbers would take the name's
+/// room, and the name is what the row is for.
+pub const USAGE_MIN_WIDTH: usize = 26;
+
 /// The done rows a person has already looked at, as (terminal, generation).
 ///
 /// Client-local, like the focus itself: one client reading a done agent does
@@ -398,6 +415,8 @@ pub struct Column<'a> {
     /// The live column width, at or above [`SIDEBAR_MIN`] on the live path.
     pub width: usize,
     pub shut: &'a Shut,
+    /// What each local agent costs, when the person asked to see it.
+    pub usage: Option<&'a Usage>,
 }
 
 /// One row of the column, and what a click on it means.
@@ -572,7 +591,28 @@ fn pin(c: &Column, room: usize) -> Vec<Row> {
 
 /// The title: `spaces` on the left, the order word and the `+` on the right.
 fn title_line(c: &Column) -> Line {
-    let right = format!("{} +", title_mode(c.view));
+    // The whole fleet's cost before the order word, when costs are shown at all.
+    let total = c
+        .usage
+        .filter(|u| !u.is_empty() && c.width >= USAGE_MIN_WIDTH)
+        .map(|u| {
+            let cpu = u.values().filter_map(|cost| cost.cpu_percent).sum::<u32>();
+            let rss = u.values().map(|cost| cost.rss).sum::<u64>();
+            format!("{cpu}% {} ", mem_text(rss))
+        })
+        .unwrap_or_default();
+    let mode = format!("{} +", title_mode(c.view));
+    // The total only when ` spaces` still fits in front of it: the title names the list
+    // first, and a number in its place would name nothing.
+    let right = if c
+        .width
+        .saturating_sub(crate::width::width(&total) + crate::width::width(&mode))
+        >= SPACES_TITLE.len() + 2
+    {
+        format!("{total}{mode}")
+    } else {
+        mode
+    };
     Line {
         text: format!(
             "{}{right}",
@@ -923,6 +963,26 @@ fn sweep(text: &str, from: usize, tick: u64) -> Vec<(usize, usize, crate::theme:
         })
         .collect()
 }
+
+/// A cost as the row says it: `4% 212M`, or the memory alone before there are two samples.
+fn cost_text(cost: Cost) -> String {
+    match cost.cpu_percent {
+        Some(cpu) => format!("{cpu}% {}", mem_text(cost.rss)),
+        None => mem_text(cost.rss),
+    }
+}
+
+/// Resident bytes as a person reads them: whole megabytes under a gigabyte, then tenths
+/// of a gigabyte.
+fn mem_text(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    let mib = bytes / MIB;
+    if mib < 1024 {
+        format!("{mib}M")
+    } else {
+        format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64)
+    }
+}
 /// The dot an agent wears, and whether its whole row goes quiet.
 ///
 /// News keeps the done sage: a derived idle-after-work is news, not calm. A stale idle
@@ -948,7 +1008,16 @@ fn dot_of(c: &Column, agent: &AgentRow) -> (crate::theme::Role, bool) {
 fn tree_line(c: &Column, agent: &AgentRow, space: &WorkspaceRow) -> Line {
     let (role, stale) = dot_of(c, agent);
     let lead = CHILD_DOT_AT + 2;
-    let room = c.width.saturating_sub(lead);
+    // What it costs, flush right, when costs are shown and the column is wide enough.
+    let cost = c
+        .usage
+        .filter(|_| c.width >= USAGE_MIN_WIDTH)
+        .and_then(|u| u.get(&agent.terminal))
+        .map(|cost| cost_text(*cost));
+    let tail = cost
+        .as_ref()
+        .map_or(0, |text| crate::width::width(text) + 2);
+    let room = c.width.saturating_sub(lead + tail);
     let name = shorten_middle(&session_name(agent), room);
     let mut text = format!(
         "{}{} {name}",
@@ -972,6 +1041,11 @@ fn tree_line(c: &Column, agent: &AgentRow, space: &WorkspaceRow) -> Line {
         ));
         text.push(' ');
         text.push_str(&place);
+    }
+    if let Some(cost) = cost {
+        let at = c.width - crate::width::width(&cost) - 1;
+        text = format!("{}{cost} ", fit_to(&text, at));
+        runs.push((at, crate::width::width(&cost), crate::theme::Role::Faint));
     }
     Line {
         text: fit(&text, c.width),
@@ -1599,6 +1673,7 @@ mod tests {
             now_unix,
             width,
             shut,
+            usage: None,
         }
     }
 
@@ -1818,6 +1893,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -1841,6 +1917,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -2307,6 +2384,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -2552,6 +2630,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2585,6 +2664,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -3923,6 +4003,108 @@ mod tests {
                 .any(|(l, _)| l.text.contains(SPIN[(SWEEP_TICKS / 2 % 10) as usize])),
             "the strip did not spin: {strip:?}"
         );
+    }
+
+    /// Costs sit flush right on an agent's row and total in the title, only when asked for
+    /// and only where the column is wide enough; the name gives way to them first.
+    #[test]
+    fn costs_ride_the_row_and_the_title_only_when_shown_and_wide_enough() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+        ];
+        let mut usage = Usage::new();
+        usage.insert(
+            1,
+            Cost {
+                cpu_percent: Some(4),
+                rss: 212 << 20,
+            },
+        );
+        usage.insert(
+            2,
+            Cost {
+                cpu_percent: None,
+                rss: 3 << 30,
+            },
+        );
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let at = |width| {
+            let mut c = column(
+                &spaces,
+                &agents,
+                1,
+                9,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                width,
+                &shut,
+            );
+            c.usage = Some(&usage);
+            rows_folded(&c, 12, None)
+        };
+        let wide = at(30);
+        let row = tree_row(&wide, 1);
+        assert!(row.text.ends_with(" 4% 212M "), "{:?}", row.text);
+        assert!(
+            row.runs
+                .iter()
+                .any(|(_, _, r)| *r == crate::theme::Role::Faint)
+        );
+        assert!(
+            tree_row(&wide, 2).text.ends_with(" 3.0G "),
+            "{:?}",
+            tree_row(&wide, 2).text
+        );
+        let title = &wide.iter().find(|(_, h)| *h == Some(Hit::Title)).unwrap().0;
+        assert!(title.text.ends_with("4% 3.2G tree +"), "{:?}", title.text);
+        for (line, _) in &wide {
+            assert_eq!(crate::width::width(&line.text), 30, "{line:?}");
+        }
+        let narrow = at(24);
+        assert!(
+            !tree_row(&narrow, 1).text.contains('%'),
+            "costs on a narrow column"
+        );
+        assert_eq!(mem_text(1023 << 20), "1023M");
+        assert_eq!(mem_text(1536 << 20), "1.5G");
+    }
+
+    /// A total too long for the title gives way: the title still says ` spaces` whole,
+    /// ends in the order word and the `+`, and is exactly the width.
+    #[test]
+    fn a_long_total_gives_way_to_the_title() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![agent(1, 1, "claude", "working")];
+        let mut usage = Usage::new();
+        usage.insert(
+            1,
+            Cost {
+                cpu_percent: Some(1234),
+                rss: 1023 << 20,
+            },
+        );
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        for view in [View::Tree, View::Priority] {
+            for width in USAGE_MIN_WIDTH..=SIDEBAR_MAX {
+                let mut c = column(
+                    &spaces, &agents, 1, 1, 0, view, &seen, &unseen, NOW, width, &shut,
+                );
+                c.usage = Some(&usage);
+                let title = title_line(&c);
+                assert!(
+                    title.text.starts_with(" spaces "),
+                    "{width}: {:?}",
+                    title.text
+                );
+                assert!(title.text.ends_with(" +"), "{width}: {:?}", title.text);
+                assert_eq!(crate::width::width(&title.text), width);
+            }
+        }
     }
     /// A pin with room for one agent shows that agent, and the title's count says how
     /// many more there are: a title over a `+2 more` and nobody is a pin that names no one.

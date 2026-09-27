@@ -1366,3 +1366,172 @@ mod emulated_tests {
         assert_eq!(emulated_argv("/usr/bin/bash", &argv(&["bash"])), None);
     }
 }
+
+/// One process of a group, as the kernel accounts for it: its pid, the CPU time it has
+/// used so far in nanoseconds, and the memory it holds now in bytes.
+pub type ProcessUsage = (Pid, u64, u64);
+
+/// Every member of each asked-for process group, with what it has cost so far.
+///
+/// Per process and not per group, so a caller can take differences per process: a group
+/// total falls when a busy member exits, and a difference of totals would read that as
+/// idle. Groups at or below zero are skipped: Linux answers zero for a terminal with no
+/// foreground job, and zero is also every kernel thread's group. A member the kernel will
+/// not answer for (another user's, or gone since the listing) is left out, and a group
+/// with no member left to ask is absent from the answer.
+pub fn group_processes(groups: &[Pgid]) -> std::collections::BTreeMap<i32, Vec<ProcessUsage>> {
+    let wanted: Vec<Pgid> = groups.iter().copied().filter(|g| g.0 > 0).collect();
+    let mut out = std::collections::BTreeMap::new();
+    if wanted.is_empty() {
+        return out;
+    }
+    for (group, members) in members_of(&wanted) {
+        if !members.is_empty() {
+            out.insert(group, members);
+        }
+    }
+    out
+}
+
+/// The asked-for groups' members with their costs: `proc_listpids` filters by group in
+/// the kernel, so each group is one call and each member one more.
+#[cfg(target_os = "macos")]
+fn members_of(groups: &[Pgid]) -> Vec<(i32, Vec<ProcessUsage>)> {
+    groups
+        .iter()
+        .map(|group| {
+            let members = group_members(*group)
+                .into_iter()
+                .filter_map(|pid| process_usage(pid).map(|(cpu, rss)| (pid, cpu, rss)))
+                .collect();
+            (group.0, members)
+        })
+        .collect()
+}
+
+/// One process's CPU nanoseconds and physical footprint in bytes, from the kernel's own
+/// accounting. The footprint and not the resident size: it is what Activity Monitor calls
+/// memory, and it does not count shared pages once per member.
+///
+/// `ri_user_time` and `ri_system_time` are mach absolute time units, not nanoseconds: on
+/// Apple silicon one unit is about 42 ns, so they go through the timebase first.
+#[cfg(target_os = "macos")]
+fn process_usage(pid: Pid) -> Option<(u64, u64)> {
+    // SAFETY: a zeroed rusage_info_v2 is a valid out-param for the V2 flavour.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer is a live rusage_info_v2, which is what RUSAGE_INFO_V2 writes.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid.0,
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // `mach_timebase_info` itself, declared here: libc marks its binding deprecated in
+    // favour of a crate, and one two-field struct is not worth a dependency.
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
+    }
+    static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut base = Timebase { numer: 1, denom: 1 };
+        // SAFETY: a valid out-param; a failure leaves the one-to-one default.
+        unsafe { mach_timebase_info(&mut base) };
+        (base.numer, base.denom.max(1))
+    });
+    let ticks = info.ri_user_time.saturating_add(info.ri_system_time) as u128;
+    let nanos = (ticks * numer as u128 / denom as u128).min(u64::MAX as u128) as u64;
+    Some((nanos, info.ri_phys_footprint))
+}
+
+/// The asked-for groups' members with their costs, from one pass over `/proc`: every
+/// process's `stat` line carries its group, its CPU ticks and its resident pages, so one
+/// read per process answers all three and no group costs a pass of its own.
+#[cfg(not(target_os = "macos"))]
+fn members_of(groups: &[Pgid]) -> Vec<(i32, Vec<ProcessUsage>)> {
+    let mut by_group: std::collections::BTreeMap<i32, Vec<ProcessUsage>> =
+        groups.iter().map(|g| (g.0, Vec::new())).collect();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return by_group.into_iter().collect();
+    };
+    // SAFETY: sysconf reads a constant.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    // SAFETY: sysconf reads a constant.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After the last close bracket the fields count from 3 (`state`): the group is
+        // field 5, `utime` and `stime` 14 and 15, and the resident pages 24.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let field = |n: usize| fields.get(n - 3).and_then(|f| f.parse::<u64>().ok());
+        let (Some(group), Some(utime), Some(stime), Some(pages)) =
+            (field(5), field(14), field(15), field(24))
+        else {
+            continue;
+        };
+        if let Some(members) = by_group.get_mut(&(group as i32)) {
+            members.push((
+                Pid(pid),
+                (utime + stime).saturating_mul(1_000_000_000) / hz,
+                pages.saturating_mul(page),
+            ));
+        }
+    }
+    by_group.into_iter().collect()
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// A tenth of a second spent spinning shows up as about a tenth of a second of this
+    /// process's own CPU, in nanoseconds: mach units read as nanoseconds would be forty
+    /// times too small. Per process, so other tests running beside this one do not count.
+    #[test]
+    fn a_process_cpu_is_counted_in_real_nanoseconds_and_its_memory_in_bytes() {
+        // SAFETY: getpgrp and getpid have no preconditions.
+        let (group, me) = (Pgid(unsafe { libc::getpgrp() }), unsafe { libc::getpid() });
+        let own = || {
+            group_processes(&[group])
+                .remove(&group.0)
+                .and_then(|members| members.into_iter().find(|(pid, _, _)| pid.0 == me))
+                .expect("this process is in its own group")
+        };
+        let (_, before, resident) = own();
+        assert!(
+            resident > 1 << 20,
+            "a running test uses more than a megabyte: {resident}"
+        );
+        let start = std::time::Instant::now();
+        let mut spin = 0u64;
+        while start.elapsed() < std::time::Duration::from_millis(100) {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+        let (_, after, _) = own();
+        let spent = after.saturating_sub(before);
+        assert!(
+            (50_000_000..2_000_000_000).contains(&spent),
+            "100 ms of spinning read as {spent} ns"
+        );
+        assert!(
+            group_processes(&[Pgid(0)]).is_empty(),
+            "group zero is never asked"
+        );
+    }
+}

@@ -150,6 +150,79 @@ const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 /// second, enough for a sweep across thirty columns to read as motion rather than jumps.
 const MOTION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// How often agent costs are sampled while `QORO_USAGE=1`: often enough to follow a
+/// build, seldom enough that the percent is a real average and not noise.
+const USAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the person asked to see what agents cost: `QORO_USAGE=1`, and nothing else.
+fn usage_on() -> bool {
+    std::env::var("QORO_USAGE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Work done off the loop's own thread, handed back when it is done.
+enum Blocked {
+    /// A cost sample: when it was taken, which terminal asked for which group, and what
+    /// each group's members had cost by then.
+    Usage {
+        at: tokio::time::Instant,
+        targets: Vec<(u32, i32)>,
+        found: std::collections::BTreeMap<i32, Vec<qoro_runtime::ProcessUsage>>,
+    },
+}
+
+/// The local agents whose cost can be sampled, as (terminal, foreground group).
+///
+/// Another machine's terminals are skipped: a process group number from over there names
+/// some other process here.
+fn usage_targets(state: &State) -> Vec<(u32, i32)> {
+    state
+        .rows
+        .iter()
+        .filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))
+        .filter_map(|r| r.pgid.filter(|group| *group > 0).map(|g| (r.terminal, g)))
+        .collect()
+}
+
+/// Fold one cost sample into what the column shows.
+///
+/// CPU is taken per process: what each member spent since the previous sample, a member
+/// born since then counted from zero, over the wall time between the samples, as a
+/// percent of one core. Per process, because a group total falls when a busy member exits
+/// and a difference of totals would read a build as idle. A terminal seen for the first
+/// time, or whose foreground group changed, has no percent until its next sample.
+fn apply_usage(
+    state: &mut State,
+    at: tokio::time::Instant,
+    targets: Vec<(u32, i32)>,
+    found: std::collections::BTreeMap<i32, Vec<qoro_runtime::ProcessUsage>>,
+) {
+    let mut next = sidebar::Usage::new();
+    let mut seen = std::collections::BTreeMap::new();
+    for (terminal, group) in targets {
+        let Some(members) = found.get(&group) else {
+            continue;
+        };
+        let rss = members.iter().map(|(_, _, rss)| rss).sum();
+        let now: std::collections::BTreeMap<i32, u64> =
+            members.iter().map(|(pid, cpu, _)| (pid.0, *cpu)).collect();
+        let cpu_percent = match state.usage_seen.get(&terminal) {
+            Some((was, when, before)) if *was == group => {
+                let wall = at.duration_since(*when).as_nanos();
+                let spent: u64 = now
+                    .iter()
+                    .map(|(pid, cpu)| cpu.saturating_sub(before.get(pid).copied().unwrap_or(0)))
+                    .sum();
+                (wall > 0).then(|| (spent as u128 * 100 / wall).min(9999) as u32)
+            }
+            _ => None,
+        };
+        seen.insert(terminal, (group, at, now));
+        next.insert(terminal, sidebar::Cost { cpu_percent, rss });
+    }
+    state.usage_seen = seen;
+    state.usage = next;
+}
+
 /// Whether the column may move at all: yes, unless `QORO_MOTION=0` or `NO_COLOR` is set.
 fn motion_on() -> bool {
     std::env::var("QORO_MOTION").map_or(true, |v| v.trim() != "0")
@@ -329,6 +402,18 @@ struct State {
     in_column: bool,
     /// `ctrl-a` came last and the next key is a command: the key row names them all.
     prefix_pending: bool,
+    /// What each local agent costs, as last sampled. Empty unless `QORO_USAGE=1`.
+    usage: sidebar::Usage,
+    /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
+    /// then, for the next sample's percent.
+    usage_seen: std::collections::BTreeMap<
+        u32,
+        (
+            i32,
+            tokio::time::Instant,
+            std::collections::BTreeMap<i32, u64>,
+        ),
+    >,
     /// The done rows this client has already looked at, as (terminal, generation).
     ///
     /// Client-local, like the focus itself: reading a done agent here does not
@@ -539,6 +624,7 @@ impl State {
             image_notice: None,
             chrome: screen::Chrome {
                 shut: self.shut.clone(),
+                usage: self.usage.clone(),
                 keys: if self.prefix_pending {
                     screen::KeyContext::Prefix
                 } else if self.in_column
@@ -898,6 +984,7 @@ impl State {
             now_unix,
             width: self.sidebar_width,
             shut: &self.shut,
+            usage: Some(&self.usage),
         }
     }
 
@@ -2598,6 +2685,10 @@ where
         in_column: false,
 
         prefix_pending: false,
+
+        usage: sidebar::Usage::new(),
+
+        usage_seen: std::collections::BTreeMap::new(),
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
         tick: 0,
@@ -2745,6 +2836,12 @@ where
     // `NO_COLOR` keeps it still. The next frame's deadline, when one is armed.
     let motion = motion_on();
     let mut motion_at: Option<tokio::time::Instant> = None;
+    // Costs are sampled only when asked for, the first time straight away.
+    let mut usage_at = usage_on().then(tokio::time::Instant::now);
+    // Work that blocks (reading /proc, reading a transcript) runs on the blocking pool and
+    // comes back here, so the keyboard never waits on a disk. One sample at a time.
+    let (blocking_tx, mut blocking_rx) = tokio::sync::mpsc::unbounded_channel::<Blocked>();
+    let mut sampling = false;
     presented = presented.checked_sub(FRAME).unwrap_or(presented);
 
     let outcome: io::Result<()> = async {
@@ -4396,6 +4493,38 @@ where
                     motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
                     dirty = true;
                 }
+                // The next cost sample, armed only while `QORO_USAGE=1`.
+                _ = async {
+                    match usage_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    usage_at = Some(tokio::time::Instant::now() + USAGE_EVERY);
+                    let targets = usage_targets(&state);
+                    if targets.is_empty() {
+                        state.usage.clear();
+                        state.usage_seen.clear();
+                    } else if !sampling {
+                        sampling = true;
+                        let tx = blocking_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let groups: Vec<qoro_runtime::Pgid> =
+                                targets.iter().map(|(_, g)| qoro_runtime::Pgid(*g)).collect();
+                            let found = qoro_runtime::group_processes(&groups);
+                            let at = tokio::time::Instant::now();
+                            let _ = tx.send(Blocked::Usage { at, targets, found });
+                        });
+                    }
+                }
+                // Blocking work handed back.
+                Some(done) = blocking_rx.recv() => match done {
+                    Blocked::Usage { at, targets, found } => {
+                        sampling = false;
+                        apply_usage(&mut state, at, targets, found);
+                        dirty = true;
+                    }
+                },
                 // A change owed to an index request that never answered: after
                 // `INDEX_PATIENCE` it is taken as lost and the owed change asks on its
                 // own, so the last change of a burst is never left waiting for the next.
@@ -6160,6 +6289,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -6306,6 +6436,10 @@ mod tests {
             in_column: false,
 
             prefix_pending: false,
+
+            usage: sidebar::Usage::new(),
+
+            usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6760,6 +6894,10 @@ mod tests {
             in_column: false,
 
             prefix_pending: false,
+
+            usage: sidebar::Usage::new(),
+
+            usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6852,6 +6990,10 @@ mod tests {
             in_column: false,
 
             prefix_pending: false,
+
+            usage: sidebar::Usage::new(),
+
+            usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,

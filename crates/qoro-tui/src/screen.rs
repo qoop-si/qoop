@@ -115,6 +115,8 @@ pub struct Chrome {
     pub shut: sidebar::Shut,
     /// Where the keyboard's attention is, for the key row.
     pub keys: KeyContext,
+    /// What each local agent costs, sampled while `QORO_USAGE=1`.
+    pub usage: sidebar::Usage,
 }
 
 impl Frame<'_> {
@@ -132,6 +134,7 @@ impl Frame<'_> {
             now_unix: self.now_unix,
             width: self.sidebar_width,
             shut: &self.chrome.shut,
+            usage: Some(&self.chrome.usage),
         }
     }
 }
@@ -1943,6 +1946,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -3655,6 +3659,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 
@@ -4085,6 +4090,7 @@ mod tests {
                 cwd: None,
                 slept_at_unix: None,
                 activity: None,
+                pgid: None,
             })
             .collect();
         // Nothing scrolls: all nine agents draw their row under the space's rule, and
@@ -4104,6 +4110,7 @@ mod tests {
                 now_unix: 0,
                 width: sidebar::WIDTH,
                 shut: &shut,
+                usage: None,
             },
             39,
         );

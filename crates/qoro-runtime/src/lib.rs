@@ -19,3 +19,7 @@ pub mod terminal;
 pub use daemon::Daemon;
 pub use lock::StartupLock;
 pub use paths::{RUNTIME_DIR_ENV, runtime_dir, socket_path};
+/// What a process group costs in CPU nanoseconds and resident bytes, for a client that
+/// shows it: the same platform split the daemon's own process reads use.
+pub use qoro_pty::sys::{ProcessUsage, group_processes};
+pub use qoro_pty::teardown::Pgid;

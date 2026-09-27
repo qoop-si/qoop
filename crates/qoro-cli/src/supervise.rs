@@ -1112,6 +1112,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         }
     }
 

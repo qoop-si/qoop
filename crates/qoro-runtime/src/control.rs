@@ -676,6 +676,11 @@ pub struct AgentRow {
     /// itself never travels here: focus events stay out of the push payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// The terminal's foreground process group on the daemon's machine, for a client on the
+    /// same machine that shows what the agent costs. Meaningless anywhere else: a client
+    /// never reads it for a terminal of another machine. `None` from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<i32>,
     /// Where this terminal is, last known, as an absolute path.
     ///
     /// Best effort with a documented bound: the per-terminal task writes it
@@ -999,6 +1004,7 @@ mod tests {
             cwd: None,
             slept_at_unix: None,
             activity: None,
+            pgid: None,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");
