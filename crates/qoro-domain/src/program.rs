@@ -70,6 +70,16 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["maki"],
 ];
 
+/// The canonical spelling of every known agent, for the palette's agent rows.
+///
+/// The first spelling in each `AGENT_ALIASES` row is the canonical one, so this is the
+/// same name the index shows for a running agent however it was installed. An agent the
+/// table does not know is still startable by typing its own command: this list is what
+/// the palette suggests, not what it allows.
+pub fn agent_names() -> Vec<&'static str> {
+    AGENT_ALIASES.iter().map(|row| row[0]).collect()
+}
+
 /// Agent names that are also ordinary words, and other programs' names.
 ///
 /// `pi`, `hermes`, `kilo`, `muse` and `maki` all name something else too, and being an

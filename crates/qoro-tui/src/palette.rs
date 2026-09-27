@@ -18,6 +18,12 @@ pub enum Item {
     Space(i64),
     NewTerminal,
     NewSpace,
+    /// A new terminal running this agent: the command is typed into the new
+    /// shell once the tab opens, the same path `qoro new -- <agent>` takes.
+    NewAgent(String),
+    /// A new terminal running an agent the table does not know: the palette
+    /// asks which command to type, so any agent works, not just the listed ones.
+    NewAgentAsk,
     CopyMode,
     Resize,
     Equalize,
@@ -150,23 +156,48 @@ impl Palette {
             });
         }
         // The things the interface can do, each with the key that does it without the
-        // palette, so the next time needs no palette.
+        // palette, so the next time needs no palette. The agent row takes no key: it
+        // asks which command to type, so an agent nobody listed still starts.
         for (item, text, key) in [
             (Item::CopyMode, "copy mode: select and search history", "["),
             (Item::Resize, "resize panes", "e"),
             (Item::Equalize, "equalize panes", "="),
             (Item::NewTerminal, "new terminal here", "c"),
+            (Item::NewAgentAsk, "new agent terminal...", ""),
             (Item::NewSpace, "new space", "w"),
         ] {
             out.push(Entry {
                 item,
                 section: "do",
                 text: text.to_string(),
-                sub: crate::keys::named(&format!("ctrl-a {key}")),
+                sub: if key.is_empty() {
+                    "type any agent".to_string()
+                } else {
+                    crate::keys::named(&format!("ctrl-a {key}"))
+                },
                 space: None,
                 space_len: 0,
                 state: None,
             });
+        }
+        // One row per known agent, but only while filtering: the empty query stays
+        // short with the single agent row above, and typing a name finds its own.
+        if !self.query.is_empty() {
+            let needle = self.query.to_lowercase();
+            for name in qoro_domain::program::agent_names() {
+                let text = format!("new {name} terminal");
+                if text.contains(&needle) {
+                    out.push(Entry {
+                        item: Item::NewAgent(name.to_string()),
+                        section: "agents",
+                        text,
+                        sub: "agent".to_string(),
+                        space: None,
+                        space_len: 0,
+                        state: None,
+                    });
+                }
+            }
         }
         let query = self.query.to_lowercase();
         if query.is_empty() {
@@ -529,5 +560,117 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1, "listed exactly once: {entries:?}");
         assert_eq!(hits[0].section, "sleeping");
+    }
+
+    /// The empty query stays short: one agent row that asks which command,
+    /// and no preset rows. Twenty preset rows would bury the tabs the palette
+    /// is for.
+    #[test]
+    fn an_empty_query_shows_one_agent_row_and_no_presets() {
+        let (rows, spaces) = sample();
+        let entries = Palette::open().items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        assert!(
+            entries
+                .iter()
+                .filter(|e| matches!(e.item, Item::NewAgent(_)))
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "presets wait for a query: {entries:?}"
+        );
+        let ask = entries
+            .iter()
+            .find(|e| e.item == Item::NewAgentAsk)
+            .expect("the generic agent row");
+        assert_eq!(ask.text, "new agent terminal...");
+        assert_eq!(entries.last().unwrap().item, Item::NewSpace);
+    }
+
+    /// Typing a name finds its own row, so `clau` starts claude. Terminals
+    /// already running that agent still list first: the palette moves to what
+    /// exists before offering to start another.
+    #[test]
+    fn typing_an_agent_name_finds_its_own_row() {
+        let (rows, spaces) = sample();
+        let mut palette = Palette::open();
+        for c in "clau".chars() {
+            palette.push(c);
+        }
+        let entries = palette.items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        let found = entries
+            .iter()
+            .find(|e| e.item == Item::NewAgent("claude".to_string()))
+            .expect("new claude terminal");
+        assert_eq!(found.text, "new claude terminal");
+        // The full row text matches nothing already running, so enter starts it.
+        let mut palette = Palette::open();
+        for c in "new claude terminal".chars() {
+            palette.push(c);
+        }
+        assert_eq!(
+            palette.picked(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new()
+            ),
+            Some(Item::NewAgent("claude".to_string()))
+        );
+    }
+
+    /// `agent` finds the generic row, which is the door for an agent nobody
+    /// listed: the prompt after it takes any command.
+    #[test]
+    fn typing_agent_finds_the_generic_row() {
+        let (rows, spaces) = sample();
+        let mut palette = Palette::open();
+        for c in "agent".chars() {
+            palette.push(c);
+        }
+        let entries = palette.items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        assert!(
+            entries.iter().any(|e| e.item == Item::NewAgentAsk),
+            "{entries:?}"
+        );
+    }
+
+    /// An unknown name matches nothing in the palette itself: it starts
+    /// through the generic row, not through a row of its own.
+    #[test]
+    fn an_unknown_agent_matches_no_row_of_its_own() {
+        let (rows, spaces) = sample();
+        let mut palette = Palette::open();
+        for c in "zzz-no-such-agent".chars() {
+            palette.push(c);
+        }
+        assert!(
+            palette
+                .items(
+                    &rows,
+                    &spaces,
+                    0,
+                    &crate::sidebar::Seen::new(),
+                    &crate::sidebar::Unseen::new()
+                )
+                .is_empty()
+        );
     }
 }

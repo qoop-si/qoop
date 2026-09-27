@@ -13,7 +13,7 @@ You are in a shell, with the index of terminals on the left.
 | split side by side, or stacked | `ctrl-a v`, `ctrl-a -` |
 | move between panes | `ctrl-a H J K L`, or click |
 | the next or previous tab | `ctrl-a n`, `ctrl-a p` |
-| find anything: a space, an agent, a tab | `ctrl-a space` |
+| find anything: a space, an agent, a tab, or start an agent tab | `ctrl-a space` |
 | scroll back and copy with the keyboard | `ctrl-a [` |
 | every key | `ctrl-a ?` |
 | leave, with everything still running | `ctrl-q` |

@@ -420,6 +420,15 @@ struct State {
     /// placeholder leaks and blocks every later split. Consumed by the
     /// `TerminalCreated`/`Failed` answer.
     split_origin: std::collections::BTreeMap<String, (i64, u32)>,
+    /// Agent commands waiting for their tab, by request id: the line to type once
+    /// the shell is there. The daemon only starts a shell (ADR-015), so an agent
+    /// is typed the way `qoro new -- <agent>` types it. Consumed by the
+    /// `TerminalCreated`/`Failed` answer.
+    pending_agents: std::collections::BTreeMap<String, String>,
+    /// Lines owed to new agent tabs, by terminal. Written at the top of the loop,
+    /// where there is always a write in hand; the shell holds the line as
+    /// typeahead, so it lands even before its first prompt is drawn.
+    agent_typing: Vec<(u32, Vec<u8>)>,
     cols: u16,
     lines: u16,
     message: Option<String>,
@@ -1371,6 +1380,57 @@ fn focused_cwd(state: &State) -> Option<String> {
     (!cwd.is_empty() && std::path::Path::new(&cwd).is_absolute() && here).then_some(cwd)
 }
 
+/// Ask the daemon for a tab running an agent command, and remember the line to
+/// type once the tab opens.
+///
+/// The daemon only starts a shell (ADR-015): the command is typed, never spawned,
+/// the same path `qoro new -- <agent>` takes. The tab takes the command's first
+/// word as its name, so it reads as the agent until renamed. Empty commands never
+/// reach here: the prompt treats them as a cancel. The caller owns the request
+/// number, incremented the same way every other prompt answer is.
+fn start_agent_terminal(state: &mut State, id: u64, command: &str) -> ControlRequest {
+    let id = format!("agent-{id}");
+    let name = command
+        .split_whitespace()
+        .next()
+        .map(|first| {
+            first
+                .rsplit('/')
+                .next()
+                .filter(|word| !word.is_empty())
+                .unwrap_or(first)
+                .to_string()
+        })
+        .filter(|word| !word.is_empty());
+    state.pending_agents.insert(id.clone(), command.to_string());
+    ControlRequest::CreateTerminal {
+        id,
+        // Like every other new tab: the agent starts where the
+        // person already is rather than where the daemon started.
+        cwd: focused_cwd(state),
+        // The space the person is looking at.
+        workspace: state.space,
+        name,
+    }
+}
+
+/// The line an agent tab is owed, from its `TerminalCreated` answer, or `None`
+/// when the answer carries no agent.
+///
+/// The id prefix is the whole protocol: only `agent-` requests recorded a line
+/// in `pending_agents`. A `Failed` answer calls this too and drops the line, so
+/// a tab that never opened types nothing.
+fn take_agent_command(state: &mut State, id: &str) -> Option<Vec<u8>> {
+    if !id.starts_with("agent-") {
+        return None;
+    }
+    state.pending_agents.remove(id).map(|command| {
+        let mut line = command.into_bytes();
+        line.push(b'\r');
+        line
+    })
+}
+
 /// The numbered name a space gets when nobody names it.
 ///
 /// Counted among the spaces of the machine on screen, and on a remote prefixed with its
@@ -1648,6 +1708,11 @@ pub struct Prompt {
 pub enum Naming {
     Space,
     Terminal,
+    /// Which agent to run in a new tab, from the palette's agent row. The answer is a
+    /// command line, not a tab name: the tab takes the command's first word, and the
+    /// whole line is typed into its shell once the tab opens. Any command works, so
+    /// an agent the table never heard of starts the same way a listed one does.
+    Agent,
     /// Rename what already exists, which is the common case: a name given at creation is a
     /// guess, and the terminal somebody opened to "look at something" is the one they are
     /// still in an hour later doing the thing it should have been called after.
@@ -1665,6 +1730,7 @@ impl Naming {
         match self {
             Naming::Space => "name the new space",
             Naming::Terminal => "name the new terminal",
+            Naming::Agent => "which agent to run",
             Naming::RenameSpace(_) => "rename this space",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::Remote => "ssh address of the machine",
@@ -1673,10 +1739,11 @@ impl Naming {
     }
 
     /// How many columns an answer may take. An address is longer than a name and is shown
-    /// in the box, which is wider than the column a name has to fit.
+    /// in the box, which is wider than the column a name has to fit. An agent command can
+    /// carry flags, so it gets the wider box too.
     pub fn limit(self) -> usize {
         match self {
-            Naming::Remote => 56,
+            Naming::Remote | Naming::Agent => 56,
             _ => NAME_LIMIT,
         }
     }
@@ -1687,6 +1754,7 @@ impl Naming {
             Naming::Space | Naming::Terminal => {
                 "enter to make it, esc to stop, empty for a default name"
             }
+            Naming::Agent => "an agent command, like claude; enter to start it, esc to stop",
             Naming::RenameTerminal(_) => {
                 "enter to rename, esc to stop, empty for the program's own name"
             }
@@ -2782,6 +2850,8 @@ where
         split_saving: 0,
         resync: false,
         split_origin: std::collections::BTreeMap::new(),
+        pending_agents: std::collections::BTreeMap::new(),
+        agent_typing: Vec::new(),
         cols,
         lines,
         // What the caller wanted said, or that this is connecting. A notice about a
@@ -3004,6 +3074,26 @@ where
                     &mut control_seq,
                 )?)
                 .await?;
+            }
+            // Agent lines owed to new tabs. Queued on the `TerminalCreated`
+            // answer below and typed here, where there is always a write in
+            // hand, in small messages like a paste: one huge message inflates
+            // on the wire and trips the reassembly bound.
+            for (terminal, line) in std::mem::take(&mut state.agent_typing) {
+                for piece in client::split_input(&line) {
+                    wr.write_all(&client::encode_command_to(
+                        terminal,
+                        // Typed, never spawned: the person's own hands by way
+                        // of the palette, no wait edge, like any other typing.
+                        &ClientWire::Input {
+                            bytes: piece.to_vec(),
+                            from_terminal: None,
+                            from_token: None,
+                        },
+                        seqs.entry(terminal).or_default(),
+                    )?)
+                    .await?;
+                }
             }
             // A tree came on screen where nothing could write (the index, a bootstrap):
             // its other tiles still need their subscriptions. Only those: the focused
@@ -3340,6 +3430,25 @@ where
                                             text: String::new(),
                                         });
                                     }
+                                    palette::Item::NewAgentAsk => {
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::Agent,
+                                            text: String::new(),
+                                        });
+                                    }
+                                    palette::Item::NewAgent(program) => {
+                                        request += 1;
+                                        let ask = start_agent_terminal(
+                                            &mut state,
+                                            request,
+                                            &program,
+                                        );
+                                        state.message = Some(format!("starting {program}"));
+                                        wr.write_all(&client::encode_control_seq(
+                                            &ask, &mut control_seq,
+                                        )?)
+                                        .await?;
+                                    }
                                     palette::Item::NewSpace => {
                                         state.prompt = Some(Prompt {
                                             what: Naming::Space,
@@ -3476,6 +3585,12 @@ where
                                         workspace: state.space,
                                         name,
                                     }),
+                                    // A command line, not a name: empty is a cancel, as
+                                    // with a space's name, and anything else starts an
+                                    // agent tab, listed or not.
+                                    Naming::Agent => name.map(|command| {
+                                        start_agent_terminal(&mut state, request, &command)
+                                    }),
                                     Naming::Space => Some(ControlRequest::CreateWorkspace {
                                         id: format!("space-{request}"),
                                         // Empty means "you name it", which is the numbered
@@ -3510,6 +3625,13 @@ where
                                     )?).await?;
                                     state.message = Some(match what {
                                         Naming::Terminal => "starting a terminal".to_string(),
+                                        Naming::Agent => match &ask {
+                                            ControlRequest::CreateTerminal {
+                                                name: Some(tab),
+                                                ..
+                                            } => format!("starting {tab}"),
+                                            _ => "starting an agent".to_string(),
+                                        },
                                         Naming::Space => "starting a space".to_string(),
                                         Naming::RenameSpace(_) | Naming::RenameTerminal(_) => {
                                             "renamed".to_string()
@@ -6436,6 +6558,11 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if on_screen || !is_split {
                 state.pending_focus = Some(terminal);
             }
+            // An agent tab's shell is up: queue its command line. The shell holds
+            // the line as typeahead, so it lands even before its first prompt.
+            if let Some(line) = take_agent_command(state, &id) {
+                state.agent_typing.push((terminal, line));
+            }
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
@@ -6504,6 +6631,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if id.starts_with("space-") {
                 state.creating = state.creating.saturating_sub(1);
             }
+            // An agent tab that never opened types nothing: its line goes with it.
+            // The refusal itself is shown below, like any other.
+            take_agent_command(state, &id);
             // A daemon older than this client, refusing the colours it was told. It has
             // nothing to do with them anyway: said once, silently, and never again.
             if id.is_empty() && reason.contains("`HostColors`") {
@@ -6936,6 +7066,8 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            pending_agents: std::collections::BTreeMap::new(),
+            agent_typing: Vec::new(),
         }
     }
 
@@ -6988,6 +7120,78 @@ mod tests {
             .expect("focused row")
             .cwd = Some("relative/path".to_string());
         assert_eq!(focused_cwd(&s), None);
+    }
+
+    /// An agent tab takes the command's first word as its name, so it reads as
+    /// the agent until renamed, and remembers the whole line to type.
+    #[test]
+    fn an_agent_tab_takes_the_commands_first_word_as_its_name() {
+        let mut s = state();
+        let ask = start_agent_terminal(&mut s, 7, "claude");
+        match ask {
+            ControlRequest::CreateTerminal { id, name, .. } => {
+                assert_eq!(id, "agent-7");
+                assert_eq!(name.as_deref(), Some("claude"));
+            }
+            other => panic!("an agent tab is a create: {other:?}"),
+        }
+        assert_eq!(
+            s.pending_agents.get("agent-7").map(String::as_str),
+            Some("claude")
+        );
+    }
+
+    /// Flags stay on the typed line, off the tab name: the tab says the agent,
+    /// the shell gets the whole command.
+    #[test]
+    fn an_agent_command_with_flags_keeps_the_whole_line() {
+        let mut s = state();
+        let ask = start_agent_terminal(&mut s, 7, "my-agent --resume");
+        match ask {
+            ControlRequest::CreateTerminal { name, .. } => {
+                assert_eq!(name.as_deref(), Some("my-agent"));
+            }
+            other => panic!("an agent tab is a create: {other:?}"),
+        }
+        assert_eq!(
+            s.pending_agents.get("agent-7").map(String::as_str),
+            Some("my-agent --resume")
+        );
+    }
+
+    /// The `TerminalCreated` answer for an agent queues its line with enter,
+    /// and an answer for any other tab queues nothing.
+    #[test]
+    fn a_terminal_answer_for_an_agent_queues_its_line() {
+        let mut s = state();
+        s.pending_agents
+            .insert("agent-7".to_string(), "claude".to_string());
+        assert_eq!(
+            take_agent_command(&mut s, "agent-7"),
+            Some(b"claude\r".to_vec())
+        );
+        assert!(s.pending_agents.is_empty(), "consumed, not kept");
+        assert_eq!(take_agent_command(&mut s, "new-8"), None);
+        s.pending_agents
+            .insert("agent-9".to_string(), "codex".to_string());
+        take_agent_command(&mut s, "agent-9");
+        assert!(s.pending_agents.is_empty(), "a refusal drops the line");
+    }
+
+    /// Typing an agent row's text in the palette and pressing enter confirms an
+    /// agent start rather than a move.
+    #[test]
+    fn picking_a_filtered_agent_row_confirms_an_agent_start() {
+        let mut state = state();
+        assert!(matches!(
+            palette_key(&mut state, b"new claude terminal"),
+            PaletteOutcome::Updated
+        ));
+        assert!(matches!(
+            palette_key(&mut state, b"\r"),
+            PaletteOutcome::Confirm(palette::Item::NewAgent(cmd)) if cmd == "claude"
+        ));
+        assert_eq!(state.palette, None, "confirming leaves the palette");
     }
 
     #[test]
@@ -7321,6 +7525,8 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            pending_agents: std::collections::BTreeMap::new(),
+            agent_typing: Vec::new(),
             cols: 80,
             lines: 24,
             message: None,
@@ -7424,6 +7630,8 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            pending_agents: std::collections::BTreeMap::new(),
+            agent_typing: Vec::new(),
             cols: 80,
             lines: 24,
             message: None,
