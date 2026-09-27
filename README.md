@@ -170,16 +170,17 @@ cut and how an update lands: [docs/update.md](docs/update.md).
 ## What is measured
 
 Numbers, from `cargo run --release -p qoro-bench` and the scale gates, on a twelve core
-machine. Nothing here is a target.
+machine, measured on 2026-09-27 in one release run with other builds sharing the machine
+(load average 8 to 17). Nothing here is a target.
 
 | | |
 |---|---|
-| 100 idle terminals, 60 s | 10 ms of daemon CPU, against a 50 ms budget |
-| memory per scrolled terminal | 2.07 MiB at 80 columns, over a hundred of them |
-| attach to a terminal with 7.1 million rows of history | 211 microseconds |
-| keystroke to echo, quiet | 0.25 ms at the median |
-| keystroke to echo, twenty terminals each streaming 1 MiB/s | 2.8 ms at the ninety fifth percentile, against an 8 ms budget |
-| `qoro --version` | 3.6 to 4.8 ms at the ninety fifth percentile, across runs |
+| 100 idle terminals, 60 s | 0 to 10 ms of daemon CPU across runs, against a 50 ms budget |
+| memory per scrolled terminal | 1.2 to 2.2 MiB resident at 80 columns, over a hundred of them, across runs |
+| attach to a terminal with 7.1 million rows of history | 145 microseconds |
+| keystroke to echo, quiet | 0.06 ms at the median |
+| keystroke to echo, twenty terminals each streaming 1 MiB/s | 1.4 ms at the ninety fifth percentile, against an 8 ms budget |
+| `qoro --version` | 3.1 ms at the ninety fifth percentile |
 
 That last row was the hard one, and for most of this project it read 38 to 99 milliseconds.
 None of that was the code. The measurement started whatever shell the person running it
