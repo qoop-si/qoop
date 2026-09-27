@@ -18,6 +18,9 @@ pub enum Item {
     Space(i64),
     NewTerminal,
     NewSpace,
+    CopyMode,
+    Resize,
+    Equalize,
 }
 
 /// One filtered row: what it does, which section it is under, and what to draw.
@@ -146,24 +149,26 @@ impl Palette {
                 state: None,
             });
         }
-        out.push(Entry {
-            item: Item::NewTerminal,
-            section: "do",
-            text: "new terminal here".to_string(),
-            sub: "^a c".to_string(),
-            space: None,
-            space_len: 0,
-            state: None,
-        });
-        out.push(Entry {
-            item: Item::NewSpace,
-            section: "do",
-            text: "new space".to_string(),
-            sub: "^a w".to_string(),
-            space: None,
-            space_len: 0,
-            state: None,
-        });
+        // The things the interface can do, each with the key that does it without the
+        // palette, so the next time needs no palette.
+        let prefix = crate::keys::prefix_name();
+        for (item, text, key) in [
+            (Item::CopyMode, "copy mode: select and search history", "["),
+            (Item::Resize, "resize panes", "e"),
+            (Item::Equalize, "equalize panes", "="),
+            (Item::NewTerminal, "new terminal here", "c"),
+            (Item::NewSpace, "new space", "w"),
+        ] {
+            out.push(Entry {
+                item,
+                section: "do",
+                text: text.to_string(),
+                sub: format!("{prefix} {key}"),
+                space: None,
+                space_len: 0,
+                state: None,
+            });
+        }
         let query = self.query.to_lowercase();
         if query.is_empty() {
             return out;
@@ -317,6 +322,30 @@ mod tests {
         assert!(entries.iter().any(|e| e.item == Item::Space(1)));
         assert!(entries.iter().any(|e| e.item == Item::NewTerminal));
         assert_eq!(entries.last().unwrap().item, Item::NewSpace);
+    }
+
+    #[test]
+    fn copy_mode_resize_and_equalize_are_found_by_name_with_their_keys() {
+        let (rows, spaces) = sample();
+        for (query, item, key) in [
+            ("copy", Item::CopyMode, "ctrl-a ["),
+            ("resize", Item::Resize, "ctrl-a e"),
+            ("equal", Item::Equalize, "ctrl-a ="),
+        ] {
+            let mut palette = Palette::open();
+            for c in query.chars() {
+                palette.push(c);
+            }
+            let entries = palette.items(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new(),
+            );
+            let found = entries.iter().find(|e| e.item == item).expect(query);
+            assert_eq!(found.sub, key);
+        }
     }
 
     #[test]

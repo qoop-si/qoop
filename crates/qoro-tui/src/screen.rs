@@ -103,8 +103,14 @@ pub struct Frame<'a> {
     pub tiles: Vec<Tile<'a>>,
 }
 
-/// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  m menu  ? keys  d detach  U update";
+/// Every command the prefix takes, for a window wide enough to read them all, after the
+/// prefix it was started with.
+fn every_key() -> String {
+    format!(
+        "{}: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  [ copy  e resize  = equalize  m menu  ? keys  d detach  U update",
+        crate::keys::prefix_name()
+    )
+}
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -546,23 +552,27 @@ pub fn paint(frame: &Frame) -> String {
     // about the one that gets them out.
     //
     // A mode names its own keys, because in a mode the others do not work.
+    let prefix = crate::keys::prefix_name();
+    let every = every_key();
     let keys = if frame.prompt.is_some() {
-        "enter to make it  esc to stop"
+        "enter to make it  esc to stop".to_string()
     } else if frame.palette.is_some() {
-        "ctrl-a space find  enter go  esc back"
+        format!("{prefix} space find  enter go  esc back")
     } else if frame.menu.is_some() {
-        "up/down or j/k move  enter choose  esc close"
+        "up/down or j/k move  enter choose  esc close".to_string()
     } else if frame.reading.is_some() {
-        "any key to close"
-    } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
+        "any key to close".to_string()
+    } else if (frame.cols as usize) >= width::width(&every) {
         // Every key when there is room for every key. On a narrower window the list is cut
         // from the right, so the way out is not last: the cut takes the update key
         // first, and a person stuck in here can still read the one that gets them out.
-        EVERY_KEY
+        every
     } else {
-        "ctrl-a: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys"
+        format!(
+            "{prefix}: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys  [ copy"
+        )
     };
-    out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize));
+    out.push_str(&width::fit(&keys, frame.cols as usize));
     out.push_str(theme::RESET);
 
     // A picture the outer terminal cannot draw, named on the focused pane's last
@@ -699,8 +709,9 @@ fn triage(
         row.state.as_str()
     };
     Some(format!(
-        "next: {space}/{} is {word}  ^a space",
+        "next: {space}/{} is {word}  {} space",
         palette_label(row),
+        crate::keys::prefix_name(),
     ))
 }
 
@@ -1200,46 +1211,9 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
 /// than no settings page.
 fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) {
     let lines: Vec<String> = match reading {
-        crate::run::Reading::Keybinds => vec![
-            " tabs".to_string(),
-            " ctrl-a n      next tab".to_string(),
-            " ctrl-a p      previous tab".to_string(),
-            " ctrl-a 1..9   the nth tab of this space".to_string(),
-            " ctrl-a c      new tab, name it first".to_string(),
-            " ctrl-a r      rename the focused tab".to_string(),
-            " ctrl-a x      close the focused tab".to_string(),
-            " spaces".to_string(),
-            " ctrl-a s      next space".to_string(),
-            " ctrl-a S      previous space".to_string(),
-            " ctrl-a w      new space, name it first".to_string(),
-            " ctrl-a W      close this space, when it holds nothing".to_string(),
-            " ctrl-a R      rename this space".to_string(),
-            " find and view".to_string(),
-            " ctrl-a space  find tabs, spaces, agents".to_string(),
-            " ctrl-a g      agents grouped or by urgency".to_string(),
-            " ctrl-a F      focus view: last prompt, last turns, one row a tool".to_string(),
-            " ctrl-a b      fold the left column away".to_string(),
-            " ctrl-a m      this menu".to_string(),
-            " ctrl-a ?      every key, without the menu".to_string(),
-            " panes".to_string(),
-            " ctrl-a v/-    split side by side / stacked".to_string(),
-            " ctrl-a H/J/K/L focus the pane left/down/up/right".to_string(),
-            " ctrl-a o      next pane".to_string(),
-            " ctrl-a z      zoom the focused pane".to_string(),
-            " ctrl-a X      drop the pane, keeping its terminal".to_string(),
-            " session".to_string(),
-            " ctrl-a d      detach, keep everything running".to_string(),
-            " ctrl-q        detach".to_string(),
-            " ctrl-a U      say if an update waits, and how".to_string(),
-            " ctrl-a l      repaint".to_string(),
-            " mouse".to_string(),
-            // The mouse is not a key, and it is the part of this a person is least
-            // likely to guess: an interface that takes the mouse has taken their
-            // terminal's own selection with it, so it owes them this line.
-            " drag          select, and copy when you let go".to_string(),
-            " shift-drag    the same, over an agent that took the mouse".to_string(),
-            " wheel         scroll: the program's own, or back through what went past".to_string(),
-        ],
+        crate::run::Reading::Keybinds => {
+            fold_to_fit(keybind_lines(), frame.lines as usize, frame.cols as usize)
+        }
         crate::run::Reading::Settings => vec![
             format!(" window          {} by {}", frame.cols, frame.lines),
             format!(
@@ -1287,6 +1261,86 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
         crate::run::Reading::Settings => lines,
     };
     paint_box(frame, title, &lines, out);
+}
+
+/// Every key, as the keys overlay lists them, under the prefix the interface was started
+/// with.
+///
+/// Short on purpose: two columns of these have to fit an 80 by 24 window, which is where a
+/// person who does not know the keys yet is most likely to be. No section headings, for
+/// the same reason; the keys are grouped by what they act on instead.
+pub(crate) fn keybind_lines() -> Vec<String> {
+    let p = crate::keys::prefix_name();
+    let key = |keys: &str, what: &str| format!(" {keys:<15}{what}");
+    let cmd = |keys: &str, what: &str| key(&format!("{p} {keys}"), what);
+    vec![
+        cmd("n/p", "next, previous tab"),
+        cmd("1..9", "the nth tab"),
+        cmd("c", "new tab"),
+        cmd("r", "rename tab"),
+        cmd("x", "close tab, may ask"),
+        cmd("s/S", "next, previous space"),
+        cmd("w", "new space"),
+        cmd("W", "close an empty space"),
+        cmd("R", "rename space"),
+        cmd("space", "find anything"),
+        cmd("g", "agents: group or rank"),
+        cmd("F", "agent focus view"),
+        cmd("b", "fold the left column"),
+        cmd("m", "menu"),
+        cmd("?", "this list"),
+        cmd("v/-", "split beside, below"),
+        cmd("H/J/K/L", "focus pane by side"),
+        cmd("o", "next pane"),
+        cmd("z", "zoom pane"),
+        cmd("X", "pane back to a tab"),
+        cmd("e", "resize: hjkl, esc"),
+        cmd("=", "equalize panes"),
+        cmd("[", "copy mode, then:"),
+        key("  hjkl w b e", "move"),
+        key("  g G ^u ^d", "jump, half a page"),
+        key("  v V y", "select, copy"),
+        key("  / ? n N", "search history"),
+        key("  q esc", "leave"),
+        cmd("d", "detach"),
+        key("ctrl-q", "detach"),
+        cmd("U", "update waiting?"),
+        cmd("l", "repaint"),
+        // The mouse is not a key, and it is the part of this a person is least likely to
+        // guess: an interface that takes the mouse has taken their terminal's own
+        // selection with it, so it owes them these lines.
+        key("click", "focus what is there"),
+        key("drag", "select and copy"),
+        key("drag a rule", "resize panes"),
+        key("shift-drag", "over a mouse app"),
+        key("wheel", "scroll back"),
+    ]
+}
+
+/// The keys as the window can show them: one column when they fit, two when two fit, and
+/// otherwise as many as fit with a line saying there is more.
+fn fold_to_fit(lines: Vec<String>, rows: usize, cols: usize) -> Vec<String> {
+    // A box takes its borders and a title: four rows, three columns.
+    let room = rows.saturating_sub(4);
+    if lines.len() <= room {
+        return lines;
+    }
+    let half = lines.len().div_ceil(2);
+    let wide = |part: &[String]| part.iter().map(|l| width::width(l)).max().unwrap_or(0);
+    let (left, right) = (wide(&lines[..half]), wide(&lines[half..]));
+    if half <= room && left + 2 + right + 3 <= cols {
+        return (0..half)
+            .map(|i| {
+                let near = &lines[i];
+                let far = lines.get(half + i).map_or("", String::as_str);
+                let pad = " ".repeat(left - width::width(near) + 2);
+                format!("{near}{pad}{far}")
+            })
+            .collect();
+    }
+    let mut shown: Vec<String> = lines.into_iter().take(room.saturating_sub(1)).collect();
+    shown.push(" more in a larger window".to_string());
+    shown
 }
 
 /// A bordered box in the middle of the screen, with a title and some rows.
@@ -2844,6 +2898,173 @@ mod tests {
         }
     }
 
+    /// Where the keys overlay teaches a command: the start of its line, and the command's
+    /// place in the list below.
+    ///
+    /// A match on the value, so a new command fails to compile here until it has a line
+    /// and a number, and the test below fails until the list carries a sample of it: a key
+    /// nobody can find from inside is a key most people never press.
+    fn taught_as(action: &crate::keys::Action) -> (usize, Option<&'static str>) {
+        use crate::keys::Action;
+        match action {
+            // Typing is not a command: it goes to the terminal.
+            Action::Input(_) => (0, None),
+            Action::Next => (1, Some("ctrl-a n/p")),
+            Action::Previous => (2, Some("ctrl-a n/p")),
+            Action::Create => (3, Some("ctrl-a c")),
+            Action::Close => (4, Some("ctrl-a x")),
+            Action::Detach => (5, Some("ctrl-a d")),
+            Action::Click { .. } => (6, Some("click")),
+            Action::Drag { .. } => (7, Some("drag")),
+            Action::Release { .. } => (8, Some("drag")),
+            Action::Wheel { .. } => (9, Some("wheel")),
+            Action::Redraw => (10, Some("ctrl-a l")),
+            Action::NextSpace => (11, Some("ctrl-a s/S")),
+            Action::PreviousSpace => (12, Some("ctrl-a s/S")),
+            Action::CreateSpace => (13, Some("ctrl-a w")),
+            Action::CloseSpace => (14, Some("ctrl-a W")),
+            Action::Rename => (15, Some("ctrl-a r")),
+            Action::RenameSpace => (16, Some("ctrl-a R")),
+            Action::Collapse => (17, Some("ctrl-a b")),
+            Action::Update => (18, Some("ctrl-a U")),
+            Action::Menu => (19, Some("ctrl-a m")),
+            Action::Keybinds => (20, Some("ctrl-a ?")),
+            Action::Tab(_) => (21, Some("ctrl-a 1..9")),
+            Action::Palette => (22, Some("ctrl-a space")),
+            Action::ToggleView => (23, Some("ctrl-a g")),
+            Action::Focus => (24, Some("ctrl-a F")),
+            Action::SplitV => (25, Some("ctrl-a v/-")),
+            Action::SplitH => (26, Some("ctrl-a v/-")),
+            Action::PaneMove(_) => (27, Some("ctrl-a H/J/K/L")),
+            Action::PaneNext => (28, Some("ctrl-a o")),
+            Action::Zoom => (29, Some("ctrl-a z")),
+            Action::DetachPane => (30, Some("ctrl-a X")),
+            Action::Resize => (31, Some("ctrl-a e")),
+            Action::Equalize => (32, Some("ctrl-a =")),
+            Action::CopyMode => (33, Some("ctrl-a [")),
+        }
+    }
+
+    #[test]
+    fn every_command_has_a_line_in_the_keys_overlay() {
+        use crate::keys::Action;
+        let every = [
+            Action::Input(Vec::new()),
+            Action::Next,
+            Action::Previous,
+            Action::Create,
+            Action::Close,
+            Action::Detach,
+            Action::Click {
+                row: 1,
+                col: 1,
+                shift: false,
+            },
+            Action::Drag {
+                row: 1,
+                col: 1,
+                shift: false,
+            },
+            Action::Release {
+                row: 1,
+                col: 1,
+                shift: false,
+            },
+            Action::Wheel {
+                row: 1,
+                col: 1,
+                up: true,
+                shift: false,
+            },
+            Action::Redraw,
+            Action::NextSpace,
+            Action::PreviousSpace,
+            Action::CreateSpace,
+            Action::CloseSpace,
+            Action::Rename,
+            Action::RenameSpace,
+            Action::Collapse,
+            Action::Update,
+            Action::Menu,
+            Action::Keybinds,
+            Action::Tab(1),
+            Action::Palette,
+            Action::ToggleView,
+            Action::Focus,
+            Action::SplitV,
+            Action::SplitH,
+            Action::PaneMove(crate::layout::Move::Left),
+            Action::PaneNext,
+            Action::Zoom,
+            Action::DetachPane,
+            Action::Resize,
+            Action::Equalize,
+            Action::CopyMode,
+        ];
+        // Every number the match hands out has a sample here, so a command added to the
+        // match and not to this list fails rather than passing untested.
+        let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
+        numbers.sort();
+        numbers.dedup();
+        assert_eq!(numbers, (0..every.len()).collect::<Vec<_>>());
+        let lines = keybind_lines();
+        for action in &every {
+            let Some(taught) = taught_as(action).1 else {
+                continue;
+            };
+            assert!(
+                lines.iter().any(|l| l.starts_with(&format!(" {taught} "))),
+                "{action:?} has no line in the keys overlay under {taught:?}"
+            );
+        }
+    }
+
+    /// Found in review: at 80 by 24 the keys drew nothing, and at 120 by 40 the second
+    /// column ran off the box. Asserted on what is painted, not on what is listed.
+    #[test]
+    fn every_key_is_on_screen_at_80_by_24_and_at_120_by_40() {
+        let rows = [row(1, "sh", "idle")];
+        for (cols, lines) in [(80u16, 24u16), (120, 40), (160, 50)] {
+            let painted = paint(&Frame {
+                rows: &rows,
+                spaces: &spaces(),
+                panes: &std::collections::BTreeSet::new(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols,
+                lines,
+                message: None,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: Some(crate::run::Reading::Keybinds),
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Grouped,
+                seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &crate::run::Behind::default(),
+                image_notice: None,
+            });
+            let shown = strip(&painted);
+            for line in keybind_lines() {
+                assert!(
+                    shown.contains(line.trim_end()),
+                    "{cols}x{lines}: {line:?} is not on screen"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_pane_row_is_never_painted_over_the_status_line() {
         let rows = [row(1, "sh", "idle")];
@@ -3232,7 +3453,7 @@ mod tests {
             painted.contains("next: app/codex is blocked"),
             "{painted:?}"
         );
-        assert!(painted.contains("^a space"), "{painted:?}");
+        assert!(painted.contains("ctrl-a space"), "{painted:?}");
     }
 
     #[test]

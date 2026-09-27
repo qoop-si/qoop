@@ -335,6 +335,9 @@ struct State {
     palette: Option<Palette>,
     /// The start of a palette key sequence the read ended in the middle of.
     palette_pending: Vec<u8>,
+    /// Copy mode, resize mode, a close waiting for its `y`, and what they leave for the
+    /// loop to send.
+    modes: Modes,
     /// Something worth saying once, until the person does anything at all.
     ///
     /// Not a message: a message is cleared by the first render, which arrives in
@@ -392,6 +395,47 @@ struct State {
 /// and the tile-local cell. Divider cells answer `None`.
 type TileHit = (u32, (usize, usize), (usize, usize));
 
+/// The modes that own the keyboard for a while, and what they leave for the loop.
+///
+/// Together because they are one idea: a key means something else until the mode is left,
+/// and `apply` (which cannot write) sometimes has to ask the daemon on a mode's behalf.
+#[derive(Default)]
+struct Modes {
+    /// Copy mode over the focused terminal. See `copy`.
+    copy: Option<crate::copy::Copy>,
+    /// A copy mode selection whose history rows are still being fetched.
+    yank: Option<crate::copy::Yank>,
+    /// A finished yank's text, waiting for the loop to put it on the clipboard.
+    clipboard: Option<String>,
+    /// Requests made where no write is in hand, sent at the loop's next write.
+    outbox: Vec<ControlRequest>,
+    /// Resize mode: `h j k l` move the nearest divider until the mode is left.
+    resizing: bool,
+    /// A split divider held by the mouse: the path to its split.
+    split_drag: Option<layout::SplitPath>,
+    /// The layout moved under the focused tile since the tile was last sized. The paint
+    /// sizes it once, however many moves the frame coalesced.
+    tile_moved: bool,
+    /// A close waiting for its `y`: the terminal, and the question on the notice row.
+    confirm_close: Option<(u32, String)>,
+    /// Rows for a pinned view that went behind the screen have been asked for and not
+    /// answered yet, so a streaming terminal asks once per answer rather than per frame.
+    refetching: bool,
+    /// The start of a key sequence the last read ended inside, held for the next one.
+    pending: Vec<u8>,
+}
+
+impl Modes {
+    /// Whether a mode owns the keyboard.
+    fn open(&self) -> bool {
+        self.copy.is_some() || self.resizing || self.confirm_close.is_some()
+    }
+}
+
+/// What resize mode says on the notice row: its own keys, because in a mode the others do
+/// not work.
+const RESIZE_KEYS: &str = "resize: h j k l move 5%  H J K L 20%  = equalize  esc done";
+
 impl State {
     fn frame(&self) -> Frame<'_> {
         // The pane area in its own cells, shared by every tile rect.
@@ -431,7 +475,8 @@ impl State {
             snapshot: self.snapshot.as_ref(),
             cols: self.cols,
             lines: self.lines,
-            message: self.message.as_deref(),
+            // A mode speaks for itself on the notice row: its keys, or its question.
+            message: self.mode_line().or(self.message.as_deref()),
             hint: self.hint.as_deref(),
             view: self.view,
             seen: &self.seen_done,
@@ -446,7 +491,7 @@ impl State {
             menu: self.menu.map(|selected| (selected, &self.menu_kind)),
             collapsed: self.collapsed,
             reading: self.reading,
-            selection: self.selection,
+            selection: self.copy_selection().or(self.selection),
             scroll: self.scrolled_rows(),
             anchor: self.anchor.unwrap_or_default(),
             rows_back: self.rows_back(),
@@ -641,6 +686,76 @@ impl State {
             Some(at_press) => self.sidebar_width != at_press,
             None => false,
         }
+    }
+
+    /// What an open mode says on the notice row, if one is open.
+    fn mode_line(&self) -> Option<&str> {
+        if let Some((_, question)) = &self.modes.confirm_close {
+            return Some(question);
+        }
+        if self.modes.resizing {
+            return Some(RESIZE_KEYS);
+        }
+        self.modes.copy.as_ref().map(|copy| copy.status.as_str())
+    }
+
+    /// Copy mode's selection, as the focused tile draws it.
+    fn copy_selection(&self) -> Option<crate::selection::Selection> {
+        let copy = self.modes.copy.as_ref()?;
+        copy.on_screen(focused_rect(self).rows, &|at| {
+            copy_row(self, at).unwrap_or_default()
+        })
+    }
+
+    /// A one based screen position as a pane-local cell, pulled inside the pane when the
+    /// pointer has left it: a divider held by the mouse follows the pointer to the edge.
+    fn pane_cell(&self, row: u16, col: u16) -> (usize, usize) {
+        let area = pane_area(self);
+        let first_col = screen::left_for(self.cols, self.collapsed, self.sidebar_width) + 1;
+        let x = (col as usize).saturating_sub(first_col);
+        let y = (row as usize).saturating_sub(screen::TABS + 1);
+        (
+            x.min(area.cols.saturating_sub(1)),
+            y.min(area.rows.saturating_sub(1)),
+        )
+    }
+
+    /// Whether a plain press lands on a divider between two tiles, and hold it if so.
+    fn split_press(&mut self, col: u16, row: u16) -> bool {
+        let first_col = screen::left_for(self.cols, self.collapsed, self.sidebar_width) + 1;
+        let area = pane_area(self);
+        // Inside the pane only: `pane_cell` pulls a pointer past the edge back in, which is
+        // right for a drag already held and wrong for a press on the status rows below.
+        if (col as usize) < first_col
+            || (col as usize) >= first_col + area.cols
+            || (row as usize) <= screen::TABS
+            || (row as usize) > screen::TABS + area.rows
+        {
+            return false;
+        }
+        let (x, y) = self.pane_cell(row, col);
+        let path = self
+            .space
+            .and_then(|space| self.layouts.get(&space))
+            .and_then(|layout| layout.divider_at(area, x, y));
+        self.modes.split_drag = path;
+        self.modes.split_drag.is_some()
+    }
+
+    /// Move a held divider to the pointer. Answers whether it moved: only then does the
+    /// frame repaint, and the paint sizes the focused tile once for all the frame's moves.
+    fn split_motion(&mut self, col: u16, row: u16) -> bool {
+        let Some(path) = self.modes.split_drag.clone() else {
+            return false;
+        };
+        let (x, y) = self.pane_cell(row, col);
+        let area = pane_area(self);
+        let moved = self
+            .space
+            .and_then(|space| self.layouts.get_mut(&space))
+            .is_some_and(|layout| layout.drag(area, &path, x, y));
+        self.modes.tile_moved |= moved;
+        moved
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
@@ -914,6 +1029,13 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
     ("zoom pane", "z", "fill the pane with this tile, or go back"),
+    (
+        "copy mode",
+        "[",
+        "move, select and search the whole history",
+    ),
+    ("resize panes", "e", "h j k l move the nearest divider"),
+    ("equalize panes", "=", "every pane the same share"),
     ("toggle agents view", "g", "agents grouped or by urgency"),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "what this daemon is set to"),
@@ -1149,6 +1271,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             if state.focused == 0 {
                 state.message = Some("nothing to close".to_string());
                 MenuSend::Nothing
+            } else if let Some(question) = close_question(state) {
+                state.modes.confirm_close = Some((state.focused, question));
+                MenuSend::Nothing
             } else {
                 *request += 1;
                 MenuSend::Control(ControlRequest::CloseTerminal {
@@ -1195,6 +1320,18 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             }
         }
         "zoom pane" => MenuSend::Zoom,
+        "copy mode" => {
+            enter_copy(state);
+            MenuSend::Nothing
+        }
+        "resize panes" => {
+            enter_resize(state);
+            MenuSend::Nothing
+        }
+        "equalize panes" => {
+            equalize(state);
+            MenuSend::Nothing
+        }
         "toggle agents view" => {
             state.view = state.view.toggle();
             MenuSend::Nothing
@@ -1544,6 +1681,787 @@ fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
     }
 }
 
+/// What one read of stdin meant while a mode owns the keyboard.
+#[derive(Debug, PartialEq, Eq)]
+enum ModeOutcome {
+    /// Taken by the mode: repaint.
+    Stay,
+    /// The mode was left, and these bytes are ordinary input after all.
+    Passthrough(Vec<u8>),
+}
+
+/// One key as the modes read it.
+#[derive(Debug, PartialEq, Eq)]
+enum ModeKey {
+    Byte(u8),
+    /// A run of bytes above ASCII: typed text in some other script.
+    Text(String),
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Esc,
+    /// The wheel, up or not.
+    Wheel(bool),
+    /// A left button press: a click, which leaves a mode and then acts as itself.
+    Press,
+    Home,
+    End,
+    /// A sequence the modes have no use for: dropped whole, never typed.
+    Skip,
+    /// The start of a sequence the read ended inside, held for the next read.
+    Partial,
+}
+
+/// The key at `at`, and how many bytes it took.
+///
+/// A sequence the read ended inside is `Partial`, and the caller holds it for the next read
+/// the way the key decoder holds half a mouse report: dropped, its tail would be read as
+/// keys of its own and typed into the program in the pane. A lone `ESC` is never held,
+/// since it is the key that leaves.
+fn mode_key(bytes: &[u8], at: usize) -> (ModeKey, usize) {
+    let rest = &bytes[at..];
+    match rest {
+        // The key decoder's own reading of a mouse report, so the two never disagree.
+        [0x1b, b'[', b'<', ..] => match crate::keys::report(rest) {
+            crate::keys::Report::Partial => (ModeKey::Partial, rest.len()),
+            crate::keys::Report::Broken(used) => (ModeKey::Skip, used.max(1)),
+            crate::keys::Report::Whole(used, action) => {
+                let key = match action {
+                    Some(Action::Wheel { up, .. }) => ModeKey::Wheel(up),
+                    Some(Action::Click { .. }) => ModeKey::Press,
+                    _ => ModeKey::Skip,
+                };
+                (key, used)
+            }
+        },
+        [0x1b, b'[', ..] => {
+            let Some(end) = rest[2..].iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                return (ModeKey::Partial, rest.len());
+            };
+            let key = match &rest[..end + 3] {
+                b"\x1b[A" => ModeKey::Up,
+                b"\x1b[B" => ModeKey::Down,
+                b"\x1b[C" => ModeKey::Right,
+                b"\x1b[D" => ModeKey::Left,
+                b"\x1b[5~" => ModeKey::PageUp,
+                b"\x1b[6~" => ModeKey::PageDown,
+                b"\x1b[H" | b"\x1b[1~" => ModeKey::Home,
+                b"\x1b[F" | b"\x1b[4~" => ModeKey::End,
+                _ => ModeKey::Skip,
+            };
+            (key, end + 3)
+        }
+        [0x1b, b'O'] => (ModeKey::Partial, 2),
+        [0x1b, b'O', last, ..] => {
+            let key = match last {
+                b'A' => ModeKey::Up,
+                b'B' => ModeKey::Down,
+                b'C' => ModeKey::Right,
+                b'D' => ModeKey::Left,
+                b'H' => ModeKey::Home,
+                b'F' => ModeKey::End,
+                _ => ModeKey::Skip,
+            };
+            (key, 3)
+        }
+        [0x1b, ..] => (ModeKey::Esc, 1),
+        [first, ..] if *first >= 0x80 => {
+            let run = rest.iter().take_while(|b| **b >= 0x80).count();
+            match std::str::from_utf8(&rest[..run]) {
+                Ok(text) => (ModeKey::Text(text.to_string()), run),
+                // Cut inside a character at the end of the read: the rest is on its way.
+                Err(e) if e.error_len().is_none() && run == rest.len() && e.valid_up_to() == 0 => {
+                    (ModeKey::Partial, run)
+                }
+                Err(e) => {
+                    let good = e.valid_up_to().max(1);
+                    (
+                        ModeKey::Text(String::from_utf8_lossy(&rest[..good]).into_owned()),
+                        good,
+                    )
+                }
+            }
+        }
+        [first, ..] => (ModeKey::Byte(*first), 1),
+        [] => (ModeKey::Skip, 0),
+    }
+}
+
+/// Hand one read to whichever mode is open, after whatever the last read left unfinished.
+fn mode_input(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> ModeOutcome {
+    let mut input = std::mem::take(&mut state.modes.pending);
+    input.extend_from_slice(bytes);
+    let outcome = if state.modes.confirm_close.is_some() {
+        confirm_key(state, &input, request)
+    } else if state.modes.resizing {
+        resize_key(state, &input)
+    } else {
+        copy_key(state, &input, prefix, request)
+    };
+    // Held for a mode that is still open, and never more than a sequence's worth: anything
+    // longer that has not ended is not one.
+    if !state.modes.open() || state.modes.pending.len() > 64 {
+        state.modes.pending.clear();
+    }
+    outcome
+}
+
+/// The question to ask before closing the focused terminal, when closing it would end an
+/// agent in the middle of something. Shells and resting agents close at once.
+fn close_question(state: &State) -> Option<String> {
+    let row = state.rows.iter().find(|r| r.terminal == state.focused)?;
+    (row.agent && matches!(row.state.as_str(), "working" | "blocked" | "starting")).then(|| {
+        // A capital Y: a blocked agent is usually waiting for a lowercase y of its own, and
+        // a stray prefix and x followed by the answer meant for it must not end it.
+        format!(
+            "close {} ({})? Y closes it, any other key keeps it",
+            row.program.as_deref().unwrap_or("this agent"),
+            row.state
+        )
+    })
+}
+
+/// Close the focused terminal, or ask first when an agent in it is busy.
+fn close_focused(state: &mut State, request: &mut u64) {
+    if state.focused == 0 {
+        return;
+    }
+    match close_question(state) {
+        Some(question) => state.modes.confirm_close = Some((state.focused, question)),
+        None => {
+            *request += 1;
+            state.modes.outbox.push(ControlRequest::CloseTerminal {
+                id: format!("close-{request}"),
+                terminal: state.focused,
+            });
+        }
+    }
+}
+
+/// The answer to "close it?": `Y` closes, anything else is a no and is not typed.
+fn confirm_key(state: &mut State, bytes: &[u8], request: &mut u64) -> ModeOutcome {
+    let Some((terminal, _)) = state.modes.confirm_close.take() else {
+        return ModeOutcome::Passthrough(bytes.to_vec());
+    };
+    if bytes.first() != Some(&b'Y') {
+        let name = state
+            .rows
+            .iter()
+            .find(|r| r.terminal == terminal)
+            .and_then(|r| r.program.clone())
+            .unwrap_or_else(|| format!("terminal {terminal}"));
+        state.message = Some(format!("kept {name}"));
+    } else {
+        *request += 1;
+        state.modes.outbox.push(ControlRequest::CloseTerminal {
+            id: format!("close-{request}"),
+            terminal,
+        });
+    }
+    ModeOutcome::Stay
+}
+
+/// Open resize mode, when there is a divider to move.
+fn enter_resize(state: &mut State) {
+    let panes = state
+        .space
+        .and_then(|space| state.layouts.get(&space))
+        .map_or(0, |layout| layout.visible().len());
+    let zoomed = state
+        .space
+        .and_then(|space| state.layouts.get(&space))
+        .is_some_and(|layout| layout.zoomed.is_some());
+    let p = crate::keys::prefix_name();
+    if zoomed {
+        state.message = Some(format!("zoomed: {p} z first, then {p} e"));
+        return;
+    }
+    if panes < 2 {
+        state.message = Some(format!(
+            "one pane, nothing to resize: {p} v or {p} - splits it"
+        ));
+        return;
+    }
+    state.modes.resizing = true;
+}
+
+/// Even every pane out, and size the focused one to its new tile at the next paint.
+fn equalize(state: &mut State) {
+    let evened = state
+        .space
+        .and_then(|space| state.layouts.get_mut(&space))
+        .is_some_and(Layout::equalize);
+    state.modes.tile_moved |= evened;
+}
+
+/// Decide what one read of stdin meant in resize mode.
+///
+/// `h j k l` and the arrows move the nearest divider 5%, `H J K L` 20%, `=` evens everything
+/// out; `esc`, `enter`, `q` and `e` leave. The prefix leaves and is passed on, so `ctrl-a d`
+/// still detaches out of it, and any other key leaves and is read again as ordinary input:
+/// a person who starts typing has finished resizing.
+fn resize_key(state: &mut State, bytes: &[u8]) -> ModeOutcome {
+    let area = pane_area(state);
+    let mut at = 0;
+    while at < bytes.len() {
+        let (key, used) = mode_key(bytes, at);
+        let nudge = match key {
+            ModeKey::Byte(b'h') | ModeKey::Left => Some((layout::Move::Left, 0.05)),
+            ModeKey::Byte(b'j') | ModeKey::Down => Some((layout::Move::Down, 0.05)),
+            ModeKey::Byte(b'k') | ModeKey::Up => Some((layout::Move::Up, 0.05)),
+            ModeKey::Byte(b'l') | ModeKey::Right => Some((layout::Move::Right, 0.05)),
+            ModeKey::Byte(b'H') => Some((layout::Move::Left, 0.2)),
+            ModeKey::Byte(b'J') => Some((layout::Move::Down, 0.2)),
+            ModeKey::Byte(b'K') => Some((layout::Move::Up, 0.2)),
+            ModeKey::Byte(b'L') => Some((layout::Move::Right, 0.2)),
+            _ => None,
+        };
+        if let Some((mv, step)) = nudge {
+            let moved = state
+                .space
+                .and_then(|space| state.layouts.get_mut(&space))
+                .is_some_and(|layout| layout.nudge(area, mv, step));
+            state.modes.tile_moved |= moved;
+        } else {
+            match key {
+                ModeKey::Byte(b'=') => equalize(state),
+                ModeKey::Esc | ModeKey::Byte(b'\r' | b'\n' | b'q' | b'e') => {
+                    state.modes.resizing = false;
+                    let rest = &bytes[at + used..];
+                    return if rest.is_empty() {
+                        ModeOutcome::Stay
+                    } else {
+                        ModeOutcome::Passthrough(rest.to_vec())
+                    };
+                }
+                ModeKey::Skip => {}
+                ModeKey::Partial => {
+                    state.modes.pending = bytes[at..].to_vec();
+                    break;
+                }
+                _ => {
+                    // The prefix, a detach, a click, or typing: not this mode's.
+                    state.modes.resizing = false;
+                    return ModeOutcome::Passthrough(bytes[at..].to_vec());
+                }
+            }
+        }
+        at += used.max(1);
+    }
+    ModeOutcome::Stay
+}
+
+/// One row of the focused terminal by its number: history below the screen's first row,
+/// the live screen from there. `None` for a history row this client has not fetched.
+fn copy_row(state: &State, at: u64) -> Option<String> {
+    let total = state.live_behind();
+    if at >= total {
+        return state
+            .snapshot
+            .as_ref()?
+            .lines
+            .get((at - total) as usize)
+            .cloned();
+    }
+    (state.behind.terminal == state.focused)
+        .then(|| state.behind.row(at).map(str::to_string))
+        .flatten()
+}
+
+/// The rows copy mode may move through, and the height of the view.
+fn copy_bounds(state: &State) -> crate::copy::Bounds {
+    let total = state.live_behind();
+    let screen = state.snapshot.as_ref().map_or(1, |s| s.rows.max(1)) as u64;
+    crate::copy::Bounds {
+        // A full screen program's screen is all there is of it: the history under it
+        // belongs to the shell it was started from.
+        first: if state.pane_is_full_screen() {
+            total
+        } else {
+            0
+        },
+        last: total + screen - 1,
+        page: focused_rect(state).rows.max(1),
+    }
+}
+
+/// Open copy mode over the focused terminal, at its cursor, or at the foot of the view when
+/// the view is already scrolled back.
+fn enter_copy(state: &mut State) {
+    let Some(snapshot) = state.snapshot.as_ref().filter(|_| state.focused != 0) else {
+        state.message = Some(format!(
+            "nothing to copy from, {} c starts a terminal",
+            crate::keys::prefix_name()
+        ));
+        return;
+    };
+    let total = state.live_behind();
+    let bounds = copy_bounds(state);
+    let (top, cursor) = match state.anchor {
+        Some(top) => (top, (top + bounds.page as u64 - 1, 0)),
+        None => (total, (total + snapshot.cursor.0 as u64, snapshot.cursor.1)),
+    };
+    let mut copy = crate::copy::Copy::open(state.focused, cursor, top, state.anchor);
+    copy.follow(bounds);
+    // The copy mode's own selection replaces the mouse's, and the focus list would cover
+    // the text being copied.
+    state.selection = None;
+    close_focus(state);
+    state.anchor = Some(copy.top);
+    state.modes.copy = Some(copy);
+}
+
+/// Leave copy mode, and put the view back where it was when the mode opened.
+fn leave_copy(state: &mut State) {
+    let Some(copy) = state.modes.copy.take() else {
+        return;
+    };
+    state.anchor = copy.restore;
+    if let Some(top) = copy.restore {
+        copy_fetch(state, top);
+    }
+}
+
+/// Ask for the rows behind a view whose top row is `top`, when it reaches behind the screen.
+fn copy_fetch(state: &mut State, top: u64) {
+    let total = state.live_behind();
+    if state.focused != 0 && top < total {
+        let want = behind_request(
+            state.focused,
+            (total - top) as usize,
+            focused_rect(state).rows,
+        );
+        state.modes.outbox.push(want);
+    }
+}
+
+/// A pinned view (copy mode, or scrolled back) whose rows have gone behind the screen since
+/// they were fetched: ask for them.
+///
+/// Rows the view was showing from the live screen become history as the terminal prints,
+/// and nothing else asks for them, so they painted blank at the top of the view. Asked only
+/// when the rows the view shows are not all held, and once per answer, so a terminal
+/// streaming sixty frames a second costs one request per round trip rather than per frame.
+fn refetch_pinned(state: &mut State) {
+    let Some(top) = state.anchor else {
+        return;
+    };
+    if state.focused == 0 || state.modes.refetching {
+        return;
+    }
+    let total = state.live_behind();
+    let page = focused_rect(state).rows as u64;
+    let end = (top + page).min(total);
+    if top >= end {
+        return;
+    }
+    let held = state.behind.terminal == state.focused
+        && state.behind.row(top).is_some()
+        && state.behind.row(end - 1).is_some();
+    if held {
+        return;
+    }
+    state.modes.refetching = true;
+    state.modes.outbox.push(behind_request(
+        state.focused,
+        (total - top) as usize,
+        page as usize,
+    ));
+}
+
+/// Decide what one read of stdin meant in copy mode.
+///
+/// The keys are tmux's vi table: `h j k l` and the arrows, `0 ^ $`, `w b e`, `ctrl-u
+/// ctrl-d` half a page, `ctrl-b ctrl-f` and page up and down a page, `g G` the ends, `v` or
+/// space and `V` select, `y` or enter copy and leave, `/ ?` search, `n N` again, `esc`
+/// puts a selection down and then leaves, `q` leaves. The prefix leaves and is passed on,
+/// so a prefix of `ctrl-b` wins over page up. The wheel moves the view; a click leaves and
+/// then acts as a click.
+fn copy_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> ModeOutcome {
+    let Some(mut copy) = state
+        .modes
+        .copy
+        .take()
+        .filter(|copy| copy.terminal == state.focused)
+    else {
+        return ModeOutcome::Passthrough(bytes.to_vec());
+    };
+    let top_before = copy.top;
+    let bounds = copy_bounds(state);
+    let half = (bounds.page / 2).max(1) as i64;
+    let page = bounds.page.max(1) as i64;
+    let mut at = 0;
+    let mut outcome = ModeOutcome::Stay;
+    let mut leave = false;
+    while at < bytes.len() {
+        let (key, used) = mode_key(bytes, at);
+        let used = used.max(1);
+        // The query line owns the keys while it is open.
+        if let Some((query, backward)) = copy.query.as_mut() {
+            match key {
+                ModeKey::Byte(b'\r' | b'\n') => {
+                    let (query, backward) = (query.clone(), *backward);
+                    copy.query = None;
+                    if !query.is_empty() {
+                        copy_search(state, &mut copy, query, backward, None, request);
+                    }
+                }
+                ModeKey::Esc => {
+                    copy.query = None;
+                    copy.status = crate::copy::KEYS.to_string();
+                }
+                ModeKey::Byte(0x7f | 0x08) => {
+                    query.pop();
+                }
+                // ctrl-u, as in a shell: the whole line.
+                ModeKey::Byte(0x15) => query.clear(),
+                ModeKey::Partial => {
+                    state.modes.pending = bytes[at..].to_vec();
+                    break;
+                }
+                ModeKey::Byte(byte) if byte == prefix || byte == crate::keys::DETACH => {
+                    leave = true;
+                    outcome = ModeOutcome::Passthrough(bytes[at..].to_vec());
+                }
+                ModeKey::Byte(byte) if byte == b' ' || byte.is_ascii_graphic() => {
+                    query.push(byte as char);
+                }
+                ModeKey::Text(text) => query.push_str(&text),
+                _ => {}
+            }
+            if let Some((query, backward)) = &copy.query {
+                copy.status = format!("{}{query}", if *backward { '?' } else { '/' });
+            }
+            if leave {
+                break;
+            }
+            at += used;
+            continue;
+        }
+        let row = |at: u64| copy_row(state, at).unwrap_or_default();
+        match key {
+            ModeKey::Byte(byte) if byte == prefix || byte == crate::keys::DETACH => {
+                leave = true;
+                outcome = ModeOutcome::Passthrough(bytes[at..].to_vec());
+                break;
+            }
+            ModeKey::Press => {
+                leave = true;
+                outcome = ModeOutcome::Passthrough(bytes[at..].to_vec());
+                break;
+            }
+            ModeKey::Wheel(up) => copy.scroll(
+                if up {
+                    -(WHEEL_ROWS as i64)
+                } else {
+                    WHEEL_ROWS as i64
+                },
+                bounds,
+            ),
+            ModeKey::Byte(b'k') | ModeKey::Up => copy.rows(-1, bounds),
+            ModeKey::Byte(b'j') | ModeKey::Down => copy.rows(1, bounds),
+            ModeKey::Byte(b'h') | ModeKey::Left => copy.sideways(false, &row(copy.cursor.0)),
+            ModeKey::Byte(b'l') | ModeKey::Right => copy.sideways(true, &row(copy.cursor.0)),
+            ModeKey::Byte(edge @ (b'0' | b'^' | b'$')) => copy.line_edge(edge, &row(copy.cursor.0)),
+            ModeKey::Home => copy.line_edge(b'0', &row(copy.cursor.0)),
+            ModeKey::End => copy.line_edge(b'$', &row(copy.cursor.0)),
+            ModeKey::Partial => {
+                state.modes.pending = bytes[at..].to_vec();
+                break;
+            }
+            ModeKey::Byte(motion @ (b'w' | b'b' | b'e')) => copy.word(motion, bounds, &row),
+            ModeKey::Byte(0x15) => copy.rows(-half, bounds),
+            ModeKey::Byte(0x04) => copy.rows(half, bounds),
+            ModeKey::Byte(0x02) | ModeKey::PageUp => copy.rows(-page, bounds),
+            ModeKey::Byte(0x06) | ModeKey::PageDown => copy.rows(page, bounds),
+            ModeKey::Byte(b'g') => {
+                copy.cursor = (bounds.first, 0);
+                copy.follow(bounds);
+            }
+            ModeKey::Byte(b'G') => {
+                copy.cursor = (bounds.last, 0);
+                copy.follow(bounds);
+            }
+            ModeKey::Byte(b'v' | b' ') => copy.toggle(crate::copy::Mode::Char),
+            ModeKey::Byte(b'V') => copy.toggle(crate::copy::Mode::Line),
+            // Copies and leaves; with nothing selected it only leaves, which is what tmux
+            // hands expect of the same key.
+            ModeKey::Byte(b'y' | b'\r' | b'\n') => {
+                if !start_yank(state, &copy) {
+                    state.message = Some("nothing was selected, nothing copied".to_string());
+                }
+                leave = true;
+                break;
+            }
+            ModeKey::Byte(slash @ (b'/' | b'?')) => {
+                copy.query = Some((String::new(), slash == b'?'));
+                copy.status = (slash as char).to_string();
+            }
+            ModeKey::Byte(again @ (b'n' | b'N')) => match copy.last.clone() {
+                Some((query, backward)) => {
+                    let backward = backward != (again == b'N');
+                    // Carry on from where the last step stopped, when it stopped for
+                    // budget in this same direction; otherwise a new search from here.
+                    let resume = copy
+                        .search
+                        .as_ref()
+                        .filter(|s| !s.waiting && s.backward == backward && s.query == query)
+                        .and_then(|s| s.resume);
+                    copy_search(state, &mut copy, query, backward, resume, request);
+                }
+                None => copy.status = "no search yet: / looks down, ? looks up".to_string(),
+            },
+            ModeKey::Esc if copy.mode != crate::copy::Mode::None => {
+                copy.mode = crate::copy::Mode::None;
+            }
+            ModeKey::Esc | ModeKey::Byte(b'q') => {
+                leave = true;
+                break;
+            }
+            _ => {}
+        }
+        at += used;
+    }
+    if leave {
+        state.modes.copy = Some(copy);
+        leave_copy(state);
+        return outcome;
+    }
+    state.anchor = Some(copy.top);
+    if copy.top != top_before {
+        copy_fetch(state, copy.top);
+    }
+    state.modes.copy = Some(copy);
+    outcome
+}
+
+/// Search for `query` from the cursor: the rows on the screen first, since the client has
+/// them, then the history through the daemon, a bounded step at a time. `resume` carries on
+/// a search whose last step ran out of budget.
+fn copy_search(
+    state: &mut State,
+    copy: &mut crate::copy::Copy,
+    query: String,
+    backward: bool,
+    resume: Option<u64>,
+    request: &mut u64,
+) {
+    copy.last = Some((query.clone(), backward));
+    let total = state.live_behind();
+    let bounds = copy_bounds(state);
+    let text = |at: u64| copy_row(state, at);
+    let from = match resume {
+        Some(resume) => Some(resume),
+        None => {
+            // The cursor's own row past the cursor, and when the cursor is on the screen the
+            // screen rows the way the search goes; for a cursor in the history, only its
+            // own row, since the rows past it are history too.
+            let local = if copy.cursor.0 >= total {
+                total..=bounds.last
+            } else {
+                copy.cursor.0..=copy.cursor.0
+            };
+            if let Some(hit) = crate::copy::find_near(&text, local, copy.cursor, &query, backward) {
+                copy.cursor = hit;
+                copy.follow(bounds);
+                copy.search = None;
+                copy.status = format!("{}{query}", if backward { '?' } else { '/' });
+                return;
+            }
+            let next = if backward {
+                copy.cursor.0.min(total).checked_sub(1)
+            } else {
+                Some(copy.cursor.0 + 1).filter(|at| *at < total)
+            };
+            next.filter(|_| bounds.first == 0)
+        }
+    };
+    let Some(from) = from else {
+        copy_missed(state, copy, &query, backward);
+        return;
+    };
+    *request += 1;
+    let id = format!("search-{request}");
+    let started = match (resume, &copy.search) {
+        (Some(_), Some(search)) => search.started,
+        _ => from,
+    };
+    state.modes.outbox.push(ControlRequest::SearchScrollback {
+        id: id.clone(),
+        terminal: copy.terminal,
+        query: query.clone(),
+        from,
+        backward,
+    });
+    copy.status = format!("searching the history for {query}");
+    copy.search = Some(crate::copy::Search {
+        id,
+        query,
+        backward,
+        started,
+        resume: None,
+        waiting: true,
+    });
+}
+
+/// Nothing found anywhere the search could look. A forward search from the history ends on
+/// the screen, which the daemon does not hold: that part is looked at here.
+fn copy_missed(state: &State, copy: &mut crate::copy::Copy, query: &str, backward: bool) {
+    copy.search = None;
+    if !backward {
+        let total = state.live_behind();
+        let bounds = copy_bounds(state);
+        // From the end of the history: the screen's first row is looked at whole.
+        let from = (total.max(copy.cursor.0 + 1).saturating_sub(1), usize::MAX);
+        let hit = crate::copy::find_near(
+            &|at| copy_row(state, at),
+            total..=bounds.last,
+            from,
+            query,
+            false,
+        );
+        if let Some(hit) = hit.filter(|hit| *hit > copy.cursor) {
+            copy.cursor = hit;
+            copy.follow(copy_bounds(state));
+            copy.status = format!("/{query}");
+            return;
+        }
+    }
+    copy.status = format!("no match for {query}");
+}
+
+/// Fold one answer to a history search into the open copy mode.
+fn copy_found(state: &mut State, id: &str, row: Option<u64>, cell: usize, resume: Option<u64>) {
+    let Some(mut copy) = state.modes.copy.take() else {
+        return;
+    };
+    let wanted = copy
+        .search
+        .as_ref()
+        .is_some_and(|s| s.waiting && s.id == id);
+    if wanted && let Some(search) = copy.search.clone() {
+        let top = copy.top;
+        match (row, resume) {
+            (Some(row), _) => {
+                copy.cursor = (row, cell);
+                copy.follow(copy_bounds(state));
+                copy.search = None;
+                copy.status = format!(
+                    "{}{}: {} rows back",
+                    if search.backward { '?' } else { '/' },
+                    search.query,
+                    state.live_behind().saturating_sub(row)
+                );
+            }
+            (None, Some(resume)) => {
+                let searched = search.started.abs_diff(resume);
+                copy.status = format!(
+                    "no match in the {} {searched} rows, n searches further",
+                    if search.backward { "last" } else { "next" }
+                );
+                copy.search = Some(crate::copy::Search {
+                    resume: Some(resume),
+                    waiting: false,
+                    ..search
+                });
+            }
+            (None, None) => copy_missed(state, &mut copy, &search.query, search.backward),
+        }
+        if copy.top != top {
+            state.anchor = Some(copy.top);
+            let top = copy.top;
+            state.modes.copy = Some(copy);
+            copy_fetch(state, top);
+            return;
+        }
+    }
+    state.modes.copy = Some(copy);
+}
+
+/// Start copying copy mode's selection. False when nothing is selected.
+///
+/// The rows on the screen and those already fetched are taken at once; the rest of the
+/// history is asked for in chunks, and the copy happens when the last one lands.
+fn start_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
+    let Some((start, end)) = copy.selected() else {
+        return false;
+    };
+    let total = state.live_behind();
+    let mut yank = crate::copy::Yank {
+        terminal: copy.terminal,
+        start,
+        end,
+        rows: std::collections::BTreeMap::new(),
+        total,
+        asked: 0,
+    };
+    for at in start.0..=end.0 {
+        if let Some(row) = copy_row(state, at) {
+            yank.rows.insert(at, row);
+        }
+    }
+    match yank.next_request() {
+        Some(ask) => {
+            state.message = Some(format!("copying {} rows", end.0 - start.0 + 1));
+            state.modes.outbox.push(ask);
+            state.modes.yank = Some(yank);
+        }
+        None => state.modes.clipboard = Some(yank.text()),
+    }
+    true
+}
+
+/// Send what the modes asked for, and copy a finished yank. Runs wherever the loop has a
+/// write in hand.
+async fn drain_modes(
+    state: &mut State,
+    control_seq: &mut u32,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    dirty: &mut bool,
+) -> io::Result<()> {
+    for ask in std::mem::take(&mut state.modes.outbox) {
+        wr.write_all(&client::encode_control_seq(&ask, control_seq)?)
+            .await?;
+    }
+    if let Some(text) = state.modes.clipboard.take() {
+        let mut out = std::io::stdout();
+        state.message = Some(match crate::selection::copy(&text, &mut out)? {
+            Some(via) => copied(&text, via),
+            None => "nothing to copy: the selection is blank".to_string(),
+        });
+        *dirty = true;
+    }
+    Ok(())
+}
+
+/// Size the focused tile after the layout moved under it, once, and only the focused one:
+/// the rest are viewport-cropped and never resized (ADR-007).
+fn size_moved_tile(
+    state: &mut State,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    if !std::mem::take(&mut state.modes.tile_moved) {
+        return Ok(None);
+    }
+    resize_focused_to_tile(state, seqs)
+}
+
+/// Where copy mode's cursor is drawn, one based on the screen, when it is in view.
+fn copy_cursor(state: &State) -> Option<(usize, usize)> {
+    let copy = state.modes.copy.as_ref()?;
+    let rect = focused_rect(state);
+    let row = copy_row(state, copy.cursor.0).unwrap_or_default();
+    let (pane_row, column) = copy.cursor_on_screen(rect.rows, &row)?;
+    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+    Some((
+        screen::TABS + rect.y + pane_row + 1,
+        left + rect.x + column.min(rect.cols.saturating_sub(1)) + 1,
+    ))
+}
+
 /// What the interface drew where a person clicked.
 enum Clicked {
     Menu,
@@ -1669,6 +2587,7 @@ where
         connecting: None,
         probing: None,
         joining: None,
+        modes: Modes::default(),
         selection: None,
         forwarded_press: false,
         anchor: None,
@@ -1863,6 +2782,12 @@ where
                 let paint_now = frame.now_unix;
                 drop(frame);
                 state.paint_now = paint_now;
+                // Copy mode's cursor, shown where it is: placed last, so it is where the
+                // frame leaves the terminal's own cursor.
+                if let Some((row, col)) = copy_cursor(&state) {
+                    painted.push_str(&screen::at(row, col));
+                    painted.push_str("\x1b[?25h");
+                }
                 written.clear();
                 presenter.present(&painted, state.cols, state.lines, &mut written);
                 // Pictures, reconciled per frame. Anything placed on the outer
@@ -1925,6 +2850,11 @@ where
                         wr.write_all(&resize).await?;
                     }
                     state.sidebar_sized = state.sidebar_width;
+                }
+                // A moved divider sizes the focused tile the same way: once per painted
+                // frame, however many nudges or drag motions the frame took in.
+                if let Some(resize) = size_moved_tile(&mut state, &mut seqs)? {
+                    wr.write_all(&resize).await?;
                 }
             }
 
@@ -2074,6 +3004,9 @@ where
                                             text: String::new(),
                                         });
                                     }
+                                    palette::Item::CopyMode => enter_copy(&mut state),
+                                    palette::Item::Resize => enter_resize(&mut state),
+                                    palette::Item::Equalize => equalize(&mut state),
                                 }
                                 dirty = true;
                             }
@@ -2253,6 +3186,14 @@ where
                             }
                             PromptOutcome::Passthrough(rest) => feed = Some(rest),
                         }
+                    } else if state.modes.open() {
+                        // A mode owns the keyboard the way the overlays do, and hands the
+                        // rest back when it is left.
+                        let outcome = mode_input(&mut state, &bytes, keys.prefix(), &mut request);
+                        dirty = true;
+                        if let ModeOutcome::Passthrough(rest) = outcome {
+                            feed = Some(rest);
+                        }
                     } else if state.focus {
                         // The focus list owns the keyboard while it is open, the way the
                         // palette and the naming box do, and hands the rest back for the
@@ -2279,6 +3220,17 @@ where
                     for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
+                                // Typed in the same read as the key that opened a mode,
+                                // as in `ctrl-a [ k`: the mode's, like everything after it.
+                                let bytes = if state.modes.open() {
+                                    dirty = true;
+                                    match mode_input(&mut state, &bytes, keys.prefix(), &mut request) {
+                                        ModeOutcome::Stay => continue,
+                                        ModeOutcome::Passthrough(rest) => rest,
+                                    }
+                                } else {
+                                    bytes
+                                };
                                 // The hint has been read or it has not; either way the
                                 // person is working now.
                                 state.hint = None;
@@ -2346,7 +3298,7 @@ where
                                 // and consumes the press whole, so it never
                                 // reaches a tile, the column, or the fold mark
                                 // the divider also crosses.
-                                if !shift && state.divider_press(col, row) {
+                                if !shift && (state.divider_press(col, row) || state.split_press(col, row)) {
                                     // A press anywhere else puts down whatever
                                     // was selected, divider presses included.
                                     if state.selection.take().is_some() {
@@ -2481,6 +3433,13 @@ where
                                     }
                                     continue;
                                 }
+                                // A held split divider latches the same way.
+                                if state.modes.split_drag.is_some() {
+                                    if state.split_motion(col, row) {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col).or_else(|| {
                                     state
                                         .forwarded_press
@@ -2540,6 +3499,9 @@ where
                                         )?)
                                         .await?;
                                     }
+                                    continue;
+                                }
+                                if state.modes.split_drag.take().is_some() {
                                     continue;
                                 }
                                 let inside = state.in_pane(row, col).or_else(|| {
@@ -2831,15 +3793,23 @@ where
                             }
 
                             Action::Close if state.focused == 0 => {}
+                            // A busy agent is asked about first: one stray `x` after the
+                            // prefix must not end an hour of its work.
                             Action::Close => {
-                                request += 1;
-                                wr.write_all(&client::encode_control_seq(
-                                    &ControlRequest::CloseTerminal {
-                                        id: format!("close-{request}"),
-                                        terminal: state.focused,
-                                    },
-                                    &mut control_seq,
-                                )?).await?;
+                                close_focused(&mut state, &mut request);
+                                dirty = true;
+                            }
+                            Action::Resize => {
+                                enter_resize(&mut state);
+                                dirty = true;
+                            }
+                            Action::Equalize => {
+                                equalize(&mut state);
+                                dirty = true;
+                            }
+                            Action::CopyMode => {
+                                enter_copy(&mut state);
+                                dirty = true;
                             }
                             Action::Palette => {
                                 state.palette = Some(Palette::open());
@@ -3039,6 +4009,7 @@ where
                     // terminal while the screen already shows the new one.
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     }
+                    drain_modes(&mut state, &mut control_seq, &mut wr, &mut dirty).await?;
                 }
                 n = rd.read(&mut read) => {
                     let n = n?;
@@ -3066,6 +4037,7 @@ where
                                 if terminal == state.focused {
                                     state.snapshot = Some(snapshot);
                                     state.message = None;
+                                    refetch_pinned(&mut state);
                                     dirty = true;
                                 } else if state.subs.contains(&terminal)
                                     && (state
@@ -3193,6 +4165,7 @@ where
                         )?).await?;
                     }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                    drain_modes(&mut state, &mut control_seq, &mut wr, &mut dirty).await?;
                     // The focus list refetches on its own flag, never on a timer:
                     // opened, moved to another terminal, or told the index
                     // changed while open. A tool event arrives with the state
@@ -3971,6 +4944,10 @@ fn focus(
     state.anchor = None;
     state.behind = Behind::default();
     state.selection = None;
+    // Copy mode and a close waiting for its answer belong to the terminal they were
+    // opened over.
+    state.modes.copy = None;
+    state.modes.confirm_close = None;
     state.focused = to;
     // The list belongs to its terminal: a new one starts unlisted, and the
     // fetch at the end of this function fills it rather than showing the
@@ -4111,6 +5088,8 @@ fn enter_space(
 fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
     state.focused = 0;
     state.snapshot = None;
+    state.modes.copy = None;
+    state.modes.confirm_close = None;
     state.message = Some(why.to_string());
     // No terminal, no list: the overlay hides, and so does the keyboard
     // ownership that would otherwise intercept keys for nobody.
@@ -4133,7 +5112,81 @@ fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Op
 
 /// Fold one answer into what is on screen.
 fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
+    if response.request_id() == "behind" {
+        state.modes.refetching = false;
+    }
     match response {
+        // Rows for a copy, gathered on their own and never into the view's window: the
+        // window is what is drawn, and a copy's rows are not what the person is looking at.
+        ControlResponse::Scrollback {
+            id,
+            terminal,
+            from,
+            total,
+            lines,
+        } if id.starts_with("yank-") => {
+            let Some(yank) = state
+                .modes
+                .yank
+                .as_mut()
+                .filter(|yank| yank.terminal == terminal)
+            else {
+                return;
+            };
+            let next = if yank.take(from, total, lines) {
+                yank.next_request()
+            } else {
+                None
+            };
+            match next {
+                Some(ask) => state.modes.outbox.push(ask),
+                None => {
+                    state.modes.clipboard = state.modes.yank.take().map(|yank| yank.text());
+                }
+            }
+        }
+        ControlResponse::ScrollbackMatch {
+            id,
+            terminal,
+            row,
+            col,
+            resume,
+        } => {
+            if terminal == state.focused {
+                copy_found(state, &id, row, col, resume);
+                *dirty = true;
+            }
+        }
+        // An older daemon cannot read the search and says so with no id, since it could
+        // not read the id either. The one search waiting is what it is answering.
+        ControlResponse::Failed { id, reason }
+            if id.is_empty()
+                && reason.contains("unknown variant")
+                && state
+                    .modes
+                    .copy
+                    .as_ref()
+                    .and_then(|copy| copy.search.as_ref())
+                    .is_some_and(|search| search.waiting) =>
+        {
+            if let Some(copy) = state.modes.copy.as_mut() {
+                copy.search = None;
+                copy.status = "search needs a newer daemon: stop the session to upgrade".into();
+            }
+            *dirty = true;
+        }
+        ControlResponse::Failed { id, reason }
+            if id.starts_with("search-") || id.starts_with("yank-") =>
+        {
+            if id.starts_with("yank-") {
+                state.modes.yank = None;
+                state.message = Some(reason);
+            } else if let Some(copy) = state.modes.copy.as_mut() {
+                copy.search = None;
+                copy.status = reason;
+            }
+            *dirty = true;
+        }
         ControlResponse::Scrollback {
             terminal,
             from,
@@ -4947,6 +6000,7 @@ mod tests {
             connecting: None,
             probing: None,
             joining: None,
+            modes: Modes::default(),
             selection: None,
             forwarded_press: false,
             anchor: None,
@@ -5388,6 +6442,7 @@ mod tests {
             connecting: None,
             probing: None,
             joining: None,
+            modes: Modes::default(),
             selection: None,
             forwarded_press: false,
             anchor: None,
@@ -5470,6 +6525,7 @@ mod tests {
             connecting: None,
             probing: None,
             joining: None,
+            modes: Modes::default(),
             selection: None,
             forwarded_press: false,
             anchor: None,
@@ -5788,10 +6844,10 @@ mod tests {
         assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(9));
+        assert_eq!(state.menu, Some(12));
         // Keyless rows answer to their first letter.
         assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(10));
+        assert_eq!(state.menu, Some(13));
         // `x` jumps straight to close tab.
         assert!(matches!(menu_key(&mut state, 0, b"x"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(4));
@@ -5825,6 +6881,9 @@ mod tests {
                 "split side by side",
                 "split stacked",
                 "zoom pane",
+                "copy mode",
+                "resize panes",
+                "equalize panes",
                 "toggle agents view",
                 "keybinds",
                 "settings",
@@ -6709,5 +7768,471 @@ mod tests {
         assert_eq!(state.space, Some(there));
         assert_eq!(state.pending_focus, Some(tab));
         assert_eq!(state.joining, None);
+    }
+
+    #[test]
+    fn resize_mode_moves_on_its_keys_and_hands_everything_else_back() {
+        let mut state = tiled_state();
+        enter_resize(&mut state);
+        assert!(state.modes.resizing);
+        let before = focused_rect(&state).cols;
+        assert_eq!(resize_key(&mut state, b"lll"), ModeOutcome::Stay);
+        assert!(focused_rect(&state).cols > before);
+        assert!(state.modes.tile_moved, "the paint owes the tile a resize");
+        assert_eq!(resize_key(&mut state, b"\x1b[D="), ModeOutcome::Stay);
+        // Leaving keys leave and are not typed; what follows them is.
+        assert_eq!(resize_key(&mut state, b"q"), ModeOutcome::Stay);
+        assert!(!state.modes.resizing);
+        state.modes.resizing = true;
+        assert_eq!(
+            resize_key(&mut state, b"\x1bls"),
+            ModeOutcome::Passthrough(b"ls".to_vec())
+        );
+        // The prefix leaves and is passed on whole, so ctrl-a d still detaches.
+        state.modes.resizing = true;
+        assert_eq!(
+            resize_key(&mut state, b"\x01d"),
+            ModeOutcome::Passthrough(b"\x01d".to_vec())
+        );
+        assert!(!state.modes.resizing);
+        // Typing is someone who has finished resizing.
+        state.modes.resizing = true;
+        assert_eq!(
+            resize_key(&mut state, b"ls -la"),
+            ModeOutcome::Passthrough(b"s -la".to_vec())
+        );
+        // One pane has nothing to resize, and says so.
+        let mut single = bare_state();
+        enter_resize(&mut single);
+        assert!(!single.modes.resizing);
+        assert!(single.message.is_some());
+    }
+
+    /// Only the focused tile is sized, and only once per painted frame however many drag
+    /// motions arrived before it.
+    #[test]
+    fn a_divider_drag_sizes_the_focused_tile_once_per_frame() {
+        let mut state = tiled_state();
+        let rect = focused_rect(&state);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let divider_col = (left + 1 + rect.cols) as u16;
+        let row = (screen::TABS + 3) as u16;
+        assert!(state.split_press(divider_col, row));
+        assert!(!state.divider_press(divider_col, row), "not the sidebar's");
+        assert!(state.split_motion(divider_col - 5, row));
+        assert!(state.split_motion(divider_col - 9, row));
+        assert_eq!(focused_rect(&state).cols, rect.cols - 9);
+        let mut seqs = std::collections::BTreeMap::new();
+        assert!(size_moved_tile(&mut state, &mut seqs).unwrap().is_some());
+        assert!(size_moved_tile(&mut state, &mut seqs).unwrap().is_none());
+        assert_eq!(
+            seqs.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "focused only"
+        );
+        // A press inside a pane is not a divider.
+        state.modes.split_drag = None;
+        assert!(!state.split_press((left + 3) as u16, row));
+    }
+
+    #[test]
+    fn closing_a_busy_agent_asks_first_and_only_a_capital_y_closes() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        // Terminal 1 is an idle shell: closed at once.
+        close_focused(&mut state, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::CloseTerminal { terminal: 1, .. })
+        ));
+        // Terminal 2 is a working claude: asked about.
+        state.focused = 2;
+        close_focused(&mut state, &mut request);
+        assert!(state.modes.outbox.is_empty());
+        assert_eq!(
+            state.mode_line(),
+            Some("close claude (working)? Y closes it, any other key keeps it")
+        );
+        // A lowercase y is the answer a blocked agent waits for, not this one's.
+        assert_eq!(
+            confirm_key(&mut state, b"y", &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(state.modes.outbox.is_empty(), "no is no");
+        assert!(state.modes.confirm_close.is_none());
+        assert_eq!(state.message.as_deref(), Some("kept claude"));
+        close_focused(&mut state, &mut request);
+        assert_eq!(
+            confirm_key(&mut state, b"Y", &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::CloseTerminal { terminal: 2, .. })
+        ));
+    }
+
+    /// Found in review: a sequence cut at the end of a read had its tail typed into the
+    /// agent, `C` from a split arrow, `0;7M` from a drag report.
+    #[test]
+    fn a_sequence_split_across_reads_stays_in_the_mode() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        enter_resize(&mut state);
+        let before = focused_rect(&state).cols;
+        assert_eq!(
+            mode_input(&mut state, b"\x1b[", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(
+            mode_input(&mut state, b"C", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(state.modes.resizing, "the arrow did not end the mode");
+        assert!(
+            focused_rect(&state).cols > before,
+            "the arrow moved the divider"
+        );
+        assert_eq!(
+            mode_input(&mut state, b"\x1b[<32;4", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(
+            mode_input(&mut state, b"0;7M", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(state.modes.resizing);
+        // In copy mode too, and a lone esc is still the esc key.
+        let mut state = copy_state();
+        enter_copy(&mut state);
+        assert_eq!(
+            mode_input(&mut state, b"\x1bO", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(
+            mode_input(&mut state, b"A", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor.0, 1_002);
+        assert_eq!(
+            mode_input(&mut state, b"\x1b", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(state.modes.copy.is_none(), "esc left");
+    }
+
+    #[test]
+    fn resize_while_zoomed_says_to_unzoom_and_a_press_under_the_pane_is_no_drag() {
+        let mut state = tiled_state();
+        let mut control_seq = 0;
+        let mut seqs = std::collections::BTreeMap::new();
+        zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
+        enter_resize(&mut state);
+        assert!(!state.modes.resizing);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("zoomed: ctrl-a z first, then ctrl-a e")
+        );
+        // Unzoomed, the status rows under the divider are not the divider.
+        zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
+        let rect = focused_rect(&state);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let divider_col = (left + 1 + rect.cols) as u16;
+        assert!(!state.split_press(divider_col, state.lines - 1));
+        assert!(!state.split_press(divider_col, state.lines));
+        assert!(state.split_press(divider_col, (screen::TABS + 1) as u16));
+    }
+
+    #[test]
+    fn copy_mode_y_with_nothing_selected_leaves_and_home_end_and_ctrl_u_work() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        copy_key(&mut state, b"k\x1b[F", 0x01, &mut request);
+        assert_eq!(
+            state.modes.copy.as_ref().unwrap().cursor,
+            (1_002, 4),
+            "end of `third`"
+        );
+        copy_key(&mut state, b"\x1b[H", 0x01, &mut request);
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor, (1_002, 0));
+        copy_key(&mut state, b"/abc\x15", 0x01, &mut request);
+        assert_eq!(
+            state.modes.copy.as_ref().unwrap().query,
+            Some((String::new(), false)),
+            "ctrl-u cleared the query"
+        );
+        copy_key(&mut state, b"\x1by", 0x01, &mut request);
+        assert!(state.modes.copy.is_none(), "y with nothing selected leaves");
+        assert!(state.modes.clipboard.is_none(), "and copies nothing");
+    }
+
+    /// A terminal with 1,000 rows behind a four row screen, one pane.
+    fn copy_state() -> State {
+        let mut state = bare_state();
+        state.snapshot = Some(SnapshotWire {
+            cols: 40,
+            rows: 4,
+            cursor: (3, 2),
+            lines: vec![
+                "first screen row".to_string(),
+                "MARK on the screen".to_string(),
+                "third".to_string(),
+                "$ ".to_string(),
+            ],
+            styles: Vec::new(),
+            modes: Default::default(),
+            behind: 1_000,
+            links: Default::default(),
+        });
+        state.lines = 4 + (screen::TABS + screen::STATUS) as u16;
+        state
+    }
+
+    #[test]
+    fn copy_mode_opens_on_the_cursor_and_moves_through_history_asking_for_it() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        let copy = state.modes.copy.as_ref().expect("open");
+        assert_eq!((copy.cursor, copy.top), ((1_003, 2), 1_000));
+        assert_eq!(state.anchor, Some(1_000), "the view is pinned");
+        // Up past the screen: the view follows and the rows behind it are asked for.
+        assert_eq!(
+            copy_key(&mut state, b"kkkk", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(state.modes.copy.as_ref().unwrap().top, 999);
+        assert!(matches!(
+            state.modes.outbox.last(),
+            Some(ControlRequest::Scrollback { id, .. }) if id == "behind"
+        ));
+        assert_eq!(
+            copy_key(&mut state, b"g", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor.0, 0);
+        assert_eq!(
+            copy_key(&mut state, b"G", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor.0, 1_003);
+        // The wheel moves the view, and a click leaves and is handed back as a click.
+        copy_key(&mut state, b"\x1b[<64;10;3M", 0x01, &mut request);
+        assert_eq!(state.modes.copy.as_ref().unwrap().top, 997);
+        assert_eq!(
+            copy_key(&mut state, b"\x1b[<0;10;3M", 0x01, &mut request),
+            ModeOutcome::Passthrough(b"\x1b[<0;10;3M".to_vec())
+        );
+        assert!(state.modes.copy.is_none());
+        assert_eq!(state.anchor, None, "the view goes back where it was");
+    }
+
+    /// Found in review: rows a pinned view showed from the live screen go behind it as an
+    /// agent prints, and nothing asked for them, so they painted blank.
+    #[test]
+    fn a_pinned_view_asks_for_the_rows_that_went_behind_the_screen_once_per_answer() {
+        let mut state = copy_state();
+        enter_copy(&mut state);
+        state.modes.outbox.clear();
+        refetch_pinned(&mut state);
+        assert!(state.modes.outbox.is_empty(), "nothing went behind yet");
+        // The agent printed three rows: the top three of the view are history now.
+        state.snapshot.as_mut().unwrap().behind = 1_003;
+        refetch_pinned(&mut state);
+        refetch_pinned(&mut state);
+        let asked: Vec<_> = std::mem::take(&mut state.modes.outbox);
+        assert_eq!(
+            asked.len(),
+            1,
+            "one request per answer, not per frame: {asked:?}"
+        );
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Scrollback {
+                id: "behind".to_string(),
+                terminal: 1,
+                from: 996,
+                total: 1_003,
+                lines: (996..1_003).map(|at| format!("row {at}")).collect(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(copy_row(&state, 1_000).as_deref(), Some("row 1000"));
+        refetch_pinned(&mut state);
+        assert!(state.modes.outbox.is_empty(), "everything shown is held");
+    }
+
+    #[test]
+    fn the_prefix_leaves_copy_mode_and_esc_puts_a_selection_down_first() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        copy_key(&mut state, b"vh", 0x01, &mut request);
+        assert!(state.copy_selection().is_some());
+        copy_key(&mut state, b"\x1b", 0x01, &mut request);
+        assert!(
+            state.modes.copy.is_some(),
+            "the first esc only drops the selection"
+        );
+        assert!(state.copy_selection().is_none());
+        // A prefix of ctrl-b wins over page up.
+        assert_eq!(
+            copy_key(&mut state, b"\x02d", 0x02, &mut request),
+            ModeOutcome::Passthrough(b"\x02d".to_vec())
+        );
+        assert!(state.modes.copy.is_none());
+    }
+
+    #[test]
+    fn a_search_tries_the_screen_first_then_asks_the_history_a_step_at_a_time() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        // On the screen: no request at all.
+        copy_key(&mut state, b"?mark\r", 0x01, &mut request);
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor, (1_001, 0));
+        assert!(
+            !state
+                .modes
+                .outbox
+                .iter()
+                .any(|a| matches!(a, ControlRequest::SearchScrollback { .. }))
+        );
+        // Not on the screen: the history, from the row above the screen.
+        copy_key(&mut state, b"?needle\r", 0x01, &mut request);
+        let Some(ControlRequest::SearchScrollback {
+            id, from, backward, ..
+        }) = state.modes.outbox.pop()
+        else {
+            panic!("no history search asked");
+        };
+        assert_eq!((from, backward), (999, true));
+        // A step that ran out of budget says how far it got, and n carries on from there.
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::ScrollbackMatch {
+                id: id.clone(),
+                terminal: 1,
+                row: None,
+                col: 0,
+                resume: Some(400),
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.mode_line(),
+            Some("no match in the last 599 rows, n searches further")
+        );
+        copy_key(&mut state, b"n", 0x01, &mut request);
+        let Some(ControlRequest::SearchScrollback { id, from, .. }) = state.modes.outbox.pop()
+        else {
+            panic!("n asked nothing");
+        };
+        assert_eq!(from, 400);
+        // The match moves the cursor to its row and cell, and the view with it.
+        apply(
+            &mut state,
+            ControlResponse::ScrollbackMatch {
+                id,
+                terminal: 1,
+                row: Some(123),
+                col: 7,
+                resume: None,
+            },
+            &mut dirty,
+        );
+        let copy = state.modes.copy.as_ref().unwrap();
+        assert_eq!(copy.cursor, (123, 7));
+        assert!(copy.top <= 123 && 123 < copy.top + 4);
+        assert_eq!(state.anchor, Some(copy.top));
+        // A stale answer changes nothing.
+        apply(
+            &mut state,
+            ControlResponse::ScrollbackMatch {
+                id: "search-old".to_string(),
+                terminal: 1,
+                row: Some(5),
+                col: 0,
+                resume: None,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.modes.copy.as_ref().unwrap().cursor, (123, 7));
+    }
+
+    #[test]
+    fn an_old_daemon_refusing_the_search_is_the_answer_to_it() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        copy_key(&mut state, b"/zzz\r", 0x01, &mut request);
+        copy_key(&mut state, b"k?zzz\r", 0x01, &mut request);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: String::new(),
+                reason: "this daemon is older (unknown variant `SearchScrollback`)".to_string(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.mode_line(),
+            Some("search needs a newer daemon: stop the session to upgrade")
+        );
+        assert_eq!(state.message, None, "said in the mode, not shouted");
+    }
+
+    /// A selection across more rows than one answer carries is fetched in chunks of
+    /// `yank-` answers that never touch the view's window, and copied whole.
+    #[test]
+    fn a_yank_across_a_chunk_boundary_copies_every_row_and_leaves_the_window_alone() {
+        let mut state = copy_state();
+        let mut request = 0;
+        enter_copy(&mut state);
+        copy_key(&mut state, b"V", 0x01, &mut request);
+        state.modes.copy.as_mut().unwrap().cursor = (200, 0);
+        assert_eq!(
+            copy_key(&mut state, b"y", 0x01, &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(state.modes.copy.is_none(), "y copies and leaves");
+        let mut dirty = false;
+        let mut answers = 0;
+        while let Some(ask) = state.modes.outbox.pop() {
+            let ControlRequest::Scrollback { id, up, rows, .. } = ask else {
+                continue;
+            };
+            if !id.starts_with("yank-") {
+                continue;
+            }
+            answers += 1;
+            let from = 1_000 - up as u64;
+            apply(
+                &mut state,
+                ControlResponse::Scrollback {
+                    id,
+                    terminal: 1,
+                    from,
+                    total: 1_000,
+                    lines: (from..from + rows as u64)
+                        .map(|at| format!("row {at}"))
+                        .collect(),
+                },
+                &mut dirty,
+            );
+        }
+        assert_eq!(answers, 2, "800 history rows are two answers");
+        let text = state.modes.clipboard.take().expect("copied");
+        assert_eq!(text.lines().count(), 804);
+        assert!(text.starts_with("row 200\n"));
+        assert!(text.ends_with("row 999\nfirst screen row\nMARK on the screen\nthird\n$"));
+        assert!(
+            state.behind.lines.is_empty(),
+            "the window was never written"
+        );
     }
 }

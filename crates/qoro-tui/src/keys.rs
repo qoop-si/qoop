@@ -179,6 +179,13 @@ pub enum Action {
     /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
     /// alive as a tab. Lowercase `x` keeps killing the terminal.
     DetachPane,
+    /// ctrl-a e: resize mode, where `h j k l` move the nearest divider until `esc`.
+    Resize,
+    /// ctrl-a =: every pane the same share of its row or column.
+    Equalize,
+    /// ctrl-a [: copy mode over the focused terminal, as in tmux: move through the whole
+    /// history with the keyboard, select, search, copy.
+    CopyMode,
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
@@ -381,6 +388,9 @@ impl Keys {
                     b'o' => Action::PaneNext,
                     b'z' => Action::Zoom,
                     b'X' => Action::DetachPane,
+                    b'e' => Action::Resize,
+                    b'=' => Action::Equalize,
+                    b'[' => Action::CopyMode,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -535,6 +545,22 @@ mod tests {
                 Action::Zoom,
                 Action::DetachPane,
             ]
+        );
+    }
+
+    #[test]
+    fn resize_equalize_and_copy_mode_decode_after_any_prefix() {
+        let mut keys = Keys::default();
+        assert_eq!(
+            keys.feed(b"\x01e\x01=\x01["),
+            vec![Action::Resize, Action::Equalize, Action::CopyMode]
+        );
+        let mut keys = Keys::with_prefix(0x02);
+        assert_eq!(keys.feed(b"\x02["), vec![Action::CopyMode]);
+        assert_eq!(
+            keys.feed(b"e=["),
+            vec![input(b"e=[")],
+            "no prefix, just typing"
         );
     }
 
