@@ -169,7 +169,7 @@ fn wrapped_script<'a>(runtime: &str, argv: &'a [String]) -> Option<&'a str> {
 /// `wrapped` is a name read out of a JavaScript or Python runtime's argv, the one place a
 /// generic name counts as evidence.
 fn from_path(path: &str, wrapped: bool) -> Program {
-    let file = basename(path);
+    let file = versioned_install(path).unwrap_or_else(|| basename(path));
     let package = package_name(path);
     let scoped = scoped_package(path);
     let candidates = scoped
@@ -283,6 +283,24 @@ fn package_name(path: &str) -> Option<&str> {
     };
     // `.bin` holds the shims, whose own names are already the program names.
     (!name.is_empty() && name != ".bin").then_some(name)
+}
+
+/// The program a self-updating install keeps as one file per version: `<name>/versions/<version>`
+/// is `<name>`. Claude Code's own installer lays itself out like this, so the running
+/// binary resolves to `~/.local/share/claude/versions/2.1.267`, and its file name is only a
+/// version: read as the program, every Claude started through that install was an
+/// unknown `2.1.267` and never an agent.
+fn versioned_install(path: &str) -> Option<&str> {
+    let mut segments = path.trim_end_matches('/').rsplit('/');
+    let version = segments.next()?;
+    let is_version = version.split('.').count() >= 2
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    (is_version && segments.next()? == "versions")
+        .then(|| segments.next())
+        .flatten()
+        .filter(|name| !name.is_empty())
 }
 
 /// The last segment of a path, tolerating a trailing slash and an empty string.
@@ -658,5 +676,19 @@ mod tests {
         }
         // The IDE of the same family is not the CLI.
         assert!(!identify("/Applications/Qoder.app/Contents/MacOS/qoder", &[]).agent);
+    }
+
+    /// Claude Code's own installer keeps one file per version and the running process
+    /// resolves to it: the program is the directory above `versions`, not the version.
+    #[test]
+    fn a_versioned_install_is_named_for_its_program() {
+        let claude = identify("/home/pat/.local/share/claude/versions/2.1.267", &[]);
+        assert_eq!(claude.name, "claude");
+        assert!(claude.agent);
+        // A file named like a version elsewhere, or a `versions` directory holding
+        // something that is not a version, stays what it is.
+        assert_eq!(identify("/opt/app/2.1.267", &[]).name, "2.1.267");
+        assert_eq!(identify("/opt/versions/current", &[]).name, "current");
+        assert_eq!(identify("/versions/1.2", &[]).name, "1.2");
     }
 }
