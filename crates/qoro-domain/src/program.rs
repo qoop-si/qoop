@@ -170,8 +170,10 @@ fn canonical_agent(name: &str) -> Option<&'static str> {
     let stripped;
     let mut candidate = name;
     for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        // Byte-wise: slicing the str at `len - 4` panics inside a multibyte name.
         if candidate.len() > suffix.len()
-            && candidate[candidate.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            && candidate.as_bytes()[candidate.len() - suffix.len()..]
+                .eq_ignore_ascii_case(suffix.as_bytes())
         {
             stripped = &candidate[..candidate.len() - suffix.len()];
             candidate = stripped;
@@ -283,6 +285,17 @@ mod tests {
         let agent = identify("/opt/homebrew/bin/claude", &argv(&["claude"]));
         assert_eq!(agent.name, "claude");
         assert!(agent.agent);
+    }
+
+    /// A multibyte name used to panic on a byte slice inside a character, under the
+    /// agent registry's lock, which poisoned it for every terminal in the daemon.
+    #[test]
+    fn a_multibyte_program_name_is_a_name_not_a_panic() {
+        for name in ["über", "日本", "ö.exe", "agent.EXE"] {
+            let program = identify(&format!("/usr/local/bin/{name}"), &[]);
+            assert!(!program.agent, "{name}");
+        }
+        assert_eq!(identify("/x/claude.exe", &[]).name, "claude");
     }
 
     #[test]
