@@ -1033,7 +1033,9 @@ fn g12_2_a_terminal_can_be_created_switched_to_and_closed_from_the_keyboard() {
 #[test]
 fn g12_3_the_child_is_sized_to_the_pane_and_not_to_the_window() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for("detach", Duration::from_secs(20)).is_some());
+    // A focused tab, not the key row: the key row paints while the client is still
+    // connecting, and keys typed then reach no terminal.
+    assert!(ui.wait_for_focused(Duration::from_secs(20)));
     ui.type_in(b"stty size\n");
     let (want_cols, want_rows) = qoro_tui::screen::pane_size(COLS, ROWS);
     let expected = format!("{want_rows} {want_cols}");
@@ -1083,7 +1085,9 @@ fn g12_4_the_interface_follows_the_foreground_process() {
 #[test]
 fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
     let mut ui = Interface::start();
-    assert!(ui.wait_for("detach", Duration::from_secs(20)).is_some());
+    // A focused tab, not the key row: the key row paints while the client is still
+    // connecting, and keys typed then reach no terminal.
+    assert!(ui.wait_for_focused(Duration::from_secs(20)));
     ui.type_in(b"echo BEFORE_DETACH\n");
     assert!(
         ui.wait_for("BEFORE_DETACH", Duration::from_secs(10))
