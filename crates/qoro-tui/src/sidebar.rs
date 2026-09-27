@@ -891,6 +891,37 @@ fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
     }
 }
 
+/// A shell command without the set-up in front of it: `cd /x/y && cargo test` and
+/// `S=/tmp/a; tmux send-keys` say what they run after the `cd` and the variable, and
+/// that is the part a person would name.
+///
+/// ponytail: a variable whose quoted value holds a space splits at the space; the row
+/// then opens on the rest of the value, which is no worse than the raw command.
+fn bare_command(mut command: &str) -> &str {
+    loop {
+        command = command
+            .trim_start()
+            .trim_start_matches([';', '&'])
+            .trim_start();
+        let word = command.split_whitespace().next().unwrap_or("");
+        let assigns = word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        });
+        let skip = if assigns {
+            Some(word.len())
+        } else if word == "cd" {
+            command.find("&&").or_else(|| command.find(';'))
+        } else {
+            None
+        };
+        match skip {
+            Some(at) if at < command.len() => command = &command[at..],
+            _ => return command,
+        }
+    }
+}
+
 /// A hook's raw activity label in the words a person would use: `Edit src/a.rs` reads
 /// `editing a.rs`, `Bash cargo test` reads `cargo test`, `Grep todo` reads
 /// `searching todo`. Tool names from Claude Code, Codex, Gemini and opencode all land
@@ -936,7 +967,7 @@ pub fn humanize(raw: &str) -> String {
             // `bash -lc 'git status'` quotes its command; the quotes are the shell's.
             .map(|inner| inner.trim().trim_matches(|q| q == '\'' || q == '"'))
             .unwrap_or(arg);
-            let command = command.trim();
+            let command = bare_command(command).trim();
             if command.is_empty() {
                 "running".to_string()
             } else {
@@ -951,7 +982,7 @@ pub fn humanize(raw: &str) -> String {
         | "list_directory"
         | "find"
         | "codesearch" => with("searching", arg.to_string()),
-        "task" | "agent" => "subagent".to_string(),
+        "task" | "agent" => with("subagent", arg.to_string()),
         "webfetch" | "websearch" | "web_fetch" | "google_web_search" | "fetch" => "web".to_string(),
         "todowrite" | "todoread" | "update_plan" | "todo" => "planning".to_string(),
         _ => raw.to_string(),
@@ -4035,6 +4066,27 @@ mod tests {
             ("Grep TODO", "searching TODO"),
             ("glob **/*.rs", "searching **/*.rs"),
             ("Task", "subagent"),
+            (
+                "Task Review second-row diff",
+                "subagent Review second-row diff",
+            ),
+            // Claude and Gemini hooks send a command's description instead of the command.
+            (
+                "Bash Resubmit prompt, type a draft, capture frames",
+                "Resubmit prompt, type a draft, capture frames",
+            ),
+            // Without one, the set-up in front of a command is not what it runs.
+            ("Bash cd /Users/me/qoro && cargo test", "cargo test"),
+            (
+                "Bash S=/private/tmp/x; tmux send-keys -t spin",
+                "tmux send-keys -t spin",
+            ),
+            ("Bash cd /a && RUST_LOG=debug FOO=1 cargo run", "cargo run"),
+            ("Bash cd /a; ls", "ls"),
+            ("Bash cd /a", "cd /a"),
+            ("Bash FOO=1", "FOO=1"),
+            ("Bash git diff a==b", "git diff a==b"),
+            ("shell bash -lc 'cd /w && bun test'", "bun test"),
             ("WebFetch https://example.com", "web"),
             ("TodoWrite", "planning"),
             ("thinking", "thinking"),

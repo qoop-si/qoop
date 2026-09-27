@@ -74,7 +74,10 @@ def one_line(text, limit=120):
 def first_fileish(tool_input):
     if not isinstance(tool_input, dict):
         return ""
-    for key in ("command", "file_path", "absolute_path", "pattern", "path", "dir_path", "url"):
+    # The description a shell command carries comes first: it is what the agent says it is
+    # doing, in its words.
+    for key in ("description", "command", "file_path", "absolute_path", "pattern", "path",
+                "dir_path", "url"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()

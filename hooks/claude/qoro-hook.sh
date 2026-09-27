@@ -42,7 +42,8 @@
 #   SessionStart, SubagentStop -> working, no event
 #   UserPromptSubmit -> working + `--event user` (prompt head, best-effort)
 #   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
-#     the first file-ish `tool_input` field, best-effort)
+#     the first file-ish `tool_input` field, a command's description before
+#     the command itself, best-effort)
 #   PermissionRequest -> blocked + `--event blocked` (tool label, best-effort)
 #   Notification (`permission_prompt`, `elicitation_dialog`,
 #     `elicitation_url_dialog`, `agent_needs_input`, `quota_auto_resume_stale`,
@@ -75,7 +76,9 @@ import sys
 def first_fileish(tool_input):
     if not isinstance(tool_input, dict):
         return ""
-    for key in ("file_path", "path", "command", "pattern"):
+    # A command's own description comes before the command: it is what the agent
+    # says it is doing, in its words, the line its own interface shows.
+    for key in ("file_path", "path", "description", "command", "pattern"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
