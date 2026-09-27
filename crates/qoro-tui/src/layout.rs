@@ -51,6 +51,10 @@ pub enum Node {
     },
 }
 
+/// A split, named by the way down to it from the root: `false` takes the first side,
+/// `true` the second. What a divider drag holds on to between the press and the release.
+pub type SplitPath = Vec<bool>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub root: Node,
@@ -273,6 +277,105 @@ impl Layout {
         out
     }
 
+    /// Move the divider nearest the focused pane on the move's axis, by `step` of its
+    /// split, the way the key points.
+    ///
+    /// The nearest ancestor split on that axis, whichever side of it the pane is on: a
+    /// pane on the right of a divider still moves it right with `l`. False when there is no
+    /// such divider, it is already at its limit, or moving it would squeeze a pane below
+    /// the minimum size.
+    pub fn nudge(&mut self, area: Rect, mv: Move, step: f32) -> bool {
+        if self.zoomed.is_some() {
+            return false;
+        }
+        // Left and right move a side by side divider, up and down a stacked one, each the
+        // way the key points (tmux's rule): which side of it the pane is on does not matter.
+        let (dir, sign) = match mv {
+            Move::Left => (Dir::V, -1.0),
+            Move::Right => (Dir::V, 1.0),
+            Move::Up => (Dir::H, -1.0),
+            Move::Down => (Dir::H, 1.0),
+        };
+        let Some(path) = ancestor_on(&self.root, self.focus, dir, &mut Vec::new()) else {
+            return false;
+        };
+        let Some((_, ratio, _)) = split_at(&self.root, &path, area) else {
+            return false;
+        };
+        self.set_ratio(area, &path, ratio + sign * step)
+    }
+
+    /// Give every pane the same share of its row or column.
+    ///
+    /// A split's ratio is how many panes its first side lines up along the split's axis,
+    /// against the whole: `[A | (B over C)]` is half and half, since the stacked pair
+    /// is one column, and `[A | B | C]` is thirds. Answers whether anything moved.
+    pub fn equalize(&mut self) -> bool {
+        let before = self.root.clone();
+        equalize_node(&mut self.root);
+        self.root != before
+    }
+
+    /// The divider under a pane-local cell, as the path to its split. `None` off a
+    /// divider, and while zoomed, when no divider is drawn.
+    pub fn divider_at(&self, area: Rect, col: usize, row: usize) -> Option<SplitPath> {
+        if self.zoomed.is_some() {
+            return None;
+        }
+        let mut path = Vec::new();
+        divider_in(&self.root, area, col, row, &mut path).then_some(path)
+    }
+
+    /// Put the divider of the split at `path` under a pane-local cell, as far as the limits
+    /// allow. Answers whether it moved.
+    pub fn drag(&mut self, area: Rect, path: &[bool], col: usize, row: usize) -> bool {
+        let Some((dir, _, rect)) = split_at(&self.root, path, area) else {
+            return false;
+        };
+        let (near, total) = match dir {
+            Dir::V => (col.saturating_sub(rect.x), rect.cols.saturating_sub(1)),
+            Dir::H => (row.saturating_sub(rect.y), rect.rows.saturating_sub(1)),
+        };
+        if total == 0 {
+            return false;
+        }
+        // Half a cell past the edge, so the floor in `halves` lands on the cell itself.
+        self.set_ratio(area, path, (near as f32 + 0.5) / total as f32)
+    }
+
+    /// Set one split's ratio, refusing a move that squeezes a pane below the minimum or
+    /// leaves one with no room to be drawn at all. A pane already under the minimum, in a
+    /// small window, may still grow.
+    fn set_ratio(&mut self, area: Rect, path: &[bool], ratio: f32) -> bool {
+        let ratio = ratio.clamp(0.1, 0.9);
+        let mut before = Vec::new();
+        layout_node(&self.root, area, &mut before);
+        let Some(slot) = ratio_at(&mut self.root, path) else {
+            return false;
+        };
+        if (*slot - ratio).abs() < f32::EPSILON {
+            return false;
+        }
+        let was = std::mem::replace(slot, ratio);
+        let mut after = Vec::new();
+        layout_node(&self.root, area, &mut after);
+        // A pane squeezed out of the drawing entirely is the worst squeeze of all: a
+        // focused one would keep the keyboard while nothing of it is on screen.
+        let refused = before.iter().any(|(terminal, then)| {
+            after
+                .iter()
+                .find(|(t, _)| t == terminal)
+                .is_none_or(|(_, now)| {
+                    (now.cols < MIN_COLS && now.cols < then.cols)
+                        || (now.rows < MIN_ROWS && now.rows < then.rows)
+                })
+        });
+        if refused && let Some(slot) = ratio_at(&mut self.root, path) {
+            *slot = was;
+        }
+        !refused
+    }
+
     /// Which visible terminal covers a pane-local `(col, row)`. Divider cells
     /// and placeholders answer `None`.
     pub fn hit(&self, area: Rect, col: usize, row: usize) -> Option<u32> {
@@ -447,75 +550,176 @@ fn layout_node(node: &Node, area: Rect, out: &mut Vec<(u32, Rect)>) {
             first,
             second,
         } => {
-            let ratio = ratio.clamp(0.1, 0.9);
-            match dir {
-                Dir::V => {
-                    // A shrunken window can leave less than two cells: clamp to
-                    // a real rectangle inside `area` rather than spilling past
-                    // it. `fits` guards the split moment; this guards every
-                    // repaint after.
-                    let total = area.cols.saturating_sub(1);
-                    if total < 2 || area.rows == 0 {
-                        return;
-                    }
-                    let left = ((total as f32 * ratio).floor() as usize)
-                        .max(1)
-                        .min(total.saturating_sub(1).max(1));
-                    let right = total.saturating_sub(left);
-                    layout_node(
-                        first,
-                        Rect {
-                            x: area.x,
-                            y: area.y,
-                            cols: left,
-                            rows: area.rows,
-                        },
-                        out,
-                    );
-                    layout_node(
-                        second,
-                        Rect {
-                            x: area.x + left + 1,
-                            y: area.y,
-                            cols: right,
-                            rows: area.rows,
-                        },
-                        out,
-                    );
-                }
-                Dir::H => {
-                    let total = area.rows.saturating_sub(1);
-                    if total < 2 || area.cols == 0 {
-                        return;
-                    }
-                    let top = ((total as f32 * ratio).floor() as usize)
-                        .max(1)
-                        .min(total.saturating_sub(1).max(1));
-                    let bottom = total.saturating_sub(top);
-                    layout_node(
-                        first,
-                        Rect {
-                            x: area.x,
-                            y: area.y,
-                            cols: area.cols,
-                            rows: top,
-                        },
-                        out,
-                    );
-                    layout_node(
-                        second,
-                        Rect {
-                            x: area.x,
-                            y: area.y + top + 1,
-                            cols: area.cols,
-                            rows: bottom,
-                        },
-                        out,
-                    );
-                }
+            if let Some((a, b)) = halves(*dir, *ratio, area) {
+                layout_node(first, a, out);
+                layout_node(second, b, out);
             }
         }
     }
+}
+
+/// The two sides of a split of `area`, with the one cell divider between them left out.
+///
+/// `None` when a shrunken window leaves less than two cells: clamped to a real rectangle
+/// inside `area` rather than spilling past it. `fits` guards the split moment; this guards
+/// every repaint after.
+fn halves(dir: Dir, ratio: f32, area: Rect) -> Option<(Rect, Rect)> {
+    let ratio = ratio.clamp(0.1, 0.9);
+    let (total, across) = match dir {
+        Dir::V => (area.cols.saturating_sub(1), area.rows),
+        Dir::H => (area.rows.saturating_sub(1), area.cols),
+    };
+    if total < 2 || across == 0 {
+        return None;
+    }
+    let near = ((total as f32 * ratio).floor() as usize)
+        .max(1)
+        .min(total.saturating_sub(1).max(1));
+    let far = total.saturating_sub(near);
+    Some(match dir {
+        Dir::V => (
+            Rect { cols: near, ..area },
+            Rect {
+                x: area.x + near + 1,
+                cols: far,
+                ..area
+            },
+        ),
+        Dir::H => (
+            Rect { rows: near, ..area },
+            Rect {
+                y: area.y + near + 1,
+                rows: far,
+                ..area
+            },
+        ),
+    })
+}
+
+/// How many panes a subtree puts side by side along `dir`: a split the other way is one
+/// block, however many panes it holds.
+fn weight(node: &Node, dir: Dir) -> usize {
+    match node {
+        Node::Split {
+            dir: d,
+            first,
+            second,
+            ..
+        } if *d == dir => weight(first, dir) + weight(second, dir),
+        _ => 1,
+    }
+}
+
+fn equalize_node(node: &mut Node) {
+    if let Node::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    {
+        let near = weight(first, *dir);
+        *ratio = near as f32 / (near + weight(second, *dir)) as f32;
+        equalize_node(first);
+        equalize_node(second);
+    }
+}
+
+/// The split at `path`: its direction, its ratio, and the area it divides.
+fn split_at(node: &Node, path: &[bool], area: Rect) -> Option<(Dir, f32, Rect)> {
+    let Node::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return None;
+    };
+    let Some((&side, rest)) = path.split_first() else {
+        return Some((*dir, *ratio, area));
+    };
+    let (a, b) = halves(*dir, *ratio, area)?;
+    if side {
+        split_at(second, rest, b)
+    } else {
+        split_at(first, rest, a)
+    }
+}
+
+/// The ratio of the split at `path`, to change in place.
+fn ratio_at<'a>(node: &'a mut Node, path: &[bool]) -> Option<&'a mut f32> {
+    let Node::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    match path.split_first() {
+        None => Some(ratio),
+        Some((true, rest)) => ratio_at(second, rest),
+        Some((false, rest)) => ratio_at(first, rest),
+    }
+}
+
+/// The path to the nearest split above `terminal` that divides along `dir`.
+fn ancestor_on(node: &Node, terminal: u32, dir: Dir, path: &mut Vec<bool>) -> Option<Vec<bool>> {
+    let Node::Split {
+        dir: d,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    for (side, child) in [(false, first), (true, second)] {
+        let mut held = Vec::new();
+        collect_leaves(child, &mut held);
+        if held.contains(&terminal) {
+            path.push(side);
+            let deeper = ancestor_on(child, terminal, dir, path);
+            path.pop();
+            return deeper.or_else(|| (*d == dir).then(|| path.clone()));
+        }
+    }
+    None
+}
+
+/// The divider under a pane-local cell, as the path to its split.
+fn divider_in(node: &Node, area: Rect, col: usize, row: usize, path: &mut Vec<bool>) -> bool {
+    let Node::Split {
+        dir,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return false;
+    };
+    let Some((a, b)) = halves(*dir, *ratio, area) else {
+        return false;
+    };
+    let on_divider = match dir {
+        Dir::V => col == a.x + a.cols && row >= area.y && row < area.y + area.rows,
+        Dir::H => row == a.y + a.rows && col >= area.x && col < area.x + area.cols,
+    };
+    if on_divider {
+        return true;
+    }
+    for (side, child, rect) in [(false, first, a), (true, second, b)] {
+        if col >= rect.x && col < rect.x + rect.cols && row >= rect.y && row < rect.y + rect.rows {
+            path.push(side);
+            if divider_in(child, rect, col, row, path) {
+                return true;
+            }
+            path.pop();
+        }
+    }
+    false
 }
 
 /// Geometric neighbour of `focus` in direction `mv`, preferring overlap then
@@ -745,5 +949,142 @@ mod tests {
         // The column right after the left pane is the divider.
         assert_eq!(layout.hit(area(80, 24), left.cols, 0), None);
         assert_eq!(layout.hit(area(80, 24), 0, 0), Some(1));
+    }
+
+    /// `[A | (B over C)]`: 1 on the left, 2 above 3 on the right, 3 focused.
+    fn three() -> Layout {
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
+        assert!(layout.bind_placeholder(2));
+        assert!(layout.split_placeholder(2, Dir::H, area(80, 24)));
+        assert!(layout.bind_placeholder(3));
+        layout
+    }
+
+    fn rect_of(layout: &Layout, terminal: u32) -> Rect {
+        layout
+            .tile_rects(area(80, 24))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .expect("a tile")
+            .1
+    }
+
+    #[test]
+    fn a_nudge_moves_the_nearest_divider_the_way_the_key_points() {
+        let mut layout = three();
+        let a = area(80, 24);
+        let before = rect_of(&layout, 1).cols;
+        // 3 is right of the side by side divider: `l` still moves that divider right.
+        assert!(layout.nudge(a, Move::Right, 0.05));
+        assert!(rect_of(&layout, 1).cols > before);
+        assert!(layout.nudge(a, Move::Left, 0.05));
+        assert_eq!(rect_of(&layout, 1).cols, before);
+        // Up and down take the stacked divider, the nearest one on that axis.
+        let top = rect_of(&layout, 2).rows;
+        assert!(layout.nudge(a, Move::Down, 0.05));
+        assert!(rect_of(&layout, 2).rows > top);
+        assert!(layout.nudge(a, Move::Up, 0.2));
+        assert!(rect_of(&layout, 2).rows < top);
+        // Pane 1 has no stacked divider above it.
+        layout.focus_terminal(1);
+        assert!(!layout.nudge(a, Move::Down, 0.05));
+    }
+
+    #[test]
+    fn a_nudge_stops_at_the_limits_and_never_squeezes_a_pane_below_the_minimum() {
+        let mut layout = three();
+        let a = area(80, 24);
+        let mut moves = 0;
+        while layout.nudge(a, Move::Right, 0.2) {
+            moves += 1;
+            assert!(moves < 10, "the divider never stopped");
+        }
+        assert!(rect_of(&layout, 2).cols >= MIN_COLS);
+        // Stacked in a short window: the rows run out before the ratio does.
+        let short = area(80, 12);
+        while layout.nudge(short, Move::Down, 0.2) {}
+        assert!(
+            layout
+                .tile_rects(short)
+                .iter()
+                .all(|(_, r)| r.rows >= MIN_ROWS)
+        );
+        // Zoomed, nothing is drawn to move.
+        layout.toggle_zoom();
+        assert!(!layout.nudge(a, Move::Left, 0.05));
+    }
+
+    #[test]
+    fn equalize_halves_a_column_against_a_stack_and_thirds_three_in_a_row() {
+        let mut layout = three();
+        let a = area(81, 25);
+        assert!(layout.nudge(a, Move::Right, 0.2));
+        assert!(layout.equalize());
+        let widths: Vec<usize> = layout.tile_rects(a).iter().map(|(_, r)| r.cols).collect();
+        assert_eq!(widths, vec![40, 40, 40], "the stack is one column");
+        assert!(!layout.equalize(), "already even");
+
+        let mut row = Layout::single(1);
+        assert!(row.split_placeholder(1, Dir::V, area(80, 24)));
+        assert!(row.bind_placeholder(2));
+        assert!(row.split_placeholder(2, Dir::V, area(80, 24)));
+        assert!(row.bind_placeholder(3));
+        row.equalize();
+        let widths: Vec<usize> = row
+            .tile_rects(area(92, 24))
+            .iter()
+            .map(|(_, r)| r.cols)
+            .collect();
+        assert_eq!(widths, vec![30, 30, 30]);
+    }
+
+    /// Found in review: `[A over (B over C)]` in twenty rows, dragged to the bottom, left B
+    /// and C no room to be drawn at all, and a focused B kept the keyboard off screen.
+    #[test]
+    fn a_move_that_would_leave_a_pane_undrawn_is_refused() {
+        let mut layout = Layout::single(1);
+        let a = area(80, 20);
+        assert!(layout.split_placeholder(1, Dir::H, a));
+        assert!(layout.bind_placeholder(2));
+        assert!(layout.split_placeholder(2, Dir::H, a));
+        assert!(layout.bind_placeholder(3));
+        layout.focus_terminal(2);
+        assert!(!layout.drag(a, &[], 0, 19));
+        assert!(!layout.nudge(a, Move::Down, 0.9));
+        assert_eq!(layout.tile_rects(a).len(), 3, "every pane is still drawn");
+    }
+
+    #[test]
+    fn a_divider_is_found_under_the_pointer_and_dragged_to_it() {
+        let mut layout = three();
+        let a = area(80, 24);
+        let left = rect_of(&layout, 1);
+        let right = rect_of(&layout, 2);
+        assert_eq!(layout.divider_at(a, left.cols, 5), Some(vec![]));
+        assert_eq!(
+            layout.divider_at(a, right.x + 3, right.rows),
+            Some(vec![true])
+        );
+        assert_eq!(layout.divider_at(a, 2, 2), None, "inside a pane");
+        // Dragged to column 30: the left pane is thirty columns wide.
+        assert!(layout.drag(a, &[], 30, 5));
+        assert_eq!(rect_of(&layout, 1).cols, 30);
+        assert!(
+            !layout.drag(a, &[], 30, 9),
+            "the same column again is no move"
+        );
+        // Dragged to the far edge: stopped at the limit, the right side still a pane.
+        layout.drag(a, &[], 79, 5);
+        assert!(rect_of(&layout, 2).cols >= MIN_COLS);
+        // The stacked divider follows rows.
+        assert!(layout.drag(a, &[true], 60, 6));
+        assert_eq!(rect_of(&layout, 2).rows, 6);
+        layout.toggle_zoom();
+        assert_eq!(
+            layout.divider_at(a, left.cols, 5),
+            None,
+            "no divider while zoomed"
+        );
     }
 }
