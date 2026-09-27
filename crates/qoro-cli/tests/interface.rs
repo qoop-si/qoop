@@ -696,8 +696,8 @@ impl Interface {
 
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
-    /// Found by its shape rather than by arithmetic: a rule opens with a dash and then
-    /// its fold arrow, and agents and the pin move the rules down as they come and go.
+    /// Found by its shape rather than by arithmetic: a rule opens with its fold arrow and
+    /// a space, and agents and the pin move the rules down as they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
@@ -705,8 +705,8 @@ impl Interface {
             .filter(|&row| {
                 self.panel_line(row).is_some_and(|line| {
                     let mut chars = line.chars();
-                    chars.next() == Some('\u{2500}')
-                        && matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
+                    matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
+                        && chars.next() == Some(' ')
                 })
             })
             .nth(nth - 1)
@@ -939,7 +939,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     let list = agents_panel(&ui.screen);
     assert!(
         list.first()
-            .is_some_and(|row| row.trim_end().starts_with("\u{2500}\u{25be} default")),
+            .is_some_and(|row| row.trim_end().starts_with("\u{25be} default")),
         "the only space is not an open rule first: {list:?}"
     );
     assert!(

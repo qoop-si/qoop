@@ -107,13 +107,13 @@ const PIN_TITLE: &str = "needs you";
 /// is still a row in its space below.
 const PIN_MOST: usize = 5;
 
-/// Where an agent's dot sits under its space rule: three columns in, so the dot lines
-/// up under the space name the rule carries.
+/// Where an agent's dot sits under its space rule: three columns in, one past where the
+/// space name starts, so the agents read as inside the space.
 const CHILD_DOT_AT: usize = 3;
 
-/// The columns of a space rule a click folds with: the leading dash, the arrow and the
-/// space after it. Anywhere else on the rule moves to the space.
-pub const FOLD_CELLS: usize = 3;
+/// The columns of a space rule a click folds with: the arrow and the space after it.
+/// Anywhere else on the rule moves to the space.
+pub const FOLD_CELLS: usize = 2;
 
 /// The state dot at the start of an agent's first row: one leading space,
 /// then the dot. The dot says the state in the state's own colour, so no
@@ -1085,7 +1085,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     } else {
         kids.len().to_string()
     };
-    // `─▾ ` then the name, a space, the dashes, and ` 2 ─` (or a last dash with no
+    // `▾ ` then the name, a space, the dashes, and ` 2 ─` (or a last dash with no
     // agents). The name gives way before the count and the arrow do.
     let tail = if count.is_empty() {
         1
@@ -1097,17 +1097,17 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let name_w = crate::width::width(&name);
     let fill = width.saturating_sub(FOLD_CELLS + name_w + 1 + tail);
     let dashes_at = FOLD_CELLS + name_w + 1;
-    let mut runs = vec![(0, 1, Role::Rule)];
+    let mut runs = Vec::new();
     let text = if count.is_empty() {
         runs.push((dashes_at, fill + 1, Role::Rule));
-        format!("\u{2500}{arrow} {name} {}", "\u{2500}".repeat(fill + 1))
+        format!("{arrow} {name} {}", "\u{2500}".repeat(fill + 1))
     } else {
         runs.push((dashes_at, fill, Role::Rule));
         let count_at = dashes_at + fill + 1;
         runs.push((count_at, crate::width::width(&count), mark));
         runs.push((count_at + crate::width::width(&count) + 1, 1, Role::Rule));
         format!(
-            "\u{2500}{arrow} {name} {} {count} \u{2500}",
+            "{arrow} {name} {} {count} \u{2500}",
             "\u{2500}".repeat(fill)
         )
     };
@@ -1115,7 +1115,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         text: fit(&text, width),
         colour: None,
         accent: Some((FOLD_CELLS, name_w, crate::theme::space_of(space.id))),
-        indicator: Some((1, 1, mark)),
+        indicator: Some((0, 1, mark)),
         runs,
     }
 }
@@ -2640,14 +2640,11 @@ mod tests {
             .iter()
             .position(|t| t == "   \u{25cf} claude")
             .unwrap_or_else(|| panic!("{texts:?}"));
-        assert!(
-            texts[head - 1].starts_with("\u{2500}\u{25be} app "),
-            "{texts:?}"
-        );
+        assert!(texts[head - 1].starts_with("\u{25be} app "), "{texts:?}");
         assert_eq!(texts[head + 1], "     \u{2514} claude", "{texts:?}");
         assert_eq!(texts[head + 2], "   \u{b7} sh", "{texts:?}");
         assert!(
-            texts[head + 3].starts_with("\u{2500}\u{25be} personal "),
+            texts[head + 3].starts_with("\u{25be} personal "),
             "{texts:?}"
         );
         // No state word on the right: the dot says the state in its colour, three
@@ -2680,7 +2677,7 @@ mod tests {
         assert_eq!(shell[0].indicator, None, "a shell has no state to colour");
         let app = lines
             .iter()
-            .find(|l| l.text.starts_with("\u{2500}\u{25be} app "))
+            .find(|l| l.text.starts_with("\u{25be} app "))
             .expect("the app rule");
         assert!(app.text.ends_with(" 2 \u{2500}"), "{:?}", app.text);
     }
@@ -2714,7 +2711,7 @@ mod tests {
             personal.accent,
             Some((FOLD_CELLS, 8, crate::theme::space_of(2)))
         );
-        assert_eq!(personal.indicator, Some((1, 1, crate::theme::Role::Faint)));
+        assert_eq!(personal.indicator, Some((0, 1, crate::theme::Role::Faint)));
     }
 
     /// Every space is one rule: the arrow says open, folded or empty, the name wears the
@@ -2727,13 +2724,12 @@ mod tests {
         let app = rule_row(&rows, 1);
         assert_eq!(
             app.text,
-            format!("\u{2500}\u{25be} app {} 2 \u{2500}", "\u{2500}".repeat(19))
+            format!("\u{25be} app {} 2 \u{2500}", "\u{2500}".repeat(20))
         );
         assert_eq!(
             app.runs,
             vec![
-                (0, 1, crate::theme::Role::Rule),
-                (7, 19, crate::theme::Role::Rule),
+                (6, 20, crate::theme::Role::Rule),
                 (27, 1, crate::theme::Role::Faint),
                 (29, 1, crate::theme::Role::Rule),
             ]
@@ -2741,15 +2737,12 @@ mod tests {
         // An empty space has nothing to fold and nothing to count: a dot for the arrow,
         // and the dashes run to the edge.
         let dub = rule_row(&rows, 3);
-        assert_eq!(
-            dub.text,
-            format!("\u{2500}\u{b7} dub {}", "\u{2500}".repeat(23))
-        );
+        assert_eq!(dub.text, format!("\u{b7} dub {}", "\u{2500}".repeat(24)));
         // Folded, the arrow points right and the count stays.
         let shut = Shut::from([1]);
         let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &shut);
         assert!(
-            rule_row(&rows, 1).text.starts_with("\u{2500}\u{25b8} app "),
+            rule_row(&rows, 1).text.starts_with("\u{25b8} app "),
             "{:?}",
             rule_row(&rows, 1).text
         );
@@ -2860,7 +2853,7 @@ mod tests {
                         Some(Hit::Title)
                     } else if text.contains(BRAND) && text.ends_with('\u{ab}') {
                         Some(Hit::Foot)
-                    } else if text.starts_with('\u{2500}') {
+                    } else if text.starts_with(['\u{25be}', '\u{25b8}', '\u{b7}']) {
                         spaces
                             .iter()
                             .find(|s| text.contains(&format!(" {} ", s.name)))
@@ -3265,8 +3258,7 @@ mod tests {
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
         assert!(
-            rule.text
-                .starts_with("\u{2500}\u{25be} \u{4e2d}\u{6587} \u{2500}"),
+            rule.text.starts_with("\u{25be} \u{4e2d}\u{6587} \u{2500}"),
             "{:?}",
             rule.text
         );
@@ -4425,7 +4417,7 @@ mod tests {
         // The fold cells are exactly the rule's dash, arrow and the space after them.
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let head: String = rule_row(&rows, 1).text.chars().take(FOLD_CELLS).collect();
-        assert_eq!(head, "\u{2500}\u{25be} ");
+        assert_eq!(head, "\u{25be} ");
     }
 
     /// No breath between the title and the tree any more: the first rule is itself a
@@ -5079,11 +5071,7 @@ mod tests {
         let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
-        assert!(
-            app.text.starts_with("\u{2500}\u{25b8} app "),
-            "{:?}",
-            app.text
-        );
+        assert!(app.text.starts_with("\u{25b8} app "), "{:?}", app.text);
         assert!(
             app.text.ends_with(" 3 \u{2500}"),
             "the count keeps every agent"
@@ -5093,7 +5081,7 @@ mod tests {
         assert_eq!(order(&rows), vec![4]);
         // And the open space next to it is untouched.
         assert!(
-            rule_row(&rows, 2).text.starts_with("\u{2500}\u{25be} dub "),
+            rule_row(&rows, 2).text.starts_with("\u{25be} dub "),
             "{:?}",
             rule_row(&rows, 2).text
         );
