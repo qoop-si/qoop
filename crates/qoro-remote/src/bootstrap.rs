@@ -27,7 +27,11 @@ impl RemoteShell {
     /// `fish` has no `VAR=value cmd` form at all. A command written for `sh` and run under
     /// `fish` fails with "Unsupported use of '='", which is a message nobody reading "the
     /// daemon did not start" would connect to their shell.
+    ///
+    /// The value is quoted, so it is one word of data and never shell text. The posix quote
+    /// reads the same in fish, except that fish folds a doubled backslash inside quotes.
     pub fn with_env(self, name: &str, value: &str, command: &str) -> String {
+        let value = crate::saved::shell_quote(value);
         match self {
             RemoteShell::Fish => format!("env {name}={value} {command}"),
             _ => format!("{name}={value} {command}"),
@@ -126,9 +130,10 @@ impl<'a, T: RemoteTransport> Bootstrap<'a, T> {
 
     /// Ask the remote daemon what it is.
     pub fn hello(&self) -> Result<RemoteHello, BootstrapError> {
-        let out = self
-            .transport
-            .run(&marker_command(&format!("{} --hello", self.daemon_path)))?;
+        let out = self.transport.run(&marker_command(&format!(
+            "{} --hello",
+            crate::saved::shell_quote(&self.daemon_path)
+        )))?;
         let Some(answer) = between_markers(&out.stdout) else {
             // Nothing between the markers means the command produced nothing, which for a
             // missing binary is what a shell does after printing to stderr.
@@ -178,11 +183,24 @@ mod tests {
     fn setting_a_variable_uses_the_shells_own_syntax() {
         assert_eq!(
             RemoteShell::PosixLike.with_env("A", "1", "qorod"),
-            "A=1 qorod"
+            "A='1' qorod"
         );
         assert_eq!(
             RemoteShell::Fish.with_env("A", "1", "qorod"),
-            "env A=1 qorod"
+            "env A='1' qorod"
+        );
+    }
+
+    /// A value is one word of data, never shell text.
+    #[test]
+    fn a_value_is_quoted_so_it_runs_nothing() {
+        assert_eq!(
+            RemoteShell::PosixLike.with_env("A", "1; touch x", "qorod"),
+            "A='1; touch x' qorod"
+        );
+        assert_eq!(
+            RemoteShell::Fish.with_env("A", "it's", "qorod"),
+            r"env A='it'\''s' qorod"
         );
     }
 
@@ -190,7 +208,7 @@ mod tests {
     fn an_unknown_shell_is_treated_as_posix_like_rather_than_refused() {
         assert_eq!(
             RemoteShell::Unknown.with_env("A", "1", "qorod"),
-            "A=1 qorod"
+            "A='1' qorod"
         );
     }
 }

@@ -108,6 +108,10 @@ impl SshTransport {
         // by the protocol inside it. Asking ssh for a tty here would put a second line
         // discipline between the child and us.
         argv.push("-T".into());
+        // Options end here, so a host that starts with a dash is still a host. Targets
+        // loaded from `remotes.json` reach this unvalidated, and `-oProxyCommand=...` as a
+        // host would run a command on this machine.
+        argv.push("--".into());
         argv.push(self.host.clone());
         argv.push(command.to_string());
         argv
@@ -223,5 +227,18 @@ mod tests {
         let host = argv.iter().position(|a| a == "myhost").expect("host");
         assert_eq!(argv.last().expect("command"), "echo hi");
         assert_eq!(host, argv.len() - 2);
+        assert_eq!(argv[host - 1], "--", "options must end before the host");
+    }
+
+    /// A host read from `remotes.json` reaches here unvalidated, and one that starts with
+    /// a dash would otherwise be an ssh option: `-oProxyCommand=...` runs a command.
+    #[test]
+    fn a_host_that_looks_like_an_option_is_still_a_host() {
+        let argv = SshTransport::new("-oProxyCommand=x").argv("true");
+        let host = argv
+            .iter()
+            .position(|a| a == "-oProxyCommand=x")
+            .expect("host");
+        assert_eq!(argv[host - 1], "--");
     }
 }

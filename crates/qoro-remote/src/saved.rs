@@ -39,9 +39,13 @@ pub fn path() -> PathBuf {
         Ok(path) if !path.is_empty() => return PathBuf::from(path),
         _ => {}
     }
+    // An empty or relative XDG_CONFIG_HOME is ignored, as the spec says and as
+    // `qoro_runtime::paths::config_dir` does: a relative one resolved against wherever
+    // the process happened to start.
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .ok()
+        .filter(|p| p.is_absolute())
         .or_else(|| {
             std::env::var("HOME")
                 .map(|h| PathBuf::from(h).join(".config"))

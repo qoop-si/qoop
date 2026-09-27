@@ -144,3 +144,27 @@ fn a_real_hello_is_read_through_a_noisy_login_shell() {
     assert_eq!(shell, RemoteShell::PosixLike);
     assert_eq!(compat, qoro_remote::Compatibility::AsIs);
 }
+
+/// The daemon's path is one word, whatever is in it: a directory with a space or a
+/// semicolon in its name is still where the daemon is, and runs nothing else.
+#[test]
+fn a_daemon_path_with_shell_characters_is_one_word() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let odd = dir.path().join("a dir; true");
+    std::fs::create_dir(&odd).expect("mkdir");
+    let fake = odd.join("qorod");
+    let hello = serde_json::json!({
+        "version": "0.0.0",
+        "codec_generation": qoro_remote::CODEC_FLOOR,
+        "platform": "linux",
+    });
+    std::fs::write(&fake, format!("#!/bin/sh\necho '{hello}'\n")).expect("write");
+    let mut perms = std::fs::metadata(&fake).expect("metadata").permissions();
+    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&fake, perms).expect("chmod");
+
+    let transport = LocalTransport::new("/bin/sh");
+    let boot = Bootstrap::new(&transport, fake.display().to_string());
+    boot.hello()
+        .expect("the daemon at a path with a space was not reached");
+}
