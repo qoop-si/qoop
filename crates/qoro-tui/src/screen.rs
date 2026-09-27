@@ -103,14 +103,8 @@ pub struct Frame<'a> {
     pub tiles: Vec<Tile<'a>>,
 }
 
-/// Every command the prefix takes, for a window wide enough to read them all, after the
-/// prefix it was started with.
-fn every_key() -> String {
-    format!(
-        "{}: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  [ copy  e resize  = equalize  m menu  ? keys  d detach  U update",
-        crate::keys::prefix_name()
-    )
-}
+/// Every command the prefix takes, for a window wide enough to read them all.
+const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  [ copy  e resize  = equalize  m menu  ? keys  d detach  U update";
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -552,27 +546,24 @@ pub fn paint(frame: &Frame) -> String {
     // about the one that gets them out.
     //
     // A mode names its own keys, because in a mode the others do not work.
-    let prefix = crate::keys::prefix_name();
-    let every = every_key();
     let keys = if frame.prompt.is_some() {
-        "enter to make it  esc to stop".to_string()
+        "enter to make it  esc to stop"
     } else if frame.palette.is_some() {
-        format!("{prefix} space find  enter go  esc back")
+        "ctrl-a space find  enter go  esc back"
     } else if frame.menu.is_some() {
-        "up/down or j/k move  enter choose  esc close".to_string()
+        "up/down or j/k move  enter choose  esc close"
     } else if frame.reading.is_some() {
-        "any key to close".to_string()
-    } else if (frame.cols as usize) >= width::width(&every) {
+        "any key to close"
+    } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
         // Every key when there is room for every key. On a narrower window the list is cut
         // from the right, so the way out is not last: the cut takes the update key
         // first, and a person stuck in here can still read the one that gets them out.
-        every
+        EVERY_KEY
     } else {
-        format!(
-            "{prefix}: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys  [ copy"
-        )
+        "ctrl-a: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys  [ copy"
     };
-    out.push_str(&width::fit(&keys, frame.cols as usize));
+    // Written with ctrl-a and named on the way out, like the keys box.
+    out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize));
     out.push_str(theme::RESET);
 
     // A picture the outer terminal cannot draw, named on the focused pane's last
@@ -708,11 +699,10 @@ fn triage(
     } else {
         row.state.as_str()
     };
-    Some(format!(
-        "next: {space}/{} is {word}  {} space",
+    Some(crate::keys::named(&format!(
+        "next: {space}/{} is {word}  ctrl-a space",
         palette_label(row),
-        crate::keys::prefix_name(),
-    ))
+    )))
 }
 
 /// Where the keyboard is, for the notice row when nothing is waiting.
@@ -733,7 +723,7 @@ fn here(frame: &Frame) -> String {
             } else if row.state == "sleeping" {
                 // A slept tab has no screen and takes no keys: name the way
                 // out, or the blank pane reads as a hang.
-                ", sleeping  ^a x dismiss".to_string()
+                crate::keys::named(", sleeping  ctrl-a x dismiss")
             } else {
                 format!(", {}", row.state)
             };
@@ -1263,16 +1253,15 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
     paint_box(frame, title, &lines, out);
 }
 
-/// Every key, as the keys overlay lists them, under the prefix the interface was started
-/// with.
+/// Every key, as the keys overlay lists them, written with `ctrl-a` and named on the way
+/// out like every other list of keys.
 ///
 /// Short on purpose: two columns of these have to fit an 80 by 24 window, which is where a
 /// person who does not know the keys yet is most likely to be. No section headings, for
 /// the same reason; the keys are grouped by what they act on instead.
 pub(crate) fn keybind_lines() -> Vec<String> {
-    let p = crate::keys::prefix_name();
     let key = |keys: &str, what: &str| format!(" {keys:<15}{what}");
-    let cmd = |keys: &str, what: &str| key(&format!("{p} {keys}"), what);
+    let cmd = |keys: &str, what: &str| key(&format!("ctrl-a {keys}"), what);
     vec![
         cmd("n/p", "next, previous tab"),
         cmd("1..9", "the nth tab"),
@@ -2335,12 +2324,15 @@ mod tests {
             image_notice: None,
         });
         assert!(painted.contains("new tab"), "menu missing row: {painted:?}");
-        assert!(painted.contains("^a c"), "menu hides its key: {painted:?}");
+        assert!(
+            painted.contains("ctrl-a c"),
+            "menu hides its key: {painted:?}"
+        );
         assert!(painted.contains("split side by side"), "{painted:?}");
         assert!(painted.contains("rename space"), "{painted:?}");
         assert!(painted.contains("close tab"), "{painted:?}");
         assert!(
-            painted.contains("^a x"),
+            painted.contains("ctrl-a x"),
             "close tab hides its key: {painted:?}"
         );
         assert!(painted.contains(" menu"), "menu missing title: {painted:?}");
@@ -2898,57 +2890,67 @@ mod tests {
         }
     }
 
+    /// How many commands there are, the one number the list below and the match share.
+    const COMMANDS: usize = 34;
+
+    /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
+    const fn place(at: usize) -> usize {
+        assert!(at < COMMANDS, "a command numbered past COMMANDS");
+        at
+    }
+
     /// Where the keys overlay teaches a command: the start of its line, and the command's
     /// place in the list below.
     ///
-    /// A match on the value, so a new command fails to compile here until it has a line
-    /// and a number, and the test below fails until the list carries a sample of it: a key
-    /// nobody can find from inside is a key most people never press.
+    /// A new command fails to compile three times over until it is taught: the match here
+    /// wants an arm, its number has to be under [`COMMANDS`] (checked at compile time), and
+    /// raising [`COMMANDS`] makes the list below, an array of exactly that many, one short.
+    /// A key nobody can find from inside is a key most people never press.
     fn taught_as(action: &crate::keys::Action) -> (usize, Option<&'static str>) {
         use crate::keys::Action;
         match action {
             // Typing is not a command: it goes to the terminal.
-            Action::Input(_) => (0, None),
-            Action::Next => (1, Some("ctrl-a n/p")),
-            Action::Previous => (2, Some("ctrl-a n/p")),
-            Action::Create => (3, Some("ctrl-a c")),
-            Action::Close => (4, Some("ctrl-a x")),
-            Action::Detach => (5, Some("ctrl-a d")),
-            Action::Click { .. } => (6, Some("click")),
-            Action::Drag { .. } => (7, Some("drag")),
-            Action::Release { .. } => (8, Some("drag")),
-            Action::Wheel { .. } => (9, Some("wheel")),
-            Action::Redraw => (10, Some("ctrl-a l")),
-            Action::NextSpace => (11, Some("ctrl-a s/S")),
-            Action::PreviousSpace => (12, Some("ctrl-a s/S")),
-            Action::CreateSpace => (13, Some("ctrl-a w")),
-            Action::CloseSpace => (14, Some("ctrl-a W")),
-            Action::Rename => (15, Some("ctrl-a r")),
-            Action::RenameSpace => (16, Some("ctrl-a R")),
-            Action::Collapse => (17, Some("ctrl-a b")),
-            Action::Update => (18, Some("ctrl-a U")),
-            Action::Menu => (19, Some("ctrl-a m")),
-            Action::Keybinds => (20, Some("ctrl-a ?")),
-            Action::Tab(_) => (21, Some("ctrl-a 1..9")),
-            Action::Palette => (22, Some("ctrl-a space")),
-            Action::ToggleView => (23, Some("ctrl-a g")),
-            Action::Focus => (24, Some("ctrl-a F")),
-            Action::SplitV => (25, Some("ctrl-a v/-")),
-            Action::SplitH => (26, Some("ctrl-a v/-")),
-            Action::PaneMove(_) => (27, Some("ctrl-a H/J/K/L")),
-            Action::PaneNext => (28, Some("ctrl-a o")),
-            Action::Zoom => (29, Some("ctrl-a z")),
-            Action::DetachPane => (30, Some("ctrl-a X")),
-            Action::Resize => (31, Some("ctrl-a e")),
-            Action::Equalize => (32, Some("ctrl-a =")),
-            Action::CopyMode => (33, Some("ctrl-a [")),
+            Action::Input(_) => (const { place(0) }, None),
+            Action::Next => (const { place(1) }, Some("ctrl-a n/p")),
+            Action::Previous => (const { place(2) }, Some("ctrl-a n/p")),
+            Action::Create => (const { place(3) }, Some("ctrl-a c")),
+            Action::Close => (const { place(4) }, Some("ctrl-a x")),
+            Action::Detach => (const { place(5) }, Some("ctrl-a d")),
+            Action::Click { .. } => (const { place(6) }, Some("click")),
+            Action::Drag { .. } => (const { place(7) }, Some("drag")),
+            Action::Release { .. } => (const { place(8) }, Some("drag")),
+            Action::Wheel { .. } => (const { place(9) }, Some("wheel")),
+            Action::Redraw => (const { place(10) }, Some("ctrl-a l")),
+            Action::NextSpace => (const { place(11) }, Some("ctrl-a s/S")),
+            Action::PreviousSpace => (const { place(12) }, Some("ctrl-a s/S")),
+            Action::CreateSpace => (const { place(13) }, Some("ctrl-a w")),
+            Action::CloseSpace => (const { place(14) }, Some("ctrl-a W")),
+            Action::Rename => (const { place(15) }, Some("ctrl-a r")),
+            Action::RenameSpace => (const { place(16) }, Some("ctrl-a R")),
+            Action::Collapse => (const { place(17) }, Some("ctrl-a b")),
+            Action::Update => (const { place(18) }, Some("ctrl-a U")),
+            Action::Menu => (const { place(19) }, Some("ctrl-a m")),
+            Action::Keybinds => (const { place(20) }, Some("ctrl-a ?")),
+            Action::Tab(_) => (const { place(21) }, Some("ctrl-a 1..9")),
+            Action::Palette => (const { place(22) }, Some("ctrl-a space")),
+            Action::ToggleView => (const { place(23) }, Some("ctrl-a g")),
+            Action::Focus => (const { place(24) }, Some("ctrl-a F")),
+            Action::SplitV => (const { place(25) }, Some("ctrl-a v/-")),
+            Action::SplitH => (const { place(26) }, Some("ctrl-a v/-")),
+            Action::PaneMove(_) => (const { place(27) }, Some("ctrl-a H/J/K/L")),
+            Action::PaneNext => (const { place(28) }, Some("ctrl-a o")),
+            Action::Zoom => (const { place(29) }, Some("ctrl-a z")),
+            Action::DetachPane => (const { place(30) }, Some("ctrl-a X")),
+            Action::Resize => (const { place(31) }, Some("ctrl-a e")),
+            Action::Equalize => (const { place(32) }, Some("ctrl-a =")),
+            Action::CopyMode => (const { place(33) }, Some("ctrl-a [")),
         }
     }
 
     #[test]
     fn every_command_has_a_line_in_the_keys_overlay() {
         use crate::keys::Action;
-        let every = [
+        let every: [Action; COMMANDS] = [
             Action::Input(Vec::new()),
             Action::Next,
             Action::Previous,
@@ -3001,12 +3003,11 @@ mod tests {
             Action::Equalize,
             Action::CopyMode,
         ];
-        // Every number the match hands out has a sample here, so a command added to the
-        // match and not to this list fails rather than passing untested.
+        // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
         numbers.sort();
         numbers.dedup();
-        assert_eq!(numbers, (0..every.len()).collect::<Vec<_>>());
+        assert_eq!(numbers, (0..COMMANDS).collect::<Vec<_>>());
         let lines = keybind_lines();
         for action in &every {
             let Some(taught) = taught_as(action).1 else {
@@ -4591,7 +4592,7 @@ mod tests {
             image_notice: None,
         };
         let slept = here(&frame(2));
-        assert!(slept.ends_with(", sleeping  ^a x dismiss"), "{slept:?}");
+        assert!(slept.ends_with(", sleeping  ctrl-a x dismiss"), "{slept:?}");
         let live = here(&frame(1));
         assert!(live.ends_with(", working"), "{live:?}");
     }

@@ -151,7 +151,6 @@ impl Palette {
         }
         // The things the interface can do, each with the key that does it without the
         // palette, so the next time needs no palette.
-        let prefix = crate::keys::prefix_name();
         for (item, text, key) in [
             (Item::CopyMode, "copy mode: select and search history", "["),
             (Item::Resize, "resize panes", "e"),
@@ -163,7 +162,7 @@ impl Palette {
                 item,
                 section: "do",
                 text: text.to_string(),
-                sub: format!("{prefix} {key}"),
+                sub: crate::keys::named(&format!("ctrl-a {key}")),
                 space: None,
                 space_len: 0,
                 state: None,

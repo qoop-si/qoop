@@ -1073,13 +1073,13 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
                 let right = if key.is_empty() {
                     String::new()
                 } else {
-                    format!("^a {key}")
+                    crate::keys::named(&format!("ctrl-a {key}"))
                 };
                 (name.to_string(), right)
             })
             .collect(),
         MenuKind::Plus => vec![
-            ("new space".to_string(), "^a w".to_string()),
+            ("new space".to_string(), crate::keys::named("ctrl-a w")),
             ("connect a machine (ssh)".to_string(), String::new()),
         ],
         MenuKind::Sessions { sessions, .. } => {
@@ -1874,14 +1874,13 @@ fn enter_resize(state: &mut State) {
         .space
         .and_then(|space| state.layouts.get(&space))
         .is_some_and(|layout| layout.zoomed.is_some());
-    let p = crate::keys::prefix_name();
     if zoomed {
-        state.message = Some(format!("zoomed: {p} z first, then {p} e"));
+        state.message = Some(crate::keys::named("zoomed: ctrl-a z first, then ctrl-a e"));
         return;
     }
     if panes < 2 {
-        state.message = Some(format!(
-            "one pane, nothing to resize: {p} v or {p} - splits it"
+        state.message = Some(crate::keys::named(
+            "one pane, nothing to resize: ctrl-a v or ctrl-a - splits it",
         ));
         return;
     }
@@ -1992,9 +1991,8 @@ fn copy_bounds(state: &State) -> crate::copy::Bounds {
 /// the view is already scrolled back.
 fn enter_copy(state: &mut State) {
     let Some(snapshot) = state.snapshot.as_ref().filter(|_| state.focused != 0) else {
-        state.message = Some(format!(
-            "nothing to copy from, {} c starts a terminal",
-            crate::keys::prefix_name()
+        state.message = Some(crate::keys::named(
+            "nothing to copy from, ctrl-a c starts a terminal",
         ));
         return;
     };
