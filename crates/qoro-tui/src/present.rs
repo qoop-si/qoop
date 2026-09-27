@@ -17,8 +17,9 @@
 //! The painted frame uses exactly five shapes: cursor placement (`CSI r;c H`), colour
 //! (`CSI ... m`), cursor visibility (`CSI ? 25 h/l`), a link's open or close
 //! (`OSC 8 ... ST`, no column) and text. Anything else is kept as text of the row it lands
-//! on, so an unknown sequence is still written, never dropped. A row holding a link is
-//! always written whole: trimming it could write a tail whose open was left out.
+//! on, so an unknown sequence is still written, never dropped. A link is carried like a
+//! colour: a changed cell is written inside its own link's open and close, so a change
+//! under a long address costs one address, not a row of them.
 
 use std::fmt::Write as _;
 
@@ -200,64 +201,123 @@ fn put(rows: &mut [String], s: &str, at: (usize, usize), open: &mut Option<usize
     rows[row].push_str(s);
 }
 
-/// Write the part of a changed row that differs from what is on screen, or all of it.
+/// Write the cells of a changed row that differ from what is on screen, or all of it.
 ///
-/// Most of a changed row is usually not: a streamed word lands at the end of a line, a
-/// spinner turns at the start of one, and every pane row begins with the same column on
-/// the left. The common start and end are skipped when skipping them leaves exactly what
-/// writing the whole row would, which holds only for a row written in one go (a later
-/// write on the same row can have covered part of the start) and whose columns this side
-/// counts the way any terminal does (no zero width character, whose cluster a terminal
-/// may draw wider than its parts). Anything else is written whole.
+/// Most of a changed row is not: a streamed word lands at the end of a line, a spinner
+/// turns at the start of one, and every pane row begins with the same column on the
+/// left. So both rows are laid out as the cells they draw, later writes over earlier ones
+/// the way a terminal draws them, and only the runs of cells that differ are written, each
+/// with the colour and the link in effect on it. Writing only the differing cells leaves
+/// exactly what writing the whole row would. A row this side cannot lay out the way any
+/// terminal does (a sequence other than a placement, a colour or a link, or a zero width
+/// character, whose cluster a terminal may draw wider than its parts) is written whole.
+///
+/// A link is carried like a colour, so no run ever leaves one open. Measured before this,
+/// a row of linked cells was written whole on every change: one changed cell a row every
+/// 16 ms, under two 2 KB addresses in turn, was over 500 MB in ten seconds.
 fn trimmed(was: &str, now: &str, out: &mut String) {
-    let (Some(was_stops), Some(now_stops)) = (stops(was), stops(now)) else {
+    let (Some(old), Some(new)) = (cells(was), cells(now)) else {
         out.push_str(now);
         return;
     };
-    let prefix = common(was.bytes(), now.bytes());
-    // The last boundary inside the shared start: identical bytes there drew identical
-    // cells, so writing resumes at that column in the colour in effect there.
-    let Some(&(from, col)) = now_stops.iter().rev().find(|(at, _)| *at <= prefix) else {
-        // Placed somewhere else entirely: nothing on screen is shared.
-        out.push_str(now);
-        return;
-    };
-    // The first boundary inside the shared end whose twin on the old row sits at the
-    // same column in the same colour: from there the old row already shows these bytes.
-    let suffix = common(was.bytes().rev(), now.bytes().rev()).min(was.len().min(now.len()) - from);
-    let to = now_stops
-        .iter()
-        .filter(|(at, _)| *at >= now.len() - suffix)
-        .find(|&&(at, c)| {
-            let twin = at + was.len() - now.len();
-            was_stops.binary_search(&(twin, c)).is_ok() && style(was, twin) == style(now, at)
-        })
-        .map_or(now.len(), |(at, _)| *at);
-    if from == to {
-        return;
-    }
     let row = now[2..].split(';').next().unwrap_or("1");
-    let _ = write!(out, "\x1b[{row};{col}H{RESET}{}", style(now, from));
-    out.push_str(&now[from..to]);
+    let dirty = |col: &usize, cell: &Cell| old.get(col) != Some(cell);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (&col, cell) in &new {
+        if !dirty(&col, cell) {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end)) if *end == col => *end = col + 1,
+            _ => {
+                // A run never starts on the right half of a wide character: its left half
+                // is what draws it.
+                let start = if cell.glyph.is_empty() { col - 1 } else { col };
+                runs.push((start, col + 1));
+            }
+        }
+    }
+    for (start, end) in runs {
+        let _ = write!(out, "\x1b[{row};{start}H{RESET}");
+        let (mut sgr, mut link): (&str, Option<&str>) = ("", None);
+        for col in start..end {
+            let Some(cell) = new.get(&col) else { continue };
+            if cell.glyph.is_empty() {
+                continue;
+            }
+            if link.is_some() && link != cell.link {
+                out.push_str(LINK_CLOSE);
+                link = None;
+            }
+            if sgr != cell.sgr {
+                if !sgr.is_empty() {
+                    out.push_str(RESET);
+                }
+                out.push_str(&cell.sgr);
+                sgr = &cell.sgr;
+            }
+            if link != cell.link
+                && let Some(open) = cell.link
+            {
+                out.push_str(open);
+                link = Some(open);
+            }
+            out.push_str(cell.glyph);
+        }
+        if link.is_some() {
+            out.push_str(LINK_CLOSE);
+        }
+    }
 }
 
-/// How many leading items two sequences share.
-fn common(a: impl Iterator<Item = u8>, b: impl Iterator<Item = u8>) -> usize {
-    a.zip(b).take_while(|(x, y)| x == y).count()
+/// The escape that ends a link.
+const LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
+
+/// One screen cell as a row draws it.
+#[derive(Debug, PartialEq, Eq)]
+struct Cell<'a> {
+    /// What is drawn there; empty on the right half of a wide character.
+    glyph: &'a str,
+    /// Every colour sequence since the last reset.
+    sgr: String,
+    /// The escape that opened the link this cell is in, if it is in one.
+    link: Option<&'a str>,
 }
 
-/// Every place a single-write row could resume, as the byte offset and the column there,
-/// or `None` when the row cannot be cut: more than one write, a sequence other than
-/// colour, or a zero width character.
-fn stops(row: &str) -> Option<Vec<(usize, usize)>> {
+/// The cells a row draws, by one based column, later writes over earlier ones, or `None`
+/// when this side cannot lay it out the way any terminal would.
+fn cells(row: &str) -> Option<std::collections::BTreeMap<usize, Cell<'_>>> {
     let bytes = row.as_bytes();
-    let head = bytes.iter().position(|&b| b == b'H')?;
-    let mut col: usize = row[2..head].split(';').nth(1)?.parse().ok()?;
-    let mut out = vec![(head + 1, col)];
-    let mut i = head + 1;
+    let mut map = std::collections::BTreeMap::new();
+    let (mut col, mut sgr, mut link) = (1usize, String::new(), None);
+    let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            let end = csi_end(bytes, i).filter(|&end| bytes[end] == b'm')?;
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b']') {
+            let end = osc_end(bytes, i)?;
+            let terminator = if bytes[end - 1] == 0x07 { 1 } else { 2 };
+            // `8 ; params ; target`: an empty target closes the link.
+            let target = row[i + 2..end - terminator]
+                .strip_prefix("8;")?
+                .split_once(';')?
+                .1;
+            link = (!target.is_empty()).then_some(&row[i..end]);
+            i = end;
+        } else if bytes[i] == 0x1b {
+            let end = csi_end(bytes, i)?;
+            let params = &row[i + 2..end];
+            match bytes[end] {
+                // Colour and link carry over a placement, as they do on a terminal.
+                b'H' => col = params.split(';').nth(1)?.parse().ok()?,
+                b'm' => {
+                    if resets(params) {
+                        sgr.clear();
+                    }
+                    if !(params.is_empty() || params == "0") {
+                        sgr.push_str(&row[i..=end]);
+                    }
+                }
+                _ => return None,
+            }
             i = end + 1;
         } else {
             let c = row[i..].chars().next()?;
@@ -265,35 +325,40 @@ fn stops(row: &str) -> Option<Vec<(usize, usize)>> {
             if w == 0 {
                 return None;
             }
+            let glyph = &row[i..i + c.len_utf8()];
+            // As a terminal draws it: writing over either half of a wide character blanks
+            // the other half.
+            for at in col..col + w {
+                if at > 1
+                    && map.get(&at).is_some_and(|c: &Cell| c.glyph.is_empty())
+                    && let Some(lead) = map.get_mut(&(at - 1))
+                {
+                    lead.glyph = " ";
+                }
+                if at + 1 >= col + w
+                    && map
+                        .get(&(at + 1))
+                        .is_some_and(|c: &Cell| c.glyph.is_empty())
+                    && let Some(right) = map.get_mut(&(at + 1))
+                {
+                    right.glyph = " ";
+                }
+            }
+            for (at, glyph) in [(col, glyph), (col + 1, "")].into_iter().take(w) {
+                map.insert(
+                    at,
+                    Cell {
+                        glyph,
+                        sgr: sgr.clone(),
+                        link,
+                    },
+                );
+            }
             col += w;
             i += c.len_utf8();
         }
-        out.push((i, col));
     }
-    Some(out)
-}
-
-/// The colour in effect at `at` in a row: every colour sequence since the last reset.
-fn style(row: &str, at: usize) -> String {
-    let bytes = &row.as_bytes()[..at];
-    let mut style = String::new();
-    let mut i = 0;
-    while let Some(start) = bytes[i..].iter().position(|&b| b == 0x1b).map(|p| i + p) {
-        let Some(end) = csi_end(bytes, start) else {
-            break;
-        };
-        let params = &row[start + 2..end];
-        if bytes[end] == b'm' {
-            if resets(params) {
-                style.clear();
-            }
-            if !(params.is_empty() || params == "0") {
-                style.push_str(&row[start..=end]);
-            }
-        }
-        i = end + 1;
-    }
-    style
+    Some(map)
 }
 
 #[cfg(test)]
@@ -387,13 +452,13 @@ mod tests {
         let mut f = frame(&["aaa", "bbb", "ccc"], (3, 4));
         f.push_str("\x1b[2;2H\x1b[7mX\x1b[0m");
         let out = present(&mut p, &f);
-        let base = out.find("bbb").expect("row replayed");
-        let over = out.find('X').expect("overlay replayed");
-        assert!(base < over, "{out:?}");
-        assert!(!out.contains("aaa"), "{out:?}");
-        // And closing the overlay puts the row back.
+        // The row under it is already on screen, so only the cell it covers is written.
+        assert!(out.contains("\x1b[2;2H\x1b[0m\x1b[7mX"), "{out:?}");
+        assert!(!out.contains("aaa") && !out.contains("bbb"), "{out:?}");
+        // And closing the overlay puts back the cell it covered.
         let out = present(&mut p, &frame(&["aaa", "bbb", "ccc"], (3, 4)));
-        assert!(out.contains("bbb") && !out.contains('X'), "{out:?}");
+        assert!(out.contains("\x1b[2;2H\x1b[0m\x1b[0;38;5;7mb"), "{out:?}");
+        assert!(!out.contains('X'), "{out:?}");
     }
 
     #[test]
@@ -425,12 +490,25 @@ mod tests {
 
     /// A screen that understands what the presenter writes: placement, colour and text.
     /// Each cell is its character and the colour sequences in effect when it was drawn.
-    fn screen(bytes: &str, cells: &mut [Vec<(char, String)>]) {
+    /// Links count as part of a cell's look, and what comes back is the link left open at
+    /// the end of the bytes, which no write may leave.
+    fn screen(bytes: &str, cells: &mut [Vec<(char, String)>]) -> Option<String> {
         let (mut row, mut col, mut style) = (0usize, 0usize, String::new());
+        let mut link: Option<String> = None;
         let b = bytes.as_bytes();
         let mut i = 0;
         while i < b.len() {
-            if let Some(end) = csi_end(b, i) {
+            if b[i] == 0x1b && b.get(i + 1) == Some(&b']') {
+                let end = osc_end(b, i).expect("a whole sequence");
+                let terminator = if b[end - 1] == 0x07 { 1 } else { 2 };
+                let target = bytes[i + 2..end - terminator]
+                    .strip_prefix("8;")
+                    .and_then(|body| body.split_once(';'))
+                    .map(|(_, target)| target.to_string())
+                    .unwrap_or_default();
+                link = (!target.is_empty()).then_some(target);
+                i = end;
+            } else if let Some(end) = csi_end(b, i) {
                 let params = &bytes[i + 2..end];
                 match b[end] {
                     b'H' => {
@@ -451,13 +529,33 @@ mod tests {
                 i = end + 1;
             } else {
                 let c = bytes[i..].chars().next().unwrap();
-                if let Some(cell) = cells.get_mut(row).and_then(|r| r.get_mut(col)) {
-                    *cell = (c, style.clone());
+                let look = format!("{style}{}", link.as_deref().unwrap_or(""));
+                let w = crate::width::columns(c);
+                if let Some(line) = cells.get_mut(row) {
+                    // As a terminal does: a wide character takes the next cell too (`\0`), and
+                    // writing over either half of one blanks the other half.
+                    for at in col..col + w {
+                        if line.get(at).is_some_and(|c| c.0 == '\0') && at > 0 {
+                            line[at - 1].0 = ' ';
+                        }
+                        if line.get(at + 1).is_some_and(|c| c.0 == '\0') && at + 1 >= col + w {
+                            line[at + 1].0 = ' ';
+                        }
+                    }
+                    if let Some(cell) = line.get_mut(col) {
+                        *cell = (c, look.clone());
+                    }
+                    if w == 2
+                        && let Some(cell) = line.get_mut(col + 1)
+                    {
+                        *cell = ('\0', look);
+                    }
                 }
-                col += crate::width::columns(c);
+                col += w;
                 i += c.len_utf8();
             }
         }
+        link
     }
 
     /// Writing only what changed leaves the same screen as writing the whole row, over
@@ -483,8 +581,14 @@ mod tests {
             "\x1b[0;31m",
             "\x1b[0m",
             "\x1b[38;5;7m",
+            "\x1b]8;;https://a.example\x1b\\",
+            "\x1b]8;;https://b.example\x1b\\",
+            LINK_CLOSE,
+            // A second write on the row, over part of the first, the way `put` starts one.
+            "\x1b]8;;\x1b\\\x1b[1;3H\x1b[0m",
         ];
-        let row = |p: &[&str]| format!("\x1b[1;1H\x1b[0m{}", p.concat());
+        // Closed at the end, as `paint_row` always leaves a row.
+        let row = |p: &[&str]| format!("\x1b[1;1H\x1b[0m{}{LINK_CLOSE}", p.concat());
         let mut shorter = 0;
         for _ in 0..5000 {
             let was: Vec<&str> = (0..next(12)).map(|_| pieces[next(pieces.len())]).collect();
@@ -506,7 +610,11 @@ mod tests {
             screen(&now, &mut whole);
             let mut out = String::new();
             trimmed(&was, &now, &mut out);
-            screen(&out, &mut cut);
+            assert_eq!(
+                screen(&out, &mut cut),
+                None,
+                "a write left a link open: {out:?}"
+            );
             assert_eq!(whole, cut, "was {was:?} now {now:?} wrote {out:?}");
             shorter += usize::from(out.len() < now.len());
         }
@@ -537,16 +645,15 @@ mod tests {
     }
 
     /// A link's open and close take no column, so the cursor after a linked word is
-    /// where the word ends; and a row holding one is written whole, open and close
-    /// together, never trimmed to a tail that would leave a link open.
+    /// where the word ends; text added after a closed link writes only the text, and a
+    /// row rewritten without the link opens nothing.
     #[test]
-    fn a_linked_row_is_written_whole_and_its_link_takes_no_column() {
+    fn a_link_takes_no_column_and_text_after_it_writes_alone() {
         let open = "\x1b]8;;https://example.com\x1b\\";
-        let close = "\x1b]8;;\x1b\\";
         let mut p = Presenter::default();
         let mut out = String::new();
         p.present(
-            &format!("\x1b[1;1H{open}link{close}{SHOW}"),
+            &format!("\x1b[1;1H{open}link{LINK_CLOSE}{SHOW}"),
             20,
             2,
             &mut out,
@@ -554,25 +661,69 @@ mod tests {
         assert!(out.contains(&format!("\x1b[1;5H{SHOW}")), "{out:?}");
         let mut out = String::new();
         p.present(
-            &format!("\x1b[1;1H{open}link{close}s{SHOW}"),
+            &format!("\x1b[1;1H{open}link{LINK_CLOSE}s{SHOW}"),
             20,
             2,
             &mut out,
         );
-        assert!(
-            out.contains(&format!("\x1b[1;1H\x1b[0m{open}link{close}s")),
-            "{out:?}"
-        );
-        // And the row after it, rewritten without the link, opens nothing and the link
-        // written before it was already closed.
+        assert!(out.contains("\x1b[1;5H\x1b[0ms"), "{out:?}");
+        assert!(!out.contains("\x1b]8;;h"), "{out:?}");
         let mut out = String::new();
         p.present(&format!("\x1b[1;1Hplain{SHOW}"), 20, 2, &mut out);
         assert!(!out.contains("\x1b]8;;h"), "{out:?}");
-        assert_eq!(
-            out.matches("\x1b]8;;h").count(),
-            out.matches(close).count(),
-            "{out:?}"
-        );
+    }
+
+    /// One changed cell in a row whose cells are linked in turn to two 2 KB addresses
+    /// writes that cell inside one open and one close of its link, not the row. Measured
+    /// before this: the whole row, 80 addresses of 2 KB, on every change.
+    #[test]
+    fn one_changed_cell_under_a_long_link_writes_one_address() {
+        let open_of = |n: usize| {
+            format!(
+                "\x1b]8;;https://e.example/{}{}\x1b\\",
+                "a".repeat(2048),
+                n % 2
+            )
+        };
+        let open = open_of(40);
+        let row = |changed: bool| {
+            let mut s = String::from("\x1b[1;1H\x1b[0m\x1b[34m");
+            for n in 0..80 {
+                let c = if changed && n == 40 { 'Y' } else { 'x' };
+                let _ = write!(s, "{}{c}{LINK_CLOSE}", open_of(n));
+            }
+            s.push_str("\x1b[0m");
+            s
+        };
+        let (was, now) = (row(false), row(true));
+        assert!(now.len() > 160_000, "the row is what made it expensive");
+        let mut out = String::new();
+        trimmed(&was, &now, &mut out);
+        assert!(out.len() < 4096, "{} bytes for one cell", out.len());
+        assert_eq!(out.matches(&open).count(), 1, "{out:?}");
+        assert!(out.ends_with(&format!("{open}Y{LINK_CLOSE}")), "{out:?}");
+        assert!(out.contains("\x1b[1;41H\x1b[0m\x1b[34m"), "{out:?}");
+    }
+
+    /// Cells under two addresses in turn: a change under the second reopens the second,
+    /// never the first, and closes it after.
+    #[test]
+    fn a_trimmed_write_reopens_the_link_it_resumes_in() {
+        let a = "\x1b]8;;https://a.example\x1b\\";
+        let b = "\x1b]8;;https://b.example\x1b\\";
+        let row = |cells: &[char]| {
+            let mut s = String::from("\x1b[1;1H\x1b[0m");
+            for (n, c) in cells.iter().enumerate() {
+                let link = if n % 2 == 0 { a } else { b };
+                let _ = write!(s, "{link}{c}{LINK_CLOSE}");
+            }
+            s
+        };
+        let was = row(&['p', 'q', 'r', 's', 't', 'u']);
+        let now = row(&['p', 'q', 'r', 'S', 't', 'u']);
+        let mut out = String::new();
+        trimmed(&was, &now, &mut out);
+        assert_eq!(out, format!("\x1b[1;4H\x1b[0m{b}S{LINK_CLOSE}"));
     }
 
     #[test]
