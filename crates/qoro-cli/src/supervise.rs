@@ -560,7 +560,8 @@ pub(crate) fn take_generation(args: &mut Vec<String>) -> Option<u64> {
     let [.., flag, value] = args.as_slice() else {
         return None;
     };
-    if flag != "--generation" {
+    // After `--` it is text, whatever it spells.
+    if flag != "--generation" || args[..args.len() - 2].iter().any(|a| a == "--") {
         return None;
     }
     let value = value.parse::<u64>().ok()?;
@@ -1321,6 +1322,8 @@ mod tests {
             "qoro prompt 3 explain --generation 5 to me",
             "qoro prompt 3 set --generation high",
             "qoro prompt 3 --generation",
+            // After `--` it is text, whatever it spells.
+            "qoro send 3 -- deploy --generation 5",
         ] {
             let mut args = words(text);
             assert_eq!(take_generation(&mut args), None, "{text}");

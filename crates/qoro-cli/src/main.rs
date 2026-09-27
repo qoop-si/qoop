@@ -1104,7 +1104,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let help = "usage: qoro send <terminal> <text...> [--enter] [--generation G]\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
+    let help = "usage: qoro send <terminal> [--enter] [--generation G] [--] <text...>\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
@@ -1120,6 +1120,9 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
             enter = true;
         } else if arg == "--key" {
             keys.push(rest.next().cloned().ok_or_else(|| usage(help))?);
+        } else if arg == "--" {
+            // Everything after is text, dashes and all: what a person typed is sent as typed.
+            parts.extend(rest.by_ref().cloned());
         } else if arg.starts_with("--") {
             return Err(usage(format!("unknown flag {arg}; {help}")));
         } else {

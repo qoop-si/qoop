@@ -33,7 +33,7 @@ a claim nobody has to keep.
 | `qoro setup check <file>` | whether a Setup may run here | no |
 | `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
 | `qoro hook-report --session-id <id>` | report only the agent's conversation id, without claiming a state | no |
-| `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
+| `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel; after `--` every word is text, dashes included | no |
 | `qoro send <terminal> --key <name>` | press named keys in another terminal, one frame each: `enter esc tab shift-tab backspace space up down left right home end pageup pagedown ctrl-a..ctrl-z`; arrows follow the program's cursor key mode | no |
 | `qoro read <terminal> [--lines N] [--json] [--watch]` | print another terminal's current screen; `--json` prints it as styled runs (`{"cols","cursor","behind","alt","rows":[[{"t","fg","bg","b",...}]]}`, colours as hex), `--watch` again on each change, at most about every 150 ms, without sending a size | no |
 | `qoro read <terminal> --back UP [--lines N] [--json]` | read the terminal's history instead: N rows (200 by default), the first of them UP rows before the newest one written; `--json` answers `{"from","total","rows"}` | no |

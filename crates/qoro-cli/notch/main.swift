@@ -105,7 +105,7 @@ final class Store: ObservableObject {
         didSet {
             guard expanded != oldValue else { return }
             mirror?.stop()
-            // The reply line of the row that closed may have had the keyboard.
+            // The peek of the row that closed may have had the keyboard.
             release?()
             mirror = expanded.map { Mirror(terminal: $0) }
             mirror?.start()
@@ -115,7 +115,19 @@ final class Store: ObservableObject {
     private(set) var mirror: Mirror?
     /// A line the island shows for a few seconds: what went wrong with the last action.
     @Published var note: String?
-    /// Hands the keyboard back to whatever had it before the reply line.
+    /// Takes the keyboard for a peek being typed into, and hands it back after.
+    var takeKeyboard: (() -> Void)?
+    /// The terminal a peek is being typed into, and each terminal's queue of keys: kept
+    /// here rather than in the peek, which is built again whenever its row moves.
+    var typingTo: Int?
+    private var queues: [Int: Keys] = [:]
+
+    func keys(for terminal: Int) -> Keys {
+        if let k = queues[terminal] { return k }
+        let k = Keys(terminal: terminal, store: self)
+        queues[terminal] = k
+        return k
+    }
     var release: (() -> Void)?
 
     func say(_ text: String) {
@@ -748,57 +760,106 @@ struct TermLine: View {
     }
 }
 
-struct Option {
-    let key: String
-    let label: String
-    /// The one the agent's own cursor is on, which Enter would pick.
-    let current: Bool
-}
-
-/// A numbered menu on the bottom of a screen, the way agents ask: `❯ 1. Yes`, `2. No`.
-/// Only the lowest run of numbered rows counts: a numbered plan printed above the question
-/// is not its answers, and its labels on the buttons would be a lie about what is sent.
-func menu(_ screen: [[Run]]) -> [Option] {
-    func option(_ row: [Run]) -> Option? {
-        var text = Substring(row.map(\.plain).joined())
-        // Inside a box the border comes first.
-        text = text.drop { $0 == " " || $0 == "\u{2502}" }
-        let current = text.first == "\u{276f}" || text.first == ">"
-        if current { text = text.dropFirst().drop { $0 == " " } }
-        guard let digit = text.first, ("1"..."9").contains(digit), text.dropFirst().hasPrefix(". ") else { return nil }
-        let label = text.dropFirst(3).trimmingCharacters(in: CharacterSet(charactersIn: " \u{2502}"))
-        return label.isEmpty ? nil : Option(key: String(digit), label: String(label.prefix(26)), current: current)
+/// What a peek sends to its terminal, in the order it was pressed. Letters typed faster
+/// than one send takes go out together, so typing keeps up; keys never merge.
+@MainActor
+final class Keys {
+    enum Op {
+        case text(String)
+        case key(String)
     }
-    var block: [Option] = []
-    for row in screen.suffix(16).reversed() {
-        if let o = option(row) {
-            block.insert(o, at: 0)
-        } else if !block.isEmpty {
-            // The first row above the block that is not an option (the question, a blank)
-            // ends it.
-            break
+
+    let terminal: Int
+    unowned let store: Store
+    private var queue: [Op] = []
+    private var sending = false
+
+    init(terminal: Int, store: Store) {
+        self.terminal = terminal
+        self.store = store
+    }
+
+    func push(_ op: Op) {
+        if case .text(let more) = op, case .text(let have)? = queue.last {
+            queue[queue.count - 1] = .text(have + more)
+        } else {
+            queue.append(op)
+        }
+        next()
+    }
+
+    private func next() {
+        guard !sending, !queue.isEmpty else { return }
+        sending = true
+        let args: [String]
+        switch queue.removeFirst() {
+        case .text(let text): args = ["send", String(terminal), "--", text]
+        case .key(let name): args = ["send", String(terminal), "--key", name]
+        }
+        let store = self.store
+        DispatchQueue.global().async { [weak self] in
+            let why = runQoroChecked(args)
+            DispatchQueue.main.async {
+                if let why { store.say(why) }
+                self?.sending = false
+                self?.next()
+            }
         }
     }
-    let keys = block.map(\.key)
-    // A menu has the agent's own cursor on one of its options; a numbered list does not.
-    return block.count >= 2 && block.contains(where: \.current) && Set(keys).count == keys.count ? block : []
 }
 
-/// The terminal of an open row: live, scrollable back into what came before, with a way
-/// to answer it and a way to go to it.
+/// A key press as the terminal should get it: a named key `qoro send --key` knows, or
+/// the text it types. Nothing is read into it: arrows move through an agent's menu, Enter
+/// picks, Esc cancels, the way they would in the terminal itself.
+func keyOp(_ press: KeyPress) -> Keys.Op? {
+    if press.modifiers.contains(.command) {
+        // The one command key that types: paste. Line ends made one kind, no control
+        // characters, and several lines marked as a paste the way a terminal marks one, so
+        // a newline inside it is text rather than the Enter that sends a prompt.
+        guard press.key.character == "v", let raw = NSPasteboard.general.string(forType: .string) else { return nil }
+        let text = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+            .filter { $0 == "\n" || $0 == "\t" || !($0.asciiValue.map { $0 < 0x20 || $0 == 0x7f } ?? false) }
+        guard !text.isEmpty else { return nil }
+        return .text(text.contains("\n") ? "\u{1b}[200~" + text + "\u{1b}[201~" : text)
+    }
+    let named: [KeyEquivalent: String] = [
+        .return: "enter", .escape: "esc", .delete: "backspace", .upArrow: "up", .downArrow: "down",
+        .leftArrow: "left", .rightArrow: "right", .home: "home", .end: "end", .pageUp: "pageup",
+        .pageDown: "pagedown",
+    ]
+    // Shift-Tab reaches here as backtab, U+0019, as often as it does as a shifted Tab.
+    if press.key == .tab || press.key.character == "\u{19}" {
+        return .key(press.modifiers.contains(.shift) || press.key.character == "\u{19}" ? "shift-tab" : "tab")
+    }
+    // A new line rather than a send, the way agents take Esc then Enter.
+    if press.key == .return, !press.modifiers.isDisjoint(with: [.shift, .option]) { return .text("\u{1b}\r") }
+    if let name = named[press.key] { return .key(name) }
+    if press.modifiers.contains(.control) {
+        let c = press.key.character.lowercased()
+        guard let ch = c.first, ch.isASCII, ch.isLetter else { return nil }
+        return .key("ctrl-\(ch)")
+    }
+    // No control characters, and none of the private codes AppKit gives function keys and
+    // forward delete, which would arrive as three bytes of nothing.
+    let text = press.characters.filter { c in
+        !(c.asciiValue.map { $0 < 0x20 || $0 == 0x7f } ?? false)
+            && !c.unicodeScalars.contains { (0xF700...0xF8FF).contains($0.value) }
+    }
+    return text.isEmpty ? nil : .text(text)
+}
+
+/// The terminal of an open row: live, scrollable back into what came before, and, once
+/// clicked, typed into directly, every key going to that terminal as pressed.
 struct TermPeek: View {
-    static let height: CGFloat = 170
+    static let height: CGFloat = 190
     @ObservedObject var m: Mirror
     let row: Row
     @ObservedObject var store: Store
     let open: (Int) -> Void
-    @State private var reply = ""
-    /// The menu an option was pressed on: nothing more is pressed until another menu shows,
-    /// so a second click cannot answer a question that has not been seen yet.
-    @State private var pressedOn: String?
+    @FocusState private var typing: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             ScrollView([.vertical, .horizontal], showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if m.more {
@@ -818,80 +879,53 @@ struct TermPeek: View {
             .defaultScrollAnchor(.bottomLeading)
             .frame(height: TermPeek.height)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color(white: 0.05)))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.08)))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(typing ? amber.opacity(0.8) : .white.opacity(0.08), lineWidth: typing ? 1.5 : 1))
             .clipShape(RoundedRectangle(cornerRadius: 10))
+            .focusable()
+            .focusEffectDisabled()
+            .focused($typing)
+            .onTapGesture {
+                store.takeKeyboard?()
+                typing = true
+            }
+            .onKeyPress(phases: [.down, .repeat]) { press in
+                guard let op = keyOp(press) else { return .ignored }
+                store.keys(for: row.terminal).push(op)
+                return .handled
+            }
             HStack(spacing: 8) {
-                let options = row.state == "blocked" ? menu(m.screen.map(\.runs)) : []
-                let shown = options.map { $0.key + $0.label }.joined(separator: "\n")
-                let locked = pressedOn == shown
-                if options.isEmpty {
-                    TextField("Type to terminal \(row.terminal)", text: $reply)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12.5))
-                        .padding(.horizontal, 12)
-                        .frame(height: 28)
-                        .background(Capsule().fill(.white.opacity(0.08)))
-                        .onSubmit { send() }
+                if let note = store.note {
+                    Text(note).foregroundStyle(amber).lineLimit(1).truncationMode(.tail)
                 } else {
-                    ForEach(options, id: \.key) { o in
-                        Button { press(o.key, on: shown) } label: {
-                            Text("\(o.key) \(o.label)").lineLimit(1)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(locked)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(o.current ? .black : .white)
-                        .padding(.horizontal, 11).frame(height: 28)
-                        .background(Capsule().fill(o.current ? amber : .white.opacity(0.1)))
-                        .opacity(locked ? 0.4 : 1)
-                    }
-                    Spacer(minLength: 0)
+                    Text(typing ? "typing into terminal \(row.terminal); click outside to stop" : "click to type into terminal \(row.terminal)")
+                        .foregroundStyle(typing ? amber.opacity(0.9) : .white.opacity(0.4))
                 }
+                Spacer(minLength: 8)
                 Button { open(row.terminal) } label: {
                     Label("open in qoro", systemImage: "arrow.up.right")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 11.5))
                 .foregroundStyle(.white.opacity(0.55))
                 .fixedSize()
             }
+            .font(.system(size: 11.5))
         }
-    }
-
-    private func send() {
-        let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        reply = ""
-        let (t, store) = (row.terminal, store)
-        // Always a prompt, which qoro refuses while the agent is blocked: typed text and an
-        // Enter into a menu it could not read would pick whatever option is highlighted.
-        let giveBack: (String) -> Void = { why in
-            store.say(why)
-            if reply.isEmpty { reply = text }
-        }
-        DispatchQueue.global().async {
-            if let why = runQoroChecked(["prompt", String(t), "--", text]) {
-                DispatchQueue.main.async { giveBack(why) }
-            } else {
-                // Sent: the keyboard goes back to where the person was, so what they type
-                // next does not land in this line and go to this agent.
-                DispatchQueue.main.async { if reply.isEmpty { store.release?() } }
+        .onChange(of: typing) { _, now in
+            if now {
+                store.typingTo = row.terminal
+            } else if store.typingTo == row.terminal {
+                store.typingTo = nil
+                store.release?()
             }
         }
-    }
-
-    private func press(_ key: String, on shown: String) {
-        pressedOn = shown
-        let (t, store) = (row.terminal, store)
-        let failed: (String) -> Void = { why in
-            store.say(why)
-            // Not sent, so the same menu may be answered again.
-            if pressedOn == shown { pressedOn = nil }
-        }
-        DispatchQueue.global().async {
-            if let why = runQoroChecked(["send", String(t), key]) {
-                DispatchQueue.main.async { failed(why) }
+        // A row moving between sections (answered, it goes from "needs you" to "working")
+        // builds its peek again: typing carries on in the new one.
+        .onAppear { if store.typingTo == row.terminal { typing = true } }
+        .onDisappear {
+            if store.expanded != row.terminal, store.typingTo == row.terminal {
+                store.typingTo = nil
+                store.release?()
             }
         }
     }
@@ -917,7 +951,7 @@ struct Island: View {
             }
             .padding(.vertical, 8)
             Divider().overlay(.white.opacity(0.08)).padding(.bottom, 2)
-            if let note = s.note {
+            if let note = s.note, s.expanded == nil {
                 Text(note)
                     .font(.system(size: 12))
                     .foregroundStyle(amber)
@@ -990,8 +1024,8 @@ struct Geometry {
 
     func openHeight(_ s: Store) -> CGFloat {
         let sections = [Row.Kind.waiting, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
-        let peek: CGFloat = s.expanded == nil ? 0 : TermPeek.height + 8 + 28 + 12
-        let note: CGFloat = s.note == nil ? 0 : 26
+        let peek: CGFloat = s.expanded == nil ? 0 : TermPeek.height + 6 + 18 + 12
+        let note: CGFloat = s.note == nil || s.expanded != nil ? 0 : 26
         let full = notch.height + 40 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + 4 + peek + note
         return min(full, Geometry.openMaxHeight)
     }
@@ -1047,7 +1081,7 @@ struct NotchView: View {
 // MARK: panel
 
 final class NotchPanel: NSPanel {
-    // Key only so the reply line can take typing; being non-activating, it never takes
+    // Key only so a peek can take typing; being non-activating, it never takes
     // the app to the front or the focus from the terminal under it until clicked in.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -1070,8 +1104,8 @@ final class App: NSObject, NSApplicationDelegate {
         panel.level = .statusBar + 1
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.ignoresMouseEvents = true
-        // Key only when a control that types asks for it, the reply line; a click on a
-        // row or the notch leaves the keyboard where it was.
+        // Key only when a peek is clicked to be typed into; a click on a row or the notch
+        // leaves the keyboard where it was.
         panel.becomesKeyOnlyIfNeeded = true
         place()
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
@@ -1095,9 +1129,10 @@ final class App: NSObject, NSApplicationDelegate {
         } as Any)
 
         store.changed = { [weak self] in self?.track() }
-        // Folding hands the keyboard back: a panel left key after the reply line is gone
+        // Folding hands the keyboard back: a panel left key after the peek is gone
         // would swallow what the person types next into the app under it.
         store.release = { [weak self] in self?.release() }
+        store.takeKeyboard = { [weak self] in self?.panel.makeKey() }
         folded = store.$open.sink { [weak self] open in
             if !open { self?.release() }
         }
@@ -1141,9 +1176,9 @@ final class App: NSObject, NSApplicationDelegate {
         if store.hover != (over && !store.open) { store.hover = over && !store.open }
         // Leaving the open inbox folds it, the way a menu closes, after a beat so a pointer
         // that overshoots the edge and comes back does not lose it.
-        // Not while typing: the reply line holds the keyboard, and a pointer drifting off the
+        // Not while typing: the peek holds the keyboard, and a pointer drifting off the
         // edge must not take the half written answer with it.
-        if store.open, !over, !closing, !(panel.isKeyWindow && panel.firstResponder is NSText) {
+        if store.open, !over, !closing, !panel.isKeyWindow {
             closing = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 guard let self else { return }

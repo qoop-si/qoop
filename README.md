@@ -44,12 +44,13 @@ counting the agents that need you, and how many are working and idle. A click dr
 list; a click on a row opens that agent's terminal right under it, live and in its own
 colours, the same grid the interface draws and never resized for it. Scrolling up goes
 back past the screen: into the terminal's history, or for an agent on the full screen,
-into its conversation. Under it is a line to answer the agent, or a button per option
-when it is waiting on a numbered menu, and "open in qoro" to switch the interface there
-and bring its app forward (inside tmux the switch happens and nothing is raised, since
-the tmux server has no app to find). The installer turns it on; `qoro notch uninstall`
-turns it off, and `qoro notch install` back on. It is built into the macOS binary, so it
-needs no download or signature of its own.
+into its conversation. A click on it types into it: every key goes to that terminal as
+pressed, so arrows move through an agent's menu, Enter picks, Esc cancels, and a click
+outside stops. "open in qoro" switches the interface there and brings its app forward
+(inside tmux the switch happens and nothing is raised, since the tmux server has no app to
+find). The installer turns it on; `qoro notch uninstall` turns it off, and `qoro notch
+install` back on. It is built into the macOS binary, so it needs no download or signature
+of its own.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
 [ADR-021](docs/adr/ADR-021-windows.md) says what one would have to include.
