@@ -113,6 +113,10 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             target: "me@devbox".into(),
             session: "default".into(),
         },
+        ControlRequest::InstallRemote {
+            id: "x20".into(),
+            target: "me@devbox".into(),
+        },
         ControlRequest::HostColors {
             id: "x20".into(),
             fg: [0, 0, 0],
@@ -152,6 +156,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
+            | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }

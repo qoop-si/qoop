@@ -12,6 +12,7 @@ pub mod eventlog;
 pub mod idle;
 pub mod lock;
 pub mod paths;
+pub mod release;
 pub mod spill;
 pub mod store;
 pub mod terminal;

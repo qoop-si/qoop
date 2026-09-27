@@ -118,12 +118,9 @@ enum FromLink {
         conn: u64,
         reason: String,
     },
-    /// The sessions on a machine the interface asked about, or why they could not be read.
-    Probed {
-        id: String,
-        target: String,
-        result: Result<Vec<RemoteSession>, String>,
-    },
+    /// An answer a task of the mux's own worked out: the sessions on a machine, that it
+    /// has no qoro, that qoro is now there, or why not.
+    Reply(ControlResponse),
 }
 
 /// One daemon as the mux keeps it.
@@ -428,13 +425,27 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             .filter_map(|l| l.remote.clone())
             .chain(saved.iter().cloned())
             .collect();
-        if let Some(same) = known
+        // Already kept: connecting it means "take me there". A link already running is woken,
+        // which after an install is exactly what brings it up; one only in the file (added
+        // from a shell while this interface ran) is started.
+        let same = |r: &Remote| r.target == target && r.session == session;
+        let linked = self
+            .links
             .iter()
-            .find(|r| r.target == target && r.session == session)
-        {
-            let name = same.name.clone();
+            .position(|l| l.as_ref().and_then(|l| l.remote.as_ref()).is_some_and(same));
+        if let Some(link) = linked {
+            let name = self.link(link).map(|l| l.name.clone()).unwrap_or_default();
+            self.wake(link);
             return self
-                .failed(id, format!("{target} {session} is already here as {name}"))
+                .respond(&ControlResponse::RemoteAdded { id, name })
+                .await;
+        }
+        if let Some(kept) = saved.iter().find(|r| same(r)).cloned() {
+            let name = kept.name.clone();
+            self.add_remote(kept);
+            self.push_lists("mux").await?;
+            return self
+                .respond(&ControlResponse::RemoteAdded { id, name })
                 .await;
         }
         let taken: Vec<&str> = known.iter().map(|r| r.name.as_str()).collect();
@@ -698,20 +709,59 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 // task of its own, answered when it reports back.
                 let events = self.events.clone();
                 tokio::spawn(async move {
-                    let result = crate::link::list_sessions(&target)
-                        .await
-                        .map(|listed| {
-                            listed
-                                .into_iter()
-                                .map(|s| RemoteSession {
-                                    name: s.name,
-                                    running: s.running,
-                                    tabs: s.tabs,
-                                })
-                                .collect()
-                        })
-                        .map_err(|e| e.to_string());
-                    let _ = events.send(FromLink::Probed { id, target, result }).await;
+                    let reply = match crate::link::list_sessions(&target).await {
+                        Ok(crate::link::Probe::Sessions(listed)) => {
+                            ControlResponse::RemoteSessions {
+                                id,
+                                target,
+                                sessions: listed
+                                    .into_iter()
+                                    .map(|s| RemoteSession {
+                                        name: s.name,
+                                        running: s.running,
+                                        tabs: s.tabs,
+                                    })
+                                    .collect(),
+                            }
+                        }
+                        Ok(crate::link::Probe::Missing(platform)) => {
+                            ControlResponse::RemoteMissing {
+                                id,
+                                target,
+                                platform: platform.describe(),
+                                root: platform.root,
+                            }
+                        }
+                        Err(e) => ControlResponse::Failed {
+                            id,
+                            reason: e.to_string(),
+                        },
+                    };
+                    let _ = events.send(FromLink::Reply(reply)).await;
+                });
+                Ok(())
+            }
+            R::InstallRemote { id, target } => {
+                if !qoro_remote::saved::valid_target(&target) {
+                    return self
+                        .failed(id, format!("{target:?} is not an ssh address"))
+                        .await;
+                }
+                // A copy of several megabytes over ssh: in a task, like the session list.
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let reply = match crate::link::install(&target).await {
+                        Ok(version) => ControlResponse::RemoteInstalled {
+                            id,
+                            target,
+                            version,
+                        },
+                        Err(e) => ControlResponse::Failed {
+                            id,
+                            reason: e.to_string(),
+                        },
+                    };
+                    let _ = events.send(FromLink::Reply(reply)).await;
                 });
                 Ok(())
             }
@@ -778,17 +828,27 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 self.push_lists("mux").await
             }
-            FromLink::Probed { id, target, result } => match result {
-                Ok(sessions) => {
-                    self.respond(&ControlResponse::RemoteSessions {
-                        id,
-                        target,
-                        sessions,
-                    })
-                    .await
+            FromLink::Reply(reply) => {
+                // A machine that just got its qoro: any link already kept for it tries now
+                // rather than at the end of its wait.
+                if let ControlResponse::RemoteInstalled { target, .. } = &reply {
+                    let waiting: Vec<usize> = self
+                        .links
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| {
+                            l.as_ref()
+                                .and_then(|l| l.remote.as_ref())
+                                .is_some_and(|r| &r.target == target)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    for link in waiting {
+                        self.wake(link);
+                    }
                 }
-                Err(reason) => self.failed(id, reason).await,
-            },
+                self.respond(&reply).await
+            }
             FromLink::Said {
                 link,
                 conn,

@@ -129,8 +129,11 @@ over there: a new tab, a split, a space made with `ctrl-a w` while you are in on
 new space `devbox:tests` from anywhere makes it on devbox. If the connection drops, its
 spaces read as offline within about fifteen seconds and come back on their own, with the same
 tabs, at most ten seconds after the network does, or at once when you reach for one of them.
-qoro has to be installed on the other machine already, and `qoro agents`, `send` and `read`
-still speak only to this machine's daemon.
+A machine with no qoro is offered one: this version, for its platform, put in its
+`~/.local/bin` over the same ssh and run once there before it is kept. A release downloaded
+for another platform is checked against its checksum first. A qoro already there is never
+replaced. `qoro agents`, `send` and `read` still
+speak only to this machine's daemon.
 
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.

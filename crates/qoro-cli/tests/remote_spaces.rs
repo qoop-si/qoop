@@ -53,20 +53,79 @@ fn stop(runtime: &Path) {
 
 /// A fake `ssh` on a PATH of its own: runs the last argument through `sh` with the remote's
 /// runtime directory, and puts the qoro under test where the remote command looks for it.
-fn fake_ssh(bin: &Path, remote_runtime: &Path) -> PathBuf {
+fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path) -> PathBuf {
     std::fs::create_dir_all(bin).expect("bin");
     std::os::unix::fs::symlink(qoro(), bin.join("qoro")).expect("link qoro");
+    // `bare.example` is a machine with no qoro: a home of its own, a PATH without it, and
+    // a `uname` that says Linux on x86_64, so what it gets is the release for that.
+    let shim = bare.join("shim");
+    std::fs::create_dir_all(&shim).expect("shim");
+    let uname = shim.join("uname");
+    std::fs::write(
+        &uname,
+        "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n",
+    )
+    .expect("uname");
+    std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let run = bare.join("run");
+    std::fs::create_dir_all(&run).expect("run");
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     let script = bin.join("ssh");
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QORO_SESSION\nQORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QORO_SESSION\n\
+             if [ \"$host\" = bare.example ]; then HOME={} PATH={}:/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
+             QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            bare.display(),
+            shim.display(),
+            run.display(),
             remote_runtime.display()
         ),
     )
     .expect("script");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     script
+}
+
+/// A release of this version in the API's own shape, served from a directory: the Linux
+/// x86_64 tarball holds the qoro under test, with its checksum, so an install onto
+/// `bare.example` goes through the real download, check and unpack.
+fn fake_release(dir: &Path) -> String {
+    let tags = dir.join("tags");
+    std::fs::create_dir_all(&tags).expect("tags");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).expect("src");
+    std::fs::copy(qoro(), src.join("qoro")).expect("copy qoro");
+    let asset = "qoro-x86_64-unknown-linux-gnu.tar.gz";
+    let tarball = dir.join(asset);
+    let packed = Command::new("tar")
+        .arg("-czf")
+        .arg(&tarball)
+        .arg("qoro")
+        .current_dir(&src)
+        .status()
+        .expect("tar");
+    assert!(packed.success());
+    let sums = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&tarball)
+        .output()
+        .expect("shasum");
+    std::fs::write(dir.join(format!("{asset}.sha256")), &sums.stdout).expect("sums");
+    let release = serde_json::json!({
+        "tag_name": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "assets": [
+            {"name": asset, "url": format!("file://{}", tarball.display())},
+            {"name": format!("{asset}.sha256"), "url": format!("file://{}/{asset}.sha256", dir.display())},
+        ],
+    });
+    std::fs::write(
+        tags.join(format!("v{}", env!("CARGO_PKG_VERSION"))),
+        release.to_string(),
+    )
+    .expect("release");
+    format!("file://{}", dir.display())
 }
 
 struct Tui {
@@ -147,10 +206,25 @@ fn remote_rows(spaces: &[WorkspaceRow]) -> Vec<&WorkspaceRow> {
 
 #[test]
 fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
+    // One scenario, one future, and in a debug build that future is bigger than a test
+    // thread's default stack: it runs on a thread with room for it.
+    let ran = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(scenario)
+        .expect("thread")
+        .join();
+    if let Err(panic) = ran {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn scenario() {
     let local = private_dir();
     let remote = private_dir();
     let home = private_dir();
-    let ssh = fake_ssh(&home.path().join("bin"), remote.path());
+    let bare = private_dir();
+    let ssh = fake_ssh(&home.path().join("bin"), remote.path(), bare.path());
+    let releases = fake_release(&home.path().join("releases"));
     // One process-wide change, in a test binary of its own: the mux spawns `ssh` by name, and
     // its control sockets go under the cache directory, which must not be the real one.
     // SAFETY: set before the runtime or any other thread exists.
@@ -161,6 +235,7 @@ fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
         );
         std::env::set_var("XDG_CACHE_HOME", home.path().join("cache"));
         std::env::set_var("QORO_REMOTES", home.path().join("remotes.json"));
+        std::env::set_var("QORO_RELEASE_BASE", &releases);
         std::env::remove_var("QORO_SESSION");
     }
 
@@ -425,22 +500,39 @@ fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
                     .any(|w| is_remote_workspace(w.id) && w.name.starts_with("10.0.0.5:"))
             })
             .await;
-            // Asking twice names the one already there instead of adding it again.
+            // Asking twice is "take me there": it answers with the one already there, under
+            // its name, and adds nothing.
             tui.ask(ControlRequest::ConnectRemote {
                 id: "connect-2".into(),
                 target: "admin@10.0.0.5".into(),
                 session: "work".into(),
             })
             .await;
-            tui.until("a second add to be refused", |incoming| match incoming {
-                Incoming::Control(ControlResponse::Failed { id, reason }) if id == "connect-2" => {
-                    assert!(reason.contains("10.0.0.5"), "{reason}");
-                    Some(())
-                }
-                _ => None,
-            })
-            .await;
+            let again = tui
+                .until(
+                    "the second connect to name the first",
+                    |incoming| match incoming {
+                        Incoming::Control(ControlResponse::RemoteAdded { id, name })
+                            if id == "connect-2" =>
+                        {
+                            Some(name.clone())
+                        }
+                        Incoming::Control(ControlResponse::Failed { id, reason })
+                            if id == "connect-2" =>
+                        {
+                            panic!("the second connect failed: {reason}")
+                        }
+                        _ => None,
+                    },
+                )
+                .await;
+            assert_eq!(again, "10.0.0.5");
+            let kept = qoro_remote::saved::load_from(&home.path().join("remotes.json"))
+                .expect("remotes saved");
+            assert_eq!(kept.len(), 1, "added twice: {kept:?}");
             stop_session(remote.path(), "work");
+
+            Box::pin(install_onto_a_bare_machine(&mut tui, bare.path())).await;
 
             // The local daemon going away ends the interface, as it does without a mux: the
             // stream closes rather than going quiet.
@@ -465,4 +557,113 @@ fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// A machine with no qoro: named as such, installed from the release of this version,
+/// then answering like any other; a second install never replaces it. Its own function,
+/// boxed by the caller, because one async block holding every step of this test is a
+/// future larger than a test thread's stack.
+async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
+    // A machine with no qoro: said so, with its platform, rather than failed.
+    tui.ask(ControlRequest::ListRemoteSessions {
+        id: "probe-bare".into(),
+        target: "bare.example".into(),
+    })
+    .await;
+    let platform = tui
+        .until("the missing qoro to be named", |incoming| match incoming {
+            Incoming::Control(ControlResponse::RemoteMissing {
+                id, platform, root, ..
+            }) if id == "probe-bare" => {
+                assert!(!root);
+                Some(platform.clone())
+            }
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "probe-bare" => {
+                panic!("the probe failed instead: {reason}")
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(platform, "linux x86_64");
+
+    // Installed from the release of this version for that platform: downloaded,
+    // checked, unpacked here, copied, run there, and only then linked.
+    tui.ask(ControlRequest::InstallRemote {
+        id: "install-1".into(),
+        target: "bare.example".into(),
+    })
+    .await;
+    let version = tui
+        .until("the install", |incoming| match incoming {
+            Incoming::Control(ControlResponse::RemoteInstalled { id, version, .. })
+                if id == "install-1" =>
+            {
+                Some(version.clone())
+            }
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "install-1" => {
+                panic!("the install failed: {reason}")
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    let installed = bare.join(".local/bin/qoro");
+    assert_eq!(
+        std::fs::read(&installed).expect("installed"),
+        std::fs::read(qoro()).expect("qoro"),
+        "what arrived is not the binary the release holds"
+    );
+    let left: Vec<String> = std::fs::read_dir(bare.join(".local/bin"))
+        .expect("bin")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        vec!["qoro".to_string()],
+        "a staged copy was left behind"
+    );
+
+    // Now it answers like any machine with qoro.
+    tui.ask(ControlRequest::ListRemoteSessions {
+        id: "probe-bare-2".into(),
+        target: "bare.example".into(),
+    })
+    .await;
+    tui.until(
+        "the sessions after the install",
+        |incoming| match incoming {
+            Incoming::Control(ControlResponse::RemoteSessions { id, .. })
+                if id == "probe-bare-2" =>
+            {
+                Some(())
+            }
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "probe-bare-2" => {
+                panic!("the probe after the install failed: {reason}")
+            }
+            _ => None,
+        },
+    )
+    .await;
+
+    // And a second install never replaces the qoro that is there.
+    tui.ask(ControlRequest::InstallRemote {
+        id: "install-2".into(),
+        target: "bare.example".into(),
+    })
+    .await;
+    tui.until(
+        "a second install to be refused",
+        |incoming| match incoming {
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "install-2" => {
+                assert!(reason.contains("already"), "{reason}");
+                Some(())
+            }
+            Incoming::Control(ControlResponse::RemoteInstalled { id, .. }) if id == "install-2" => {
+                panic!("a second install replaced the qoro there")
+            }
+            _ => None,
+        },
+    )
+    .await;
 }

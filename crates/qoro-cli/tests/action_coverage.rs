@@ -272,6 +272,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "install qoro on a machine that has none",
+            method: || {
+                Method::Control(ControlRequest::InstallRemote {
+                    id: "a".into(),
+                    target: "me@devbox".into(),
+                })
+            },
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -424,6 +433,10 @@ fn every_control_method_is_reachable_from_some_action() {
             target: String::new(),
             session: String::new(),
         },
+        ControlRequest::InstallRemote {
+            id: String::new(),
+            target: String::new(),
+        },
         ControlRequest::HostColors {
             id: String::new(),
             fg: [0; 3],
@@ -453,6 +466,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
+            | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }

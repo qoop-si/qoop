@@ -15,6 +15,7 @@ qoro-setup = { path = "../qoro-setup" }
 qoro-runtime = { path = "../qoro-runtime" }
 qoro-tui = { path = "../qoro-tui" }
 qoro-remote = { path = "../qoro-remote" }
+tempfile = { workspace = true }
 qoro-history = { path = "../qoro-history" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 bytes = { workspace = true }

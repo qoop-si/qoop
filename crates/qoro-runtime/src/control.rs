@@ -253,6 +253,13 @@ pub enum ControlRequest {
         target: String,
         session: String,
     },
+    /// Put this version of qoro on a machine that has none, into `~/.local/bin` over ssh.
+    /// Answered by the interface's connection, like `ListRemoteSessions`; it never replaces
+    /// a qoro that is already there.
+    InstallRemote {
+        id: String,
+        target: String,
+    },
     /// The foreground and background of the terminal a person is looking at, as the
     /// interface read them from it, so a program inside that asks for them (`OSC 10 ?`,
     /// `OSC 11 ?`) learns the real ones and picks a readable palette.
@@ -304,6 +311,7 @@ impl ControlRequest {
             | Self::ReloadAgentManifests { id }
             | Self::ListRemoteSessions { id, .. }
             | Self::ConnectRemote { id, .. }
+            | Self::InstallRemote { id, .. }
             | Self::GrantOwnership { id, .. } => id,
         }
     }
@@ -440,6 +448,20 @@ pub enum ControlResponse {
     RemoteAdded {
         id: String,
         name: String,
+    },
+    /// The machine has no qoro, and is one qoro is built for: `platform` as shown to a
+    /// person ("linux x86_64"), and whether the connection logs in as root.
+    RemoteMissing {
+        id: String,
+        target: String,
+        platform: String,
+        root: bool,
+    },
+    /// qoro `version` is now on the machine.
+    RemoteInstalled {
+        id: String,
+        target: String,
+        version: String,
     },
     /// `HostColors` was taken: programs asking from now on get these.
     HostColorsNoted {
@@ -748,6 +770,8 @@ impl ControlResponse {
             | Self::FocusEvents { id, .. }
             | Self::RemoteSessions { id, .. }
             | Self::RemoteAdded { id, .. }
+            | Self::RemoteMissing { id, .. }
+            | Self::RemoteInstalled { id, .. }
             | Self::HostColorsNoted { id }
             | Self::SplitSaved { id }
             | Self::Failed { id, .. } => id,

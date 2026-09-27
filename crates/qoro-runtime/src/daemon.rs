@@ -3041,13 +3041,12 @@ async fn handle_control(
         }
         // Another machine is the interface's business, not this daemon's. Reaching here
         // means a client sent it straight to a daemon, and that is said rather than ignored.
-        ControlRequest::ListRemoteSessions { .. } | ControlRequest::ConnectRemote { .. } => {
-            ControlResponse::Failed {
-                id,
-                reason: "remote machines are reached by the interface, not by the daemon"
-                    .to_string(),
-            }
-        }
+        ControlRequest::ListRemoteSessions { .. }
+        | ControlRequest::ConnectRemote { .. }
+        | ControlRequest::InstallRemote { .. } => ControlResponse::Failed {
+            id,
+            reason: "remote machines are reached by the interface, not by the daemon".to_string(),
+        },
         ControlRequest::ReloadAgentManifests { .. } => {
             // Answered live from the files, never journalled: a replayed answer
             // would lie about what the directory says now. Good files replace

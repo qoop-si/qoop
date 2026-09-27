@@ -398,6 +398,12 @@ struct State {
     /// The id of the session list last asked for. An answer to any other is late, and a
     /// list that opened over whatever the person has moved on to would steal the keys.
     probing: Option<String>,
+    /// The id of the install last asked for. Its success is always said; only while it is
+    /// still standing does the list of the machine's sessions follow on its own.
+    installing: Option<String>,
+    /// A machine to ask about its sessions again, once the loop can write: qoro was just
+    /// installed there.
+    reprobe: Option<String>,
     /// A machine just connected from here, whose first tab the screen moves to when it
     /// arrives. Forgotten as soon as the person goes anywhere themselves.
     joining: Option<String>,
@@ -1201,6 +1207,12 @@ pub enum MenuKind {
         target: String,
         sessions: Vec<qoro_runtime::control::RemoteSession>,
     },
+    /// A machine being connected has no qoro: put this version there, or not.
+    Install {
+        target: String,
+        platform: String,
+        root: bool,
+    },
 }
 
 /// The rows the menu box shows: a name on the left, and on the right its key or what
@@ -1242,6 +1254,13 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             rows.push(("new session".to_string(), "name it".to_string()));
             rows
         }
+        MenuKind::Install { platform, .. } => vec![
+            (
+                format!("install qoro {} there", env!("CARGO_PKG_VERSION")),
+                platform.clone(),
+            ),
+            ("cancel".to_string(), String::new()),
+        ],
     }
 }
 
@@ -1251,6 +1270,11 @@ pub fn menu_title(kind: &MenuKind) -> String {
         MenuKind::Main => " menu".to_string(),
         MenuKind::Plus => " spaces".to_string(),
         MenuKind::Sessions { target, .. } => format!(" sessions on {target}"),
+        // As root said out loud: every agent started there will run as root.
+        MenuKind::Install { target, root, .. } => {
+            let who = if *root { " as root" } else { "" };
+            format!(" no qoro on {target}{who}")
+        }
     }
 }
 
@@ -1329,6 +1353,17 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                 Naming::Remote
             });
             return MenuSend::Nothing;
+        }
+        MenuKind::Install { target, .. } => {
+            if item != 0 {
+                state.connecting = None;
+                return MenuSend::Nothing;
+            }
+            *request += 1;
+            let id = format!("install-{request}");
+            state.installing = Some(id.clone());
+            state.message = Some(format!("installing qoro on {target}"));
+            return MenuSend::Control(ControlRequest::InstallRemote { id, target });
         }
         MenuKind::Sessions { target, sessions } => {
             // The last row names a new session; every row before it is one to open, or
@@ -2742,6 +2777,8 @@ where
         menu_kind: MenuKind::Main,
         connecting: None,
         probing: None,
+        installing: None,
+        reprobe: None,
         joining: None,
         modes: Modes::default(),
         selection: None,
@@ -3203,6 +3240,7 @@ where
                     // stripped above and never reaches this.
                     state.joining = None;
                     state.probing = None;
+                    state.installing = None;
                     // Ahead of the keystroke itself: a resize behind the input
                     // loses the race with the shell reading it.
                     drain_adopt_resize(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
@@ -4547,6 +4585,18 @@ where
                             &mut control_seq,
                         )?).await?;
                     }
+                    // qoro was just put on a machine the person is connecting: ask it about its
+                    // sessions again, and the list follows as if it had been there all along.
+                    if let Some(target) = state.reprobe.take() {
+                        request += 1;
+                        let id = format!("probe-{request}");
+                        state.probing = Some(id.clone());
+                        state.connecting = Some(target.clone());
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::ListRemoteSessions { id, target },
+                            &mut control_seq,
+                        )?).await?;
+                    }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     drain_modes(&mut state, &mut control_seq, &mut wr, &mut dirty).await?;
                     // The focus list refetches on its own flag, never on a timer:
@@ -5714,6 +5764,44 @@ fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Op
     )?))
 }
 
+/// Open the list an answer about another machine brings (its sessions, or the offer to
+/// install qoro there), but only as the answer to the question still standing and only
+/// over nothing else. An answer can take seconds, and a list that opened over a box the
+/// person has moved on to, or one too big to be painted, would still take their keys.
+fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
+    if state.probing.as_deref() != Some(id) {
+        return;
+    }
+    state.probing = None;
+    let target = match &kind {
+        MenuKind::Sessions { target, .. } | MenuKind::Install { target, .. } => target.clone(),
+        MenuKind::Main | MenuKind::Plus => String::new(),
+    };
+    let fits = crate::screen::menu_rect(
+        state.cols,
+        state.lines,
+        &menu_rows(&kind),
+        &menu_title(&kind),
+    )
+    .is_some();
+    let busy = state.menu.is_some()
+        || state.prompt.is_some()
+        || state.palette.is_some()
+        || state.reading.is_some()
+        || state.focus;
+    if !fits || busy {
+        state.message = Some(if fits {
+            format!("{target} answered while a box was open; connect again to pick")
+        } else {
+            format!("the window is too small for what {target} answered")
+        });
+        return;
+    }
+    state.message = None;
+    state.menu_kind = kind;
+    state.menu = Some(0);
+}
+
 /// Fold one answer into what is on screen.
 fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
     if response.request_id() == "behind" {
@@ -6254,6 +6342,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             if state.probing.as_deref() == Some(id.as_str()) {
                 state.probing = None;
             }
+            if state.installing.as_deref() == Some(id.as_str()) {
+                state.installing = None;
+            }
             // A space that was refused is not coming: it no longer counts toward the next
             // numbered name.
             if id.starts_with("space-") {
@@ -6315,34 +6406,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             target,
             mut sessions,
         } => {
-            if state.probing.as_deref() != Some(id.as_str()) {
-                return;
-            }
-            state.probing = None;
-            let rows = menu_rows(&MenuKind::Sessions {
-                target: target.clone(),
-                sessions: sessions.clone(),
-            });
-            let title = menu_title(&MenuKind::Sessions {
-                target: target.clone(),
-                sessions: Vec::new(),
-            });
-            // A list that does not fit is not painted but would still own the keys.
-            let fits = crate::screen::menu_rect(state.cols, state.lines, &rows, &title).is_some();
-            let busy = state.menu.is_some()
-                || state.prompt.is_some()
-                || state.palette.is_some()
-                || state.reading.is_some()
-                || state.focus;
-            if !fits || busy {
-                state.message = Some(if fits {
-                    format!("{target} answered while a box was open; connect again to pick")
-                } else {
-                    format!("the window is too small for the sessions on {target}")
-                });
-                *dirty = true;
-                return;
-            }
             // What is running first, then what holds the most, then by name.
             sessions.sort_by(|a, b| {
                 b.running
@@ -6350,9 +6413,40 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     .then(b.tabs.cmp(&a.tabs))
                     .then(a.name.cmp(&b.name))
             });
-            state.message = None;
-            state.menu_kind = MenuKind::Sessions { target, sessions };
-            state.menu = Some(0);
+            open_answer_list(state, &id, MenuKind::Sessions { target, sessions });
+            *dirty = true;
+        }
+        // No qoro on the machine being connected: the same kind of list, offering to put it
+        // there, under the same rules.
+        ControlResponse::RemoteMissing {
+            id,
+            target,
+            platform,
+            root,
+        } => {
+            open_answer_list(
+                state,
+                &id,
+                MenuKind::Install {
+                    target,
+                    platform,
+                    root,
+                },
+            );
+            *dirty = true;
+        }
+        // Said whatever the person is doing now, because it happened; the list of its
+        // sessions follows only while they are still waiting for it.
+        ControlResponse::RemoteInstalled {
+            id,
+            target,
+            version,
+        } => {
+            state.message = Some(format!("installed qoro {version} on {target}"));
+            if state.installing.as_deref() == Some(id.as_str()) {
+                state.installing = None;
+                state.reprobe = Some(target);
+            }
             *dirty = true;
         }
         ControlResponse::RemoteAdded { name, .. } => {
@@ -6638,6 +6732,8 @@ mod tests {
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
+            installing: None,
+            reprobe: None,
             joining: None,
             modes: Modes::default(),
             selection: None,
@@ -7098,6 +7194,8 @@ mod tests {
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
+            installing: None,
+            reprobe: None,
             joining: None,
             modes: Modes::default(),
             selection: None,
@@ -7196,6 +7294,8 @@ mod tests {
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
+            installing: None,
+            reprobe: None,
             joining: None,
             modes: Modes::default(),
             selection: None,
@@ -9220,5 +9320,80 @@ mod tests {
             state.behind.lines.is_empty(),
             "the window was never written"
         );
+    }
+
+    /// A machine with no qoro opens the offer to install it, under the same rules as the
+    /// session list, with the platform on the row and root said in the title.
+    #[test]
+    fn a_machine_without_qoro_offers_the_install() {
+        let mut state = bare_state();
+        state.probing = Some("probe-1".into());
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::RemoteMissing {
+                id: "probe-1".into(),
+                target: "admin@10.0.0.5".into(),
+                platform: "linux x86_64".into(),
+                root: true,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.menu, Some(0));
+        let rows = menu_rows(&state.menu_kind);
+        assert!(rows[0].0.starts_with("install qoro "), "{rows:?}");
+        assert_eq!(rows[0].1, "linux x86_64");
+        assert_eq!(rows[1].0, "cancel");
+        assert!(menu_title(&state.menu_kind).contains("as root"));
+
+        let mut request = 0;
+        match apply_menu_choice(&mut state, 0, &mut request) {
+            MenuSend::Control(ControlRequest::InstallRemote { id, target }) => {
+                assert_eq!(target, "admin@10.0.0.5");
+                assert_eq!(state.installing.as_deref(), Some(id.as_str()));
+            }
+            _ => panic!("choosing install does not ask for it"),
+        }
+    }
+
+    #[test]
+    fn cancelling_the_install_asks_for_nothing() {
+        let mut state = bare_state();
+        state.menu_kind = MenuKind::Install {
+            target: "h".into(),
+            platform: "linux x86_64".into(),
+            root: false,
+        };
+        let mut request = 0;
+        assert!(matches!(
+            apply_menu_choice(&mut state, 1, &mut request),
+            MenuSend::Nothing
+        ));
+        assert_eq!(state.installing, None);
+    }
+
+    /// An install that finishes is always said; the session list follows only while the
+    /// person is still waiting on that install.
+    #[test]
+    fn a_finished_install_asks_again_only_while_awaited() {
+        let mut state = bare_state();
+        let mut dirty = false;
+        let done = |id: &str| ControlResponse::RemoteInstalled {
+            id: id.into(),
+            target: "h".into(),
+            version: "0.2.0".into(),
+        };
+        state.installing = Some("install-2".into());
+        apply(&mut state, done("install-1"), &mut dirty);
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("installed"))
+        );
+        assert_eq!(state.reprobe, None, "a stale install asked again");
+        apply(&mut state, done("install-2"), &mut dirty);
+        assert_eq!(state.reprobe.as_deref(), Some("h"));
+        assert_eq!(state.installing, None);
     }
 }

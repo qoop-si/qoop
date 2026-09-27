@@ -23,9 +23,9 @@ qoro-terminal = { path = "../qoro-terminal" }
 qoro-detect = { path = "../qoro-detect" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 unicode-width = "0.2"
+tempfile = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }
 qoro-store = { path = "../qoro-store" }
-tempfile = "3"
 qoro-testkit = { path = "../qoro-testkit" }

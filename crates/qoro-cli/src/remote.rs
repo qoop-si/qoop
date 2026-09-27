@@ -85,7 +85,13 @@ fn add(rest: &[String], session: &str) -> io::Result<()> {
 /// Reach the remote in the foreground and ask its qoro what it is, refusing one this
 /// build cannot talk to.
 pub fn check(remote: &Remote) -> io::Result<RemoteHello> {
-    let hello = probe(remote)?;
+    let hello = match probe(remote) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            offer_install(remote)?;
+            probe(remote)?
+        }
+        other => other?,
+    };
     match compatibility(&hello) {
         Ok(Compatibility::AsIs) => {}
         Ok(Compatibility::NeedsRestart) => eprintln!(
@@ -116,6 +122,14 @@ fn probe(remote: &Remote) -> io::Result<RemoteHello> {
         .split_once(RELAY_MARKER)
         .map(|(_, after)| after.trim())
         .unwrap_or_default();
+    // Told apart by what happened: the remote command prints the marker and exits 127 when
+    // it finds no qoro, and nothing else does both.
+    if out.status.code() == Some(127) && text.contains(RELAY_MARKER) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("qoro is not installed on {}", remote.target),
+        ));
+    }
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "could not reach qoro on {} (ssh exited with {})",
@@ -128,6 +142,35 @@ fn probe(remote: &Remote) -> io::Result<RemoteHello> {
             remote.target
         ))
     })
+}
+
+/// Offer to put this version of qoro on a machine that has none, and do it on a yes.
+///
+/// Asked only of a person at a terminal, after ssh has finished with it: a pipe answering
+/// on their behalf is not a yes, and a script gets the way to do it instead.
+fn offer_install(remote: &Remote) -> io::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let version = env!("CARGO_PKG_VERSION");
+    if !std::io::stdin().is_terminal() {
+        return Err(io::Error::other(format!(
+            "qoro is not installed on {}; run this from a terminal to install it there",
+            remote.target
+        )));
+    }
+    print!(
+        "qoro is not installed on {}. install qoro {version} there, in ~/.local/bin? [y/N] ",
+        remote.target
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Err(io::Error::other("not installed; nothing was changed"));
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    let installed = runtime.block_on(qoro_tui::link::install(&remote.target))?;
+    println!("installed qoro {installed} on {}", remote.target);
+    Ok(())
 }
 
 fn rm(name: Option<&str>) -> io::Result<()> {
