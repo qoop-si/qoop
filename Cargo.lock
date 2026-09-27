@@ -683,6 +683,7 @@ dependencies = [
  "bytes",
  "qoro-attention",
  "qoro-domain",
+ "qoro-history",
  "qoro-proto",
  "qoro-remote",
  "qoro-runtime",

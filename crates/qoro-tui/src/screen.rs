@@ -117,6 +117,8 @@ pub struct Chrome {
     pub keys: KeyContext,
     /// What each local agent costs, sampled while `QORO_USAGE=1`.
     pub usage: sidebar::Usage,
+    /// An agent's last answer is open over the pane, and the key row says how to read it.
+    pub answer: bool,
 }
 
 impl Frame<'_> {
@@ -205,6 +207,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("F", Some("focus"), 5),
             ("g", Some("view"), 6),
             ("m", Some("menu"), 4),
+            ("M", Some("last answer"), 6),
             ("?", Some("keys"), 2),
             ("U", Some("update"), 7),
             ("d", Some("detach"), 0),
@@ -735,6 +738,8 @@ pub fn paint(frame: &Frame) -> String {
         Some("up/down or j/k move  enter choose  esc close")
     } else if frame.reading.is_some() {
         Some("any key to close")
+    } else if frame.chrome.answer {
+        Some("j/k scroll  space page  g/G top/bottom  q close")
     } else {
         None
     };
@@ -1450,6 +1455,7 @@ pub(crate) fn keybind_lines() -> Vec<String> {
         cmd("space", "find anything"),
         cmd("g", "spaces: tree or rank"),
         cmd("f", "fold this space"),
+        cmd("M", "last answer, as a page"),
         cmd("F", "agent focus view"),
         cmd("b", "fold the left column"),
         cmd("m", "menu"),
@@ -1861,6 +1867,51 @@ pub fn paint_focus(frame: &Frame, events: &[FocusEvent], offset: usize, out: &mu
         out.push_str(&theme::fg(*role));
         out.push_str(text);
         out.push_str(theme::RESET);
+    }
+    out.push_str("\x1b[?25l");
+}
+
+/// An agent's last answer as a page over the pane: its title on the first row, then the
+/// answer laid out to the pane's width from where the reader has scrolled to, every row of
+/// the pane covered so nothing of the terminal shows through.
+pub fn paint_answer(frame: &Frame, answer: &crate::answer::Answer, out: &mut String) {
+    let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
+    let (pane_cols, pane_rows) = pane_size_for(
+        frame.cols,
+        frame.lines,
+        frame.collapsed,
+        0,
+        frame.sidebar_width,
+    );
+    let (cols, rows) = (pane_cols as usize, pane_rows as usize);
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let body = answer.rows_for(cols);
+    let height = rows - 1;
+    let first = answer.offset.min(body.len().saturating_sub(height));
+    out.push_str(&at(TABS + 1, left + 1));
+    out.push_str(&theme::fg(theme::Role::Title));
+    out.push_str(&width::fit(
+        &format!(
+            " last answer: {}   {} of {} rows",
+            answer.title,
+            first + height.min(body.len()),
+            body.len()
+        ),
+        cols,
+    ));
+    out.push_str(theme::RESET);
+    for i in 0..height {
+        out.push_str(&at(TABS + 2 + i, left + 1));
+        match body.get(first + i) {
+            Some(row) => out.push_str(row),
+            None => {
+                out.push_str(&theme::fg(theme::Role::Text));
+                out.push_str(&" ".repeat(cols));
+                out.push_str(theme::RESET);
+            }
+        }
     }
     out.push_str("\x1b[?25l");
 }
@@ -3036,6 +3087,75 @@ mod tests {
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
     }
 
+    /// The last answer covers every row of the pane: its title on the first, the page
+    /// under it, blank rows past its end, and the key row says how to read it.
+    #[test]
+    fn an_open_answer_covers_the_pane_and_the_key_row_says_how_to_read_it() {
+        let rows = [row(1, "claude", "idle")];
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind::default();
+        let panes = std::collections::BTreeSet::new();
+        let spaces = spaces();
+        let frame = Frame {
+            rows: &rows,
+            spaces: &spaces,
+            panes,
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &seen,
+            unseen: &unseen,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+            image_notice: None,
+            chrome: Chrome {
+                answer: true,
+                ..Default::default()
+            },
+        };
+        let answer = crate::answer::Answer::new(
+            "claude".into(),
+            "# Done\n\nThe key row follows the keyboard.".into(),
+        );
+        let mut out = String::new();
+        paint_answer(&frame, &answer, &mut out);
+        let (_, pane_rows) = pane_size_for(80, 24, false, 0, sidebar::WIDTH);
+        let moves = (0..pane_rows as usize)
+            .filter(|i| out.contains(&at(TABS + 1 + i, sidebar::WIDTH + 2)))
+            .count();
+        assert_eq!(
+            moves, pane_rows as usize,
+            "a pane row was left showing through"
+        );
+        let shown = strip(&out);
+        assert!(shown.contains("last answer: claude"), "{shown:?}");
+        assert!(
+            shown.contains("Done") && shown.contains("follows the keyboard"),
+            "{shown:?}"
+        );
+        let painted = paint(&frame);
+        assert!(
+            strip(&painted).contains("j/k scroll"),
+            "the key row did not say how to read"
+        );
+    }
     /// The key row follows the keyboard: the prefix commands in the pane, what the column
     /// answers to after a click in it, every command while `ctrl-a` waits. Each drops its
     /// least used entries on a short row and keeps the way out on every one.
@@ -3137,7 +3257,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 35;
+    const COMMANDS: usize = 36;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -3191,6 +3311,7 @@ mod tests {
             Action::Equalize => (const { place(32) }, Some("ctrl-a =")),
             Action::CopyMode => (const { place(33) }, Some("ctrl-a [")),
             Action::FoldSpace => (const { place(34) }, Some("ctrl-a f")),
+            Action::Answer => (const { place(35) }, Some("ctrl-a M")),
         }
     }
 
@@ -3250,6 +3371,7 @@ mod tests {
             Action::Equalize,
             Action::CopyMode,
             Action::FoldSpace,
+            Action::Answer,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();

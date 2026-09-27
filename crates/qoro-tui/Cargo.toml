@@ -12,6 +12,7 @@ qoro-proto = { path = "../qoro-proto" }
 qoro-attention = { path = "../qoro-attention" }
 qoro-domain = { path = "../qoro-domain" }
 qoro-runtime = { path = "../qoro-runtime" }
+qoro-history = { path = "../qoro-history" }
 qoro-remote = { path = "../qoro-remote" }
 bytes = { workspace = true }
 serde = { workspace = true }

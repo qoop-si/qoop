@@ -160,6 +160,8 @@ pub enum Action {
     ToggleView,
     /// ctrl-a f: fold the focused space's agents under its rule, or open them again.
     FoldSpace,
+    /// ctrl-a M: the focused agent's last answer, read from its transcript, as a page.
+    Answer,
     /// ctrl-a F: the focus view over the focused terminal: the user's last
     /// prompt, the agent's last turns, and one row per tool call.
     ///
@@ -386,6 +388,7 @@ impl Keys {
                     b' ' => Action::Palette,
                     b'g' => Action::ToggleView,
                     b'f' => Action::FoldSpace,
+                    b'M' => Action::Answer,
                     b'F' => Action::Focus,
                     b'v' => Action::SplitV,
                     b'-' => Action::SplitH,

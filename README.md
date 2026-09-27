@@ -28,7 +28,11 @@ pinned at the top, lights its row and rings the bell, so you find out without lo
 when its space is folded. The name is the one you would say, not the runtime underneath it:
 an agent installed as a node package reads as itself, not as `node`.
 
-`ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches.
+`ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches. The
+bottom row names the keys that work where you are, and every command while `ctrl-a` waits
+for its letter. Under a working agent the column says what it is doing (`editing
+sidebar.rs`, `cargo test`), from the agent's own hook. `ctrl-a M` opens the focused agent's
+last answer as a page, and `QORO_USAGE=1` shows what each agent costs in CPU and memory.
 Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a
 minute, and the state is read off a terminal's screen only once it stops changing. The one
 motion is the spinner and sweep beside an agent that is working and on screen: about 0.3

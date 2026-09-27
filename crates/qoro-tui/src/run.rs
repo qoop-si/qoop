@@ -168,6 +168,40 @@ enum Blocked {
         targets: Vec<(u32, i32)>,
         found: std::collections::BTreeMap<i32, Vec<qoro_runtime::ProcessUsage>>,
     },
+    /// An agent's last answer read from its transcript, or why it could not be.
+    Answer(u32, Result<crate::answer::Answer, String>),
+}
+
+/// The newest assistant message of an agent's transcript, as a page, or why there is none.
+///
+/// Runs on the blocking pool: it reads the agent's own files, and a long transcript takes a
+/// moment. The reasons come back in words a person can act on.
+fn read_answer(
+    program: String,
+    session: Option<String>,
+    title: String,
+) -> Result<crate::answer::Answer, String> {
+    let dirs = qoro_history::BaseDirs::from_home().map_err(|e| e.to_string())?;
+    let window = qoro_history::history(
+        &program,
+        session.as_deref(),
+        &dirs,
+        1,
+        Some(qoro_history::Role::Assistant),
+    )
+    .map_err(|e| match e {
+        qoro_history::Error::MissingId { .. } => {
+            "this agent has not reported a session yet: qoro hooks install makes it".to_string()
+        }
+        other => other.to_string(),
+    })?;
+    let text = window
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| "no answer from this agent yet".to_string())?;
+    Ok(crate::answer::Answer::new(title, text))
 }
 
 /// The local agents whose cost can be sampled, as (terminal, foreground group).
@@ -402,6 +436,8 @@ struct State {
     in_column: bool,
     /// `ctrl-a` came last and the next key is a command: the key row names them all.
     prefix_pending: bool,
+    /// An agent's last answer, open as a page over the pane.
+    answer: Option<crate::answer::Answer>,
     /// What each local agent costs, as last sampled. Empty unless `QORO_USAGE=1`.
     usage: sidebar::Usage,
     /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
@@ -625,6 +661,7 @@ impl State {
             chrome: screen::Chrome {
                 shut: self.shut.clone(),
                 usage: self.usage.clone(),
+                answer: self.answer.is_some(),
                 keys: if self.prefix_pending {
                     screen::KeyContext::Prefix
                 } else if self.in_column
@@ -2686,6 +2723,8 @@ where
 
         prefix_pending: false,
 
+        answer: None,
+
         usage: sidebar::Usage::new(),
 
         usage_seen: std::collections::BTreeMap::new(),
@@ -2842,6 +2881,8 @@ where
     // comes back here, so the keyboard never waits on a disk. One sample at a time.
     let (blocking_tx, mut blocking_rx) = tokio::sync::mpsc::unbounded_channel::<Blocked>();
     let mut sampling = false;
+    // The terminal whose last answer is being read, so a result for any other is dropped.
+    let mut answer_for: Option<u32> = None;
     presented = presented.checked_sub(FRAME).unwrap_or(presented);
 
     let outcome: io::Result<()> = async {
@@ -2881,6 +2922,18 @@ where
                 dirty = true;
             }
             if dirty && presented.elapsed() >= FRAME {
+                // An open answer lays out for the pane before the frame borrows the state:
+                // once per width, so a long answer is not wrapped again every frame.
+                if let Some(answer) = state.answer.as_mut() {
+                    let (cols, rows) = screen::pane_size_for(
+                        state.cols,
+                        state.lines,
+                        state.collapsed,
+                        0,
+                        state.sidebar_width,
+                    );
+                    answer.layout(cols as usize, (rows as usize).saturating_sub(1));
+                }
                 // One frame for both paints: a single clock for tiers, order
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
@@ -2941,6 +2994,15 @@ where
                         &mut painted,
                     );
                 }
+                // An open answer covers the pane the same way, over the focus list too.
+                if let Some(answer) = state.answer.as_ref()
+                    && state.palette.is_none()
+                    && state.reading.is_none()
+                    && state.prompt.is_none()
+                    && state.menu.is_none()
+                {
+                    screen::paint_answer(&frame, answer, &mut painted);
+                }
                 // The borrow ends here: the clock is copied out before the
                 // state is touched again below.
                 let paint_now = frame.now_unix;
@@ -2967,6 +3029,7 @@ where
                     || state.prompt.is_some()
                     || state.menu.is_some()
                     || state.reading.is_some()
+                    || state.answer.is_some()
                     || state.focus;
                 let resized = state.img_size != (state.cols, state.lines);
                 let anchored = state.anchor.is_some() || suppressed;
@@ -3368,6 +3431,33 @@ where
                         if let ModeOutcome::Passthrough(rest) = outcome {
                             feed = Some(rest);
                         }
+                    } else if state.answer.is_some() {
+                        // An open answer owns the keyboard: it scrolls and closes, and a stray
+                        // key does nothing rather than type into the agent behind it.
+                        let (cols, rows) = screen::pane_size_for(
+                            state.cols,
+                            state.lines,
+                            state.collapsed,
+                            0,
+                            state.sidebar_width,
+                        );
+                        let body = (rows as usize).saturating_sub(1).max(1);
+                        if let Some(answer) = state.answer.as_mut() {
+                            match answer.key(&bytes, body) {
+                                crate::answer::Key::Closed => state.answer = None,
+                                crate::answer::Key::Scrolled => {
+                                    answer.layout(cols as usize, body);
+                                }
+                                crate::answer::Key::Ignored => {}
+                                // The prefix, a detach or a click: the page closes and the
+                                // bytes run the ordinary path below.
+                                crate::answer::Key::Pass => {
+                                    state.answer = None;
+                                    feed = Some(bytes.clone());
+                                }
+                            }
+                        }
+                        dirty = true;
                     } else if state.focus {
                         // The focus list owns the keyboard while it is open, the way the
                         // palette and the naming box do, and hands the rest back for the
@@ -4020,6 +4110,54 @@ where
                                 state.view = state.view.toggle();
                                 dirty = true;
                             }
+                            // The focused agent's last answer, read off the loop: a page over the
+                            // pane when it arrives, a sentence on the notice row when it cannot.
+                            Action::Answer => {
+                                let row = state.rows.iter().find(|r| r.terminal == state.focused);
+                                match row {
+                                    None => {
+                                        state.message = Some("nothing focused to read".to_string());
+                                    }
+                                    Some(row) if crate::mux::is_remote_terminal(row.terminal) => {
+                                        state.message = Some(
+                                            "that agent keeps its answers on another machine".to_string(),
+                                        );
+                                    }
+                                    Some(row) if !row.agent => {
+                                        state.message =
+                                            Some("not an agent, so no answer to read".to_string());
+                                    }
+                                    // While it works or waits, its newest message is a tool call
+                                    // more often than an answer; the page waits for it to stop.
+                                    Some(row) if matches!(row.state.as_str(), "working" | "starting" | "blocked") => {
+                                        state.message = Some(
+                                            "still working: its last answer opens once it stops"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Some(row) => {
+                                        let terminal = row.terminal;
+                                        answer_for = Some(terminal);
+                                        let program = row.program.clone().unwrap_or_default();
+                                        let session = row.agent_session.clone();
+                                        let title = row
+                                            .agent_title
+                                            .clone()
+                                            .or_else(|| row.program.clone())
+                                            .unwrap_or_else(|| "agent".to_string());
+                                        let tx = blocking_tx.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = tx.send(Blocked::Answer(
+                                                terminal,
+                                                read_answer(program, session, title),
+                                            ));
+                                        });
+                                        state.message =
+                                            Some("reading the last answer".to_string());
+                                    }
+                                }
+                                dirty = true;
+                            }
                             // Only in the tree, and only a space with agents in it: a fold with
                             // nothing under it shows nothing, and would hide the first agent that
                             // arrives later without anybody having seen it fold.
@@ -4522,6 +4660,26 @@ where
                     Blocked::Usage { at, targets, found } => {
                         sampling = false;
                         apply_usage(&mut state, at, targets, found);
+                        dirty = true;
+                    }
+                    // Only the answer last asked for, and only while its agent still has the
+                    // keyboard: a slow read for a terminal left behind opens nothing.
+                    Blocked::Answer(terminal, _) if answer_for != Some(terminal) || state.focused != terminal => {
+                        if answer_for == Some(terminal) {
+                            answer_for = None;
+                        }
+                    }
+                    Blocked::Answer(_, Ok(answer)) => {
+                        answer_for = None;
+                        // The page is the answer to "reading the last answer": that
+                        // sentence has nothing left to say.
+                        state.message = None;
+                        state.answer = Some(answer);
+                        dirty = true;
+                    }
+                    Blocked::Answer(_, Err(why)) => {
+                        answer_for = None;
+                        state.message = Some(why);
                         dirty = true;
                     }
                 },
@@ -6437,6 +6595,8 @@ mod tests {
 
             prefix_pending: false,
 
+            answer: None,
+
             usage: sidebar::Usage::new(),
 
             usage_seen: std::collections::BTreeMap::new(),
@@ -6895,6 +7055,8 @@ mod tests {
 
             prefix_pending: false,
 
+            answer: None,
+
             usage: sidebar::Usage::new(),
 
             usage_seen: std::collections::BTreeMap::new(),
@@ -6990,6 +7152,8 @@ mod tests {
             in_column: false,
 
             prefix_pending: false,
+
+            answer: None,
 
             usage: sidebar::Usage::new(),
 
