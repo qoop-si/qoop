@@ -1478,15 +1478,17 @@ async fn serve_client(
                         from_token,
                     } => {
                         // A CLI send/prompt from inside one terminal to
-                        // another records the wait: the waiter is shielded
-                        // while the target is observably alive. Verified by
+                        // another records the wait: the waiter is vetoed
+                        // while the target is busy. Verified by
                         // `verify_waiter`; anything unverified is ignored.
                         if let (Some(waiter), Some(token)) = (from_terminal, from_token)
                             && verify_waiter(&agents, &terminals, waiter, &token, message.stream)
                         {
-                            let now = crate::agents::now_unix();
-                            agents.note_expectation(waiter, message.stream, now);
-                            agents.note_shield(waiter, now);
+                            agents.note_expectation(
+                                waiter,
+                                message.stream,
+                                crate::agents::now_unix(),
+                            );
                         }
                         ClientCommand::Input {
                             from: client.clone(),
@@ -1812,7 +1814,6 @@ async fn reap_pass(
     // vetoes evaluate against this map, so the outcome never depends on
     // the order the pass happens to visit terminals in.
     let mut eligible: BTreeMap<u32, bool> = BTreeMap::new();
-    let mut idle_since: BTreeMap<u32, i64> = BTreeMap::new();
     let mut snaps: BTreeMap<u32, crate::agents::ReapSnapshot> = BTreeMap::new();
     for stream in &streams {
         // Asked before and still tearing down (ADR-014 escalation takes up
@@ -1842,23 +1843,30 @@ async fn reap_pass(
             watched.watched(*stream),
             idle_secs,
             timeout_secs,
-        ) && !agents.shield_fresh(*stream, now, timeout_secs);
+        ) && !agents.shield_fresh(*stream, now, timeout_secs)
+            // A task under a shell leader that the snapshot program alone
+            // reports as the shell. Checked here, before edges, so a waiter
+            // on such a tab sees it busy. No master known means
+            // just-created or a race: fail closed and retry next pass.
+            && agents
+                .master_of(*stream)
+                .is_some_and(|master| !crate::idle::group_holds_task(master));
         eligible.insert(*stream, verdict);
         if verdict {
-            idle_since.insert(*stream, since);
             snaps.insert(*stream, snap);
         }
     }
     let victims = {
-        // Edges at targets already going away end with them: a wait on a
-        // terminal tearing down is not a wait on anything alive. Filtered
-        // before evaluation so a waiter is never vetoed an extra pass.
-        let edges: Vec<(u32, u32, i64)> = agents
+        // Edges at targets already going away, reaped or closed by hand,
+        // end with them: a wait on a terminal tearing down is not a wait on
+        // anything alive. Filtered before evaluation so a waiter is never
+        // vetoed an extra pass.
+        let edges: Vec<(u32, u32)> = agents
             .expectation_edges()
             .into_iter()
-            .filter(|(_, target, _)| !in_flight.contains(target))
+            .filter(|(_, target)| !in_flight.contains(target) && !agents.is_closed(*target))
             .collect();
-        crate::idle::apply_edge_vetoes(&eligible, &edges, &idle_since)
+        crate::idle::apply_edge_vetoes(&eligible, &edges)
     };
     for stream in &streams {
         if !victims.get(stream).copied().unwrap_or(false) {
@@ -1866,16 +1874,6 @@ async fn reap_pass(
         }
         let snap = snaps.get(stream).expect("victims come from snapshots");
         let idle_secs = now.saturating_sub(snap.idle_since.expect("snapshots carry clocks"));
-        // Candidate-only foreground-group check: a task under a shell
-        // leader that the snapshot program alone reports as the shell. No
-        // master known means just-created or a race: fail closed and retry
-        // next pass.
-        let Some(master) = agents.master_of(*stream) else {
-            continue;
-        };
-        if crate::idle::group_holds_task(master) {
-            continue;
-        }
         // Journal first, in the same shape as a manual close, so post-hoc
         // forensics can tell a reap from a crash or a kill. A journal that
         // will not write vetoes the reap: retry next pass.
@@ -1929,9 +1927,8 @@ async fn reap_pass(
 /// itself, and the presented token equals the claimed terminal's stored
 /// token (hook-grade binding: per-terminal unguessable nonces, equality
 /// only, no generation since a CLI cannot know it). Anything unverified is
-/// ignored, fail closed. A shield only ever protects, so a forgery without
-/// the token buys nothing but keeping a tab: the pre-feature default,
-/// never a close.
+/// ignored, fail closed. An edge only ever keeps a tab awake, at most for
+/// the edge TTL: the pre-feature default, never a close.
 fn verify_waiter(
     agents: &Arc<crate::agents::AgentRegistry>,
     terminals: &Arc<TerminalRegistry>,
@@ -2146,18 +2143,22 @@ async fn handle_control(
                 // owns its teardown, which has to contain what it started (ADR-014).
                 //
                 // An explicit close wins over a reaper mark in both
-                // directions: the reaper mark is taken back before asking,
-                // and the explicit mark (set only once the ask is accepted)
-                // keeps the reaper from re-asking while the tab tears down.
-                // A user-closed tab forgets, never entombs.
-                agents.unmark_reaped(terminal);
+                // directions (`take_ending` prefers it), and keeps the
+                // reaper from re-asking while the tab tears down. Marked
+                // before asking, so a teardown that runs before this
+                // handler's next line still reads it; taken back if the
+                // ask is refused, so a refused close leaves the reaper's
+                // own mark, and its tomb, alone. Only a mark this request
+                // set is taken back: a repeat close refused while an
+                // accepted one tears down must not undo that one. A
+                // user-closed tab forgets, never entombs.
+                let marked = agents.mark_closed(terminal);
                 // The result is not discarded. A terminal whose command channel is full,
                 // because another connection is pasting into it, would otherwise be
                 // reported closed to a client that then stops subscribing while the shell
                 // keeps running, with no way for that client to find out.
                 match handle.commands.try_send(ClientCommand::Close) {
                     Ok(()) => {
-                        agents.mark_closed(terminal);
                         let _ = events
                             .append_durable(vec![
                                 (
@@ -2180,10 +2181,15 @@ async fn handle_control(
                             .await;
                         ControlResponse::TerminalClosed { id, terminal }
                     }
-                    Err(e) => ControlResponse::Failed {
-                        id,
-                        reason: format!("terminal {terminal} did not accept the close: {e}"),
-                    },
+                    Err(e) => {
+                        if marked {
+                            agents.take_closed(terminal);
+                        }
+                        ControlResponse::Failed {
+                            id,
+                            reason: format!("terminal {terminal} did not accept the close: {e}"),
+                        }
+                    }
                 }
             }
             // No live terminal: this may be a sleeping marker, dismissed
@@ -3083,7 +3089,7 @@ pub enum ClientWire {
         bytes: Vec<u8>,
         /// Which terminal the sender runs in, if it runs in one. Filled by
         /// the CLI from `QORO_TERMINAL`/`QORO_TOKEN` for send/prompt, so the
-        /// daemon can shield the waiter while the wait is observably alive.
+        /// daemon keeps the waiter awake while its target is busy.
         /// Defaulted: older clients send no claim and get today's behavior.
         /// TUI typing and attach never fill it: only CLI send/prompt mints
         /// edges.
@@ -3091,8 +3097,8 @@ pub enum ClientWire {
         from_terminal: Option<u32>,
         /// The claimed terminal's token, binding the claim to its sender
         /// (same strength as hook admission). Verified by equality, ignored
-        /// when absent or wrong: shields only ever protect, so a forgery
-        /// without the token buys nothing but keeping a tab.
+        /// when absent or wrong: a wait edge only ever keeps a tab awake,
+        /// and a forgery without the token cannot mint one.
         #[serde(default)]
         from_token: Option<String>,
     },
@@ -5697,7 +5703,7 @@ mod idle_reap_tests {
     async fn a_waiter_survives_while_its_target_is_busy() {
         let (terminals, agents, events, watched) = harness();
         let ancient = now_unix() - 7200;
-        let (mut x_rx, x_token, _x_tx) = add_terminal(&terminals, &agents, 1);
+        let (mut x_rx, _x_token, _x_tx) = add_terminal(&terminals, &agents, 1);
         let (mut y_rx, y_token, _y_tx) = add_terminal(&terminals, &agents, 2);
         for stream in [1, 2] {
             agents.note_spawn(stream, ancient);
@@ -5718,7 +5724,10 @@ mod idle_reap_tests {
             .expect("applies");
         // Terminal 1 asks terminal 2, with its own token: the wait is real.
         agents.note_expectation(1, 2, ancient);
-        let _ = &x_token;
+        // Then prints, the way an agent renders its tool result and ends its
+        // turn after `qoro prompt` returns. Output after asking must not end
+        // the wait: the waiter is still waiting on a busy target.
+        agents.note_io(1, ancient + 3);
 
         let mut in_flight = BTreeSet::new();
         reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;

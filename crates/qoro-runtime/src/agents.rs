@@ -194,11 +194,11 @@ pub struct AgentRegistry {
     tombs: Mutex<BTreeMap<u32, Tombstone>>,
     /// Who waits on whom: waiter stream → (target stream, edge since, unix
     /// seconds). Set when a verified `qoro send/prompt` arrives from one
-    /// terminal to another. The waiter is vetoed while the wait is
-    /// observably alive; both idle together sleep together.
+    /// terminal to another. The waiter is vetoed while its target is busy;
+    /// both idle together sleep together. `since` only ages the edge out.
     expectations: Mutex<BTreeMap<u32, (u32, i64)>>,
     /// Recent proof of life beyond the two activity clocks: admitted hook
-    /// focus events and verified cross-terminal prompts. Vetoes while
+    /// focus events. Vetoes while
     /// fresher than the reap timeout. Bounded by live-terminal count,
     /// cleared on forget and entomb.
     shield_at_unix: Mutex<BTreeMap<u32, i64>>,
@@ -469,12 +469,6 @@ impl AgentRegistry {
         self.reaped.lock().unwrap().insert(stream, program);
     }
 
-    /// Take back a reap mark, e.g. an explicit close landing on a stream
-    /// the reaper just asked about: a user-closed tab is never entombed.
-    pub fn unmark_reaped(&self, stream: u32) {
-        self.reaped.lock().unwrap().remove(&stream);
-    }
-
     /// Whether the reaper asked about this stream and teardown has not run yet.
     pub fn is_reaped(&self, stream: u32) -> bool {
         self.reaped.lock().unwrap().contains_key(&stream)
@@ -483,12 +477,14 @@ impl AgentRegistry {
     /// Mark a stream an explicit close asked about. Wins over a reaper mark:
     /// call before asking, so a user-closed tab forgets even if the reaper
     /// marked first, and the reaper never re-asks it while it tears down.
-    pub fn mark_closed(&self, stream: u32) {
-        self.closed.lock().unwrap().insert(stream);
+    /// True when this call set the mark, false when an earlier close already
+    /// had: only the caller that set it may take it back.
+    pub fn mark_closed(&self, stream: u32) -> bool {
+        self.closed.lock().unwrap().insert(stream)
     }
 
     /// Take back an explicit-close mark and say whether one was there: the
-    /// teardown ending that is neither an explicit close nor a reap.
+    /// close was refused, so the tab lives on and a reap may still entomb it.
     pub fn take_closed(&self, stream: u32) -> bool {
         self.closed.lock().unwrap().remove(&stream)
     }
@@ -511,9 +507,10 @@ impl AgentRegistry {
         }
     }
 
-    /// Whether an explicit close was accepted for this stream and teardown
-    /// has not run yet. The reaper skips these: asking again would re-mark
-    /// a user-closed tab and entomb it.
+    /// Whether an explicit close is asking or was accepted for this stream
+    /// and teardown has not run yet. The reaper skips these: asking again
+    /// would re-mark a user-closed tab and entomb it. A refused close takes
+    /// its mark back, so at worst the reaper waits one pass.
     pub fn is_closed(&self, stream: u32) -> bool {
         self.closed.lock().unwrap().contains(&stream)
     }
@@ -608,13 +605,13 @@ impl AgentRegistry {
         self.expectations.lock().unwrap().get(&waiter).copied()
     }
 
-    /// Every recorded edge, for snapshot evaluation.
-    pub fn expectation_edges(&self) -> Vec<(u32, u32, i64)> {
+    /// Every recorded edge as (waiter, target), for snapshot evaluation.
+    pub fn expectation_edges(&self) -> Vec<(u32, u32)> {
         self.expectations
             .lock()
             .unwrap()
             .iter()
-            .map(|(w, (t, s))| (*w, *t, *s))
+            .map(|(w, (t, _))| (*w, *t))
             .collect()
     }
 
@@ -635,8 +632,8 @@ impl AgentRegistry {
             .retain(|_, (_, since)| now_unix.saturating_sub(*since) <= EXPECTATION_TTL_SECS);
     }
 
-    /// Proof of life beyond the activity clocks: a verified cross-terminal
-    /// prompt involving this stream, or an admitted hook focus event.
+    /// Proof of life beyond the activity clocks: an admitted hook focus
+    /// event.
     pub fn note_shield(&self, stream: u32, now_unix: i64) {
         self.shield_at_unix.lock().unwrap().insert(stream, now_unix);
     }
@@ -1104,10 +1101,7 @@ impl AgentRegistry {
     /// the hook's advisory wire clock, so a skewed hook cannot stretch
     /// the shield.
     pub fn push_focus_event(&self, stream: u32, event: crate::control::FocusEvent) {
-        self.shield_at_unix
-            .lock()
-            .unwrap()
-            .insert(stream, event.at_unix);
+        self.note_shield(stream, event.at_unix);
         let mut focus = self.focus.lock().unwrap();
         let log = focus.entry(stream).or_default();
         log.push_back(event);
@@ -2088,6 +2082,10 @@ mod tests {
         assert_eq!(r.take_ending(3), (Reaped, Some("claude".into())));
         // Nothing: plain forgetting.
         assert_eq!(r.take_ending(4), (Other, None));
+        // A second close on a stream already marked does not own the mark:
+        // refusing it must not take back the first close's decision.
+        assert!(r.mark_closed(5), "first close sets the mark");
+        assert!(!r.mark_closed(5), "a repeat close finds it set");
         // Decided once: a second take finds nothing.
         assert_eq!(r.take_ending(1), (Other, None));
         assert!(!r.is_reaped(1));

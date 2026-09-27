@@ -106,6 +106,18 @@ fn short_copied(text: &str) -> String {
     }
 }
 
+/// Where this interface run starts numbering its requests: nanoseconds
+/// since the epoch, so no later run reuses an id an earlier one sent.
+fn request_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// The notice a new interface shows until its focused terminal first renders.
+const CONNECTING: &str = "connecting";
+
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
 /// Said, not fetched: the interface never touches the network, it only reads the notice
@@ -1448,7 +1460,7 @@ where
         // What the caller wanted said, or that this is connecting. A notice about a
         // missing hook is worth more than the word "connecting", which is gone by the time
         // anybody reads it.
-        message: Some("connecting".to_string()),
+        message: Some(CONNECTING.to_string()),
         hint: notice,
         pending_focus: None,
         spaces: Vec::new(),
@@ -1491,7 +1503,12 @@ where
     // daemon's reassembler is right to refuse that.
     let mut seqs: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
     let mut control_seq = 0u32;
-    let mut request = 0u64;
+    // Mutating ids are replayed by the daemon's durable ledger (ADR-017),
+    // so they must not repeat across interface runs: a counter from zero
+    // made a second run's first `close-N` or `new-N` replay an older answer
+    // and do nothing. Started from the wall clock in nanoseconds, the way
+    // the CLI's `request_id` stays unique.
+    let mut request = request_seed();
     let mut keys = Keys::default();
     let mut connection = Connection::new();
     let mut inbuf = leftover;
@@ -3753,6 +3770,17 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // A slept tab never renders, so the first render that clears
+            // "connecting" never comes for it: drop the word and let the
+            // notice row name the tomb and its way out.
+            if state.message.as_deref() == Some(CONNECTING)
+                && state
+                    .rows
+                    .iter()
+                    .any(|r| r.terminal == state.focused && r.state == "sleeping")
+            {
+                state.message = None;
+            }
             // The keyboard lives in the space on screen. A focused terminal
             // elsewhere is typing somewhere the person cannot see; bootstrap
             // races (a render adopted before the index named its space) land
@@ -5036,6 +5064,38 @@ mod tests {
             "the keyboard comes back to its space: {:?}",
             state.pending_focus
         );
+    }
+
+    /// Requests are numbered from the clock, not from zero: a run from zero
+    /// reused an earlier run's `close-N` and the ledger replayed its answer.
+    #[test]
+    fn requests_are_numbered_from_the_clock() {
+        // 2020-01-01 in nanoseconds: far past any id a run from zero reached.
+        assert!(request_seed() > 1_577_836_800 * 1_000_000_000);
+    }
+
+    /// A slept tab never renders, so "connecting" must not wait for one: the
+    /// index clears it once the focused row is known to be sleeping, and
+    /// leaves it for a live row whose render is still on its way.
+    #[test]
+    fn a_focused_sleeping_tab_does_not_stay_connecting() {
+        for (state_word, cleared) in [("sleeping", true), ("idle", false)] {
+            let mut state = bare_state();
+            state.space = Some(1);
+            state.adopted = true;
+            state.focused = 1;
+            state.message = Some(CONNECTING.to_string());
+            let mut dirty = false;
+            apply(
+                &mut state,
+                ControlResponse::Agents {
+                    id: "index".to_string(),
+                    agents: vec![agent(1, 1, "zsh", state_word)],
+                },
+                &mut dirty,
+            );
+            assert_eq!(state.message.is_none(), cleared, "{state_word}");
+        }
     }
 
     /// The first workspace list parks the bar: a keyboard adopted from

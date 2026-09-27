@@ -713,6 +713,10 @@ fn here(frame: &Frame) -> String {
         Some(row) => {
             let state = if row.state == "unknown" {
                 String::new()
+            } else if row.state == "sleeping" {
+                // A slept tab has no screen and takes no keys: name the way
+                // out, or the blank pane reads as a hang.
+                ", sleeping  ^a x dismiss".to_string()
             } else {
                 format!(", {}", row.state)
             };
@@ -4051,5 +4055,54 @@ mod tests {
         );
         assert!(out.contains(" agents          1"), "{out:?}");
         assert!(out.contains(" terminals       2"), "{out:?}");
+    }
+
+    /// A focused slept tab has a blank pane that takes no keys: the notice
+    /// row names the way out instead of leaving it to read as a hang.
+    #[test]
+    fn a_focused_sleeping_tab_names_how_to_dismiss_it() {
+        let rows = [row(1, "claude", "working"), row(2, "claude", "sleeping")];
+        let (spaces, panes) = (spaces(), std::collections::BTreeSet::new());
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind {
+            terminal: 0,
+            from: 0,
+            lines: Vec::new(),
+            total: 0,
+        };
+        let frame = |focused| Frame {
+            rows: &rows,
+            spaces: &spaces,
+            panes: &panes,
+            space: Some(1),
+            focused,
+            snapshot: None,
+            cols: 100,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Grouped,
+            seen: &seen,
+            unseen: &unseen,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+            image_notice: None,
+        };
+        let slept = here(&frame(2));
+        assert!(slept.ends_with(", sleeping  ^a x dismiss"), "{slept:?}");
+        let live = here(&frame(1));
+        assert!(live.ends_with(", working"), "{live:?}");
     }
 }
