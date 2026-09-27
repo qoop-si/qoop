@@ -1408,13 +1408,16 @@ async fn g2_17_a_screen_that_never_settles_is_read_anyway() {
 ///
 /// Regression for the index showing `working` for agents that finished long
 /// ago. Two shapes: the live composer positively seen (an explicit idle rule
-/// outranks the stale interrupt hint still sitting above it), and a screen
+/// reads its status row, and the stale interrupt hints above it are not
+/// read), and a screen
 /// matching no rule at all (the known-agent idle fallback settles a
 /// screen-held belief instead of leaving the last state standing).
 ///
 /// A stand in named after the real agent, like G2.17 above: the rules that
 /// read the screen are that agent's, and the daemon reads the program name
-/// off the process rather than the interpreter's.
+/// off the process rather than the interpreter's. It prints the composer's
+/// status row as opencode v1.18 draws it: the spinner and `esc interrupt`
+/// while the turn runs, then the composer with the key hints alone.
 async fn run_opencode_stand_in(dir: &tempfile::TempDir) -> std::path::PathBuf {
     let source = dir.path().join("opencode.rs");
     std::fs::write(
@@ -1422,7 +1425,7 @@ async fn run_opencode_stand_in(dir: &tempfile::TempDir) -> std::path::PathBuf {
         "fn main() {\n\
          \x20   let plain = std::env::args().nth(1).is_some();\n\
          \x20   for n in 0..6 {\n\
-         \x20       println!(\"crunching {n} (esc to interrupt)\");\n\
+         \x20       println!(\"   ⬝⬝■■■⬝⬝⬝ esc interrupt   step {n}   ctrl+p commands\");\n\
          \x20       std::thread::sleep(std::time::Duration::from_millis(200));\n\
          \x20   }\n\
          \x20   if plain {\n\
@@ -1430,7 +1433,10 @@ async fn run_opencode_stand_in(dir: &tempfile::TempDir) -> std::path::PathBuf {
          \x20           println!(\"done line {n}\");\n\
          \x20       }\n\
          \x20   } else {\n\
-         \x20       println!(\"> ask me anything\");\n\
+         \x20       println!(\"  ┃  Ask anything\");\n\
+         \x20       println!(\"  ┃  Build · Claude Sonnet 4.5 Anthropic\");\n\
+         \x20       println!(\"  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\");\n\
+         \x20       println!(\"   ~/coding/site   ctrl+p commands\");\n\
          \x20   }\n\
          \x20   std::thread::sleep(std::time::Duration::from_secs(30));\n\
          }\n",

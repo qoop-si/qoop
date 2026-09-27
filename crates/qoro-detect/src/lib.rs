@@ -1469,13 +1469,116 @@ contains = "esc to interrupt"
         assert_eq!(verdict("generic", &["$ cargo test", "   Compiling"]), None);
     }
 
+    /// opencode's permission dialog at each of its stages, laid out as its own source
+    /// draws it (packages/tui/src/routes/session/permission.tsx at v1.18.32, the installed
+    /// version): the dialog takes the composer's place at the bottom, and its key hints
+    /// sit one border-only row above the session's blank last row.
+    const OPENCODE_TRANSCRIPT: &[&str] = &[
+        "     I'll clear the old build output first.",
+        "",
+        "     # Shell command",
+        "",
+    ];
+
+    fn opencode_screen(dialog: &[&'static str]) -> Vec<&'static str> {
+        let mut lines = OPENCODE_TRANSCRIPT.to_vec();
+        lines.extend_from_slice(dialog);
+        lines.push("");
+        lines
+    }
+
     #[test]
-    fn the_opencode_manifest_reads_a_permission_dialog_as_a_visible_blocker() {
-        let v = verdict("opencode", &["△ Permission required"])
-            .expect("a permission dialog is a blocker");
-        assert_eq!(v.state, AgentRuntimeState::Blocked);
-        assert_eq!(v.rule, "permission_required");
-        assert!(v.visible_blocker);
+    fn a_live_opencode_permission_reads_blocked_at_every_stage() {
+        let inline = [
+            "  ┃",
+            "  ┃  △ Permission required",
+            "  ┃    # Shell command",
+            "  ┃",
+            "  ┃  $ rm -rf build",
+            "  ┃",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject       ctrl+f fullscreen  ⇆ select  enter confirm",
+            "  ┃",
+        ];
+        // At 80 to 88 columns the boxes do not shrink and the row is cut short.
+        let cut = [
+            "  ┃",
+            "  ┃  △ Permission required",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject       ctrl+f fullscreen  ⇆ select  enter co",
+            "  ┃",
+        ];
+        let v = verdict("opencode", &cut).expect("a cut permission row is still a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Blocked, "{v:?}");
+        // Under 80 columns the options and the hints stack.
+        let narrow = [
+            "  ┃",
+            "  ┃  △ Permission required",
+            "  ┃    # Shell command",
+            "  ┃",
+            "  ┃  $ rm -rf build",
+            "  ┃",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject",
+            "  ┃",
+            "  ┃  ctrl+f fullscreen  ⇆ select  enter confirm",
+            "  ┃",
+        ];
+        // Fullscreen: the header goes to the top of the screen and a diff fills the rest,
+        // so the header is far above any bottom region.
+        let mut fullscreen = vec![
+            "  ┃",
+            "  ┃  △ Permission required",
+            "  ┃    → Edit src/lib.rs",
+            "  ┃",
+        ];
+        fullscreen.extend(std::iter::repeat_n(
+            "  ┃   12   let total = parts.iter().sum::<u64>();",
+            30,
+        ));
+        fullscreen.extend([
+            "  ┃",
+            "  ┃",
+            "  ┃   Allow once   Allow always   Reject       ctrl+f minimize  ⇆ select  enter confirm",
+            "  ┃",
+        ]);
+        // "Allow always" asks once more before it applies.
+        let always = [
+            "  ┃",
+            "  ┃  △ Always allow",
+            "  ┃",
+            "  ┃  This will allow the following patterns until OpenCode is restarted",
+            "  ┃",
+            "  ┃  - rm -rf *",
+            "  ┃",
+            "  ┃",
+            "  ┃   Confirm   Cancel                                     ⇆ select  enter confirm",
+            "  ┃",
+        ];
+        // "Reject" in a subagent asks what to do instead.
+        let reject = [
+            "  ┃",
+            "  ┃  △ Reject permission",
+            "  ┃",
+            "  ┃  Tell OpenCode what to do differently",
+            "  ┃",
+            "  ┃",
+            "  ┃  use make clean instead                            enter confirm  esc cancel",
+            "  ┃",
+        ];
+        for (stage, dialog) in [
+            ("inline", &inline[..]),
+            ("narrow", &narrow[..]),
+            ("fullscreen", &fullscreen[..]),
+            ("always", &always[..]),
+            ("reject", &reject[..]),
+        ] {
+            let v = verdict("opencode", &opencode_screen(dialog));
+            let v = v.unwrap_or_else(|| panic!("{stage}: a live permission read nothing"));
+            assert_eq!(v.state, AgentRuntimeState::Blocked, "{stage}: {v:?}");
+            assert_eq!(v.rule, "permission_required", "{stage}");
+            assert!(v.visible_blocker, "{stage}");
+        }
     }
 
     /// The folder trust dialog as Claude Code draws it now, captured from a
@@ -1748,10 +1851,88 @@ contains = "esc to interrupt"
         assert!(!v.visible_idle, "{v:?}");
     }
 
+    /// The composer as opencode v1.18.32 draws it (packages/tui/src/component/prompt/
+    /// index.tsx) above the transcript lines given: the input, the agent and model row, the
+    /// bottom edge, and the status row that tells a turn in progress from a finished one.
+    fn opencode_composer(
+        transcript: &[&'static str],
+        input: &'static str,
+        status: &'static str,
+    ) -> Vec<&'static str> {
+        let mut lines = transcript.to_vec();
+        lines.extend([
+            "",
+            "  ┃",
+            input,
+            "  ┃",
+            "  ┃  Build · Claude Sonnet 4.5 Anthropic",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            status,
+            "",
+        ]);
+        lines
+    }
+
+    const OPENCODE_EMPTY_INPUT: &str = "  ┃  Ask anything… \"Fix a TODO in the codebase\"";
+    const OPENCODE_IDLE_ROW: &str =
+        "   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands";
+    const OPENCODE_BUSY_ROW: &str =
+        "   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands";
+    const OPENCODE_BUSY_AGAIN_ROW: &str =
+        "   ■■■⬝⬝⬝⬝⬝ esc again to interrupt                 12.4K (6%) · $0.04  ctrl+p commands";
+
+    /// A narrow tile cuts the interrupt hint but not the spinner, whose box never shrinks,
+    /// and the key hints can still be there: that is a turn in progress, not idle.
     #[test]
-    fn the_opencode_manifest_reads_an_interrupt_hint_as_working() {
-        let v = verdict("opencode", &["esc to interrupt"]).expect("an interrupt hint");
-        assert_eq!(v.state, AgentRuntimeState::Working);
+    fn a_busy_opencode_row_cut_short_is_still_working() {
+        let screen = opencode_composer(
+            &["     Working on it."],
+            OPENCODE_EMPTY_INPUT,
+            "   ⬝⬝■■■⬝⬝⬝ esc in  ctrl+p commands",
+        );
+        let v = verdict("opencode", &screen).expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Working, "{v:?}");
+    }
+
+    /// Once answered, the dialog is gone and the composer is back. Its words above the
+    /// composer, left there or quoted in an answer, are the past and must not block.
+    #[test]
+    fn an_answered_opencode_permission_above_the_composer_is_not_blocked() {
+        let answered = opencode_composer(
+            &[
+                "  ┃  △ Permission required",
+                "  ┃    # Shell command",
+                "  ┃  $ rm -rf build",
+                "  ┃   Allow once   Allow always   Reject       ctrl+f fullscreen  ⇆ select  enter confirm",
+                "  ┃",
+            ],
+            OPENCODE_EMPTY_INPUT,
+            OPENCODE_IDLE_ROW,
+        );
+        let quoted = opencode_composer(
+            &[
+                "     The deploy stopped: permission required to write /var/www.",
+                "     Run it again with sudo, or change the directory's owner.",
+            ],
+            OPENCODE_EMPTY_INPUT,
+            OPENCODE_IDLE_ROW,
+        );
+        for (case, screen) in [("answered", answered), ("quoted", quoted)] {
+            let v = verdict("opencode", &screen).expect("a composer is idle");
+            assert_eq!(v.state, AgentRuntimeState::Idle, "{case}: {v:?}");
+            assert_eq!(v.rule, "composer_idle", "{case}");
+        }
+    }
+
+    #[test]
+    fn the_opencode_manifest_reads_a_turn_in_progress_as_working() {
+        let screen = opencode_composer(
+            &["     Reading the build script first."],
+            "  ┃  also check the tests",
+            OPENCODE_BUSY_ROW,
+        );
+        let v = verdict("opencode", &screen).expect("a turn in progress");
+        assert_eq!(v.state, AgentRuntimeState::Working, "{v:?}");
         assert_eq!(v.rule, "interrupt_hint_working");
         assert!(v.visible_working);
     }
@@ -1766,57 +1947,101 @@ contains = "esc to interrupt"
 
     #[test]
     fn the_opencode_manifest_reads_its_composer_as_idle() {
-        let v = verdict("opencode", &["> tell me a joke"]).expect("a composer is idle");
-        assert_eq!(v.state, AgentRuntimeState::Idle);
+        let screen = opencode_composer(
+            &["     Done: the build passes."],
+            OPENCODE_EMPTY_INPUT,
+            OPENCODE_IDLE_ROW,
+        );
+        let v = verdict("opencode", &screen).expect("a composer is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
         assert_eq!(v.rule, "composer_idle");
         assert!(v.visible_idle);
+        // The home screen has no session, so its status row is the key hints alone.
+        let home = opencode_composer(&[], OPENCODE_EMPTY_INPUT, "   tab agents  ctrl+p commands");
+        let v = verdict("opencode", &home).expect("the home composer is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+    }
+
+    /// A real opencode 1.18.32 start, captured from a qoro terminal: the key hints sit
+    /// above a tip and the directory, so the idle row is third from the bottom.
+    #[test]
+    fn a_real_opencode_home_screen_reads_idle_by_its_rule() {
+        let screen = [
+            r#"                                                          ▄"#,
+            r#"                         █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█"#,
+            r#"                         █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀"#,
+            r#"                         ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀"#,
+            r#""#,
+            r#""#,
+            r#"       ┃"#,
+            r#"       ┃  Ask anything… "Fix broken tests""#,
+            r#"       ┃"#,
+            r#"       ┃  Build · Muse Spark 1.3 Free OpenCode Zen"#,
+            r#"       ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"#,
+            r#"                                                       tab agents  ctrl+p commands"#,
+            r#""#,
+            r#""#,
+            r#""#,
+            r#"                ● Tip Run /connect to add an AI provider and start coding"#,
+            r#""#,
+            r#""#,
+            r#""#,
+            r#"  /private/tmp                                                                  1.18.32"#,
+        ];
+        let v = verdict("opencode", &screen).expect("the home screen is idle");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+        assert_eq!(
+            v.rule, "composer_idle",
+            "read by the fallback, not the rule"
+        );
     }
 
     #[test]
-    fn an_opencode_interrupt_hint_in_scrollback_does_not_hold_working() {
-        // The hint sits in the transcript after the turn ends while the live
-        // composer waits below it. The working rule reads the live lines only,
-        // so the composer wins and the finished agent reads idle, not working.
-        let v = verdict(
-            "opencode",
+    fn an_opencode_interrupt_hint_in_the_transcript_does_not_hold_working() {
+        // The words sit in the transcript while the finished agent's composer waits
+        // below. Only the status row is read, so the agent reads idle, not working.
+        let screen = opencode_composer(
             &[
-                "esc to interrupt",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "> tell me a joke",
+                "     Press esc interrupt to stop a turn; ■■■■ is the spinner.",
+                "     ▣  Build · Claude Sonnet 4.5 · 4.2s",
             ],
-        )
-        .expect("a verdict");
+            OPENCODE_EMPTY_INPUT,
+            OPENCODE_IDLE_ROW,
+        );
+        let v = verdict("opencode", &screen).expect("a verdict");
         assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
         assert_eq!(v.rule, "composer_idle");
     }
 
     #[test]
-    fn an_interrupted_opencode_turn_is_not_working() {
-        // The hint is still on screen but the turn is over: Esc was already
-        // pressed and the conversation notes it. Reporting working here is
-        // how a cancelled agent stays working until its next turn.
-        let v = verdict(
-            "opencode",
-            &[
-                "esc to interrupt",
-                "conversation interrupted",
-                "> tell me a joke",
-            ],
+    fn an_interrupted_opencode_turn_is_idle() {
+        // Esc pressed twice: the turn ends, its footer says so, and the status row
+        // drops the spinner and the hint.
+        let screen = opencode_composer(
+            &["     ▣  Build · Claude Sonnet 4.5 · 4.2s · interrupted"],
+            OPENCODE_EMPTY_INPUT,
+            OPENCODE_IDLE_ROW,
         );
-        assert!(
-            !v.as_ref()
-                .is_some_and(|v| v.state == AgentRuntimeState::Working),
-            "an interrupted turn read as working: {v:?}"
-        );
+        let v = verdict("opencode", &screen).expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
+    }
+
+    /// The turn the replay fixture plays, frame by frame: working, the first esc press,
+    /// finished, a new turn, finished again.
+    #[test]
+    fn an_opencode_turn_reads_working_then_idle_then_working() {
+        let transcript = ["     Reading the build script first."];
+        for (row, want) in [
+            (OPENCODE_BUSY_ROW, AgentRuntimeState::Working),
+            (OPENCODE_BUSY_AGAIN_ROW, AgentRuntimeState::Working),
+            (OPENCODE_IDLE_ROW, AgentRuntimeState::Idle),
+            (OPENCODE_BUSY_ROW, AgentRuntimeState::Working),
+            (OPENCODE_IDLE_ROW, AgentRuntimeState::Idle),
+        ] {
+            let screen = opencode_composer(&transcript, OPENCODE_EMPTY_INPUT, row);
+            let v = verdict("opencode", &screen);
+            assert_eq!(v.map(|v| v.state), Some(want), "{row}");
+        }
     }
 
     #[test]

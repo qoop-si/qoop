@@ -1,42 +1,173 @@
-# SYNTHESIZED transition, not a recording: opencode interrupt hint -> typed
-# composer. The composer reads as idle with visible_idle, so the tail
+# SYNTHESIZED transition, not a recording: opencode turn in progress -> finished
+# composer. The frames are opencode v1.18.32's composer rebuilt from its own source
+# (packages/tui/src/component/prompt/index.tsx). They replace frames written as
+# `esc to interrupt` over a bare `> ` composer: that spelling is in none of the
+# releases sampled from v0.0.2 to v1.18.32, and only v0.0 drew a bare `>`. Only the
+# timing is constructed, and it is the earlier fixture's: the
+# status row shows the spinner and `esc interrupt` while the turn runs and the key hints
+# alone once it ends, and the composer reads as idle with visible_idle, so the tail
 # publishes Idle once and stays there: the honest expectation is a clean
-# Working-to-Idle handoff with no Working-to-Idle-to-Working flap on a
-# stable tail.
+# Working-to-Idle handoff with no Working-to-Idle-to-Working flap on a stable tail.
 agent: opencode
 @@ 0
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 50
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 100
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 150
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 200
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 250
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 300
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 350
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 400
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 550
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 600
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 650
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 750
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 800
-esc to interrupt
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝■■■⬝⬝⬝ esc interrupt                          12.4K (6%) · $0.04  ctrl+p commands
 @@ 950
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 1000
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 1050
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
 @@ 1450
-> tell me a joke
+     Reading the build script first.
+
+  ┃
+  ┃  Ask anything… "Fix a TODO in the codebase"
+  ┃
+  ┃  Build · Claude Sonnet 4.5 Anthropic
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/coding/site                                   12.4K (6%) · $0.04  ctrl+p commands
