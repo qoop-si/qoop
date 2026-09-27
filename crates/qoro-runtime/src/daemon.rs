@@ -3074,6 +3074,11 @@ pub struct SpanWire {
     /// bit set: six booleans would be six fields on every run.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attrs: u8,
+    /// Where the run points, when the program linked it with `OSC 8`. As the program wrote
+    /// it: a client cleans it where it writes it into an escape again. Absent on almost
+    /// every run, and an older client ignores it and draws the text unlinked (ADR-010).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 fn is_zero(v: &u8) -> bool {
@@ -3217,6 +3222,7 @@ impl From<&qoro_terminal::Span> for SpanWire {
             fg: colour_wire(st.fg),
             bg: colour_wire(st.bg),
             attrs: bits,
+            link: st.link.as_deref().map(str::to_string),
         }
     }
 }
@@ -5490,6 +5496,26 @@ mod image_wire_tests {
         assert_eq!(decoded.bytes, image.bytes);
         assert_eq!(decoded.id, image.id);
         assert_eq!(decoded.protocol, image.protocol);
+    }
+
+    /// A link crosses the wire both ways, costs nothing on a run without one, and a span
+    /// from a daemon that predates links reads as unlinked.
+    #[test]
+    fn a_link_crosses_the_wire_and_its_absence_costs_nothing() {
+        let mut engine = qoro_terminal::AlacrittyEngine::new(20, 2);
+        use qoro_terminal::TerminalEngine as _;
+        engine.feed(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1b[1mbold");
+        let wire = super::SnapshotWire::from(&engine.snapshot());
+        let body = serde_json::to_string(&wire).expect("serialize");
+        assert_eq!(body.matches("\"link\"").count(), 1, "{body}");
+        let back: super::SnapshotWire = serde_json::from_str(&body).expect("parse");
+        assert_eq!(back, wire);
+        assert_eq!(
+            back.styles[0][0].link.as_deref(),
+            Some("https://example.com")
+        );
+        let old: super::SpanWire = serde_json::from_str(r#"{"at":0,"len":3}"#).expect("old");
+        assert_eq!(old.link, None);
     }
 
     /// An older client parses snapshots and skips anything else. The image shape

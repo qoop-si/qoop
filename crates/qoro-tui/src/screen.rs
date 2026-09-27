@@ -1480,6 +1480,10 @@ pub(crate) fn paint_row(
     // Whether the cell just painted was part of the selection, so the escape is written
     // once at each edge of it rather than before every character.
     let mut reversed = false;
+    // Whether a link is open on the terminal above. Closed before any change of run and
+    // at the end of what this paints, so a link never reaches a cell it was not on: not
+    // the next tile, not the chrome, not the next frame's rows.
+    let mut linked = false;
     for (cell, c) in line.chars().enumerate() {
         // A grid cell never holds a control character when this machine's engine filled
         // it, but a screen relayed from another machine is only as honest as that
@@ -1507,6 +1511,9 @@ pub(crate) fn paint_row(
         // selection with, so it is also what a person already recognises.
         let mark = selected.as_ref().is_some_and(|r| r.contains(&used));
         if span.map(|s| s as *const _) != current.map(|s| s as *const _) || mark != reversed {
+            if std::mem::take(&mut linked) {
+                out.push_str(crate::hyperlink::CLOSE);
+            }
             out.push_str("\x1b[0m");
             if let Some(span) = span {
                 out.push_str(&sgr(span));
@@ -1514,11 +1521,21 @@ pub(crate) fn paint_row(
             if mark {
                 out.push_str("\x1b[7m");
             }
+            if let Some(uri) = span
+                .and_then(|s| s.link.as_deref())
+                .and_then(crate::hyperlink::clean_uri)
+            {
+                out.push_str(&crate::hyperlink::open(uri));
+                linked = true;
+            }
             current = span;
             reversed = mark;
         }
         out.push(c);
         used += w;
+    }
+    if linked {
+        out.push_str(crate::hyperlink::CLOSE);
     }
     if current.is_some() || reversed {
         out.push_str("\x1b[0m");
@@ -1530,7 +1547,7 @@ pub(crate) fn paint_row(
 }
 
 fn is_plain(s: &SpanWire) -> bool {
-    s.fg.is_none() && s.bg.is_none() && s.attrs == 0
+    s.fg.is_none() && s.bg.is_none() && s.attrs == 0 && s.link.is_none()
 }
 
 /// The focus list, as rows of text with the role each wears.
@@ -1778,6 +1795,7 @@ mod tests {
                 }),
                 bg: None,
                 attrs: 0,
+                link: None,
             },
             SpanWire {
                 at: 3,
@@ -1785,6 +1803,7 @@ mod tests {
                 fg: None,
                 bg: None,
                 attrs: attrs::INVERSE,
+                link: None,
             },
         ];
         let painted = paint_row(line, &spans, 40, None);
@@ -1811,6 +1830,66 @@ mod tests {
             plain.push(c);
         }
         assert_eq!(crate::width::width(&plain), 40, "{plain:?}");
+    }
+
+    fn linked(at: usize, len: usize, uri: &str) -> SpanWire {
+        SpanWire {
+            at,
+            len,
+            fg: None,
+            bg: None,
+            attrs: 0,
+            link: Some(uri.to_string()),
+        }
+    }
+
+    /// A linked run opens after its colour and closes before the next run starts, so
+    /// the link covers exactly its own text and two neighbouring links never merge.
+    #[test]
+    fn a_link_opens_after_its_colour_and_closes_before_the_next_run() {
+        let spans = vec![
+            SpanWire {
+                at: 0,
+                len: 2,
+                fg: Some(ColourWire::Indexed { i: 1 }),
+                bg: None,
+                attrs: 0,
+                link: Some("https://a.example".to_string()),
+            },
+            linked(2, 2, "https://b.example"),
+        ];
+        let painted = paint_row("abcd tail", &spans, 20, None);
+        let open_a = "\x1b]8;;https://a.example\x1b\\";
+        let open_b = "\x1b]8;;https://b.example\x1b\\";
+        let expected = format!(
+            "\x1b[0m\x1b[31m{open_a}ab{close}\x1b[0m\x1b[m{open_b}cd{close}\x1b[0m tail",
+            close = crate::hyperlink::CLOSE
+        );
+        assert!(painted.starts_with(&expected), "{painted:?}");
+        assert_eq!(painted.matches("\x1b]8;;h").count(), 2);
+        assert_eq!(painted.matches(crate::hyperlink::CLOSE).count(), 2);
+    }
+
+    /// A linked run cut by the edge of its tile is still closed, inside the tile, so the
+    /// divider and the next tile are not part of the link.
+    #[test]
+    fn a_link_cut_by_the_tile_edge_is_closed_at_the_edge() {
+        let spans = vec![linked(0, 30, "https://example.com")];
+        let painted = paint_row(&"x".repeat(30), &spans, 10, None);
+        assert!(
+            painted.ends_with(&format!("{}\x1b[0m", crate::hyperlink::CLOSE)),
+            "{painted:?}"
+        );
+        assert_eq!(painted.matches(crate::hyperlink::CLOSE).count(), 1);
+    }
+
+    /// A target that could end the escape early paints its text unlinked.
+    #[test]
+    fn a_hostile_link_target_paints_its_text_unlinked() {
+        let spans = vec![linked(0, 4, "https://x\x07\x1b]2;owned")];
+        let painted = paint_row("link", &spans, 10, None);
+        assert!(!painted.contains("\x1b]"), "{painted:?}");
+        assert!(painted.contains("link"), "{painted:?}");
     }
 
     /// The naming box cursor sits at the end of what has been typed, past the
@@ -2309,6 +2388,7 @@ mod tests {
             fg: Some(ColourWire::Indexed { i: 1 }),
             bg: None,
             attrs: attrs::BOLD,
+            link: None,
         }]];
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
@@ -2424,6 +2504,7 @@ mod tests {
             fg: Some(ColourWire::Indexed { i: 2 }),
             bg: None,
             attrs: 0,
+            link: None,
         }]];
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
@@ -3337,6 +3418,7 @@ mod tests {
             fg: Some(ColourWire::Indexed { i: 5 }),
             bg: None,
             attrs: attrs::BOLD,
+            link: None,
         }]];
         let palette = Palette::open();
         let painted = paint(&Frame {

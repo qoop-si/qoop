@@ -14,9 +14,11 @@
 //! terminal that supports it shows the frame whole or not at all. A frame identical to the
 //! last writes nothing.
 //!
-//! The painted frame uses exactly four shapes: cursor placement (`CSI r;c H`), colour
-//! (`CSI ... m`), cursor visibility (`CSI ? 25 h/l`) and text. Anything else is kept as
-//! text of the row it lands on, so an unknown sequence is still written, never dropped.
+//! The painted frame uses exactly five shapes: cursor placement (`CSI r;c H`), colour
+//! (`CSI ... m`), cursor visibility (`CSI ? 25 h/l`), a link's open or close
+//! (`OSC 8 ... ST`, no column) and text. Anything else is kept as text of the row it lands
+//! on, so an unknown sequence is still written, never dropped. A row holding a link is
+//! always written whole: trimming it could write a tail whose open was left out.
 
 use std::fmt::Write as _;
 
@@ -93,6 +95,20 @@ fn csi_end(bytes: &[u8], i: usize) -> Option<usize> {
     Some(i + 2 + len)
 }
 
+/// Where the operating system command opening at `i` (`ESC ]`) ends: just past its `BEL`
+/// or `ESC \`, when it is complete.
+fn osc_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let body = i + 2;
+    bytes[body..]
+        .iter()
+        .enumerate()
+        .find_map(|(at, &b)| match b {
+            0x07 => Some(body + at + 1),
+            0x1b if bytes.get(body + at + 1) == Some(&b'\\') => Some(body + at + 2),
+            _ => None,
+        })
+}
+
 /// Whether a colour sequence's parameters start from a clean slate.
 fn resets(params: &str) -> bool {
     params.is_empty() || params == "0" || params.starts_with("0;")
@@ -146,6 +162,15 @@ fn cut(painted: &str, lines: usize, rows: &mut Vec<String>) -> ((usize, usize), 
                 _ => put(rows, seq, at, &mut open, &style),
             }
             i = end + 1;
+        } else if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b']') {
+            // A link's open or close: kept in the row it lands on, and taking no column,
+            // so the cursor is still where the text left it.
+            let Some(end) = osc_end(bytes, i) else {
+                put(rows, &painted[i..], at, &mut open, &style);
+                break;
+            };
+            put(rows, &painted[i..end], at, &mut open, &style);
+            i = end;
         } else {
             // Text up to the next escape. Starting the search one byte on keeps a lone
             // escape that opens no sequence moving forward as text.
@@ -509,6 +534,45 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, "\x1b[2;2H\x1b[0m/");
+    }
+
+    /// A link's open and close take no column, so the cursor after a linked word is
+    /// where the word ends; and a row holding one is written whole, open and close
+    /// together, never trimmed to a tail that would leave a link open.
+    #[test]
+    fn a_linked_row_is_written_whole_and_its_link_takes_no_column() {
+        let open = "\x1b]8;;https://example.com\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        let mut p = Presenter::default();
+        let mut out = String::new();
+        p.present(
+            &format!("\x1b[1;1H{open}link{close}{SHOW}"),
+            20,
+            2,
+            &mut out,
+        );
+        assert!(out.contains(&format!("\x1b[1;5H{SHOW}")), "{out:?}");
+        let mut out = String::new();
+        p.present(
+            &format!("\x1b[1;1H{open}link{close}s{SHOW}"),
+            20,
+            2,
+            &mut out,
+        );
+        assert!(
+            out.contains(&format!("\x1b[1;1H\x1b[0m{open}link{close}s")),
+            "{out:?}"
+        );
+        // And the row after it, rewritten without the link, opens nothing and the link
+        // written before it was already closed.
+        let mut out = String::new();
+        p.present(&format!("\x1b[1;1Hplain{SHOW}"), 20, 2, &mut out);
+        assert!(!out.contains("\x1b]8;;h"), "{out:?}");
+        assert_eq!(
+            out.matches("\x1b]8;;h").count(),
+            out.matches(close).count(),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -12,11 +12,13 @@
 //!   costs exactly the same as 1000. 1000 is therefore the cheapest non-zero setting and
 //!   anything smaller is a false economy.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Hyperlink;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -116,17 +118,25 @@ impl AlacrittyEngine {
         let grid = self.term.grid();
         let mut text = String::with_capacity(grid.columns());
         let mut spans: Vec<Span> = Vec::new();
+        // The last run's look and link in the engine's own terms, so a cell is compared
+        // without building the link's text: that is built once, when a run starts.
+        let mut last: Option<(Style, Option<Hyperlink>)> = None;
         for col in 0..grid.columns() {
             let cell = &grid[Point::new(Line(line), Column(col))];
             text.push(cell.c);
-            let style = style_of(cell);
+            let here = (style_of(cell), cell.hyperlink());
             match spans.last_mut() {
-                Some(last) if last.style == style && last.at + last.len == col => last.len += 1,
-                _ => spans.push(Span {
-                    at: col,
-                    len: 1,
-                    style,
-                }),
+                Some(span) if last.as_ref() == Some(&here) => span.len += 1,
+                _ => {
+                    let mut style = here.0.clone();
+                    style.link = here.1.as_ref().map(|link| Arc::from(link.uri()));
+                    spans.push(Span {
+                        at: col,
+                        len: 1,
+                        style,
+                    });
+                    last = Some(here);
+                }
             }
         }
         while spans.last().is_some_and(|s| s.style.is_plain()) {
@@ -260,6 +270,8 @@ fn style_of(cell: &alacritty_terminal::term::cell::Cell) -> Style {
         inverse: cell.flags.contains(Flags::INVERSE),
         dim: cell.flags.contains(Flags::DIM),
         strike: cell.flags.contains(Flags::STRIKEOUT),
+        // Filled per run in `row`, so a cell is never made to build the link's text.
+        link: None,
     }
 }
 
@@ -833,5 +845,30 @@ mod tests {
         e.feed(b"\x1b[?1000l\x1b[?1049l");
         assert!(!e.snapshot().modes.alt_screen);
         assert!(!e.snapshot().modes.mouse_reporting);
+    }
+
+    /// A program's `OSC 8` link reaches the snapshot as one run over exactly the linked
+    /// text, in the default colours, and the text around it carries no link.
+    #[test]
+    fn an_osc_8_link_becomes_one_run_over_the_linked_text() {
+        let mut e = engine();
+        e.feed(b"see \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ here");
+        let s = e.snapshot();
+        assert_eq!(s.lines[0], "see link here");
+        let linked: Vec<&Span> = s.styles[0]
+            .iter()
+            .filter(|sp| sp.style.link.is_some())
+            .collect();
+        assert_eq!(linked.len(), 1, "{:?}", s.styles[0]);
+        assert_eq!((linked[0].at, linked[0].len), (4, 4));
+        assert_eq!(linked[0].style.link.as_deref(), Some("https://example.com"));
+        assert!(!linked[0].style.is_plain(), "a linked run is not plain");
+        assert!(
+            s.styles[0]
+                .iter()
+                .all(|sp| sp.at + sp.len <= 8 || sp.style.link.is_none()),
+            "the link ran past its text: {:?}",
+            s.styles[0]
+        );
     }
 }

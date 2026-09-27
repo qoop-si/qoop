@@ -88,7 +88,7 @@ pub struct Span {
 /// Indexed colours stay indexed rather than being resolved to rgb here: the palette
 /// belongs to whoever is drawing, and resolving it in the daemon would bake this machine's
 /// theme into what every client sees.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Style {
     pub fg: Colour,
     pub bg: Colour,
@@ -98,10 +98,17 @@ pub struct Style {
     pub inverse: bool,
     pub dim: bool,
     pub strike: bool,
+    /// Where the text in this run points, when the program wrapped it in an `OSC 8` link.
+    ///
+    /// Shared rather than copied per cell: a link is usually a whole word or a whole path,
+    /// and the run is built once for all of its cells. The target is kept as the program
+    /// wrote it; whoever writes it into an escape sequence again cleans it there.
+    pub link: Option<std::sync::Arc<str>>,
 }
 
 impl Style {
-    /// Nothing set, which is the state most cells are in.
+    /// Nothing set, which is the state most cells are in. A link counts: a linked run in
+    /// the default colours is still something a client has to be told about.
     pub fn is_plain(&self) -> bool {
         *self == Self::default()
     }
