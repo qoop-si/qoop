@@ -183,7 +183,7 @@ fn is_placeable(image: &StoredImage) -> bool {
                 && image.bytes[3..image.bytes.len() - 2].contains(&b';')
         }
         ImageProtocol::ITerm2 => {
-            image.bytes.starts_with(b"\x1b]1337;")
+            image.bytes.starts_with(b"\x1b]1337;File=")
                 && (image.bytes.ends_with(b"\x07") || image.bytes.ends_with(b"\x1b\\"))
         }
     }

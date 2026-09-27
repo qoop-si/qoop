@@ -164,6 +164,30 @@ mod tests {
         assert_eq!(f.discarded().0, 1, "the discard was not counted");
     }
 
+    /// A control byte between the ESC and the `]` is ignored by the parser and has to be
+    /// ignored here too, or the OSC it opens is never bounded.
+    #[test]
+    fn a_control_byte_after_escape_does_not_open_an_unbounded_hole() {
+        for prefix in [&b"\x1b\x00]0;"[..], b"\x1b\x7f]0;", b"\x1b\x85]0;"] {
+            let mut f = ControlStringFilter::default();
+            let mut out = Vec::new();
+            f.feed(prefix, &mut out);
+            for _ in 0..8 {
+                f.feed(&vec![b'A'; 64 * 1024], &mut out);
+                assert!(
+                    f.staged_len() <= MAX_CONTROL_STRING,
+                    "{prefix:?} held {} bytes",
+                    f.staged_len()
+                );
+            }
+            assert_eq!(
+                f.discarded().0,
+                1,
+                "{prefix:?}: the discard was not counted"
+            );
+        }
+    }
+
     /// The same missing transition in the other direction: CAN returns the parser to
     /// ground, and a scanner that stayed in `String` would discard ordinary text as if it
     /// were a control string, blanking the terminal from that point on.

@@ -63,13 +63,11 @@ enum State {
     ApcKind,
     /// Inside a Kitty envelope, after `ESC _ G`.
     ApcBody,
-    /// `ESC ]` seen, matching `1337` byte by byte.
+    /// `ESC ]` seen, matching `1337;File=` byte by byte.
     OscKind {
         matched: u8,
     },
-    /// `1337` matched; the `;` that makes it an iTerm2 image still owed.
-    OscSemi,
-    /// Inside an iTerm2 envelope, after `ESC ] 1337;`.
+    /// Inside an iTerm2 envelope, after `ESC ] 1337;File=`.
     OscBody,
     /// Over budget or past deadline: swallowing until the terminator.
     Discarding {
@@ -205,35 +203,22 @@ impl ImageSniffer {
                     return;
                 }
                 self.staged.push(b);
-                const MAGIC: &[u8; 4] = b"1337";
-                if matched < 4 && b == MAGIC[matched as usize] {
+                // The whole address, `File=` included. `1337` alone also carries
+                // `ClearScrollback`, `StealFocus`, `Copy=` and the rest of iTerm2's
+                // commands, and capturing those as pictures forwarded them to the outer
+                // terminal untouched, clipboard writes past the policy gate included.
+                // The `;` matters too: `ESC ] 13371;...` is some other OSC.
+                const MAGIC: &[u8] = b"1337;File=";
+                if (matched as usize) < MAGIC.len() && b == MAGIC[matched as usize] {
                     let matched = matched + 1;
-                    self.state = if matched == 4 {
-                        // The `;` after `1337` is part of the address: `ESC ]
-                        // 13371;...` is some other OSC, and capturing it would
-                        // hide a sequence the filter owns.
-                        State::OscSemi
+                    self.state = if matched as usize == MAGIC.len() {
+                        State::OscBody
                     } else {
                         State::OscKind { matched }
                     };
                     self.body_esc = false;
                 } else {
                     // Not an iTerm2 image. Ordinary OSC, the filter's business.
-                    self.flush_to_clean(clean);
-                }
-            }
-            State::OscSemi => {
-                if b == 0x1b {
-                    self.flush_to_clean(clean);
-                    self.begin_stage();
-                    self.state = State::SawEsc;
-                    return;
-                }
-                self.staged.push(b);
-                if b == b';' {
-                    self.state = State::OscBody;
-                    self.body_esc = false;
-                } else {
                     self.flush_to_clean(clean);
                 }
             }
@@ -249,6 +234,11 @@ impl ImageSniffer {
                     self.body_esc = false;
                     if b == b'\\' {
                         self.drop_staged();
+                    } else {
+                        // Not ST: the ESC ended the string for the parser, so it ends
+                        // the discard too, and opens whatever it opens.
+                        self.drop_staged();
+                        self.reopen(b, clean);
                     }
                 }
             }
@@ -268,9 +258,16 @@ impl ImageSniffer {
                 });
                 return;
             }
-            // A stray ESC inside the body. Base64 never holds one, but staging on
-            // is cheaper than being wrong about a protocol extension.
-            self.check_bound();
+            // An ESC that does not open ST ends the envelope, as it ends the string for
+            // the parser. Staged on, one lone ESC held back every byte after it, up to
+            // the bound, and then the filter threw them away. What was staged is an
+            // unfinished picture: counted and dropped.
+            self.staged.pop();
+            self.discarded_envelopes += 1;
+            self.discarded_bytes += self.staged.len() as u64;
+            self.abandon_assembly();
+            self.drop_staged();
+            self.reopen(b, clean);
             return;
         }
         if b == 0x1b {
@@ -287,6 +284,13 @@ impl ImageSniffer {
         self.staged.push(b);
         self.check_bound();
         let _ = clean;
+    }
+
+    /// An ESC that ended something, and the byte after it: read as a fresh sequence.
+    fn reopen(&mut self, b: u8, clean: &mut Vec<u8>) {
+        self.begin_stage();
+        self.state = State::SawEsc;
+        self.step(b, clean);
     }
 
     fn begin_stage(&mut self) {
@@ -511,6 +515,34 @@ mod tests {
         assert!(images.iter().all(|i| i.protocol == ImageProtocol::ITerm2));
         assert_eq!(images[0].id, 1);
         assert_eq!(images[1].id, 2);
+    }
+
+    /// iTerm2's other commands share the `1337` address and are not pictures. Captured,
+    /// they reached the outer terminal verbatim: a clipboard write past the policy gate.
+    #[test]
+    fn an_iterm2_command_that_is_not_a_file_is_not_a_picture() {
+        for command in [
+            &b"\x1b]1337;ClearScrollback\x07"[..],
+            b"\x1b]1337;StealFocus\x07",
+            b"\x1b]1337;Copy=:aGk=\x07",
+            b"\x1b]1337;SetMark\x1b\\",
+        ] {
+            let (clean, images) = run(&[command]);
+            assert!(images.is_empty(), "{command:?} was captured");
+            assert_eq!(clean, command, "{command:?} left the stream");
+        }
+    }
+
+    /// A lone ESC in a body ends the envelope and what follows is output again: held
+    /// back, the rest of the stream vanished into a picture that never finished.
+    #[test]
+    fn a_stray_escape_ends_an_envelope_and_the_output_after_it_survives() {
+        let (clean, images) = run(&[b"\x1b]1337;File=inline=1:Zm9v\x1b[1mbold text"]);
+        assert!(images.is_empty());
+        assert_eq!(clean, b"\x1b[1mbold text");
+        let (clean, images) = run(&[b"\x1b_Gf=100;Zm9v\x1bxplain"]);
+        assert!(images.is_empty());
+        assert_eq!(clean, b"\x1bxplain");
     }
 
     #[test]

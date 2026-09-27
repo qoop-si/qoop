@@ -60,6 +60,11 @@ impl EscapeState {
                 },
                 // ESC ( , ESC ) , ESC # and friends take one more byte.
                 b'(' | b')' | b'*' | b'+' | b'#' | b' ' | b'%' => EscapeState::TwoByte,
+                // Controls, DEL and high bytes leave vte in its escape state, so they
+                // leave this one there too. Back at ground here, `ESC NUL ]` let the
+                // parser open an OSC this scanner never saw, the same unbounded hole as
+                // `ESC [ 1 ESC ]` by a different prefix.
+                0x00..=0x1f | 0x7f..=0xff => EscapeState::Escape,
                 _ => EscapeState::Ground,
             },
             EscapeState::Csi => {
