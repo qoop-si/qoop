@@ -84,7 +84,14 @@ impl Containment {
     pub fn absorb(&mut self, enumerated: impl IntoIterator<Item = Member>) {
         self.captured = true;
         for m in enumerated {
-            self.members.entry(m.pid).or_insert(m);
+            // The same process read again keeps its place but takes its current group: a
+            // job that moved group was otherwise signalled at the old one, which the
+            // membership check refuses, and teardown ran to its deadline with it alive.
+            // A different start time is a different process, and the recorded one stays.
+            let entry = self.members.entry(m.pid).or_insert(m);
+            if entry.start_time == m.start_time {
+                entry.pgid = m.pgid;
+            }
         }
     }
 
@@ -314,6 +321,25 @@ mod tests {
         let left = |_: Pid, _: u64, _: Pgid| false;
         assert!(c.groups_to_signal(0, &all_alive, &left).is_empty());
         assert_eq!(c.groups_to_signal(0, &all_alive, &in_all), vec![Pgid(10)]);
+    }
+
+    /// Read again after it moved group, the same process is signalled at its new group;
+    /// a different process under a reused pid does not replace the recorded one.
+    #[test]
+    fn a_member_read_again_in_a_new_group_is_signalled_there() {
+        let mut c = Containment::new();
+        c.absorb([m(20, 10, 1)]);
+        c.absorb([m(20, 30, 1)]);
+        let in_thirty = |_: Pid, _: u64, g: Pgid| g == Pgid(30);
+        assert_eq!(
+            c.groups_to_signal(0, &all_alive, &in_thirty),
+            vec![Pgid(30)]
+        );
+        c.absorb([m(20, 40, 2)]);
+        assert_eq!(
+            c.groups_to_signal(0, &all_alive, &in_thirty),
+            vec![Pgid(30)]
+        );
     }
 
     #[test]
