@@ -24,6 +24,9 @@ pub struct SshTransport {
     control_path: Option<String>,
     /// What the user has already set, so it is not overridden.
     user_set: Vec<String>,
+    /// Never prompt. A connection made in the background has nobody to answer a password
+    /// or a host key question, and a prompt nobody sees is a connection that hangs.
+    batch: bool,
 }
 
 impl SshTransport {
@@ -32,7 +35,14 @@ impl SshTransport {
             host: host.into(),
             control_path: None,
             user_set: Vec::new(),
+            batch: false,
         }
+    }
+
+    /// Fail rather than ask: for a connection nobody is watching.
+    pub fn batch(mut self) -> Self {
+        self.batch = true;
+        self
     }
 
     /// Reuse one authenticated connection through a control socket.
@@ -69,6 +79,12 @@ impl SshTransport {
         if !self.user_set.iter().any(|n| n == "ServerAliveCountMax") {
             argv.push("-o".into());
             argv.push(format!("ServerAliveCountMax={KEEPALIVE_MISSES}"));
+        }
+        if self.batch {
+            argv.push("-o".into());
+            argv.push("BatchMode=yes".into());
+            argv.push("-o".into());
+            argv.push("ConnectTimeout=10".into());
         }
         // No pseudo terminal: this transport carries commands, and the terminal is carried
         // by the protocol inside it. Asking ssh for a tty here would put a second line
@@ -154,6 +170,15 @@ mod tests {
                 "the transport bypasses the user's config with {hostile}"
             );
         }
+    }
+
+    #[test]
+    fn a_batch_connection_never_prompts_and_gives_up_on_a_dead_host() {
+        let quiet = SshTransport::new("host").batch().argv("true");
+        assert!(quiet.iter().any(|a| a == "BatchMode=yes"));
+        assert!(quiet.iter().any(|a| a.starts_with("ConnectTimeout=")));
+        let asked = SshTransport::new("host").argv("true");
+        assert!(!asked.iter().any(|a| a == "BatchMode=yes"));
     }
 
     #[test]

@@ -8,6 +8,8 @@
 pub mod graphics;
 pub mod keys;
 pub mod layout;
+pub mod link;
+pub mod mux;
 pub mod palette;
 pub mod present;
 pub mod run;
@@ -18,4 +20,4 @@ pub mod tabs;
 pub mod theme;
 pub mod width;
 
-pub use run::{run, run_with_notice};
+pub use run::{run, run_stream, run_with_notice};

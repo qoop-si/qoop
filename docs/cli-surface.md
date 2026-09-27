@@ -22,6 +22,10 @@ a claim nobody has to keep.
 | `qoro daemon` | run the daemon in the foreground | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
+| `qoro --remote <remote>` | the interface for another machine's qoro alone, over ssh, by an added name or an ssh target; a dropped connection comes back on its own | yes |
+| `qoro remote add <name> <ssh-target> [--session S]` | reach a machine over ssh in the foreground, check its qoro speaks this codec, and list its spaces in `qoro` as `<name>:<space>` beside this machine's | yes |
+| `qoro remote rm <name>` | stop listing a machine's spaces | no |
+| `qoro remote ls` | the machines added, their ssh targets and sessions | no |
 | `qoro setup show <file>` | what a Setup will run, its content hash and its reproducibility level | no |
 | `qoro setup trust <file>` | confirm a Setup on this machine | no |
 | `qoro setup check <file>` | whether a Setup may run here | no |

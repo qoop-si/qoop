@@ -123,7 +123,16 @@ fn hello(client_id: &str) -> ClientHello {
 /// blank screen until something else happened to change. It passed every unit test and
 /// failed the first time a person ran it.
 pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, BytesMut)> {
-    let mut stream = UnixStream::connect(socket).await?;
+    handshake(UnixStream::connect(socket).await?, client_id).await
+}
+
+/// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`
+/// running `qoro relay` on another machine. The relay does not change the protocol, so
+/// nothing after this point needs to know which one it is.
+pub async fn handshake<S>(mut stream: S, client_id: &str) -> io::Result<(S, BytesMut)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let body = serde_json::to_vec(&hello(client_id))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = BytesMut::new();

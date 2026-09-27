@@ -77,6 +77,28 @@ qoro ls                 what there is, and what is running
 qoro stop work          end it: the tabs come back on the next open
 ```
 
+### Other machines
+
+A qoro on a server keeps running when you log out, like the one here does. Add it once and
+its spaces are listed beside this machine's:
+
+```
+qoro remote add devbox me@devbox      runs ssh in the foreground, checks the qoro there
+qoro                                  devbox:api, devbox:web under this machine's spaces
+qoro --remote devbox                  only that machine
+```
+
+It is the system `ssh` with your own `~/.ssh/config`, so jump hosts, keys and agent
+forwarding work as they do for `ssh devbox`. The interface itself never asks for anything:
+a key in your ssh agent just works, and after `qoro remote add` or `qoro --remote`, which
+can ask, ssh keeps that connection shared for ten minutes. A host that would need a password
+or a touch outside that shows as offline with ssh's reason. Everything
+in a remote space runs over there: a new tab, a split, a space made with `ctrl-a w` while
+you are in one. Naming a new space `devbox:tests` from anywhere makes it on devbox. If the
+connection drops, its spaces stay listed as offline and come back on their own, with the
+same tabs. qoro has to be installed on the other machine already, and `qoro agents`, `send`
+and `read` still speak only to this machine's daemon.
+
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 

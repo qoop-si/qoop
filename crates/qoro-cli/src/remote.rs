@@ -1,0 +1,158 @@
+//! `qoro remote`: the machines whose spaces the interface shows beside this one's.
+//!
+//! Adding one is the only step that talks to a person: it runs ssh in the foreground, so a
+//! password, a passphrase, a new host key or a hardware key touch is answered where it is
+//! asked. It also leaves ssh's shared connection open for a while, which is what the
+//! interface's own connection, which never asks anything, then rides on.
+
+use std::io;
+use std::process::{Command, Stdio};
+
+use qoro_remote::saved::{self, RELAY_MARKER, Remote, remote_command};
+use qoro_remote::{Compatibility, RemoteHello, SshTransport, compatibility};
+use qoro_runtime::paths;
+
+/// `session` is the one given with `--session`, which the caller has already taken out of
+/// the arguments; `None` means the remote's default.
+pub fn run(args: &[String], session: Option<&str>) -> io::Result<()> {
+    let done = match args.get(2).map(String::as_str) {
+        Some("add") => add(&args[3..], session.unwrap_or("default")),
+        Some("rm") => rm(args.get(3).map(String::as_str)),
+        Some("ls") | None => ls(),
+        _ => {
+            eprintln!(
+                "usage: qoro remote add <name> <ssh-target> [--session S]\n\
+                 \x20      qoro remote rm <name>\n\
+                 \x20      qoro remote ls"
+            );
+            std::process::exit(2);
+        }
+    };
+    // Said as a sentence: these are answers to a person at a prompt, not a trace.
+    if let Err(e) = done {
+        eprintln!("qoro: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn refuse(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn add(rest: &[String], session: &str) -> io::Result<()> {
+    let session = session.to_string();
+    let [name, target] = rest else {
+        return Err(refuse(
+            "usage: qoro remote add <name> <ssh-target> [--session S]".into(),
+        ));
+    };
+    if !saved::valid_name(name) {
+        return Err(refuse(format!(
+            "{name:?} cannot be a remote's name: letters, digits, `-`, `_` and `.`, up to 24"
+        )));
+    }
+    if !saved::valid_target(target) {
+        return Err(refuse(format!("{target:?} cannot be an ssh target")));
+    }
+    if !paths::valid_session_name(&session) {
+        return Err(refuse(format!("{session:?} cannot be a session name")));
+    }
+    let file = saved::path();
+    let mut list = saved::load_from(&file)?;
+    if list.iter().any(|r| &r.name == name) {
+        return Err(refuse(format!(
+            "{name} is already added; `qoro remote rm {name}` first to change it"
+        )));
+    }
+    let remote = Remote {
+        name: name.clone(),
+        target: target.clone(),
+        session,
+    };
+    let hello = check(&remote)?;
+    list.push(remote);
+    saved::save_to(&file, &list)?;
+    println!(
+        "added {name}: qoro {} on {}, session {}. its spaces show in `qoro` as {name}:<space>",
+        hello.version,
+        hello.platform,
+        list.last().map(|r| r.session.as_str()).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Reach the remote in the foreground and ask its qoro what it is, refusing one this
+/// build cannot talk to.
+pub fn check(remote: &Remote) -> io::Result<RemoteHello> {
+    let hello = probe(remote)?;
+    match compatibility(&hello) {
+        Ok(Compatibility::AsIs) => {}
+        Ok(Compatibility::NeedsRestart) => eprintln!(
+            "qoro on {} is {}, older than this one: its spaces show as offline until it is \
+             updated there",
+            remote.name, hello.version
+        ),
+        Err(e) => return Err(io::Error::other(format!("{}: {e}", remote.name))),
+    }
+    Ok(hello)
+}
+
+fn probe(remote: &Remote) -> io::Result<RemoteHello> {
+    let mut transport = SshTransport::new(&remote.target);
+    if let Some(path) = qoro_tui::link::control_path() {
+        transport = transport.with_control_path(path);
+    }
+    let argv = transport.argv(&remote_command(&remote.session, "--hello"));
+    // Standard input and error stay with the person: that is where ssh asks, and where it
+    // says why it could not connect.
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answer = text
+        .split_once(RELAY_MARKER)
+        .map(|(_, after)| after.trim())
+        .unwrap_or_default();
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "could not reach qoro on {} (ssh exited with {})",
+            remote.target, out.status
+        )));
+    }
+    serde_json::from_str(answer).map_err(|_| {
+        io::Error::other(format!(
+            "{} answered something that is not qoro: {answer:?}",
+            remote.target
+        ))
+    })
+}
+
+fn rm(name: Option<&str>) -> io::Result<()> {
+    let Some(name) = name else {
+        return Err(refuse("usage: qoro remote rm <name>".into()));
+    };
+    let file = saved::path();
+    let mut list = saved::load_from(&file)?;
+    let before = list.len();
+    list.retain(|r| r.name != name);
+    if list.len() == before {
+        return Err(refuse(format!("there is no remote called {name}")));
+    }
+    saved::save_to(&file, &list)?;
+    println!("removed {name}");
+    Ok(())
+}
+
+fn ls() -> io::Result<()> {
+    let list = saved::load()?;
+    if list.is_empty() {
+        println!("no remotes. `qoro remote add <name> <ssh-target>` adds one");
+    }
+    for r in list {
+        println!("{}  {}  session {}", r.name, r.target, r.session);
+    }
+    Ok(())
+}

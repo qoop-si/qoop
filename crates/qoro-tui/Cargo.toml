@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 qoro-proto = { path = "../qoro-proto" }
 qoro-runtime = { path = "../qoro-runtime" }
+qoro-remote = { path = "../qoro-remote" }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -15,7 +16,7 @@ serde_json = { workspace = true }
 # download. A multiplexer that counts characters where the terminal counts columns puts
 # every wide character one column out.
 unicode-width = "0.2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util", "process", "sync"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -17,10 +17,12 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod saved;
 pub mod ssh;
 pub mod transport;
 
 pub use bootstrap::{Bootstrap, BootstrapError, RemoteShell, marker_command};
+pub use saved::Remote;
 pub use ssh::SshTransport;
 pub use transport::{LocalTransport, RemoteTransport, TransportError};
 

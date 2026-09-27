@@ -479,6 +479,7 @@ dependencies = [
  "qoro-history",
  "qoro-proto",
  "qoro-pty",
+ "qoro-remote",
  "qoro-runtime",
  "qoro-setup",
  "qoro-store",
@@ -680,6 +681,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "qoro-proto",
+ "qoro-remote",
  "qoro-runtime",
  "serde",
  "serde_json",

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 mod avatar;
 mod hooks;
+mod remote;
 mod skills;
 mod update;
 
@@ -37,6 +38,13 @@ fn shell() -> PathBuf {
 
 fn main() -> std::io::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
+    // Asked before the session is taken out of the arguments: a remote opened with no
+    // `--session` opens that machine's default session, not whichever one was last opened
+    // here.
+    let session_given = args
+        .iter()
+        .any(|a| a == "--session" || a == "-s" || a.starts_with("--session="))
+        || std::env::var(paths::SESSION_ENV).is_ok_and(|s| !s.is_empty());
     // Taken out of the arguments before anything reads them, and put into the environment,
     // because the session decides which directory every path in this process resolves
     // against. Held in one place rather than passed down twelve call sites, and inherited
@@ -70,6 +78,8 @@ fn main() -> std::io::Result<()> {
         }
         Some("attach") => run_attach(),
         Some("relay") => run_relay(),
+        Some("remote") => remote::run(&args, session_given.then_some(session.as_str())),
+        Some("--remote") => run_remote(&args, session_given.then_some(session.as_str())),
         Some("send") => run_send(&args),
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
@@ -99,6 +109,11 @@ fn main() -> std::io::Result<()> {
                  \x20 qoro daemon     run the daemon in the foreground\n\
                  \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
+                 \x20 qoro --remote <name|ssh-target>  the interface for another machine's qoro\n\
+                 \x20 qoro remote add <name> <ssh-target> [--session S]  show that\n\
+                 \x20                 machine's spaces in `qoro`, beside this one's\n\
+                 \x20 qoro remote rm <name>  stop showing them\n\
+                 \x20 qoro remote ls  the remotes added\n\
                  \x20 qoro setup ...  capture, inspect, trust and run a Setup\n\
                    \x20 qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
@@ -212,7 +227,63 @@ fn run_client() -> std::io::Result<()> {
             agents.join(", ")
         )),
     };
-    rt.block_on(qoro_tui::run_with_notice(&socket, notice))
+    // With remotes added, their spaces are listed beside this machine's. Without any, the
+    // interface talks to the daemon directly, exactly as it always has.
+    match qoro_remote::saved::load() {
+        Ok(remotes) if !remotes.is_empty() => {
+            rt.block_on(qoro_tui::mux::run(Some(&socket), remotes, notice))
+        }
+        Ok(_) => rt.block_on(qoro_tui::run_with_notice(&socket, notice)),
+        Err(e) => {
+            let broken = format!("remotes not loaded: {e}");
+            let notice = Some(match notice {
+                Some(hooks) => format!("{broken}; {hooks}"),
+                None => broken,
+            });
+            rt.block_on(qoro_tui::run_with_notice(&socket, notice))
+        }
+    }
+}
+
+/// `qoro --remote <name|target>`: the interface for another machine's qoro alone.
+///
+/// A name added with `qoro remote add` brings its own target and session; anything else is
+/// an ssh target, opened in the session given with `--session`, else that machine's
+/// default. It goes through the same connection the interface keeps for added remotes, so
+/// a dropped connection comes back on its own rather than ending the interface.
+fn run_remote(args: &[String], session: Option<&str>) -> std::io::Result<()> {
+    let Some(what) = args.get(2) else {
+        eprintln!("usage: qoro --remote <name|ssh-target> [--session S]");
+        std::process::exit(2);
+    };
+    let added = qoro_remote::saved::load()?
+        .into_iter()
+        .find(|r| &r.name == what);
+    let remote = match added {
+        Some(mut remote) => {
+            if let Some(session) = session {
+                remote.session = session.to_string();
+            }
+            remote
+        }
+        None if qoro_remote::saved::valid_target(what) => qoro_remote::Remote {
+            name: what.clone(),
+            target: what.clone(),
+            session: session.unwrap_or("default").to_string(),
+        },
+        None => {
+            eprintln!("qoro: {what:?} is neither an added remote nor an ssh target");
+            std::process::exit(2);
+        }
+    };
+    // In the foreground first, where ssh can ask whatever it needs to, and where a remote
+    // without qoro says so before the screen is taken over.
+    if let Err(e) = remote::check(&remote) {
+        eprintln!("qoro: {e}");
+        std::process::exit(1);
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(qoro_tui::mux::run(None, vec![remote], None))
 }
 
 /// Attach to one terminal, with no interface around it.

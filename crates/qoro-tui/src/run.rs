@@ -896,10 +896,36 @@ fn focused_cwd(state: &State) -> Option<String> {
         .find(|r| r.terminal == state.focused)?
         .cwd
         .clone()?;
-    (!cwd.is_empty()
-        && std::path::Path::new(&cwd).is_absolute()
-        && std::path::Path::new(&cwd).is_dir())
-    .then_some(cwd)
+    // A remote terminal's directory is on its own machine, so this one cannot check it;
+    // the mux carries it only to that same machine.
+    let here = crate::mux::is_remote_terminal(state.focused) || std::path::Path::new(&cwd).is_dir();
+    (!cwd.is_empty() && std::path::Path::new(&cwd).is_absolute() && here).then_some(cwd)
+}
+
+/// The numbered name a space gets when nobody names it.
+///
+/// Counted among the spaces of the machine on screen, and on a remote prefixed with its
+/// name, which is also what makes the new space over there: `ctrl-a w` in `devbox:api`
+/// makes `devbox:space 3`, not a local space.
+fn next_space_name(state: &State) -> String {
+    let remote = state
+        .space
+        .filter(|s| crate::mux::is_remote_workspace(*s))
+        .and_then(|s| state.spaces.iter().find(|w| w.id == s))
+        .and_then(|w| w.name.split_once(':'))
+        .map(|(prefix, _)| prefix.to_string());
+    let same = |w: &&qoro_runtime::control::WorkspaceRow| match &remote {
+        Some(prefix) => {
+            crate::mux::is_remote_workspace(w.id)
+                && w.name.split_once(':').is_some_and(|(p, _)| p == prefix)
+        }
+        None => !crate::mux::is_remote_workspace(w.id),
+    };
+    let n = state.spaces.iter().filter(same).count() + state.creating + 1;
+    match remote {
+        Some(prefix) => format!("{prefix}:space {n}"),
+        None => format!("space {n}"),
+    }
 }
 
 /// Run one menu row: prompts, messages and state changes happen here, and the
@@ -1372,6 +1398,15 @@ pub async fn run(socket: &Path) -> io::Result<()> {
 /// hook is still read from its screen.
 pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Result<()> {
     let (stream, leftover) = client::connect(socket, "qoro-tui").await?;
+    run_stream(stream, leftover, notice).await
+}
+
+/// The interface over a connection that has already done its handshake: a local socket,
+/// an `ssh` running `qoro relay`, or the mux that puts several daemons behind one stream.
+pub async fn run_stream<S>(stream: S, leftover: BytesMut, notice: Option<String>) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let guard = TerminalGuard::enter_raw()?;
     // A panic must not leave the outer terminal raw either, which is the one failure a
     // person cannot recover from without knowing that `qoro reset` exists.
@@ -1387,12 +1422,11 @@ pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Resul
     outcome
 }
 
-async fn drive(
-    stream: tokio::net::UnixStream,
-    leftover: BytesMut,
-    notice: Option<String>,
-) -> io::Result<()> {
-    let (mut rd, mut wr) = stream.into_split();
+async fn drive<S>(stream: S, leftover: BytesMut, notice: Option<String>) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
     let (cols, lines) = client::outer_size();
     let mut state = State {
         rows: Vec::new(),
@@ -1722,7 +1756,7 @@ async fn drive(
                     let Some(bytes) = typed else { return Ok(()) };
                     // Ahead of the keystroke itself: a resize behind the input
                     // loses the race with the shell reading it.
-                    drain_adopt_resize(&mut state, &mut seqs, &mut wr, &mut dirty).await?;
+                    drain_adopt_resize(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     // The palette owns the keyboard while it is open: typing filters,
                     // enter goes, esc is back. A prefix or a detach inside it closes
                     // the palette and the bytes from there on are ordinary input, so
@@ -1892,12 +1926,7 @@ async fn drive(
                                         id: format!("space-{request}"),
                                         // Empty means "you name it", which is the numbered
                                         // name this counted before anybody was asked.
-                                        name: name.unwrap_or_else(|| {
-                                            format!(
-                                                "space {}",
-                                                state.spaces.len() + state.creating + 1
-                                            )
-                                        }),
+                                        name: name.unwrap_or_else(|| next_space_name(&state)),
                                     },
                                 };
                                 if matches!(what, Naming::Space) {
@@ -3176,7 +3205,7 @@ async fn drain_pending_focus(
         wr.write_all(&bytes).await?;
         *dirty = true;
     }
-    drain_adopt_resize(state, seqs, wr, dirty).await
+    drain_adopt_resize(state, control_seq, seqs, wr, dirty).await
 }
 
 /// Size an adopted child to this pane, once.
@@ -3185,14 +3214,23 @@ async fn drain_pending_focus(
 /// sized for whoever had it before. Runs everywhere a write is in hand, and
 /// ahead of typed input: a resize behind the keystroke loses the race with
 /// the shell reading it.
+///
+/// The adopted terminal is subscribed here too, rather than left to the daemon's habit of
+/// subscribing a new connection to its lowest terminal: behind the mux the adopted one can
+/// be on another machine, where nothing subscribes it, and locally subscribing twice is
+/// one set insert.
 async fn drain_adopt_resize(
     state: &mut State,
+    control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
     wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     dirty: &mut bool,
 ) -> std::io::Result<()> {
     if state.adopted_resize {
         state.adopted_resize = false;
+        if let Some(subscribe) = sync_subs(state, control_seq)? {
+            wr.write_all(&subscribe).await?;
+        }
         if let Some(resize) = resize_focused_to_tile(state, seqs)? {
             wr.write_all(&resize).await?;
             *dirty = true;
@@ -3641,7 +3679,33 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // them it is a screen a person has to know a key to escape from. Ending is what
             // every multiplexer does when its last window closes, and the daemon stays: it
             // is the client that goes.
-            state.done = state.adopted && agents.is_empty();
+            // Nothing focused, nothing on its way, and the space on screen has a tab: that
+            // tab, through the subscribing path. This is what brings the keyboard back to a
+            // remote space when its host reconnects, and a tab that appears in the empty
+            // space a person is looking at is theirs to see. A sleeping row has no process
+            // behind it to type into.
+            if state.adopted
+                && state.focused == 0
+                && state.pending_focus.is_none()
+                && let Some(space) = state.space
+            {
+                state.pending_focus = agents
+                    .iter()
+                    .find(|r| {
+                        r.workspace == space
+                            && !state.panes.contains(&r.terminal)
+                            && r.state != "sleeping"
+                    })
+                    .map(|r| r.terminal);
+            }
+            // A remote that is connecting or offline is still somewhere to be: its space is
+            // listed, and it comes back on its own.
+            state.done = state.adopted
+                && agents.is_empty()
+                && !state
+                    .spaces
+                    .iter()
+                    .any(|w| crate::mux::is_remote_workspace(w.id));
 
             // A terminal that has just started needing a person. The bell is the local
             // notification: it is what the person's own terminal emulator turns into a
@@ -3848,6 +3912,11 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Failed { id, reason, .. } => {
+            // A space that was refused is not coming: it no longer counts toward the next
+            // numbered name.
+            if id.starts_with("space-") {
+                state.creating = state.creating.saturating_sub(1);
+            }
             // A split whose spawn failed rolls its tree entry back where it
             // was asked for: one failure must not clear another space's
             // split still on its way, and a rollback on screen only would
@@ -5182,5 +5251,113 @@ mod tests {
             state.message, None,
             "an old daemon would shout on every index"
         );
+    }
+
+    const R1: i64 = 1 << 40;
+
+    /// A remote that is offline has no terminals but is still somewhere to be: the
+    /// interface stays open for it to come back, where without one it would end.
+    #[test]
+    fn an_offline_remote_keeps_the_interface_open_and_nothing_else_does() {
+        let mut state = state();
+        state.adopted = true;
+        state.spaces = vec![space(1, "space 1"), space(R1 | 1, "devbox:work (offline)")];
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "mux".into(),
+                agents: vec![],
+            },
+            &mut dirty,
+        );
+        assert!(!state.done, "an offline remote ended the interface");
+        state.spaces = vec![space(1, "space 1")];
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".into(),
+                agents: vec![],
+            },
+            &mut dirty,
+        );
+        assert!(
+            state.done,
+            "with nothing anywhere the interface ends as it always has"
+        );
+    }
+
+    /// The keyboard comes back when a remote reconnects: nothing focused, the space on
+    /// screen is the remote one, and its terminal is listed again.
+    #[test]
+    fn a_terminal_back_in_the_space_on_screen_takes_the_keyboard() {
+        let mut state = state();
+        state.adopted = true;
+        state.focused = 0;
+        state.space = Some(R1 | 1);
+        let remote = crate::mux::REMOTE_TERMINAL | 1 << 24 | 3;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "mux".into(),
+                agents: vec![
+                    agent(1, 1, "zsh", "idle"),
+                    agent(remote, R1 | 1, "claude", "idle"),
+                ],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, Some(remote));
+
+        // A sleeping row has nothing behind it to type into.
+        let mut state = self::state();
+        state.adopted = true;
+        state.focused = 0;
+        state.space = Some(R1 | 1);
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "mux".into(),
+                agents: vec![agent(remote, R1 | 1, "claude", "sleeping")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.pending_focus, None);
+    }
+
+    /// An unnamed space is counted among the spaces of the machine on screen and, on a
+    /// remote, carries its prefix, which is what makes it over there.
+    #[test]
+    fn an_unnamed_space_is_numbered_and_placed_on_the_machine_on_screen() {
+        let mut state = state();
+        state.spaces = vec![
+            space(1, "space 1"),
+            space(2, "space 2"),
+            space(R1 | 1, "devbox:work"),
+        ];
+        state.space = Some(1);
+        assert_eq!(next_space_name(&state), "space 3");
+        state.space = Some(R1 | 1);
+        assert_eq!(next_space_name(&state), "devbox:space 2");
+        state.creating = 1;
+        assert_eq!(next_space_name(&state), "devbox:space 3");
+    }
+
+    /// A refused new space stops counting toward the next name.
+    #[test]
+    fn a_refused_space_no_longer_counts() {
+        let mut state = state();
+        state.creating = 1;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: "space-4".into(),
+                reason: "devbox is offline".into(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.creating, 0);
     }
 }
