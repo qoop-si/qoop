@@ -39,7 +39,9 @@
 # state alone.
 #
 # Event map:
-#   SessionStart, SubagentStop -> working, no event
+#   SessionStart -> working, no event
+#   anything a subagent fired (the payload carries `agent_id`, SubagentStop
+#     always does) -> nothing: it describes the subagent, not this terminal
 #   UserPromptSubmit -> working + `--event user` (prompt head, best-effort)
 #   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
 #     the first file-ish `tool_input` field, a command's description before
@@ -96,7 +98,12 @@ except Exception:
     raise SystemExit(0)
 
 name = payload.get("hook_event_name") or ""
-if name in ("SessionStart", "SubagentStop"):
+# A subagent's tool calls and its end are not this terminal's turn. Reported, a
+# background agent finishing after the turn ended put the tab back to working,
+# and the screen's idle composer took it away again a moment later.
+if payload.get("agent_id"):
+    raise SystemExit(0)
+if name == "SessionStart":
     state, flags, event, label = "working", "--visible-working", "", ""
 elif name == "UserPromptSubmit":
     state, flags, event = "working", "--visible-working", "user"

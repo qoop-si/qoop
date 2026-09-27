@@ -1292,6 +1292,55 @@ mod tests {
         }
     }
 
+    /// What a subagent fires describes the subagent: its tool calls and its end would
+    /// otherwise put a tab whose own turn is over back to working.
+    #[test]
+    fn the_claude_hook_reports_nothing_for_a_subagent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("qoro-hook.sh");
+        std::fs::write(&script, target("claude").body).expect("write");
+        let log = dir.path().join("reports");
+        let fake = dir.path().join("qoro");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let report = |payload: &str| -> String {
+            let _ = std::fs::remove_file(&log);
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QORO_TERMINAL", "1")
+                .env("QORO_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        for payload in [
+            r#"{"hook_event_name":"SubagentStop","agent_id":"def456","agent_type":"Explore"}"#,
+            r#"{"hook_event_name":"PreToolUse","agent_id":"def456","tool_name":"Bash"}"#,
+            r#"{"hook_event_name":"PostToolUse","agent_id":"def456","tool_name":"Read"}"#,
+        ] {
+            let said = report(payload);
+            assert!(said.is_empty(), "{payload} reported {said:?}");
+        }
+        // The main thread's own tool call still reports.
+        let said = report(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#);
+        assert!(said.contains("--state working"), "{said:?}");
+    }
+
     /// A configuration that is not JSON is reported, not overwritten.
     #[test]
     fn a_file_that_cannot_be_read_is_left_exactly_as_it_is() {
