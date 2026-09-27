@@ -33,7 +33,7 @@ pub struct Frame<'a> {
     pub space: Option<i64>,
     /// Split panes hidden from the top tab bar. Sub-terminals inside their
     /// tab, still listed in the sidebar when an agent runs in them.
-    pub panes: &'a std::collections::BTreeSet<u32>,
+    pub panes: std::collections::BTreeSet<u32>,
     pub focused: u32,
     /// The focused terminal's last snapshot. `None` before the first one arrives, which is
     /// a real state: a terminal that has produced nothing yet has nothing to draw.
@@ -1987,7 +1987,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2039,7 +2039,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2085,7 +2085,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -2137,7 +2137,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &panes,
+            panes,
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2190,7 +2190,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2245,7 +2245,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &panes,
+            panes: panes.clone(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -2291,7 +2291,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2383,7 +2383,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2427,7 +2427,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2477,7 +2477,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2529,7 +2529,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2593,7 +2593,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2656,7 +2656,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2707,7 +2707,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -2756,7 +2756,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -2806,7 +2806,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -2851,7 +2851,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -3029,7 +3029,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -3074,7 +3074,7 @@ mod tests {
             let painted = paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -3139,7 +3139,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3197,7 +3197,7 @@ mod tests {
             paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -3266,7 +3266,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &wide,
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3353,7 +3353,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3418,7 +3418,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3464,7 +3464,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3507,7 +3507,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3556,7 +3556,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &wide,
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 0,
             snapshot: None,
@@ -3601,7 +3601,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -3683,7 +3683,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -3761,7 +3761,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -3875,7 +3875,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3937,7 +3937,7 @@ mod tests {
             paint(&Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -3988,7 +3988,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4048,7 +4048,7 @@ mod tests {
         let painted = paint(&Frame {
             rows: &rows,
             spaces: &spaces(),
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4198,7 +4198,7 @@ mod tests {
         paint(&Frame {
             rows,
             spaces,
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused,
             snapshot: focused_snap,
@@ -4237,7 +4237,7 @@ mod tests {
         let legacy = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -4267,7 +4267,7 @@ mod tests {
         let tiled = paint(&Frame {
             rows: &rows,
             spaces: &spaces,
-            panes: &std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeSet::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -4322,7 +4322,7 @@ mod tests {
         let frame_of = |notice: Option<&'static str>| Frame {
             rows: &rows,
             spaces: &spaces,
-            panes: &panes,
+            panes: panes.clone(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -4509,7 +4509,7 @@ mod tests {
             &Frame {
                 rows: &rows,
                 spaces: &spaces(),
-                panes: &std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeSet::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -4564,7 +4564,7 @@ mod tests {
         let frame = |focused| Frame {
             rows: &rows,
             spaces: &spaces,
-            panes: &panes,
+            panes: panes.clone(),
             space: Some(1),
             focused,
             snapshot: None,

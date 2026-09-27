@@ -934,3 +934,181 @@ async fn two_tabs_in_one_directory_resume_distinct_conversations() {
 
     qoro_detect::reload_overrides(std::path::Path::new("/nonexistent-qoro-overrides"));
 }
+
+fn leaf(terminal: u32) -> qoro_runtime::control::Pane {
+    qoro_runtime::control::Pane::Leaf { terminal }
+}
+
+fn beside(
+    first: qoro_runtime::control::Pane,
+    second: qoro_runtime::control::Pane,
+) -> qoro_runtime::control::Pane {
+    qoro_runtime::control::Pane::Split {
+        dir: qoro_runtime::control::SplitDir::V,
+        permille: 500,
+        first: Box::new(first),
+        second: Box::new(second),
+    }
+}
+
+/// A tab split into four comes back as one tab with four panes, not as four tabs.
+///
+/// The incident this gate is for: four agents in one tab, a restart, four tabs.
+#[tokio::test]
+async fn a_restart_brings_a_split_tab_back_as_one_tree() {
+    let dir = runtime_dir();
+    let tree = with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        let first = terminals.streams()[0];
+        let mut panes = vec![first];
+        for _ in 0..3 {
+            let pane = terminals.mint();
+            store
+                .create_terminal(pane as i64, workspace, "/tmp".into(), "/bin/sh".into())
+                .await
+                .expect("a row");
+            panes.push(pane);
+        }
+        let tree = beside(
+            beside(leaf(panes[0]), leaf(panes[1])),
+            beside(leaf(panes[2]), leaf(panes[3])),
+        );
+        terminals
+            .set_split(tree.clone(), &store)
+            .await
+            .expect("recorded");
+        tree
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        assert!(
+            until(|| terminals.streams().len() == 4).await,
+            "four panes, not {:?}",
+            terminals.streams()
+        );
+        assert_eq!(terminals.live_splits(&terminals.streams()), vec![tree]);
+    })
+    .await;
+}
+
+/// A pane that did not come back is cut out of its tree on disk, not only in the listing,
+/// so no later terminal that happens to get its number is pulled into the tab.
+#[tokio::test]
+async fn a_restart_cuts_a_pane_that_did_not_come_back_out_of_the_stored_tree() {
+    let dir = runtime_dir();
+    let kept = with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let workspace = daemon.workspace();
+        let first = terminals.streams()[0];
+        let mut panes = vec![first];
+        for _ in 0..2 {
+            let pane = terminals.mint();
+            store
+                .create_terminal(pane as i64, workspace, "/tmp".into(), "/bin/sh".into())
+                .await
+                .expect("a row");
+            panes.push(pane);
+        }
+        terminals
+            .set_split(
+                beside(leaf(panes[0]), beside(leaf(panes[1]), leaf(panes[2]))),
+                &store,
+            )
+            .await
+            .expect("recorded");
+        // Closed while the daemon runs: the row stays, as closed.
+        store.close_terminal(panes[2] as i64).await.expect("closed");
+        beside(leaf(panes[0]), leaf(panes[1]))
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let store = daemon.store();
+        let stored = store.splits().await.expect("splits");
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        let tree: qoro_runtime::control::Pane = serde_json::from_str(&stored[0]).expect("a tree");
+        assert_eq!(tree, kept, "the dead pane is still on disk");
+    })
+    .await;
+}
+
+/// Over the wire: a recorded split rides the index, and a closed pane leaves it.
+#[tokio::test]
+async fn a_recorded_split_rides_the_index_until_a_pane_closes() {
+    use qoro_runtime::control::ControlResponse;
+    let d = qoro_testkit::TestDaemon::start().await;
+    let first = d.terminals().streams()[0];
+    let mut client = d.attach("splitter").await;
+    let Some(ControlResponse::TerminalCreated {
+        terminal: second, ..
+    }) = client
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "split-1".into(),
+                cwd: None,
+                workspace: None,
+                name: None,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    else {
+        panic!("no terminal for the split");
+    };
+    let tree = beside(leaf(first), leaf(second));
+    assert!(matches!(
+        client
+            .control(
+                &ControlRequest::SetSplit {
+                    id: "tree-1".into(),
+                    tree: tree.clone(),
+                },
+                qoro_testkit::PATIENCE,
+            )
+            .await,
+        Some(ControlResponse::SplitSaved { .. })
+    ));
+    let Some(ControlResponse::Agents { splits, .. }) = client
+        .control(
+            &ControlRequest::ListAgents {
+                id: "index-1".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    else {
+        panic!("no index");
+    };
+    assert_eq!(splits, vec![tree]);
+
+    client
+        .control(
+            &ControlRequest::CloseTerminal {
+                id: "close-1".into(),
+                terminal: second,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+        .expect("closed");
+    // The answer comes before the teardown finishes; the index follows the registry.
+    let registry = d.terminals();
+    assert!(until(|| !registry.streams().contains(&second)).await);
+    let Some(ControlResponse::Agents { splits, .. }) = client
+        .control(
+            &ControlRequest::ListAgents {
+                id: "index-2".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    else {
+        panic!("no index");
+    };
+    assert!(splits.is_empty(), "a tree of one is a tab: {splits:?}");
+}

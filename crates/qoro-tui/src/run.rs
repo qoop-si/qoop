@@ -209,21 +209,35 @@ struct State {
     /// set of the space on screen: over-subscribing spends daemon and client
     /// work on output nobody sees.
     subs: std::collections::BTreeSet<u32>,
-    /// One tiling tree per space. Spaces without an entry show a single pane.
+    /// The tiling tree on screen, per space. Spaces without an entry show a single pane.
     layouts: std::collections::BTreeMap<i64, Layout>,
-    /// Terminals created as split panes, hidden from the top tab bar.
-    /// A split is a sub-terminal inside its tab, never a new tab. Agents
-    /// in panes still list in the sidebar. Filled on `TerminalCreated`
-    /// with a `split-` id, cleared on close/prune/detach. Client-local like
-    /// layouts: a second client or a reconnect sees these terminals as
-    /// ordinary tabs until splits are made again.
-    panes: std::collections::BTreeSet<u32>,
-    /// Where each outstanding split was asked for, by request id. A split
-    /// answer carries no workspace, and the space on screen may have moved
-    /// since the request: without this the bind lands in the wrong tree or
-    /// the placeholder leaks and blocks every later split. Consumed by the
+    /// The other tabs' trees, per space. A tab is a tree: moving to another tab
+    /// parks the one on screen here rather than dropping it, and coming back
+    /// takes it out again. See `activate`.
+    ///
+    /// Which terminals are panes is not stored: a pane is any leaf after the
+    /// first of a tree on screen or parked, and the first is its tab
+    /// (`is_pane`). Agents in panes still list in the sidebar.
+    parked: std::collections::BTreeMap<i64, Vec<Layout>>,
+    /// Trees to record with the daemon, queued where the change happened and
+    /// sent at the top of the loop. Only a person's own split or detach queues
+    /// one: pruning and adopting never write, so a stale index or a remote that
+    /// reconnects cannot overwrite what is on disk.
+    split_writes: Vec<qoro_runtime::control::Pane>,
+    /// Recordings sent and not yet answered. While any is out, trees in the
+    /// index may predate it and are not adopted.
+    split_saving: usize,
+    /// A tree came on screen outside a focus change (adopted from the index), so
+    /// the loop owes the daemon a subscription sync and a resize.
+    resync: bool,
+    /// Where each outstanding split was asked for, by request id: the space
+    /// and the pane that was split. A split answer carries no workspace, and
+    /// the space on screen may have moved since the request, or the tree may
+    /// have been parked while another tab of the space has a split of its own
+    /// on the way: without this the bind lands in the wrong tree or the
+    /// placeholder leaks and blocks every later split. Consumed by the
     /// `TerminalCreated`/`Failed` answer.
-    split_origin: std::collections::BTreeMap<String, i64>,
+    split_origin: std::collections::BTreeMap<String, (i64, u32)>,
     cols: u16,
     lines: u16,
     message: Option<String>,
@@ -470,7 +484,7 @@ impl State {
             rows: &self.rows,
             spaces: &self.spaces,
             space: self.space,
-            panes: &self.panes,
+            panes: self.panes(),
             focused: self.focused,
             snapshot: self.snapshot.as_ref(),
             cols: self.cols,
@@ -508,10 +522,31 @@ impl State {
     /// Split panes are sub-terminals inside their tab, never top tabs, so
     /// they are filtered here. Agents in panes still list in the sidebar.
     fn tabs(&self) -> Vec<AgentRow> {
+        let panes = self.panes();
         screen::in_space(&self.rows, self.space)
             .into_iter()
-            .filter(|r| !self.panes.contains(&r.terminal))
+            .filter(|r| !panes.contains(&r.terminal))
             .collect()
+    }
+
+    /// Every terminal that is a pane inside somebody's tab. See `is_pane`.
+    fn panes(&self) -> std::collections::BTreeSet<u32> {
+        self.trees()
+            .flat_map(|tree| tree.leaves().into_iter().skip(1))
+            .collect()
+    }
+
+    /// Every tree this client holds, on screen and parked, in every space.
+    fn trees(&self) -> impl Iterator<Item = &Layout> {
+        self.layouts.values().chain(self.parked.values().flatten())
+    }
+
+    /// Whether a terminal is a pane inside somebody's tab rather than a tab:
+    /// a leaf after the first of a tree. The first leaf is the tab, so when it
+    /// closes the next one takes the tab's place on the bar.
+    fn is_pane(&self, terminal: u32) -> bool {
+        self.trees()
+            .any(|tree| tree.leaves().iter().skip(1).any(|t| *t == terminal))
     }
 
     /// What a click at a one based screen position means.
@@ -1308,7 +1343,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                 } else {
                     *request += 1;
                     if let Some(s) = space {
-                        state.split_origin.insert(format!("split-{request}"), s);
+                        state
+                            .split_origin
+                            .insert(format!("split-{request}"), (s, focused));
                     }
                     MenuSend::Control(ControlRequest::CreateTerminal {
                         id: format!("split-{request}"),
@@ -2541,7 +2578,10 @@ where
         img_size: (0, 0),
         subs: std::collections::BTreeSet::new(),
         layouts: std::collections::BTreeMap::new(),
-        panes: std::collections::BTreeSet::new(),
+        parked: std::collections::BTreeMap::new(),
+        split_writes: Vec::new(),
+        split_saving: 0,
+        resync: false,
         split_origin: std::collections::BTreeMap::new(),
         cols,
         lines,
@@ -2711,6 +2751,31 @@ where
 
     let outcome: io::Result<()> = async {
         loop {
+            // Splits a person made or took apart since the last turn, recorded so a
+            // restart brings the tab back whole. Queued wherever the change was made,
+            // sent here, where there is always a write in hand.
+            for tree in std::mem::take(&mut state.split_writes) {
+                request += 1;
+                state.split_saving += 1;
+                wr.write_all(&client::encode_control_seq(
+                    &ControlRequest::SetSplit {
+                        id: format!("tree-{request}"),
+                        tree,
+                    },
+                    &mut control_seq,
+                )?)
+                .await?;
+            }
+            // A tree came on screen where nothing could write (the index, a bootstrap):
+            // its other tiles still need their subscriptions. Only those: the focused
+            // tile's size goes out with the caller's own resize or `adopted_resize`,
+            // and a second resize of the same size is a nudge the child can see.
+            if std::mem::take(&mut state.resync)
+                && let Some(sync) = sync_subs(&mut state, &mut control_seq)?
+            {
+                wr.write_all(&sync).await?;
+                dirty = true;
+            }
             // At most one frame per `FRAME`. The first render after a quiet spell goes out
             // at once, so a keystroke echoes with no added wait; renders arriving closer
             // together than that wait for the timer arm below and go out as one frame.
@@ -3890,7 +3955,7 @@ where
                                         // answers, rollback when it fails.
                                         request += 1;
                                         if let Some(s) = space {
-                                            state.split_origin.insert(format!("split-{request}"), s);
+                                            state.split_origin.insert(format!("split-{request}"), (s, focused));
                                         }
                                         wr.write_all(&client::encode_control_seq(
                                             &ControlRequest::CreateTerminal {
@@ -3970,8 +4035,11 @@ where
                                 {
                                     Some(layout) if layout.leaf_count() > 1 => {
                                         layout.remove(focused);
-                                        // Detached panes become real tabs again.
-                                        state.panes.remove(&focused);
+                                        // Out of the tree is a tab again. Recorded as
+                                        // the tree that is left: a lone leaf clears it.
+                                        if let Some(tree) = layout.to_pane() {
+                                            state.split_writes.push(tree);
+                                        }
                                         Some(layout.focus)
                                     }
                                     _ => None,
@@ -4061,10 +4129,12 @@ where
                                         state.focused = terminal;
                                         state.snapshot = Some(snapshot);
                                         state.message = None;
-                                        // Bootstrap the tiling state to match: one pane, one
-                                        // subscription.
+                                        // Bootstrap the tiling state to match: the tree this
+                                        // terminal is in (one pane unless the index already
+                                        // brought its tab's split), and its subscription.
+                                        // `activate` owes the other panes theirs.
                                         if let Some(space) = state.space {
-                                            state.layouts.insert(space, Layout::single(terminal));
+                                            activate(&mut state, space, terminal);
                                             state.subs.insert(terminal);
                                         }
                                         // And the size to match: the child was sized for
@@ -4111,6 +4181,9 @@ where
                                         | ControlResponse::WorkspaceCreated { .. }
                                         | ControlResponse::WorkspaceClosed { .. }
                                         | ControlResponse::Renamed { .. }
+                                        // The mux holds merged lists back until the
+                                        // link answers again; this is that question.
+                                        | ControlResponse::SplitSaved { .. }
                                 );
                                 refresh_spaces |= matches!(
                                     response,
@@ -4719,26 +4792,156 @@ fn focused_rect(state: &State) -> layout::Rect {
         .unwrap_or(area)
 }
 
+/// Where the split asked for by `id` is waiting: its space, and which of that
+/// space's trees (`None` for the one on screen, else the parked index). The
+/// tree is the one holding the pane that was split, since it may have been
+/// parked since and another tab of the space may have a split pending too. An
+/// answer with no record falls back to the space on screen.
+fn split_home(state: &mut State, id: &str) -> Option<(i64, Option<usize>)> {
+    let (space, split) = match state.split_origin.remove(id) {
+        Some((space, split)) => (space, Some(split)),
+        None => (state.space?, None),
+    };
+    let waits = |layout: &Layout| layout.has_pending() && split.is_none_or(|t| layout.contains(t));
+    if state.layouts.get(&space).is_some_and(waits) {
+        return Some((space, None));
+    }
+    let at = state.parked.get(&space)?.iter().position(waits)?;
+    Some((space, Some(at)))
+}
+
+/// The tree `split_home` named.
+fn tree_at(state: &mut State, space: i64, at: Option<usize>) -> Option<&mut Layout> {
+    match at {
+        None => state.layouts.get_mut(&space),
+        Some(at) => state.parked.get_mut(&space)?.get_mut(at),
+    }
+}
+
+/// Take the terminals `gone` names out of every tree, on screen and parked.
+///
+/// A leaf nobody can focus is a zombie pane. A tree on screen left with no
+/// leaves and no pending split goes, so the next focus reseeds a single pane;
+/// a parked tree left with one leaf goes too, and that leaf is a tab again.
+/// Never writes to the daemon: what is gone is gone there already.
+fn prune_trees(state: &mut State, gone: impl Fn(u32) -> bool) {
+    let State {
+        layouts, parked, ..
+    } = &mut *state;
+    for layout in layouts.values_mut().chain(parked.values_mut().flatten()) {
+        for terminal in layout.leaves().into_iter().filter(|t| gone(*t)) {
+            layout.remove(terminal);
+        }
+    }
+    layouts.retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+    for trees in parked.values_mut() {
+        trees.retain(|layout| layout.leaf_count() > 1 || layout.has_pending());
+    }
+}
+
+/// Take the index's split trees for tabs this client holds no split of.
+///
+/// A client that already has a split over any of the same terminals keeps its
+/// own: it made or adopted it, and it writes every change it makes. A tree of
+/// one pane is not a split and yields, which is what lets a restart's first
+/// render (a single pane) grow back into its tab. Nothing is adopted while a
+/// recording is out: the index may predate it.
+fn adopt_splits(state: &mut State, agents: &[AgentRow], splits: Vec<qoro_runtime::control::Pane>) {
+    if state.split_saving > 0 {
+        return;
+    }
+    let space_of = |t: u32| agents.iter().find(|r| r.terminal == t).map(|r| r.workspace);
+    for tree in splits {
+        let Some(tree) = tree.retain(&|t| space_of(t).is_some()) else {
+            continue;
+        };
+        let leaves = tree.leaves();
+        let Some(space) = space_of(leaves[0]) else {
+            continue;
+        };
+        let held = state.trees().any(|layout| {
+            (layout.leaf_count() > 1 || layout.has_pending())
+                && layout.leaves().iter().any(|t| leaves.contains(t))
+        });
+        if leaves.len() < 2 || held || leaves.iter().any(|t| space_of(*t) != Some(space)) {
+            continue;
+        }
+        state
+            .parked
+            .entry(space)
+            .or_default()
+            .push(Layout::from_pane(&tree));
+        // The single pane on screen is one of its terminals: the tab takes its place.
+        if let Some(focus) = state
+            .layouts
+            .get(&space)
+            .map(|layout| layout.focus)
+            .filter(|f| leaves.contains(f))
+        {
+            state.layouts.remove(&space);
+            activate(state, space, focus);
+            // The focused tile just shrank into its split.
+            state.adopted_resize = true;
+        }
+    }
+}
+
+/// Put the tree holding `to` on screen in `space`, with the keyboard in `to`.
+///
+/// The one place a tab switch changes trees. The tree on screen is parked when
+/// it is a split (or one is on its way), never dropped: dropping it is what
+/// left a split tab's panes on no tab and in no tree after moving away. A
+/// terminal in no tree gets a tree of its own.
+fn activate(state: &mut State, space: i64, to: u32) {
+    if let Some(layout) = state.layouts.get_mut(&space)
+        && layout.focus_terminal(to)
+    {
+        return;
+    }
+    let parked = state.parked.entry(space).or_default();
+    let mut next = match parked.iter().position(|tree| tree.contains(to)) {
+        Some(at) => parked.remove(at),
+        None => Layout::single(to),
+    };
+    next.focus_terminal(to);
+    // Other tiles came on screen, and a caller without a write in hand (the
+    // index, a bootstrap) cannot subscribe to them: the loop does, next turn.
+    state.resync = true;
+    if let Some(old) = state.layouts.insert(space, next)
+        && (old.leaf_count() > 1 || old.has_pending())
+    {
+        state.parked.entry(space).or_default().push(old);
+    }
+}
+
 /// Make sure the space on screen has a tiling tree, seeding a single pane
 /// from the focused terminal (or the first tab) when it has none.
-fn ensure_layout(state: &mut State) {
+///
+/// Answers whether a split came on screen, which changes the focused tile's
+/// size: a caller with no write in hand owes the resize (`adopted_resize`).
+fn ensure_layout(state: &mut State) -> bool {
     let Some(space) = state.space else {
-        return;
+        return false;
     };
     if state.layouts.contains_key(&space) {
-        return;
+        return false;
     }
-    let tabs = state.tabs();
-    let seed = tabs
+    // The focused terminal even when it is a pane: `activate` brings its tab.
+    let seed = state
+        .rows
         .iter()
-        .find(|r| r.terminal == state.focused)
-        .or_else(|| tabs.first())
+        .find(|r| r.terminal == state.focused && r.workspace == space)
         .map(|r| r.terminal)
+        .or_else(|| state.tabs().first().map(|r| r.terminal))
         .unwrap_or(0);
     if seed == 0 {
-        return;
+        return false;
     }
-    state.layouts.insert(space, Layout::single(seed));
+    activate(state, space, seed);
+    state
+        .layouts
+        .get(&space)
+        .is_some_and(|l| l.leaf_count() > 1)
 }
 
 /// The terminals this client receives renders for: the visible set of the
@@ -4911,17 +5114,10 @@ fn focus(
         .find(|r| r.terminal == to)
         .map(|r| r.workspace)
         .or(state.space);
-    // A tab outside the tiling tree drops the tree back to a single pane:
-    // tabs name every terminal in the space, tiles only the visible ones.
+    // A tab outside the tree on screen brings its own tree, and the one it
+    // replaces is parked for the way back.
     if let Some(space) = state.space {
-        ensure_layout(state);
-        if let Some(layout) = state.layouts.get_mut(&space) {
-            if layout.contains(to) {
-                layout.focus_terminal(to);
-            } else {
-                state.layouts.insert(space, Layout::single(to));
-            }
-        }
+        activate(state, space, to);
     }
     // Promote the already-visible snapshot instead of waiting for the next
     // render: the subscription never dropped, so the picture is fresh.
@@ -5234,6 +5430,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                         state.pending_focus = state.tabs().first().map(|r| r.terminal);
                     }
                 }
+                // The first render and the index may both have come before
+                // this, with no space to build a tree in: build it now, or a
+                // restored split tab shows one pane until the next index.
+                if state.focused != 0 && ensure_layout(state) {
+                    state.adopted_resize = true;
+                }
             }
             state.spaces = workspaces;
             *dirty = true;
@@ -5249,6 +5451,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // hand, and the render filter below drops the old space's renders
             // by space in the meantime.
             state.layouts.remove(&workspace);
+            state.parked.remove(&workspace);
             state.subs.clear();
             state.snapshots.clear();
             // Asked for here rather than by the caller, because a space with no terminal in
@@ -5262,13 +5465,16 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // reseed nothing and leak the entry. The space itself moves to whatever the
             // next list answers: `None` reads as "pick the first" on that path.
             state.layouts.remove(&workspace);
+            state.parked.remove(&workspace);
             if state.space == Some(workspace) {
                 state.space = None;
                 state.snapshot = None;
             }
             *dirty = true;
         }
-        ControlResponse::Agents { agents, .. } => {
+        ControlResponse::Agents { agents, splits, .. } => {
+            // First, so the bootstrap below already knows which rows are panes.
+            adopt_splits(state, &agents, splits);
             if state.focused == 0 && !state.adopted {
                 // Only before this client has ever had a terminal. The daemon subscribes a
                 // fresh client to what is already open, so this is the bootstrap and no
@@ -5277,11 +5483,16 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 // person ends up typing somewhere they cannot see. Without a space yet
                 // the first workspace wins, the way the workspace list and the first
                 // render both pick it.
+                // A tab, not a pane inside one: the pane's tab brings it on screen.
                 let first = match state.space {
-                    Some(s) => agents.iter().find(|r| r.workspace == s),
+                    Some(s) => agents
+                        .iter()
+                        .find(|r| r.workspace == s && !state.is_pane(r.terminal)),
                     None => {
                         let min = agents.iter().map(|r| r.workspace).min();
-                        agents.iter().find(|r| Some(r.workspace) == min)
+                        agents
+                            .iter()
+                            .find(|r| Some(r.workspace) == min && !state.is_pane(r.terminal))
                     }
                 };
                 if let Some(first) = first {
@@ -5308,19 +5519,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // Tiling trees are pruned here too, in every space: a leaf nobody can focus
             // is a zombie pane. Layouts left with no leaves and no pending split go
             // away entirely, so the next focus reseeds a single pane.
-            for layout in state.layouts.values_mut() {
-                let dead: Vec<u32> = layout
-                    .leaves()
-                    .into_iter()
-                    .filter(|t| !agents.iter().any(|r| r.terminal == *t))
-                    .collect();
-                for terminal in dead {
-                    layout.remove(terminal);
-                }
-            }
-            state
-                .layouts
-                .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+            prune_trees(state, |t| !agents.iter().any(|r| r.terminal == t));
             // TerminalClosed and Agents prune the local set silently: the
             // daemon ended the terminal, which ends its subscription
             // server-side too, so there is nothing to unsubscribe from. The
@@ -5330,7 +5529,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             let live: std::collections::BTreeSet<u32> = agents.iter().map(|r| r.terminal).collect();
             state.snapshots.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
-            state.panes.retain(|t| live.contains(t));
             // Pictures too, up to 4 MiB each, or every terminal that exited on its own
             // kept its last one for the life of this client.
             state.images.retain(|t, _| live.contains(t));
@@ -5366,7 +5564,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 let prefix = format!("{name}:");
                 let arrived = agents.iter().find(|r| {
                     r.state != "sleeping"
-                        && !state.panes.contains(&r.terminal)
+                        && !state.is_pane(r.terminal)
                         && state
                             .spaces
                             .iter()
@@ -5392,9 +5590,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 state.pending_focus = agents
                     .iter()
                     .find(|r| {
-                        r.workspace == space
-                            && !state.panes.contains(&r.terminal)
-                            && r.state != "sleeping"
+                        r.workspace == space && !state.is_pane(r.terminal) && r.state != "sleeping"
                     })
                     .map(|r| r.terminal);
             }
@@ -5545,8 +5741,8 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // `Subscribe` on the wire makes the next `sync_subs` believe the
             // daemon is already sending, and the pane stays dark. The first
             // real focus or space entry sends the subscribe.
-            if state.focused != 0 {
-                ensure_layout(state);
+            if state.focused != 0 && ensure_layout(state) {
+                state.adopted_resize = true;
             }
             *dirty = true;
         }
@@ -5557,18 +5753,19 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // a split answer landing after a space switch binds home rather
             // than stranding a foreign terminal in the tree on screen.
             let is_split = id.starts_with("split-");
-            let origin = if is_split {
-                state.split_origin.remove(&id).or(state.space)
+            let home = if is_split {
+                split_home(state, &id)
             } else {
                 None
             };
-            let bound = is_split
-                && origin
-                    .and_then(|space| state.layouts.get_mut(&space))
-                    .is_some_and(|layout| layout.bind_placeholder(terminal));
-            if bound {
-                state.panes.insert(terminal);
-            } else if !is_split {
+            // A person split this tab: that is worth keeping.
+            let written = home.and_then(|(space, at)| {
+                let layout = tree_at(state, space, at)?;
+                layout.bind_placeholder(terminal).then(|| layout.to_pane())
+            });
+            let bound = written.is_some();
+            state.split_writes.extend(written.flatten());
+            if !is_split {
                 // The caller subscribes: a new terminal that the client is not
                 // watching draws the terminal it came from, which is what the
                 // first version did.
@@ -5576,8 +5773,11 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             }
             // An unbound split stays where the keyboard is: yanking the focus
             // to a terminal in another space would collapse that space's tree
-            // onto one pane.
-            if bound && origin == state.space || !is_split {
+            // onto one pane. So does one bound into a parked tree: the person
+            // has moved to another tab since.
+            let on_screen =
+                bound && matches!(home, Some((space, None)) if state.space == Some(space));
+            if on_screen || !is_split {
                 state.pending_focus = Some(terminal);
             }
             *dirty = true;
@@ -5587,13 +5787,7 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // Trees left with no leaves and no pending split go away, and the
             // unsubscription of a tile nobody watches piggybacks on the next
             // sync: the daemon already ended the terminal itself.
-            state.panes.remove(&terminal);
-            for layout in state.layouts.values_mut() {
-                layout.remove(terminal);
-            }
-            state
-                .layouts
-                .retain(|_, layout| !layout.leaves().is_empty() || layout.has_pending());
+            prune_trees(state, |t| t == terminal);
             state.snapshots.remove(&terminal);
             // The picture with it. A Kitty placement still on the outer screen
             // comes down on the next painted frame, through the per-frame
@@ -5662,10 +5856,26 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // split still on its way, and a rollback on screen only would
             // leak the origin's placeholder forever.
             if id.starts_with("split-")
-                && let Some(space) = state.split_origin.remove(&id).or(state.space)
-                && let Some(layout) = state.layouts.get_mut(&space)
+                && let Some((space, at)) = split_home(state, &id)
+                && let Some(layout) = tree_at(state, space, at)
+                && layout.drop_placeholder()
             {
-                layout.drop_placeholder();
+                // Recorded as it stands now: a detach made while this split
+                // was on its way could not be (a pending tree has no whole
+                // shape to write), and the disk would still hold that pane.
+                if let Some(tree) = layout.to_pane() {
+                    state.split_writes.push(tree);
+                }
+                // A parked tree the rollback left with one pane is a tab again.
+                prune_trees(state, |_| false);
+            }
+            // A tree that did not reach the disk is still on screen here, and
+            // the next split or detach writes it again. The refusal is shown
+            // below: a split that will not survive a restart is news. An
+            // older daemon cannot read the request at all, and cannot say
+            // whose refusal it is either, so an empty id counts as one.
+            if id.starts_with("tree-") || id.is_empty() {
+                state.split_saving = state.split_saving.saturating_sub(1);
             }
             // A refused focus fetch is silence, not news: an older daemon
             // answers every one, and shouting on each would shout on every
@@ -5678,6 +5888,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Subscribed { .. } => {}
+        ControlResponse::SplitSaved { .. } => {
+            state.split_saving = state.split_saving.saturating_sub(1);
+        }
 
         // The sessions on the machine being connected. Opened only as the answer to the
         // question still standing, and only over nothing else: an answer can take seconds,
@@ -6020,7 +6233,10 @@ mod tests {
             img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
-            panes: std::collections::BTreeSet::new(),
+            parked: std::collections::BTreeMap::new(),
+            split_writes: Vec::new(),
+            split_saving: 0,
+            resync: false,
             split_origin: std::collections::BTreeMap::new(),
         }
     }
@@ -6401,7 +6617,10 @@ mod tests {
             img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
             layouts: std::collections::BTreeMap::new(),
-            panes: std::collections::BTreeSet::new(),
+            parked: std::collections::BTreeMap::new(),
+            split_writes: Vec::new(),
+            split_saving: 0,
+            resync: false,
             split_origin: std::collections::BTreeMap::new(),
             cols: 80,
             lines: 24,
@@ -6484,7 +6703,10 @@ mod tests {
             img_size: (0, 0),
             subs: std::collections::BTreeSet::from([1, 2]),
             layouts: std::collections::BTreeMap::new(),
-            panes: std::collections::BTreeSet::new(),
+            parked: std::collections::BTreeMap::new(),
+            split_writes: Vec::new(),
+            split_saving: 0,
+            resync: false,
             split_origin: std::collections::BTreeMap::new(),
             cols: 80,
             lines: 24,
@@ -6579,7 +6801,7 @@ mod tests {
     }
 
     #[test]
-    fn focusing_a_tab_outside_the_tree_drops_back_to_a_single_pane() {
+    fn a_tab_switch_parks_the_split_and_the_way_back_brings_it_back() {
         let mut state = tiled_state();
         state.rows.push(agent(3, 1, "sh", "idle"));
         let mut seqs = std::collections::BTreeMap::new();
@@ -6587,6 +6809,313 @@ mod tests {
         focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![3]));
         assert_eq!(state.subs, std::collections::BTreeSet::from([3]));
+        // The split's pane is still a pane, not a tab and not lost.
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![1, 3]);
+        focus(&mut state, 1, &mut control_seq, &mut seqs).unwrap();
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1, 2]));
+        assert_eq!(state.subs, std::collections::BTreeSet::from([1, 2]));
+        assert!(
+            state.split_writes.is_empty(),
+            "moving between tabs writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_pane_picked_from_the_sidebar_brings_its_whole_tab() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        focus(&mut state, 2, &mut control_seq, &mut seqs).unwrap();
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1, 2]));
+        assert_eq!(state.focused, 2);
+    }
+
+    #[test]
+    fn closing_the_tabs_own_terminal_leaves_the_rest_as_one_tab() {
+        let mut state = tiled_state();
+        let area = pane_area(&state);
+        let layout = state.layouts.get_mut(&1).unwrap();
+        assert!(layout.split_placeholder(2, layout::Dir::H, area));
+        assert!(layout.bind_placeholder(3));
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalClosed {
+                id: "x".to_string(),
+                terminal: 1,
+            },
+            &mut dirty,
+        );
+        state.rows.retain(|r| r.terminal != 1);
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![2], "the next pane is the tab now");
+        assert!(state.is_pane(3));
+    }
+
+    #[test]
+    fn a_split_answered_after_a_tab_switch_binds_into_the_parked_tree() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let area = pane_area(&state);
+        assert!(
+            state
+                .layouts
+                .get_mut(&1)
+                .unwrap()
+                .split_placeholder(2, layout::Dir::H, area)
+        );
+        state.split_origin.insert("split-4".to_string(), (1, 2));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "split-4".to_string(),
+                terminal: 4,
+            },
+            &mut dirty,
+        );
+        let parked: Vec<Vec<u32>> = state.parked[&1].iter().map(|l| l.leaves()).collect();
+        assert_eq!(parked, vec![vec![1, 2, 4]]);
+        assert!(state.is_pane(4));
+        assert_eq!(
+            state.split_writes.len(),
+            1,
+            "the new split is recorded once"
+        );
+        assert_eq!(state.split_writes[0].leaves(), vec![1, 2, 4]);
+        assert_eq!(
+            state.pending_focus, None,
+            "the keyboard stays on the tab it moved to"
+        );
+    }
+
+    #[test]
+    fn two_tabs_splitting_at_once_each_get_their_own_pane() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let area = pane_area(&state);
+        assert!(
+            state
+                .layouts
+                .get_mut(&1)
+                .unwrap()
+                .split_placeholder(2, layout::Dir::H, area)
+        );
+        state.split_origin.insert("split-4".to_string(), (1, 2));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        assert!(
+            state
+                .layouts
+                .get_mut(&1)
+                .unwrap()
+                .split_placeholder(3, layout::Dir::V, area)
+        );
+        state.split_origin.insert("split-5".to_string(), (1, 3));
+        let mut dirty = false;
+        // The first tab's answer arrives while the second tab is on screen.
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "split-4".to_string(),
+                terminal: 4,
+            },
+            &mut dirty,
+        );
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "split-5".to_string(),
+                terminal: 5,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.layouts[&1].leaves(), vec![3, 5]);
+        let parked: Vec<Vec<u32>> = state.parked[&1].iter().map(|l| l.leaves()).collect();
+        assert_eq!(parked, vec![vec![1, 2, 4]]);
+    }
+
+    #[test]
+    fn a_space_answered_after_the_index_still_brings_the_split_on_screen() {
+        let mut state = fresh_client_with_one_pane_on_screen();
+        state.layouts.clear();
+        state.subs.clear();
+        state.space = None;
+        let mut dirty = false;
+        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        assert!(state.layouts.is_empty(), "no space yet, no tree on screen");
+        apply(
+            &mut state,
+            ControlResponse::Workspaces {
+                id: "spaces".to_string(),
+                workspaces: vec![space(1, "app")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.layouts.get(&1).map(|l| l.leaves()),
+            Some(vec![1, 2, 3])
+        );
+        assert!(state.resync, "the other panes are owed their subscriptions");
+        assert!(state.adopted_resize, "and the focused one its smaller size");
+    }
+
+    #[test]
+    fn a_bound_split_is_recorded_once() {
+        let mut state = tiled_state();
+        let area = pane_area(&state);
+        state
+            .layouts
+            .get_mut(&1)
+            .unwrap()
+            .split_placeholder(2, layout::Dir::H, area);
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalCreated {
+                id: "split-5".to_string(),
+                terminal: 5,
+            },
+            &mut dirty,
+        );
+        let written: Vec<Vec<u32>> = state.split_writes.iter().map(|t| t.leaves()).collect();
+        assert_eq!(written, vec![vec![1, 2, 5]]);
+    }
+
+    /// A restart: the daemon's index names three panes of one tab, and a fresh
+    /// client that has only seen one of them on screen takes the whole tab.
+    fn fresh_client_with_one_pane_on_screen() -> State {
+        let mut state = tiled_state();
+        state.layouts.clear();
+        state.layouts.insert(1, Layout::single(1));
+        state.subs = std::collections::BTreeSet::from([1]);
+        state
+    }
+
+    fn three_panes() -> qoro_runtime::control::Pane {
+        use qoro_runtime::control::{Pane, SplitDir};
+        let leaf = |terminal| Pane::Leaf { terminal };
+        Pane::Split {
+            dir: SplitDir::V,
+            permille: 500,
+            first: Box::new(leaf(1)),
+            second: Box::new(Pane::Split {
+                dir: SplitDir::H,
+                permille: 500,
+                first: Box::new(leaf(2)),
+                second: Box::new(leaf(3)),
+            }),
+        }
+    }
+
+    fn index_with(splits: Vec<qoro_runtime::control::Pane>) -> ControlResponse {
+        ControlResponse::Agents {
+            id: "index".to_string(),
+            agents: vec![
+                agent(1, 1, "claude", "idle"),
+                agent(2, 1, "claude", "idle"),
+                agent(3, 1, "claude", "idle"),
+            ],
+            splits,
+        }
+    }
+
+    #[test]
+    fn a_split_in_the_index_comes_back_as_one_tab() {
+        let mut state = fresh_client_with_one_pane_on_screen();
+        let mut dirty = false;
+        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        assert_eq!(
+            state.layouts.get(&1).map(|l| l.leaves()),
+            Some(vec![1, 2, 3])
+        );
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![1], "one tab, not three");
+        assert!(
+            state.resync,
+            "the other panes still need their subscriptions"
+        );
+        assert!(
+            state.split_writes.is_empty(),
+            "adopting writes nothing back"
+        );
+        let mut control_seq = 0;
+        assert!(sync_subs(&mut state, &mut control_seq).unwrap().is_some());
+        assert_eq!(state.subs, std::collections::BTreeSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn a_split_for_a_tab_not_on_screen_is_parked() {
+        let mut state = fresh_client_with_one_pane_on_screen();
+        state.rows.push(agent(9, 1, "sh", "idle"));
+        state.layouts.insert(1, Layout::single(9));
+        state.focused = 9;
+        let mut dirty = false;
+        let mut index = index_with(vec![three_panes()]);
+        if let ControlResponse::Agents { agents, .. } = &mut index {
+            agents.push(agent(9, 1, "sh", "idle"));
+        }
+        apply(&mut state, index, &mut dirty);
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![9]));
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![1, 9]);
+    }
+
+    #[test]
+    fn a_split_this_client_holds_is_not_replaced_by_the_index() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut dirty = false;
+        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1, 2]));
+        assert!(!state.is_pane(3), "the local tree wins; 3 stays a tab");
+    }
+
+    #[test]
+    fn nothing_is_adopted_while_a_recording_is_on_its_way() {
+        let mut state = fresh_client_with_one_pane_on_screen();
+        state.split_saving = 1;
+        let mut dirty = false;
+        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1]));
+        apply(
+            &mut state,
+            ControlResponse::SplitSaved {
+                id: "tree-1".to_string(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.split_saving, 0);
+    }
+
+    #[test]
+    fn a_parked_tree_left_with_one_pane_is_a_tab_again() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalClosed {
+                id: "x".to_string(),
+                terminal: 1,
+            },
+            &mut dirty,
+        );
+        state.rows.retain(|r| r.terminal != 1);
+        assert!(state.parked[&1].is_empty());
+        let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, vec![2, 3]);
     }
 
     #[test]
@@ -6710,10 +7239,7 @@ mod tests {
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
         assert!(!state.layouts.get(&2).unwrap().contains(3));
-        assert!(
-            state.panes.contains(&3),
-            "bound splits hide from the tab bar"
-        );
+        assert!(state.is_pane(3), "bound splits hide from the tab bar");
         state.rows.push(agent(3, 1, "zsh", "idle"));
         assert!(!state.tabs().iter().any(|r| r.terminal == 3));
         assert!(state.rows.iter().any(|r| r.terminal == 3));
@@ -6739,7 +7265,7 @@ mod tests {
             &mut dirty,
         );
         assert!(!state.layouts.get(&1).unwrap().contains(3));
-        assert!(!state.panes.contains(&3));
+        assert!(!state.is_pane(3));
         assert!(state.layouts.get(&1).unwrap().has_pending());
     }
 
@@ -6753,7 +7279,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .split_placeholder(1, layout::Dir::H, area);
-        state.split_origin.insert("split-9".to_string(), 1);
+        state.split_origin.insert("split-9".to_string(), (1, 1));
         // Switched away while the spawn was on its way.
         state.space = Some(2);
         state.layouts.insert(2, Layout::single(9));
@@ -6769,7 +7295,7 @@ mod tests {
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
         assert!(!state.layouts.get(&2).unwrap().contains(3));
-        assert!(state.panes.contains(&3));
+        assert!(state.is_pane(3));
         assert_eq!(state.focused, 9, "focus stays where the keyboard is");
         assert_eq!(state.pending_focus, None);
         assert!(!state.split_origin.contains_key("split-9"));
@@ -6785,7 +7311,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .split_placeholder(1, layout::Dir::H, area);
-        state.split_origin.insert("split-9".to_string(), 1);
+        state.split_origin.insert("split-9".to_string(), (1, 1));
         state.space = Some(2);
         state.layouts.insert(2, Layout::single(9));
         let mut dirty = false;
@@ -7038,6 +7564,7 @@ mod tests {
             ControlResponse::Agents {
                 id: "index".to_string(),
                 agents,
+                splits: Vec::new(),
             },
             &mut dirty,
         );
@@ -7224,6 +7751,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "index".to_string(),
+                splits: Vec::new(),
                 agents: vec![agent(7, 5, "zsh", "working")],
             },
             &mut dirty,
@@ -7243,6 +7771,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "index".to_string(),
+                splits: Vec::new(),
                 agents: rows,
             },
             &mut dirty,
@@ -7279,6 +7808,7 @@ mod tests {
                 &mut state,
                 ControlResponse::Agents {
                     id: "index".to_string(),
+                    splits: Vec::new(),
                     agents: vec![agent(1, 1, "zsh", state_word)],
                 },
                 &mut dirty,
@@ -7329,6 +7859,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "index".to_string(),
+                splits: Vec::new(),
                 agents: vec![agent(1, 1, "claude", "working")],
             },
             &mut dirty,
@@ -7527,6 +8058,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "mux".into(),
+                splits: Vec::new(),
                 agents: vec![],
             },
             &mut dirty,
@@ -7537,6 +8069,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "index".into(),
+                splits: Vec::new(),
                 agents: vec![],
             },
             &mut dirty,
@@ -7561,6 +8094,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "mux".into(),
+                splits: Vec::new(),
                 agents: vec![
                     agent(1, 1, "zsh", "idle"),
                     agent(remote, R1 | 1, "claude", "idle"),
@@ -7579,6 +8113,7 @@ mod tests {
             &mut state,
             ControlResponse::Agents {
                 id: "mux".into(),
+                splits: Vec::new(),
                 agents: vec![agent(remote, R1 | 1, "claude", "sleeping")],
             },
             &mut dirty,
@@ -7760,6 +8295,7 @@ mod tests {
             ControlResponse::Agents {
                 id: "mux".into(),
                 agents: vec![agent(1, 1, "zsh", "idle"), agent(tab, there, "zsh", "idle")],
+                splits: Vec::new(),
             },
             &mut dirty,
         );

@@ -59,7 +59,7 @@ fn main() {
         rows: &rows,
         spaces: &spaces,
         space: Some(1),
-        panes: &std::collections::BTreeSet::new(),
+        panes: std::collections::BTreeSet::new(),
         focused: 1,
         snapshot: None,
         cols: 60,

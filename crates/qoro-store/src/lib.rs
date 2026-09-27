@@ -143,7 +143,12 @@ impl Store {
                  ordinal INTEGER NOT NULL,
                  PRIMARY KEY (workspace, terminal)
              );
-             CREATE INDEX IF NOT EXISTS terminal_by_workspace ON terminal(workspace);",
+             CREATE INDEX IF NOT EXISTS terminal_by_workspace ON terminal(workspace);
+             -- Each tab's split tree, as JSON the client wrote. A table of its own and
+             -- created unconditionally rather than a column behind a version bump: a
+             -- bump makes every older binary refuse this file, and an older binary that
+             -- ignores the table loses nothing but the splits.
+             CREATE TABLE IF NOT EXISTS split_tree (tree TEXT NOT NULL);",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
@@ -262,6 +267,29 @@ impl Store {
             params![id, now],
         )?;
         Ok(n == 1)
+    }
+
+    /// Every stored split tree, oldest first, as the JSON it was written as.
+    pub fn splits(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tree FROM split_tree ORDER BY rowid")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Replace every stored split tree. One transaction, so a crash in the middle leaves
+    /// the old set rather than half of the new one.
+    pub fn set_splits(&mut self, trees: &[String]) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM split_tree", [])?;
+        for tree in trees {
+            tx.execute("INSERT INTO split_tree (tree) VALUES (?1)", params![tree])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The highest terminal id ever written, open or closed, or 0 for none.
@@ -456,6 +484,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_trees_are_replaced_as_a_set_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("qoro.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.set_splits(&["a".into(), "b".into()]).unwrap();
+            s.set_splits(&["c".into(), "a".into()]).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.splits().unwrap(), vec!["c".to_string(), "a".to_string()]);
+        s.set_splits(&[]).unwrap();
+        assert!(s.splits().unwrap().is_empty());
+    }
+
+    /// Splits must not cost an older binary the file: the table is new, the version is not.
+    #[test]
+    fn split_trees_do_not_bump_the_schema_version() {
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
     /// A database written by the build before sessions existed, opened by this build.
     ///
     /// The check this replaces refused it outright, and refusing is not a migration: the
@@ -500,6 +549,10 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("an old database must open, not be refused");
+        assert!(
+            store.splits().expect("the split table exists").is_empty(),
+            "an old database gains the split table empty"
+        );
         let spaces = store.workspaces().expect("workspaces");
         assert_eq!(spaces.len(), 1, "the workspace survived");
         assert_eq!(spaces[0].name, "app");

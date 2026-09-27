@@ -127,6 +127,10 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             from: 0,
             backward: true,
         },
+        ControlRequest::SetSplit {
+            id: "x22".into(),
+            tree: qoro_runtime::control::Pane::Leaf { terminal },
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -149,6 +153,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::HostColors { .. }
+            | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

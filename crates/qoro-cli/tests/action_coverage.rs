@@ -263,6 +263,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "split a tab, or take a pane out of it",
+            method: || {
+                Method::Control(ControlRequest::SetSplit {
+                    id: "a".into(),
+                    tree: qoro_runtime::control::Pane::Leaf { terminal: 1 },
+                })
+            },
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -420,6 +429,10 @@ fn every_control_method_is_reachable_from_some_action() {
             fg: [0; 3],
             bg: [0; 3],
         },
+        ControlRequest::SetSplit {
+            id: String::new(),
+            tree: qoro_runtime::control::Pane::Leaf { terminal: 0 },
+        },
     ];
     for request in &all {
         match request {
@@ -441,6 +454,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::HostColors { .. }
+            | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

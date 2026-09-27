@@ -266,6 +266,16 @@ pub enum ControlRequest {
         fg: [u8; 3],
         bg: [u8; 3],
     },
+    /// Record one tab's split tree, so a restart or a new client brings the panes back
+    /// as one tab rather than as a tab each.
+    ///
+    /// The tree replaces every stored tree that shares a terminal with it, which is
+    /// what moves a tree under a new first pane and what clears one: a single `Leaf`
+    /// stores nothing and removes the tree that held it. Answered once durable.
+    SetSplit {
+        id: String,
+        tree: Pane,
+    },
 }
 
 impl ControlRequest {
@@ -290,6 +300,7 @@ impl ControlRequest {
             | Self::ReportAgentSession { id, .. }
             | Self::ListFocusEvents { id, .. }
             | Self::HostColors { id, .. }
+            | Self::SetSplit { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ListRemoteSessions { id, .. }
             | Self::ConnectRemote { id, .. }
@@ -316,6 +327,11 @@ pub enum ControlResponse {
     Agents {
         id: String,
         agents: Vec<AgentRow>,
+        /// The stored split trees, each cut down to the terminals alive now and sent
+        /// only while two or more are left. In the same message as the rows so the two
+        /// never disagree. Defaulted, so an older daemon reads as "no splits".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        splits: Vec<Pane>,
     },
     Workspaces {
         id: String,
@@ -398,6 +414,10 @@ pub enum ControlResponse {
         loaded: Vec<String>,
         errors: Vec<String>,
     },
+    /// A `SetSplit` is on disk.
+    SplitSaved {
+        id: String,
+    },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
     Failed {
@@ -446,6 +466,90 @@ pub struct FocusEvent {
     pub kind: String,
     pub label: String,
     pub at_unix: i64,
+}
+
+/// One tab's split tree, as it crosses the socket.
+///
+/// The client owns the tree and the daemon only keeps it, so this is the client's shape
+/// with nothing the daemon would have to understand. Typed rather than a string so the
+/// ssh mux can renumber the terminals in it. The ratio is in thousandths, which keeps the
+/// type `Eq` like everything else on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "snake_case")]
+pub enum Pane {
+    Leaf {
+        terminal: TerminalStream,
+    },
+    Split {
+        dir: SplitDir,
+        permille: u16,
+        first: Box<Pane>,
+        second: Box<Pane>,
+    },
+}
+
+/// `V` puts the panes side by side, `H` stacks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDir {
+    V,
+    H,
+}
+
+impl Pane {
+    /// The terminals in the tree, in tree order. The first one is the tab.
+    pub fn leaves(&self) -> Vec<TerminalStream> {
+        match self {
+            Self::Leaf { terminal } => vec![*terminal],
+            Self::Split { first, second, .. } => {
+                let mut out = first.leaves();
+                out.extend(second.leaves());
+                out
+            }
+        }
+    }
+
+    /// The tree with only the terminals `keep` accepts. A split that lost one side
+    /// becomes the other side; `None` when nothing is left.
+    pub fn retain(&self, keep: &impl Fn(TerminalStream) -> bool) -> Option<Pane> {
+        match self {
+            Self::Leaf { terminal } => keep(*terminal).then(|| self.clone()),
+            Self::Split {
+                dir,
+                permille,
+                first,
+                second,
+            } => match (first.retain(keep), second.retain(keep)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    dir: *dir,
+                    permille: *permille,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+
+    /// Every terminal renumbered, or `None` when any one cannot be.
+    pub fn map(&self, f: &impl Fn(TerminalStream) -> Option<TerminalStream>) -> Option<Pane> {
+        match self {
+            Self::Leaf { terminal } => Some(Self::Leaf {
+                terminal: f(*terminal)?,
+            }),
+            Self::Split {
+                dir,
+                permille,
+                first,
+                second,
+            } => Some(Self::Split {
+                dir: *dir,
+                permille: *permille,
+                first: Box::new(first.map(f)?),
+                second: Box::new(second.map(f)?),
+            }),
+        }
+    }
 }
 
 /// One workspace, as a client lists it.
@@ -633,6 +737,7 @@ impl ControlResponse {
             | Self::RemoteSessions { id, .. }
             | Self::RemoteAdded { id, .. }
             | Self::HostColorsNoted { id }
+            | Self::SplitSaved { id }
             | Self::Failed { id, .. } => id,
         }
     }
@@ -694,9 +799,91 @@ pub fn parse_reported_state(name: &str) -> Option<qoro_domain::AgentRuntimeState
     })
 }
 
+/// The id of a request that did not parse, when its JSON still names one.
+///
+/// A request from a newer client carries an op this daemon has never heard of. Answering
+/// its refusal with an empty id leaves the client unable to tell whose refusal it is, so
+/// the id is read out of the raw object when there is one.
+pub fn raw_request_id(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("id")?.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf(terminal: u32) -> Pane {
+        Pane::Leaf { terminal }
+    }
+
+    fn split(dir: SplitDir, first: Pane, second: Pane) -> Pane {
+        Pane::Split {
+            dir,
+            permille: 500,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    /// Two by two: 1 and 2 side by side over 3 and 4.
+    fn quad() -> Pane {
+        split(
+            SplitDir::H,
+            split(SplitDir::V, leaf(1), leaf(2)),
+            split(SplitDir::V, leaf(3), leaf(4)),
+        )
+    }
+
+    #[test]
+    fn a_split_tree_keeps_its_shape_across_the_wire() {
+        let json = serde_json::to_string(&quad()).expect("encode");
+        let back: Pane = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, quad());
+        assert_eq!(back.leaves(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn retain_collapses_a_split_that_lost_a_side() {
+        let kept = quad().retain(&|t| t != 2 && t != 3).expect("two left");
+        assert_eq!(kept, split(SplitDir::H, leaf(1), leaf(4)));
+        assert_eq!(quad().retain(&|t| t == 4), Some(leaf(4)));
+        assert_eq!(quad().retain(&|_| false), None);
+    }
+
+    #[test]
+    fn map_renumbers_every_leaf_or_gives_up() {
+        let moved = quad().map(&|t| Some(t + 10)).expect("all map");
+        assert_eq!(moved.leaves(), vec![11, 12, 13, 14]);
+        assert_eq!(quad().map(&|t| (t != 3).then_some(t)), None);
+    }
+
+    #[test]
+    fn an_index_from_an_older_daemon_has_no_splits() {
+        let answer: ControlResponse =
+            serde_json::from_str(r#"{"op":"Agents","id":"i","agents":[]}"#).expect("decode");
+        assert_eq!(
+            answer,
+            ControlResponse::Agents {
+                id: "i".into(),
+                agents: Vec::new(),
+                splits: Vec::new(),
+            }
+        );
+        // And an index with none says nothing about them, for an older client.
+        let json = serde_json::to_string(&answer).expect("encode");
+        assert!(!json.contains("splits"), "{json}");
+    }
+
+    #[test]
+    fn an_unknown_op_still_gives_up_its_id() {
+        let body = br#"{"op":"FromTheFuture","id":"tree-7"}"#;
+        assert!(serde_json::from_slice::<ControlRequest>(body).is_err());
+        assert_eq!(raw_request_id(body), "tree-7");
+        assert_eq!(raw_request_id(b"not json"), "");
+    }
 
     #[test]
     fn readiness_names_setup_before_identity_before_starting() {

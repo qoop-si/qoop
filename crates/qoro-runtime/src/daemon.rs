@@ -373,6 +373,12 @@ pub struct TerminalHandle {
 pub struct TerminalRegistry {
     inner: std::sync::Mutex<BTreeMap<u32, TerminalHandle>>,
     next: AtomicU64,
+    /// Each tab's split tree, as the clients recorded it. Kept here as well as on disk so
+    /// an index can carry them without a read per listing.
+    splits: std::sync::Mutex<Vec<crate::control::Pane>>,
+    /// Held across a split change and its write, so two clients changing splits at
+    /// once cannot land on disk in the other order from memory.
+    split_write: tokio::sync::Mutex<()>,
 }
 
 impl TerminalRegistry {
@@ -436,6 +442,45 @@ impl TerminalRegistry {
 
     pub fn streams(&self) -> Vec<u32> {
         self.inner.lock().unwrap().keys().copied().collect()
+    }
+
+    /// The split trees cut down to the terminals alive now, and only those with two or
+    /// more left: a tree of one is a tab, not a split.
+    pub fn live_splits(&self, live: &[u32]) -> Vec<crate::control::Pane> {
+        self.splits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|tree| tree.retain(&|t| live.contains(&t)))
+            .filter(|tree| tree.leaves().len() > 1)
+            .collect()
+    }
+
+    /// Replace every split tree at once.
+    pub fn load_splits(&self, trees: Vec<crate::control::Pane>) {
+        *self.splits.lock().unwrap() = trees;
+    }
+
+    /// Record one tab's tree and write the whole set down, answering once it is durable.
+    ///
+    /// Every tree sharing a terminal with this one goes first: that is how a tree moves
+    /// under a new first pane, and a single leaf clears the tree that held it.
+    pub async fn set_split(
+        &self,
+        tree: crate::control::Pane,
+        store: &crate::store::StoreHandle,
+    ) -> Result<(), crate::store::HandleError> {
+        let _order = self.split_write.lock().await;
+        let trees = {
+            let mut splits = self.splits.lock().unwrap();
+            let leaves = tree.leaves();
+            splits.retain(|kept| !kept.leaves().iter().any(|t| leaves.contains(t)));
+            if leaves.len() > 1 {
+                splits.push(tree);
+            }
+            splits.clone()
+        };
+        store.set_splits(splits_json(&trees)).await
     }
 
     pub fn len(&self) -> usize {
@@ -592,6 +637,7 @@ impl Daemon {
             events: events.clone(),
         })
         .await;
+        restore_splits(&terminals, &store).await;
         if report.brought_back == 0 {
             // Nothing to bring back, so the one terminal a first start has always had.
             let stream = terminals.mint();
@@ -1532,10 +1578,10 @@ async fn serve_client(
                             .await
                         }
                         Err(e) => ControlResponse::Failed {
-                            // No request id to echo, because the request did not parse. The
-                            // empty id is the honest answer, and it is why a client must match
-                            // on its own id rather than on arrival order.
-                            id: String::new(),
+                            // The typed request did not parse, but its JSON may still name
+                            // an id: an op from a newer client is the usual case, and a
+                            // refusal nobody can match is one every client has to guess at.
+                            id: crate::control::raw_request_id(&message.body),
                             reason: unparsable(&e.to_string()),
                         },
                     };
@@ -2639,9 +2685,12 @@ async fn handle_control(
             // Read from the registry rather than by walking the process table here: the
             // registry is what the process watcher and the observation precedence in
             // ADR-008 already maintain, and a second reader would be a second answer.
-            let mut rows: Vec<crate::control::AgentRow> = terminals
-                .streams()
-                .into_iter()
+            // One read of the registry for the rows and the splits both, so a terminal
+            // that closes in between cannot be in one and not the other.
+            let live = terminals.streams();
+            let mut rows: Vec<crate::control::AgentRow> = live
+                .iter()
+                .copied()
                 .map(|terminal| {
                     let agent = agents.agent(terminal);
                     let (program, behind, generation, is_agent) =
@@ -2736,8 +2785,34 @@ async fn handle_control(
             for tomb in agents.tombs() {
                 rows.push(tomb_row(&tomb));
             }
-            ControlResponse::Agents { id, agents: rows }
+            ControlResponse::Agents {
+                id,
+                agents: rows,
+                splits: terminals.live_splits(&live),
+            }
         }
+        // A tree naming one terminal twice would come back on every index as a tab
+        // showing one terminal in two tiles.
+        ControlRequest::SetSplit { tree, .. }
+            if tree.leaves().len()
+                != tree
+                    .leaves()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() =>
+        {
+            ControlResponse::Failed {
+                id,
+                reason: "a split names one terminal twice".to_string(),
+            }
+        }
+        ControlRequest::SetSplit { tree, .. } => match terminals.set_split(tree, store).await {
+            Ok(()) => ControlResponse::SplitSaved { id },
+            Err(e) => ControlResponse::Failed {
+                id,
+                reason: format!("the split could not be recorded: {e}"),
+            },
+        },
         ControlRequest::Subscribe {
             terminals: wanted, ..
         } => {
@@ -3703,6 +3778,36 @@ fn note_cwd(
                 .await;
         });
     }
+}
+
+/// Bring back the split trees, cut down to the terminals that came back.
+///
+/// Written back at once, because a dead leaf must not outlive a restart: ids can repeat
+/// after one (a deleted workspace takes its rows, highest ids included, with it), and a
+/// stale leaf would pull an unrelated new terminal into somebody's tab. While the daemon
+/// runs ids only grow, so the listing's own cut is enough from here on.
+async fn restore_splits(terminals: &TerminalRegistry, store: &crate::store::StoreHandle) {
+    let stored: Vec<crate::control::Pane> = store
+        .splits()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    terminals.load_splits(stored.clone());
+    let kept = terminals.live_splits(&terminals.streams());
+    terminals.load_splits(kept.clone());
+    if kept != stored {
+        let _ = store.set_splits(splits_json(&kept)).await;
+    }
+}
+
+/// Split trees as the rows the store keeps.
+fn splits_json(trees: &[crate::control::Pane]) -> Vec<String> {
+    trees
+        .iter()
+        .filter_map(|tree| serde_json::to_string(tree).ok())
+        .collect()
 }
 
 /// Everything bringing a session back needs.

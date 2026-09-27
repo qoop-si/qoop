@@ -1,9 +1,12 @@
-//! Client-local tiling layout: one tree per space.
+//! Client-owned tiling layout: one tree per tab.
 //!
-//! The daemon knows nothing about this. It sees independent terminals with a
-//! single resize owner each. The tree only decides which terminals are visible,
+//! The daemon keeps a copy of each tree (`Pane`) so a restart brings the tab back
+//! whole, and never reads it: it sees independent terminals with a single resize
+//! owner each. The tree only decides which terminals are visible,
 //! where on the pane, and which one owns the keyboard and the single `Resize`
 //! stream. Every function here is pure so it can be tested without a screen.
+
+use qoro_runtime::control::{Pane, SplitDir};
 
 /// Split direction.
 ///
@@ -71,6 +74,25 @@ impl Layout {
                 terminal: Some(terminal),
             },
             focus: terminal,
+            prev_focus: None,
+            zoomed: None,
+        }
+    }
+
+    /// The tree as the daemon keeps it, or `None` while a split is on its way: a
+    /// placeholder has no terminal to name, and the bind writes the tree once it has.
+    pub fn to_pane(&self) -> Option<Pane> {
+        to_pane(&self.root)
+    }
+
+    /// A tree the daemon kept, with the keyboard in its first pane (the tab).
+    pub fn from_pane(pane: &Pane) -> Self {
+        let root = from_pane(pane);
+        let mut leaves = Vec::new();
+        collect_leaves(&root, &mut leaves);
+        Layout {
+            root,
+            focus: leaves.first().copied().unwrap_or(0),
             prev_focus: None,
             zoomed: None,
         }
@@ -388,6 +410,48 @@ impl Layout {
             .into_iter()
             .find(|(_, r)| col >= r.x && col < r.x + r.cols && row >= r.y && row < r.y + r.rows)
             .map(|(t, _)| t)
+    }
+}
+
+fn to_pane(node: &Node) -> Option<Pane> {
+    match node {
+        Node::Leaf { terminal } => terminal.map(|terminal| Pane::Leaf { terminal }),
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => Some(Pane::Split {
+            dir: match dir {
+                Dir::V => SplitDir::V,
+                Dir::H => SplitDir::H,
+            },
+            permille: (ratio.clamp(0.0, 1.0) * 1000.0).round() as u16,
+            first: Box::new(to_pane(first)?),
+            second: Box::new(to_pane(second)?),
+        }),
+    }
+}
+
+fn from_pane(pane: &Pane) -> Node {
+    match pane {
+        Pane::Leaf { terminal } => Node::Leaf {
+            terminal: Some(*terminal),
+        },
+        Pane::Split {
+            dir,
+            permille,
+            first,
+            second,
+        } => Node::Split {
+            dir: match dir {
+                SplitDir::V => Dir::V,
+                SplitDir::H => Dir::H,
+            },
+            ratio: f32::from((*permille).min(1000)) / 1000.0,
+            first: Box::new(from_pane(first)),
+            second: Box::new(from_pane(second)),
+        },
     }
 }
 
@@ -794,6 +858,29 @@ mod tests {
             cols,
             rows,
         }
+    }
+
+    #[test]
+    fn a_tree_goes_to_the_daemon_and_comes_back_the_same() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
+        assert_eq!(
+            layout.to_pane(),
+            None,
+            "a pending split has nothing to name"
+        );
+        assert!(layout.bind_placeholder(2));
+        assert!(layout.split_placeholder(2, Dir::H, area(80, 24)));
+        assert!(layout.bind_placeholder(3));
+        let pane = layout.to_pane().expect("a whole tree");
+        let back = Layout::from_pane(&pane);
+        assert_eq!(back.root, layout.root);
+        assert_eq!(back.leaves(), vec![1, 2, 3]);
+        assert_eq!(back.focus, 1, "the keyboard lands on the tab");
+        assert_eq!(
+            back.tile_rects(area(80, 24)),
+            layout.tile_rects(area(80, 24))
+        );
     }
 
     #[test]

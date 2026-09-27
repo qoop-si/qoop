@@ -24,7 +24,7 @@ use qoro_proto::{Channel, Frame, Reassembler};
 use qoro_remote::Remote;
 use qoro_runtime::client::{self, Connection, Incoming};
 use qoro_runtime::control::{
-    AgentRow, ControlRequest, ControlResponse, EventMessage, RemoteSession, WorkspaceRow,
+    AgentRow, ControlRequest, ControlResponse, EventMessage, Pane, RemoteSession, WorkspaceRow,
 };
 use qoro_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -143,6 +143,8 @@ struct Link {
     seqs: BTreeMap<u32, u32>,
     /// Rows already in the interface's numbering.
     agents: Vec<AgentRow>,
+    /// Split trees from the same answer as `agents`, numbered the same way.
+    splits: Vec<Pane>,
     spaces: Vec<WorkspaceRow>,
     /// Whether this link has ever answered a space list. Before that it is one
     /// placeholder row, after it the last list it gave, marked offline while it is down.
@@ -178,6 +180,7 @@ impl Link {
             control_seq: 0,
             seqs: BTreeMap::new(),
             agents: Vec::new(),
+            splits: Vec::new(),
             spaces: Vec::new(),
             listed: false,
             reason: "connecting".to_string(),
@@ -325,9 +328,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             return Ok(());
         }
         let agents = self.merged_agents();
+        let splits = self
+            .links
+            .iter()
+            .flatten()
+            .flat_map(|l| l.splits.iter().cloned())
+            .collect();
         self.respond(&ControlResponse::Agents {
             id: id.to_string(),
             agents,
+            splits,
         })
         .await
     }
@@ -609,6 +619,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(link, R::RenameTerminal { id, terminal, name })
                     .await
             }
+            // A tab lives on one daemon, so its tree does: sent to the daemon of its
+            // first pane in that daemon's numbering. A tree reaching across daemons is
+            // not one any daemon could bring back, and is refused.
+            R::SetSplit { id, tree } => match split_in(&tree) {
+                Some((link, tree)) => self.send_one(link, R::SetSplit { id, tree }).await,
+                None => {
+                    self.failed(id, "a split cannot span two hosts".to_string())
+                        .await
+                }
+            },
             R::CloseTerminal { id, terminal } => {
                 let (link, terminal) = terminal_in(terminal);
                 self.send_one(link, R::CloseTerminal { id, terminal }).await
@@ -744,6 +764,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.stale_agents = false;
                 l.stale_spaces = false;
                 l.agents.clear();
+                l.splits.clear();
                 l.desired.clear();
                 l.reason = if reason.is_empty() {
                     "offline".to_string()
@@ -849,7 +870,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         l.inflight.remove(&id);
         let name = l.name.clone();
         match response {
-            C::Agents { agents, .. } => {
+            C::Agents { agents, splits, .. } => {
+                l.splits = splits
+                    .iter()
+                    .filter_map(|tree| tree.map(&|t| terminal_out(link, t)))
+                    .collect();
                 l.agents = agents
                     .into_iter()
                     .filter_map(|mut row| {
@@ -913,6 +938,12 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 None => Ok(()),
             },
+            // The splits cached from this link predate the one just recorded: merged as
+            // they are, the interface would take the old tree back.
+            C::SplitSaved { id } => {
+                self.touched(link);
+                self.respond(&C::SplitSaved { id }).await
+            }
             C::WorkspaceCreated { id, workspace } => match workspace_out(link, workspace) {
                 Some(workspace) => {
                     self.touched(link);
@@ -1012,6 +1043,17 @@ impl<W> Mux<W> {
             l.stale_spaces = true;
         }
     }
+}
+
+/// A tree in the interface's numbering as the daemon of its first pane numbers it, and
+/// which daemon that is. `None` when a pane belongs to another daemon.
+fn split_in(tree: &Pane) -> Option<(usize, Pane)> {
+    let link = terminal_in(*tree.leaves().first()?).0;
+    let tree = tree.map(&|t| {
+        let (at, t) = terminal_in(t);
+        (at == link).then_some(t)
+    })?;
+    Some((link, tree))
 }
 
 /// Interface terminal numbers grouped by the daemon they belong to, in its numbering.
@@ -1360,6 +1402,25 @@ mod tests {
         assert!(local < remote);
         assert!(
             workspace_out(0, (1 << 40) - 1).expect("fits") < workspace_out(1, 1).expect("fits")
+        );
+    }
+
+    #[test]
+    fn a_remote_tabs_split_goes_home_in_its_own_numbering() {
+        let beside = |a, b| Pane::Split {
+            dir: qoro_runtime::control::SplitDir::V,
+            permille: 500,
+            first: Box::new(Pane::Leaf { terminal: a }),
+            second: Box::new(Pane::Leaf { terminal: b }),
+        };
+        let (a, b) = (terminal_out(2, 4).unwrap(), terminal_out(2, 5).unwrap());
+        assert_eq!(split_in(&beside(a, b)), Some((2, beside(4, 5))));
+        assert_eq!(split_in(&beside(3, 7)), Some((0, beside(3, 7))));
+        assert_eq!(split_in(&beside(3, a)), None, "a tab lives on one host");
+        // And back out: what the remote keeps renumbers into the interface's range.
+        assert_eq!(
+            beside(4, 5).map(&|t| terminal_out(2, t)),
+            Some(beside(a, b))
         );
     }
 

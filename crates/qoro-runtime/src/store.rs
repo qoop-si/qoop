@@ -152,6 +152,16 @@ impl StoreHandle {
     pub async fn open_terminals(&self, workspace: i64) -> Result<Vec<TerminalRow>, HandleError> {
         self.run(move |s| s.open_terminals(workspace)).await
     }
+
+    /// Every stored split tree, as the JSON it was written as.
+    pub async fn splits(&self) -> Result<Vec<String>, HandleError> {
+        self.run(move |s| s.splits()).await
+    }
+
+    /// Replace every stored split tree in one transaction.
+    pub async fn set_splits(&self, trees: Vec<String>) -> Result<(), HandleError> {
+        self.run(move |s| s.set_splits(&trees)).await
+    }
 }
 
 #[cfg(test)]
