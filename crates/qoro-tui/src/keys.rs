@@ -153,21 +153,54 @@ pub struct Keys {
     pending_mouse: Vec<u8>,
 }
 
-/// Where the next mouse report starts, if there is one in these bytes.
-fn find_mouse(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(3).position(|w| w == b"\x1b[<")
+/// What the bytes from an `ESC [ <` hold.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// A whole report, its length, and what it means (`None` for what nothing here uses).
+    Whole(usize, Option<Action>),
+    /// Digits and separators up to the end of the read: the rest is still coming.
+    Partial,
+    /// Not a report after all. This many bytes are dropped and the byte after them is
+    /// ordinary input, so a `ctrl-q` right behind a mangled report still detaches.
+    Broken(usize),
+}
+
+/// Read what starts at an `ESC [ <`.
+///
+/// The report ends at the first byte that is not a digit or `;`. Searching for the next
+/// `M` or `m` anywhere was the first version, and a report that never got its terminator
+/// held everything typed after it, `ctrl-q` included, until the person happened to type
+/// an `m`.
+pub(crate) fn report(bytes: &[u8]) -> Report {
+    // Three numbers of at most five digits and the two separators between them.
+    const LONGEST_BODY: usize = 17;
+    let body = bytes
+        .iter()
+        .skip(3)
+        .take_while(|b| b.is_ascii_digit() || **b == b';')
+        .count();
+    let end = 3 + body;
+    if body > LONGEST_BODY {
+        return Report::Broken(end);
+    }
+    match bytes.get(end) {
+        None => Report::Partial,
+        Some(b'M' | b'm') => match mouse(&bytes[..=end]) {
+            Some(action) => Report::Whole(end + 1, action),
+            None => Report::Broken(end + 1),
+        },
+        Some(_) => Report::Broken(end),
+    }
 }
 
 /// The reply to `CSI ? 1006 h`, which is how a terminal reports a mouse press with
 /// coordinates that are not limited to 223 columns.
 ///
-/// `\x1b[<button;col;rowM` for a press and `m` for a release. Only the press is turned into
-/// an action: acting on both would switch twice for one click.
-fn mouse(bytes: &[u8]) -> Option<(usize, Option<Action>)> {
-    if !bytes.starts_with(b"\x1b[<") {
-        return None;
-    }
-    let end = bytes.iter().position(|b| *b == b'M' || *b == b'm')?;
+/// `\x1b[<button;col;rowM` for a press and `m` for a release, the terminator being the
+/// last byte of `bytes`. Only the press is turned into an action: acting on both would
+/// switch twice for one click.
+fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
+    let end = bytes.len() - 1;
     let body = std::str::from_utf8(&bytes[3..end]).ok()?;
     let mut parts = body.split(';');
     let button: u16 = parts.next()?.parse().ok()?;
@@ -203,7 +236,7 @@ fn mouse(bytes: &[u8]) -> Option<(usize, Option<Action>)> {
     } else {
         Some(Action::Release { row, col, shift })
     };
-    Some((end + 1, action))
+    Some(action)
 }
 
 impl Keys {
@@ -217,10 +250,11 @@ impl Keys {
         let mut actions = Vec::new();
         let mut pending = Vec::new();
 
-        // A mouse report is a sequence, so it is taken off the front before the loop that
-        // works a byte at a time. Carried across reads for the same reason the prefix is:
-        // a report can be split, and half of one passed through to a shell would type
-        // `[<0;5;3M` at a prompt.
+        // A mouse report is a sequence, so it is read whole where it starts, in the same
+        // pass as everything else: taken off first, the bytes before it skipped the prefix
+        // decoder, and `ctrl-a n` typed while the trackpad scrolled reached the shell.
+        // Carried across reads for the same reason the prefix is: a report can be split,
+        // and half of one passed through to a shell would type `[<0;5;3M` at a prompt.
         let mut bytes = bytes;
         let mut carried;
         if !self.pending_mouse.is_empty() {
@@ -228,29 +262,26 @@ impl Keys {
             carried.extend_from_slice(bytes);
             bytes = &carried[..];
         }
-        let mut rest = bytes;
-        while let Some(at) = find_mouse(rest) {
-            let (before, from) = rest.split_at(at);
-            pending.extend_from_slice(before);
-            match mouse(from) {
-                Some((used, action)) => {
-                    flush(&mut pending, &mut actions);
-                    if let Some(action) = action {
-                        actions.push(action);
-                    }
-                    rest = &from[used..];
-                }
-                None => {
-                    // The start of a report and not the whole of it. Held rather than
-                    // passed on, and the rest of this read has already been taken.
-                    self.pending_mouse = from.to_vec();
-                    rest = &[];
-                }
-            }
-        }
-        let bytes: Vec<u8> = pending.drain(..).chain(rest.iter().copied()).collect();
 
-        for &byte in &bytes {
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at..].starts_with(b"\x1b[<") {
+                match report(&bytes[at..]) {
+                    Report::Whole(used, action) => {
+                        flush(&mut pending, &mut actions);
+                        actions.extend(action);
+                        at += used;
+                    }
+                    Report::Partial => {
+                        self.pending_mouse = bytes[at..].to_vec();
+                        break;
+                    }
+                    Report::Broken(dropped) => at += dropped,
+                }
+                continue;
+            }
+            let byte = bytes[at];
+            at += 1;
             if self.after_prefix {
                 self.after_prefix = false;
                 let command = match byte {
@@ -620,6 +651,38 @@ mod tests {
                 col: 12,
                 shift: false
             }]
+        );
+    }
+
+    /// A report that never gets its terminator is dropped where it stops being one. Held
+    /// until some later `m`, it swallowed everything typed after it, the detach included.
+    #[test]
+    fn a_mangled_report_does_not_swallow_what_comes_after_it() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x1b[<0;5ls\r"), vec![input(b"ls\r")]);
+        assert_eq!(keys.feed(&[DETACH]), vec![Action::Detach]);
+        // Longer than any real report, with no end in sight: not held either.
+        let mut long = b"\x1b[<".to_vec();
+        long.extend(std::iter::repeat_n(b'1', 40));
+        assert!(keys.feed(&long).is_empty());
+        assert_eq!(keys.feed(b"x"), vec![input(b"x")]);
+    }
+
+    /// The bytes in front of a report are keys like any others: the prefix still works.
+    #[test]
+    fn a_command_in_front_of_a_mouse_report_is_still_a_command() {
+        let mut keys = Keys::default();
+        assert_eq!(
+            keys.feed(b"\x01n\x1b[<64;3;4M"),
+            vec![
+                Action::Next,
+                Action::Wheel {
+                    row: 4,
+                    col: 3,
+                    up: true,
+                    shift: false
+                }
+            ]
         );
     }
 }

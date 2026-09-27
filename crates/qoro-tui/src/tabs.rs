@@ -279,31 +279,10 @@ fn clip(text: &str) -> String {
     crate::width::fit(text, MAX_LABEL.min(crate::width::width(text)))
 }
 
-/// Cut or pad to exactly `cols` columns.
-///
-/// Not [`crate::width::fit`], which also drops the space a grid puts after a full width
-/// character to hold its second column. This bar is text this module composed, so a space
-/// in it is a space somebody meant, and dropping one would move every tab after it one
-/// column left of where [`hit`] says it is.
+/// Cut or pad to exactly `cols` columns, keeping every space: this bar is text this
+/// module composed, and dropping one would move every tab after it off where [`hit`] says.
 fn exactly(text: &str, cols: usize) -> String {
-    let mut out = String::with_capacity(cols);
-    let mut used = 0;
-    for c in text.chars() {
-        // A tab's name can come from another machine: an escape in it is never drawn.
-        if c.is_control() {
-            continue;
-        }
-        let wide = crate::width::columns(c);
-        if used + wide > cols {
-            break;
-        }
-        out.push(c);
-        used += wide;
-    }
-    for _ in used..cols {
-        out.push(' ');
-    }
-    out
+    crate::width::text(text, cols)
 }
 
 #[cfg(test)]

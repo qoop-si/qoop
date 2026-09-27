@@ -359,6 +359,10 @@ struct State {
     /// copied something looks at it to check they got the right thing. The next press in
     /// the pane clears it.
     selection: Option<crate::selection::Selection>,
+    /// A press went to the program in the focused pane and its release has not. The
+    /// program is owed the rest of that gesture wherever the pointer goes; without the
+    /// flag a release outside the tile was dropped and vim never saw the button come up.
+    forwarded_press: bool,
 }
 
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
@@ -1201,29 +1205,18 @@ fn menu_click(bytes: &[u8], cols: u16, lines: u16, kind: &MenuKind) -> Option<Op
     let mut found: Option<Option<usize>> = None;
     while let Some(start) = bytes[at..].windows(3).position(|w| w == b"\x1b[<") {
         let from = at + start;
-        let Some(end) = bytes[from..].iter().position(|b| *b == b'M' || *b == b'm') else {
-            break;
-        };
-        let end = from + end;
-        let press = bytes[end] == b'M';
-        if let Ok(body) = std::str::from_utf8(&bytes[from + 3..end]) {
-            let mut parts = body.split(';');
-            if let (Some(button), Some(col), Some(row)) = (
-                parts.next().and_then(|s| s.parse::<u16>().ok()),
-                parts.next().and_then(|s| s.parse::<u16>().ok()),
-                parts.next().and_then(|s| s.parse::<u16>().ok()),
-            ) {
-                let wheel = button & 64 != 0;
-                let motion = button & 32 != 0;
-                let plain = button & 0b0000_0011;
-                if press && !wheel && !motion && plain == 0 {
+        match crate::keys::report(&bytes[from..]) {
+            crate::keys::Report::Whole(used, action) => {
+                if let Some(Action::Click { row, col, .. }) = action {
                     found = Some(crate::screen::menu_row_at(
                         cols, lines, &rows, &title, row, col,
                     ));
                 }
+                at = from + used;
             }
+            crate::keys::Report::Broken(dropped) => at = from + dropped,
+            crate::keys::Report::Partial => break,
         }
-        at = end + 1;
     }
     found
 }
@@ -1480,6 +1473,12 @@ fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
             at += len;
             continue;
         }
+        // A mouse report goes to the ordinary path whole, list still open: the wheel arm
+        // there scrolls the list and a click closes it. Treated as a key, its esc was the
+        // close and the rest of the report was typed into the terminal as text.
+        if rest.starts_with(b"\x1b[<") {
+            return FocusOutcome::Passthrough(rest.to_vec());
+        }
         // Everything else closes first; what differs is what survives it.
         close_focus(state);
         // The close keystroke itself is dropped; what follows it is typed.
@@ -1641,6 +1640,7 @@ where
         probing: None,
         joining: None,
         selection: None,
+        forwarded_press: false,
         anchor: None,
         behind: Behind::default(),
     };
@@ -1668,6 +1668,9 @@ where
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    // Raw mode means ctrl-c is a byte, not a signal, so this only fires for a `kill -INT`
+    // from outside, which otherwise ended the process without restoring the terminal.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     // An interval, and not an acknowledgement sent only when something arrives. A client
     // that has taken a render and then goes quiet has nothing to reply to, so it never
     // says it kept up, and after thirty seconds the daemon is right to conclude it stopped
@@ -1696,16 +1699,10 @@ where
     )?)
     .await?;
 
-    let (pane_cols, pane_rows) = screen::pane_size(state.cols, state.lines);
-    wr.write_all(&client::encode_command_to(
-        1,
-        &ClientWire::Resize {
-            cols: pane_cols,
-            rows: pane_rows,
-        },
-        seqs.entry(1).or_default(),
-    )?)
-    .await?;
+    // No resize here. Terminal 1 by number claimed a terminal that may not be on screen
+    // (ADR-007), and its size then matched the adoption resize that follows, which the
+    // daemon answers with a one-row repaint nudge: a child reading its size in those
+    // 30 ms saw a row too few. The adoption path sizes whichever terminal is focused.
 
     let mut out = io::stdout();
     // The alternate screen, so that detaching gives the user their scrollback back, and
@@ -1888,6 +1885,7 @@ where
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),
+                _ = sigint.recv() => return Ok(()),
                 _ = sigwinch.recv() => {
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
@@ -2043,9 +2041,13 @@ where
                             }
                         }
                     } else if state.reading.is_some() {
-                        // Anything at all closes a thing that is only being read.
-                        state.reading = None;
-                        dirty = true;
+                        // A key or a click closes a thing that is only being read.
+                        // Through the one decoder, so half a report carried across
+                        // reads is still half a report, not two keys.
+                        if closes_reading(&keys.feed(&bytes)) {
+                            state.reading = None;
+                            dirty = true;
+                        }
                     } else if state.prompt.is_some() {
                         // The naming box owns the keyboard the same way the palette does,
                         // and hands a prefix or a detach back for the same reason.
@@ -2058,31 +2060,27 @@ where
                                 request += 1;
                                 let ask = match what {
                                     Naming::RenameTerminal(terminal) => {
-                                        ControlRequest::RenameTerminal {
+                                        Some(ControlRequest::RenameTerminal {
                                             id: format!("rename-{request}"),
                                             terminal,
                                             // Empty hands the tab back to its program's
                                             // name, which is the only way to undo a name
                                             // without inventing a second key for it.
                                             name,
-                                        }
+                                        })
                                     }
+                                    // A space with no name is a space nobody can point
+                                    // at, so an empty answer is a cancel. Not a
+                                    // `continue`: that also dropped the keys typed after
+                                    // the enter, which are in `feed` and run below.
                                     Naming::RenameSpace(workspace) => {
-                                        match name {
-                                            Some(name) => ControlRequest::RenameWorkspace {
-                                                id: format!("rename-{request}"),
-                                                workspace,
-                                                name,
-                                            },
-                                            // A space with no name is a space nobody can
-                                            // point at, so an empty answer is a cancel.
-                                            None => {
-                                                dirty = true;
-                                                continue;
-                                            }
-                                        }
+                                        name.map(|name| ControlRequest::RenameWorkspace {
+                                            id: format!("rename-{request}"),
+                                            workspace,
+                                            name,
+                                        })
                                     }
-                                    Naming::Terminal => ControlRequest::CreateTerminal {
+                                    Naming::Terminal => Some(ControlRequest::CreateTerminal {
                                         id: format!("new-{request}"),
                                         // The new tab follows the
                                         // focused terminal's directory.
@@ -2090,58 +2088,55 @@ where
                                         // The space the person is looking at.
                                         workspace: state.space,
                                         name,
-                                    },
-                                    Naming::Space => ControlRequest::CreateWorkspace {
+                                    }),
+                                    Naming::Space => Some(ControlRequest::CreateWorkspace {
                                         id: format!("space-{request}"),
                                         // Empty means "you name it", which is the numbered
                                         // name this counted before anybody was asked.
                                         name: name.unwrap_or_else(|| next_space_name(&state)),
-                                    },
-                                    Naming::Remote => {
-                                        // An address is what the box is for: empty is a
-                                        // cancel, as with a space's name.
-                                        let Some(target) = name else {
-                                            dirty = true;
-                                            continue;
-                                        };
+                                    }),
+                                    // An address is what the box is for: empty is a
+                                    // cancel, as with a space's name.
+                                    Naming::Remote => name.map(|target| {
                                         let id = format!("probe-{request}");
                                         state.probing = Some(id.clone());
                                         state.connecting = Some(target.clone());
                                         ControlRequest::ListRemoteSessions { id, target }
-                                    }
+                                    }),
                                     Naming::RemoteSession => {
-                                        let Some(target) = state.connecting.clone() else {
-                                            dirty = true;
-                                            continue;
-                                        };
-                                        ControlRequest::ConnectRemote {
-                                            id: format!("connect-{request}"),
-                                            target,
-                                            session: name.unwrap_or_else(|| "default".into()),
-                                        }
+                                        state.connecting.clone().map(|target| {
+                                            ControlRequest::ConnectRemote {
+                                                id: format!("connect-{request}"),
+                                                target,
+                                                session: name
+                                                    .unwrap_or_else(|| "default".into()),
+                                            }
+                                        })
                                     }
                                 };
-                                if matches!(what, Naming::Space) {
-                                    state.creating += 1;
-                                }
-                                wr.write_all(&client::encode_control_seq(
-                                    &ask, &mut control_seq,
-                                )?).await?;
-                                state.message = Some(match what {
-                                    Naming::Terminal => "starting a terminal".to_string(),
-                                    Naming::Space => "starting a space".to_string(),
-                                    Naming::RenameSpace(_) | Naming::RenameTerminal(_) => {
-                                        "renamed".to_string()
+                                if let Some(ask) = ask {
+                                    if matches!(what, Naming::Space) {
+                                        state.creating += 1;
                                     }
-                                    Naming::Remote => format!(
-                                        "looking at {}",
-                                        state.connecting.as_deref().unwrap_or_default()
-                                    ),
-                                    Naming::RemoteSession => format!(
-                                        "connecting to {}",
-                                        state.connecting.as_deref().unwrap_or_default()
-                                    ),
-                                });
+                                    wr.write_all(&client::encode_control_seq(
+                                        &ask, &mut control_seq,
+                                    )?).await?;
+                                    state.message = Some(match what {
+                                        Naming::Terminal => "starting a terminal".to_string(),
+                                        Naming::Space => "starting a space".to_string(),
+                                        Naming::RenameSpace(_) | Naming::RenameTerminal(_) => {
+                                            "renamed".to_string()
+                                        }
+                                        Naming::Remote => format!(
+                                            "looking at {}",
+                                            state.connecting.as_deref().unwrap_or_default()
+                                        ),
+                                        Naming::RemoteSession => format!(
+                                            "connecting to {}",
+                                            state.connecting.as_deref().unwrap_or_default()
+                                        ),
+                                    });
+                                }
                                 dirty = true;
                             }
                             PromptOutcome::Passthrough(rest) => feed = Some(rest),
@@ -2219,6 +2214,10 @@ where
                                 dirty = true;
                             }
                             Action::Click { row, col, shift } => {
+                                // A new press ends whatever gesture came before: a
+                                // release swallowed elsewhere (the palette, a divider
+                                // drag) must not leave the program owed one.
+                                state.forwarded_press = false;
                                 // A click lands on the live pane, never on the
                                 // list: the list closes under it and the press
                                 // itself runs the ordinary path below.
@@ -2264,11 +2263,19 @@ where
                                     // theirs: a press starts a selection rather than
                                     // reaching anything.
                                     if state.pane_wants_mouse() && !shift {
+                                        // The press is the program's, so a selection kept
+                                        // from an earlier copy goes down: left up, the drag
+                                        // after this press extended it instead of reaching
+                                        // the program, and the release copied again.
+                                        if state.selection.take().is_some() {
+                                            dirty = true;
+                                        }
                                         if let Some(bytes) =
                                             mouse_report(0, tile_row, tile_col, true)
                                         {
                                             send_to_pane(&mut state, &mut seqs, &mut wr, bytes)
                                                 .await?;
+                                            state.forwarded_press = true;
                                         }
                                     } else {
                                         state.selection =
@@ -2357,7 +2364,11 @@ where
                                     }
                                     continue;
                                 }
-                                let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
+                                let Some((pane_row, pane_col)) = state.in_pane(row, col).or_else(|| {
+                                    state
+                                        .forwarded_press
+                                        .then(|| clamped_to_focused(&state, row, col))
+                                }) else {
                                     continue;
                                 };
                                 if let Some(selection) = state.selection.as_mut() {
@@ -2414,7 +2425,12 @@ where
                                     }
                                     continue;
                                 }
-                                let inside = state.in_pane(row, col);
+                                let inside = state.in_pane(row, col).or_else(|| {
+                                    state
+                                        .forwarded_press
+                                        .then(|| clamped_to_focused(&state, row, col))
+                                });
+                                state.forwarded_press = false;
                                 if let Some(selection) = state.selection {
                                     // Copied when the button comes up, with no key to
                                     // press: a selection that has to be confirmed is a
@@ -2552,7 +2568,14 @@ where
                                     }
                                 }
                             }
-                            Action::Redraw => dirty = true,
+                            Action::Redraw => {
+                                // A fresh presenter, or the repaint writes only rows that
+                                // differ from its cache, which is none: the key existed
+                                // for a screen the outer terminal mangled, and did nothing.
+                                presenter = present::Presenter::default();
+                                state.shown_images.clear();
+                                dirty = true;
+                            }
                             Action::Next | Action::Previous => {
                                 let forward = matches!(action, Action::Next);
                                 if let Some(next) = state.neighbour(forward)
@@ -3198,19 +3221,35 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
                         palette.move_by(1, count);
                         i += 3;
                     }
-                    Some(b'<') => {
-                        // A mouse report, swallowed whole. Split across the read, it
-                        // is stashed like the key decoder stashes its own.
-                        if let Some(end) = buf[i..].iter().position(|b| *b == b'M' || *b == b'm') {
-                            i += end + 1;
-                        } else {
+                    // A mouse report, swallowed whole, read the way the key decoder
+                    // reads one. Split across the read, it is stashed like the key
+                    // decoder stashes its own.
+                    Some(b'<') => match crate::keys::report(&buf[i..]) {
+                        crate::keys::Report::Whole(used, _) | crate::keys::Report::Broken(used) => {
+                            i += used
+                        }
+                        crate::keys::Report::Partial => {
                             state.palette_pending = buf[i..].to_vec();
                             break;
                         }
-                    }
-                    // Any other sequence (arrows with modifiers, function keys):
-                    // nothing to do with it here, and it must not reach a shell.
-                    Some(_) => i += 3,
+                    },
+                    // Any other sequence (arrows with modifiers, function keys),
+                    // skipped whole: nothing to do with it here, and it must not reach
+                    // a shell, nor its tail the query (`Delete` used to type `~`).
+                    // A control byte before the final one ends it unfinished, as it does
+                    // for the parser, and is read as itself: held on, an `ESC [` that
+                    // never finished swallowed Enter, esc and the detach after it.
+                    Some(_) => match buf[i + 2..]
+                        .iter()
+                        .position(|b| (0x40..=0x7e).contains(b) || *b < 0x20)
+                    {
+                        Some(at) if buf[i + 2 + at] >= 0x40 => i += 2 + at + 1,
+                        Some(at) => i += 2 + at,
+                        None => {
+                            state.palette_pending = buf[i..].to_vec();
+                            break;
+                        }
+                    },
                     // Split mid sequence: hold it for the next read.
                     None => {
                         state.palette_pending = buf[i..].to_vec();
@@ -3860,6 +3899,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.snapshots.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
             state.panes.retain(|t| live.contains(t));
+            // Pictures too, up to 4 MiB each, or every terminal that exited on its own
+            // kept its last one for the life of this client.
+            state.images.retain(|t, _| live.contains(t));
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 state.focused = 0;
                 state.snapshot = None;
@@ -4252,9 +4294,68 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
     }
 }
 
+/// A pointer position as a cell of the focused tile, pulled back to its nearest edge when
+/// the pointer has left it. Only for a gesture whose press already went to the program:
+/// a release with no press, or a drag begun on the sidebar, is never sent.
+fn clamped_to_focused(state: &State, row: u16, col: u16) -> (usize, usize) {
+    let tile = focused_rect(state);
+    let first_col = screen::left_for(state.cols, state.collapsed, state.sidebar_width) + 1;
+    let x = (col as usize)
+        .saturating_sub(first_col)
+        .saturating_sub(tile.x);
+    let y = (row as usize)
+        .saturating_sub(screen::TABS + 1)
+        .saturating_sub(tile.y);
+    (
+        y.min(tile.rows.saturating_sub(1)),
+        x.min(tile.cols.saturating_sub(1)),
+    )
+}
+
+/// Whether a read closes an overlay that is only being read: a key or a click does. The
+/// release of the click that chose it from the menu, or the pointer jittering with the
+/// button still down, arrives after the overlay is up, and closing on those closed it
+/// again before anyone saw it.
+fn closes_reading(actions: &[Action]) -> bool {
+    actions.iter().any(|action| {
+        !matches!(
+            action,
+            Action::Release { .. } | Action::Drag { .. } | Action::Wheel { .. }
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drag or release past the tile's edge reaches the program at that edge.
+    #[test]
+    fn a_pointer_outside_the_focused_tile_is_pulled_back_to_its_edge() {
+        let s = state();
+        let tile = focused_rect(&s);
+        assert!(tile.rows > 0 && tile.cols > 0);
+        assert_eq!(
+            clamped_to_focused(&s, u16::MAX, u16::MAX),
+            (tile.rows - 1, tile.cols - 1)
+        );
+        assert_eq!(clamped_to_focused(&s, 1, 1), (0, 0));
+    }
+
+    #[test]
+    fn the_rest_of_the_choosing_click_does_not_close_what_it_opened() {
+        let mut keys = Keys::default();
+        assert!(!closes_reading(&keys.feed(b"\x1b[<0;5;5m")), "the release");
+        assert!(
+            !closes_reading(&keys.feed(b"\x1b[<32;6;5M")),
+            "a jitter, button down"
+        );
+        assert!(!closes_reading(&keys.feed(b"\x1b[<0;5")), "half a release");
+        assert!(!closes_reading(&keys.feed(b";5m")), "and its other half");
+        assert!(closes_reading(&keys.feed(b"\x1b[<0;5;5M")), "a new click");
+        assert!(closes_reading(&keys.feed(b"q")), "a key");
+    }
+
     use qoro_runtime::control::WorkspaceRow;
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
@@ -4438,6 +4539,7 @@ mod tests {
             probing: None,
             joining: None,
             selection: None,
+            forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
             snapshots: std::collections::BTreeMap::new(),
@@ -4519,6 +4621,21 @@ mod tests {
             PaletteOutcome::Confirm(palette::Item::Terminal(1))
         ));
         assert_eq!(state.palette, None, "confirming leaves the palette");
+    }
+
+    /// A longer key sequence is skipped whole: only its first three bytes were, and
+    /// `Delete` typed `~`, ctrl-up `;5A`, into the query.
+    #[test]
+    fn a_long_key_sequence_types_nothing_into_the_query() {
+        let mut state = state();
+        palette_key(&mut state, b"ma");
+        palette_key(&mut state, b"\x1b[3~\x1b[1;5A\x1b[<0;5;5m");
+        assert_eq!(state.palette.as_ref().map(|p| p.query.as_str()), Some("ma"));
+        // An `ESC [` that never finishes does not hold the enter behind it.
+        assert!(matches!(
+            palette_key(&mut state, b"\x1b[\r"),
+            PaletteOutcome::Confirm(_)
+        ));
     }
 
     #[test]
@@ -4740,6 +4857,7 @@ mod tests {
             probing: None,
             joining: None,
             selection: None,
+            forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
         }
@@ -4810,6 +4928,7 @@ mod tests {
             probing: None,
             joining: None,
             selection: None,
+            forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
         };
@@ -5508,6 +5627,17 @@ mod tests {
             );
             assert!(!state.focus);
         }
+    }
+
+    #[test]
+    fn a_mouse_report_reaches_the_mouse_handling_whole_with_the_list_open() {
+        let mut state = bare_state();
+        state.focus = true;
+        match focus_key(&mut state, b"\x1b[<64;12;5M") {
+            FocusOutcome::Passthrough(rest) => assert_eq!(rest, b"\x1b[<64;12;5M"),
+            other => panic!("the report is handed on intact: {other:?}"),
+        }
+        assert!(state.focus, "a wheel over the list is not a close");
     }
 
     #[test]

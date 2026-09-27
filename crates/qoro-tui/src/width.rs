@@ -73,6 +73,31 @@ pub fn fit(row: &str, cols: usize) -> String {
     out
 }
 
+/// Composed text, cut or padded to exactly `cols` columns.
+///
+/// Not [`fit`], which also drops the space a grid puts after a full width character to
+/// hold its second column. Text a module composed has no spacers, so a space in it is a
+/// space somebody meant: measured, an agent whose name was two full width characters had
+/// a pad space eaten and its state stopped a column short of the right edge. Control
+/// characters are never drawn, as in [`fit`]: names can come from another machine or a
+/// program's own title, and an escape in one would reach this terminal as a command.
+pub fn text(text: &str, cols: usize) -> String {
+    let mut out = String::with_capacity(cols);
+    let mut used = 0;
+    for c in text.chars().filter(|c| !c.is_control()) {
+        let wide = columns(c);
+        if used + wide > cols {
+            break;
+        }
+        out.push(c);
+        used += wide;
+    }
+    for _ in used..cols {
+        out.push(' ');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +146,15 @@ mod tests {
                 assert_eq!(width(&fit(row, cols)), cols, "{row:?} at {cols}");
             }
         }
+    }
+
+    /// Composed text keeps its spaces and never carries an escape out.
+    #[test]
+    fn composed_text_keeps_spaces_and_drops_controls() {
+        assert_eq!(text("中 x", 4), "中 x");
+        let fitted = text("a\x1b]52;c;aGk=\x07b\u{9b}", 20);
+        assert!(!fitted.chars().any(char::is_control), "{fitted:?}");
+        assert_eq!(width(&fitted), 20);
     }
 
     #[test]

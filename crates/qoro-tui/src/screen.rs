@@ -904,7 +904,9 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                 let sub = entry.sub.clone();
                 let head = entry.text.clone();
                 let room = inner.saturating_sub(width::width(&sub) + 2);
-                let head = width::fit(&head, room);
+                // Composed text, so every space in it is meant: the grid fitter would drop
+                // the one after a wide character.
+                let head = width::text(&head, room);
                 out.push_str(&base);
                 out.push(' ');
                 match (space_ink, entry.space_len) {
@@ -914,9 +916,22 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                         } else {
                             theme::fg(ink)
                         });
-                        out.push_str(&width::fit(&head, len));
+                        // Split where the columns reach `len`, not after `len` characters:
+                        // counted in characters, a wide space name lost text and pulled
+                        // the right border two columns in.
+                        let mut cols = 0;
+                        let cut = head
+                            .char_indices()
+                            .find_map(|(i, c)| {
+                                let here = (cols >= len).then_some(i);
+                                cols += width::columns(c);
+                                here
+                            })
+                            .unwrap_or(head.len());
+                        let (lead, tail) = head.split_at(cut);
+                        out.push_str(lead);
                         out.push_str(&base);
-                        out.push_str(&head.chars().skip(len).collect::<String>());
+                        out.push_str(tail);
                     }
                     _ => out.push_str(&head),
                 }
@@ -1268,7 +1283,11 @@ fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
         .max()
         .unwrap_or(0);
     let w = (widest + 3).min(cols);
-    if lines < rows.len() + 4 || w < 6 {
+    // Clipped to the window rather than skipped: the keybind list is taller than an
+    // 80x24 window, and skipping painted nothing while the overlay still took the next
+    // key, which read as a frozen screen.
+    let rows = &rows[..rows.len().min(lines.saturating_sub(4))];
+    if rows.is_empty() || w < 6 {
         return;
     }
     let left = cols.saturating_sub(w) / 2;
@@ -1850,6 +1869,53 @@ mod tests {
         assert!(
             painted.contains(&want),
             "no caret at the end of the typed text: {painted:?}"
+        );
+    }
+
+    /// The keybind list is taller than an 80x24 window. It is clipped to fit, not skipped:
+    /// skipped, the overlay painted nothing and still took the next key.
+    #[test]
+    fn the_keybinds_overlay_paints_on_an_80_by_24_window() {
+        let rows = [row(1, "zsh", "idle")];
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &spaces(),
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: Some(crate::run::Reading::Keybinds),
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+            image_notice: None,
+        });
+        assert!(painted.contains(" keybinds"), "no keybinds box on 80x24");
+        assert!(
+            !painted.contains("\x1b[25;"),
+            "the box ran past the last row"
         );
     }
 
@@ -3134,6 +3200,56 @@ mod tests {
             image_notice: None,
         });
         assert!(painted.contains("starting a terminal"), "{painted:?}");
+    }
+
+    /// A space named in wide characters keeps its whole name and the row keeps its border:
+    /// the colour split used to count characters where the name was measured in columns.
+    #[test]
+    fn a_wide_space_name_in_the_palette_loses_nothing() {
+        let rows = [blocked_row(1, "codex")];
+        let wide = vec![WorkspaceRow {
+            id: 1,
+            name: "中文ab".to_string(),
+            terminals: 1,
+        }];
+        let palette = Palette::open();
+        let painted = paint(&Frame {
+            rows: &rows,
+            spaces: &wide,
+            panes: &std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 0,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: Some(&palette),
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Grouped,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+            image_notice: None,
+        });
+        let shown = strip(&painted);
+        assert!(shown.contains("中文ab codex"), "{shown:?}");
     }
 
     /// The palette floats over the terminal with what needs a person first.

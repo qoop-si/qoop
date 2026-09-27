@@ -983,7 +983,7 @@ pub(crate) fn rows_folded(
     }
     // The mark that folds the column away, at its foot, where the eye lands last.
     if let Some(last) = out.last_mut() {
-        *last = collapse_row_with(false, width, avatar);
+        *last = collapse_row_with(false, width, avatar, update_available().as_deref());
     }
     out
 }
@@ -1085,7 +1085,12 @@ fn strip_space(n: usize) -> String {
 
 /// The row that folds the column away, and unfolds it again.
 fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
-    collapse_row_with(collapsed, width, current_avatar().as_ref())
+    collapse_row_with(
+        collapsed,
+        width,
+        current_avatar().as_ref(),
+        update_available().as_deref(),
+    )
 }
 
 /// The picked avatar, when one is picked.
@@ -1165,10 +1170,13 @@ pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
 
 /// [`collapse_row`] with the avatar passed in, so tests can paint both feet
 /// without touching a home directory.
+/// `update` is what [`update_available`] said, passed in so a test can say it without
+/// writing the notice file every other paint in the process reads.
 fn collapse_row_with(
     collapsed: bool,
     width: usize,
     avatar: Option<&qoro_runtime::avatar::Avatar>,
+    update: Option<&str>,
 ) -> (Line, Option<Hit>) {
     let width = if collapsed { COLLAPSED } else { width };
     let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
@@ -1198,7 +1206,7 @@ fn collapse_row_with(
         Some(_) => format!(" {BRAND_MARK}{BRAND_MARK} {BRAND}"),
         None => format!(" {BRAND_MARK} {BRAND}"),
     };
-    let version = match update_available() {
+    let version = match update {
         Some(new) => format!("{VERSION}>{new} "),
         None => format!("{VERSION} "),
     };
@@ -1649,37 +1657,10 @@ fn fit(text: &str, width: usize) -> String {
     fit_to(text, width)
 }
 
-/// Cut or pad to exactly `cols` columns.
-///
-/// Columns and not characters: a program or a space named with a full width glyph would
-/// otherwise draw past the column and over the terminal beside it, which is the arithmetic
-/// error [`crate::width`] exists to stop repeating.
-///
-/// Not [`crate::width::fit`], which also drops the space a grid puts after a full width
-/// character to hold its second column. These rows are text this module composed, so a
-/// space in one is a space somebody meant: measured, an agent whose name was two full width
-/// characters had a pad space eaten and its state stopped a column short of the right edge,
-/// and a space with a wide name lost the space in front of the separator.
+/// Cut or pad to exactly `cols` columns, in columns and not characters: a program or a
+/// space named with a full width glyph would otherwise draw over the terminal beside it.
 fn fit_to(text: &str, cols: usize) -> String {
-    let mut out = String::with_capacity(cols);
-    let mut used = 0;
-    for c in text.chars() {
-        // Names can come from another machine or a program's own title: an escape in
-        // one is never drawn, or it would reach this terminal as a command.
-        if c.is_control() {
-            continue;
-        }
-        let wide = crate::width::columns(c);
-        if used + wide > cols {
-            break;
-        }
-        out.push(c);
-        used += wide;
-    }
-    for _ in used..cols {
-        out.push(' ');
-    }
-    out
+    crate::width::text(text, cols)
 }
 
 #[cfg(test)]
@@ -2514,7 +2495,7 @@ mod tests {
             hair_ink: 212,
             body_ink: 33,
         };
-        let (line, hit) = collapse_row_with(false, WIDTH, Some(&pet));
+        let (line, hit) = collapse_row_with(false, WIDTH, Some(&pet), None);
         assert_eq!(
             crate::width::width(&line.text),
             WIDTH,
@@ -2561,14 +2542,14 @@ mod tests {
             body_ink: 33,
         };
         assert_eq!(pet.name(), "Thin 4 Blocked");
-        let (wide, _) = collapse_row_with(false, WIDTH, Some(&pet));
+        let (wide, _) = collapse_row_with(false, WIDTH, Some(&pet), None);
         assert_eq!(crate::width::width(&wide.text), WIDTH);
         assert!(
             wide.text.contains('\u{2026}'),
             "fourteen characters never fit at thirty columns: {wide:?}"
         );
         assert!(wide.text.contains("Thin 4 Bloc"), "{wide:?}");
-        let (narrow, _) = collapse_row_with(false, 18, Some(&pet));
+        let (narrow, _) = collapse_row_with(false, 18, Some(&pet), None);
         assert_eq!(crate::width::width(&narrow.text), 18);
         assert!(
             !narrow.text.contains("Thin"),
@@ -2580,7 +2561,7 @@ mod tests {
     /// Without an avatar the foot is byte for byte what it always was.
     #[test]
     fn without_an_avatar_the_foot_is_unchanged() {
-        let (line, _) = collapse_row_with(false, WIDTH, None);
+        let (line, _) = collapse_row_with(false, WIDTH, None, None);
         assert_eq!(
             line.accent,
             Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand))
@@ -2705,13 +2686,10 @@ mod tests {
     /// A seen update signs the foot of the column with where this build stands.
     #[test]
     fn a_seen_update_names_itself_beside_the_version() {
-        // The notice file the check leaves, under a runtime directory of this test's
-        // own: no other test reads the variable, so holding it here races nothing.
-        let base = tempfile::tempdir().expect("tempdir");
-        // SAFETY: the only reader of this variable in this binary is the row below.
-        unsafe { std::env::set_var("QORO_RUNTIME_DIR", base.path()) };
-        std::fs::write(base.path().join("update-available"), "9.9.9\n").expect("notice");
-        let (line, _) = collapse_row(false, WIDTH);
+        // Said directly rather than through the notice file: every foot painted by any
+        // test in this process reads that file, so writing it here changed their rows
+        // and failed them at random.
+        let (line, _) = collapse_row_with(false, WIDTH, None, Some("9.9.9"));
         assert!(
             line.text.contains("9.9.9"),
             "the waiting release has to be readable off the screen: {:?}",
@@ -2723,15 +2701,12 @@ mod tests {
             "the longer row still fills the column exactly: {:?}",
             line.text
         );
-        std::fs::remove_file(base.path().join("update-available")).expect("cleanup");
-        let (plain, _) = collapse_row(false, WIDTH);
+        let (plain, _) = collapse_row_with(false, WIDTH, None, None);
         assert!(
             !plain.text.contains('>'),
             "no notice is the row it always was: {:?}",
             plain.text
         );
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("QORO_RUNTIME_DIR") };
     }
 
     /// A done row is unread until the keyboard has been there: not focused,
