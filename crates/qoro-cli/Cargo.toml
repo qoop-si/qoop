@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 qoro-proto = { path = "../qoro-proto" }
 qoro-store = { path = "../qoro-store" }
+qoro-pty = { path = "../qoro-pty" }
 
 [dev-dependencies]
 bytes = { workspace = true }

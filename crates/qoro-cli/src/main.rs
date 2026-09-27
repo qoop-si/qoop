@@ -21,6 +21,7 @@ mod remote;
 mod skills;
 mod supervise;
 mod update;
+mod worktree;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
 use qoro_runtime::daemon::ClientWire;
@@ -40,10 +41,31 @@ fn shell() -> PathBuf {
 fn main() {
     // One sentence and a failing exit, never the `Error: Custom { kind: .. }` dump that
     // returning the error from `main` prints: every refusal below is worded for a person.
+    // Exit 2 when the command was called wrong, 1 when it failed.
     if let Err(e) = run() {
         eprintln!("qoro: {e}");
-        std::process::exit(1);
+        std::process::exit(if is_usage(&e) { 2 } else { 1 });
     }
+}
+
+/// A command called wrong, as opposed to one that failed: exits 2.
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+pub(crate) fn usage(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(Usage(message.into()))
+}
+
+fn is_usage(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Usage>())
 }
 
 fn run() -> std::io::Result<()> {
@@ -102,6 +124,7 @@ fn run() -> std::io::Result<()> {
         Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
         Some("new") => supervise::run_new(&args),
         Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),
+        Some("worktree") => worktree::run(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
@@ -138,14 +161,21 @@ fn run() -> std::io::Result<()> {
                   \x20                 shift-tab backspace space up down left right home end\n\
                   \x20                 pageup pagedown ctrl-a..ctrl-z\n\
                   \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
-                  \x20 qoro prompt <target> <text>  send text plus Enter, unless blocked\n\
+                  \x20 qoro prompt <target> [--wait] [--timeout SECS] [--] <text>  send text\n\
+                  \x20                 plus Enter, unless blocked; --wait returns once the\n\
+                  \x20                 agent took the turn and stopped\n\
                   \x20                 send, prompt and close take --generation G: refused\n\
                   \x20                 when the process is no longer the one that was read\n\
-                  \x20 qoro wait [target...] [--until STATE,...] [--timeout SECS] [--json]\n\
-                  \x20                 block until a terminal reaches a state; exits 124 on\n\
-                  \x20                 timeout\n\
-                  \x20 qoro new [--name N] [--cwd DIR] [--space ID] [-- command...]  open a\n\
+                  \x20 qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
+                  \x20                 block until a terminal reaches a state, or TEXT is on\n\
+                  \x20                 its live screen; exits 124 on timeout\n\
+                  \x20 qoro new [--name N] [--cwd DIR] [--space ID|NAME] [-- command...]  open a\n\
                   \x20                 terminal, print its number, type the command into it\n\
+                  \x20 qoro worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
+                  \x20                 a git worktree beside the repo, with a terminal in it\n\
+                  \x20 qoro worktree ls [--json]  every worktree and the terminals inside\n\
+                  \x20 qoro worktree rm <branch|path> [--force]  remove one, keeping the\n\
+                  \x20                 branch; refused while any process is inside\n\
                   \x20 qoro close <terminal>  end a terminal and what it started\n\
                   \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
@@ -191,7 +221,7 @@ fn run() -> std::io::Result<()> {
         }
         None => run_client(),
         // A typo is named, not answered with a daemon and the full-screen interface.
-        Some(other) => Err(std::io::Error::other(format!(
+        Some(other) => Err(usage(format!(
             "unknown command {other}; usage: qoro [command] [--session <name>], see qoro --help"
         ))),
     }
@@ -474,7 +504,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("show") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| std::io::Error::other("usage: qoro setup show <file>"))?;
+                .ok_or_else(|| usage("usage: qoro setup show <file>"))?;
             let setup = read_setup(path)?;
             let (level, gaps) = level_of(&setup);
             print!("{}", setup.confirmation_text());
@@ -488,7 +518,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("trust") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| std::io::Error::other("usage: qoro setup trust <file>"))?;
+                .ok_or_else(|| usage("usage: qoro setup trust <file>"))?;
             let setup = read_setup(path)?;
             // Shown before it is trusted, in full. The value of the prompt is that it is
             // rare enough to read, so there is no way to trust something without seeing it.
@@ -514,7 +544,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("check") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| std::io::Error::other("usage: qoro setup check <file>"))?;
+                .ok_or_else(|| usage("usage: qoro setup check <file>"))?;
             let setup = read_setup(path)?;
             let ledger = ConfirmationLedger::open(&ledger_path);
             match qoro_setup::ledger::admit(&setup, &ledger, true) {
@@ -579,7 +609,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 state = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
@@ -589,7 +619,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 event = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
@@ -599,7 +629,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 label = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
@@ -611,7 +641,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     None => None,
                 };
                 if terminal.is_none() {
-                    return Err(std::io::Error::other(
+                    return Err(usage(
                         "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                     ));
                 }
@@ -620,7 +650,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 token = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
@@ -633,7 +663,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 id = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
@@ -646,14 +676,14 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 session = match rest.next() {
                     Some(v) => Some(v.clone()),
                     None => {
-                        return Err(std::io::Error::other(
+                        return Err(usage(
                             "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
             }
             other => {
-                return Err(std::io::Error::other(format!(
+                return Err(usage(format!(
                     "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]"
                 )));
             }
@@ -680,12 +710,12 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let request = match state {
         None => {
             if event.is_some() || label.is_some() {
-                return Err(std::io::Error::other(
+                return Err(usage(
                     "usage: --event/--label need --state; or qoro hook-report --session-id S [--terminal N] [--token T]",
                 ));
             }
             let Some(session) = session.filter(|s| !s.trim().is_empty()) else {
-                return Err(std::io::Error::other(
+                return Err(usage(
                     "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
                 ));
             };
@@ -706,14 +736,12 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             if let Some(ref kind) = event
                 && !qoro_runtime::control::parse_focus_event(kind)
             {
-                return Err(std::io::Error::other(format!(
+                return Err(usage(format!(
                     "unknown focus event {kind:?}; usage: qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...]"
                 )));
             }
             if label.is_some() && event.is_none() {
-                return Err(std::io::Error::other(
-                    "usage: --label needs --event user|tool|blocked|done",
-                ));
+                return Err(usage("usage: --label needs --event user|tool|blocked|done"));
             }
             let id = id.unwrap_or_else(|| format!("hook-{terminal}-{nanos}"));
             ControlRequest::ReportAgentState {
@@ -1032,11 +1060,11 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let usage = "usage: qoro send <terminal> <text...> [--enter] [--generation G]\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
+    let help = "usage: qoro send <terminal> <text...> [--enter] [--generation G]\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
-        .ok_or_else(|| std::io::Error::other(usage))?;
+        .ok_or_else(|| usage(help))?;
     let mut enter = false;
     let mut parts = Vec::new();
     let mut keys = Vec::new();
@@ -1047,23 +1075,17 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         if arg == "--enter" {
             enter = true;
         } else if arg == "--key" {
-            keys.push(
-                rest.next()
-                    .cloned()
-                    .ok_or_else(|| std::io::Error::other(usage))?,
-            );
+            keys.push(rest.next().cloned().ok_or_else(|| usage(help))?);
         } else if arg.starts_with("--") {
-            return Err(std::io::Error::other(format!(
-                "unknown flag {arg}; {usage}"
-            )));
+            return Err(usage(format!("unknown flag {arg}; {help}")));
         } else {
             parts.push(arg.clone());
         }
     }
     // Keys and text in one call would have to agree on an order nobody wrote down.
     if !keys.is_empty() && (!parts.is_empty() || enter) {
-        return Err(std::io::Error::other(format!(
-            "send either text or --key, not both; {usage}"
+        return Err(usage(format!(
+            "send either text or --key, not both; {help}"
         )));
     }
     supervise::check_generation(terminal, generation)?;
@@ -1074,9 +1096,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     }
     let mut text = parts.join(" ");
     if text.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "refusing to send empty input; {usage}"
-        )));
+        return Err(usage(format!("refusing to send empty input; {help}")));
     }
     if enter {
         text.push('\r');
@@ -1286,11 +1306,11 @@ fn trim_rows(mut rows: Vec<String>, lines: Option<usize>) -> Vec<String> {
 /// Subscribes, takes the first snapshot for that terminal and prints it.
 /// Trailing blank rows are trimmed; `--lines N` keeps the last N rows.
 fn run_read(args: &[String]) -> std::io::Result<()> {
-    let usage = "usage: qoro read <terminal> [--lines N]";
+    let help = "usage: qoro read <terminal> [--lines N]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
-        .ok_or_else(|| std::io::Error::other(usage))?;
+        .ok_or_else(|| usage(help))?;
     let mut lines: Option<usize> = None;
     let mut rest = args.iter().skip(3);
     while let Some(arg) = rest.next() {
@@ -1298,12 +1318,10 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
             lines = Some(
                 rest.next()
                     .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| std::io::Error::other(usage))?,
+                    .ok_or_else(|| usage(help))?,
             );
         } else {
-            return Err(std::io::Error::other(format!(
-                "unknown flag {arg}; {usage}"
-            )));
+            return Err(usage(format!("unknown flag {arg}; {help}")));
         }
     }
 
@@ -1389,23 +1407,20 @@ fn prompt_refusal(row: &qoro_runtime::control::AgentRow) -> Option<String> {
 /// "yes" lands on a question that was never asked. Text and Enter travel as
 /// two writes with a short pause between them, so a bracketed paste lands
 /// before the newline submits it.
+///
+/// `--wait` then waits for the turn the prompt caused (`supervise::Turn`), with the
+/// exit status of `qoro wait`.
 fn run_prompt(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let usage = "usage: qoro prompt <target> <text...> [--generation G]";
-    let mut args = args.to_vec();
-    let generation = supervise::take_generation(&mut args);
-    let target = args
-        .get(2)
-        .ok_or_else(|| std::io::Error::other(usage))?
-        .clone();
-    let text = args[3..].join(" ");
-    if text.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "refusing to send an empty prompt; {usage}"
-        )));
-    }
+    let PromptOpts {
+        target,
+        text,
+        wait,
+        timeout,
+        generation,
+    } = parse_prompt_args(args).map_err(usage)?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -1481,7 +1496,79 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         .await?;
         wr.flush().await?;
         println!("prompted terminal {terminal}");
-        Ok(())
+        if !wait {
+            return Ok(());
+        }
+        let before = row.clone();
+        supervise::finish_turn(supervise::wait_for_turn(&before, timeout).await?)
+    })
+}
+
+/// Parsed `qoro prompt` arguments, pure so the refusals are testable.
+struct PromptOpts {
+    target: String,
+    text: String,
+    wait: bool,
+    timeout: Option<Duration>,
+    generation: Option<u64>,
+}
+
+/// Flags right after the target, up to an optional `--`: `--wait`, `--timeout SECS`,
+/// `--generation G`. The first word that is not one starts the text, and everything from
+/// there is text, except a trailing `--generation G`, which `send` and `close` take the
+/// same way. A text that ends in `--wait` or `--timeout N` is refused as a misplaced flag
+/// rather than typed into the agent, unless it follows `--`.
+fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
+    let help = "usage: qoro prompt <target> [--wait] [--timeout SECS] [--generation G] [--] <text...> [--generation G]";
+    let mut args = args.to_vec();
+    let mut generation = supervise::take_generation(&mut args);
+    let target = args.get(2).cloned().ok_or_else(|| help.to_string())?;
+    let mut wait = false;
+    let mut timeout: Option<Duration> = None;
+    let mut literal = false;
+    let mut rest = args.iter().skip(3).peekable();
+    while let Some(arg) = rest.next_if(|a| a.starts_with("--")) {
+        match arg.as_str() {
+            "--" => {
+                literal = true;
+                break;
+            }
+            "--wait" => wait = true,
+            "--timeout" => {
+                let secs = rest.next().and_then(|v| v.parse::<u64>().ok());
+                timeout = Some(Duration::from_secs(secs.ok_or_else(|| help.to_string())?));
+            }
+            "--generation" => {
+                let value = rest.next().and_then(|v| v.parse::<u64>().ok());
+                if generation.is_some() {
+                    return Err(format!("--generation given twice; {help}"));
+                }
+                generation = Some(value.ok_or_else(|| help.to_string())?);
+            }
+            other => return Err(format!("unknown flag {other}; {help}")),
+        }
+    }
+    if timeout.is_some() && !wait {
+        return Err(format!("--timeout needs --wait; {help}"));
+    }
+    let words: Vec<&str> = rest.map(String::as_str).collect();
+    let trailing = words.last() == Some(&"--wait")
+        || (words.len() >= 2 && words[words.len() - 2] == "--timeout");
+    if trailing && !literal {
+        return Err(format!(
+            "flags go right after the target: qoro prompt <target> --wait <text>; {help}"
+        ));
+    }
+    let text = words.join(" ");
+    if text.is_empty() {
+        return Err(format!("refusing to send an empty prompt; {help}"));
+    }
+    Ok(PromptOpts {
+        target,
+        text,
+        wait,
+        timeout,
+        generation,
     })
 }
 
@@ -1495,7 +1582,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
 fn run_history(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
-    let opts = parse_history_args(args).map_err(std::io::Error::other)?;
+    let opts = parse_history_args(args).map_err(usage)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -1668,7 +1755,7 @@ fn truncate_text(text: &str) -> String {
 fn run_context(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse};
 
-    let opts = parse_context_args(args).map_err(std::io::Error::other)?;
+    let opts = parse_context_args(args).map_err(usage)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -1924,7 +2011,7 @@ fn render_context_text(
 fn run_agents(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
-    let usage = "usage: qoro agents [--json]\n       qoro agents explain <target> [--json]";
+    let help = "usage: qoro agents [--json]\n       qoro agents explain <target> [--json]";
     enum Mode<'a> {
         List { json: bool },
         Explain { target: &'a str, json: bool },
@@ -1934,16 +2021,14 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
     if rest.clone().next().is_some_and(|a| a == "explain") {
         rest.next();
         let Some(target) = rest.next() else {
-            return Err(std::io::Error::other(usage.to_string()));
+            return Err(usage(help));
         };
         let mut json = false;
         for arg in rest {
             if arg == "--json" {
                 json = true;
             } else {
-                return Err(std::io::Error::other(format!(
-                    "unknown flag {arg}; {usage}"
-                )));
+                return Err(usage(format!("unknown flag {arg}; {help}")));
             }
         }
         mode = Mode::Explain { target, json };
@@ -1952,9 +2037,7 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
             if arg == "--json" {
                 mode = Mode::List { json: true };
             } else {
-                return Err(std::io::Error::other(format!(
-                    "unknown flag {arg}; {usage}"
-                )));
+                return Err(usage(format!("unknown flag {arg}; {help}")));
             }
         }
     }
@@ -2263,9 +2346,9 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextJson, cli_sender_from, explain_row, parse_context_args, parse_history_args,
-        prompt_refusal, render_context_text, render_window_text, resolve_target, take_session,
-        trim_rows, truncate_text,
+        ContextJson, cli_sender_from, explain_row, is_usage, parse_context_args,
+        parse_history_args, parse_prompt_args, prompt_refusal, render_context_text,
+        render_window_text, resolve_target, take_session, trim_rows, truncate_text, usage,
     };
     use qoro_history::{Message, Role, SessionId, Window};
     use qoro_runtime::control::AgentRow;
@@ -2695,5 +2778,110 @@ mod tests {
         ];
         assert_eq!(trim_rows(rows.clone(), None), vec!["a", "b"]);
         assert_eq!(trim_rows(rows, Some(1)), vec!["b"]);
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn prompt_flags_come_right_after_the_target_and_text_is_never_eaten() {
+        let opts = parse_prompt_args(&argv(&[
+            "qoro",
+            "prompt",
+            "2",
+            "--wait",
+            "--timeout",
+            "30",
+            "run",
+            "--wait",
+            "please",
+        ]))
+        .unwrap();
+        assert!(opts.wait);
+        assert_eq!(opts.timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            opts.text, "run --wait please",
+            "flags inside the text are text"
+        );
+        let dashed =
+            parse_prompt_args(&argv(&["qoro", "prompt", "2", "--", "--help", "me"])).unwrap();
+        assert_eq!(dashed.text, "--help me");
+        assert!(!dashed.wait);
+        for late in [
+            &["qoro", "prompt", "2", "fix the bug", "--wait"][..],
+            &["qoro", "prompt", "2", "fix", "--wait", "--timeout", "9"],
+        ] {
+            let refused = parse_prompt_args(&argv(late));
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.starts_with("flags go right after the target")),
+                "{late:?}: {:?}",
+                refused.err()
+            );
+        }
+        let on_purpose =
+            parse_prompt_args(&argv(&["qoro", "prompt", "2", "--", "say", "--wait"])).unwrap();
+        assert_eq!(on_purpose.text, "say --wait");
+        let typo = parse_prompt_args(&argv(&["qoro", "prompt", "2", "--wiat", "go"]));
+        assert!(
+            typo.as_ref()
+                .is_err_and(|e| e.starts_with("unknown flag --wiat")),
+            "{:?}",
+            typo.err()
+        );
+        assert!(parse_prompt_args(&argv(&["qoro", "prompt", "2", "--timeout", "5", "x"])).is_err());
+        assert!(parse_prompt_args(&argv(&["qoro", "prompt", "2", "--wait"])).is_err());
+        // `--generation` both ways, and never mistaken for a misplaced flag.
+        let trailing = parse_prompt_args(&argv(&[
+            "qoro",
+            "prompt",
+            "2",
+            "--wait",
+            "go on",
+            "--generation",
+            "7",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (trailing.generation, trailing.text.as_str()),
+            (Some(7), "go on")
+        );
+        assert!(trailing.wait);
+        let leading = parse_prompt_args(&argv(&[
+            "qoro",
+            "prompt",
+            "2",
+            "--generation",
+            "7",
+            "--wait",
+            "go on",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (leading.generation, leading.text.as_str()),
+            (Some(7), "go on")
+        );
+        assert!(
+            parse_prompt_args(&argv(&[
+                "qoro",
+                "prompt",
+                "2",
+                "--generation",
+                "7",
+                "go",
+                "--generation",
+                "8",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_usage_mistake_is_told_apart_from_a_failure() {
+        assert!(is_usage(&usage("usage: qoro wait <target>")));
+        assert!(!is_usage(&std::io::Error::other("terminal 3 closed")));
+        assert_eq!(usage("usage: x").to_string(), "usage: x");
     }
 }

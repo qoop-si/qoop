@@ -78,7 +78,13 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
     )
     .expect("chmod");
     let mut command = Command::new(qoro());
-    command.args(args).env("QORO_RUNTIME_DIR", dir.path());
+    // Run from the scratch directory too, so a row that reads where it runs (`worktree
+    // ls` lists the repository it is in) answers the same thing on every machine rather
+    // than whatever worktrees this checkout has at the moment.
+    command
+        .args(args)
+        .current_dir(dir.path())
+        .env("QORO_RUNTIME_DIR", dir.path());
     if offline {
         // Blackholed: no proxy, no resolver, nowhere to reach. A subcommand that consulted
         // a control plane would notice.
@@ -191,14 +197,15 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
             out.status.code(),
         )
     };
+    // A command called wrong exits 2, like every usage mistake; 1 is kept for failures.
     let (stderr, code) = run(&["send"]);
-    assert_eq!(code, Some(1));
+    assert_eq!(code, Some(2));
     assert!(
         stderr.starts_with("qoro: ") && !stderr.contains("Custom {"),
         "an error printed as a debug dump: {stderr:?}"
     );
     let (stderr, code) = run(&["upadte"]);
-    assert_eq!(code, Some(1));
+    assert_eq!(code, Some(2));
     assert!(
         stderr.contains("unknown command") && stderr.contains("upadte"),
         "a typo was not named as one: {stderr:?}"
