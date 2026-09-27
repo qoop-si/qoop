@@ -3033,9 +3033,9 @@ pub struct SnapshotWire {
 
 /// What the program in a terminal has asked its terminal to be, as it crosses the socket.
 ///
-/// Four of the five the engine tracks. Bracketed paste is the daemon's
+/// All but one of what the engine tracks. Bracketed paste is the daemon's
 /// business alone, because it is the daemon that writes to the child; the
-/// other four are the client's, because they decide what the client draws and
+/// others are the client's, because they decide what the client draws and
 /// what it does with a wheel of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModesWire {
@@ -3060,6 +3060,12 @@ pub struct ModesWire {
     /// shows the cursor always: one stale cursor rather than none.
     #[serde(default = "cursor_visible_default", skip_serializing_if = "is_shown")]
     pub cursor_visible: bool,
+    /// The program asked to hear when its window gains or loses the focus (`CSI ? 1004 h`).
+    /// A client passes the outer terminal's focus on only then, and tells a pane it lost
+    /// the keyboard when another pane takes it. Absent means not asked, which is what an
+    /// older daemon's snapshot meant, and costs nothing on the wire for most programs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub focus_events: bool,
 }
 
 /// A missing visibility is a visible cursor, for the reason on the field.
@@ -3080,6 +3086,7 @@ impl Default for ModesWire {
             mouse_reporting: false,
             application_cursor: false,
             cursor_visible: true,
+            focus_events: false,
         }
     }
 }
@@ -3221,6 +3228,7 @@ impl From<&Snapshot> for SnapshotWire {
                 mouse_reporting: s.modes.mouse_reporting,
                 application_cursor: s.modes.application_cursor,
                 cursor_visible: s.modes.cursor_visible,
+                focus_events: s.modes.focus_events,
             },
         }
     }

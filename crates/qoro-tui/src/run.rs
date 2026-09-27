@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use bytes::BytesMut;
+use qoro_domain::AgentRuntimeState;
 use qoro_runtime::client::{self, Connection, Incoming, TerminalGuard};
 use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage};
 use qoro_runtime::daemon::{ClientWire, SnapshotWire, StoredImage};
@@ -363,6 +364,14 @@ struct State {
     host_sent: Option<([u8; 3], [u8; 3])>,
     /// The daemon predates `HostColors` and said so: not asked again this session.
     host_refused: bool,
+    /// State changes waiting out `notify::DELAY` before they are said, and when the first
+    /// of them is due. Empty on a quiet screen, so nothing is armed (ADR-009).
+    notes: Vec<crate::notify::Note>,
+    notes_due: Option<std::time::Instant>,
+    /// Where a desktop note goes, decided once at start.
+    route: crate::notify::Route,
+    /// What to say, once, the first time a note had nowhere to go.
+    nowhere: Option<&'static str>,
     /// What `config.toml` said when it was last read: at start, and whenever the settings
     /// box opens. Every overlay that hands the prefix back to the decoder reads it here.
     config: crate::config::Config,
@@ -1668,6 +1677,10 @@ where
         host_light: None,
         host_sent: None,
         host_refused: false,
+        notes: Vec::new(),
+        notes_due: None,
+        route: crate::notify::Route::Nowhere,
+        nowhere: None,
         config: crate::config::Config::default(),
     };
     // The file is read before the first frame, so the first frame already names the
@@ -1675,6 +1688,13 @@ where
     // beside whatever the caller wanted said.
     let read = crate::config::read();
     use_config(&mut state, &read);
+    // Where a desktop note would go, decided once: the environment does not change under a
+    // running interface, and inside tmux it costs asking tmux.
+    let env = crate::notify::Env::read();
+    state.route = crate::notify::route(&env);
+    if state.route == crate::notify::Route::Nowhere {
+        state.nowhere = Some(crate::notify::nowhere_hint(&env));
+    }
     if let Some(first) = read.problems.first() {
         let more = match read.problems.len() {
             1 => String::new(),
@@ -1933,6 +1953,8 @@ where
             // A held `ESC [` or `ESC ]` waiting to see whether it is a report. `None` on a
             // quiet screen, like the tier boundary, so nothing is armed.
             let hold_at = reports.deadline().map(tokio::time::Instant::from_std);
+            // Notes waiting out their second. `None` with nothing held, so nothing is armed.
+            let notes_at = state.notes_due.map(tokio::time::Instant::from_std);
 
             tokio::select! {
                 biased;
@@ -1978,8 +2000,12 @@ where
                     // Reports first, before any overlay or the key decoder sees the bytes:
                     // each of those reads an escape as a cancel.
                     let (bytes, said) = reports.strip(&raw);
+                    let mut window_focus = None;
                     let mut ask_again = false;
                     for report in said {
+                        if let crate::input::Report::Focus(focused) = report {
+                            window_focus = Some(focused);
+                        }
                         ask_again |= note_report(&mut state, report);
                         dirty = true;
                     }
@@ -1991,6 +2017,15 @@ where
                     if let Some(tell) = host_colors_request(&mut state, &mut request) {
                         wr.write_all(&client::encode_control_seq(&tell, &mut control_seq)?)
                             .await?;
+                    }
+                    // The window's focus, passed on to the pane that has the keyboard when its
+                    // program asked for it, the way tmux does: vim reloads a file changed
+                    // while the person was away on exactly this.
+                    if let Some(focused) = window_focus
+                        && wants_focus_events(state.snapshot.as_ref())
+                    {
+                        let report = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                        send_to_pane(&mut state, &mut seqs, &mut wr, report.to_vec()).await?;
                     }
                     if bytes.is_empty() {
                         continue;
@@ -3216,6 +3251,14 @@ where
                         let _ = wake.try_send(Vec::new());
                     }
                 }
+                _ = async {
+                    match notes_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    fire_notes(&mut state, &mut out)?;
+                }
                 // Last, so it never goes ahead of input: it only wakes the loop to send
                 // the frame that the renders above held back.
                 _ = tokio::time::sleep_until(presented + FRAME), if dirty => {}
@@ -3344,6 +3387,112 @@ fn host_colors_request(state: &mut State, request: &mut u64) -> Option<ControlRe
         fg,
         bg,
     })
+}
+
+/// Hold a desktop note for a row that has just started needing a person who is not
+/// looking at it: another tab has the keyboard, or the whole window lost the focus.
+///
+/// `qoro_attention` decides whether the change is worth it and how urgent it is, the same
+/// rule a push to a phone follows. The note waits out `notify::DELAY` with any others, and
+/// is checked again then (see [`fire_notes`]). True when it will reach the desktop, so the
+/// bell for the same change stays quiet; with nowhere to send it, the bell rings as it
+/// always did and the hint row says why, once.
+fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
+    let looking = row.terminal == state.focused && state.outer_focus != Some(false);
+    if looking || !(state.config.desktop || state.config.sound) {
+        return false;
+    }
+    let terminal = qoro_domain::TerminalId::new(row.terminal.to_string());
+    let Some(push) = qoro_attention::Push::for_state(0, &terminal, runtime, 0) else {
+        return false;
+    };
+    let generation = sidebar::gen_of(row);
+    let held = state
+        .notes
+        .iter()
+        .any(|n| n.terminal == row.terminal && n.generation == generation && n.state == row.state);
+    if !held {
+        state.notes.push(crate::notify::Note {
+            terminal: row.terminal,
+            state: row.state.clone(),
+            generation,
+            label: row
+                .name
+                .clone()
+                .or_else(|| row.program.clone())
+                .unwrap_or_else(|| format!("terminal {}", row.terminal)),
+            what: match push.reason {
+                qoro_attention::Reason::AgentBlocked => "is blocked",
+                qoro_attention::Reason::AgentFailed => "failed",
+                _ => "finished",
+            },
+            space: state
+                .spaces
+                .iter()
+                .find(|s| s.id == row.workspace)
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
+            urgent: push.priority == qoro_attention::Priority::Urgent,
+        });
+        state
+            .notes_due
+            .get_or_insert_with(|| std::time::Instant::now() + crate::notify::DELAY);
+    }
+    let reaches = state.config.desktop && state.route != crate::notify::Route::Nowhere;
+    if state.config.desktop
+        && !reaches
+        && let Some(hint) = state.nowhere.take()
+    {
+        state.hint = Some(hint.to_string());
+    }
+    reaches
+}
+
+/// Say what came due, as one note: whatever is still true of it. A row that went back to
+/// work, or that the person has since come to look at, is dropped, so a blip says nothing.
+fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
+    state.notes_due = None;
+    let held = std::mem::take(&mut state.notes);
+    let due: Vec<crate::notify::Note> = held
+        .into_iter()
+        .filter(|note| {
+            let still = state.rows.iter().any(|r| {
+                r.terminal == note.terminal
+                    && r.state == note.state
+                    && sidebar::gen_of(r) == note.generation
+            });
+            let looking = note.terminal == state.focused && state.outer_focus != Some(false);
+            still && !looking
+        })
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let body = crate::notify::clean(&crate::notify::say(&due));
+    if state.config.desktop {
+        match state.route {
+            crate::notify::Route::Escape { escape, tmux } => {
+                out.write_all(&crate::notify::escape(escape, tmux, &body))?;
+                out.flush()?;
+            }
+            crate::notify::Route::System(program) => {
+                let (name, args) = crate::notify::argv(program, &body);
+                crate::notify::spawn(name, &args);
+            }
+            crate::notify::Route::Nowhere => {}
+        }
+    }
+    // Played here and not on the far side of an ssh session, where nobody is listening.
+    if state.config.sound
+        && std::env::var_os("SSH_CONNECTION").is_none()
+        && let Some((player, args)) = crate::notify::sound(
+            due.iter().any(|note| note.urgent),
+            cfg!(target_os = "macos"),
+        )
+    {
+        crate::notify::spawn(player, &args);
+    }
+    Ok(())
 }
 /// Whether a fresh client's first render may adopt its terminal: only what
 /// is on screen. The daemon subscribes a fresh client to whatever is already
@@ -3779,6 +3928,7 @@ fn focus(
         return Ok(None);
     }
     let from = state.focused;
+    let from_wants = wants_focus_events(state.snapshot.as_ref());
     // The space follows the terminal, first of all: a click in the agents
     // panel can land on an agent in another space, which is the point of that
     // panel crossing spaces, and every layout and subscription below is per
@@ -3847,6 +3997,25 @@ fn focus(
     if let Some(sync) = sync_subs(state, control_seq)? {
         out.extend_from_slice(&sync);
     }
+    // The keyboard moved: the pane it left hears it lost the focus and the one it came to
+    // hears it gained it, each only if its program asked, the way tmux tells its panes.
+    // A pane whose screen this client has not seen yet cannot be asked, and is not told.
+    for (terminal, wants, report) in [
+        (from, from_wants, b"\x1b[O"),
+        (to, wants_focus_events(state.snapshot.as_ref()), b"\x1b[I"),
+    ] {
+        if wants && terminal != 0 {
+            out.extend_from_slice(&client::encode_command_to(
+                terminal,
+                &ClientWire::Input {
+                    bytes: report.to_vec(),
+                    from_terminal: None,
+                    from_token: None,
+                },
+                seqs.entry(terminal).or_default(),
+            )?);
+        }
+    }
     if let Some(resize) = resize_focused_to_tile(state, seqs)? {
         out.extend_from_slice(&resize);
     }
@@ -3874,6 +4043,11 @@ fn focus(
     }
     state.message = None;
     Ok(Some(out))
+}
+
+/// Whether the program on this screen asked to hear about focus (`CSI ? 1004 h`).
+fn wants_focus_events(snapshot: Option<&SnapshotWire>) -> bool {
+    snapshot.is_some_and(|s| s.modes.focus_events)
 }
 
 /// Put a space on screen, and the keyboard in one of its terminals.
@@ -4187,17 +4361,27 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // badge or a bounce, and it is the one channel that works with no account, no
             // daemon of somebody else's, and no network.
             for row in &agents {
-                let before = state.was.get(&row.terminal);
+                let before = state.was.get(&row.terminal).cloned();
                 let wants_someone = matches!(row.state.as_str(), "blocked" | "failed" | "done");
-                if wants_someone && before.is_some_and(|b| b != &row.state) {
-                    state.ring = true;
+                if wants_someone && before.as_ref().is_some_and(|b| *b != row.state) {
+                    let runtime = match row.state.as_str() {
+                        "blocked" => AgentRuntimeState::Blocked,
+                        "failed" => AgentRuntimeState::Failed,
+                        _ => AgentRuntimeState::Done,
+                    };
+                    // The desktop says it instead when it can, a second later; the bell
+                    // stays quiet so a terminal that turns bells into notes says it once.
+                    if !note(state, row, runtime) {
+                        state.ring = true;
+                    }
                     state.message = Some(format!("terminal {} is {}", row.terminal, row.state));
                 }
                 // A screen agent that worked and now sits idle while the
                 // keyboard is elsewhere finished without ever reporting done.
                 // Same news as a daemon done, same bell, same `new` row.
-                let was_working =
-                    before.is_some_and(|b| matches!(b.as_str(), "working" | "starting"));
+                let was_working = before
+                    .as_deref()
+                    .is_some_and(|b| matches!(b, "working" | "starting"));
                 if was_working
                     && matches!(row.state.as_str(), "idle" | "done")
                     && row.terminal != state.focused
@@ -4208,9 +4392,17 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     // Idle has no daemon done word to carry the news, so ring
                     // here the way done does above.
                     if row.state == "idle" {
-                        state.ring = true;
+                        if !note(state, row, AgentRuntimeState::Done) {
+                            state.ring = true;
+                        }
                         state.message = Some(format!("terminal {} finished", row.terminal));
                     }
+                }
+                // The one under the keyboard, finishing while the person is in another
+                // window: nothing on this screen changes for them, so only the desktop
+                // can say it.
+                if was_working && row.state == "idle" && row.terminal == state.focused {
+                    note(state, row, AgentRuntimeState::Done);
                 }
                 // Back to work, or under the keyboard: no longer news.
                 if matches!(
@@ -4764,6 +4956,10 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            notes: Vec::new(),
+            notes_due: None,
+            route: crate::notify::Route::Nowhere,
+            nowhere: None,
             config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
             images: std::collections::BTreeMap::new(),
@@ -5201,6 +5397,10 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            notes: Vec::new(),
+            notes_due: None,
+            route: crate::notify::Route::Nowhere,
+            nowhere: None,
             config: crate::config::Config::default(),
         }
     }
@@ -5278,6 +5478,10 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            notes: Vec::new(),
+            notes_due: None,
+            route: crate::notify::Route::Nowhere,
+            nowhere: None,
             config: crate::config::Config::default(),
         };
         let area = pane_area(&state);
@@ -5767,6 +5971,135 @@ mod tests {
         );
         state.rows.clear();
         assert!(adopt_render(&state, 9), "nothing listed yet adopts");
+    }
+
+    fn index(state: &mut State, agents: Vec<AgentRow>) {
+        let mut dirty = false;
+        apply(
+            state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                agents,
+            },
+            &mut dirty,
+        );
+    }
+
+    /// Changes while the person is not looking are held, said together once due, and
+    /// the bell for them stays quiet when the desktop will say it instead.
+    #[test]
+    fn changes_away_from_the_keyboard_are_held_and_said_as_one() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        let working = |t| agent(t, 1, "claude", "working");
+        index(&mut state, vec![working(1), working(2), working(3)]);
+        index(
+            &mut state,
+            vec![
+                working(1),
+                agent(2, 1, "codex", "blocked"),
+                agent(3, 1, "aider", "idle"),
+            ],
+        );
+        assert_eq!(state.notes.len(), 2, "{:?}", state.notes);
+        assert!(
+            state.notes_due.is_some(),
+            "a timer is armed while something is held"
+        );
+        assert!(!state.ring, "the desktop says it, so the bell does not");
+        let mut out = Vec::new();
+        fire_notes(&mut state, &mut out).expect("fire");
+        assert_eq!(
+            out,
+            b"\x1b]9;2 agents need you: codex, aider\x1b\\".to_vec()
+        );
+        assert!(
+            state.notes.is_empty() && state.notes_due.is_none(),
+            "nothing left armed"
+        );
+    }
+
+    /// A change undone inside the second says nothing, and the one under the keyboard
+    /// says nothing while the window has the focus.
+    #[test]
+    fn a_blip_and_a_change_being_watched_say_nothing() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "working")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "blocked")],
+        );
+        assert_eq!(state.notes.len(), 1, "the focused one is being watched");
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "working")],
+        );
+        let mut out = Vec::new();
+        fire_notes(&mut state, &mut out).expect("fire");
+        assert!(out.is_empty(), "a blip was said: {out:?}");
+        // The window lost the focus: the focused one finishing is news after all.
+        state.outer_focus = Some(false);
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "working")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "working")],
+        );
+        assert_eq!(state.notes.len(), 1);
+    }
+
+    /// With nowhere to send a note the bell rings exactly as before, and the hint says why
+    /// once.
+    #[test]
+    fn with_nowhere_to_send_it_the_bell_rings_and_the_hint_says_why_once() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.nowhere = Some("desktop notifications: nothing here can show one");
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "working")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "blocked")],
+        );
+        assert!(state.ring);
+        assert!(
+            state
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.starts_with("desktop"))
+        );
+        assert_eq!(state.nowhere, None, "said once");
+        state.config.desktop = false;
+        state.ring = false;
+        state.notes.clear();
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "working")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "working"), agent(2, 1, "b", "failed")],
+        );
+        assert!(
+            state.ring && state.notes.is_empty(),
+            "notifications off: only the bell"
+        );
     }
 
     /// Bootstrap parks the space under the keyboard, and a focused terminal

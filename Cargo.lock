@@ -680,6 +680,8 @@ name = "qoro-tui"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "qoro-attention",
+ "qoro-domain",
  "qoro-proto",
  "qoro-remote",
  "qoro-runtime",

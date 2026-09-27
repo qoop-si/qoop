@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 qoro-proto = { path = "../qoro-proto" }
+# What a state change is worth interrupting a person for, and how loudly: the same
+# classification the push path uses, so the desktop and a phone never disagree.
+qoro-attention = { path = "../qoro-attention" }
+qoro-domain = { path = "../qoro-domain" }
 qoro-runtime = { path = "../qoro-runtime" }
 qoro-remote = { path = "../qoro-remote" }
 bytes = { workspace = true }

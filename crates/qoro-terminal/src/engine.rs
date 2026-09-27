@@ -133,6 +133,9 @@ pub struct TerminalModes {
     /// Whether the program wants its cursor seen. Off while it redraws, so a
     /// client that shows one anyway paints a cursor the program hid: flicker.
     pub cursor_visible: bool,
+    /// Whether the program asked to be told when its window gains and loses the focus
+    /// (`CSI ? 1004 h`), so a client knows whether to pass that on.
+    pub focus_events: bool,
 }
 
 impl Default for TerminalModes {
@@ -146,6 +149,7 @@ impl Default for TerminalModes {
             mouse_reporting: false,
             application_cursor: false,
             cursor_visible: true,
+            focus_events: false,
         }
     }
 }

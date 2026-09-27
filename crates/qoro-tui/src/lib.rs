@@ -13,6 +13,7 @@ pub mod keys;
 pub mod layout;
 pub mod link;
 pub mod mux;
+pub mod notify;
 pub mod palette;
 pub mod present;
 pub mod run;

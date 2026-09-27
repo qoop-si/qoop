@@ -444,6 +444,7 @@ impl TerminalEngine for AlacrittyEngine {
             mouse_reporting: m.intersects(TermMode::MOUSE_MODE),
             application_cursor: m.contains(TermMode::APP_CURSOR),
             cursor_visible: m.contains(TermMode::SHOW_CURSOR),
+            focus_events: m.contains(TermMode::FOCUS_IN_OUT),
         }
     }
 
@@ -868,6 +869,12 @@ mod tests {
         e.feed(b"\x1b[?1000l\x1b[?1049l");
         assert!(!e.snapshot().modes.alt_screen);
         assert!(!e.snapshot().modes.mouse_reporting);
+        assert!(!e.snapshot().modes.focus_events);
+        e.feed(b"\x1b[?1004h");
+        assert!(
+            e.snapshot().modes.focus_events,
+            "a program that asked to hear about focus is never told"
+        );
     }
 
     /// A program's `OSC 8` link reaches the snapshot as one run over exactly the linked
