@@ -234,14 +234,15 @@ pub struct Note {
 }
 
 /// One sentence for everything that came due together: what happened to each, by name.
-/// Two terminals with one name are told apart by their number, as `qoro agents` shows it.
+/// Two terminals with one name are told apart by their space, the way the agents panel
+/// tells them apart (`app - claude`).
 pub fn say(notes: &[Note]) -> String {
     let name = |note: &Note| {
         let shared = notes
             .iter()
             .any(|other| other.label == note.label && other.terminal != note.terminal);
-        if shared {
-            format!("{} ({})", note.label, note.terminal)
+        if shared && !note.space.is_empty() {
+            format!("{} - {}", note.space, note.label)
         } else {
             note.label.clone()
         }
@@ -653,11 +654,17 @@ mod tests {
         );
         assert_eq!(
             say(&[
-                note(3, "claude", "is blocked"),
-                note(7, "claude", "finished")
+                Note {
+                    space: "app".into(),
+                    ..note(3, "claude", "is blocked")
+                },
+                Note {
+                    space: "personal".into(),
+                    ..note(7, "claude", "finished")
+                },
             ]),
-            "claude (3) is blocked, claude (7) finished",
-            "two tabs of one name are told apart"
+            "app - claude is blocked, personal - claude finished",
+            "two tabs of one name are told apart the way the panel tells them apart"
         );
     }
 

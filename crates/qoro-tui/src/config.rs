@@ -20,6 +20,7 @@
 //! setting and a sentence, never the interface. A line that is not TOML at all is said
 //! with its number and left out, and the rest of the file is still read.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The keys a prefix may be. The others are taken: `c d h i j m q s z` are either
@@ -84,6 +85,14 @@ pub struct Problem {
 }
 
 impl Problem {
+    /// A problem, its text made plain for the screen (see [`plain`]).
+    fn new(line: Option<usize>, what: &str) -> Problem {
+        Problem {
+            line,
+            what: plain(what),
+        }
+    }
+
     /// As the settings box says it, beside the file's own path.
     pub fn short(&self) -> String {
         match self.line {
@@ -113,7 +122,7 @@ impl Read {
         };
         Some(format!(
             "{} {}, kept the default{more}",
-            self.path.display(),
+            plain(&self.path.display().to_string()),
             first.short()
         ))
     }
@@ -141,10 +150,7 @@ pub fn read_from(path: &Path) -> Read {
         }
         Err(error) => (
             Config::default(),
-            vec![Problem {
-                line: None,
-                what: format!("could not be read ({error})"),
-            }],
+            vec![Problem::new(None, &format!("could not be read ({error})"))],
             true,
         ),
     };
@@ -158,76 +164,123 @@ pub fn read_from(path: &Path) -> Read {
 
 /// The settings, and everything that could not be used.
 pub fn parse(text: &str) -> (Config, Vec<Problem>) {
-    let mut problems = Vec::new();
+    let mut problems: Vec<Problem> = Vec::new();
     let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
     let table = loop {
-        match text.parse::<toml::Table>() {
+        let error = match text.parse::<toml::Table>() {
             Ok(table) => break table,
-            Err(error) => {
-                let line = error
-                    .span()
-                    .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
-                problems.push(Problem {
-                    line,
-                    what: unreadable(&text, line, error.message()),
-                });
-                // Leave the line out and read the rest, so one bad line costs one setting.
-                match line {
-                    Some(line) if problems.len() < MAX_BAD_LINES => {
-                        text = text
-                            .lines()
-                            .enumerate()
-                            .map(|(at, l)| if at + 1 == line { "" } else { l })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                    }
-                    _ => break toml::Table::new(),
-                }
-            }
+            Err(error) => error,
+        };
+        let line = error.span().map(|span| line_at(&text, span.start));
+        // Said once: a line already reported, or one with nothing on it to leave out (an
+        // array left open to the end of the file), would only be reported again.
+        if problems.iter().any(|p| p.line == line) {
+            break toml::Table::new();
         }
+        problems.push(Problem::new(
+            line,
+            &unreadable(&text, line, error.message()),
+        ));
+        let Some(line) = line.filter(|_| problems.len() < MAX_BAD_LINES) else {
+            break toml::Table::new();
+        };
+        if text
+            .lines()
+            .nth(line - 1)
+            .is_none_or(|l| l.trim().is_empty())
+        {
+            break toml::Table::new();
+        }
+        // Leave the line out and read the rest, so one bad line costs one setting.
+        text = text
+            .lines()
+            .enumerate()
+            .map(|(at, l)| if at + 1 == line { "" } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
     };
+    // Where each value is, for the ones refused below. The table itself carries no spans,
+    // so the same text is read once more for them, top level and `[notify]`.
+    type Spans = BTreeMap<String, toml::Spanned<toml::Value>>;
+    #[derive(Default, serde::Deserialize)]
+    struct NotifySpans {
+        #[serde(default)]
+        notify: Spans,
+    }
+    let top: Spans = toml::from_str(&text).unwrap_or_default();
+    let nested: NotifySpans = toml::from_str(&text).unwrap_or_default();
+    let line_of = |spans: &Spans, key: &str| spans.get(key).map(|s| line_at(&text, s.span().start));
+
     let mut config = Config::default();
-    let mut refuse = |what: String| problems.push(Problem { line: None, what });
+    let mut refuse = |line: Option<usize>, what: String| problems.push(Problem::new(line, &what));
     for (key, value) in &table {
+        let line = line_of(&top, key);
         match (key.as_str(), value) {
-            ("prefix", toml::Value::String(name)) => match prefix_byte(name) {
-                Some(byte) => config.prefix = byte,
-                None => refuse(format!("prefix = {value} is not {PREFIX_SAID}")),
-            },
+            ("prefix", toml::Value::String(name)) if prefix_byte(name).is_some() => {
+                config.prefix = prefix_byte(name).unwrap_or(config.prefix);
+            }
             ("theme", toml::Value::String(name)) if name == "auto" => config.theme = Theme::Auto,
             ("theme", toml::Value::String(name)) if name == "dark" => config.theme = Theme::Dark,
             ("theme", toml::Value::String(name)) if name == "light" => {
                 config.theme = Theme::Light;
             }
-            ("prefix", _) => refuse(format!("prefix = {value} is not {PREFIX_SAID}")),
-            ("theme", _) => refuse(format!(
-                "theme = {value} is not \"auto\", \"dark\" or \"light\""
-            )),
+            ("prefix", _) => refuse(line, format!("prefix = {value} is not {PREFIX_SAID}")),
+            ("theme", _) => refuse(
+                line,
+                format!("theme = {value} is not \"auto\", \"dark\" or \"light\""),
+            ),
             ("notify", toml::Value::Table(notify)) => {
                 for (key, value) in notify {
+                    let line = line_of(&nested.notify, key);
                     let slot = match key.as_str() {
                         "desktop" => &mut config.desktop,
                         "sound" => &mut config.sound,
                         _ => {
-                            refuse(format!("there is no setting notify.{key}"));
+                            refuse(line, format!("there is no setting notify.{key}"));
                             continue;
                         }
                     };
                     match value {
                         toml::Value::Boolean(on) => *slot = *on,
-                        _ => refuse(format!("notify.{key} = {value} is not true or false")),
+                        _ => refuse(line, format!("{key} = {value} is not true or false")),
                     }
                 }
             }
-            ("notify", _) => refuse("notify is a table: [notify] then desktop = true".into()),
-            _ => refuse(format!("there is no setting {key}")),
+            ("notify", _) => refuse(
+                line,
+                "notify is a table: [notify] then desktop = true".into(),
+            ),
+            _ => refuse(line, format!("there is no setting {key}")),
         }
     }
+    // In the order a person reads the file, not the order the table holds its keys.
+    problems.sort_by_key(|p| p.line.unwrap_or(usize::MAX));
     (config, problems)
 }
 
+/// The line a byte offset is on, counted from one.
+fn line_at(text: &str, at: usize) -> usize {
+    text.as_bytes()[..at.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+/// Text from the file as the screen may show it: every run of whitespace or control
+/// characters becomes one space. A parser's message spans lines, a quoted key can hold a
+/// bell, and either one painted raw would run past its row and put the rows after it out of
+/// step with what is on the terminal.
+fn plain(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What to say about a line that is not TOML. The mistake a person actually makes is a
-/// bare word where a string goes, and for that the fix is spelled out.
+/// bare word where a value goes, and for that the fix is spelled out: quotes for a word,
+/// `true` or `false` for a switch.
 fn unreadable(text: &str, line: Option<usize>, message: &str) -> String {
     let bare = line
         .and_then(|line| text.lines().nth(line - 1))
@@ -242,8 +295,11 @@ fn unreadable(text: &str, line: Option<usize>, message: &str) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         });
     match bare {
+        Some((key, _)) if matches!(key.rsplit('.').next(), Some("desktop" | "sound")) => {
+            format!("{} is true or false", key.rsplit('.').next().unwrap_or(key))
+        }
         Some((key, value)) => format!("needs quotes: {key} = \"{value}\""),
-        None => format!("not TOML ({})", message.trim()),
+        None => format!("not TOML ({message})"),
     }
 }
 
@@ -296,7 +352,7 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
     let mut rows = vec![
         format!(
             " {}{}",
-            read.path.display(),
+            plain(&read.path.display().to_string()),
             if read.exists {
                 ""
             } else {
@@ -386,7 +442,7 @@ mod tests {
     #[test]
     fn each_refusal_keeps_its_default_and_the_rest_is_still_read() {
         let (config, problems) = parse(
-            "prefix = ctrl-b\ntheme = \"blue\"\ncolour = \"red\"\n[notify]\nsound = \"yes\"\ndesktop = false\nloud = true\n",
+            "prefix = ctrl-b\ntheme = \"blue\"\ncolour = \"red\"\n[notify]\nsound = yes\ndesktop = false\nloud = true\n",
         );
         assert_eq!(
             config,
@@ -401,7 +457,7 @@ mod tests {
         for needle in [
             "theme = \"blue\"",
             "no setting colour",
-            "notify.sound = \"yes\"",
+            "sound is true or false",
             "no setting notify.loud",
         ] {
             assert!(
@@ -453,5 +509,44 @@ mod tests {
         );
         assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
         assert_eq!(rows[6], " ! line 1: needs quotes: theme = \"blue\"");
+    }
+
+    /// Nothing from the file reaches the screen with a line break or a control character
+    /// in it: the parser's own message spans lines, and a quoted key can hold anything.
+    #[test]
+    fn no_problem_carries_a_control_character_to_the_screen() {
+        let (_, problems) = parse("theme = \u{e9}\n\"a\\u0007b\" = 1\n");
+        assert!(!problems.is_empty());
+        for problem in &problems {
+            assert!(
+                !problem.short().chars().any(char::is_control),
+                "{problem:?}"
+            );
+        }
+    }
+
+    /// A bare word where a boolean goes is told what a boolean is, not to quote it.
+    #[test]
+    fn a_bare_word_for_a_switch_is_told_true_or_false() {
+        let (config, problems) = parse("[notify]\nsound = yes\ndesktop = false\n");
+        assert!(!config.desktop, "the rest is still read");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].short(), "line 2: sound is true or false");
+    }
+
+    /// A file that stays broken to its end is said once, not once per retry.
+    #[test]
+    fn an_unclosed_array_is_said_once() {
+        let (_, problems) = parse("theme = \"dark\"\nx = [1,\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+    }
+
+    /// A value refused after parsing still names its line.
+    #[test]
+    fn a_refused_value_names_its_line() {
+        let (_, problems) =
+            parse("prefix = \"ctrl-a\"\ntheme = \"blue\"\n[notify]\n\nsound = \"yes\"\n");
+        let lines: Vec<Option<usize>> = problems.iter().map(|p| p.line).collect();
+        assert_eq!(lines, vec![Some(2), Some(5)], "{problems:?}");
     }
 }
