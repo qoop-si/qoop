@@ -938,7 +938,11 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the only space is not an empty rule first: {list:?}"
     );
     assert!(
-        !list.iter().any(|row| row.starts_with("   \u{25cf}")),
+        // An agent row has its mark three columns in: a dot, the failed diamond, or a
+        // spinner frame. None of them may be there.
+        !list
+            .iter()
+            .any(|row| row.starts_with("   ") && row.chars().nth(3).is_some_and(|c| c != ' ')),
         "a plain shell is listed as an agent: {list:?}"
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.

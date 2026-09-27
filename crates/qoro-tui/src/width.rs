@@ -21,6 +21,14 @@ pub fn columns(c: char) -> usize {
     c.width().unwrap_or(0)
 }
 
+/// Whether a character may be drawn at all: never a control character, and never a
+/// bidirectional override or isolate, which a terminal that implements bidi would obey
+/// and use to turn the rest of a row around. Names and labels come from other machines and
+/// other programs; either would reach this terminal as a command rather than as text.
+fn drawn(c: char) -> bool {
+    !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// The columns a string will take, once painted.
 pub fn width(s: &str) -> usize {
     s.chars().map(columns).sum()
@@ -39,7 +47,7 @@ fn painted(row: &str) -> impl Iterator<Item = char> + '_ {
         // A control character is never text here. The interface paints names and
         // messages that can come from another machine, and an escape in one of those
         // would reach this terminal as a command rather than as a name.
-        if c.is_control() {
+        if !drawn(*c) {
             return false;
         }
         if skip_spacer && *c == ' ' {
@@ -84,7 +92,7 @@ pub fn fit(row: &str, cols: usize) -> String {
 pub fn text(text: &str, cols: usize) -> String {
     let mut out = String::with_capacity(cols);
     let mut used = 0;
-    for c in text.chars().filter(|c| !c.is_control()) {
+    for c in text.chars().filter(|c| drawn(*c)) {
         let wide = columns(c);
         if used + wide > cols {
             break;

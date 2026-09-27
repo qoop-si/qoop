@@ -2735,8 +2735,6 @@ async fn handle_control(
                     // no timestamp until the first accepted observation, no
                     // cwd until the terminal's own task has seen one.
                     let last_active_at_unix = agent.as_ref().and_then(|a| a.last_active_at_unix);
-                    // What it is doing, only while it is doing something: a calm agent
-                    // has no activity, whatever its last tool was.
                     // The foreground job's group, which a client on this machine samples for
                     // its cost; one syscall on the master already held open.
                     let pgid = agents
@@ -2746,6 +2744,8 @@ async fn handle_control(
                         // Linux answers zero when nothing holds the foreground, and zero is
                         // every kernel thread's group: no group rather than theirs.
                         .filter(|group| *group > 0);
+                    // What it is doing, only while it is doing something: a calm agent
+                    // has no activity, whatever its last tool was.
                     let activity = matches!(
                         state.as_str(),
                         "working" | "starting" | "blocked" | "failed"
@@ -2935,9 +2935,11 @@ async fn handle_control(
                         );
                         // The row carries the activity, so a new one is news even when the
                         // state held: without this a run of tools inside one `working`
-                        // would leave the sidebar naming the first of them. A repeat of
-                        // the same label is not news and announces nothing.
-                        if !changed && agents.activity(terminal) != before {
+                        // would leave the sidebar naming the first of them. Announced after
+                        // the push even when the state changed too, since that announce went
+                        // out before the label was recorded; a client coalesces the two. A
+                        // repeat of the same label is not news and announces nothing.
+                        if agents.activity(terminal) != before {
                             agents.announce(terminal);
                         }
                     }

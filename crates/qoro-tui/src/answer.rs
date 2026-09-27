@@ -292,24 +292,27 @@ fn wrap(
             }
             // A word longer than the row goes across rows, a character at a time.
             let mut chunk = String::new();
+            let mut chunk_w = 0usize;
             for c in word.chars() {
                 let w = crate::width::columns(c);
                 if w > width - hang {
                     continue;
                 }
-                if *used + crate::width::width(&chunk) + w > width {
+                if *used + chunk_w + w > width {
                     if !chunk.is_empty() {
                         rows.last_mut()
                             .expect("a row")
                             .push((std::mem::take(&mut chunk), *ink));
                     }
+                    chunk_w = 0;
                     new_row(rows);
                     *used = hang;
                     *start = hang;
                 }
                 chunk.push(c);
+                chunk_w += w;
             }
-            *used += crate::width::width(&chunk);
+            *used += chunk_w;
             if !chunk.is_empty() {
                 rows.last_mut().expect("a row").push((chunk, *ink));
             }
@@ -338,7 +341,9 @@ fn paint(row: &[(String, Ink)], width: usize) -> String {
         if used >= width {
             break;
         }
-        let shown = cut(text, width - used);
+        // Cut to what is left, never padded: the shared helper pads to the width it is
+        // given, so it is given no more than the text itself needs.
+        let shown = crate::width::text(text, crate::width::width(text).min(width - used));
         out.push_str(&theme::fg(ink.role));
         if ink.bold {
             out.push_str("\x1b[1m");
@@ -352,22 +357,6 @@ fn paint(row: &[(String, Ink)], width: usize) -> String {
     out.push_str(&theme::fg(Role::Text));
     out.push_str(&" ".repeat(width.saturating_sub(used)));
     out.push_str(theme::RESET);
-    out
-}
-
-/// The start of `text` that fits in `cols` columns, never padded and never splitting a
-/// wide character; control characters are dropped, the way every row here drops them.
-fn cut(text: &str, cols: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in text.chars().filter(|c| !c.is_control()) {
-        let wide = crate::width::columns(c);
-        if used + wide > cols {
-            break;
-        }
-        out.push(c);
-        used += wide;
-    }
     out
 }
 

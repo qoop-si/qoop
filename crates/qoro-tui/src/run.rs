@@ -659,8 +659,8 @@ impl State {
             // capability is a client property, not daemon state.
             image_notice: None,
             chrome: screen::Chrome {
-                shut: self.shut.clone(),
-                usage: self.usage.clone(),
+                shut: &self.shut,
+                usage: &self.usage,
                 answer: self.answer.is_some(),
                 keys: if self.prefix_pending {
                     screen::KeyContext::Prefix
@@ -2870,6 +2870,9 @@ where
     // costs one round trip at a time rather than one request per announce, and the last
     // change is never lost. A request unanswered for [`INDEX_PATIENCE`] is taken as lost.
     let mut index_asked: Option<tokio::time::Instant> = None;
+    // The id of that request, so only its own answer clears it: behind the mux one request
+    // can be answered once per machine, and a late answer must not open the gate early.
+    let mut index_id = String::new();
     let mut index_owed = false;
     // The column moves only while something works and motion is on: `QORO_MOTION=0` or
     // `NO_COLOR` keeps it still. The next frame's deadline, when one is armed.
@@ -4129,12 +4132,21 @@ where
                                     }
                                     // While it works or waits, its newest message is a tool call
                                     // more often than an answer; the page waits for it to stop.
-                                    Some(row) if matches!(row.state.as_str(), "working" | "starting" | "blocked") => {
+                                    Some(row) if row.state == "blocked" => {
+                                        state.message = Some(
+                                            "waiting on you: answer it in its pane, the page opens once it stops"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Some(row) if matches!(row.state.as_str(), "working" | "starting") => {
                                         state.message = Some(
                                             "still working: its last answer opens once it stops"
                                                 .to_string(),
                                         );
                                     }
+                                    // Already being read: one read at a time, the page opens
+                                    // when it arrives.
+                                    Some(row) if answer_for == Some(row.terminal) => {}
                                     Some(row) => {
                                         let terminal = row.terminal;
                                         answer_for = Some(terminal);
@@ -4501,8 +4513,9 @@ where
                                 }
                                 let index_answer = match &response {
                                     // The index this loop asked for, not the mux's own pushes.
-                                    ControlResponse::Agents { id, .. } => id.starts_with("index"),
-                                    ControlResponse::Failed { id, .. } => id.starts_with("index"),
+                                    ControlResponse::Agents { id, .. } | ControlResponse::Failed { id, .. } => {
+                                        !index_id.is_empty() && *id == index_id
+                                    }
                                     _ => false,
                                 };
                                 if index_answer {
@@ -4571,6 +4584,7 @@ where
                             &mut control_seq,
                         )?).await?;
                         index_asked = Some(tokio::time::Instant::now());
+                        index_id = format!("index-{request}");
                     }
                     if refresh_spaces {
                         request += 1;
@@ -4669,8 +4683,19 @@ where
                             answer_for = None;
                         }
                     }
+                    // An overlay that took the keyboard meanwhile keeps it: the page would
+                    // otherwise open out of nowhere when it closes, over whatever the person
+                    // is typing by then.
+                    Blocked::Answer(_, Ok(_))
+                        if state.palette.is_some() || state.prompt.is_some() || state.menu.is_some() =>
+                    {
+                        answer_for = None;
+                        state.message = None;
+                    }
                     Blocked::Answer(_, Ok(answer)) => {
                         answer_for = None;
+                        // A `ctrl-a` typed while the answer was read belongs to nothing now.
+                        keys.clear_prefix();
                         // The page is the answer to "reading the last answer": that
                         // sentence has nothing left to say.
                         state.message = None;
@@ -4699,6 +4724,7 @@ where
                         &mut control_seq,
                     )?).await?;
                     index_asked = Some(tokio::time::Instant::now());
+                    index_id = format!("index-{request}");
                 }
             }
         }

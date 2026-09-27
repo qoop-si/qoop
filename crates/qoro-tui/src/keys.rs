@@ -315,6 +315,12 @@ impl Keys {
         self.after_prefix
     }
 
+    /// Forget a `ctrl-a` still waiting for its letter: something else took the keyboard
+    /// first, and the next key must not arrive as a command it was never typed as.
+    pub fn clear_prefix(&mut self) {
+        self.after_prefix = false;
+    }
+
     /// Decode one read. May return several actions, and may keep state for the next read.
     ///
     /// Ordinary bytes are coalesced into as few `Input` actions as the commands between

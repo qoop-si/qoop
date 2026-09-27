@@ -102,23 +102,38 @@ pub struct Frame<'a> {
     /// before, so a single pane paints pixel for pixel what it always has.
     pub tiles: Vec<Tile<'a>>,
     /// What this client alone decided about how things look, beside the daemon's rows.
-    pub chrome: Chrome,
+    pub chrome: Chrome<'a>,
 }
 
-/// Client-local display state: owned, small, and cloned into each frame.
+/// Client-local display state, borrowed into each frame like the daemon's rows.
 ///
 /// Kept together so a frame gains one field when the client learns one more thing to
 /// remember, rather than one more field at every place a frame is built.
-#[derive(Clone, Debug, Default)]
-pub struct Chrome {
+#[derive(Clone, Copy, Debug)]
+pub struct Chrome<'a> {
     /// The spaces folded away under their rule.
-    pub shut: sidebar::Shut,
+    pub shut: &'a sidebar::Shut,
     /// Where the keyboard's attention is, for the key row.
     pub keys: KeyContext,
     /// What each local agent costs, sampled while `QORO_USAGE=1`.
-    pub usage: sidebar::Usage,
+    pub usage: &'a sidebar::Usage,
     /// An agent's last answer is open over the pane, and the key row says how to read it.
     pub answer: bool,
+}
+
+/// Nothing folded and nothing sampled, for a frame built without a client behind it.
+static NO_SHUT: sidebar::Shut = sidebar::Shut::new();
+static NO_USAGE: sidebar::Usage = sidebar::Usage::new();
+
+impl Default for Chrome<'_> {
+    fn default() -> Self {
+        Chrome {
+            shut: &NO_SHUT,
+            keys: KeyContext::default(),
+            usage: &NO_USAGE,
+            answer: false,
+        }
+    }
 }
 
 impl Frame<'_> {
@@ -135,8 +150,8 @@ impl Frame<'_> {
             unseen: self.unseen,
             now_unix: self.now_unix,
             width: self.sidebar_width,
-            shut: &self.chrome.shut,
-            usage: Some(&self.chrome.usage),
+            shut: self.chrome.shut,
+            usage: Some(self.chrome.usage),
         }
     }
 }
@@ -218,7 +233,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
 /// What the column can do right now, which decides which of its keys the row offers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Place {
-    /// A space can fold: the tree is showing and the column is open.
+    /// A space can fold: the tree is showing (open or folded to the strip).
     pub fold: bool,
     /// The column is folded away to its strip.
     pub collapsed: bool,
@@ -553,7 +568,9 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
-                Some(sidebar::Hit::Title | sidebar::Hit::Foot) | None => false,
+                Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Pinned(_)) | None => {
+                    false
+                }
             };
             let base = match (selected, line.colour) {
                 (true, Some(role)) => theme::selected_in(role),
@@ -752,7 +769,7 @@ pub fn paint(frame: &Frame) -> String {
         None => out.push_str(&crate::keys::named(&key_row(
             frame.chrome.keys,
             Place {
-                fold: frame.view == sidebar::View::Tree && !frame.collapsed,
+                fold: frame.view == sidebar::View::Tree,
                 collapsed: frame.collapsed,
             },
             frame.cols as usize,
@@ -784,14 +801,18 @@ pub fn paint(frame: &Frame) -> String {
     // (plain rows) holds for every gate and the whole corpus. Before the
     // floating overlays, so an open palette covers it the way it covers
     // terminal text.
-    out.push_str(&avatar_overlay_paint(
-        column_rows,
-        frame.sidebar_width,
-        frame.collapsed,
-        wide_enough,
-        avatar.as_ref(),
-        std::env::var("NO_COLOR").is_err(),
-    ));
+    // Only where the column gave the pet its rows: the list comes first.
+    if wide_enough && !frame.collapsed && sidebar::pet_shown(&column, column_rows, avatar.is_some())
+    {
+        out.push_str(&avatar_overlay_paint(
+            column_rows,
+            frame.sidebar_width,
+            frame.collapsed,
+            wide_enough,
+            avatar.as_ref(),
+            std::env::var("NO_COLOR").is_err(),
+        ));
+    }
 
     // The palette floats over the terminal, so it is painted last: every row it takes
     // overwrites what the pane and the column drew under it.
@@ -929,13 +950,7 @@ fn waiting(
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
 ) -> Option<theme::Role> {
-    sidebar::most_urgent(rows, focused, seen, unseen).map(|r| {
-        if sidebar::is_new(r, focused, seen, unseen) {
-            theme::of("done")
-        } else {
-            theme::of(&r.state)
-        }
-    })
+    sidebar::urgency_ink(rows, focused, seen, unseen)
 }
 
 /// What a terminal is called outside the tab bar: its program's last segment, the
@@ -1892,7 +1907,7 @@ pub fn paint_answer(frame: &Frame, answer: &crate::answer::Answer, out: &mut Str
     let first = answer.offset.min(body.len().saturating_sub(height));
     out.push_str(&at(TABS + 1, left + 1));
     out.push_str(&theme::fg(theme::Role::Title));
-    out.push_str(&width::fit(
+    out.push_str(&width::text(
         &format!(
             " last answer: {}   {} of {} rows",
             answer.title,

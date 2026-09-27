@@ -97,6 +97,9 @@ if name == "BeforeTool":
         args += ["--label", label]
 elif name == "BeforeAgent":
     args += ["--event", "user"]
+elif name == "AfterAgent":
+    # The turn ended: its last tool is not what the agent is doing any more.
+    args += ["--event", "done"]
 subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 ' 2>/dev/null && exit 0
 fi

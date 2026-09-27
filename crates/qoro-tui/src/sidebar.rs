@@ -158,6 +158,9 @@ const UNNAMED: &str = "agent";
 pub enum Hit {
     Space(i64),
     Terminal(u32),
+    /// An agent's row in the pin: it reaches the agent like its row in the tree, and is
+    /// never raised, so the keyboard's row is only ever drawn in one place.
+    Pinned(u32),
     /// The `spaces` title, with the order word and the `+` at its right.
     Title,
     /// The foot of the column: the brand, `menu`, and the mark that folds the column.
@@ -452,16 +455,27 @@ pub fn most_urgent<'a>(
         })
 }
 
-/// The colour the most urgent of `rows` lends a folded space: its state's own, or done's
-/// sage for news. `None` when nobody among them wants a person.
-fn urgent_ink(c: &Column, rows: &[&AgentRow]) -> Option<crate::theme::Role> {
-    most_urgent(rows.iter().copied(), c.focused_terminal, c.seen, c.unseen).map(|a| {
-        if is_new(a, c.focused_terminal, c.seen, c.unseen) {
+/// The colour the most urgent of `rows` lends whatever speaks for them (a folded space's
+/// arrow, the strip, the status line): its state's own, or done's sage for news. `None`
+/// when nobody among them wants a person.
+pub fn urgency_ink<'a>(
+    rows: impl IntoIterator<Item = &'a AgentRow>,
+    focused: u32,
+    seen: &Seen,
+    unseen: &Unseen,
+) -> Option<crate::theme::Role> {
+    most_urgent(rows, focused, seen, unseen).map(|a| {
+        if is_new(a, focused, seen, unseen) {
             crate::theme::of("done")
         } else {
             crate::theme::of(&a.state)
         }
     })
+}
+
+/// [`urgency_ink`] for rows of the column.
+fn urgent_ink(c: &Column, rows: &[&AgentRow]) -> Option<crate::theme::Role> {
+    urgency_ink(rows.iter().copied(), c.focused_terminal, c.seen, c.unseen)
 }
 
 /// The open column, painted into `height` rows: the pin, the title, the tree or the
@@ -483,7 +497,7 @@ pub(crate) fn rows_folded(
     }
     // The foot and the pet over it are taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
-    let pet = if avatar_fits(height, c.width, avatar.is_some()) {
+    let pet = if pet_shown(c, height, avatar.is_some()) {
         qoro_runtime::avatar::ART_ROWS
     } else {
         0
@@ -512,6 +526,24 @@ pub(crate) fn rows_folded(
     out
 }
 
+/// Whether the pet stands over the foot: it fits the column, and the whole list still fits
+/// above it. The pet is decoration and the list is not: when the agents need the rows,
+/// the pet gives them up rather than push anyone off the column.
+/// The column and the painter ask this one question, so the art never lands on a row the
+/// list was given.
+pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
+    if !avatar_fits(height, c.width, present) {
+        return false;
+    }
+    let room = height - 1 - qoro_runtime::avatar::ART_ROWS;
+    let pinned = if c.view == View::Tree {
+        pin(c, room).len()
+    } else {
+        0
+    };
+    pinned + 1 + content(c).len() <= room
+}
+
 /// The open column as lines alone, for a caller that paints and never clicks.
 pub fn render_folded(c: &Column, height: usize) -> Vec<Line> {
     rows_folded(c, height, None)
@@ -529,13 +561,11 @@ fn pin(c: &Column, room: usize) -> Vec<Row> {
     let mut needing: Vec<&AgentRow> = c
         .agents
         .iter()
-        // The agent the keyboard is on is not repeated: it is on screen already, and a
-        // second raised row for it would be a second place the keyboard seems to be.
-        .filter(|a| {
-            a.agent
-                && a.terminal != c.focused_terminal
-                && needs_person(a, c.focused_terminal, c.seen, c.unseen)
-        })
+        // The agent the keyboard is on stays listed while it needs a person, so the rows
+        // under the pointer do not move the moment one of them is clicked. Its pin row is a
+        // `Pinned` hit, which the painter never raises: the keyboard's own row is the one
+        // in the tree.
+        .filter(|a| a.agent && needs_person(a, c.focused_terminal, c.seen, c.unseen))
         .collect();
     // A title, one agent and the rule under them, or nothing: a pin that cannot show
     // one agent is a title with nothing under it.
@@ -570,10 +600,7 @@ fn pin(c: &Column, room: usize) -> Vec<Row> {
         None,
     )];
     for agent in needing.iter().take(shown) {
-        out.push((
-            flat_line(c, agent, true),
-            Some(Hit::Terminal(agent.terminal)),
-        ));
+        out.push((flat_line(c, agent, true), Some(Hit::Pinned(agent.terminal))));
     }
     if shown < total && fits > 1 {
         out.push((
@@ -850,7 +877,6 @@ pub fn humanize(raw: &str) -> String {
         }
     };
     match tool.to_ascii_lowercase().as_str() {
-        "thinking" if arg.is_empty() => "thinking".to_string(),
         "read" | "read_file" | "read_many_files" | "view" | "notebookread" => {
             with("reading", base(arg))
         }
@@ -870,11 +896,11 @@ pub fn humanize(raw: &str) -> String {
             // `bash -lc 'git status'` quotes its command; the quotes are the shell's.
             .map(|inner| inner.trim().trim_matches(|q| q == '\'' || q == '"'))
             .unwrap_or(arg);
-            let first = command.lines().next().unwrap_or("").trim();
-            if first.is_empty() {
+            let command = command.trim();
+            if command.is_empty() {
                 "running".to_string()
             } else {
-                first.to_string()
+                command.to_string()
             }
         }
         "grep"
@@ -1075,9 +1101,15 @@ fn flat_line(c: &Column, agent: &AgentRow, inline: bool) -> Line {
     // shows no sub-row, and the pin is where a person reads why they are needed.
     // Only when the activity will really fit beside a shortened name: a name cut for an
     // activity that then does not fit would be cut for nothing.
+    // The pin drops the `wants:` the tree says: the blocked colour already says it, and
+    // the row is short enough that the words are better spent on what it wants.
     let said = inline
         .then(|| said(agent))
         .flatten()
+        .map(|(text, ink)| match text.strip_prefix("wants: ") {
+            Some(what) => (what.to_string(), ink),
+            None => (text, ink),
+        })
         .filter(|_| room >= (room * 42 / 100).max(7) + 6);
     let name_room = if said.is_some() {
         (room * 42 / 100).max(7).min(room)
@@ -1151,7 +1183,7 @@ fn window(content: Vec<Row>, body: usize, c: &Column, width: usize) -> Vec<Row> 
 /// opens the column again.
 pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
     match hit {
-        Hit::Terminal(terminal) => Some(Act::Terminal(terminal)),
+        Hit::Terminal(terminal) | Hit::Pinned(terminal) => Some(Act::Terminal(terminal)),
         Hit::Space(id) => {
             // The arrow folds; a rule with nothing under it has nothing to fold, so
             // every cell of it moves to the space.
@@ -2009,7 +2041,7 @@ mod tests {
         rows.iter()
             .take_while(|(_, h)| *h != Some(Hit::Title))
             .filter_map(|(_, h)| match h {
-                Some(Hit::Terminal(t)) => Some(*t),
+                Some(Hit::Pinned(t)) => Some(*t),
                 _ => None,
             })
             .collect()
@@ -2323,7 +2355,17 @@ mod tests {
                                         || text.starts_with(&format!("   {g} {name}"))
                                 })
                             })
-                            .map(|a| Hit::Terminal(a.terminal))
+                            // Above the title a row is the pin's, which answers `Pinned`.
+                            .map(|a| {
+                                let above = !lines[..row]
+                                    .iter()
+                                    .any(|l| l.text.starts_with(&format!(" {SPACES_TITLE}")));
+                                if above {
+                                    Hit::Pinned(a.terminal)
+                                } else {
+                                    Hit::Terminal(a.terminal)
+                                }
+                            })
                     };
                     assert_eq!(got, want, "row {row} of {height}: {text:?}");
                 }
@@ -2760,10 +2802,10 @@ mod tests {
         let texts = texts(&lines);
         // Every agent draws one row under its space, in the daemon's order inside it:
         // terminal 1 (blocked) first because it is listed first, not because of what
-        // it needs. Urgency is the pin's job, which lists who needs a person except
-        // terminal 1: it has the keyboard, so it is on screen already.
+        // it needs. Urgency is the pin's job, which lists both that need a person, the
+        // keyboard's own terminal 1 included so the rows do not move under a click.
         assert_eq!(order(&rows), vec![1, 3, 5, 6, 9, 2, 4, 7, 8]);
-        assert_eq!(pinned(&rows), vec![2]);
+        assert_eq!(pinned(&rows), vec![1, 2]);
         // At frame zero running agents carry the working dot, no spinner, and no
         // state word on the right.
         assert!(
@@ -2784,13 +2826,13 @@ mod tests {
                 "a group header leaked: {header}: {texts:?}"
             );
         }
-        // Nine tree rows, and the one the pin repeats.
+        // Nine tree rows, and the two the pin repeats.
         assert_eq!(
             texts
                 .iter()
                 .filter(|t| t.contains("claude") || t.contains("codex"))
                 .count(),
-            10,
+            11,
             "{texts:?}"
         );
         // The title names the order on its right.
@@ -3009,40 +3051,46 @@ mod tests {
         )
     }
 
-    /// With a pet the five rows above the foot go blank for the overlay, the
-    /// foot keeps its dots and name, and the column keeps its exact height.
+    /// With a pet and a list short enough to stand above it, the five rows over the foot go
+    /// blank for the overlay, the foot keeps its dots and name, and the column keeps its
+    /// exact height. A list that needs those rows keeps them: the pet gives way, and no
+    /// agent is pushed off the column for a picture.
     #[test]
-    fn a_pet_reserves_five_blank_rows_above_the_foot() {
+    fn a_pet_takes_five_rows_only_when_the_list_still_fits() {
         let pet = art_pet();
-        let (spaces, agents) = crowd();
-        let rows = rows12(
-            &spaces,
-            &agents,
-            1,
-            1,
-            30,
-            0,
-            View::Tree,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-            Some(&pet),
-        );
+        let at = |(spaces, agents): (Vec<WorkspaceRow>, Vec<AgentRow>)| {
+            rows12(
+                &spaces,
+                &agents,
+                1,
+                1,
+                30,
+                0,
+                View::Tree,
+                &Seen::new(),
+                &Unseen::new(),
+                NOW,
+                WIDTH,
+                Some(&pet),
+            )
+        };
+        let rows = at(sample());
         assert_eq!(rows.len(), 30);
         for (line, hit) in rows[24..29].iter() {
             assert_eq!(line.text, " ".repeat(WIDTH), "{line:?}");
             assert_eq!(*hit, None);
         }
-        // The list is laid out in the rows above the pet: its last row is an agent.
-        assert!(
-            matches!(rows[23].1, Some(Hit::Terminal(_))),
-            "{:?}",
-            rows[23]
-        );
         let (foot, hit) = &rows[29];
         assert!(foot.text.contains("Mohawk"), "{foot:?}");
         assert_eq!(*hit, Some(Hit::Foot));
+        // A crowd needs every row: the pet gives way and the row over the foot is an agent.
+        let crowded = at(crowd());
+        assert_eq!(crowded.len(), 30);
+        assert!(
+            matches!(crowded[28].1, Some(Hit::Terminal(_))),
+            "{:?}",
+            crowded[28]
+        );
     }
 
     /// The reservation eats list rows, not padding: without a pet those rows
@@ -3367,7 +3415,12 @@ mod tests {
                 lines[row].indicator,
                 Some((at, 1, crate::theme::of("failed")))
             );
-            assert_eq!(hit(&spaces, &agents, 2, 99, 8, row), Some(Hit::Terminal(2)));
+            let want = if at == DOT_AT {
+                Hit::Pinned(2)
+            } else {
+                Hit::Terminal(2)
+            };
+            assert_eq!(hit(&spaces, &agents, 2, 99, 8, row), Some(want));
         }
         // An unseen failed finish keeps the diamond: failed is never news.
         let mut unseen = Unseen::new();
@@ -3512,7 +3565,7 @@ mod tests {
         // Both its rows, the pin's and the tree's, wear the done circle.
         let mine: Vec<&Line> = rows
             .iter()
-            .filter(|(_, h)| *h == Some(Hit::Terminal(6)))
+            .filter(|(_, h)| matches!(h, Some(Hit::Terminal(6) | Hit::Pinned(6))))
             .map(|(l, _)| l)
             .collect();
         assert_eq!(mine.len(), 2);
@@ -3696,7 +3749,7 @@ mod tests {
         assert_eq!(rows[0].1, None);
         assert!(texts[1].starts_with(" \u{25cf} codex"), "{texts:?}");
         assert!(texts[1].ends_with(" app"), "{texts:?}");
-        assert_eq!(rows[1].1, Some(Hit::Terminal(1)));
+        assert_eq!(rows[1].1, Some(Hit::Pinned(1)));
         assert_eq!(lines[2].text, "\u{2500}".repeat(WIDTH));
         assert_eq!(lines[2].colour, Some(crate::theme::Role::Rule));
         assert_eq!(rows[2].1, None);
@@ -3883,9 +3936,10 @@ mod tests {
         assert_eq!(two[1].text.trim_end(), "     \u{2514} wants: bun test");
         assert_eq!(two[1].colour, Some(crate::theme::Role::Blocked));
         assert_eq!(under(3).len(), 1, "a calm agent keeps one row: {texts:?}");
-        // The pin names what the waiting agent wants on its own row.
+        // The pin names what the waiting agent wants on its own row, without the word the
+        // colour already says.
         assert!(
-            texts[1].starts_with(" \u{25cf} codex - wants: bun"),
+            texts[1].starts_with(" \u{25cf} codex - bun test"),
             "{texts:?}"
         );
         for (line, _) in &rows {

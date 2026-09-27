@@ -78,6 +78,10 @@ def first_fileish(tool_input):
     for key in ("command", "cmd", "file_path", "path", "pattern"):
         value = tool_input.get(key)
         if isinstance(value, list):
+            # A patch rides in the command list as its second part: file content,
+            # never a label. The tool name says enough.
+            if value[:1] == ["apply_patch"]:
+                return "apply_patch"
             value = " ".join(str(part) for part in value)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -100,6 +104,9 @@ if name in ("PreToolUse", "PermissionRequest"):
         args += ["--label", label]
 elif name == "UserPromptSubmit":
     args += ["--event", "user"]
+elif name == "Stop":
+    # The turn ended: its last tool is not what the agent is doing any more.
+    args += ["--event", "done"]
 subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 ' 2>/dev/null && exit 0
 fi
