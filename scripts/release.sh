@@ -20,6 +20,12 @@
 # workspace member, build the release binary, smoke it, pack it with its
 # checksum, commit the bump, tag it, push, and create the GitHub release with
 # notes from the commits since the previous tag.
+#
+# Safe to run again with the same version after a failure past the build (a
+# push or `gh release create` that did not go through): the commit and the tag
+# are made only if missing, and the pushes and the release pick up from there.
+# If the release was created but an asset upload failed, finish it with
+# `gh release upload "v<version>" dist/* --clobber`.
 
 set -eu
 
@@ -51,6 +57,7 @@ docker info >/dev/null 2>&1 || { echo "release.sh: docker is not running; the Li
 
 if [ -n "$(git status --porcelain)" ]; then
     echo "release.sh: refusing: the tree is dirty, commit or stash first" >&2
+    echo "release.sh: if a previous run stopped before its commit, undo its stamp with: git checkout -- crates Cargo.lock" >&2
     exit 1
 fi
 
@@ -116,16 +123,27 @@ for triple in $TARGETS; do
     cat "dist/$ASSET.sha256"
 done
 
-PREVIOUS="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+# This version's own tag and bump commit are left out: on a rerun both already
+# sit at HEAD, and the notes would come out empty or name the bump.
+PREVIOUS="$(git describe --tags --abbrev=0 --exclude "v$VERSION" 2>/dev/null || true)"
 if [ -n "$PREVIOUS" ]; then
-    NOTES="$(git log "$PREVIOUS..HEAD" --format='- %s')"
+    NOTES="$(git log "$PREVIOUS..HEAD" --format='- %s' --invert-grep --grep "^chore: release v$VERSION\$")"
 else
     NOTES="$(git log --format='- %s' -20)"
 fi
 
+# Each step only if a previous run did not get that far: a rerun has nothing
+# to commit, and its tag is already there.
 git add crates/*/Cargo.toml Cargo.lock
-git commit -m "chore: release v$VERSION"
-git tag "v$VERSION"
+git diff --cached --quiet || git commit -m "chore: release v$VERSION"
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+    if [ "$(git rev-parse "v$VERSION^{commit}")" != "$(git rev-parse HEAD)" ]; then
+        echo "release.sh: refusing: v$VERSION exists and is not HEAD" >&2
+        exit 1
+    fi
+else
+    git tag "v$VERSION"
+fi
 git push origin HEAD
 git push origin "v$VERSION"
 

@@ -14,10 +14,14 @@ case where a weaker source may overrule a stronger one under ADR-008.
 
 ```text
 qoro hooks status               which are installed, and which agents are not present
-qoro hooks install              every agent qoro ships a hook for that is on this machine
+qoro hooks install              every agent on this machine it can install for (a config entry, or opencode's plugin file)
 qoro hooks install claude       one of them
 qoro hooks uninstall claude     exactly what was installed, and nothing else
 ```
+
+amp and goose ship a hook too, but are installed by hand: see "Installing" below.
+A hooks directory whose path holds whitespace or shell syntax is refused rather than
+quoted, because not every agent runs its hook command through a shell.
 
 The script is written to `<config>/qoro/hooks/`, and one entry is added to that agent's
 own configuration file. Three things this will not do to a person's configuration: it adds
@@ -187,7 +191,8 @@ shape in each case:
   `.gemini/settings.json` (project), with the state as the script's argument.
 - cursor: entries in `.cursor/hooks.json` (project) or `~/.cursor/hooks.json`
   (user) with `"version": 1`, state as the script's argument.
-- opencode: load `hooks/opencode/qoro-plugin.js` as a plugin.
+- opencode: `qoro hooks install opencode`, or copy `hooks/opencode/qoro-plugin.js` into
+  `~/.config/opencode/plugin/`; do not also list it in `opencode.json`, which loads it twice.
 - amp: load `hooks/amp/qoro-plugin.js` as a plugin.
 - copilot: flat entries (`{ "command": ... }`, no wrapper) under `"hooks"`
   in `~/.copilot/settings.json` (`$COPILOT_HOME/settings.json` when set; a

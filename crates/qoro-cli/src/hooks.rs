@@ -305,16 +305,26 @@ fn present_in(target: &Target, home: &Path, path: &str) -> bool {
 /// that is where a thing they can read and edit belongs. Not in the runtime directory:
 /// that is for sockets and databases and is thrown away.
 fn hooks_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .ok()
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("qoro").join("hooks")
+    qoro_runtime::paths::config_dir().join("hooks")
+}
+
+/// Refuse a hooks directory that a hook command cannot carry as it is.
+///
+/// Refused rather than quoted, because quoting is only right if every agent runs the
+/// command through a shell. Claude does; Cursor documents command lines but not how it
+/// splits them, and an agent that splits on whitespace would receive the quote characters
+/// and break every hook for everybody. Only whitespace and what a shell reads as syntax are
+/// refused: an `@` in a directory-joined Linux home, or a non-ASCII name, is carried fine.
+fn safe_hook_dir(dir: &Path) -> std::io::Result<()> {
+    let special =
+        |c: char| c.is_whitespace() || c.is_control() || "'\"\\$`;&|<>()*?[]{}!#~".contains(c);
+    if dir.to_str().is_some_and(|text| !text.chars().any(special)) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "{} has a character a hook command cannot carry; set XDG_CONFIG_HOME to a plain path",
+        dir.display()
+    )))
 }
 
 fn home() -> Option<PathBuf> {
@@ -446,6 +456,7 @@ fn status() -> std::io::Result<()> {
 
 fn install(args: &[String]) -> std::io::Result<()> {
     let dir = hooks_dir();
+    safe_hook_dir(&dir)?;
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to install into"));
     };
@@ -813,12 +824,13 @@ fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io
 ///
 /// Recognised by the path it points at, which is why the script goes in a directory of its
 /// own: an entry mentioning that path is one this put there, and nothing else in the file
-/// can be mistaken for it. Only what this emptied is taken away with it: an event list, or
-/// the `hooks` object, left holding nothing because the entry was the last thing in it. An
-/// empty list the person had for any other event stays; one they had for the event this
-/// registered is taken away with the entry, because nothing tells it apart from one this
-/// created. A file with no kept copy at all was created by the install; when it holds
-/// nothing of the person's afterwards it is removed rather than left as `{}`.
+/// can be mistaken for it. Only what this emptied is taken away with it: a group, an event
+/// list, or the `hooks` object, left holding nothing because the entry was the last thing
+/// in it. An empty group the person had stays, and so does an empty list for any other
+/// event; one they had for the event this registered is taken away with the entry,
+/// because nothing tells it apart from one this created. A file with no kept copy at all
+/// was created by the install; when it holds nothing of the person's afterwards it is
+/// removed rather than left as `{}`.
 fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> {
     if !config.exists() {
         return Ok(false);
@@ -840,22 +852,24 @@ fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> 
             };
             let before = groups.len();
             let mut touched = false;
+            // Only a group this pass emptied goes: an empty group the person already had
+            // is theirs, and dropping it would leave a diff they never asked for. A group
+            // that was empty until install filled it still goes, since nothing records
+            // that it was empty before; not worth a marker.
+            let mut gone = Vec::with_capacity(before);
             for group in groups.iter_mut() {
+                // The flat shape: the group is itself the entry.
+                let mut ours = says(group, &path);
                 if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                     let was = inner.len();
                     inner.retain(|entry| !says(entry, &path));
                     touched |= inner.len() != was;
+                    ours |= was != 0 && inner.is_empty();
                 }
+                gone.push(ours);
             }
-            // A group left holding nothing is a group this emptied.
-            groups.retain(|group| {
-                !says(group, &path)
-                    && group
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|h| !h.is_empty())
-                        .unwrap_or(true)
-            });
+            let mut gone = gone.into_iter();
+            groups.retain(|_| !gone.next().unwrap_or(false));
             touched |= groups.len() != before;
             if touched && groups.is_empty() {
                 emptied.push(event.clone());
@@ -863,7 +877,7 @@ fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> 
             changed |= touched;
         }
         for event in emptied {
-            hooks.remove(&event);
+            hooks.shift_remove(&event);
         }
         hooks_emptied = changed && hooks.is_empty();
     }
@@ -871,12 +885,7 @@ fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> 
         && !at_root
         && let Some(root) = root.as_object_mut()
     {
-        root.remove("hooks");
-    }
-    if let Some(plugins) = root.get_mut("plugin").and_then(|p| p.as_array_mut()) {
-        let before = plugins.len();
-        plugins.retain(|entry| !says(entry, &path));
-        changed |= plugins.len() != before;
+        root.shift_remove("hooks");
     }
     if changed {
         // No kept copy at all means no write ever found the file there before it: the
@@ -1088,6 +1097,65 @@ mod tests {
         assert!(after["hooks"].get("SessionEnd").is_none(), "{after}");
         // And taking it out twice is not an error.
         assert!(!remove(&config, &script, false).expect("uninstall again"));
+    }
+
+    /// A settings file kept in dotfiles comes back in the order it was written, so the
+    /// only diff an install leaves is the hooks it added.
+    #[test]
+    fn installing_keeps_the_order_of_everything_it_did_not_add() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        std::fs::write(&config, r#"{"model":"opus","env":{"B":"1","A":"2"}}"#).expect("write");
+        let script = dir.path().join("qoro-hook.sh");
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
+        let text = std::fs::read_to_string(&config).expect("read");
+        let at = |k: &str| text.find(&format!("\"{k}\"")).expect(k);
+        assert!(at("model") < at("env") && at("env") < at("hooks"), "{text}");
+        assert!(at("B") < at("A"), "{text}");
+    }
+
+    /// An empty group or event list the person already had is theirs: uninstall takes out
+    /// only what its own pass emptied.
+    #[test]
+    fn uninstalling_leaves_empty_groups_and_events_that_were_already_empty() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        let mut before = existing();
+        before["hooks"]["Foo"] = serde_json::json!([]);
+        before["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .expect("a list")
+            .insert(0, serde_json::json!({ "matcher": "Bash", "hooks": [] }));
+        std::fs::write(&config, serde_json::to_string(&before).expect("json")).expect("write");
+        let script = dir.path().join("qoro-hook.sh");
+        edit(&config, &target("claude"), &script, false).expect("install");
+
+        assert!(remove(&config, &script, false).expect("uninstall"));
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert_eq!(after["hooks"]["Foo"], serde_json::json!([]), "{after}");
+        assert_eq!(
+            after["hooks"]["PreToolUse"][0],
+            serde_json::json!({ "matcher": "Bash", "hooks": [] }),
+            "{after}"
+        );
+        assert_eq!(
+            after["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
+            "~/mine.sh"
+        );
+        assert!(after["hooks"].get("SessionEnd").is_none(), "{after}");
+    }
+
+    /// A hooks directory a command line cannot carry as is is refused, not quoted.
+    #[test]
+    fn a_hooks_directory_with_a_space_is_refused() {
+        let err = safe_hook_dir(Path::new("/Users/a/my config/qoro/hooks")).expect_err("space");
+        assert!(err.to_string().contains("XDG_CONFIG_HOME"), "{err}");
+        safe_hook_dir(Path::new("/Users/a.b/.config/qoro/hooks")).expect("a plain path");
+        // A directory-joined Linux home, and a non-ASCII name: both carried fine unquoted.
+        safe_hook_dir(Path::new("/home/jo@corp.example/.config/qoro/hooks")).expect("an @");
+        safe_hook_dir(Path::new("/home/çağrı/.config/qoro/hooks")).expect("non-ASCII");
+        safe_hook_dir(Path::new("/tmp/$(x)/qoro/hooks")).expect_err("shell syntax");
     }
 
     /// The flat shape and the plugin shape are written the way their agent reads them.

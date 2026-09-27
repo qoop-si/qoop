@@ -499,8 +499,13 @@ async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
 fn run_setup(args: &[String]) -> std::io::Result<()> {
     use qoro_setup::{ConfirmationLedger, level_of};
 
-    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-    let ledger_path = dir.join("confirmed-setups");
+    // Under the runtime base, not a session's directory: trust is per machine (ADR-015),
+    // and a Setup confirmed in one session was otherwise untrusted in every other one.
+    // Resolved only by the verbs that read it, so a typo or the usage touches nothing.
+    let ledger_path = || -> std::io::Result<std::path::PathBuf> {
+        let base = paths::runtime_base().map_err(std::io::Error::other)?;
+        Ok(base.join("confirmed-setups"))
+    };
 
     match args.get(2).map(String::as_str) {
         Some("show") => {
@@ -536,7 +541,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
                     setup.name
                 )));
             }
-            let mut ledger = ConfirmationLedger::open(&ledger_path);
+            let mut ledger = ConfirmationLedger::open(&ledger_path()?);
             ledger
                 .confirm(&setup.content_hash())
                 .map_err(std::io::Error::other)?;
@@ -548,7 +553,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
                 .get(3)
                 .ok_or_else(|| usage("usage: qoro setup check <file>"))?;
             let setup = read_setup(path)?;
-            let ledger = ConfirmationLedger::open(&ledger_path);
+            let ledger = ConfirmationLedger::open(&ledger_path()?);
             match qoro_setup::ledger::admit(&setup, &ledger, true) {
                 Ok(()) => {
                     println!("confirmed");
@@ -565,7 +570,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
                 }
             }
         }
-        _ => {
+        None | Some("--help" | "-h") => {
             print!(
                 "usage:\n\
                  \x20 qoro setup show <file>    what it will run, its hash and its level\n\
@@ -574,6 +579,9 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
             );
             Ok(())
         }
+        Some(other) => Err(usage(format!(
+            "unknown command {other}; usage: qoro setup <show|trust|check> <file>"
+        ))),
     }
 }
 
@@ -763,7 +771,12 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     };
     let id = request.request_id().to_string();
 
-    let rt = tokio::runtime::Runtime::new()?;
+    // One thread, as `stop` uses: this runs on every tool call an agent makes, and a
+    // runtime with a worker per core was that many threads spawned and joined for one
+    // request. `enable_all` because the bound below is a timer and the socket is IO.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2459,6 +2472,7 @@ mod tests {
         paths::write_last_session(base.path(), "hobby");
         assert_eq!(bare(), "hobby");
         // The environment wins over the file.
+        // SAFETY: same variables as the SAFETY above, same single test.
         unsafe { std::env::set_var(paths::SESSION_ENV, "work") };
         assert_eq!(bare(), "work");
         // The flag wins over both.
@@ -2472,9 +2486,11 @@ mod tests {
             "play"
         );
         // A stale file is the default, never an error.
+        // SAFETY: same variables as the SAFETY above, same single test.
         unsafe { std::env::remove_var(paths::SESSION_ENV) };
         std::fs::write(paths::last_session_path(base.path()), "gone\n").unwrap();
         assert_eq!(bare(), paths::DEFAULT_SESSION);
+        // SAFETY: same variables as the SAFETY above, same single test.
         unsafe {
             std::env::remove_var(paths::RUNTIME_DIR_ENV);
             std::env::remove_var(paths::SESSION_ENV);

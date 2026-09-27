@@ -8,8 +8,7 @@
 //! Secrets are captured as references and never as values, which is not a filter but a type:
 //! there is no field on a `SecretRef` that can hold one.
 
-use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use qoro_domain::{EnvPlan, EnvRef, LaunchIntent, NativeSessionRef, SecretRef};
@@ -106,15 +105,9 @@ impl Setup {
     /// A relative executable is refused here, by `LaunchIntent`, which is the same refusal
     /// a live spawn gets because it is the same constructor (gate G5.5).
     pub fn to_launch_intent(&self) -> Result<LaunchIntent, CaptureError> {
-        let mut argv: Vec<OsString> = self.argv.iter().map(OsString::from).collect();
-        for (index, bytes) in &self.argv_bytes {
-            if let Some(slot) = argv.get_mut(*index) {
-                *slot = OsString::from_vec(bytes.clone());
-            }
-        }
         let mut intent = LaunchIntent::new(
             PathBuf::from(&self.executable),
-            argv,
+            self.argv_os(),
             PathBuf::from(&self.cwd),
         )
         .map_err(|e| CaptureError::Invalid(e.to_string()))?;
@@ -211,6 +204,8 @@ pub fn redact_capture(mut setup: Setup, secrets: &[&str]) -> (Setup, Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     fn intent() -> LaunchIntent {
         let mut i = LaunchIntent::new(

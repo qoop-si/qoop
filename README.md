@@ -77,11 +77,15 @@ conversation, which is what lets a stopped session come back to that conversatio
 rather than to whichever one in the directory is newest. `qoro hooks status` says
 what is installed and `qoro hooks uninstall` takes out exactly what was added;
 `qoro skills status` and `qoro skills uninstall` do the same for the skill.
+How a screen is read, and how to override a misreading, is in
+[docs/manifests.md](docs/manifests.md); what each hook installs is in
+[docs/hooks.md](docs/hooks.md).
 
 On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
-skill.
-The releases are private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or
-`GITHUB_TOKEN`, or a `gh` login.
+skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro` (or
+`QORO_DEST`), and it says so if that directory is not on your PATH. The releases are
+private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
+`gh` login.
 
 Sessions are named, and a stopped one comes back as itself:
 
@@ -142,7 +146,8 @@ Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm6
 2.17 and newer) live on GitHub Releases, all built on one Mac with `./scripts/release.sh
 0.1.0`: GitHub only hosts the files, nothing is compiled there. `qoro update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
-how it installs, and `qoro update` installs it once no session is running.
+how it installs, and `qoro update` installs it once no session is running. How a release is
+cut and how an update lands: [docs/update.md](docs/update.md).
 
 ## What is measured
 
@@ -171,6 +176,10 @@ Every decision that was hard is written down as a decision record in
 [docs/adr](docs/adr), with what was measured and what the first version got wrong. Several of
 them are corrections: the containment identity read from the wrong end of a pty, teardown
 that ended when the child was reaped, a parser bound that a three byte prefix walked past.
+
+The keyboard corpus gate G1.3 checks key encodings against, and where each row came from:
+[docs/keyboard-corpus.md](docs/keyboard-corpus.md). Every benchmark run so far:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 Every claim about this program is a gate, and a gate is a command that exits zero. There are
 eighty seven of them, they live in the tests next to the code they are about, and each one

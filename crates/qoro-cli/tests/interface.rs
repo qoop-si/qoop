@@ -376,8 +376,6 @@ impl Interface {
 
         let pty = qoro_pty::sys::open_pty(cols, rows).expect("a pty");
         let slave = pty.slave;
-        // SAFETY: the only unsafe part is `pre_exec` below, whose closure runs post fork
-        // and calls two async signal safe syscalls with no allocation.
         let stdin = slave.try_clone().expect("dup");
         let stdout = slave.try_clone().expect("dup");
         let stderr = slave.try_clone().expect("dup");
@@ -394,6 +392,8 @@ impl Interface {
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")
             .env("TERM", "xterm-256color");
+        // SAFETY: the only unsafe part is `pre_exec` below, whose closure runs post fork
+        // and calls two async signal safe syscalls with no allocation.
         let child = unsafe {
             use std::os::unix::process::CommandExt;
             cmd.stdin(Stdio::from(stdin))

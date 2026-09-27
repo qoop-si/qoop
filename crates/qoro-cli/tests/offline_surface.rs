@@ -213,6 +213,11 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
         stderr.contains("unknown command") && stderr.contains("upadte"),
         "a typo was not named as one: {stderr:?}"
     );
+    let (stderr, code) = run(&["setup", "shwo", "x"]);
+    assert_eq!(code, Some(2), "a setup typo exited as success: {stderr:?}");
+    assert!(stderr.contains("unknown command shwo"), "{stderr:?}");
+    let (_, code) = run(&["setup"]);
+    assert_eq!(code, Some(0), "bare `qoro setup` is its usage");
 }
 
 /// A trailing `--session` with nothing after it is a mistake, not the default session.

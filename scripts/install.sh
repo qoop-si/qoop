@@ -7,11 +7,22 @@
 # `qoro update` owns that path.
 #
 # Fail closed: no network, no install. Rerunning changes nothing.
+#
+# Into the person's home, never as root: `/usr/local/bin` needs sudo on a stock
+# Mac and on Linux, and under sudo the hooks and skill land root-owned where the
+# person's agents cannot run them, and every later `qoro update` needs sudo too.
 
 set -eu
 
+# Only under sudo: root on its own box (a container, a server) installing into its own
+# home is the person, and gets what anyone else gets.
+[ -z "${SUDO_USER:-}" ] || [ "$(id -u)" -ne 0 ] || {
+    echo "qoro install: run it as yourself, not with sudo: the binary, hooks and skill all go into your home" >&2
+    exit 1
+}
+
 REPO="pat/qoro"
-DEST="${QORO_DEST:-/usr/local/bin/qoro}"
+DEST="${QORO_DEST:-$HOME/.local/bin/qoro}"
 # A mirror, or a local directory as file:///path holding a `latest` file in the API's own
 # shape: how the platform pick is tested with no network. `qoro update` reads the same.
 BASE="${QORO_RELEASE_BASE:-https://api.github.com/repos/$REPO/releases}"
@@ -46,6 +57,12 @@ ASSET="qoro-$TRIPLE.tar.gz"
 if command -v qoro >/dev/null 2>&1; then
     echo "qoro is already on PATH: $(command -v qoro)" >&2
     echo "for a newer release run: qoro update" >&2
+    exit 0
+fi
+# Not on PATH but already there, a link to a dev build for one: left exactly as it is.
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+    echo "qoro is already at $DEST, not on PATH; nothing replaced" >&2
+    echo "for a newer release run: $DEST update" >&2
     exit 0
 fi
 
@@ -184,4 +201,15 @@ if [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
     "$DEST" avatar pick || true
 else
     echo "pick an avatar when ready: qoro avatar pick"
+fi
+
+# The hooks call `qoro` by name, so it has to be on PATH. Said, not done: an rc
+# file is the person's own.
+if ! command -v qoro >/dev/null 2>&1; then
+    case "${SHELL:-}" in
+        */zsh) rc=.zshrc ;;
+        */bash) rc=.bashrc ;;
+        *) rc=.profile ;;
+    esac
+    echo "add $(dirname "$DEST") to PATH, e.g. echo 'export PATH=\"$(dirname "$DEST"):\$PATH\"' >> ~/$rc"
 fi

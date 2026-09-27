@@ -66,10 +66,15 @@ impl Gap {
 /// capture and a person who fills in something that was already fine, while the other
 /// mistake produces a Setup that fails on the target with no warning.
 fn is_unportable(path: &str) -> bool {
+    // Both spellings of each: capture keeps the cwd as the shell gave it, and a shell in
+    // `$TMPDIR` says `/var/folders/...` while a resolved `/tmp` says `/private/tmp/...`.
     const MACHINE_LOCAL: &[&str] = &[
         "/private/var/folders/",
+        "/var/folders/",
         "/tmp/",
+        "/private/tmp/",
         "/var/tmp/",
+        "/private/var/tmp/",
         "/run/user/",
         "/Volumes/",
         "/media/",
@@ -222,6 +227,21 @@ mod tests {
         let (level, gaps) = level_of(&s);
         assert_eq!(level, Level::LocalSnapshot);
         assert!(gaps.iter().any(Gap::is_blocking));
+    }
+
+    /// The same places spelled the way a shell reports them: capture keeps the cwd as
+    /// given, so `$TMPDIR` is `/var/folders/...` and a resolved `/tmp` is `/private/tmp`.
+    #[test]
+    fn a_machine_local_path_is_local_however_it_is_spelled() {
+        for cwd in [
+            "/var/folders/xy/T/scratch",
+            "/private/tmp/x",
+            "/private/var/tmp/x",
+        ] {
+            let mut s = base();
+            s.cwd = cwd.into();
+            assert_eq!(level_of(&s).0, Level::LocalSnapshot, "{cwd}");
+        }
     }
 
     #[test]

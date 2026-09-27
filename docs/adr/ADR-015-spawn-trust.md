@@ -27,10 +27,12 @@ read or guess that value can forge state for any terminal.
 ### Confirmation is decided by a local ledger, never by a field in the artifact
 
 The daemon keeps a **local confirmation ledger** of content hashes it has been told to
-trust. It lives in the daemon's own state, in the same SQLite database as the event store
-(ADR-005), under the user's data directory with the same ownership and permission checks
-ADR-012 applies to the runtime directory. It is never inside a Setup, never synced, and
-never written by anything but an explicit confirmation.
+trust. It is the file `confirmed-setups` in the runtime base directory, the parent of every
+session's directory, so one confirmation holds for every session on the machine, with the
+ownership and permission checks ADR-012 applies to that directory. It is never inside a
+Setup, never synced, and never written by anything but an explicit confirmation. Where the
+runtime directory is cleared on reboot (`XDG_RUNTIME_DIR` on Linux), so are the
+confirmations, which fails closed like every other absence below.
 
 Its integrity requirement is one-directional and therefore cheap: **absence fails closed**.
 A deleted, corrupted or unreadable ledger means nothing is trusted and every Setup prompts
