@@ -5234,16 +5234,7 @@ pub const BLOCKER_REANNOUNCE: std::time::Duration = std::time::Duration::from_mi
 /// The user's own config directory, like their shell rc: same trust, no
 /// daemon-managed permissions. A missing directory simply means no overrides.
 fn override_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .ok()
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("qoro").join("agent-detection")
+    crate::paths::config_dir().join("agent-detection")
 }
 
 #[allow(clippy::too_many_arguments)]

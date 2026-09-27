@@ -353,6 +353,16 @@ struct State {
     /// The rows behind the screen, as far back as they have been asked for, and how many
     /// there are in total.
     behind: Behind,
+    /// The outer window's focus as the terminal last reported it; `None` until it says.
+    // ponytail: recorded here for the notification and theme work that reads them.
+    #[allow(dead_code)]
+    outer_focus: Option<bool>,
+    /// The outer terminal's own foreground and background, as it last answered `OSC 10/11`.
+    #[allow(dead_code)]
+    host_colors: [Option<[u8; 3]>; 2],
+    /// Whether the outer terminal last said its scheme is light (`CSI ? 997 ; 2 n`).
+    #[allow(dead_code)]
+    host_light: Option<bool>,
     /// Text being selected with the mouse, or selected and still shown.
     ///
     /// Kept after the button comes up rather than cleared, because a person who has just
@@ -1643,6 +1653,9 @@ where
         forwarded_press: false,
         anchor: None,
         behind: Behind::default(),
+        outer_focus: None,
+        host_colors: [None, None],
+        host_light: None,
     };
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
@@ -1663,7 +1676,13 @@ where
     let mut read = [0u8; 64 * 1024];
 
     let (tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // Weak, so it never keeps the channel open after the reader has gone: it only wakes the
+    // stdin arm when a held escape runs out of time and is owed to the person as a key.
+    let wake_stdin = tx.downgrade();
     client::spawn_stdin_reader(tx);
+    // What the terminal says about itself comes out of the keyboard stream before anything
+    // reads a key from it. See `input`.
+    let mut reports = crate::input::Reports::default();
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1875,6 +1894,10 @@ where
                 })
             };
 
+            // A held `ESC [` or `ESC ]` waiting to see whether it is a report. `None` on a
+            // quiet screen, like the tier boundary, so nothing is armed.
+            let hold_at = reports.deadline().map(tokio::time::Instant::from_std);
+
             tokio::select! {
                 biased;
                 _ = ack_tick.tick() => {
@@ -1915,10 +1938,22 @@ where
                     dirty = true;
                 }
                 typed = stdin_rx.recv() => {
-                    let Some(bytes) = typed else { return Ok(()) };
+                    let Some(raw) = typed else { return Ok(()) };
+                    // Reports first, before any overlay or the key decoder sees the bytes:
+                    // each of those reads an escape as a cancel.
+                    let (bytes, said) = reports.strip(&raw);
+                    for report in said {
+                        note_report(&mut state, report);
+                        dirty = true;
+                    }
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     // The person is doing something: a machine they connected a moment
                     // ago no longer gets to move the screen when it arrives, and a list
-                    // of its sessions no longer gets to open under their next key.
+                    // of its sessions no longer gets to open under their next key. A
+                    // report the terminal sent about itself is not the person, so it is
+                    // stripped above and never reaches this.
                     state.joining = None;
                     state.probing = None;
                     // Ahead of the keystroke itself: a resize behind the input
@@ -3098,6 +3133,19 @@ where
                         )?).await?;
                     }
                 }
+                // A held escape that nothing completed: it was a key. Released into the
+                // filter, and the stdin arm is woken to type it through the ordinary path.
+                _ = async {
+                    match hold_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    reports.expire();
+                    if let Some(wake) = wake_stdin.upgrade() {
+                        let _ = wake.try_send(Vec::new());
+                    }
+                }
                 // Last, so it never goes ahead of input: it only wakes the loop to send
                 // the frame that the renders above held back.
                 _ = tokio::time::sleep_until(presented + FRAME), if dirty => {}
@@ -3140,6 +3188,18 @@ where
     let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
     let _ = out.flush();
     outcome
+}
+
+/// Keep what the terminal said about itself.
+fn note_report(state: &mut State, report: crate::input::Report) {
+    use crate::input::Report;
+    match report {
+        Report::Focus(focused) => state.outer_focus = Some(focused),
+        Report::Color { background, rgb } => {
+            state.host_colors[usize::from(background)] = Some(rgb);
+        }
+        Report::Scheme { light } => state.host_light = Some(light),
+    }
 }
 
 /// Whether a fresh client's first render may adopt its terminal: only what
@@ -4542,6 +4602,9 @@ mod tests {
             forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
+            outer_focus: None,
+            host_colors: [None, None],
+            host_light: None,
             snapshots: std::collections::BTreeMap::new(),
             images: std::collections::BTreeMap::new(),
             graphics: crate::graphics::GraphicsCap::off(),
@@ -4860,6 +4923,9 @@ mod tests {
             forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
+            outer_focus: None,
+            host_colors: [None, None],
+            host_light: None,
         }
     }
 
@@ -4931,6 +4997,9 @@ mod tests {
             forwarded_press: false,
             anchor: None,
             behind: Behind::default(),
+            outer_focus: None,
+            host_colors: [None, None],
+            host_light: None,
         };
         let area = pane_area(&state);
         let mut layout = Layout::single(1);

@@ -180,16 +180,7 @@ pub fn avatar_path() -> PathBuf {
         Ok(path) if !path.is_empty() => return PathBuf::from(path),
         _ => {}
     }
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .ok()
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("qoro").join("avatar.json")
+    crate::paths::config_dir().join("avatar.json")
 }
 
 /// Read and validate, from an explicit path so tests never touch a home.

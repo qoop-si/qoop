@@ -10,8 +10,34 @@
 //! reconsidering would put a stray ctrl-a into whatever the user is running, which in a
 //! shell moves the cursor to the start of the line.
 
-/// The prefix that turns the next byte into a command.
+/// The prefix a decoder starts with when nobody chose another: ctrl-a, as in screen.
 pub(crate) const PREFIX: u8 = 0x01;
+
+/// The prefix this interface was started with, for the words on the screen.
+///
+/// Held apart from the decoder on purpose. The decoder is a value, one per client, and its
+/// tests build as many as they like; the text that names the key ("ctrl-a c starts a
+/// terminal") is spread across every painter and message in the interface, and threading a
+/// byte through all of them to spell one word is a larger change than the word.
+static SHOWN_PREFIX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PREFIX);
+
+/// Say which prefix the screen should name. Set once, where the interface starts.
+pub fn show_prefix(byte: u8) {
+    SHOWN_PREFIX.store(byte, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prefix as a person writes it: `ctrl-a`.
+pub fn prefix_name() -> String {
+    name_of(SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A control byte as a person writes it: `0x02` is `ctrl-b`.
+pub fn name_of(byte: u8) -> String {
+    match byte {
+        0x01..=0x1a => format!("ctrl-{}", (byte + b'a' - 1) as char),
+        other => format!("0x{other:02x}"),
+    }
+}
 
 /// ctrl-q, documented as detach since before there was a prefix key, so it stays a command
 /// on its own rather than becoming `ctrl-a d` only.
@@ -145,8 +171,10 @@ pub enum Action {
 }
 
 /// The decoder. Cheap to hold, and one per attached client.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Keys {
+    /// The byte that turns the next one into a command.
+    prefix: u8,
     /// The last byte of the previous read was the prefix, so the next byte is a command.
     after_prefix: bool,
     /// The start of a mouse report that the read ended in the middle of.
@@ -239,7 +267,27 @@ fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
     Some(action)
 }
 
+impl Default for Keys {
+    fn default() -> Self {
+        Keys::with_prefix(PREFIX)
+    }
+}
+
 impl Keys {
+    /// A decoder whose commands follow `prefix` rather than ctrl-a.
+    pub fn with_prefix(prefix: u8) -> Self {
+        Keys {
+            prefix,
+            after_prefix: false,
+            pending_mouse: Vec::new(),
+        }
+    }
+
+    /// The byte that starts a command.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
     /// Decode one read. May return several actions, and may keep state for the next read.
     ///
     /// Ordinary bytes are coalesced into as few `Input` actions as the commands between
@@ -287,8 +335,8 @@ impl Keys {
                 let command = match byte {
                     // Twice over is how the user types the prefix itself for the program
                     // inside, so it is input rather than a command.
-                    PREFIX => {
-                        pending.push(PREFIX);
+                    byte if byte == self.prefix => {
+                        pending.push(self.prefix);
                         continue;
                     }
                     b'n' => Action::Next,
@@ -332,7 +380,7 @@ impl Keys {
             }
 
             match byte {
-                PREFIX => self.after_prefix = true,
+                byte if byte == self.prefix => self.after_prefix = true,
                 DETACH => {
                     flush(&mut pending, &mut actions);
                     actions.push(Action::Detach);
@@ -360,6 +408,26 @@ mod tests {
 
     fn input(bytes: &[u8]) -> Action {
         Action::Input(bytes.to_vec())
+    }
+
+    #[test]
+    fn another_prefix_takes_over_every_command_and_ctrl_a_becomes_typing() {
+        let mut keys = Keys::with_prefix(0x02);
+        assert_eq!(keys.feed(b"\x02c"), vec![Action::Create]);
+        assert_eq!(keys.feed(b"\x02\x02"), vec![input(b"\x02")]);
+        assert_eq!(
+            keys.feed(b"\x01c"),
+            vec![input(b"\x01c")],
+            "ctrl-a is the program's own key now"
+        );
+    }
+
+    #[test]
+    fn a_prefix_is_named_the_way_a_person_writes_it() {
+        assert_eq!(name_of(0x01), "ctrl-a");
+        assert_eq!(name_of(0x02), "ctrl-b");
+        assert_eq!(name_of(0x1a), "ctrl-z");
+        assert_eq!(prefix_name(), "ctrl-a", "nobody chose another here");
     }
 
     #[test]

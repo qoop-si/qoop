@@ -79,6 +79,28 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
     Ok(dir)
 }
 
+/// The person's own qoro configuration directory: `$XDG_CONFIG_HOME/qoro`, else
+/// `~/.config/qoro`.
+///
+/// One resolver, because the hooks, the agent-detection overrides, the avatar and the
+/// interface's own settings all live here, and three copies of this lookup had already
+/// been written by the time a fourth was needed. Not verified like the runtime directory:
+/// this is the person's own configuration, with the same trust as their shell rc, and a
+/// missing directory simply means nothing has been configured.
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+                .ok()
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("qoro")
+}
+
 pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("qorod.sock")
 }

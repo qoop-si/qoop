@@ -1,0 +1,384 @@
+//! What the terminal says about itself, taken out of what the person typed.
+//!
+//! A terminal that has been asked to report focus, its colours or its light and dark
+//! scheme answers on the same stream the keyboard arrives on. Those answers are not
+//! keystrokes, and every place that reads keystrokes treats an escape as a cancel: the
+//! naming box, the menu, the focus list and the palette all read `ESC` as "close", and the
+//! read only view closes on any byte at all. So a window switch would close whatever the
+//! person had open and type the rest of the report into the program in the pane.
+//!
+//! This is the one place that sees every read first. It takes the reports out, hands them
+//! over as what they are, and leaves everything else exactly as it arrived.
+//!
+//! A read can end inside a report. The start of one is held for the next read the way a
+//! mouse report is, but only once it is unambiguous: a lone `ESC` at the end of a read is
+//! the Esc key, which has to close an overlay at once, so it is never held. `ESC [` and
+//! `ESC ]` are held, and given back as typed input if nothing follows within
+//! [`HOLD`], because Alt with `[` or `]` sends exactly those two bytes and the person is
+//! still owed their key. What remains is a report split right after its escape byte, which
+//! terminals do not do in practice: they write a report in one go.
+
+use std::time::{Duration, Instant};
+
+/// How long a held `ESC [` or `ESC ]` waits for the rest of a report before it is typed.
+///
+/// The same idea as tmux's `escape-time`, at the small end of what that is set to: long
+/// enough for the rest of a report written in one go and split by the read, short enough
+/// that an Alt key is not felt to lag.
+pub const HOLD: Duration = Duration::from_millis(10);
+
+/// The longest report this reads. A colour answer is about thirty bytes; anything much
+/// longer that has not ended is not one of these and is handed on as typed.
+const MAX_REPORT: usize = 96;
+
+/// Something the terminal said about itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// The window the interface runs in gained (`true`) or lost the focus (`CSI I`, `CSI O`).
+    Focus(bool),
+    /// An answer to `OSC 10 ?` (foreground) or `OSC 11 ?` (background), as 8 bit channels.
+    Color { background: bool, rgb: [u8; 3] },
+    /// The terminal's scheme changed or was asked for (`CSI ? 997 ; 1 n` dark, `; 2 n` light).
+    Scheme { light: bool },
+}
+
+/// The filter. One per client, like the key decoder.
+#[derive(Debug, Default)]
+pub struct Reports {
+    /// The start of a report the last read ended inside.
+    held: Vec<u8>,
+    /// When the held bytes were held, so they can be given back if nothing follows.
+    since: Option<Instant>,
+    /// Held bytes whose wait ran out: a key after all, typed on the next strip as they are,
+    /// never looked at again (looked at again, `ESC [` would only be held again).
+    released: Vec<u8>,
+}
+
+/// What one sequence at the front of a buffer is.
+enum Found {
+    /// A whole report, and how many bytes it took.
+    Report(usize, Option<Report>),
+    /// Could still become a report: wait for more.
+    Partial,
+    /// Not a report.
+    No,
+}
+
+impl Reports {
+    /// Take the reports out of one read. The rest comes back in its original order.
+    pub fn strip(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<Report>) {
+        let mut input = std::mem::take(&mut self.held);
+        self.since = None;
+        input.extend_from_slice(bytes);
+
+        let mut out = std::mem::take(&mut self.released);
+        out.reserve(input.len());
+        let mut reports = Vec::new();
+        let mut at = 0;
+        while at < input.len() {
+            if input[at] != 0x1b {
+                out.push(input[at]);
+                at += 1;
+                continue;
+            }
+            match classify(&input[at..]) {
+                Found::Report(used, report) => {
+                    reports.extend(report);
+                    at += used;
+                }
+                Found::Partial => {
+                    self.held = input[at..].to_vec();
+                    self.since = Some(Instant::now());
+                    break;
+                }
+                Found::No => {
+                    out.push(input[at]);
+                    at += 1;
+                }
+            }
+        }
+        (out, reports)
+    }
+
+    /// When the held bytes should be given back as typed, if anything is held.
+    ///
+    /// `None` while nothing is held, so the loop arms no timer at all on a quiet screen.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.since.map(|since| since + HOLD)
+    }
+
+    /// The wait ran out: the held bytes were a key after all, and the next [`strip`]
+    /// hands them over as typed, ahead of whatever that read brings.
+    ///
+    /// [`strip`]: Reports::strip
+    pub fn expire(&mut self) {
+        self.since = None;
+        let held = std::mem::take(&mut self.held);
+        self.released.extend(held);
+    }
+}
+
+/// What the escape at the front of `bytes` starts.
+fn classify(bytes: &[u8]) -> Found {
+    debug_assert_eq!(bytes.first(), Some(&0x1b));
+    // A lone escape is the Esc key. Never held: an overlay has to close on it now.
+    let Some(&kind) = bytes.get(1) else {
+        return Found::No;
+    };
+    match kind {
+        b'[' => csi(bytes),
+        b']' => osc(bytes),
+        _ => Found::No,
+    }
+}
+
+/// `CSI I`, `CSI O` and `CSI ? 997 ; n n`.
+fn csi(bytes: &[u8]) -> Found {
+    const SCHEME: &[u8] = b"\x1b[?997;";
+    match bytes.get(2) {
+        None => return Found::Partial,
+        Some(b'I') => return Found::Report(3, Some(Report::Focus(true))),
+        Some(b'O') => return Found::Report(3, Some(Report::Focus(false))),
+        Some(b'?') => {}
+        Some(_) => return Found::No,
+    }
+    let shared = bytes.len().min(SCHEME.len());
+    if bytes[..shared] != SCHEME[..shared] {
+        return Found::No;
+    }
+    if bytes.len() < SCHEME.len() + 2 {
+        return Found::Partial;
+    }
+    let light = match bytes[SCHEME.len()] {
+        b'1' => false,
+        b'2' => true,
+        _ => return Found::No,
+    };
+    if bytes[SCHEME.len() + 1] != b'n' {
+        return Found::No;
+    }
+    Found::Report(SCHEME.len() + 2, Some(Report::Scheme { light }))
+}
+
+/// `OSC 10 ; rgb:... ST` and `OSC 11 ; rgb:... ST`, ended by `BEL` or `ESC \`.
+fn osc(bytes: &[u8]) -> Found {
+    let body = &bytes[2..];
+    let background = if body.starts_with(b"11;") {
+        true
+    } else if body.starts_with(b"10;") {
+        false
+    } else if b"10;".starts_with(body) || b"11;".starts_with(body) {
+        return Found::Partial;
+    } else {
+        return Found::No;
+    };
+    let payload = &body[3..];
+    // Whichever terminator comes first ends it.
+    let end = payload
+        .iter()
+        .enumerate()
+        .find_map(|(at, byte)| match byte {
+            0x07 => Some((at, 1)),
+            0x1b if payload.get(at + 1) == Some(&b'\\') => Some((at, 2)),
+            _ => None,
+        });
+    let Some((at, terminator)) = end else {
+        return if bytes.len() < MAX_REPORT {
+            Found::Partial
+        } else {
+            Found::No
+        };
+    };
+    let used = 2 + 3 + at + terminator;
+    // An answer this cannot read is still an answer and never a keystroke: it is taken out
+    // and dropped rather than typed into the pane.
+    let report = parse_rgb(&payload[..at]).map(|rgb| Report::Color { background, rgb });
+    Found::Report(used, report)
+}
+
+/// `rgb:R/G/B` with one to four hex digits a channel, scaled to eight bits.
+fn parse_rgb(text: &[u8]) -> Option<[u8; 3]> {
+    let text = std::str::from_utf8(text).ok()?;
+    let rest = text.strip_prefix("rgb:")?;
+    let mut channels = rest.split('/');
+    let mut rgb = [0u8; 3];
+    for slot in &mut rgb {
+        let digits = channels.next()?;
+        if digits.is_empty() || digits.len() > 4 {
+            return None;
+        }
+        let value = u32::from_str_radix(digits, 16).ok()?;
+        let max = (1u32 << (4 * digits.len() as u32)) - 1;
+        *slot = ((value * 255 + max / 2) / max) as u8;
+    }
+    channels.next().is_none().then_some(rgb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strip(bytes: &[u8]) -> (Vec<u8>, Vec<Report>) {
+        Reports::default().strip(bytes)
+    }
+
+    #[test]
+    fn ordinary_typing_passes_through_untouched() {
+        let (out, reports) = strip(b"hello \x1b[A\x1b[<0;3;4M\x01d");
+        assert_eq!(out, b"hello \x1b[A\x1b[<0;3;4M\x01d");
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn focus_reports_are_taken_out_wherever_they_land() {
+        let (out, reports) = strip(b"ab\x1b[Ocd\x1b[I");
+        assert_eq!(out, b"abcd");
+        assert_eq!(reports, vec![Report::Focus(false), Report::Focus(true)]);
+    }
+
+    #[test]
+    fn a_lone_escape_is_the_esc_key_and_is_never_held() {
+        let mut filter = Reports::default();
+        let (out, reports) = filter.strip(b"\x1b");
+        assert_eq!(out, b"\x1b", "the Esc key has to close an overlay now");
+        assert!(reports.is_empty());
+        assert_eq!(filter.deadline(), None);
+    }
+
+    #[test]
+    fn a_background_answer_in_either_terminator_is_read_as_a_colour() {
+        let (out, reports) = strip(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+        assert!(out.is_empty());
+        assert_eq!(
+            reports,
+            vec![Report::Color {
+                background: true,
+                rgb: [255, 255, 255]
+            }]
+        );
+        let (out, reports) = strip(b"x\x1b]10;rgb:0/8/f\x07y");
+        assert_eq!(out, b"xy");
+        assert_eq!(
+            reports,
+            vec![Report::Color {
+                background: false,
+                rgb: [0, 136, 255]
+            }]
+        );
+    }
+
+    #[test]
+    fn channels_of_one_to_four_digits_scale_to_eight_bits() {
+        assert_eq!(parse_rgb(b"rgb:f/f/f"), Some([255, 255, 255]));
+        assert_eq!(parse_rgb(b"rgb:80/80/80"), Some([128, 128, 128]));
+        assert_eq!(parse_rgb(b"rgb:c0c0/c0c0/c0c0"), Some([192, 192, 192]));
+        assert_eq!(parse_rgb(b"rgb:123/abc/000"), Some([18, 171, 0]));
+        assert_eq!(parse_rgb(b"rgb:12345/0/0"), None);
+        assert_eq!(parse_rgb(b"rgb:1/2"), None);
+        assert_eq!(parse_rgb(b"rgb:1/2/3/4"), None);
+        assert_eq!(parse_rgb(b"cmyk:1/2/3"), None);
+    }
+
+    #[test]
+    fn an_unreadable_colour_answer_is_dropped_rather_than_typed() {
+        let (out, reports) = strip(b"\x1b]11;rgba:1/2/3/4\x07");
+        assert!(out.is_empty(), "{out:?}");
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_scheme_report_says_dark_or_light() {
+        let (out, reports) = strip(b"\x1b[?997;2n\x1b[?997;1n");
+        assert!(out.is_empty());
+        assert_eq!(
+            reports,
+            vec![
+                Report::Scheme { light: true },
+                Report::Scheme { light: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn other_private_sequences_are_not_mistaken_for_a_scheme() {
+        let (out, reports) = strip(b"\x1b[?1049h\x1b[?997;3n");
+        assert_eq!(out, b"\x1b[?1049h\x1b[?997;3n");
+        assert!(reports.is_empty());
+    }
+
+    /// Every report, cut at every byte after its escape, arrives whole and leaves nothing
+    /// typed. The cut right after the escape byte is the one documented exception.
+    #[test]
+    fn a_report_split_anywhere_after_its_escape_still_arrives_whole() {
+        let cases: [(&[u8], Report); 5] = [
+            (b"\x1b[I", Report::Focus(true)),
+            (b"\x1b[O", Report::Focus(false)),
+            (b"\x1b[?997;2n", Report::Scheme { light: true }),
+            (
+                b"\x1b]11;rgb:0000/0000/0000\x1b\\",
+                Report::Color {
+                    background: true,
+                    rgb: [0, 0, 0],
+                },
+            ),
+            (
+                b"\x1b]10;rgb:ff/ff/ff\x07",
+                Report::Color {
+                    background: false,
+                    rgb: [255, 255, 255],
+                },
+            ),
+        ];
+        for (whole, expected) in cases {
+            for cut in 2..whole.len() {
+                let mut filter = Reports::default();
+                let (first, early) = filter.strip(&whole[..cut]);
+                assert!(first.is_empty(), "cut {cut} of {whole:?} typed {first:?}");
+                assert!(early.is_empty());
+                assert!(filter.deadline().is_some(), "cut {cut} held nothing");
+                let (second, reports) = filter.strip(&whole[cut..]);
+                assert!(second.is_empty(), "cut {cut} of {whole:?} typed {second:?}");
+                assert_eq!(reports, vec![expected], "cut {cut} of {whole:?}");
+                assert_eq!(filter.deadline(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_alt_bracket_is_given_back_as_typed_when_nothing_follows() {
+        let mut filter = Reports::default();
+        let (out, _) = filter.strip(b"x\x1b[");
+        assert_eq!(out, b"x");
+        assert!(filter.deadline().is_some());
+        filter.expire();
+        assert_eq!(filter.deadline(), None);
+        // Typed as they are, even though they still look like the start of a report.
+        let (out, _) = filter.strip(b"");
+        assert_eq!(out, b"\x1b[");
+        let (out, _) = filter.strip(b"\x1b]");
+        assert!(out.is_empty());
+        filter.expire();
+        let (out, _) = filter.strip(b"k");
+        assert_eq!(out, b"\x1b]k", "released first, then what the read brought");
+    }
+
+    #[test]
+    fn a_held_prefix_that_turns_out_to_be_a_key_is_typed_in_order() {
+        let mut filter = Reports::default();
+        let (out, _) = filter.strip(b"\x1b[");
+        assert!(out.is_empty());
+        // The arrow key that was split: typed whole, nothing lost, nothing reordered.
+        let (out, reports) = filter.strip(b"Ab");
+        assert_eq!(out, b"\x1b[Ab");
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn an_endless_osc_is_not_held_forever() {
+        let mut long = b"\x1b]11;rgb:".to_vec();
+        long.extend(std::iter::repeat_n(b'0', MAX_REPORT));
+        let (out, reports) = strip(&long);
+        assert_eq!(out, long, "a runaway sequence is typed, not swallowed");
+        assert!(reports.is_empty());
+    }
+}
