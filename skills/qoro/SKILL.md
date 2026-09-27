@@ -1,6 +1,6 @@
 ---
 name: qoro
-description: "Work with the coding agents running in qoro terminals: see who is there, understand one before writing to it, send it text, read its screen and transcript. Use when the user mentions qoro, tabs, terminals, or another agent's session."
+description: "Work with the coding agents running in qoro terminals: see who is there, understand one before writing to it, send it text, wait for it to finish, read its screen and transcript, and start new agents in terminals or git worktrees. Use when the user mentions qoro, tabs, terminals, worktrees, or another agent's session."
 license: AGPL-3.0-or-later
 metadata:
   author: us
@@ -42,11 +42,18 @@ recent transcript window. Defaults: last 20 messages, full trimmed screen.
 
 ```bash
 qoro prompt <target> <text>   # text plus Enter; refused when blocked or trust_required
+qoro prompt <target> --wait [--timeout SECS] <text>  # the same, then wait for that turn
 qoro send <terminal> <text> [--enter]  # raw typing; enforces nothing, check context first
 ```
 
 Only `prompt` refuses. `send` checks that the terminal exists and nothing
-else. Empty text is refused by both.
+else. Empty text is refused by both. `prompt` flags go right after the
+target; `prompt X "text" --wait` is refused rather than typed.
+
+`prompt --wait` waits for the turn the prompt caused, with `wait`'s exit
+codes. An agent that was busy when the prompt arrived must stay stopped for
+2 s before it returns, because it may have folded the prompt into its
+running turn or queued it for the next one.
 
 ```bash
 qoro send <terminal> --key esc              # interrupt an agent
@@ -76,6 +83,7 @@ hook never reported its conversation: run `qoro hooks install`.
 
 ```bash
 qoro wait [target...] [--until idle,blocked] [--timeout 600] [--json]
+qoro wait <target> --match "TEXT" [--until STATE] [--timeout 600]
 ```
 
 Returns as soon as a target is in one of the states (already there counts),
@@ -84,19 +92,35 @@ target means every agent terminal except your own. Exit 124 is a timeout,
 exit 1 means a target closed. Wait on the terminals you know are busy, not
 on ones already idle. It reads the state when something changes, so a state
 that comes and goes in a blink can be missed; the ones that wait on you
-(`idle`, `blocked`) last until someone answers.
+(`idle`, `blocked`) last until someone answers. Right after writing to an
+agent, use `prompt --wait` instead: a bare `wait` on an agent that has not
+started yet returns at once. `--match` waits for text on the live screen
+only, not the scrollback; with `--until` both must hold.
 
 ## Start and end terminals
 
 ```bash
 t=$(qoro new --name worker --cwd ~/repo -- claude)   # prints the number
+qoro new --space review -- claude                      # a space by id or name
 qoro close <terminal>                                  # never your own
+qoro worktree new <branch> [--base REF] [-- claude]    # a worktree and a terminal in it
+qoro worktree ls [--json]
+qoro worktree rm <branch|path> [--force]
 ```
+
+`new` never starts a session, and a new `--space` name is made once.
+`worktree new` adds `<repo>-wt-<slug>` beside the repository (the slug is
+the branch lowercased, other characters as dashes) and opens a terminal
+there named after the branch; a branch only on a remote is checked out
+tracking it. `worktree rm` refuses while any process is inside it, even
+with `--force`, which only overrides a dirty tree; run it from outside the
+worktree. The branch is kept.
 
 ## Supervising other agents
 
 1. `qoro agents --json`: note each worker's `terminal` and `generation`.
-2. `qoro wait <busy terminals> --timeout 600`: sleep until one needs you.
+2. `qoro wait <busy terminals> --timeout 600`: sleep until one needs you
+   (right after a prompt, `prompt --wait` covers this step).
 3. `qoro context <n>`: read what it did or what it asks.
 4. Answer: blocked on a menu -> `send <n> --key ... --generation G`;
    finished -> `prompt <n> "next task" --generation G`.
