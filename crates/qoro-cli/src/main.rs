@@ -36,14 +36,23 @@ fn shell() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/bin/sh"))
 }
 
-fn main() -> std::io::Result<()> {
+fn main() {
+    // One sentence and a failing exit, never the `Error: Custom { kind: .. }` dump that
+    // returning the error from `main` prints: every refusal below is worded for a person.
+    if let Err(e) = run() {
+        eprintln!("qoro: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> std::io::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     // Asked before the session is taken out of the arguments: a remote opened with no
     // `--session` opens that machine's default session, not whichever one was last opened
     // here.
     let session_given = args
         .iter()
-        .any(|a| a == "--session" || a == "-s" || a.starts_with("--session="))
+        .any(|a| a == "--session" || a.starts_with("--session="))
         || std::env::var(paths::SESSION_ENV).is_ok_and(|s| !s.is_empty());
     // Taken out of the arguments before anything reads them, and put into the environment,
     // because the session decides which directory every path in this process resolves
@@ -162,7 +171,11 @@ fn main() -> std::io::Result<()> {
             Command::new("stty").arg("sane").status().ok();
             Ok(())
         }
-        _ => run_client(),
+        None => run_client(),
+        // A typo is named, not answered with a daemon and the full-screen interface.
+        Some(other) => Err(std::io::Error::other(format!(
+            "unknown command {other}; usage: qoro [command] [--session <name>], see qoro --help"
+        ))),
     }
 }
 
@@ -461,7 +474,18 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
             let setup = read_setup(path)?;
             // Shown before it is trusted, in full. The value of the prompt is that it is
             // rare enough to read, so there is no way to trust something without seeing it.
-            print!("{}", setup.confirmation_text());
+            // And the question is really asked: only a typed yes trusts it, and anything
+            // else, an empty line or no input at all, leaves the ledger untouched.
+            print!("{}\nRun this? [y/N] ", setup.confirmation_text());
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                return Err(std::io::Error::other(format!(
+                    "not confirmed: {} stays untrusted",
+                    setup.name
+                )));
+            }
             let mut ledger = ConfirmationLedger::open(&ledger_path);
             ledger
                 .confirm(&setup.content_hash())
@@ -480,7 +504,15 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
                     println!("confirmed");
                     Ok(())
                 }
-                Err(refusal) => Err(std::io::Error::other(format!("{refusal:?}"))),
+                // Said as a sentence, like every other refusal, not as the type's dump.
+                Err(qoro_setup::ledger::Refusal::NeedsConfirmation { prompt }) => Err(
+                    std::io::Error::other(format!("not confirmed yet:\n{prompt}")),
+                ),
+                Err(qoro_setup::ledger::Refusal::NeedsConfirmationNoClient { name }) => {
+                    Err(std::io::Error::other(format!(
+                        "{name} is not confirmed, and nobody is here to ask"
+                    )))
+                }
             }
         }
         _ => {
@@ -687,16 +719,19 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-        let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-hook").await?;
-        let (mut rd, mut wr) = stream.into_split();
-        let mut seq = 0u32;
-        wr.write_all(&client::encode_control_seq(&request, &mut seq)?)
-            .await?;
-        let mut connection = client::Connection::new();
-        let mut read = [0u8; 64 * 1024];
+        // One bound over the whole exchange, connect and handshake included, not only
+        // the answer: a daemon that accepts and never greets would otherwise hold the
+        // agent's turn until the agent's own hook timeout, minutes for most of them.
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+            let socket = paths::socket_path(&dir);
+            let (stream, mut inbuf) = client::connect(&socket, "qoro-hook").await?;
+            let (mut rd, mut wr) = stream.into_split();
+            let mut seq = 0u32;
+            wr.write_all(&client::encode_control_seq(&request, &mut seq)?)
+                .await?;
+            let mut connection = client::Connection::new();
+            let mut read = [0u8; 64 * 1024];
             loop {
                 let n = rd.read(&mut read).await?;
                 if n == 0 {
@@ -2028,9 +2063,12 @@ fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
     let mut asked = None;
     let mut at = 1;
     while at < args.len() {
-        let taken = if args[at] == "--session" || args[at] == "-s" {
+        // No short `-s`: the flag is taken from anywhere in argv, text words of `send`
+        // and `prompt` included, and `du -s` or `ls -s` there is text, not a session.
+        let taken = if args[at] == "--session" {
             // The value that follows, if there is one. A trailing `--session` with nothing
-            // after it is a mistake worth naming rather than a request for the default.
+            // after it is a mistake worth naming rather than a request for the default:
+            // `session_name` refuses the empty value.
             let value = args.get(at + 1).cloned().unwrap_or_default();
             args.drain(at..(at + 2).min(args.len()));
             Some(value)

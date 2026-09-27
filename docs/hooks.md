@@ -61,6 +61,13 @@ Notes:
   lifecycle; the mapping mirrors the session-status table (`idle` to idle,
   `active`/`busy`/`pending`/`retry`/`running`/`streaming`/`working` to
   working, `permission.asked` to blocked).
+- claude's `Notification` is blocked only for the kinds that wait on the
+  person: `permission_prompt`, `elicitation_dialog`,
+  `elicitation_url_dialog`, `agent_needs_input` and `quota_auto_resume_stale`
+  (a resume that waits for Enter), plus a payload with no `notification_type`
+  (an older build). Every other kind, `idle_prompt` a minute after the agent
+  finished included, reports nothing; `Stop` already said idle. An installed
+  hook picks this up on the next `qoro hooks install`.
 - focus events (claude + opencode only): both scripts add `--event
   user|tool|blocked|done` with a one-line `--label` beside the unchanged
   state word. The daemon keeps the last 50 per terminal in memory for the
@@ -79,7 +86,9 @@ Notes:
 2. The agent's hook mechanism calls the script in `hooks/<agent>/` on lifecycle
    events. The script maps the event to a state and calls
    `qoro hook-report --state <state> [--event <kind>] [--label ...]`, which posts one `ReportAgentState`
-   control request and waits up to five seconds for the answer. Each script
+   control request and gives the whole exchange five seconds: connecting, the
+   handshake and the answer, so a daemon that is stuck costs a hook five
+   seconds and never the agent's turn. Each script
    also passes the agent's own id for the conversation as
    `--session-id`, read out of that agent's hook payload on stdin (claude's
    `session_id`, codex's `session_id`, gemini's `session_id` or

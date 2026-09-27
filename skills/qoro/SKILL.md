@@ -8,7 +8,7 @@ metadata:
 allowed-tools: Bash(qoro:*) Read
 ---
 
-# qoro — agents in terminals
+# qoro: agents in terminals
 
 qoro holds shells and coding agents in terminals (tabs). Rule one:
 **understand before writing.** Look first (`agents`, `context`),

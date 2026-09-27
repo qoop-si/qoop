@@ -32,67 +32,71 @@ for tool in curl python3 shasum tar; do
     }
 done
 
-AUTH_HEADER=""
-if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-    TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-    AUTH_HEADER="Authorization: Bearer $TOKEN"
+# The repository is private, so without a token nothing is found at all. The
+# environment first, then the token `gh` logged in with.
+TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -z "$TOKEN" ] && command -v gh >/dev/null 2>&1; then
+    TOKEN="$(gh auth token 2>/dev/null || true)"
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK" "$DEST.qoro-new"' EXIT INT TERM
 
+# GET an api.github.com URL into a file: accept type, max seconds, file, URL.
+# The token goes to curl on stdin (`-H @-`, printf is a shell builtin), never in
+# an argv any process listing shows. `-L` follows an asset's redirect to the
+# storage host and curl drops the header there, so the token stays with the API.
+api_get() {
+    if [ -n "$TOKEN" ]; then
+        printf 'Authorization: Bearer %s\n' "$TOKEN" |
+            curl -fsSL --max-time "$2" -H "Accept: $1" -H @- -o "$3" "$4"
+    else
+        curl -fsSL --max-time "$2" -H "Accept: $1" -o "$3" "$4"
+    fi
+}
+
 release_json="$WORK/release.json"
-if [ -n "$AUTH_HEADER" ]; then
-    curl -fsSL --max-time 25 -H "$AUTH_HEADER" -o "$release_json" \
-        "https://api.github.com/repos/$REPO/releases/latest" || {
-        echo "qoro install: cannot reach GitHub Releases" >&2
-        exit 1
-    }
-else
-    curl -fsSL --max-time 25 -o "$release_json" \
-        "https://api.github.com/repos/$REPO/releases/latest" || {
-        echo "qoro install: cannot reach GitHub Releases" >&2
-        exit 1
-    }
-fi
+api_get application/vnd.github+json 25 "$release_json" \
+    "https://api.github.com/repos/$REPO/releases/latest" || {
+    echo "qoro install: cannot reach GitHub Releases" >&2
+    exit 1
+}
 
 version="$(python3 -c "
 import json
 tag = json.load(open('$release_json'))['tag_name']
 print(tag[1:] if tag.startswith('v') else tag)
 ")"
-asset_url="$(python3 -c "
-import json,sys
+# The API `url` of an asset, found by name. Not `browser_download_url`, which
+# 404s for a private repository even with a token.
+asset_url_of() {
+    python3 -c "
+import json
 for a in json.load(open('$release_json'))['assets']:
-    if a['name'] == '$ASSET':
-        print(a['browser_download_url'])
+    if a['name'] == '$1':
+        print(a['url'])
         break
-")"
-checksum_url="${asset_url}.sha256"
+"
+}
+asset_url="$(asset_url_of "$ASSET")"
+checksum_url="$(asset_url_of "$ASSET.sha256")"
 [ -n "$asset_url" ] || {
     echo "qoro install: the newest release carries no $ASSET" >&2
     exit 1
 }
+[ -n "$checksum_url" ] || {
+    echo "qoro install: the newest release carries no $ASSET.sha256" >&2
+    exit 1
+}
 
-if [ -n "$AUTH_HEADER" ]; then
-    curl -fsSL --max-time 120 -H "$AUTH_HEADER" -o "$WORK/$ASSET" "$asset_url" || {
-        echo "qoro install: cannot download $ASSET" >&2
-        exit 1
-    }
-    curl -fsSL --max-time 120 -H "$AUTH_HEADER" -o "$WORK/$ASSET.sha256" "$checksum_url" || {
-        echo "qoro install: cannot download $ASSET.sha256" >&2
-        exit 1
-    }
-else
-    curl -fsSL --max-time 120 -o "$WORK/$ASSET" "$asset_url" || {
-        echo "qoro install: cannot download $ASSET" >&2
-        exit 1
-    }
-    curl -fsSL --max-time 120 -o "$WORK/$ASSET.sha256" "$checksum_url" || {
-        echo "qoro install: cannot download $ASSET.sha256" >&2
-        exit 1
-    }
-fi
+api_get application/octet-stream 120 "$WORK/$ASSET" "$asset_url" || {
+    echo "qoro install: cannot download $ASSET" >&2
+    exit 1
+}
+api_get application/octet-stream 120 "$WORK/$ASSET.sha256" "$checksum_url" || {
+    echo "qoro install: cannot download $ASSET.sha256" >&2
+    exit 1
+}
 
 (cd "$WORK" && shasum -a 256 -c "$ASSET.sha256") || {
     echo "qoro install: checksum mismatch" >&2

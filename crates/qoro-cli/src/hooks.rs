@@ -387,12 +387,26 @@ fn read(config: &Path) -> std::io::Result<serde_json::Value> {
 }
 
 /// Write a configuration back, keeping a copy of what was there.
+///
+/// Written beside it and renamed over it, never truncated in place: an agent that
+/// re-reads its settings while they change, or a kill between truncate and write, would
+/// otherwise see an empty or half-written file. A linked config (a dotfile manager's)
+/// is written through to its target so the link survives, and the file keeps its mode,
+/// so a 0600 settings file holding a key stays 0600.
 fn write(config: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = config.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Where the bytes go: through a link, even one whose target is not there yet, so the
+    // link survives; a config that does not exist yet is itself.
+    let target =
+        std::fs::canonicalize(config).unwrap_or_else(|_| match std::fs::read_link(config) {
+            Ok(to) => config.parent().map_or(to.clone(), |dir| dir.join(&to)),
+            Err(_) => config.to_path_buf(),
+        });
     // A copy before every write, not only the first: the second write is the one that
-    // happens after a person has spent an afternoon on the file.
+    // happens after a person has spent an afternoon on the file. Beside the path the
+    // person knows, not beside a link's target, which may sit in a dotfiles repository.
     if config.exists() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -401,7 +415,32 @@ fn write(config: &Path, value: &serde_json::Value) -> std::io::Result<()> {
         let backup = config.with_extension(format!("qoro-backup-{stamp}"));
         std::fs::copy(config, &backup)?;
     }
-    std::fs::write(config, serde_json::to_string_pretty(value)? + "\n")
+    // Created with the original's mode rather than chmod'ed afterwards, so the key in
+    // a private file is never readable by others for the moment in between.
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let original = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let staged = target.with_extension("qoro-new");
+    let _ = std::fs::remove_file(&staged);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(original.as_ref().map_or(0o666, |p| p.mode() & 0o7777))
+        .open(&staged)
+        .and_then(|mut file| {
+            file.write_all((serde_json::to_string_pretty(value)? + "\n").as_bytes())?;
+            file.sync_all()
+        })
+        // The umask may have narrowed it; the original's exact mode is what it keeps.
+        .and_then(|()| match &original {
+            Some(mode) => std::fs::set_permissions(&staged, mode.clone()),
+            None => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&staged, &target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
 }
 
 /// Add this hook to a configuration. Answers whether anything changed.
@@ -751,6 +790,100 @@ mod tests {
             "the target is the plugin directory: {}",
             opencode.config
         );
+    }
+
+    /// A config kept by a dotfile manager is a link, and a settings file holding a key
+    /// is 0600: the edit goes through the link and keeps the mode.
+    #[test]
+    fn a_linked_private_config_stays_a_link_and_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let real = dir.path().join("dotfiles-settings.json");
+        std::fs::write(&real, serde_json::to_string(&existing()).expect("json")).expect("write");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let config = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &config).expect("link");
+        let script = dir.path().join("qoro-hook.sh");
+
+        assert!(edit(&config, &target("claude"), &script).expect("install"));
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a plain file"
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("read")
+                .contains("qoro-hook.sh"),
+            "the file behind the link was not edited"
+        );
+        let mode = std::fs::metadata(&real).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a private config was left readable: {mode:o}");
+    }
+
+    /// Claude's `Notification` covers much more than a question: `idle_prompt` fires a
+    /// minute after an agent finished. Only the kinds that wait on the person are
+    /// blocked; a payload with no kind at all is an older build and stays blocked.
+    #[test]
+    fn the_claude_hook_reports_blocked_only_for_notifications_that_wait_on_the_person() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("qoro-hook.sh");
+        std::fs::write(&script, target("claude").body).expect("write");
+        // A stand-in `qoro` that writes down what it was asked to report.
+        let log = dir.path().join("reports");
+        let fake = dir.path().join("qoro");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let report = |payload: &str| -> String {
+            let _ = std::fs::remove_file(&log);
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QORO_TERMINAL", "1")
+                .env("QORO_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        for kind in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
+            "quota_auto_resume_stale",
+        ] {
+            let said = report(&format!(
+                r#"{{"hook_event_name":"Notification","notification_type":"{kind}"}}"#
+            ));
+            assert!(said.contains("--state blocked"), "{kind} reported {said:?}");
+        }
+        let said = report(r#"{"hook_event_name":"Notification"}"#);
+        assert!(
+            said.contains("--state blocked"),
+            "no kind reported {said:?}"
+        );
+        for kind in ["idle_prompt", "auth_success", "agent_completed"] {
+            let said = report(&format!(
+                r#"{{"hook_event_name":"Notification","notification_type":"{kind}"}}"#
+            ));
+            assert!(said.is_empty(), "{kind} reported {said:?}");
+        }
     }
 
     /// A configuration that is not JSON is reported, not overwritten.

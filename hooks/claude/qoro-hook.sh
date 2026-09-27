@@ -44,7 +44,11 @@
 #   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
 #     the first file-ish `tool_input` field, best-effort)
 #   PermissionRequest -> blocked + `--event blocked` (tool label, best-effort)
-#   Notification -> blocked + `--event blocked`, no label (it carries no tool)
+#   Notification (`permission_prompt`, `elicitation_dialog`,
+#     `elicitation_url_dialog`, `agent_needs_input`, `quota_auto_resume_stale`,
+#     or no `notification_type` from an older build)
+#     -> blocked + `--event blocked`, no label (it carries no tool); every other
+#     notification type reports nothing
 #   Stop, SessionEnd -> idle + `--event done`, no label
 
 set -eu
@@ -107,6 +111,16 @@ elif name == "PermissionRequest":
     head = f"{tool} {arg}".strip()
     label = one_line(head or tool)
 elif name == "Notification":
+    # Only the kinds that wait on the person: a question, a setup question for a
+    # teammate, or a resume that waits for Enter. `idle_prompt` fires a minute after
+    # the agent finished, and `auth_success`, `agent_completed` and the rest ask
+    # nothing; `Stop` already said idle. No kind at all is an older build, where
+    # every notification was a question.
+    kind = payload.get("notification_type")
+    if kind not in (None, "", "permission_prompt", "elicitation_dialog",
+                    "elicitation_url_dialog", "agent_needs_input",
+                    "quota_auto_resume_stale"):
+        raise SystemExit(0)
     state, flags, event, label = "blocked", "--visible-blocker", "blocked", ""
 elif name in ("Stop", "SessionEnd"):
     state, flags, event, label = "idle", "--visible-idle", "done", ""

@@ -23,6 +23,17 @@ const ASSET: &str = "qoro-aarch64-apple-darwin.tar.gz";
 /// `qoro update` checks GitHub Releases and installs the newest binary;
 /// `qoro update --check` only leaves what it saw in the notice file the interface reads.
 pub fn run(args: &[String]) -> std::io::Result<()> {
+    // Anything else is refused before the network: a mistyped `--check` read as no
+    // flag at all would install instead of looking.
+    if let Some(other) = args
+        .iter()
+        .skip(2)
+        .find(|a| !matches!(a.as_str(), "--check" | "--help" | "-h"))
+    {
+        return Err(std::io::Error::other(format!(
+            "unknown argument {other}; usage: qoro update [--check]"
+        )));
+    }
     let check_only = args.iter().any(|a| a == "--check");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!(
@@ -36,14 +47,12 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     if platform != "macos-aarch64" {
         return Err(std::io::Error::other(format!(
-            "qoro update: no prebuilt binary for {platform}; only macos-aarch64 ships one, \
+            "no prebuilt binary for {platform}; only macos-aarch64 ships one, \
              elsewhere build from source: cargo build --release -p qoro-cli"
         )));
     }
     let latest = fetch_latest().map_err(|detail| {
-        std::io::Error::other(format!(
-            "qoro update: cannot reach GitHub Releases: {detail}"
-        ))
+        std::io::Error::other(format!("cannot reach GitHub Releases: {detail}"))
     })?;
     if !qoro_runtime::paths::is_newer_version(&latest.version, current) {
         clear_notice();
@@ -53,7 +62,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     if check_only {
         if let Err(e) = write_notice(&latest.version) {
             return Err(std::io::Error::other(format!(
-                "qoro update: saw {}, but cannot leave the notice: {e}",
+                "saw {}, but cannot leave the notice: {e}",
                 latest.version
             )));
         }
@@ -66,7 +75,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     let live = live_sessions();
     if !live.is_empty() {
         return Err(std::io::Error::other(format!(
-            "qoro update: refusing: session{} running: {}. Stop {} first (`qoro stop <name>`), \
+            "refusing to update: session{} running: {}. Stop {} first (`qoro stop <name>`), \
              then update, so no agent dies to a routine upgrade",
             if live.len() == 1 { "" } else { "s" },
             live.join(", "),
@@ -111,12 +120,13 @@ fn fetch_latest_parsing(json: &serde_json::Value) -> Result<Release, String> {
         .and_then(|a| a.as_array())
         .cloned()
         .unwrap_or_default();
+    // The API `url`, not `browser_download_url`: the browser one 404s for a private
+    // repository even with a token, while the API one answers with the file when asked
+    // for `application/octet-stream`. It works unchanged for a public repository.
     let url_of = |name: &str| {
         assets.iter().find_map(|a| {
             if a.get("name").and_then(|n| n.as_str()) == Some(name) {
-                a.get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string)
+                a.get("url").and_then(|u| u.as_str()).map(str::to_string)
             } else {
                 None
             }
@@ -132,27 +142,60 @@ fn fetch_latest_parsing(json: &serde_json::Value) -> Result<Release, String> {
     })
 }
 
-/// GET a URL to memory. Anything curl reports becomes text the person can act on.
-///
-/// An API token rides along when one is in the environment: anonymous calls share
-/// 60 requests an hour per IP, which a shared egress burns through, while a token
-/// gets 5000. Nothing is stored anywhere; the token only travels in this request.
+/// GET a URL to memory.
 fn curl(url: &str) -> Result<Vec<u8>, String> {
+    fetch(url, "application/vnd.github+json", "25", None)
+}
+
+/// Download a release asset to a file. The API asset URL answers with the file itself
+/// only when asked for octet-stream; otherwise it answers with the asset's JSON.
+fn download(url: &str, dest: &Path) -> Result<(), String> {
+    fetch(url, "application/octet-stream", "120", Some(dest)).map(drop)
+}
+
+/// One curl request, to memory or to a file. Anything curl reports becomes text the
+/// person can act on.
+///
+/// A token rides along when there is one, and only to `api.github.com`: the repository
+/// is private, so without one nothing is found at all, and anonymous calls also share
+/// 60 requests an hour per IP. It goes to curl on stdin (`-H @-`), never in argv where
+/// any process listing shows it. `-L` follows the asset's redirect to the storage
+/// host and curl drops the header there, so the token never leaves GitHub's API.
+fn fetch(url: &str, accept: &str, max_time: &str, dest: Option<&Path>) -> Result<Vec<u8>, String> {
+    use std::process::Stdio;
+    let token = if url.starts_with("https://api.github.com/") {
+        github_token()
+    } else {
+        None
+    };
     let mut command = Command::new("curl");
-    command.args([
-        "-fsSL",
-        "--max-time",
-        "25",
-        "-H",
-        "Accept: application/vnd.github+json",
-        url,
-    ]);
-    if let Some(token) = github_token() {
-        command.args(["-H", &format!("Authorization: Bearer {token}")]);
+    command.args(["-fsSL", "--max-time", max_time, "-H"]);
+    command.arg(format!("Accept: {accept}"));
+    if token.is_some() {
+        command.args(["-H", "@-"]);
     }
-    let out = command
-        .output()
+    if let Some(dest) = dest {
+        command.arg("-o").arg(dest);
+    }
+    command
+        .arg(url)
+        .stdin(if token.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("curl is not installed or cannot run: {e}"))?;
+    if let (Some(token), Some(mut stdin)) = (token, child.stdin.take()) {
+        // A failed write shows up as curl failing, with its own words.
+        let _ = writeln!(stdin, "Authorization: Bearer {token}");
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("curl did not finish: {e}"))?;
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if detail.is_empty() {
@@ -164,30 +207,27 @@ fn curl(url: &str) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// A GitHub API token from the environment, when the person has one.
+/// A GitHub API token, when the person has one: from the environment, else from `gh`.
 ///
-/// `gh` users already do: it keeps exactly this variable. Checked at request time
-/// rather than at startup, so a failure never depends on when the process began.
+/// `gh` users already have one: it keeps exactly these variables, and `gh auth token`
+/// prints the one it logged in with. Checked at request time rather than at startup,
+/// so a failure never depends on when the process began.
 fn github_token() -> Option<String> {
     ["GH_TOKEN", "GITHUB_TOKEN"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())
         .map(|token| token.trim().to_string())
         .find(|token| !token.is_empty())
-}
-
-/// Download a URL to a file.
-fn download(url: &str, dest: &Path) -> Result<(), String> {
-    let status = Command::new("curl")
-        .args(["-fsSL", "--max-time", "120", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .map_err(|e| format!("curl is not installed or cannot run: {e}"))?;
-    if !status.success() {
-        return Err(format!("curl exited with {status} downloading the release"));
-    }
-    Ok(())
+        .or_else(|| {
+            let out = Command::new("gh")
+                .args(["auth", "token"])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (out.status.success() && !token.is_empty()).then_some(token)
+        })
 }
 
 /// Every session with a daemon answering, read off the disk the way `qoro ls` does.
@@ -207,13 +247,18 @@ fn live_sessions() -> Vec<String> {
 /// Fetch the tarball, check it, and swap it over this binary atomically.
 fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()
-        .map_err(|e| std::io::Error::other(format!("qoro update: cannot find this binary: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("cannot find this binary: {e}")))?;
     install_to(latest, current, &exe)
 }
 
 /// The same swap onto an explicit path, so tests drive the whole chain without
 /// touching the test binary they are running inside of.
 fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()> {
+    // The file itself, not the link it was launched through: `current_exe` on macOS is
+    // the PATH spelling, and renaming over a link turns it into a plain file that no
+    // later build of what it pointed at ever reaches again.
+    let exe = &std::fs::canonicalize(exe)
+        .map_err(|e| std::io::Error::other(format!("cannot resolve {exe:?}: {e}")))?;
     // Counted, because one process can install twice: two tests in one binary share
     // a pid, and a shared work directory would have them unpacking over each other.
     static INSTALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -228,9 +273,7 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
 
     let tarball = work.join(ASSET);
     if let Err(detail) = download(&latest.asset_url, &tarball) {
-        return Err(failed(format!(
-            "qoro update: the download failed: {detail}"
-        )));
+        return Err(failed(format!("the download failed: {detail}")));
     }
     if let Some(url) = &latest.checksum_url {
         let checksum_file = work.join(format!("{ASSET}.sha256"));
@@ -238,12 +281,18 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
             Ok(()) => {
                 if let Err(detail) = check_sha256(&tarball, &checksum_file) {
                     return Err(failed(format!(
-                        "qoro update: refusing: the checksum does not match: {detail}"
+                        "refusing to update: the checksum does not match: {detail}"
                     )));
                 }
             }
+            // The release says it has a checksum, so failing to fetch it is not the
+            // same as there being none: installing unverified here would skip the one
+            // integrity check exactly when something went wrong.
             Err(detail) => {
-                eprintln!("qoro update: warning: no checksum to check against: {detail}");
+                return Err(failed(format!(
+                    "refusing to update: the release lists a checksum that cannot be \
+                     downloaded: {detail}"
+                )));
             }
         }
     }
@@ -252,25 +301,21 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
         .arg(&tarball)
         .current_dir(&work)
         .status()
-        .map_err(|e| failed(format!("qoro update: cannot unpack the release: {e}")))?;
+        .map_err(|e| failed(format!("cannot unpack the release: {e}")))?;
     if !tar.success() {
         return Err(failed(format!(
-            "qoro update: cannot unpack the release: tar exited {tar}"
+            "cannot unpack the release: tar exited {tar}"
         )));
     }
     let fresh = work.join("qoro");
     let reported = Command::new(&fresh)
         .arg("--version")
         .output()
-        .map_err(|e| {
-            failed(format!(
-                "qoro update: the downloaded binary does not run: {e}"
-            ))
-        })?;
+        .map_err(|e| failed(format!("the downloaded binary does not run: {e}")))?;
     let reported = String::from_utf8_lossy(&reported.stdout).trim().to_string();
     if reported != format!("qoro {}", latest.version) {
         return Err(failed(format!(
-            "qoro update: refusing: the download reports {reported:?}, want {:?}",
+            "refusing to update: the download reports {reported:?}, want {:?}",
             format!("qoro {}", latest.version)
         )));
     }
@@ -279,7 +324,7 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     if let Err(e) = std::fs::rename(&staged, exe) {
         let _ = std::fs::remove_file(&staged);
-        return Err(failed(format!("qoro update: cannot replace {exe:?}: {e}")));
+        return Err(failed(format!("cannot replace {exe:?}: {e}")));
     }
     cleanup();
     clear_notice();
@@ -351,14 +396,26 @@ mod tests {
         let body = serde_json::json!({
             "tag_name": "v0.4.0",
             "assets": [
-                {"name": "qoro-aarch64-apple-darwin.tar.gz", "browser_download_url": "https://example.invalid/qoro.tgz"},
-                {"name": "qoro-aarch64-apple-darwin.tar.gz.sha256", "browser_download_url": "https://example.invalid/qoro.tgz.sha256"},
+                {"name": "qoro-aarch64-apple-darwin.tar.gz",
+                 "url": "https://api.github.com/repos/pat/qoro/releases/assets/1",
+                 "browser_download_url": "https://example.invalid/qoro.tgz"},
+                {"name": "qoro-aarch64-apple-darwin.tar.gz.sha256",
+                 "url": "https://api.github.com/repos/pat/qoro/releases/assets/2",
+                 "browser_download_url": "https://example.invalid/qoro.tgz.sha256"},
             ],
         });
         let release = fetch_latest_parsing(&body).expect("the fixture is well formed");
         assert_eq!(release.version, "0.4.0");
-        assert_eq!(release.asset_url, "https://example.invalid/qoro.tgz");
-        assert!(release.checksum_url.is_some());
+        // The API url, because the browser one 404s for a private repository even
+        // with a token.
+        assert_eq!(
+            release.asset_url,
+            "https://api.github.com/repos/pat/qoro/releases/assets/1"
+        );
+        assert_eq!(
+            release.checksum_url.as_deref(),
+            Some("https://api.github.com/repos/pat/qoro/releases/assets/2")
+        );
     }
 
     #[test]
@@ -414,6 +471,60 @@ mod tests {
             "qoro 9.9.9",
             "the file at the old path is the new release now"
         );
+    }
+
+    /// A release that lists a checksum and then cannot serve it is not a release
+    /// without one: installing unverified there skips the only integrity check.
+    #[test]
+    fn a_checksum_that_cannot_be_downloaded_refuses_the_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack dir");
+        let exe = dir.path().join("qoro");
+        std::fs::write(&exe, "old binary").expect("old");
+        let latest = Release {
+            version: "9.9.9".to_string(),
+            asset_url: fake_release(&pack, "9.9.9"),
+            checksum_url: Some(format!("file://{}/missing.sha256", pack.display())),
+        };
+        assert!(install_to(&latest, "0.0.0", &exe).is_err());
+        assert_eq!(
+            std::fs::read(&exe).expect("read"),
+            b"old binary",
+            "an unverifiable download must not touch the binary in hand"
+        );
+    }
+
+    /// Launched through a link on PATH, the update lands on the file the link points
+    /// at, and the link stays a link: replacing it would cut it off from every later
+    /// build of the file it pointed to.
+    #[test]
+    fn install_through_a_symlink_replaces_the_file_it_points_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack dir");
+        let real = dir.path().join("real-qoro");
+        std::fs::write(&real, "old binary").expect("old");
+        let link = dir.path().join("qoro");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let latest = Release {
+            version: "9.9.9".to_string(),
+            asset_url: fake_release(&pack, "9.9.9"),
+            checksum_url: None,
+        };
+        install_to(&latest, "0.0.0", &link).expect("install");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a plain file"
+        );
+        let out = std::process::Command::new(&real)
+            .arg("--version")
+            .output()
+            .expect("run the swapped binary");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "qoro 9.9.9");
     }
 
     #[test]

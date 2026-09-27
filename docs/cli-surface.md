@@ -65,7 +65,13 @@ a claim nobody has to keep.
 The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
 `qoro send --session work 2 "x"` are the same thing. It is put into the environment of
 everything the session starts, which is what lets a shell inside a session say `qoro send`
-and reach its own daemon rather than the default one.
+and reach its own daemon rather than the default one. It has no short form, because the
+text of `qoro send` and `qoro prompt` is searched too and `du -s` there is text. An empty
+value (a trailing `--session`, or `qoro stop ""`) is refused rather than read as `default`.
+
+A word that is not a subcommand is an error naming it, not the interface: `qoro stauts`
+says so and exits 1. Every error prints as one `qoro: ...` line on stderr and exits
+nonzero.
 
 Every row says no except one, and the one is the point: `qoro update` is the only
 subcommand that reaches the network, and only a person runs it. There is no control

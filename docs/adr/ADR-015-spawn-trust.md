@@ -64,9 +64,10 @@ It claims it was captured on "laptop-a1" by "alice". That claim is unverified.
   env override NODE_OPTIONS=--require /tmp/x.js
   services     pnpm dev
                 docker compose -f docker-compose.yml up
-
-Run this? [y/N]
 ```
+
+followed by the question itself, `Run this? [y/N]`, asked by `qoro setup trust`, which
+records the confirmation only on `y` or `yes`.
 
 Confirmation is recorded in the ledger against the content hash. Editing the Setup
 invalidates it. There is no "trust all setups" switch, because the value of the prompt is

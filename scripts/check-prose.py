@@ -15,8 +15,9 @@ EN = "\u2013"
 # exists to support. Reviews are an internal record, not a shipped artifact.
 # `crates` is in the list because most of this project's prose is in doc comments, and a
 # rule that is enforced over the documentation and not over the code is enforced over the
-# smaller half.
-roots = ["crates", "docs", "plans", "scripts", "README.md", ".github"]
+# smaller half. `skills` and `hooks` are copied into people's own agent directories, so
+# they ship as surely as the binary does.
+roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "README.md", ".github"]
 skip = ("ref/", "target/")
 
 fail = []
@@ -26,7 +27,7 @@ for r in roots:
     if p.is_file():
         files.append(p)
     elif p.is_dir():
-        files.extend(x for x in p.rglob("*") if x.suffix in {".md", ".py", ".sh", ".yml", ".rs"})
+        files.extend(x for x in p.rglob("*") if x.suffix in {".md", ".py", ".sh", ".yml", ".rs", ".js"})
 
 for f in files:
     if any(s in str(f) for s in skip):

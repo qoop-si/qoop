@@ -50,11 +50,27 @@ fn captured_on_a(work: &std::path::Path) -> Setup {
 }
 
 fn run(dir: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(qoro())
+    answering(dir, args, "")
+}
+
+/// The same, with what a person types on stdin.
+fn answering(dir: &std::path::Path, args: &[&str], typed: &str) -> (String, String, bool) {
+    use std::io::Write;
+    let mut child = Command::new(qoro())
         .args(args)
         .env("QORO_RUNTIME_DIR", dir)
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("run qoro");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(typed.as_bytes())
+        .expect("type");
+    let out = child.wait_with_output().expect("run qoro");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -107,9 +123,22 @@ fn a_setup_captured_on_one_machine_runs_on_another_after_it_is_trusted() {
         !shown.contains("sess-from-a") || shown.contains("unverified"),
         "the prompt is missing its origin caveat"
     );
+    assert!(
+        !shown.contains("[y/N]"),
+        "`setup show` asks a question it never reads the answer to:\n{shown}"
+    );
+
+    // A person who says no, or says nothing, has not trusted it.
+    for typed in ["n\n", ""] {
+        let (asked, _, ok) = answering(b.path(), &["setup", "trust", &artifact], typed);
+        assert!(!ok, "{typed:?} trusted the Setup");
+        assert!(asked.contains("[y/N]"), "trust never asked:\n{asked}");
+        let (_, _, ok) = run(b.path(), &["setup", "check", &artifact]);
+        assert!(!ok, "{typed:?} was recorded as a confirmation");
+    }
 
     // A person confirms it on B.
-    let (_, _, ok) = run(b.path(), &["setup", "trust", &artifact]);
+    let (_, _, ok) = answering(b.path(), &["setup", "trust", &artifact], "y\n");
     assert!(ok, "trusting the Setup failed");
 
     let (_, _, ok) = run(b.path(), &["setup", "check", &artifact]);
@@ -159,7 +188,7 @@ fn an_edited_setup_is_not_the_setup_that_was_trusted() {
     std::fs::write(&artifact, setup.to_toml().expect("encode")).expect("write");
     let artifact_path = artifact.display().to_string();
 
-    let (_, _, ok) = run(b.path(), &["setup", "trust", &artifact_path]);
+    let (_, _, ok) = answering(b.path(), &["setup", "trust", &artifact_path], "y\n");
     assert!(ok);
     let (_, _, ok) = run(b.path(), &["setup", "check", &artifact_path]);
     assert!(ok);

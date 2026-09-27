@@ -191,7 +191,9 @@ impl Setup {
                 service.argv.join(" ")
             ));
         }
-        out.push_str("\nRun this? [y/N]\n");
+        // No question here: `setup show` prints this too and asks nothing, and a
+        // question that is never read is worse than none. The caller that asks,
+        // `setup trust`, puts it after this text.
         out
     }
 }

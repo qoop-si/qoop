@@ -241,3 +241,58 @@ fn an_event_report_reaches_the_daemon_instead_of_the_usage_error() {
     assert!(!ok, "a forgery must not report");
     assert!(err.contains("refused"), "the refusal names itself: {err:?}");
 }
+
+/// A daemon that accepts the connection and never says hello is still bounded by the
+/// documented five seconds. Every agent turn waits on this command, so a stuck daemon
+/// must cost a hook five seconds and not the agent's own hook timeout.
+#[test]
+fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = qoro_testkit::socket_in(dir.path());
+    let mut private = dir.path().to_path_buf();
+    for part in [None, Some("sessions"), Some("default")] {
+        if let Some(part) = part {
+            private.push(part);
+            std::fs::create_dir(&private).expect("mkdir");
+        }
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    // Bound and listening, so the connect lands in the backlog, and never accepted.
+    let _wedged = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qoro"))
+        .args([
+            "hook-report",
+            "--state",
+            "working",
+            "--terminal",
+            "1",
+            "--token",
+            "t",
+        ])
+        .env("QORO_RUNTIME_DIR", dir.path())
+        .env_remove("QORO_SESSION")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run hook-report");
+    let deadline = started + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let status = status.expect("hook-report hung on a daemon that never answered");
+    assert!(!status.success(), "no answer is not a report");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+}

@@ -158,6 +158,67 @@ fn update_fails_closed_with_the_network_gone() {
     );
 }
 
+/// A mistyped `--check` is not a request to install: it is refused before anything
+/// reaches the network.
+#[test]
+fn update_refuses_an_argument_it_does_not_know() {
+    let (_, stderr, code) = run(&["update".to_string(), "--chek".to_string()], true);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("--chek") && !stderr.contains("GitHub"),
+        "the unknown argument went on to the network: {stderr}"
+    );
+}
+
+/// An error is one readable line, not a Rust debug dump, and a mistyped subcommand is
+/// an error rather than the full-screen interface. The runtime directory is a file
+/// here, so the old fallthrough into the interface fails fast instead of starting a
+/// daemon.
+#[test]
+fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let not_a_dir = dir.path().join("file");
+    std::fs::write(&not_a_dir, "").expect("write");
+    let run = |args: &[&str]| {
+        let out = Command::new(qoro())
+            .args(args)
+            .env("QORO_RUNTIME_DIR", &not_a_dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run qoro");
+        (
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code(),
+        )
+    };
+    let (stderr, code) = run(&["send"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.starts_with("qoro: ") && !stderr.contains("Custom {"),
+        "an error printed as a debug dump: {stderr:?}"
+    );
+    let (stderr, code) = run(&["upadte"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("unknown command") && stderr.contains("upadte"),
+        "a typo was not named as one: {stderr:?}"
+    );
+}
+
+/// A trailing `--session` with nothing after it is a mistake, not the default session.
+#[test]
+fn an_empty_session_is_refused_rather_than_the_default() {
+    for args in [&["stop", "--session"][..], &["stop", ""][..]] {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (stdout, stderr, code) = run(&args, false);
+        assert_ne!(code, Some(0), "{args:?} went on: {stdout:?}");
+        assert!(
+            stderr.contains("cannot be a session name"),
+            "{args:?} did not name the problem: {stderr:?}"
+        );
+    }
+}
+
 /// The Setup subcommands, which take a file, run against a real artifact.
 #[test]
 fn the_setup_subcommands_are_identical_with_the_network_gone() {

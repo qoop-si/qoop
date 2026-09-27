@@ -68,6 +68,8 @@ what is installed and `qoro hooks uninstall` takes out exactly what was added;
 `qoro skills status` and `qoro skills uninstall` do the same for the skill.
 
 On a fresh Mac, `scripts/install.sh` does all three in one go: binary, hooks, skill.
+The releases are private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or
+`GITHUB_TOKEN`, or a `gh` login.
 
 Sessions are named, and a stopped one comes back as itself:
 

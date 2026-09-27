@@ -119,12 +119,18 @@ pub fn valid_session_name(name: &str) -> bool {
 
 /// The session a command is about: what was asked for, else the environment, else the
 /// default.
+///
+/// An empty name asked for is refused like any other bad name: a trailing `--session`
+/// or `qoro stop ""` is a mistake, and quietly working on `default` instead is the
+/// wrong session. An empty `QORO_SESSION` is different: it means unset.
 pub fn session_name(asked: Option<&str>) -> Result<String, PathError> {
-    let name = asked
-        .map(str::to_string)
-        .or_else(|| std::env::var(SESSION_ENV).ok())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+    let name = match asked {
+        Some(name) => name.to_string(),
+        None => std::env::var(SESSION_ENV)
+            .ok()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| DEFAULT_SESSION.to_string()),
+    };
     if !valid_session_name(&name) {
         return Err(PathError::BadSessionName(name));
     }
@@ -300,6 +306,11 @@ pub fn verify_private_dir(dir: &Path) -> Result<(), PathError> {
 mod tests {
     use super::*;
 
+    /// Held by every test that sets or reads this module's environment variables: the
+    /// test harness runs them on parallel threads, and one test's `remove_var` landing
+    /// between another's `set_var` and its read failed it at random.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_fresh_directory_is_created_private() {
         let base = tempfile::tempdir().unwrap();
@@ -352,6 +363,7 @@ mod tests {
 
     #[test]
     fn the_env_override_is_honoured_and_still_verified() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("override");
         // SAFETY: single-threaded test setup.
@@ -393,6 +405,7 @@ mod tests {
 
     #[test]
     fn a_session_name_that_would_escape_its_directory_is_refused_rather_than_cleaned() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         for bad in [
             "..",
             ".",
@@ -422,14 +435,15 @@ mod tests {
             !valid_session_name(&"x".repeat(NAME_LIMIT + 1)),
             "a name past the limit is refused"
         );
-        // An empty name is not a bad name, it is no name: the default, same as saying
-        // nothing at all.
+        // An empty name asked for is a mistake worth naming, a trailing `--session` or
+        // `qoro stop ""`, and never quietly the default session.
         assert!(!valid_session_name(""));
-        assert_eq!(session_name(Some("")).unwrap(), DEFAULT_SESSION);
+        assert!(session_name(Some("")).is_err());
     }
 
     #[test]
     fn a_session_comes_from_the_flag_then_the_environment_then_the_default() {
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: single-threaded test setup.
         unsafe { std::env::remove_var(SESSION_ENV) };
         assert_eq!(session_name(None).unwrap(), DEFAULT_SESSION);
