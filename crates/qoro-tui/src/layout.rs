@@ -3,8 +3,8 @@
 //! The daemon keeps a copy of each tree (`Pane`) so a restart brings the tab back
 //! whole, and never reads it: it sees independent terminals with a single resize
 //! owner each. The tree only decides which terminals are visible,
-//! where on the pane, and which one owns the keyboard and the single `Resize`
-//! stream. Every function here is pure so it can be tested without a screen.
+//! where on the pane, the rectangle each is sized to, and which one owns the
+//! keyboard. Every function here is pure so it can be tested without a screen.
 
 use qoro_runtime::control::{Pane, SplitDir};
 

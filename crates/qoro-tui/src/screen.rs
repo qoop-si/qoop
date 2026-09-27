@@ -1643,10 +1643,10 @@ fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
 
 /// One pane row with several tiles in it, plus the dividers between them.
 ///
-/// Each tile shows the leftmost columns of its own snapshot: the focused tile
-/// was resized to its rectangle so nothing is hidden there, the others are
-/// viewport-cropped. Scrollback, selection and the cursor belong to the
-/// focused tile alone. Cells no tile covers are dividers.
+/// Each tile shows the leftmost columns of its own snapshot. Every tile is
+/// sized to its rectangle, so nothing is hidden, unless another client owns
+/// that terminal's size and it is cropped. Scrollback, selection and the
+/// cursor belong to the focused tile alone. Cells no tile covers are dividers.
 fn paint_tiled_row(
     frame: &Frame,
     pane_row: usize,

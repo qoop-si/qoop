@@ -31,7 +31,7 @@ The full rules:
 
 | Event | Result |
 |---|---|
-| owner detaches cleanly | ownership passes to the longest-attached remaining writable client; if none, policy becomes `Fixed` at the current size and the terminal is marked unowned |
+| owner detaches cleanly | ownership passes to the writable client that was refused a size first, and the size it last asked for applies at once; if none asked, the terminal is unowned and the next writable resize claims it |
 | owner connection dies | same as a clean detach, triggered by the connection's close, not by a timeout |
 | a writable client attaches to an unowned terminal | it becomes the owner and may resize |
 | a writable client attaches to an owned terminal | it does not become the owner and cannot resize |
@@ -55,6 +55,15 @@ process correctness and touches neither sizing nor ownership.
 Mouse coordinates from a cropped viewport are translated into logical grid coordinates by
 the daemon, using the viewport offset the client declared. A client never sends logical
 coordinates it cannot know.
+
+### What the interface sizes
+
+The interface sizes every terminal it lays out to the rectangle it is drawn in: the tiles on
+screen, the other tabs and spaces at the whole pane, and a pane hidden by zoom left at its
+last size. Another machine's terminals are sized only once shown here, and the tabs off
+screen wait for a drag of a divider or the panel to end. So the first interface on a session owns the geometry of what it shows, as one client
+controls a tab's geometry in a terminal multiplexer. It sends a terminal a size only when that
+size changed, because an equal size is the repaint nudge.
 
 ## Consequences
 - A small client sees a cropped view rather than a reflowed one. This is the correct

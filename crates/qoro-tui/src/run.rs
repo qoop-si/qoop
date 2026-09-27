@@ -311,7 +311,8 @@ struct State {
     snapshot: Option<SnapshotWire>,
     /// Snapshots of the visible but unfocused tiles, by terminal. The focused
     /// terminal lives in `snapshot` (with scrollback and selection); the
-    /// others are viewport-cropped live screens.
+    /// others are live screens sized to their tiles (cropped only when another
+    /// client owns the terminal's size).
     snapshots: std::collections::BTreeMap<u32, SnapshotWire>,
     /// The newest image per terminal, by terminal. Drawn by the frame painter
     /// (overlay or placeholder); keyed like `snapshots` so tiles work the same.
@@ -329,6 +330,9 @@ struct State {
     /// set of the space on screen: over-subscribing spends daemon and client
     /// work on output nobody sees.
     subs: std::collections::BTreeSet<u32>,
+    /// The size this client last sent each terminal it lays out, so one whose size did
+    /// not change is not sent it again: to the daemon an equal size is a repaint nudge.
+    sized: std::collections::BTreeMap<u32, (u16, u16)>,
     /// The tiling tree on screen, per space. Spaces without an entry show a single pane.
     layouts: std::collections::BTreeMap<i64, Layout>,
     /// The other tabs' trees, per space. A tab is a tree: moving to another tab
@@ -576,9 +580,6 @@ struct Modes {
     resizing: bool,
     /// A split divider held by the mouse: the path to its split.
     split_drag: Option<layout::SplitPath>,
-    /// The layout moved under the focused tile since the tile was last sized. The paint
-    /// sizes it once, however many moves the frame coalesced.
-    tile_moved: bool,
     /// A close waiting for its `y`: the terminal, and the question on the notice row.
     confirm_close: Option<(u32, String)>,
     /// Rows for a pinned view that went behind the screen have been asked for and not
@@ -948,12 +949,9 @@ impl State {
         };
         let (x, y) = self.pane_cell(row, col);
         let area = pane_area(self);
-        let moved = self
-            .space
+        self.space
             .and_then(|space| self.layouts.get_mut(&space))
-            .is_some_and(|layout| layout.drag(area, &path, x, y));
-        self.modes.tile_moved |= moved;
-        moved
+            .is_some_and(|layout| layout.drag(area, &path, x, y))
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
@@ -2066,11 +2064,9 @@ fn enter_resize(state: &mut State) {
 
 /// Even every pane out, and size the focused one to its new tile at the next paint.
 fn equalize(state: &mut State) {
-    let evened = state
-        .space
-        .and_then(|space| state.layouts.get_mut(&space))
-        .is_some_and(Layout::equalize);
-    state.modes.tile_moved |= evened;
+    if let Some(layout) = state.space.and_then(|space| state.layouts.get_mut(&space)) {
+        layout.equalize();
+    }
 }
 
 /// Decide what one read of stdin meant in resize mode.
@@ -2096,11 +2092,9 @@ fn resize_key(state: &mut State, bytes: &[u8]) -> ModeOutcome {
             _ => None,
         };
         if let Some((mv, step)) = nudge {
-            let moved = state
-                .space
-                .and_then(|space| state.layouts.get_mut(&space))
-                .is_some_and(|layout| layout.nudge(area, mv, step));
-            state.modes.tile_moved |= moved;
+            if let Some(layout) = state.space.and_then(|space| state.layouts.get_mut(&space)) {
+                layout.nudge(area, mv, step);
+            }
         } else {
             match key {
                 ModeKey::Byte(b'=') => equalize(state),
@@ -2612,16 +2606,14 @@ async fn drain_modes(
     Ok(())
 }
 
-/// Size the focused tile after the layout moved under it, once, and only the focused one:
-/// the rest are viewport-cropped and never resized (ADR-007).
+/// Size whatever changed since the last painted frame: tiles a divider moved, however many
+/// nudges or drag motions the frame took in, and a terminal nothing has sized yet, such as
+/// one a script just opened.
 fn size_moved_tile(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    if !std::mem::take(&mut state.modes.tile_moved) {
-        return Ok(None);
-    }
-    resize_focused_to_tile(state, seqs)
+    size_terminals(state, seqs, false)
 }
 
 /// Where copy mode's cursor is drawn, one based on the screen, when it is in view.
@@ -2718,6 +2710,7 @@ where
         shown_images: std::collections::BTreeMap::new(),
         img_size: (0, 0),
         subs: std::collections::BTreeSet::new(),
+        sized: std::collections::BTreeMap::new(),
         layouts: std::collections::BTreeMap::new(),
         parked: std::collections::BTreeMap::new(),
         split_writes: Vec::new(),
@@ -3113,7 +3106,7 @@ where
                 // never changes the row count, so no intermediate width is
                 // worth a reflow of its own.
                 if state.sidebar_width != state.sidebar_sized {
-                    if let Some(resize) = resize_focused_to_tile(&state, &mut seqs)? {
+                    if let Some(resize) = size_terminals(&mut state, &mut seqs, false)? {
                         wr.write_all(&resize).await?;
                     }
                     state.sidebar_sized = state.sidebar_width;
@@ -3174,10 +3167,9 @@ where
                     // The window moved: refresh what is shown before
                     // sizing, or the child reflows against the width the pane no longer
                     // has.
-                    // The focused tile only. A resize is a claim about the window the
-                    // person is looking at, and sending it to every terminal would reflow
-                    // the ones they are not.
-                    if let Some(resize) = resize_focused_to_tile(&state, &mut seqs)? {
+                    // Every terminal to its own tile, or to the whole pane for a tab not on
+                    // screen, the way it would be drawn.
+                    if let Some(resize) = size_terminals(&mut state, &mut seqs, false)? {
                         wr.write_all(&resize).await?;
                     }
                     // A taller window reads further back, and what was fetched for the
@@ -3739,7 +3731,7 @@ where
                                         // child that is not told reflows its output against
                                         // a width it no longer has.
                                         if let Some(resize) =
-                                            resize_focused_to_tile(&state, &mut seqs)?
+                                            size_terminals(&mut state, &mut seqs, false)?
                                         {
                                             wr.write_all(&resize).await?;
                                         }
@@ -3815,7 +3807,7 @@ where
                                     {
                                         if state.sidebar_width != state.sidebar_sized {
                                             if let Some(resize) =
-                                                resize_focused_to_tile(&state, &mut seqs)?
+                                                size_terminals(&mut state, &mut seqs, false)?
                                             {
                                                 wr.write_all(&resize).await?;
                                             }
@@ -3831,9 +3823,13 @@ where
                                         )?)
                                         .await?;
                                     }
+                                    // The paint after a release sizes the tabs off screen
+                                    // that waited out the drag.
+                                    dirty = true;
                                     continue;
                                 }
                                 if state.modes.split_drag.take().is_some() {
+                                    dirty = true;
                                     continue;
                                 }
                                 let inside = state.in_pane(row, col).or_else(|| {
@@ -4099,10 +4095,9 @@ where
                                 state.collapsed = !state.collapsed;
                                 // The pane's width changed with the column, and a child
                                 // that is not told reflows its output against a width it no
-                                // longer has. Only the focused tile is told: the others
-                                // are viewport-cropped.
+                                // longer has. Every tile is told its own.
                                 if let Some(resize) =
-                                    resize_focused_to_tile(&state, &mut seqs)?
+                                    size_terminals(&mut state, &mut seqs, false)?
                                 {
                                     wr.write_all(&resize).await?;
                                 }
@@ -4481,7 +4476,7 @@ where
                                         // default), so without this the first paint shows
                                         // a small screen until anything moves the focus.
                                         if let Some(resize) =
-                                            resize_focused_to_tile(&state, &mut seqs)?
+                                            size_terminals(&mut state, &mut seqs, false)?
                                         {
                                             wr.write_all(&resize).await?;
                                         }
@@ -5462,7 +5457,7 @@ async fn drain_adopt_resize(
         if let Some(subscribe) = sync_subs(state, control_seq)? {
             wr.write_all(&subscribe).await?;
         }
-        if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+        if let Some(resize) = size_terminals(state, seqs, true)? {
             wr.write_all(&resize).await?;
             *dirty = true;
         }
@@ -5495,7 +5490,7 @@ fn zoom_flip(
     if let Some(sync) = sync_subs(state, control_seq)? {
         out.extend_from_slice(&sync);
     }
-    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+    if let Some(resize) = size_terminals(state, seqs, false)? {
         out.extend_from_slice(&resize);
     }
     Ok((true, if out.is_empty() { None } else { Some(out) }))
@@ -5503,11 +5498,26 @@ fn zoom_flip(
 
 fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
     let want: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
-    if want == state.subs {
+    // A visible terminal with no screen here is asked again even when already subscribed:
+    // the daemon answers a repeat with its live screen and no second watcher. Otherwise a
+    // pane that dropped its copy (a space left and come back to) stays blank until the
+    // terminal prints.
+    let blank = |t: &u32| {
+        if *t == state.focused {
+            state.snapshot.is_none()
+        } else {
+            !state.snapshots.contains_key(t)
+        }
+    };
+    let drop: Vec<u32> = state.subs.difference(&want).copied().collect();
+    let add: Vec<u32> = want
+        .iter()
+        .copied()
+        .filter(|t| !state.subs.contains(t) || blank(t))
+        .collect();
+    if drop.is_empty() && add.is_empty() {
         return Ok(None);
     }
-    let drop: Vec<u32> = state.subs.difference(&want).copied().collect();
-    let add: Vec<u32> = want.difference(&state.subs).copied().collect();
     state.subs = want;
     let mut out = BytesMut::new();
     if !drop.is_empty() {
@@ -5531,25 +5541,88 @@ fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<Byte
     Ok(Some(out))
 }
 
-/// Resize the focused terminal to its own tile. The only resize this client
-/// sends for tiling: unfocused tiles are viewport-cropped and never resized,
-/// which is what keeps the single-owner rule of ADR-007 intact.
-fn resize_focused_to_tile(
-    state: &State,
+/// Size every terminal this interface lays out to the rectangle it is drawn in, that is:
+/// the tiles on screen, every parked tab and every other space's tree laid out
+/// in the same pane, and any other live terminal as a whole-pane tab. A child that is
+/// told its real width formats for it, whether it is on screen now or when its tab comes
+/// back.
+///
+/// A terminal is sent its size only when it changed: to the daemon an equal size is a
+/// repaint nudge, one row short for 30 ms. `nudge_focused` asks for that repaint on the
+/// focused one, which only adopting a terminal on attach wants. A pane hidden by zoom keeps its last size. A terminal
+/// another client owns is refused by the daemon and stays viewport-cropped (ADR-007).
+fn size_terminals(
+    state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
+    nudge_focused: bool,
 ) -> io::Result<Option<BytesMut>> {
-    if state.focused == 0 {
-        return Ok(None);
+    let area = pane_area(state);
+    let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
+    let asleep: std::collections::BTreeSet<u32> = state
+        .rows
+        .iter()
+        .filter(|row| row.state == "sleeping")
+        .map(|row| row.terminal)
+        .collect();
+    let mut want: std::collections::BTreeMap<u32, (u16, u16)> = state
+        .rows
+        .iter()
+        .filter(|row| !asleep.contains(&row.terminal))
+        .map(|row| (row.terminal, size(area)))
+        .collect();
+    let mut zoomed_away = std::collections::BTreeSet::new();
+    // Parked first, so the tree on screen is what a terminal in both is sized by.
+    for tree in state
+        .parked
+        .values()
+        .flatten()
+        .chain(state.layouts.values())
+    {
+        let tiles = tree.tile_rects(area);
+        for leaf in tree.leaves() {
+            if !tiles.iter().any(|(t, _)| *t == leaf) {
+                want.remove(&leaf);
+                zoomed_away.insert(leaf);
+            }
+        }
+        want.extend(tiles.into_iter().map(|(t, r)| (t, size(r))));
     }
-    let rect = focused_rect(state);
-    Ok(Some(client::encode_command_to(
-        state.focused,
-        &ClientWire::Resize {
-            cols: rect.cols as u16,
-            rows: rect.rows as u16,
-        },
-        seqs.entry(state.focused).or_default(),
-    )?))
+    want.retain(|t, _| !asleep.contains(t));
+    // Off screen and left for later: everything while a divider or the panel is being
+    // dragged, so a hundred terminals do not reflow on every frame of a drag (the paint
+    // after the release sizes them); and another machine's terminals, whose geometry is
+    // for a person at that machine to take until one here looks at them.
+    let visible: std::collections::BTreeSet<u32> = visible_set(state)
+        .into_iter()
+        .chain([state.focused])
+        .collect();
+    let dragging = state.sidebar_drag.is_some() || state.modes.split_drag.is_some();
+    let later: std::collections::BTreeSet<u32> = want
+        .keys()
+        .copied()
+        .filter(|t| !visible.contains(t) && (dragging || crate::mux::is_remote_terminal(*t)))
+        .collect();
+    want.retain(|t, _| !later.contains(t));
+    if state.focused != 0 {
+        want.insert(state.focused, size(focused_rect(state)));
+    }
+    let mut out = BytesMut::new();
+    for (&terminal, &(cols, rows)) in &want {
+        let nudge = nudge_focused && terminal == state.focused;
+        if cols == 0 || rows == 0 || (!nudge && state.sized.get(&terminal) == Some(&(cols, rows))) {
+            continue;
+        }
+        out.extend_from_slice(&client::encode_command_to(
+            terminal,
+            &ClientWire::Resize { cols, rows },
+            seqs.entry(terminal).or_default(),
+        )?);
+    }
+    state
+        .sized
+        .retain(|t, _| want.contains_key(t) || zoomed_away.contains(t) || later.contains(t));
+    state.sized.extend(want);
+    Ok((!out.is_empty()).then_some(out))
 }
 
 fn focus(
@@ -5647,7 +5720,7 @@ fn focus(
             )?);
         }
     }
-    if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+    if let Some(resize) = size_terminals(state, seqs, false)? {
         out.extend_from_slice(&resize);
     }
     // The list refetches on the same bytes as the subscribe above: on an
@@ -5716,7 +5789,7 @@ fn enter_space(
             if let Some(sync) = sync_subs(state, control_seq)? {
                 out.extend_from_slice(&sync);
             }
-            if let Some(resize) = resize_focused_to_tile(state, seqs)? {
+            if let Some(resize) = size_terminals(state, seqs, false)? {
                 out.extend_from_slice(&resize);
             }
             Ok(Some(out))
@@ -5946,15 +6019,14 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.creating = state.creating.saturating_sub(1);
             state.space = Some(workspace);
             state.snapshot = None;
-            // A new space starts bare: no tree, and forget the old subs. The
-            // unsubscribe itself cannot go out from here (`apply` cannot
-            // write), so it queues behind the terminal request the new space
-            // always triggers: `wants_terminal_in` drains with a write in
-            // hand, and the render filter below drops the old space's renders
-            // by space in the meantime.
+            // A new space starts bare: no tree. The old space's subscriptions
+            // stay in `subs` until the next sync drops them, since `apply`
+            // cannot write: forgetting them here meant the unsubscribe never
+            // went out, the daemon kept them, and coming back subscribed to a
+            // terminal it still watched, which asks it for no screen. The
+            // render filter drops the old space's renders by space meanwhile.
             state.layouts.remove(&workspace);
             state.parked.remove(&workspace);
-            state.subs.clear();
             state.snapshots.clear();
             // Asked for here rather than by the caller, because a space with no terminal in
             // it shows an empty pane and a bar with only a `+` on it, and the first thing
@@ -6756,6 +6828,7 @@ mod tests {
             shown_images: std::collections::BTreeMap::new(),
             img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
+            sized: std::collections::BTreeMap::new(),
             layouts: std::collections::BTreeMap::new(),
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
@@ -7140,6 +7213,7 @@ mod tests {
             shown_images: std::collections::BTreeMap::new(),
             img_size: (0, 0),
             subs: std::collections::BTreeSet::new(),
+            sized: std::collections::BTreeMap::new(),
             layouts: std::collections::BTreeMap::new(),
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
@@ -7240,6 +7314,7 @@ mod tests {
             shown_images: std::collections::BTreeMap::new(),
             img_size: (0, 0),
             subs: std::collections::BTreeSet::from([1, 2]),
+            sized: std::collections::BTreeMap::new(),
             layouts: std::collections::BTreeMap::new(),
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
@@ -7751,8 +7826,29 @@ mod tests {
         );
     }
 
+    /// A visible terminal with no screen here is subscribed again although it already is,
+    /// which the daemon answers with its live screen: back in a space whose copy was dropped,
+    /// the pane is not left blank until the terminal prints.
     #[test]
-    fn a_new_space_starts_bare_and_forgets_the_old_subscriptions() {
+    fn a_visible_terminal_with_no_screen_is_asked_for_one_again() {
+        let mut state = tiled_state();
+        let mut control_seq = 0;
+        assert!(sync_subs(&mut state, &mut control_seq).unwrap().is_none());
+        state.snapshot = None;
+        let out = sync_subs(&mut state, &mut control_seq)
+            .unwrap()
+            .expect("a subscribe");
+        assert!(String::from_utf8_lossy(&out).contains("show-tiles"));
+        assert!(!String::from_utf8_lossy(&out).contains("hide-tiles"));
+        assert_eq!(state.subs, std::collections::BTreeSet::from([1, 2]));
+    }
+
+    /// A new space starts bare, and the old space's subscriptions are dropped by the next
+    /// sync, with an unsubscribe that reaches the daemon. Forgotten locally instead, the
+    /// daemon kept them, and coming back subscribed to a terminal it still watched, which
+    /// asks for no screen: the first space came back blank.
+    #[test]
+    fn a_new_space_starts_bare_and_its_first_sync_unsubscribes_the_old_one() {
         let mut state = tiled_state();
         let mut dirty = false;
         apply(
@@ -7764,9 +7860,18 @@ mod tests {
             &mut dirty,
         );
         assert!(!state.layouts.contains_key(&2));
-        assert!(state.subs.is_empty());
         assert!(state.snapshots.is_empty());
         assert_eq!(state.wants_terminal_in, vec![2]);
+        state.focused = 0;
+        let mut control_seq = 0;
+        let out = sync_subs(&mut state, &mut control_seq)
+            .unwrap()
+            .expect("an unsubscribe");
+        assert!(
+            String::from_utf8_lossy(&out).contains("hide-tiles"),
+            "the old space's terminals were not unsubscribed"
+        );
+        assert!(state.subs.is_empty());
     }
 
     #[test]
@@ -8864,7 +8969,11 @@ mod tests {
         let before = focused_rect(&state).cols;
         assert_eq!(resize_key(&mut state, b"lll"), ModeOutcome::Stay);
         assert!(focused_rect(&state).cols > before);
-        assert!(state.modes.tile_moved, "the paint owes the tile a resize");
+        let mut seqs = std::collections::BTreeMap::new();
+        assert!(
+            size_moved_tile(&mut state, &mut seqs).unwrap().is_some(),
+            "the paint owes the tiles a resize"
+        );
         assert_eq!(resize_key(&mut state, b"\x1b[D="), ModeOutcome::Stay);
         // Leaving keys leave and are not typed; what follows them is.
         assert_eq!(resize_key(&mut state, b"q"), ModeOutcome::Stay);
@@ -8894,10 +9003,10 @@ mod tests {
         assert!(single.message.is_some());
     }
 
-    /// Only the focused tile is sized, and only once per painted frame however many drag
-    /// motions arrived before it.
+    /// Both tiles either side of a moved divider are sized, once per painted frame however
+    /// many drag motions arrived before it.
     #[test]
-    fn a_divider_drag_sizes_the_focused_tile_once_per_frame() {
+    fn a_divider_drag_sizes_both_tiles_once_per_frame() {
         let mut state = tiled_state();
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
@@ -8911,14 +9020,126 @@ mod tests {
         let mut seqs = std::collections::BTreeMap::new();
         assert!(size_moved_tile(&mut state, &mut seqs).unwrap().is_some());
         assert!(size_moved_tile(&mut state, &mut seqs).unwrap().is_none());
-        assert_eq!(
-            seqs.keys().copied().collect::<Vec<_>>(),
-            vec![1],
-            "focused only"
-        );
+        assert_eq!(sent(&seqs), vec![(1, 1), (2, 1)], "each tile once");
+        let other = layout_rect(&state, 2);
+        assert_eq!(state.sized[&1], (rect.cols as u16 - 9, rect.rows as u16));
+        assert_eq!(state.sized[&2], (other.cols as u16, other.rows as u16));
         // A press inside a pane is not a divider.
         state.modes.split_drag = None;
         assert!(!state.split_press((left + 3) as u16, row));
+    }
+
+    /// How many resizes each terminal was sent, from the sequence numbers they took.
+    fn sent(seqs: &std::collections::BTreeMap<u32, u32>) -> Vec<(u32, u32)> {
+        seqs.iter().map(|(t, n)| (*t, *n)).collect()
+    }
+
+    fn layout_rect(state: &State, terminal: u32) -> layout::Rect {
+        state.layouts[&1]
+            .tile_rects(pane_area(state))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .map(|(_, r)| r)
+            .expect("a tile")
+    }
+
+    /// Every tile is sized to its own rectangle, the unfocused one included, and asking
+    /// again with nothing changed nudges only the focused one.
+    #[test]
+    fn every_tile_is_sized_and_an_unchanged_one_is_not_sent_again() {
+        let mut state = tiled_state();
+        let mut seqs = std::collections::BTreeMap::new();
+        assert!(
+            size_terminals(&mut state, &mut seqs, true)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(sent(&seqs), vec![(1, 1), (2, 1)]);
+        let right = layout_rect(&state, 2);
+        assert_eq!(state.sized[&2], (right.cols as u16, right.rows as u16));
+        assert!(right.cols < pane_area(&state).cols, "a tile, not the pane");
+        size_terminals(&mut state, &mut seqs, true).unwrap();
+        assert_eq!(sent(&seqs), vec![(1, 2), (2, 1)], "only the focused nudge");
+        assert!(
+            size_terminals(&mut state, &mut seqs, false)
+                .unwrap()
+                .is_none()
+        );
+        // Moving the focus to a tile already at its size sends it nothing: an equal size
+        // would be the daemon's one-row-short repaint nudge.
+        let mut control_seq = 0;
+        focus(&mut state, 2, &mut control_seq, &mut seqs).unwrap();
+        assert_eq!(
+            sent(&seqs),
+            vec![(1, 2), (2, 1)],
+            "no resize on a focus move"
+        );
+    }
+
+    /// A tab not on screen, parked or in another space, is sized to the whole pane, the
+    /// way it will be drawn when it comes back; a sleeping row has no process to size.
+    #[test]
+    fn a_tab_off_screen_is_sized_to_the_pane_and_a_sleeping_row_is_not() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "zsh", "idle"));
+        state.rows.push(agent(4, 2, "codex", "working"));
+        state.rows.push(agent(5, 2, "claude", "sleeping"));
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs, true).unwrap();
+        let area = pane_area(&state);
+        let whole = (area.cols as u16, area.rows as u16);
+        assert_eq!(state.sized.get(&3), Some(&whole));
+        assert_eq!(state.sized.get(&4), Some(&whole));
+        assert_eq!(state.sized.get(&5), None);
+        assert!(!seqs.contains_key(&5));
+        // Gone from the index: forgotten, so it is sized again if it comes back.
+        state.rows.retain(|r| r.terminal != 3);
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        assert_eq!(state.sized.get(&3), None);
+    }
+
+    /// While the panel is dragged only what is on screen follows; the tabs off screen are
+    /// sized once the drag lets go, not on every frame of it.
+    #[test]
+    fn a_drag_sizes_the_tabs_off_screen_only_once_it_lets_go() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "zsh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        let before = state.sized[&3];
+        state.sidebar_drag = Some(state.sidebar_width);
+        state.sidebar_width += 6;
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        assert_eq!(
+            state.sized[&3], before,
+            "an off-screen tab followed the drag"
+        );
+        assert_eq!(seqs[&3], 1);
+        assert_ne!(seqs[&1], 1, "the tiles on screen follow it");
+        state.sidebar_drag = None;
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        assert_eq!(seqs[&3], 2, "sized once the drag let go");
+        assert_ne!(state.sized[&3], before);
+    }
+
+    /// Zoom sizes the zoomed pane to the whole area and leaves the pane it hides at the
+    /// size it had; unzooming gives each its tile back.
+    #[test]
+    fn zoom_sizes_the_zoomed_pane_and_leaves_the_hidden_one_alone() {
+        let mut state = tiled_state();
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs, true).unwrap();
+        let tile = state.sized[&2];
+        assert!(state.layouts.get_mut(&1).unwrap().toggle_zoom());
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        let area = pane_area(&state);
+        assert_eq!(state.sized[&1], (area.cols as u16, area.rows as u16));
+        assert_eq!(state.sized[&2], tile, "kept while hidden");
+        assert_eq!(seqs[&2], 1, "the hidden pane was not sent anything");
+        assert!(state.layouts.get_mut(&1).unwrap().toggle_zoom());
+        size_terminals(&mut state, &mut seqs, false).unwrap();
+        assert_eq!(seqs[&2], 1, "back at the size it kept");
+        assert_eq!(seqs[&1], 3, "the focused one sized back to its tile");
     }
 
     #[test]
