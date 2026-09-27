@@ -631,6 +631,27 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
+            // A history search names a terminal like a scrollback read, and goes where it is.
+            R::SearchScrollback {
+                id,
+                terminal,
+                query,
+                from,
+                backward,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(
+                    link,
+                    R::SearchScrollback {
+                        id,
+                        terminal,
+                        query,
+                        from,
+                        backward,
+                    },
+                )
+                .await
+            }
             R::ListFocusEvents {
                 id,
                 terminal,
@@ -920,6 +941,25 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         from,
                         total,
                         lines,
+                    })
+                    .await
+                }
+                None => Ok(()),
+            },
+            C::ScrollbackMatch {
+                id,
+                terminal,
+                row,
+                col,
+                resume,
+            } => match terminal_out(link, terminal) {
+                Some(terminal) => {
+                    self.respond(&C::ScrollbackMatch {
+                        id,
+                        terminal,
+                        row,
+                        col,
+                        resume,
                     })
                     .await
                 }
@@ -1331,5 +1371,75 @@ mod tests {
         assert_eq!(by[&0], vec![3, 9]);
         assert_eq!(by[&1], vec![4]);
         assert_eq!(by[&2], vec![4]);
+    }
+
+    /// The one frame's body in `bytes`, read as `T`.
+    fn body_of<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+        let mut buf = BytesMut::from(bytes);
+        let frame = Frame::decode(&mut buf).expect("a frame").expect("whole");
+        serde_json::from_slice(&frame.body).expect("json")
+    }
+
+    /// A history search on a remote space goes to that remote with its own number for the
+    /// terminal, and the answer comes back in the interface's numbering: sent home with
+    /// the encoded number, the home daemon said "there is no terminal", and an answer left
+    /// in the remote's numbering was dropped as another terminal's.
+    #[tokio::test]
+    async fn a_history_search_reaches_the_remote_that_holds_the_terminal_and_comes_back() {
+        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
+        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
+        let mut home = Link::new(String::new(), None);
+        home.conn = Some((1, home_tx));
+        let mut remote = Link::new("devbox".into(), None);
+        remote.conn = Some((1, remote_tx));
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![Some(home), Some(remote)],
+            home: 0,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 0,
+            events,
+        };
+        let there = terminal_out(1, 21).expect("fits");
+        mux.control(ControlRequest::SearchScrollback {
+            id: "search-1".into(),
+            terminal: there,
+            query: "needle".into(),
+            from: 5,
+            backward: true,
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert!(
+            matches!(asked, ControlRequest::SearchScrollback { terminal: 21, .. }),
+            "{asked:?}"
+        );
+        mux.answer(
+            1,
+            ControlResponse::ScrollbackMatch {
+                id: "search-1".into(),
+                terminal: 21,
+                row: Some(3),
+                col: 4,
+                resume: None,
+            },
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        assert_eq!(
+            answered,
+            ControlResponse::ScrollbackMatch {
+                id: "search-1".into(),
+                terminal: there,
+                row: Some(3),
+                col: 4,
+                resume: None,
+            }
+        );
     }
 }

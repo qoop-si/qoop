@@ -326,8 +326,13 @@ impl Layout {
         divider_in(&self.root, area, col, row, &mut path).then_some(path)
     }
 
-    /// Put the divider of the split at `path` under a pane-local cell, as far as the limits
-    /// allow. Answers whether it moved.
+    /// Put the divider of the split at `path` under a pane-local cell. Answers whether it
+    /// moved.
+    ///
+    /// A cell past what the limits allow is refused whole and the divider stays where it
+    /// was, rather than being pulled part of the way: a terminal reports the pointer cell by
+    /// cell, so a drag toward the limit has already put the divider on the last allowed cell
+    /// by the time the pointer passes it.
     pub fn drag(&mut self, area: Rect, path: &[bool], col: usize, row: usize) -> bool {
         let Some((dir, _, rect)) = split_at(&self.root, path, area) else {
             return false;
