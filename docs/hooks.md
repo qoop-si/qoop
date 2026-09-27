@@ -13,8 +13,8 @@ case where a weaker source may overrule a stronger one under ADR-008.
 ## Installing them
 
 ```text
-qoro hooks status               which are installed
-qoro hooks install              every agent qoro ships a hook for
+qoro hooks status               which are installed, and which agents are not present
+qoro hooks install              every agent qoro ships a hook for that is on this machine
 qoro hooks install claude       one of them
 qoro hooks uninstall claude     exactly what was installed, and nothing else
 ```
@@ -22,8 +22,33 @@ qoro hooks uninstall claude     exactly what was installed, and nothing else
 The script is written to `<config>/qoro/hooks/`, and one entry is added to that agent's
 own configuration file. Three things this will not do to a person's configuration: it adds
 beside what is already there rather than replacing it, installing twice changes nothing the
-second time, and a file it cannot parse is reported rather than overwritten. A copy is kept
-before every write.
+second time, and a file it cannot parse is reported rather than overwritten.
+
+An install that names no agent installs only for the agents on this machine: an agent
+counts as present when its binary is on `PATH` or its configuration directory exists, and
+the others are listed as `not present, skipped` rather than having a directory created for
+them. Naming an agent installs it whether or not it is here yet.
+
+Every write goes to a temporary file beside the configuration and is renamed over it, so an
+interrupted write never leaves half a settings file; the temporary file is created with the
+configuration's own permissions, so a 0600 file is never briefly readable by others, and a
+configuration the install creates gets the mode your umask gives any new file. A
+configuration you made read-only is reported as not edited and left alone. A
+symlinked configuration is followed, even a link whose target does not exist yet, so the
+link stays and the file it points at is changed or created. A copy is
+kept before every write, next to the file as `<name>.qoro-backup-<stamp>`; the oldest copy
+(the file before qoro first touched it) and the newest three are kept, the rest pruned.
+
+Uninstalling right after installing gives back the file byte for byte in the common cases:
+when what is left is exactly what a kept copy holds, that copy's own bytes are written back
+rather than a reformatted rendering of the same content (an empty or blank file included),
+and a file that did not exist before the install is removed rather than left as `{}` (or,
+for Cursor, as `{"version": 1}`). Two cases come back equal in content
+but not in bytes: an empty list the person had under the very event the hook registers
+(`"SessionStart": []`) is removed with the entry, and a file edited between install and
+uninstall is written back in qoro's own formatting. Uninstall looks in every file the agent
+could read the entry from, so an entry is found even after the agent's choice of file
+changed (Droid's, below).
 
 An agent that is already running does not read its configuration again, so it has to be
 started afresh.
@@ -48,9 +73,19 @@ configuration entry it needs in its own header.
 | opencode | yes          | opencode plugin events (`session.status`, `permission.asked`, ...)     | `hooks/opencode/qoro-plugin.js`  |
 | amp      | yes          | https://ampcode.com/manual/plugin-api                                  | `hooks/amp/qoro-plugin.js`       |
 | goose    | yes          | https://goose-docs.ai/docs/guides/context-engineering/hooks/           | `hooks/goose/qoro-hook.sh`       |
+| copilot  | session only | https://docs.github.com/en/copilot/reference/hooks-reference           | `hooks/session/qoro-session-hook.sh` |
+| droid    | session only | https://docs.factory.ai/harness/hooks                                  | `hooks/session/qoro-session-hook.sh` |
+| qwen     | session only | https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/       | `hooks/session/qoro-session-hook.sh` |
+| qodercli | session only | https://docs.qoder.com/cli/hooks                                       | `hooks/session/qoro-session-hook.sh` |
 
 Notes:
 
+- copilot, droid, qwen, qodercli: one shared script, installed once per agent
+  under that agent's name, registered for `SessionStart` only. It reports the
+  agent's own conversation id (`session_id` in the payload, `sessionId` for
+  Copilot's camelCase events) with `qoro hook-report --session-id` and no
+  state, so these agents are resumed by id while their state stays with the
+  screen.
 - cursor: the IDE supports the full hook list; `cursor-agent` on the CLI only
   fires a subset (`sessionStart`, `stop`, `postToolUse` on recent builds).
   Events that never fire never report; the screen covers those.
@@ -148,6 +183,15 @@ shape in each case:
   (user) with `"version": 1`, state as the script's argument.
 - opencode: load `hooks/opencode/qoro-plugin.js` as a plugin.
 - amp: load `hooks/amp/qoro-plugin.js` as a plugin.
+- copilot: flat entries (`{ "command": ... }`, no wrapper) under `"hooks"`
+  in `~/.copilot/settings.json` (`$COPILOT_HOME/settings.json` when set; a
+  leading `~` in any of these variables is the home directory).
+- droid: nested entries under `"hooks"` in `~/.factory/settings.json`, or at
+  the root of `~/.factory/hooks.json` when that file exists, because Droid
+  reads `hooks.json` instead of the settings whenever there is one.
+- qwen, qodercli: nested entries with `"matcher": "*"` under `"hooks"` in
+  `~/.qwen/settings.json` and `~/.qoder/settings.json` (under `$QWEN_HOME` and
+  `$QODER_CONFIG_DIR` when set).
 - goose: a plugin directory with `hooks/hooks.json` pointing at
   `hooks/goose/qoro-hook.sh` (project `.agents/plugins/` or user
   `~/.agents/plugins/`).

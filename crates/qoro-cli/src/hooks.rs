@@ -34,6 +34,16 @@ struct Target {
     file: &'static str,
     /// That agent's configuration, under the person's home directory.
     config: &'static str,
+    /// The variable that moves the agent's configuration directory (the first component
+    /// of `config`) somewhere else, when the agent has one. An install that ignored it
+    /// would write to a file that agent never reads.
+    home_env: Option<&'static str>,
+    /// A file beside `config` that the agent reads instead of it whenever it exists, with
+    /// the event map at its root rather than under `hooks`. Factory Droid's: it reads
+    /// `~/.factory/hooks.json` when there is one and only falls back to the `hooks` key of
+    /// `settings.json` when there is not, so an entry written to the file it ignores would
+    /// be an install that never runs.
+    instead: Option<&'static str>,
     shape: Shape,
 }
 
@@ -46,8 +56,13 @@ enum Shape {
         events: &'static [Event],
         matcher: Option<&'static str>,
     },
-    /// `hooks.<event>[] = { command }`. Cursor's, which has no wrapper object.
-    Flat { events: &'static [Event] },
+    /// `hooks.<event>[] = { command }`, with no wrapper object. Cursor's, whose file also
+    /// carries a `version` of its own schema (`versioned`), and Copilot's inline settings
+    /// block, which has none because it lives inside a settings file.
+    Flat {
+        events: &'static [Event],
+        versioned: bool,
+    },
     /// A directory the agent loads everything out of. Dropping the file in is the whole
     /// installation, and there is no configuration to edit: opencode reads every plugin in
     /// `~/.config/opencode/plugin`, which is also how anything else a person has put there
@@ -74,6 +89,8 @@ fn targets() -> Vec<Target> {
             body: include_str!("../../../hooks/claude/qoro-hook.sh"),
             file: "qoro-hook.sh",
             config: ".claude/settings.json",
+            instead: None,
+            home_env: None,
             shape: Shape::Nested {
                 // Claude's hook reads the event name from its payload, so every entry is
                 // the same command and the mapping lives in the script.
@@ -96,6 +113,8 @@ fn targets() -> Vec<Target> {
             body: include_str!("../../../hooks/codex/qoro-hook.sh"),
             file: "qoro-codex-hook.sh",
             config: ".codex/hooks.json",
+            instead: None,
+            home_env: None,
             shape: Shape::Nested {
                 // Codex runs a hook per event and passes nothing to read, so which state
                 // each event means is an argument here.
@@ -114,6 +133,8 @@ fn targets() -> Vec<Target> {
             body: include_str!("../../../hooks/gemini/qoro-hook.sh"),
             file: "qoro-gemini-hook.sh",
             config: ".gemini/settings.json",
+            instead: None,
+            home_env: None,
             shape: Shape::Nested {
                 events: &[
                     Event("SessionStart", Some("working")),
@@ -129,12 +150,15 @@ fn targets() -> Vec<Target> {
             body: include_str!("../../../hooks/cursor/qoro-hook.sh"),
             file: "qoro-cursor-hook.sh",
             config: ".cursor/hooks.json",
+            instead: None,
+            home_env: None,
             shape: Shape::Flat {
                 events: &[
                     Event("sessionStart", Some("working")),
                     Event("postToolUse", Some("working")),
                     Event("stop", Some("idle")),
                 ],
+                versioned: true,
             },
         },
         Target {
@@ -142,9 +166,134 @@ fn targets() -> Vec<Target> {
             body: include_str!("../../../hooks/opencode/qoro-plugin.js"),
             file: "qoro-plugin.js",
             config: ".config/opencode/plugin",
+            instead: None,
+            home_env: None,
             shape: Shape::Dropped,
         },
+        // Session-only hooks: one shared script that reports the agent's own id for its
+        // conversation on SessionStart and nothing else, so a restored tab resumes that
+        // conversation. State for these agents stays with the screen.
+        //
+        // Copilot reads an inline `hooks` block in its user settings. The PascalCase event
+        // name is the one whose payload says `session_id`, and `command` is its documented
+        // cross-platform field.
+        Target {
+            agent: "copilot",
+            body: SESSION_HOOK,
+            file: "qoro-copilot-session.sh",
+            config: ".copilot/settings.json",
+            instead: None,
+            home_env: Some("COPILOT_HOME"),
+            shape: Shape::Flat {
+                events: &[Event("SessionStart", None)],
+                versioned: false,
+            },
+        },
+        Target {
+            agent: "droid",
+            body: SESSION_HOOK,
+            file: "qoro-droid-session.sh",
+            config: ".factory/settings.json",
+            instead: Some(".factory/hooks.json"),
+            home_env: None,
+            shape: Shape::Nested {
+                events: &[Event("SessionStart", None)],
+                matcher: None,
+            },
+        },
+        Target {
+            agent: "qwen",
+            body: SESSION_HOOK,
+            file: "qoro-qwen-session.sh",
+            config: ".qwen/settings.json",
+            instead: None,
+            home_env: Some("QWEN_HOME"),
+            shape: Shape::Nested {
+                events: &[Event("SessionStart", None)],
+                matcher: Some("*"),
+            },
+        },
+        Target {
+            agent: "qodercli",
+            body: SESSION_HOOK,
+            file: "qoro-qodercli-session.sh",
+            config: ".qoder/settings.json",
+            instead: None,
+            home_env: Some("QODER_CONFIG_DIR"),
+            shape: Shape::Nested {
+                events: &[Event("SessionStart", None)],
+                matcher: Some("*"),
+            },
+        },
     ]
+}
+
+/// The session-only hook, installed once per agent that uses it.
+const SESSION_HOOK: &str = include_str!("../../../hooks/session/qoro-session-hook.sh");
+
+/// The file this agent reads its hooks from, and whether the event map sits at its root.
+///
+/// Where an install writes. Droid's choice is made when this is called, so a file that
+/// appears later can hold an entry this wrote into the other one: status and uninstall
+/// look in both, through [`configs_of`].
+fn config_of(target: &Target, home: &Path) -> (PathBuf, bool) {
+    match target.instead.map(|file| home.join(file)) {
+        Some(file) if file.exists() => (file, true),
+        _ => (config_path(target, home), false),
+    }
+}
+
+/// Every file an entry of this agent's could be in, each with where its event map sits.
+fn configs_of(target: &Target, home: &Path) -> Vec<(PathBuf, bool)> {
+    let mut files = vec![(config_path(target, home), false)];
+    files.extend(target.instead.map(|file| (home.join(file), true)));
+    files
+}
+
+/// The agent's own configuration file, under its home variable when the person set one.
+fn config_path(target: &Target, home: &Path) -> PathBuf {
+    let moved = target
+        .home_env
+        .and_then(std::env::var_os)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    config_path_in(target, home, moved)
+}
+
+/// The same, with the variable's value given, so a test need not set it for the process.
+///
+/// A leading `~` is the home directory, as a shell would have expanded it: a value set in a
+/// file the shell never read arrives with it still in place.
+fn config_path_in(target: &Target, home: &Path, moved: Option<PathBuf>) -> PathBuf {
+    let moved = moved.map(|dir| match dir.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => dir,
+    });
+    match moved {
+        Some(dir) => dir.join(
+            target
+                .config
+                .split_once('/')
+                .map_or(target.config, |(_, rest)| rest),
+        ),
+        None => home.join(target.config),
+    }
+}
+
+/// Whether a person has this agent: its binary on `PATH`, or its configuration directory.
+///
+/// An install that names no agent installs only for these, rather than creating a
+/// directory for every agent qoro knows of on a machine that has two of them.
+fn present(target: &Target, home: &Path) -> bool {
+    present_in(target, home, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// The same, with the search path given.
+fn present_in(target: &Target, home: &Path, path: &str) -> bool {
+    on_path_in(target.agent, path)
+        || config_path(target, home)
+            .parent()
+            .is_some_and(|dir| dir.is_dir())
 }
 
 /// Where the installed scripts live.
@@ -194,9 +343,11 @@ fn registered(target: &Target, dir: &Path, home: &Path) -> bool {
         return home.join(target.config).join(target.file).exists();
     }
     let script = dir.join(target.file).display().to_string();
-    std::fs::read_to_string(home.join(target.config))
-        .map(|text| text.contains(&script))
-        .unwrap_or(false)
+    configs_of(target, home).iter().any(|(config, _)| {
+        std::fs::read_to_string(config)
+            .map(|text| text.contains(&script))
+            .unwrap_or(false)
+    })
 }
 
 /// Whether a person has this agent at all.
@@ -259,6 +410,7 @@ fn wanted(args: &[String]) -> std::io::Result<Vec<Target>> {
 
 fn status() -> std::io::Result<()> {
     let dir = hooks_dir();
+    let home = home();
     for target in targets() {
         let installed = dir.join(target.file);
         let current = std::fs::read_to_string(&installed)
@@ -266,18 +418,18 @@ fn status() -> std::io::Result<()> {
             .unwrap_or(false);
         let (registered, current) = if matches!(target.shape, Shape::Dropped) {
             // The file being in the directory is the whole of it.
-            let dropped = home().map(|h| h.join(target.config).join(target.file));
+            let dropped = home
+                .as_ref()
+                .map(|h| h.join(target.config).join(target.file));
             let body = dropped.and_then(|p| std::fs::read_to_string(p).ok());
             (body.is_some(), body.as_deref() == Some(target.body))
         } else {
-            let registered = home()
-                .map(|h| h.join(target.config))
-                .and_then(|c| std::fs::read_to_string(c).ok())
-                .map(|text| text.contains(&installed.display().to_string()))
-                .unwrap_or(false);
+            let registered = home.as_ref().is_some_and(|h| registered(&target, &dir, h));
             (registered, current)
         };
+        let here = home.as_ref().is_some_and(|h| present(&target, h));
         let state = match (registered, current) {
+            (false, _) if !here => "not present",
             (false, _) => "not installed",
             (true, false) => "installed, and older than this build: run install again",
             (true, true) => "installed",
@@ -291,11 +443,16 @@ fn status() -> std::io::Result<()> {
 
 fn install(args: &[String]) -> std::io::Result<()> {
     let dir = hooks_dir();
-    std::fs::create_dir_all(&dir)?;
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
+        // Asked for every agent, only the ones on this machine: an agent named on the
+        // command line is installed whether or not it is here yet.
+        if args.is_empty() && !present(&target, &home) {
+            println!("  {:<10} not present, skipped", target.agent);
+            continue;
+        }
         // Dropped hooks have no configuration to edit: the file itself goes
         // into the agent's plugin directory. The file is qoro's own and the
         // person never edits it, so missing or different means install.
@@ -307,22 +464,23 @@ fn install(args: &[String]) -> std::io::Result<()> {
             }
             continue;
         }
+        // Made here rather than up front, so an install that skips every agent leaves
+        // nothing behind.
+        std::fs::create_dir_all(&dir)?;
         let script = dir.join(target.file);
         std::fs::write(&script, target.body)?;
         if target.file.ends_with(".sh") {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
         }
-        let config = home.join(target.config);
-        match edit(&config, &target, &script) {
-            Ok(true) => println!(
-                "  {:<10} installed, and {} updated",
-                target.agent, target.config
-            ),
+        let (config, at_root) = config_of(&target, &home);
+        let shown = config.strip_prefix(&home).unwrap_or(&config).display();
+        match edit(&config, &target, &script, at_root) {
+            Ok(true) => println!("  {:<10} installed, and {shown} updated", target.agent),
             Ok(false) => println!("  {:<10} already installed", target.agent),
             Err(e) => println!(
-                "  {:<10} script written, {} not edited: {e}",
-                target.agent, target.config
+                "  {:<10} script written, {shown} not edited: {e}",
+                target.agent
             ),
         }
     }
@@ -356,23 +514,49 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
     };
     for target in wanted(args)? {
         let script = dir.join(target.file);
-        let config = home.join(target.config);
         if matches!(target.shape, Shape::Dropped) {
-            let dropped = config.join(target.file);
+            let dropped = home.join(target.config).join(target.file);
             match std::fs::remove_file(&dropped) {
                 Ok(()) => println!("  {:<10} removed from {}", target.agent, target.config),
                 Err(_) => println!("  {:<10} was not there", target.agent),
             }
             continue;
         }
-        match remove(&config, &script) {
-            Ok(true) => println!("  {:<10} removed from {}", target.agent, target.config),
-            Ok(false) => println!("  {:<10} was not there", target.agent),
-            Err(e) => println!("  {:<10} {} not edited: {e}", target.agent, target.config),
+        let mut removed = false;
+        for (config, outcome) in remove_everywhere(&target, &home, &script) {
+            let shown = config.strip_prefix(&home).unwrap_or(&config).display();
+            match outcome {
+                Ok(true) => {
+                    removed = true;
+                    println!("  {:<10} removed from {shown}", target.agent);
+                }
+                Ok(false) => {}
+                Err(e) => println!("  {:<10} {shown} not edited: {e}", target.agent),
+            }
+        }
+        if !removed {
+            println!("  {:<10} was not there", target.agent);
         }
         let _ = std::fs::remove_file(&script);
     }
     Ok(())
+}
+
+/// Take this hook out of every file an entry of it could be in, not only the one an
+/// install would pick now: Droid's pick changes when its `hooks.json` appears, and an entry
+/// left behind in the other file would point at a script uninstall deletes.
+fn remove_everywhere(
+    target: &Target,
+    home: &Path,
+    script: &Path,
+) -> Vec<(PathBuf, std::io::Result<bool>)> {
+    configs_of(target, home)
+        .into_iter()
+        .map(|(config, at_root)| {
+            let outcome = remove(&config, script, at_root);
+            (config, outcome)
+        })
+        .collect()
 }
 
 /// Read a configuration, or an empty object if there is not one yet.
@@ -388,68 +572,177 @@ fn read(config: &Path) -> std::io::Result<serde_json::Value> {
 
 /// Write a configuration back, keeping a copy of what was there.
 ///
-/// Written beside it and renamed over it, never truncated in place: an agent that
-/// re-reads its settings while they change, or a kill between truncate and write, would
-/// otherwise see an empty or half-written file. A linked config (a dotfile manager's)
-/// is written through to its target so the link survives, and the file keeps its mode,
-/// so a 0600 settings file holding a key stays 0600.
+/// When the value being written is exactly what one of those copies holds, the copy's own
+/// bytes go back rather than a fresh rendering of them. That is what makes an uninstall
+/// return a person's file as they wrote it, indentation, key order and all, instead of a
+/// reformatted file that means the same thing and shows up as a diff of every line.
+///
+/// The new content goes to a temporary file beside the real one and is renamed over it,
+/// so a crash or a full disk never leaves half a settings file. A symlinked configuration
+/// (a dotfiles checkout) is followed first, so the link survives and its target changes.
 fn write(config: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = config.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Where the bytes go: through a link, even one whose target is not there yet, so the
-    // link survives; a config that does not exist yet is itself.
-    let target =
-        std::fs::canonicalize(config).unwrap_or_else(|_| match std::fs::read_link(config) {
-            Ok(to) => config.parent().map_or(to.clone(), |dir| dir.join(&to)),
-            Err(_) => config.to_path_buf(),
+    // Looked up before this write's own copy is taken, so that copy can never be the one
+    // that is chosen and can never have overwritten the one that should be.
+    let text = kept_copy_of(config, value)
+        .map_or_else(|| serde_json::to_string_pretty(value).map(|t| t + "\n"), Ok)?;
+    let real = link_target(config);
+    // A file this process cannot write is the person saying no (read-only, or owned by
+    // somebody else). The rename below asks only the directory, so it would replace the
+    // file anyway; refuse, as a plain write would have, and before any copy is taken, so
+    // a refused install leaves nothing behind. Probed by opening it for writing, without
+    // truncating, because the permission bits alone do not say who may write.
+    if real.exists()
+        && let Err(e) = std::fs::OpenOptions::new().write(true).open(&real)
+    {
+        return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "it is read-only")
+        } else {
+            e
         });
+    }
     // A copy before every write, not only the first: the second write is the one that
     // happens after a person has spent an afternoon on the file. Beside the path the
     // person knows, not beside a link's target, which may sit in a dotfiles repository.
     if config.exists() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let backup = config.with_extension(format!("qoro-backup-{stamp}"));
-        std::fs::copy(config, &backup)?;
+        keep_copy(config)?;
     }
-    // Created with the original's mode rather than chmod'ed afterwards, so the key in
-    // a private file is never readable by others for the moment in between.
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let original = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    let staged = target.with_extension("qoro-new");
-    let _ = std::fs::remove_file(&staged);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(original.as_ref().map_or(0o666, |p| p.mode() & 0o7777))
-        .open(&staged)
-        .and_then(|mut file| {
-            file.write_all((serde_json::to_string_pretty(value)? + "\n").as_bytes())?;
-            file.sync_all()
-        })
-        // The umask may have narrowed it; the original's exact mode is what it keeps.
-        .and_then(|()| match &original {
-            Some(mode) => std::fs::set_permissions(&staged, mode.clone()),
-            None => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&staged, &target));
+    if let Some(parent) = real.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = real
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = real.with_file_name(format!(".{name}.qoro-{}", std::process::id()));
+    // The mode the file already has, when it exists. A new file gets whatever the umask
+    // gives any new file, so a person with `umask 077` gets 0600 and not a mode of ours.
+    let existing = std::fs::metadata(&real).ok().map(|m| m.permissions());
+    // A leftover from a write that died half way would make the exclusive create fail.
+    let _ = std::fs::remove_file(&temp);
+    let written = (|| {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Created with the file's own mode, so a 0600 settings file holding a token is
+        // never readable by others, not even for the moment before the rename.
+        if let Some(permissions) = &existing {
+            options.mode(permissions.mode() & 0o7777);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        // The umask may have narrowed the mode on create; the file keeps what it had.
+        if let Some(permissions) = existing {
+            file.set_permissions(permissions)?;
+        }
+        std::fs::rename(&temp, &real)
+    })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&temp);
     }
     written
 }
 
+/// The file a configuration path names, following symlinks even when the last one
+/// dangles, so the link survives a write and its target is what is created or changed.
+fn link_target(config: &Path) -> PathBuf {
+    let mut path = config.to_path_buf();
+    // Bounded, so a symlink loop is a write to the last link rather than a hang.
+    for _ in 0..40 {
+        match std::fs::read_link(&path) {
+            Ok(next) if next.is_absolute() => path = next,
+            Ok(next) => {
+                path = path
+                    .parent()
+                    .map_or_else(|| next.clone(), |parent| parent.join(&next))
+            }
+            Err(_) => break,
+        }
+    }
+    path
+}
+
+/// What a kept copy is called after the file's stem.
+const BACKUP: &str = "qoro-backup-";
+
+/// How many of the newest kept copies stay, beside the oldest.
+const KEPT_NEWEST: usize = 3;
+
+/// Copy a configuration aside before it is changed, then prune the copies.
+///
+/// The oldest copy is always kept, because it is the file as the person had it before qoro
+/// first touched it, which is what an uninstall gives back. Past that only the newest few
+/// stay: a copy per write, unpruned, is a directory that fills up with them.
+fn keep_copy(config: &Path) -> std::io::Result<()> {
+    // Nanoseconds, so an install and an uninstall in the same second keep two copies
+    // rather than the second overwriting the original.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::fs::copy(config, config.with_extension(format!("{BACKUP}{stamp}")))?;
+    let mut copies = kept_copies(config);
+    if copies.len() > KEPT_NEWEST + 1 {
+        copies.sort_unstable_by_key(|c| c.0);
+        let excess = copies.len() - KEPT_NEWEST - 1;
+        for (_, path) in copies.drain(1..=excess) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Every kept copy of this file, with its stamp, in no particular order.
+fn kept_copies(config: &Path) -> Vec<(u128, PathBuf)> {
+    let (Some(stem), Some(parent)) = (config.file_stem(), config.parent()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.{BACKUP}", stem.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stamp = name.strip_prefix(&prefix)?.parse().ok()?;
+            Some((stamp, entry.path()))
+        })
+        .collect()
+}
+
+/// The newest kept copy of this file whose content is `value`, as its original bytes.
+fn kept_copy_of(config: &Path, value: &serde_json::Value) -> Option<String> {
+    let mut copies = kept_copies(config);
+    copies.sort_unstable_by_key(|c| std::cmp::Reverse(c.0));
+    copies.into_iter().find_map(|(_, path)| {
+        let text = std::fs::read_to_string(path).ok()?;
+        // Read the way `read` reads a configuration: a blank file is an empty object.
+        let parsed: serde_json::Value = if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&text).ok()?
+        };
+        (&parsed == value).then_some(text)
+    })
+}
+
 /// Add this hook to a configuration. Answers whether anything changed.
-fn edit(config: &Path, target: &Target, script: &Path) -> std::io::Result<bool> {
+///
+/// `at_root` is a file whose event map is the whole file rather than its `hooks` key.
+fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io::Result<bool> {
     let mut root = read(config)?;
     let path = script.display().to_string();
     let changed = match &target.shape {
         Shape::Nested { events, matcher } => {
-            let hooks = object(&mut root, "hooks");
+            let hooks = if at_root {
+                object_root(&mut root)
+            } else {
+                object(&mut root, "hooks")
+            };
             let mut changed = false;
             for Event(event, argument) in events.iter() {
                 let command = match argument {
@@ -483,9 +776,9 @@ fn edit(config: &Path, target: &Target, script: &Path) -> std::io::Result<bool> 
             }
             changed
         }
-        Shape::Flat { events } => {
+        Shape::Flat { events, versioned } => {
             // Cursor's file carries a version of its own schema, and refuses one without.
-            if root.get("version").is_none() {
+            if *versioned && root.get("version").is_none() {
                 object_root(&mut root).insert("version".into(), serde_json::json!(1));
             }
             let hooks = object(&mut root, "hooks");
@@ -517,25 +810,38 @@ fn edit(config: &Path, target: &Target, script: &Path) -> std::io::Result<bool> 
 ///
 /// Recognised by the path it points at, which is why the script goes in a directory of its
 /// own: an entry mentioning that path is one this put there, and nothing else in the file
-/// can be mistaken for it.
-fn remove(config: &Path, script: &Path) -> std::io::Result<bool> {
+/// can be mistaken for it. Only what this emptied is taken away with it: an event list, or
+/// the `hooks` object, left holding nothing because the entry was the last thing in it. An
+/// empty list the person had for any other event stays; one they had for the event this
+/// registered is taken away with the entry, because nothing tells it apart from one this
+/// created. A file with no kept copy at all was created by the install; when it holds
+/// nothing of the person's afterwards it is removed rather than left as `{}`.
+fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> {
     if !config.exists() {
         return Ok(false);
     }
     let mut root = read(config)?;
     let path = script.display().to_string();
     let mut changed = false;
-    if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for (_, list) in hooks.iter_mut() {
+    let hooks = if at_root {
+        root.as_object_mut()
+    } else {
+        root.get_mut("hooks").and_then(|h| h.as_object_mut())
+    };
+    let mut hooks_emptied = false;
+    if let Some(hooks) = hooks {
+        let mut emptied = Vec::new();
+        for (event, list) in hooks.iter_mut() {
             let Some(groups) = list.as_array_mut() else {
                 continue;
             };
             let before = groups.len();
+            let mut touched = false;
             for group in groups.iter_mut() {
                 if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                     let was = inner.len();
                     inner.retain(|entry| !says(entry, &path));
-                    changed |= inner.len() != was;
+                    touched |= inner.len() != was;
                 }
             }
             // A group left holding nothing is a group this emptied.
@@ -547,9 +853,22 @@ fn remove(config: &Path, script: &Path) -> std::io::Result<bool> {
                         .map(|h| !h.is_empty())
                         .unwrap_or(true)
             });
-            changed |= groups.len() != before;
+            touched |= groups.len() != before;
+            if touched && groups.is_empty() {
+                emptied.push(event.clone());
+            }
+            changed |= touched;
         }
-        hooks.retain(|_, list| list.as_array().map(|l| !l.is_empty()).unwrap_or(true));
+        for event in emptied {
+            hooks.remove(&event);
+        }
+        hooks_emptied = changed && hooks.is_empty();
+    }
+    if hooks_emptied
+        && !at_root
+        && let Some(root) = root.as_object_mut()
+    {
+        root.remove("hooks");
     }
     if let Some(plugins) = root.get_mut("plugin").and_then(|p| p.as_array_mut()) {
         let before = plugins.len();
@@ -557,9 +876,25 @@ fn remove(config: &Path, script: &Path) -> std::io::Result<bool> {
         changed |= plugins.len() != before;
     }
     if changed {
-        write(config, &root)?;
+        // No kept copy at all means no write ever found the file there before it: the
+        // install created it. Holding nothing of the person's, it goes.
+        if holds_nothing(&root) && kept_copies(config).is_empty() {
+            // The file, not a link to it: a symlinked configuration keeps its link, left
+            // dangling again the way the install found it.
+            std::fs::remove_file(link_target(config))?;
+        } else {
+            write(config, &root)?;
+        }
     }
     Ok(changed)
+}
+
+/// Whether a configuration holds nothing but what an install would have put in a file it
+/// created: nothing, or Cursor's schema version.
+fn holds_nothing(root: &serde_json::Value) -> bool {
+    root.as_object().is_some_and(|o| {
+        o.is_empty() || (o.len() == 1 && o.get("version") == Some(&serde_json::json!(1)))
+    })
 }
 
 /// Whether anything in this list points at our script.
@@ -675,7 +1010,7 @@ mod tests {
         std::fs::write(&config, serde_json::to_string(&existing()).expect("json")).expect("write");
         let script = dir.path().join("qoro-hook.sh");
 
-        assert!(edit(&config, &target("claude"), &script).expect("install"));
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
 
@@ -720,10 +1055,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
         let script = dir.path().join("qoro-hook.sh");
-        assert!(edit(&config, &target("claude"), &script).expect("install"));
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         let once = std::fs::read_to_string(&config).expect("read");
         assert!(
-            !edit(&config, &target("claude"), &script).expect("install again"),
+            !edit(&config, &target("claude"), &script, false).expect("install again"),
             "the second install reported a change"
         );
         assert_eq!(once, std::fs::read_to_string(&config).expect("read"));
@@ -736,9 +1071,9 @@ mod tests {
         let config = dir.path().join("settings.json");
         std::fs::write(&config, serde_json::to_string(&existing()).expect("json")).expect("write");
         let script = dir.path().join("qoro-hook.sh");
-        edit(&config, &target("claude"), &script).expect("install");
+        edit(&config, &target("claude"), &script, false).expect("install");
 
-        assert!(remove(&config, &script).expect("uninstall"));
+        assert!(remove(&config, &script, false).expect("uninstall"));
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
         assert_eq!(after["model"], "opus");
@@ -749,7 +1084,7 @@ mod tests {
         // The events that held nothing but ours are gone rather than left empty.
         assert!(after["hooks"].get("SessionEnd").is_none(), "{after}");
         // And taking it out twice is not an error.
-        assert!(!remove(&config, &script).expect("uninstall again"));
+        assert!(!remove(&config, &script, false).expect("uninstall again"));
     }
 
     /// The flat shape and the plugin shape are written the way their agent reads them.
@@ -760,7 +1095,7 @@ mod tests {
 
         // Cursor: a version, and entries with nothing around them.
         let cursor = dir.path().join("cursor.json");
-        edit(&cursor, &target("cursor"), &script).expect("install");
+        edit(&cursor, &target("cursor"), &script, false).expect("install");
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cursor).expect("read")).expect("json");
         assert_eq!(after["version"], 1, "cursor refuses a file with no version");
@@ -805,7 +1140,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &config).expect("link");
         let script = dir.path().join("qoro-hook.sh");
 
-        assert!(edit(&config, &target("claude"), &script).expect("install"));
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         assert!(
             std::fs::symlink_metadata(&config)
                 .expect("stat")
@@ -893,7 +1228,7 @@ mod tests {
         let config = dir.path().join("settings.json");
         std::fs::write(&config, "{ this is not json").expect("write");
         let script = dir.path().join("qoro-hook.sh");
-        let err = edit(&config, &target("claude"), &script).expect_err("not JSON");
+        let err = edit(&config, &target("claude"), &script, false).expect_err("not JSON");
         assert!(err.to_string().contains("valid JSON"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&config).expect("read"),
@@ -997,5 +1332,482 @@ mod tests {
         assert!(!on_path_in("codex", &path));
         // An empty entry in a path is not the current directory to look in.
         assert!(!on_path_in("claude", "::"));
+    }
+
+    /// A file a person wrote by hand, with their own indentation, key order and an empty
+    /// list of their own, none of which a JSON library would reproduce.
+    const HANDWRITTEN: &str = "{\n    \"zeta\": true,\n    \"alpha\": [1, 2],\n    \"hooks\": {\n        \"PreToolUse\": [],\n        \"Stop\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"~/mine.sh\" } ] } ]\n    }\n}\n";
+
+    /// Installing and then uninstalling a session hook gives back the file byte for byte,
+    /// for every agent that takes one, whether or not the file had a `hooks` key.
+    #[test]
+    fn a_session_hook_round_trip_leaves_the_file_exactly_as_it_was() {
+        for agent in ["copilot", "droid", "qwen", "qodercli"] {
+            for original in [HANDWRITTEN, "{ \"model\":\"x\" }\n"] {
+                let home = tempfile::tempdir().expect("a home");
+                let t = target(agent);
+                let (config, at_root) = config_of(&t, home.path());
+                assert!(!at_root, "{agent}: no hooks.json was made");
+                std::fs::create_dir_all(config.parent().expect("a parent")).expect("dir");
+                std::fs::write(&config, original).expect("write");
+                let script = home.path().join(t.file);
+
+                assert!(
+                    edit(&config, &t, &script, at_root).expect("install"),
+                    "{agent}"
+                );
+                let installed = std::fs::read_to_string(&config).expect("read");
+                assert!(installed.contains(t.file), "{agent}: {installed}");
+                assert!(
+                    remove(&config, &script, at_root).expect("uninstall"),
+                    "{agent}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&config).expect("read"),
+                    original,
+                    "{agent}: the file came back different"
+                );
+            }
+        }
+    }
+
+    /// Each session hook is written in the shape its agent reads, for SessionStart only.
+    #[test]
+    fn each_session_hook_lands_where_and_how_its_agent_reads_it() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("qoro-session.sh");
+        let installed = |agent: &str| {
+            let config = dir.path().join(format!("{agent}.json"));
+            edit(&config, &target(agent), &script, false).expect("install");
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(&config).expect("read"),
+            )
+            .expect("json")
+        };
+
+        // Copilot: flat entries in its settings, and no version key: that belongs to a
+        // hook file, not to a settings file.
+        let copilot = installed("copilot");
+        assert!(copilot.get("version").is_none(), "{copilot}");
+        let entry = &copilot["hooks"]["SessionStart"][0];
+        assert!(
+            entry.get("hooks").is_none(),
+            "copilot has no wrapper: {entry}"
+        );
+        assert_eq!(entry["command"], script.display().to_string());
+
+        // Droid: nested, no matcher. Qwen and Qoder: nested, matching everything.
+        let droid = installed("droid");
+        let group = &droid["hooks"]["SessionStart"][0];
+        assert!(group.get("matcher").is_none(), "{group}");
+        assert_eq!(group["hooks"][0]["type"], "command");
+        for agent in ["qwen", "qodercli"] {
+            let value = installed(agent);
+            assert_eq!(value["hooks"]["SessionStart"][0]["matcher"], "*", "{value}");
+        }
+
+        // Every one of them reports the session only, so one event and no argument.
+        for agent in ["copilot", "droid", "qwen", "qodercli"] {
+            let t = target(agent);
+            let events = match &t.shape {
+                Shape::Nested { events, .. } | Shape::Flat { events, .. } => events,
+                Shape::Dropped => panic!("{agent} edits a configuration"),
+            };
+            assert!(
+                matches!(events, [Event("SessionStart", None)]),
+                "{agent} registers more than SessionStart"
+            );
+            assert_eq!(t.body, SESSION_HOOK, "{agent} ships its own script");
+        }
+    }
+
+    /// Droid reads `hooks.json` instead of `settings.json` whenever there is one, and there
+    /// the event map is the whole file. An entry written to the file it ignores would be an
+    /// install that never runs.
+    #[test]
+    fn droid_writes_to_hooks_json_when_the_person_keeps_one() {
+        let home = tempfile::tempdir().expect("a home");
+        let droid = target("droid");
+        assert_eq!(
+            config_of(&droid, home.path()),
+            (home.path().join(".factory/settings.json"), false)
+        );
+
+        let hooks_json = home.path().join(".factory/hooks.json");
+        std::fs::create_dir_all(hooks_json.parent().expect("a parent")).expect("dir");
+        let original = "{\"PreToolUse\":[{\"matcher\":\"Execute\",\"hooks\":[{\"type\":\"command\",\"command\":\"/a.sh\"}]}]}";
+        std::fs::write(&hooks_json, original).expect("write");
+        let (config, at_root) = config_of(&droid, home.path());
+        assert_eq!((config.clone(), at_root), (hooks_json.clone(), true));
+
+        let script = home.path().join(droid.file);
+        assert!(edit(&config, &droid, &script, at_root).expect("install"));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert!(
+            value.get("hooks").is_none(),
+            "no wrapper in hooks.json: {value}"
+        );
+        assert_eq!(
+            value["SessionStart"][0]["hooks"][0]["command"],
+            script.display().to_string()
+        );
+        assert_eq!(value["PreToolUse"][0]["hooks"][0]["command"], "/a.sh");
+        assert!(registered(&droid, home.path(), home.path()));
+
+        assert!(remove(&config, &script, at_root).expect("uninstall"));
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), original);
+    }
+
+    /// The session hook reads the id out of the payload, reports it alone, and says
+    /// nothing for any other event or for an id that is not only an id.
+    #[test]
+    fn the_session_hook_reports_the_id_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("dir");
+        let log = dir.path().join("argv");
+        // A stand-in qoro that records its argv.
+        let qoro = bin.join("qoro");
+        std::fs::write(
+            &qoro,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&qoro, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(&hook, SESSION_HOOK).expect("write");
+
+        let run = |payload: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&hook)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("QORO_TERMINAL", "3")
+                .env("QORO_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(
+                child.wait().expect("wait").success(),
+                "the hook must exit zero"
+            );
+        };
+        run(r#"{"hook_event_name":"SessionStart","session_id":"abc-123","source":"startup"}"#);
+        run(r#"{"hookEventName":"sessionStart","sessionId":"def_456"}"#);
+        run(r#"{"hook_event_name":"PreToolUse","session_id":"nope"}"#);
+        run(r#"{"hook_event_name":"SessionStart","session_id":"a b; rm -rf /"}"#);
+        run(r#"{"hook_event_name":"SessionStart","session_id":"--resume"}"#);
+        run(r#"{"hook_event_name":"SessionStart","session_id":"abcé"}"#);
+        run(r#"{"hook_event_name":"SessionStart","session_id":"٣٤"}"#);
+        run("not json");
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            lines,
+            "hook-report --session-id abc-123\nhook-report --session-id def_456\n"
+        );
+    }
+
+    /// An entry written into Droid's settings before its `hooks.json` appeared is still
+    /// seen by status and taken out by uninstall, rather than left pointing at a deleted
+    /// script while status says nothing is installed and a reinstall adds a second one.
+    #[test]
+    fn droid_entry_in_settings_is_found_and_removed_after_hooks_json_appears() {
+        let home = tempfile::tempdir().expect("a home");
+        let droid = target("droid");
+        let script = home.path().join(droid.file);
+        let (settings, at_root) = config_of(&droid, home.path());
+        assert!(!at_root);
+        assert!(edit(&settings, &droid, &script, at_root).expect("install"));
+
+        let hooks_json = home.path().join(".factory/hooks.json");
+        std::fs::write(&hooks_json, "{}\n").expect("write");
+        assert!(
+            registered(&droid, home.path(), home.path()),
+            "status must still see the entry in settings.json"
+        );
+        let outcomes = remove_everywhere(&droid, home.path(), &script);
+        assert!(
+            outcomes
+                .iter()
+                .any(|(path, r)| path == &settings && matches!(r, Ok(true))),
+            "{outcomes:?}"
+        );
+        assert!(!registered(&droid, home.path(), home.path()));
+        assert_eq!(std::fs::read_to_string(&hooks_json).expect("read"), "{}\n");
+    }
+
+    /// A configuration directory moved by the agent's own variable is where the entry goes.
+    #[test]
+    fn a_moved_configuration_directory_is_followed() {
+        let home = Path::new("/home/u");
+        let moved = Some(PathBuf::from("/elsewhere/copilot"));
+        assert_eq!(
+            config_path_in(&target("copilot"), home, moved),
+            PathBuf::from("/elsewhere/copilot/settings.json")
+        );
+        assert_eq!(
+            config_path_in(&target("qodercli"), home, None),
+            PathBuf::from("/home/u/.qoder/settings.json")
+        );
+        for (agent, var) in [
+            ("copilot", "COPILOT_HOME"),
+            ("qwen", "QWEN_HOME"),
+            ("qodercli", "QODER_CONFIG_DIR"),
+        ] {
+            assert_eq!(target(agent).home_env, Some(var), "{agent}");
+        }
+    }
+
+    /// An agent is present by its binary or by its configuration directory, and neither
+    /// means absent: an unnamed install skips it rather than creating its directory.
+    #[test]
+    fn an_agent_with_neither_binary_nor_configuration_is_not_present() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("dir");
+        let path = bin.display().to_string();
+        let qwen = target("qwen");
+        assert!(!present_in(&qwen, &home, &path));
+        std::fs::create_dir_all(home.join(".qwen")).expect("dir");
+        assert!(present_in(&qwen, &home, &path), "its directory is enough");
+        std::fs::write(bin.join("qodercli"), "#!/bin/sh\n").expect("write");
+        assert!(
+            present_in(&target("qodercli"), &home, &path),
+            "its binary is enough"
+        );
+    }
+
+    /// A configuration that did not exist before the install does not survive the
+    /// uninstall as an empty `{}`.
+    #[test]
+    fn a_file_the_install_created_is_removed_by_the_uninstall() {
+        let home = tempfile::tempdir().expect("a home");
+        let qwen = target("qwen");
+        let config = home.path().join(qwen.config);
+        let script = home.path().join(qwen.file);
+        assert!(edit(&config, &qwen, &script, false).expect("install"));
+        assert!(config.exists());
+        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(
+            !config.exists(),
+            "an empty file the person never had was left"
+        );
+
+        // A file that was `{}` before the install is theirs, and comes back.
+        std::fs::write(&config, "{ }\n").expect("write");
+        edit(&config, &qwen, &script, false).expect("install");
+        remove(&config, &script, false).expect("uninstall");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), "{ }\n");
+    }
+
+    /// A symlinked configuration keeps its link, and the target keeps its permissions.
+    #[test]
+    fn writing_follows_a_symlink_and_keeps_the_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let real = dir.path().join("dotfiles-settings.json");
+        std::fs::write(&real, "{\"a\": 1}\n").expect("write");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let script = dir.path().join("qoro.sh");
+        assert!(edit(&link, &target("qwen"), &script, false).expect("install"));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a file"
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("read")
+                .contains("qoro.sh")
+        );
+        let mode = std::fs::metadata(&real).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Kept copies are pruned to the oldest plus the newest few, and the oldest (the
+    /// file as it was before qoro first touched it) is the one that survives.
+    #[test]
+    fn kept_copies_are_pruned_to_the_oldest_and_the_newest_three() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        std::fs::write(&config, "{\"original\": true}\n").expect("write");
+        for i in 0..8 {
+            write(&config, &serde_json::json!({ "n": i })).expect("write");
+        }
+        let mut copies = kept_copies(&config);
+        assert_eq!(copies.len(), KEPT_NEWEST + 1, "{copies:?}");
+        copies.sort_unstable_by_key(|c| c.0);
+        assert_eq!(
+            std::fs::read_to_string(&copies[0].1).expect("read"),
+            "{\"original\": true}\n"
+        );
+    }
+
+    /// A configuration that was an empty file (or only whitespace) before the install is
+    /// theirs, and comes back exactly: its existence alone decides things, Droid's
+    /// `hooks.json` among them.
+    #[test]
+    fn an_empty_or_blank_original_comes_back_as_it_was() {
+        for original in ["", "  \n"] {
+            let dir = tempfile::tempdir().expect("a directory");
+            let config = dir.path().join("hooks.json");
+            std::fs::write(&config, original).expect("write");
+            let script = dir.path().join("qoro.sh");
+            let droid = target("droid");
+            assert!(edit(&config, &droid, &script, true).expect("install"));
+            assert!(remove(&config, &script, true).expect("uninstall"));
+            assert_eq!(
+                std::fs::read_to_string(&config).ok().as_deref(),
+                Some(original),
+                "{original:?}"
+            );
+        }
+    }
+
+    /// Cursor's file, created by the install, goes with the uninstall: the version key
+    /// this wrote into it is not the person's.
+    #[test]
+    fn a_cursor_file_the_install_created_is_removed_by_the_uninstall() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("hooks.json");
+        let script = dir.path().join("qoro.sh");
+        assert!(edit(&config, &target("cursor"), &script, false).expect("install"));
+        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(!config.exists(), "{:?}", std::fs::read_to_string(&config));
+    }
+
+    /// A dangling symlink stays a symlink, and the file it points at is created.
+    #[test]
+    fn a_dangling_symlink_keeps_its_link_and_gets_its_target() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink("dotfiles/qwen/settings.json", &link).expect("symlink");
+        let script = dir.path().join("qoro.sh");
+        assert!(edit(&link, &target("qwen"), &script, false).expect("install"));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a file"
+        );
+        let real = dir.path().join("dotfiles/qwen/settings.json");
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("the target was created")
+                .contains("qoro.sh")
+        );
+        // Uninstalled, it is as it was: the link still there, dangling again.
+        assert!(remove(&link, &script, false).expect("uninstall"));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link survives the uninstall")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!real.exists(), "the file the install created is gone");
+    }
+
+    /// A leading `~` in an agent's home variable is the person's home, as a shell would
+    /// have expanded it.
+    #[test]
+    fn a_tilde_in_a_home_variable_is_the_home_directory() {
+        let home = Path::new("/home/u");
+        for (value, expected) in [
+            ("~/cp", "/home/u/cp/settings.json"),
+            ("~", "/home/u/settings.json"),
+            ("/abs/cp", "/abs/cp/settings.json"),
+        ] {
+            assert_eq!(
+                config_path_in(&target("copilot"), home, Some(PathBuf::from(value))),
+                PathBuf::from(expected),
+                "{value}"
+            );
+        }
+    }
+
+    /// A settings file the person made read-only is refused, and left exactly as it is:
+    /// a rename would replace it regardless, because only the directory's permission is
+    /// asked.
+    #[test]
+    fn a_read_only_configuration_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        std::fs::write(&config, "{\"mine\": true}\n").expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let script = dir.path().join("qoro.sh");
+        let err = edit(&config, &target("qwen"), &script, false).expect_err("read-only");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            "{\"mine\": true}\n"
+        );
+        let mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o444);
+        assert!(
+            kept_copies(&config).is_empty(),
+            "a refused install left a backup behind"
+        );
+    }
+
+    /// A configuration the install creates gets the mode the person's umask gives any new
+    /// file, not a mode of qoro's choosing: with `umask 077` it is 0600.
+    ///
+    /// The umask is process-wide, so the check runs in a child of this test binary with
+    /// the umask set there, rather than changing it under every other test running now.
+    #[test]
+    fn a_created_configuration_follows_the_umask() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"umask 077 && exec "$0" --exact hooks::tests::created_file_mode_under_umask_077 --ignored"#)
+            .arg(&exe)
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the created file was not 0600 under umask 077: {stdout}"
+        );
+        // A renamed or filtered-out test runs nothing and succeeds; it must have run.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by a_created_configuration_follows_the_umask with umask 077 set"]
+    fn created_file_mode_under_umask_077() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        let script = dir.path().join("qoro.sh");
+        assert!(edit(&config, &target("qwen"), &script, false).expect("install"));
+        let mode = std::fs::metadata(&config)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
