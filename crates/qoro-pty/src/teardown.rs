@@ -140,10 +140,16 @@ impl Containment {
     /// signal whatever unrelated process group had inherited that number.
     ///
     /// The probe costs 248 nanoseconds, measured, so there was never anything to buy.
+    ///
+    /// Alive is not enough either: the member has to still be in the group. One that left
+    /// it (`setsid`, `setpgid`, as daemonizing tools do) kept a group "alive" after its
+    /// number was free, and teardown signalled whatever group had the number by then.
+    /// `in_group` is that check, `qoro_pty::sys::in_group` in production.
     pub fn groups_to_signal(
         &self,
         round: usize,
         still_alive: &dyn Fn(Pid, u64) -> bool,
+        in_group: &dyn Fn(Pid, u64, Pgid) -> bool,
     ) -> Vec<Pgid> {
         let _ = round;
         // Group once and probe each pid at most once. The obvious nested version is
@@ -155,7 +161,11 @@ impl Containment {
         }
         by_group
             .into_iter()
-            .filter(|(_, members)| members.iter().any(|o| still_alive(o.pid, o.start_time)))
+            .filter(|(pgid, members)| {
+                members.iter().any(|o| {
+                    still_alive(o.pid, o.start_time) && in_group(o.pid, o.start_time, *pgid)
+                })
+            })
             .map(|(pgid, _)| pgid)
             .collect()
     }
@@ -180,6 +190,7 @@ pub fn next_step(
     child_reaped: bool,
     containment: &Containment,
     still_alive: &dyn Fn(Pid, u64) -> bool,
+    in_group: &dyn Fn(Pid, u64, Pgid) -> bool,
 ) -> Step {
     // Reaping the child is necessary but not sufficient. Closing here was the first
     // version, and it meant that the ordinary case, a user typing `exit`, signalled nothing
@@ -204,7 +215,7 @@ pub fn next_step(
     }
     match plan(round) {
         Some(signal) => {
-            let groups = containment.groups_to_signal(round, still_alive);
+            let groups = containment.groups_to_signal(round, still_alive, in_group);
             if groups.is_empty() {
                 Step::Reap
             } else {
@@ -244,6 +255,9 @@ mod tests {
     fn none_alive(_: Pid, _: u64) -> bool {
         false
     }
+    fn in_all(_: Pid, _: u64, _: Pgid) -> bool {
+        true
+    }
 
     #[test]
     fn the_containment_set_never_shrinks() {
@@ -263,7 +277,7 @@ mod tests {
         // survives kill(-leader_pgid). It must appear as a separate group here.
         let mut c = Containment::new();
         c.absorb([m(10, 10, 1), m(11, 11, 2)]);
-        let groups = c.groups_to_signal(0, &all_alive);
+        let groups = c.groups_to_signal(0, &all_alive, &in_all);
         assert!(groups.contains(&Pgid(10)));
         assert!(groups.contains(&Pgid(11)));
     }
@@ -274,8 +288,11 @@ mod tests {
         // is signalled 500 ms later and hits an unrelated process's whole group.
         let mut c = Containment::new();
         c.absorb([m(10, 10, 1)]);
-        assert_eq!(c.groups_to_signal(1, &none_alive), Vec::<Pgid>::new());
-        assert_eq!(c.groups_to_signal(1, &all_alive), vec![Pgid(10)]);
+        assert_eq!(
+            c.groups_to_signal(1, &none_alive, &in_all),
+            Vec::<Pgid>::new()
+        );
+        assert_eq!(c.groups_to_signal(1, &all_alive, &in_all), vec![Pgid(10)]);
     }
 
     #[test]
@@ -284,8 +301,19 @@ mod tests {
         // first round is the one with the oldest entries, not the freshest.
         let mut c = Containment::new();
         c.absorb([m(10, 10, 1)]);
-        assert!(c.groups_to_signal(0, &none_alive).is_empty());
-        assert_eq!(c.groups_to_signal(0, &all_alive), vec![Pgid(10)]);
+        assert!(c.groups_to_signal(0, &none_alive, &in_all).is_empty());
+        assert_eq!(c.groups_to_signal(0, &all_alive, &in_all), vec![Pgid(10)]);
+    }
+
+    /// A member that left its group (`setsid`, `setpgid`, as daemonizing tools do) does
+    /// not keep that group alive: the number may belong to a stranger's group by now.
+    #[test]
+    fn a_member_that_left_its_group_does_not_keep_the_group_signalled() {
+        let mut c = Containment::new();
+        c.absorb([m(20, 10, 1)]);
+        let left = |_: Pid, _: u64, _: Pgid| false;
+        assert!(c.groups_to_signal(0, &all_alive, &left).is_empty());
+        assert_eq!(c.groups_to_signal(0, &all_alive, &in_all), vec![Pgid(10)]);
     }
 
     #[test]
@@ -303,7 +331,10 @@ mod tests {
         let mut c = Containment::new();
         c.absorb([m(10, 10, 111)]);
         let recycled = |_: Pid, start: u64| start == 999;
-        assert_eq!(c.groups_to_signal(1, &recycled), Vec::<Pgid>::new());
+        assert_eq!(
+            c.groups_to_signal(1, &recycled, &in_all),
+            Vec::<Pgid>::new()
+        );
     }
 
     #[test]
@@ -311,13 +342,16 @@ mod tests {
         let t = Instant::now();
         let empty = Containment::new();
         assert!(matches!(
-            next_step(0, t, t, false, &empty, &all_alive),
+            next_step(0, t, t, false, &empty, &all_alive, &in_all),
             Step::Failed { .. }
         ));
         // After an enumeration, even one that found nothing, the machine proceeds.
         let mut captured = Containment::new();
         captured.absorb([]);
-        assert_eq!(next_step(0, t, t, false, &captured, &all_alive), Step::Reap);
+        assert_eq!(
+            next_step(0, t, t, false, &captured, &all_alive, &in_all),
+            Step::Reap
+        );
     }
 
     #[test]
@@ -331,7 +365,7 @@ mod tests {
             *probes.borrow_mut() += 1;
             true
         };
-        let groups = c.groups_to_signal(1, &counting);
+        let groups = c.groups_to_signal(1, &counting, &in_all);
         assert_eq!(groups.len(), 3);
         assert!(
             *probes.borrow() <= 500,
@@ -355,16 +389,19 @@ mod tests {
         c.absorb([m(10, 10, 1)]);
         // Not reaped yet: never close.
         assert!(!matches!(
-            next_step(0, t, t, false, &c, &all_alive),
+            next_step(0, t, t, false, &c, &all_alive, &in_all),
             Step::CloseMaster
         ));
         // Reaped, but a member of the containment set is still running: not done either.
         assert!(!matches!(
-            next_step(1, t, t, true, &c, &all_alive),
+            next_step(1, t, t, true, &c, &all_alive, &in_all),
             Step::CloseMaster
         ));
         // Reaped and nothing left on the terminal: close, and only now.
-        assert_eq!(next_step(3, t, t, true, &c, &none_alive), Step::CloseMaster);
+        assert_eq!(
+            next_step(3, t, t, true, &c, &none_alive, &in_all),
+            Step::CloseMaster
+        );
     }
 
     #[test]
@@ -374,7 +411,7 @@ mod tests {
         let t = Instant::now();
         let mut c = Containment::new();
         c.absorb([m(10, 10, 1), m(11, 11, 2)]);
-        let step = next_step(1, t, t, true, &c, &all_alive);
+        let step = next_step(1, t, t, true, &c, &all_alive, &in_all);
         assert_eq!(
             step,
             Step::SignalGroups {
@@ -388,7 +425,15 @@ mod tests {
     fn the_deadline_produces_a_reported_failure_not_a_silent_give_up() {
         let t = Instant::now();
         let c = Containment::new();
-        let step = next_step(0, t + TEARDOWN_DEADLINE * 2, t, false, &c, &all_alive);
+        let step = next_step(
+            0,
+            t + TEARDOWN_DEADLINE * 2,
+            t,
+            false,
+            &c,
+            &all_alive,
+            &in_all,
+        );
         assert!(matches!(step, Step::Failed { .. }));
     }
 

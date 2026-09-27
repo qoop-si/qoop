@@ -352,10 +352,27 @@ pub fn enumerate_session(sid: Pid) -> (Vec<Member>, usize) {
                 }
             }
             Some(_) => {}
-            None => opaque += 1,
+            // Only a member that exists and is not ours to read, which is the `sudo` job
+            // the count is for. One that exited or went between the two reads holds
+            // nothing, and counting it made a plain teardown warn about nothing.
+            // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+            None if unsafe { libc::kill(pid, 0) } != 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) =>
+            {
+                opaque += 1
+            }
+            None => {}
         }
     }
     (out, opaque)
+}
+
+/// Is this pid, with this start time, still in this process group?
+///
+/// The teardown guard for a member that left its group after it was recorded: alive is
+/// not enough, because the group's number may belong to a stranger by now.
+pub fn in_group(pid: Pid, start_time: u64, pgid: Pgid) -> bool {
+    group_and_start(pid) == Some((pgid.0, start_time))
 }
 
 /// A process's group and start time, read together.
@@ -478,6 +495,7 @@ pub fn cwd_of(pid: Pid) -> Option<std::path::PathBuf> {
     // `proc_pidinfo` with `PROC_PIDVNODEPATHINFO` fills a struct whose first member is the
     // current directory, path included. It refuses a process we do not own, which is the
     // same answer as not knowing.
+    // SAFETY: plain C data, for which all zero is a valid value.
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
     // SAFETY: info is a live, correctly sized buffer for PROC_PIDVNODEPATHINFO.
@@ -599,6 +617,7 @@ mod group_tests {
     fn a_group_holds_the_leader_and_what_it_started() {
         // Its own group, the way a shell puts a job in one. Without this the child inherits
         // the test runner's group and there is no group with its pid to ask about.
+        // SAFETY: the pre_exec closure only calls setpgid, which is async signal safe.
         let mut child = unsafe {
             use std::os::unix::process::CommandExt;
             std::process::Command::new("/bin/sh")
@@ -1169,6 +1188,46 @@ mod tests {
             "pid -1 would signal everything we can"
         );
     }
+
+    #[test]
+    fn a_process_is_in_its_own_group_and_not_in_another() {
+        let me = Pid(std::process::id() as i32);
+        let start = start_time_of(me).expect("this test's own process is readable");
+        // SAFETY: getpgrp takes nothing and cannot fail.
+        let mine = Pgid(unsafe { libc::getpgrp() });
+        assert!(in_group(me, start, mine));
+        assert!(!in_group(me, start, Pgid(mine.0 + 1)));
+        assert!(!in_group(me, start.wrapping_add(1), mine));
+    }
+
+    /// An exited, unreaped job of our own is not something that "could not be inspected":
+    /// it holds nothing, and counting it would make every such teardown log a warning.
+    /// Only a member we may not read (EPERM, a `sudo` job) counts.
+    #[test]
+    fn an_unreaped_member_of_our_own_is_not_counted_as_opaque() {
+        use std::os::unix::process::CommandExt;
+        // Its own session, and a background job whose parent then becomes `sleep`, which
+        // never reaps it.
+        // SAFETY: the pre_exec closure only calls setsid, which is async signal safe.
+        let mut child = unsafe {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 0.1 & exec sleep 3")
+                .pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn a session")
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (_, opaque) = enumerate_session(Pid(child.id() as i32));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(opaque, 0, "a zombie of our own was counted as opaque");
+    }
 }
 
 #[cfg(test)]
@@ -1437,6 +1496,8 @@ fn process_usage(pid: Pid) -> Option<(u64, u64)> {
         numer: u32,
         denom: u32,
     }
+    // SAFETY: the signature matches <mach/mach_time.h>: one pointer to a two-u32 struct,
+    // returning kern_return_t, which is an int.
     unsafe extern "C" {
         fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
     }
