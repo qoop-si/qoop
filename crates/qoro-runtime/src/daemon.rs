@@ -1622,14 +1622,15 @@ fn subscribe(
     true
 }
 
-/// Opencode conversation titles, read out of opencode's own database.
+/// Conversation titles, read out of the agent's own storage: opencode's
+/// database for `ses_` ids, Claude's transcript for everything else.
 ///
 /// Best effort and cached: the hook already reports the session id, and the
-/// title sits in opencode's storage next to that id, so the panel can name
+/// title sits in the agent's storage next to that id, so the panel can name
 /// the conversation the way the agent does. A rename arrives on its own
 /// because entries go stale after a minute. Anything unreadable (no database,
-/// unknown id, locked) reads as absent, never as an error: the panel falls
-/// back to the shortened id.
+/// no transcript, unknown id, locked) reads as absent, never as an error: the
+/// panel falls back to the shortened id.
 fn agent_title(session: Option<&str>) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1638,11 +1639,6 @@ fn agent_title(session: Option<&str>) -> Option<String> {
     static CACHE: OnceLock<Mutex<Titles>> = OnceLock::new();
     const TTL: Duration = Duration::from_secs(60);
     let id = session.filter(|s| !s.trim().is_empty())?;
-    // Other agents' ids never touch the cache or the database: a miss per
-    // poll per agent would be pure overhead for a title that cannot exist.
-    if !id.starts_with("ses_") {
-        return None;
-    }
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock()
         && let Some((title, at)) = cache.get(id)
@@ -1650,7 +1646,11 @@ fn agent_title(session: Option<&str>) -> Option<String> {
     {
         return title.clone();
     }
-    let title = opencode_session_title(id);
+    let title = if id.starts_with("ses_") {
+        opencode_session_title(id)
+    } else {
+        claude_session_title(id)
+    };
     if let Ok(mut cache) = cache.lock() {
         // Bounded: entries only refresh, so evict the stale tail past this.
         if cache.len() > 512 {
@@ -1708,6 +1708,77 @@ fn opencode_session_title_at(db: &Path, id: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
         .and_then(|t| t.lines().next())
         .map(str::to_string)
+}
+
+/// One title out of Claude's transcript for this session id, or nothing.
+fn claude_session_title(id: &str) -> Option<String> {
+    claude_transcript(id).and_then(|path| claude_session_title_at(&path))
+}
+
+/// `<projects>/<slug>/<id>.jsonl`: the id is the file name, so one stat per
+/// project directory finds it. `CLAUDE_CONFIG_DIR` first, as Claude reads it.
+/// An id that could climb out of the directory is refused up front.
+fn claude_transcript(id: &str) -> Option<PathBuf> {
+    if id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        roots.push(PathBuf::from(dir).join("projects"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".claude/projects"));
+    }
+    let file = format!("{id}.jsonl");
+    roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flat_map(|dirs| dirs.flatten())
+        .map(|slug| slug.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// The title Claude last wrote into this transcript: a `/rename` title
+/// (`custom-title`) over the generated one (`ai-title`). Claude re-appends
+/// both every few turns, so the tail carries the current pair and a
+/// transcript of any size costs one bounded read.
+///
+/// ponytail: tail window only; a session whose last title sits further back
+/// than this reads as untitled until Claude writes the pair again.
+fn claude_session_title_at(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 1 << 20;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut tail = Vec::new();
+    file.take(TAIL).read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let (mut custom, mut generated) = (None, None);
+    for line in tail.lines().rev() {
+        if custom.is_some() {
+            break;
+        }
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (slot, key) = match value.get("type").and_then(|t| t.as_str()) {
+            Some("custom-title") => (&mut custom, "customTitle"),
+            Some("ai-title") if generated.is_none() => (&mut generated, "aiTitle"),
+            _ => continue,
+        };
+        *slot = value
+            .get(key)
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .and_then(|t| t.lines().next())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+    }
+    custom.or(generated)
 }
 
 /// The wire name of a runtime state.
@@ -5329,7 +5400,7 @@ mod nudge_tests {
 
 #[cfg(test)]
 mod session_title_tests {
-    use super::opencode_session_title_at;
+    use super::{claude_session_title_at, opencode_session_title_at};
 
     fn fake_db_with(title: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5362,6 +5433,37 @@ mod session_title_tests {
             Some("Second line".to_string()),
             "a stored newline never reaches the row"
         );
+    }
+
+    /// Claude's transcript names the conversation: the newest generated
+    /// title, and a `/rename` title over it wherever the two sit.
+    #[test]
+    fn a_claude_transcript_resolves_to_its_newest_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("abc.jsonl");
+        let lines = [
+            r#"{"type":"ai-title","aiTitle":"Old title","sessionId":"abc"}"#,
+            r#"{"type":"user","message":{"content":"mentions \"ai-title\" in text"}}"#,
+            r#"{"type":"ai-title","aiTitle":"New title","sessionId":"abc"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).expect("write");
+        assert_eq!(
+            claude_session_title_at(&path),
+            Some("New title".to_string())
+        );
+
+        let renamed = [
+            r#"{"type":"custom-title","customTitle":"my-rename","sessionId":"abc"}"#,
+            r#"{"type":"ai-title","aiTitle":"New title","sessionId":"abc"}"#,
+        ];
+        std::fs::write(&path, renamed.join("\n")).expect("write");
+        assert_eq!(
+            claude_session_title_at(&path),
+            Some("my-rename".to_string())
+        );
+
+        std::fs::write(&path, r#"{"type":"user"}"#).expect("write");
+        assert_eq!(claude_session_title_at(&path), None);
     }
 }
 
