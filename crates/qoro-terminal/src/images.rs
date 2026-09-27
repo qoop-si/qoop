@@ -48,12 +48,28 @@ pub struct CapturedImage {
     pub bytes: Vec<u8>,
 }
 
-/// A Kitty chunked transmission in progress: the first chunk's control and the
-/// payload so far. Emitted whole on `m=0`, never in parts.
+/// A chunked transmission in progress: a Kitty chain's first control, or an iTerm2
+/// `MultipartFile=`'s arguments, and the payload so far. Emitted whole on Kitty's
+/// `m=0` or iTerm2's `FileEnd`, never in parts.
 struct Assembly {
+    protocol: ImageProtocol,
     control: Vec<u8>,
     payload: Vec<u8>,
 }
+
+/// The iTerm2 commands that carry a picture, each by its whole address, `=` included.
+/// `1337` alone also carries `ClearScrollback`, `StealFocus`, `Copy=` and the rest of
+/// iTerm2's commands, and capturing those as pictures forwarded them to the outer
+/// terminal untouched, clipboard writes past the policy gate included. The `;`
+/// matters too: `ESC ] 13371;...` is some other OSC. The last three are one picture
+/// cut into pieces (iTerm2 3.5, and `imgcat`'s default since): `MultipartFile=` with
+/// the arguments, `FilePart=` slices of one base64 stream, and a bare `FileEnd`.
+const ITERM2_ADDRESSES: [&[u8]; 4] = [
+    b"1337;File=",
+    b"1337;MultipartFile=",
+    b"1337;FilePart=",
+    b"1337;FileEnd",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -63,11 +79,9 @@ enum State {
     ApcKind,
     /// Inside a Kitty envelope, after `ESC _ G`.
     ApcBody,
-    /// `ESC ]` seen, matching `1337;File=` byte by byte.
-    OscKind {
-        matched: u8,
-    },
-    /// Inside an iTerm2 envelope, after `ESC ] 1337;File=`.
+    /// `ESC ]` seen, matching one of `ITERM2_ADDRESSES` byte by byte.
+    OscKind,
+    /// Inside an iTerm2 envelope, after its whole address.
     OscBody,
     /// Over budget or past deadline: swallowing until the terminator.
     Discarding {
@@ -166,7 +180,7 @@ impl ImageSniffer {
                 self.staged.push(b);
                 match b {
                     b'_' => self.state = State::ApcKind,
-                    b']' => self.state = State::OscKind { matched: 0 },
+                    b']' => self.state = State::OscKind,
                     0x1b => {
                         // The old ESC was ordinary text; the new one may open.
                         self.staged.clear();
@@ -195,7 +209,7 @@ impl ImageSniffer {
                 }
             }
             State::ApcBody => self.body_step(b, true, clean),
-            State::OscKind { matched } => {
+            State::OscKind => {
                 if b == 0x1b {
                     self.flush_to_clean(clean);
                     self.begin_stage();
@@ -203,26 +217,27 @@ impl ImageSniffer {
                     return;
                 }
                 self.staged.push(b);
-                // The whole address, `File=` included. `1337` alone also carries
-                // `ClearScrollback`, `StealFocus`, `Copy=` and the rest of iTerm2's
-                // commands, and capturing those as pictures forwarded them to the outer
-                // terminal untouched, clipboard writes past the policy gate included.
-                // The `;` matters too: `ESC ] 13371;...` is some other OSC.
-                const MAGIC: &[u8] = b"1337;File=";
-                if (matched as usize) < MAGIC.len() && b == MAGIC[matched as usize] {
-                    let matched = matched + 1;
-                    self.state = if matched as usize == MAGIC.len() {
-                        State::OscBody
-                    } else {
-                        State::OscKind { matched }
-                    };
+                // Staged is `ESC ]` and the address so far. No address is a prefix of
+                // another, so a whole match is the one it is.
+                let address = &self.staged[2..];
+                if ITERM2_ADDRESSES.contains(&address) {
+                    self.state = State::OscBody;
                     self.body_esc = false;
-                } else {
+                } else if !ITERM2_ADDRESSES.iter().any(|a| a.starts_with(address)) {
                     // Not an iTerm2 image. Ordinary OSC, the filter's business.
                     self.flush_to_clean(clean);
                 }
             }
-            State::OscBody => self.body_step(b, false, clean),
+            State::OscBody => {
+                // `FileEnd` carries nothing. Anything but its terminator after it
+                // makes some other command, `FileEndless`, the filter's business.
+                if b != 0x07 && b != 0x1b && self.staged[2..] == *b"1337;FileEnd" {
+                    self.staged.push(b);
+                    self.flush_to_clean(clean);
+                    return;
+                }
+                self.body_step(b, false, clean)
+            }
             State::Discarding { kitty } => {
                 self.discarded_bytes += 1;
                 if b == 0x07 && !kitty {
@@ -321,8 +336,12 @@ impl ImageSniffer {
         self.staged_since = None;
         self.state = State::Ground;
         self.body_esc = false;
-        if protocol == ImageProtocol::Kitty && self.assemble_chunk(&bytes) {
-            // A middle chunk: held for the rest of the chain, not emitted.
+        let held = match protocol {
+            ImageProtocol::Kitty => self.assemble_chunk(&bytes),
+            ImageProtocol::ITerm2 => self.assemble_part(&bytes),
+        };
+        if held {
+            // A piece of a chain: held for the rest of it, not emitted.
             return;
         }
         self.emit(protocol, bytes);
@@ -330,6 +349,15 @@ impl ImageSniffer {
 
     /// One finished envelope for the client.
     fn emit(&mut self, protocol: ImageProtocol, bytes: Vec<u8>) {
+        // The whole envelope, not only its payload: an assembled picture adds its control
+        // or arguments to the parts, and one past the bound is refused further down the
+        // line (the wire's reassembly limit dropped the connection, and every reattach
+        // replayed it). Refused here instead, and counted.
+        if bytes.len() > MAX_IMAGE_BYTES {
+            self.discarded_envelopes += 1;
+            self.discarded_bytes += bytes.len() as u64;
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.ready.push_back(CapturedImage {
@@ -370,10 +398,15 @@ impl ImageSniffer {
                 if fresh {
                     self.abandon_assembly();
                     self.assembling = Some(Assembly {
+                        protocol: ImageProtocol::Kitty,
                         control: control.to_vec(),
                         payload: payload.to_vec(),
                     });
-                } else if let Some(chain) = self.assembling.as_mut() {
+                } else if let Some(chain) = self
+                    .assembling
+                    .as_mut()
+                    .filter(|c| c.protocol == ImageProtocol::Kitty)
+                {
                     if chain.payload.len() + payload.len() > MAX_IMAGE_BYTES {
                         self.abandon_assembly();
                     } else {
@@ -388,7 +421,10 @@ impl ImageSniffer {
                 true
             }
             _ => {
-                if let Some(chain) = self.assembling.take() {
+                if let Some(chain) = self
+                    .assembling
+                    .take_if(|c| c.protocol == ImageProtocol::Kitty)
+                {
                     if chain.payload.len() + payload.len() > MAX_IMAGE_BYTES {
                         self.discarded_envelopes += 1;
                         self.discarded_bytes +=
@@ -428,6 +464,69 @@ impl ImageSniffer {
                 }
             }
         }
+    }
+
+    /// Fold an iTerm2 multipart envelope into the transfer in progress.
+    ///
+    /// Each piece alone is nothing an outer terminal can draw, and forwarded in
+    /// order they would not survive the client either: it places one envelope per
+    /// frame and replays only the last one. So the pieces assemble here, as Kitty
+    /// chunks do, into the one `File=` envelope the legacy form would have sent.
+    /// Returns true when the envelope was a piece, consumed whether or not it fit;
+    /// false for a plain `File=`, which is a picture on its own.
+    fn assemble_part(&mut self, bytes: &[u8]) -> bool {
+        let terminator = if bytes.ends_with(b"\x07") { 1 } else { 2 };
+        let body = &bytes[2..bytes.len() - terminator];
+        if let Some(args) = body.strip_prefix(b"1337;MultipartFile=") {
+            // One chain at a time, as for Kitty: a new opening abandons the old.
+            self.abandon_assembly();
+            self.assembling = Some(Assembly {
+                protocol: ImageProtocol::ITerm2,
+                control: args.to_vec(),
+                payload: Vec::new(),
+            });
+        } else if let Some(part) = body.strip_prefix(b"1337;FilePart=") {
+            match self
+                .assembling
+                .as_mut()
+                .filter(|c| c.protocol == ImageProtocol::ITerm2)
+            {
+                Some(chain) if chain.payload.len() + part.len() > MAX_IMAGE_BYTES => {
+                    self.abandon_assembly();
+                }
+                Some(chain) => chain.payload.extend_from_slice(part),
+                None => {
+                    // A part with no opening: the opening was lost to a bound or a
+                    // cancel, or the transfer already went over. Counted, not drawn.
+                    self.discarded_envelopes += 1;
+                    self.discarded_bytes += bytes.len() as u64;
+                }
+            }
+        } else if body == b"1337;FileEnd" {
+            match self
+                .assembling
+                .take_if(|c| c.protocol == ImageProtocol::ITerm2)
+            {
+                Some(chain) => {
+                    let mut whole = Vec::with_capacity(
+                        b"\x1b]1337;File=".len() + chain.control.len() + chain.payload.len() + 2,
+                    );
+                    whole.extend_from_slice(b"\x1b]1337;File=");
+                    whole.extend_from_slice(&chain.control);
+                    whole.push(b':');
+                    whole.extend_from_slice(&chain.payload);
+                    whole.push(0x07);
+                    self.emit(ImageProtocol::ITerm2, whole);
+                }
+                None => {
+                    self.discarded_envelopes += 1;
+                    self.discarded_bytes += bytes.len() as u64;
+                }
+            }
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Drop a chain in progress, counted. A half picture is never emitted.
@@ -648,6 +747,113 @@ mod tests {
         // And the sniffer still works afterwards.
         s.feed(b"\x1b_Ga=T;eA==\x1b\\", &mut clean);
         assert_eq!(s.take_images().len(), 1);
+    }
+
+    /// What `imgcat` sends by default since iTerm2 3.5: one `MultipartFile=` with the
+    /// arguments, the base64 cut into `FilePart=` slices, then `FileEnd`. It arrives as
+    /// the one `File=` envelope the legacy form would have been.
+    #[test]
+    fn an_iterm2_multipart_transfer_arrives_as_one_picture() {
+        let (clean, images) = run(&[
+            b"before\x1b]1337;MultipartFile=inline=1;size=6\x07".as_slice(),
+            b"\x1b]1337;FilePart=Zm9v\x07".as_slice(),
+            b"\x1b]1337;FilePart=YmFy\x1b\\".as_slice(),
+            b"\x1b]1337;FileEnd\x07after".as_slice(),
+        ]);
+        assert_eq!(clean, b"beforeafter");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].protocol, ImageProtocol::ITerm2);
+        assert_eq!(
+            images[0].bytes,
+            b"\x1b]1337;File=inline=1;size=6:Zm9vYmFy\x07"
+        );
+    }
+
+    /// The assembled whole is held to the image bound, arguments included: a huge
+    /// `MultipartFile=` plus parts within the payload bound made an envelope the wire
+    /// refused, which dropped the connection on every attach.
+    #[test]
+    fn an_assembled_picture_past_the_bound_is_refused_and_counted() {
+        let mut s = ImageSniffer::new();
+        let mut clean = Vec::new();
+        let args = [
+            b"\x1b]1337;MultipartFile=inline=1;name=".as_slice(),
+            &vec![b'a'; MAX_IMAGE_BYTES / 2],
+            b"\x07",
+        ]
+        .concat();
+        s.feed(&args, &mut clean);
+        let part = [
+            b"\x1b]1337;FilePart=".as_slice(),
+            &vec![b'A'; MAX_IMAGE_BYTES / 2 + 16],
+            b"\x07",
+        ]
+        .concat();
+        s.feed(&part, &mut clean);
+        let before = s.discarded().0;
+        s.feed(b"\x1b]1337;FileEnd\x07", &mut clean);
+        assert!(
+            s.take_images().is_empty(),
+            "an envelope past the bound was emitted"
+        );
+        assert!(s.discarded().0 > before, "the refusal was not counted");
+    }
+
+    /// A transfer that never ends holds at most the image budget, and is counted when
+    /// it gives up rather than drawn half.
+    #[test]
+    fn an_unfinished_iterm2_multipart_transfer_is_bounded_and_counted() {
+        let mut s = ImageSniffer::new();
+        let mut clean = Vec::new();
+        s.feed(b"\x1b]1337;MultipartFile=inline=1\x07", &mut clean);
+        let part = [
+            b"\x1b]1337;FilePart=".as_slice(),
+            &[b'A'; 1024 * 1024],
+            b"\x07",
+        ]
+        .concat();
+        for _ in 0..5 {
+            s.feed(&part, &mut clean);
+        }
+        s.feed(b"\x1b]1337;FileEnd\x07", &mut clean);
+        assert!(clean.is_empty());
+        assert!(s.take_images().is_empty());
+        assert!(s.discarded().0 >= 1);
+        // A fresh opening abandons an older unfinished one, counted too.
+        let before = s.discarded().0;
+        s.feed(b"\x1b]1337;MultipartFile=inline=1\x07", &mut clean);
+        s.feed(b"\x1b]1337;FilePart=Zm9v\x07", &mut clean);
+        s.feed(b"\x1b]1337;MultipartFile=inline=1\x07", &mut clean);
+        assert_eq!(s.discarded().0, before + 1);
+        s.feed(
+            b"\x1b]1337;FilePart=YmFy\x07\x1b]1337;FileEnd\x07",
+            &mut clean,
+        );
+        let images = s.take_images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].bytes, b"\x1b]1337;File=inline=1:YmFy\x07");
+    }
+
+    /// Only the transfer's own three commands belong to it. Another `1337` command in
+    /// the middle stays in the stream for the filter, and a Kitty picture in between
+    /// is its own picture, not a part.
+    #[test]
+    fn other_sequences_inside_an_iterm2_multipart_transfer_are_not_parts() {
+        let (clean, images) = run(&[
+            b"\x1b]1337;MultipartFile=inline=1\x07".as_slice(),
+            b"\x1b]1337;FilePart=Zm9v\x07".as_slice(),
+            b"\x1b]1337;Copy=:aGk=\x07\x1b]1337;ClearScrollback\x07".as_slice(),
+            b"\x1b]1337;FileEndless\x07".as_slice(),
+            b"\x1b_Ga=T;eA==\x1b\\".as_slice(),
+            b"\x1b]1337;FilePart=YmFy\x07\x1b]1337;FileEnd\x07".as_slice(),
+        ]);
+        assert_eq!(
+            clean,
+            b"\x1b]1337;Copy=:aGk=\x07\x1b]1337;ClearScrollback\x07\x1b]1337;FileEndless\x07"
+        );
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].bytes, b"\x1b_Ga=T;eA==\x1b\\");
+        assert_eq!(images[1].bytes, b"\x1b]1337;File=inline=1:Zm9vYmFy\x07");
     }
 
     #[test]
