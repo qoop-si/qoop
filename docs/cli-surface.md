@@ -57,7 +57,7 @@ a claim nobody has to keep.
 | `qoro avatar show` | print the picked avatar | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
-| `qoro update [--check]` | ask GitHub Releases for the newest macOS arm64 binary and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
+| `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
 | `qoro --version` | the version | no |
