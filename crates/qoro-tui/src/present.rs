@@ -22,6 +22,7 @@
 //! under a long address costs one address, not a row of them.
 
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
@@ -216,15 +217,33 @@ fn put(rows: &mut [String], s: &str, at: (usize, usize), open: &mut Option<usize
 /// a row of linked cells was written whole on every change: one changed cell a row every
 /// 16 ms, under two 2 KB addresses in turn, was over 500 MB in ten seconds.
 fn trimmed(was: &str, now: &str, out: &mut String) {
+    // New nearly end to end (a scrolled row): the whole row costs no more to write, and
+    // laying out both rows cell by cell would only find that out slower.
+    // ponytail: the shared ends are a cheap proxy for how much changed. Two changes near
+    // opposite ends of a row also look new end to end and are written whole, which costs
+    // a plain row a few hundred bytes; a row with a link in it can be hundreds of
+    // kilobytes, so it always takes the cell by cell path.
+    let (a, b) = (was.as_bytes(), now.as_bytes());
+    let head = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    if 8 * (head + tail) < b.len() && !now.contains("\x1b]8;") {
+        out.push_str(now);
+        return;
+    }
     let (Some(old), Some(new)) = (cells(was), cells(now)) else {
         out.push_str(now);
         return;
     };
     let row = now[2..].split(';').next().unwrap_or("1");
-    let dirty = |col: &usize, cell: &Cell| old.get(col) != Some(cell);
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (&col, cell) in &new {
-        if !dirty(&col, cell) {
+    for (col, cell) in new.iter().enumerate() {
+        let Some(cell) = cell else { continue };
+        if old.get(col).and_then(Option::as_ref) == Some(cell) {
             continue;
         }
         match runs.last_mut() {
@@ -241,7 +260,9 @@ fn trimmed(was: &str, now: &str, out: &mut String) {
         let _ = write!(out, "\x1b[{row};{start}H{RESET}");
         let (mut sgr, mut link): (&str, Option<&str>) = ("", None);
         for col in start..end {
-            let Some(cell) = new.get(&col) else { continue };
+            let Some(Some(cell)) = new.get(col) else {
+                continue;
+            };
             if cell.glyph.is_empty() {
                 continue;
             }
@@ -249,11 +270,15 @@ fn trimmed(was: &str, now: &str, out: &mut String) {
                 out.push_str(LINK_CLOSE);
                 link = None;
             }
-            if sgr != cell.sgr {
-                if !sgr.is_empty() {
-                    out.push_str(RESET);
+            if sgr != &*cell.sgr {
+                // A colour that only adds to the one in effect is written as what it adds.
+                match cell.sgr.strip_prefix(sgr) {
+                    Some(more) => out.push_str(more),
+                    None => {
+                        out.push_str(RESET);
+                        out.push_str(&cell.sgr);
+                    }
                 }
-                out.push_str(&cell.sgr);
                 sgr = &cell.sgr;
             }
             if link != cell.link
@@ -278,18 +303,23 @@ const LINK_CLOSE: &str = "\x1b]8;;\x1b\\";
 struct Cell<'a> {
     /// What is drawn there; empty on the right half of a wide character.
     glyph: &'a str,
-    /// Every colour sequence since the last reset.
-    sgr: String,
+    /// Every colour sequence since the last reset, shared by the cells drawn under it.
+    sgr: Rc<str>,
     /// The escape that opened the link this cell is in, if it is in one.
     link: Option<&'a str>,
 }
 
-/// The cells a row draws, by one based column, later writes over earlier ones, or `None`
-/// when this side cannot lay it out the way any terminal would.
-fn cells(row: &str) -> Option<std::collections::BTreeMap<usize, Cell<'_>>> {
+/// The cells a row draws, indexed by one based column, later writes over earlier ones, or
+/// `None` when this side cannot lay it out the way any terminal would.
+///
+/// A `Vec` and a shared colour, not a map and a copy per cell: a frame where every row
+/// changes lays out every cell of both rows, and that has to stay inside a frame's budget.
+fn cells(row: &str) -> Option<Vec<Option<Cell<'_>>>> {
     let bytes = row.as_bytes();
-    let mut map = std::collections::BTreeMap::new();
-    let (mut col, mut sgr, mut link) = (1usize, String::new(), None);
+    let mut map: Vec<Option<Cell>> = Vec::new();
+    let (mut col, mut link) = (1usize, None);
+    // The colour as it is built, and the shared copy the cells hold, made once per change.
+    let (mut sgr, mut shared): (String, Rc<str>) = (String::new(), Rc::from(""));
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b']') {
@@ -307,13 +337,24 @@ fn cells(row: &str) -> Option<std::collections::BTreeMap<usize, Cell<'_>>> {
             let params = &row[i + 2..end];
             match bytes[end] {
                 // Colour and link carry over a placement, as they do on a terminal.
-                b'H' => col = params.split(';').nth(1)?.parse().ok()?,
+                // A column no screen has is left to the terminal: the row is written whole.
+                b'H' => {
+                    col = params
+                        .split(';')
+                        .nth(1)?
+                        .parse()
+                        .ok()
+                        .filter(|c| (1..=u16::MAX as usize).contains(c))?
+                }
                 b'm' => {
                     if resets(params) {
                         sgr.clear();
                     }
                     if !(params.is_empty() || params == "0") {
                         sgr.push_str(&row[i..=end]);
+                    }
+                    if *shared != *sgr {
+                        shared = Rc::from(sgr.as_str());
                     }
                 }
                 _ => return None,
@@ -328,31 +369,34 @@ fn cells(row: &str) -> Option<std::collections::BTreeMap<usize, Cell<'_>>> {
             let glyph = &row[i..i + c.len_utf8()];
             // As a terminal draws it: writing over either half of a wide character blanks
             // the other half.
+            if map.len() < col + w + 1 {
+                map.resize_with(col + w + 1, || None);
+            }
+            let half = |map: &[Option<Cell>], at: usize| {
+                map.get(at)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|c| c.glyph.is_empty())
+            };
             for at in col..col + w {
                 if at > 1
-                    && map.get(&at).is_some_and(|c: &Cell| c.glyph.is_empty())
-                    && let Some(lead) = map.get_mut(&(at - 1))
+                    && half(&map, at)
+                    && let Some(lead) = map[at - 1].as_mut()
                 {
                     lead.glyph = " ";
                 }
                 if at + 1 >= col + w
-                    && map
-                        .get(&(at + 1))
-                        .is_some_and(|c: &Cell| c.glyph.is_empty())
-                    && let Some(right) = map.get_mut(&(at + 1))
+                    && half(&map, at + 1)
+                    && let Some(right) = map[at + 1].as_mut()
                 {
                     right.glyph = " ";
                 }
             }
             for (at, glyph) in [(col, glyph), (col + 1, "")].into_iter().take(w) {
-                map.insert(
-                    at,
-                    Cell {
-                        glyph,
-                        sgr: sgr.clone(),
-                        link,
-                    },
-                );
+                map[at] = Some(Cell {
+                    glyph,
+                    sgr: Rc::clone(&shared),
+                    link,
+                });
             }
             col += w;
             i += c.len_utf8();
@@ -738,5 +782,45 @@ mod tests {
         let mut out = String::new();
         trimmed("\x1b[1;1H\x1b[0mabc", now, &mut out);
         assert_eq!(out, now);
+    }
+
+    /// A row new end to end is written whole without being laid out; a linked one never is,
+    /// since writing it whole is what cost hundreds of kilobytes, and only its changed cells go.
+    #[test]
+    fn a_scrolled_row_is_written_whole_and_a_linked_one_by_its_cells() {
+        let plain = |n: u32| {
+            format!(
+                "\x1b[1;1H\x1b[0m\x1b[3{}m{}",
+                n % 8,
+                format!("{n:04}").repeat(40)
+            )
+        };
+        let (was, now) = (plain(1234), plain(5678));
+        let mut out = String::new();
+        trimmed(&was, &now, &mut out);
+        assert_eq!(out, now);
+
+        let open = format!("\x1b]8;;https://e.example/{}\x1b\\", "a".repeat(2000));
+        let linked = |first: char, last: char| {
+            let mut s = String::from("\x1b[1;1H\x1b[0m");
+            for n in 0..40 {
+                let c = match n {
+                    0 => first,
+                    39 => last,
+                    _ => 'x',
+                };
+                let _ = write!(s, "{open}{c}{LINK_CLOSE}");
+            }
+            s
+        };
+        let (was, now) = (linked('a', 'b'), linked('A', 'B'));
+        let mut out = String::new();
+        trimmed(&was, &now, &mut out);
+        assert!(
+            out.len() < 2 * open.len() + 100,
+            "{} bytes for two cells",
+            out.len()
+        );
+        assert_eq!(out.matches(&open).count(), 2, "{out:?}");
     }
 }
