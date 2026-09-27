@@ -551,7 +551,10 @@ fn pin(c: &Column, room: usize) -> Vec<Row> {
         None,
     )];
     for agent in needing.iter().take(shown) {
-        out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
+        out.push((
+            flat_line(c, agent, true),
+            Some(Hit::Terminal(agent.terminal)),
+        ));
     }
     if shown < total && fits > 1 {
         out.push((
@@ -615,7 +618,11 @@ fn content(c: &Column) -> Vec<Row> {
                 }
             });
             for agent in ordered {
-                out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
+                out.push((
+                    flat_line(c, agent, false),
+                    Some(Hit::Terminal(agent.terminal)),
+                ));
+                out.extend(activity_row(c, agent, DOT_AT + 2));
             }
             if out.is_empty() {
                 // Said, rather than left as a void: an empty list under a title reads as
@@ -647,6 +654,7 @@ fn content(c: &Column) -> Vec<Row> {
                             tree_line(c, agent, space),
                             Some(Hit::Terminal(agent.terminal)),
                         ));
+                        out.extend(activity_row(c, agent, CHILD_DOT_AT + 2));
                     }
                 }
             }
@@ -657,7 +665,11 @@ fn content(c: &Column) -> Vec<Row> {
                 .iter()
                 .filter(|a| a.agent && !c.spaces.iter().any(|s| s.id == a.workspace))
             {
-                out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
+                out.push((
+                    flat_line(c, agent, false),
+                    Some(Hit::Terminal(agent.terminal)),
+                ));
+                out.extend(activity_row(c, agent, DOT_AT + 2));
             }
         }
     }
@@ -722,6 +734,117 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     }
 }
 
+/// What an agent is doing, on a row of its own under its name, while it is doing it.
+///
+/// Only when the daemon sent an activity, which it does only while the agent works,
+/// starts, waits for a person or has failed: a calm agent keeps its single row, so a
+/// quiet column stays short. The hook's raw label is put in a person's words first
+/// ([`humanize`]); a waiting agent says what it wants, in the blocked colour, and a failed
+/// one in the failed colour. The row reaches the same terminal as the name above it.
+fn activity_row(c: &Column, agent: &AgentRow, at: usize) -> Option<Row> {
+    use crate::theme::Role;
+    let (text, colour) = said(agent)?;
+    let lead = format!("{}\u{2514} ", " ".repeat(at));
+    let body = shorten_middle(&text, c.width.saturating_sub(crate::width::width(&lead)));
+    Some((
+        Line {
+            text: fit(&format!("{lead}{body}"), c.width),
+            colour: Some(colour),
+            runs: vec![(at, 1, Role::Rule)],
+            ..Line::default()
+        },
+        Some(Hit::Terminal(agent.terminal)),
+    ))
+}
+
+/// What an agent's activity says in its state, and the colour it says it in: working
+/// quietly, waiting as what it wants in the blocked colour, failed in the failed colour.
+/// A waiting agent whose newest word is `thinking` has said nothing about what it wants
+/// (a label-less prompt), so it says nothing rather than `wants: thinking`.
+fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
+    use crate::theme::Role;
+    let raw = agent
+        .activity
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())?;
+    match agent.state.as_str() {
+        "blocked" if raw != "thinking" => {
+            Some((format!("wants: {}", humanize(raw)), Role::Blocked))
+        }
+        "failed" => Some((humanize(raw), Role::Failed)),
+        "working" | "starting" => Some((humanize(raw), Role::Faint)),
+        _ => None,
+    }
+}
+
+/// A hook's raw activity label in the words a person would use: `Edit src/a.rs` reads
+/// `editing a.rs`, `Bash cargo test` reads `cargo test`, `Grep todo` reads
+/// `searching todo`. Tool names from Claude Code, Codex, Gemini and opencode all land
+/// on the same few verbs; a tool nobody has taught this reads as its own label.
+pub fn humanize(raw: &str) -> String {
+    let raw = raw.trim();
+    let (tool, arg) = match raw.split_once(' ') {
+        Some((tool, arg)) => (tool, arg.trim()),
+        None => (raw, ""),
+    };
+    let base = |path: &str| {
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path)
+            .to_string()
+    };
+    let with = |verb: &str, what: String| {
+        if what.is_empty() {
+            verb.to_string()
+        } else {
+            format!("{verb} {what}")
+        }
+    };
+    match tool.to_ascii_lowercase().as_str() {
+        "thinking" if arg.is_empty() => "thinking".to_string(),
+        "read" | "read_file" | "read_many_files" | "view" | "notebookread" => {
+            with("reading", base(arg))
+        }
+        "edit" | "multiedit" | "write" | "notebookedit" | "write_file" | "replace"
+        | "apply_patch" | "edit_file" | "patch" => with("editing", base(arg)),
+        "bash" | "shell" | "exec_command" | "run_shell_command" | "local_shell" => {
+            let command = [
+                "bash -lc ",
+                "bash -c ",
+                "zsh -lc ",
+                "zsh -c ",
+                "sh -lc ",
+                "sh -c ",
+            ]
+            .iter()
+            .find_map(|shell| arg.strip_prefix(shell))
+            // `bash -lc 'git status'` quotes its command; the quotes are the shell's.
+            .map(|inner| inner.trim().trim_matches(|q| q == '\'' || q == '"'))
+            .unwrap_or(arg);
+            let first = command.lines().next().unwrap_or("").trim();
+            if first.is_empty() {
+                "running".to_string()
+            } else {
+                first.to_string()
+            }
+        }
+        "grep"
+        | "glob"
+        | "search_file_content"
+        | "ls"
+        | "list"
+        | "list_directory"
+        | "find"
+        | "codesearch" => with("searching", arg.to_string()),
+        "task" | "agent" => "subagent".to_string(),
+        "webfetch" | "websearch" | "web_fetch" | "google_web_search" | "fetch" => "web".to_string(),
+        "todowrite" | "todoread" | "update_plan" | "todo" => "planning".to_string(),
+        _ => raw.to_string(),
+    }
+}
 /// The dot an agent wears, and whether its whole row goes quiet.
 ///
 /// News keeps the done sage: a derived idle-after-work is news, not calm. A stale idle
@@ -779,7 +902,8 @@ fn tree_line(c: &Column, agent: &AgentRow, space: &WorkspaceRow) -> Line {
 
 /// An agent in a flat list, the pin or the priority view: the dot, the session, and the
 /// space it lives in on the right, in the space's own colour.
-fn flat_line(c: &Column, agent: &AgentRow) -> Line {
+fn flat_line(c: &Column, agent: &AgentRow, inline: bool) -> Line {
+    use crate::theme::Role;
     let (role, stale) = dot_of(c, agent);
     let space = c
         .spaces
@@ -791,11 +915,32 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
     // The dot and its two spaces, the name, a gap, the space and a trailing space.
     let right = if space.is_empty() { 0 } else { space_w + 2 };
     let room = c.width.saturating_sub(DOT_AT + 2 + right);
-    let name = shorten_middle(&session_name(agent), room);
-    let left = fit_to(
-        &format!("{}{} {name}", " ".repeat(DOT_AT), dot_glyph(role)),
-        c.width.saturating_sub(right),
-    );
+    // In the pin, what the agent wants rides the same row after a dash: a folded space
+    // shows no sub-row, and the pin is where a person reads why they are needed.
+    // Only when the activity will really fit beside a shortened name: a name cut for an
+    // activity that then does not fit would be cut for nothing.
+    let said = inline
+        .then(|| said(agent))
+        .flatten()
+        .filter(|_| room >= (room * 42 / 100).max(7) + 6);
+    let name_room = if said.is_some() {
+        (room * 42 / 100).max(7).min(room)
+    } else {
+        room
+    };
+    let name = shorten_middle(&session_name(agent), name_room);
+    let mut head = format!("{}{} {name}", " ".repeat(DOT_AT), dot_glyph(role));
+    let mut runs = Vec::new();
+    let rest = room.saturating_sub(crate::width::width(&name));
+    if let Some((what, ink)) = said.filter(|_| rest >= 6) {
+        let what = shorten_middle(&what, rest - 3);
+        let at = crate::width::width(&head);
+        runs.push((at + 1, 1, Role::Rule));
+        runs.push((at + 3, crate::width::width(&what), ink));
+        head.push_str(" - ");
+        head.push_str(&what);
+    }
+    let left = fit_to(&head, c.width.saturating_sub(right));
     let (text, accent) = if space.is_empty() {
         (left, None)
     } else {
@@ -810,7 +955,7 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
         colour: stale.then_some(crate::theme::Role::Faint),
         accent,
         indicator: Some((DOT_AT, 1, role)),
-        runs: Vec::new(),
+        runs,
     }
 }
 
@@ -1590,6 +1735,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 
@@ -1612,6 +1758,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 
@@ -2077,6 +2224,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 
@@ -2321,6 +2469,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -2353,6 +2502,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
         assert!(
@@ -3438,6 +3588,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every agent's tool names land on the same few words a person would say.
+    #[test]
+    fn humanize_puts_every_agents_tools_in_a_persons_words() {
+        for (raw, said) in [
+            (
+                "Edit /Users/me/qoro/crates/qoro-tui/src/sidebar.rs",
+                "editing sidebar.rs",
+            ),
+            ("Write src/new.rs", "editing new.rs"),
+            ("apply_patch src/a.rs", "editing a.rs"),
+            ("Read /x/y/README.md", "reading README.md"),
+            ("read_file /x/src/main.rs", "reading main.rs"),
+            ("Bash cargo test -p qoro-tui", "cargo test -p qoro-tui"),
+            (
+                "shell bash -lc git worktree add ../wt",
+                "git worktree add ../wt",
+            ),
+            ("run_shell_command npm run build", "npm run build"),
+            ("Grep TODO", "searching TODO"),
+            ("glob **/*.rs", "searching **/*.rs"),
+            ("Task", "subagent"),
+            ("WebFetch https://example.com", "web"),
+            ("TodoWrite", "planning"),
+            ("thinking", "thinking"),
+            ("mcp__crw__scrape https://x", "mcp__crw__scrape https://x"),
+            ("Bash", "running"),
+            ("shell bash -lc 'git status'", "git status"),
+            ("list /x/src", "searching /x/src"),
+        ] {
+            assert_eq!(humanize(raw), said, "{raw}");
+        }
+    }
+
+    /// A working agent says what it is doing on a row of its own under its name; a waiting
+    /// one says what it wants in the blocked colour, and the pin says it on the same row.
+    /// A calm agent keeps one row, whatever its last tool was.
+    #[test]
+    fn activity_rides_a_sub_row_in_the_tree_and_the_same_row_in_the_pin() {
+        let spaces = vec![space(1, "app")];
+        let mut working = agent(1, 1, "claude", "working");
+        working.activity = Some("Edit src/sidebar.rs".into());
+        let mut blocked = agent(2, 1, "codex", "blocked");
+        blocked.activity = Some("Bash bun test".into());
+        let mut idle = agent(3, 1, "gemini", "idle");
+        idle.activity = Some("Read a.rs".into());
+        let agents = vec![working, blocked, idle];
+        let rows = tree_rows(&spaces, &agents, 9, 30, &Seen::new(), &Shut::new());
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|(l, _)| l.text.trim_end().to_string())
+            .collect();
+        let under = |terminal: u32| -> Vec<&Line> {
+            rows.iter()
+                .skip_while(|(_, h)| *h != Some(Hit::Title))
+                .filter(|(_, h)| *h == Some(Hit::Terminal(terminal)))
+                .map(|(l, _)| l)
+                .collect()
+        };
+        let one = under(1);
+        assert_eq!(one.len(), 2, "{texts:?}");
+        assert_eq!(one[1].text.trim_end(), "     \u{2514} editing sidebar.rs");
+        assert_eq!(one[1].colour, Some(crate::theme::Role::Faint));
+        let two = under(2);
+        assert_eq!(two[1].text.trim_end(), "     \u{2514} wants: bun test");
+        assert_eq!(two[1].colour, Some(crate::theme::Role::Blocked));
+        assert_eq!(under(3).len(), 1, "a calm agent keeps one row: {texts:?}");
+        // The pin names what the waiting agent wants on its own row.
+        assert!(
+            texts[1].starts_with(" \u{25cf} codex - wants: bun"),
+            "{texts:?}"
+        );
+        for (line, _) in &rows {
+            assert_eq!(crate::width::width(&line.text), WIDTH, "{line:?}");
+        }
+    }
+
+    /// A waiting agent whose newest word is `thinking` has not said what it wants: no
+    /// `wants: thinking` row, in the tree or in the pin.
+    #[test]
+    fn a_wait_with_nothing_said_draws_no_activity() {
+        let spaces = vec![space(1, "app")];
+        let mut blocked = agent(2, 1, "claude", "blocked");
+        blocked.activity = Some("thinking".into());
+        let rows = tree_rows(&spaces, &[blocked], 9, 30, &Seen::new(), &Shut::new());
+        assert!(
+            !rows.iter().any(|(l, _)| l.text.contains("thinking")),
+            "{:?}",
+            rows.iter()
+                .map(|(l, _)| l.text.trim_end())
+                .collect::<Vec<_>>()
+        );
     }
     /// A pin with room for one agent shows that agent, and the title's count says how
     /// many more there are: a title over a `+2 more` and nobody is a pin that names no one.

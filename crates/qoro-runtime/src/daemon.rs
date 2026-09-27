@@ -2185,6 +2185,7 @@ fn tomb_row(tomb: &crate::agents::Tombstone) -> crate::control::AgentRow {
         last_active_at_unix: None,
         cwd: None,
         slept_at_unix: Some(tomb.slept_at_unix),
+        activity: None,
     }
 }
 
@@ -2733,6 +2734,14 @@ async fn handle_control(
                     // no timestamp until the first accepted observation, no
                     // cwd until the terminal's own task has seen one.
                     let last_active_at_unix = agent.as_ref().and_then(|a| a.last_active_at_unix);
+                    // What it is doing, only while it is doing something: a calm agent
+                    // has no activity, whatever its last tool was.
+                    let activity = matches!(
+                        state.as_str(),
+                        "working" | "starting" | "blocked" | "failed"
+                    )
+                    .then(|| agents.activity(terminal))
+                    .flatten();
                     let cwd = terminals.cwd_of(terminal);
                     // Read before the row moves the strings: the mapping only
                     // borrows, and the literal below owns.
@@ -2775,6 +2784,7 @@ async fn handle_control(
                         last_active_at_unix,
                         cwd,
                         slept_at_unix: None,
+                        activity,
                     }
                 })
                 .collect();
@@ -2901,6 +2911,7 @@ async fn handle_control(
                     // report with nothing to show": no row, still a success.
                     if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
                         let at_unix = crate::agents::now_unix();
+                        let before = agents.activity(terminal);
                         agents.push_focus_event(
                             terminal,
                             crate::control::FocusEvent {
@@ -2911,6 +2922,13 @@ async fn handle_control(
                                 at_unix,
                             },
                         );
+                        // The row carries the activity, so a new one is news even when the
+                        // state held: without this a run of tools inside one `working`
+                        // would leave the sidebar naming the first of them. A repeat of
+                        // the same label is not news and announces nothing.
+                        if !changed && agents.activity(terminal) != before {
+                            agents.announce(terminal);
+                        }
                     }
                     // The agent's own id for its conversation, recorded here and nowhere
                     // else: this is the point at which the report has been admitted, so a

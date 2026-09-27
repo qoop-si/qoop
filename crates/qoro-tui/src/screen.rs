@@ -1766,6 +1766,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 
@@ -3428,6 +3429,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 
@@ -3857,6 +3859,7 @@ mod tests {
                 last_active_at_unix: None,
                 cwd: None,
                 slept_at_unix: None,
+                activity: None,
             })
             .collect();
         // Nothing scrolls: all nine agents draw their row under the space's rule, and

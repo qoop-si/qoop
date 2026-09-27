@@ -669,6 +669,13 @@ pub struct AgentRow {
     /// rows from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slept_at_unix: Option<i64>,
+    /// What the agent is doing right now, as its own hook last said it: the newest tool
+    /// label (`Edit src/a.rs`, `Bash cargo test`), or `thinking` after a prompt and before
+    /// any tool. Only while the agent is working, starting, blocked or failed, and `None`
+    /// otherwise or from a daemon that predates it. Raw: the client words it. The prompt
+    /// itself never travels here: focus events stay out of the push payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     /// Where this terminal is, last known, as an absolute path.
     ///
     /// Best effort with a documented bound: the per-terminal task writes it
@@ -770,7 +777,13 @@ pub fn parse_focus_event(kind: &str) -> bool {
 /// row, and a multi-line prompt head would otherwise break the row it is
 /// drawn on.
 pub fn truncate_focus_label(label: &str) -> String {
-    let single: String = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Control characters out first: a label is shown on screens and printed by
+    // `qoro agents --json`, and an escape in a command must not travel as one.
+    let clean: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let single: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
     if single.chars().count() <= MAX_FOCUS_LABEL_CHARS {
         return single;
     }
@@ -985,6 +998,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");
@@ -1104,6 +1118,11 @@ mod tests {
         assert_eq!(
             truncate_focus_label("first line\nsecond line"),
             "first line second line"
+        );
+        // An escape in a command is text on the way out, never a sequence.
+        assert_eq!(
+            truncate_focus_label("Bash \x1b]52;c;aGk=\x07 ls"),
+            "Bash ]52;c;aGk= ls"
         );
         let long = "x".repeat(MAX_FOCUS_LABEL_CHARS + 40);
         let cut = truncate_focus_label(&long);

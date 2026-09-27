@@ -116,10 +116,12 @@ fn targets() -> Vec<Target> {
             instead: None,
             home_env: None,
             shape: Shape::Nested {
-                // Codex runs a hook per event and passes nothing to read, so which state
-                // each event means is an argument here.
+                // Codex runs a hook per event, so which state each event means is an
+                // argument here; the script reads the event name only to label the
+                // focus event.
                 events: &[
                     Event("SessionStart", Some("working")),
+                    Event("UserPromptSubmit", Some("working")),
                     Event("PreToolUse", Some("working")),
                     Event("PostToolUse", Some("working")),
                     Event("PermissionRequest", Some("blocked")),
@@ -139,6 +141,7 @@ fn targets() -> Vec<Target> {
                 events: &[
                     Event("SessionStart", Some("working")),
                     Event("BeforeAgent", Some("working")),
+                    Event("BeforeTool", Some("working")),
                     Event("AfterAgent", Some("idle")),
                     Event("SessionEnd", Some("idle")),
                 ],

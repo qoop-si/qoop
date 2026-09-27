@@ -103,14 +103,20 @@ Notes:
   (an older build). Every other kind, `idle_prompt` a minute after the agent
   finished included, reports nothing; `Stop` already said idle. An installed
   hook picks this up on the next `qoro hooks install`.
-- focus events (claude + opencode only): both scripts add `--event
+- focus events (claude, codex, gemini, opencode): the scripts add `--event
   user|tool|blocked|done` with a one-line `--label` beside the unchanged
   state word. The daemon keeps the last 50 per terminal in memory for the
-  focus view and nothing else: no journal, no push payload, no event log.
-  Other agents report state only and read as "no hook reports yet" in the
-  focus view. Labels are best-effort (tool name plus first file-ish
-  argument, or the prompt head, cut to 120 characters); a payload without
-  the field reports label-less, which is today's behaviour.
+  focus view: no journal, no push payload, no event log. Labels are
+  best-effort (tool name plus its command, path or pattern, cut to 120
+  characters, control characters removed); a payload without the field
+  reports label-less. Claude sends the prompt head as the `user` label for
+  the focus view; codex and gemini send `user` with no label at all.
+- activity: while an agent works, waits or has failed, its row carries
+  `activity`, the newest non-empty tool or blocked label (or `thinking`
+  after a prompt), which the sidebar shows under the agent and
+  `qoro agents --json` prints. The prompt text is never an activity. It is
+  cleared when the turn ends. Codex needs `UserPromptSubmit` and gemini
+  `BeforeTool` registered, which `qoro hooks install` now does.
 
 ## How it works
 

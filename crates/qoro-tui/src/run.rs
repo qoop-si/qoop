@@ -143,6 +143,9 @@ fn update_message() -> String {
 /// this are sent as one frame, the newest.
 const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How long an index request may stay unanswered before the next change asks again.
+const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One mouse report in the form a program that asked for the mouse expects.
 ///
 /// SGR (`CSI ? 1006`), which every program that asks for the mouse these days understands
@@ -2703,6 +2706,12 @@ where
     let mut presenter = present::Presenter::default();
     let mut written = String::new();
     let mut presented = tokio::time::Instant::now();
+    // At most one index request in flight. Announces that land while one is out ride on its
+    // answer, which asks once more: a burst of tool calls, each one news for the sidebar,
+    // costs one round trip at a time rather than one request per announce, and the last
+    // change is never lost. A request unanswered for [`INDEX_PATIENCE`] is taken as lost.
+    let mut index_asked: Option<tokio::time::Instant> = None;
+    let mut index_owed = false;
     presented = presented.checked_sub(FRAME).unwrap_or(presented);
 
     let outcome: io::Result<()> = async {
@@ -4185,6 +4194,16 @@ where
                                 {
                                     refresh_spaces = true;
                                 }
+                                let index_answer = match &response {
+                                    // The index this loop asked for, not the mux's own pushes.
+                                    ControlResponse::Agents { id, .. } => id.starts_with("index"),
+                                    ControlResponse::Failed { id, .. } => id.starts_with("index"),
+                                    _ => false,
+                                };
+                                if index_answer {
+                                    index_asked = None;
+                                    refresh |= std::mem::take(&mut index_owed);
+                                }
                                 apply(&mut state, response, &mut dirty);
                             }
                         }
@@ -4238,12 +4257,15 @@ where
                     if state.done {
                         return Ok(());
                     }
-                    if refresh {
+                    if refresh && index_asked.is_some_and(|at| at.elapsed() < INDEX_PATIENCE) {
+                        index_owed = true;
+                    } else if refresh {
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::ListAgents { id: format!("index-{request}") },
                             &mut control_seq,
                         )?).await?;
+                        index_asked = Some(tokio::time::Instant::now());
                     }
                     if refresh_spaces {
                         request += 1;
@@ -4290,6 +4312,23 @@ where
                     }
                 } => {
                     dirty = true;
+                }
+                // A change owed to an index request that never answered: after
+                // `INDEX_PATIENCE` it is taken as lost and the owed change asks on its
+                // own, so the last change of a burst is never left waiting for the next.
+                _ = async {
+                    match index_asked.filter(|_| index_owed) {
+                        Some(at) => tokio::time::sleep_until(at + INDEX_PATIENCE).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    index_owed = false;
+                    request += 1;
+                    wr.write_all(&client::encode_control_seq(
+                        &ControlRequest::ListAgents { id: format!("index-{request}") },
+                        &mut control_seq,
+                    )?).await?;
+                    index_asked = Some(tokio::time::Instant::now());
                 }
             }
         }
@@ -6037,6 +6076,7 @@ mod tests {
             last_active_at_unix: None,
             cwd: None,
             slept_at_unix: None,
+            activity: None,
         }
     }
 

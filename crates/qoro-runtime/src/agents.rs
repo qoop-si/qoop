@@ -1156,6 +1156,29 @@ impl AgentRegistry {
         }
     }
 
+    /// What a terminal's agent is doing right now, from its newest focus events: the
+    /// newest non-empty tool or blocked label, `thinking` when a prompt is newer than any
+    /// such label, and `None` once the turn ended or before anything was said.
+    ///
+    /// Labels, not the prompt: a `user` event reads as the word `thinking`, so what a
+    /// person typed never leaves the focus view. Empty labels are skipped rather than
+    /// taken, because a labelled permission request is followed by a label-less
+    /// notification that says the same thing with less.
+    pub fn activity(&self, stream: u32) -> Option<String> {
+        let focus = self.focus.lock().unwrap();
+        for event in focus.get(&stream)?.iter().rev() {
+            match event.kind.as_str() {
+                "done" => return None,
+                "user" => return Some("thinking".to_string()),
+                "tool" | "blocked" if !event.label.is_empty() => {
+                    return Some(event.label.clone());
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// A terminal's focus events, oldest first.
     pub fn focus_events(&self, stream: u32) -> Vec<crate::control::FocusEvent> {
         self.focus
@@ -1841,6 +1864,35 @@ mod tests {
             events.last().expect("a tail").label,
             format!("Read {}.rs", crate::control::MAX_FOCUS_EVENTS + 4)
         );
+    }
+
+    /// Activity: the newest non-empty tool or blocked label, `thinking` after a prompt,
+    /// nothing once the turn is done, and never the prompt's own text.
+    #[test]
+    fn activity_is_the_newest_label_and_never_the_prompt() {
+        let r = registry();
+        let push = |kind: &str, label: &str| {
+            r.push_focus_event(
+                1,
+                crate::control::FocusEvent {
+                    kind: kind.into(),
+                    label: label.into(),
+                    at_unix: 0,
+                },
+            )
+        };
+        assert_eq!(r.activity(1), None, "nothing said yet");
+        push("user", "delete the prod database please");
+        assert_eq!(r.activity(1).as_deref(), Some("thinking"));
+        push("tool", "Edit src/a.rs");
+        assert_eq!(r.activity(1).as_deref(), Some("Edit src/a.rs"));
+        push("blocked", "Bash cargo publish");
+        // Claude follows a labelled permission request with a label-less notification.
+        push("blocked", "");
+        assert_eq!(r.activity(1).as_deref(), Some("Bash cargo publish"));
+        push("done", "");
+        assert_eq!(r.activity(1), None, "a finished turn has no activity");
+        assert_eq!(r.activity(2), None, "another terminal has its own log");
     }
 
     /// Focus: forgetting a terminal drops its log with it.
