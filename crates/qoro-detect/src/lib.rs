@@ -117,6 +117,18 @@ pub struct Verdict {
     pub setup_gate: bool,
 }
 
+/// The whole answer to one look at a screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// A rule matched and says what the agent is doing.
+    Verdict(Verdict),
+    /// A `skip_state_update` rule won: what is on screen is a view of the past, and the
+    /// last reading should be left as it is.
+    Skip { rule: String },
+    /// No rule matched.
+    Nothing,
+}
+
 /// Why a manifest was rejected.
 ///
 /// Every variant names the rule it came from. A manifest is edited by a person under time
@@ -519,6 +531,19 @@ impl Manifest {
     /// The split exists so screen-only callers keep working unchanged: with an
     /// empty title this behaves exactly like [`Manifest::evaluate`].
     pub fn evaluate_with_osc(&self, screen: &[String], osc: &OscContext<'_>) -> Option<Verdict> {
+        match self.read_with_osc(screen, osc) {
+            Reading::Verdict(v) => Some(v),
+            Reading::Skip { .. } | Reading::Nothing => None,
+        }
+    }
+
+    /// What the screen says, keeping apart the two ways of saying nothing.
+    ///
+    /// [`Manifest::evaluate_with_osc`] answers `None` both when no rule matched and when a
+    /// `skip_state_update` rule won, and those mean opposite things to a caller that falls
+    /// back to idle on silence: no match is an agent with nothing on screen, a skip is a
+    /// pager over the past that says the last reading still stands.
+    pub fn read_with_osc(&self, screen: &[String], osc: &OscContext<'_>) -> Reading {
         let capped = &screen[screen.len().saturating_sub(MAX_REGION_LINES)..];
         let mut best: Option<&Rule> = None;
         for rule in &self.rules {
@@ -534,11 +559,15 @@ impl Manifest {
                 best = Some(rule);
             }
         }
-        let rule = best?;
+        let Some(rule) = best else {
+            return Reading::Nothing;
+        };
         if rule.skip_state_update {
-            return None;
+            return Reading::Skip {
+                rule: rule.id.clone(),
+            };
         }
-        Some(Verdict {
+        Reading::Verdict(Verdict {
             state: rule.state,
             rule: rule.id.clone(),
             visible_blocker: rule.visible_blocker,
@@ -554,7 +583,10 @@ impl Manifest {
 /// A manifest carrying a larger `min_engine_version` is refused at parse time
 /// rather than misread: rules written for newer semantics failing open as
 /// wrong states would be worse than no rules at all.
-pub const ENGINE_VERSION: u32 = 1;
+///
+/// 2 added the `whole_recent`, `prompt_box_body`, `last_non_empty_above_prompt_box` and
+/// `after_last_horizontal_rule` regions.
+pub const ENGINE_VERSION: u32 = 2;
 
 /// The manifests compiled into the binary, as source text.
 const SOURCES: &[&str] = &[
@@ -569,10 +601,22 @@ const SOURCES: &[&str] = &[
     // generic rules and resumed by their own.
     include_str!("../manifests/aider.toml"),
     include_str!("../manifests/goose.toml"),
+    // Rules for the remaining agents, one manifest each.
     include_str!("../manifests/droid.toml"),
     include_str!("../manifests/qwen.toml"),
     include_str!("../manifests/grok.toml"),
     include_str!("../manifests/copilot.toml"),
+    include_str!("../manifests/devin.toml"),
+    include_str!("../manifests/kiro.toml"),
+    include_str!("../manifests/kimi.toml"),
+    include_str!("../manifests/kilo.toml"),
+    include_str!("../manifests/hermes.toml"),
+    include_str!("../manifests/cline.toml"),
+    include_str!("../manifests/antigravity.toml"),
+    include_str!("../manifests/muse.toml"),
+    include_str!("../manifests/pi.toml"),
+    include_str!("../manifests/maki.toml"),
+    include_str!("../manifests/qodercli.toml"),
     include_str!("../manifests/generic.toml"),
 ];
 
@@ -927,6 +971,48 @@ contains = "do you want to proceed"
     }
 
     #[test]
+    fn a_winning_skip_rule_is_read_as_a_skip_and_not_as_nothing() {
+        let m = Manifest::parse(
+            r#"
+id = "t"
+version = "1"
+
+[[rules]]
+id = "transcript"
+state = "unknown"
+priority = 1000
+skip_state_update = true
+contains = "showing detailed transcript"
+
+[[rules]]
+id = "working"
+state = "working"
+priority = 900
+contains = "esc to interrupt"
+"#,
+        )
+        .expect("parses");
+        let osc = OscContext { title: "" };
+        assert_eq!(
+            m.read_with_osc(
+                &screen(&["esc to interrupt", "showing detailed transcript"]),
+                &osc
+            ),
+            Reading::Skip {
+                rule: "transcript".into()
+            }
+        );
+        assert_eq!(
+            m.read_with_osc(&screen(&["nothing here"]), &osc),
+            Reading::Nothing
+        );
+        assert!(matches!(
+            m.read_with_osc(&screen(&["esc to interrupt"]), &osc),
+            Reading::Verdict(v) if v.rule == "working"
+        ));
+    }
+
+    #[test]
     fn a_regex_that_does_not_compile_is_a_parse_error_naming_the_rule() {
         let err = Manifest::parse(
             "id = \"t\"\nversion = \"1\"\n\n[[rules]]\nid = \"broken\"\nstate = \"idle\"\nany = [ { line_regex = '([unclosed' } ]\n",
@@ -941,12 +1027,12 @@ contains = "do you want to proceed"
 
     #[test]
     fn an_unknown_region_is_a_parse_error_naming_the_rule() {
-        let err = one_rule_err("region = \"prompt_box_body\"\ncontains = \"x\"\n");
+        let err = one_rule_err("region = \"above_prompt_box\"\ncontains = \"x\"\n");
         assert_eq!(
             err,
             ManifestError::UnknownRegion {
                 rule: "r".to_string(),
-                region: "prompt_box_body".to_string(),
+                region: "above_prompt_box".to_string(),
             }
         );
     }
@@ -1009,8 +1095,30 @@ contains = "do you want to proceed"
         assert_eq!(
             ids,
             vec![
-                "claude", "codex", "opencode", "cursor", "gemini", "amp", "aider", "goose",
-                "droid", "qwen", "grok", "copilot", "generic"
+                "claude",
+                "codex",
+                "opencode",
+                "cursor",
+                "gemini",
+                "amp",
+                "aider",
+                "goose",
+                "droid",
+                "qwen",
+                "grok",
+                "copilot",
+                "devin",
+                "kiro",
+                "kimi",
+                "kilo",
+                "hermes",
+                "cline",
+                "antigravity",
+                "muse",
+                "pi",
+                "maki",
+                "qodercli",
+                "generic"
             ]
         );
     }
@@ -1417,7 +1525,7 @@ contains = "do you want to proceed"
         )
         .expect("a verdict");
         assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
-        assert_eq!(v.rule, "composer_draft_idle");
+        assert_eq!(v.rule, "live_prompt_box");
         assert!(v.visible_idle);
     }
 
@@ -1450,7 +1558,7 @@ contains = "do you want to proceed"
             ],
         );
         assert!(
-            v.as_ref().is_none_or(|v| v.rule != "composer_draft_idle"),
+            v.as_ref().is_none_or(|v| v.rule != "live_prompt_box"),
             "{v:?}"
         );
     }
@@ -1466,11 +1574,11 @@ contains = "do you want to proceed"
                 "────────────────────────────────────────────────────────────────────────────────",
                 " Enter to select · Esc to cancel",
             ],
-        );
-        assert!(
-            v.as_ref().is_none_or(|v| v.rule != "composer_draft_idle"),
-            "{v:?}"
-        );
+        )
+        .expect("a verdict");
+        // A picker waiting on the person, read by the form rule and never as a draft.
+        assert_eq!(v.rule, "live_blocked_form", "{v:?}");
+        assert_eq!(v.state, AgentRuntimeState::Blocked);
     }
 
     #[test]
@@ -1678,12 +1786,12 @@ contains = "do you want to proceed"
 
     #[test]
     fn agents_without_a_shipped_manifest_fall_back_to_generic() {
-        // The capture gate is unchanged: no agent gets rules without a verified capture of
-        // its screen. Some of them now ship a manifest anyway, because how to carry a
-        // conversation across a restart is a different question from how to read a screen
-        // and is answered from an agent's own published flags. A manifest with no rules in
-        // it must not shadow the generic ones.
-        for name in ["aider", "goose", "droid", "qwen", "grok", "copilot"] {
+        // No agent gets rules without a capture of its screen behind them. These two
+        // have neither and ship a manifest anyway, because how to carry a conversation
+        // across a restart is a different question from how to read a screen and is
+        // answered from an agent's own published flags. A manifest with no rules in it
+        // must not shadow the generic ones.
+        for name in ["aider", "goose"] {
             let manifest = for_program(name).unwrap_or_else(|| panic!("{name} has a manifest"));
             assert!(
                 manifest.rules.is_empty(),

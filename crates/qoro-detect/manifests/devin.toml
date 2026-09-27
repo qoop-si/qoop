@@ -1,0 +1,56 @@
+# Devin CLI (Cognition AI), installed as `devin`.
+#
+# Devin CLI is closed source. Every string below is from its 3000.11.3 release
+# (static.devin.ai): strings in `bin/devin`, the bundled man page and docs, and the
+# transcripts on devin.ai/cli.
+#
+# Its approval prompt is known only as option fragments with no sourced layout or position,
+# so it is not read; neither is its window title, whose text is unknown.
+
+id = "devin"
+version = "1"
+
+# The model picker's hint row, `↑↓ select · tab lead · ←→ effort · ↵ confirm · esc cancel`
+# (devin.ai/cli). The person opened it, and the last reading stands.
+[[rules]]
+id = "model_picker"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(4)"
+skip_state_update = true
+line_regex = '^\s*↑↓ select · tab lead · ←→ effort · ↵ confirm · esc cancel'
+
+# The status line above the composer while working:
+# `⡆ Thinking · 0s (esc twice to interrupt)`, then `(esc again to interrupt)` after one
+# press (devin.ai/cli, `bin/devin`).
+[[rules]]
+id = "interrupt_hint"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = '\(esc (twice|again) to interrupt\)\s*$'
+
+# The composer while a turn runs: `Guide Devin while it works` (`bin/devin`).
+[[rules]]
+id = "working_placeholder"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = '^\W*Guide Devin while it works'
+
+# The empty composer: the glyph `❭` then
+# `Ask Devin to build features, fix bugs, or work on your code` (devin.ai/cli, `bin/devin`).
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*Ask Devin to build features, fix bugs, or work on your code'
+
+# From the man page: `--resume <SESSION_ID>` resumes that session. No latest line: a restore
+# resumes only a conversation whose id was reported, never whichever is newest.
+[resume]
+session = ["devin", "--resume", "{session}"]

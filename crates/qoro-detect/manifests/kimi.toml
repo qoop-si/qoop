@@ -1,0 +1,95 @@
+# Kimi Code CLI (Moonshot AI), installed as `kimi`.
+#
+# Every string below is from MoonshotAI/kimi-cli at 9ab1286b (2026-10-06, kimi-cli 1.52.0),
+# the shell interface in `src/kimi_cli/ui/shell`. Its window title is set once to
+# `Kimi Code` and never says what it is doing, so nothing here reads it.
+
+id = "kimi"
+version = "1"
+
+# The session picker, a full-screen list headed ` SESSIONS (<n> of <total>) `
+# (`session_picker.py`). The person opened it, and the last reading stands.
+[[rules]]
+id = "session_picker"
+state = "unknown"
+priority = 400
+region = "top_non_empty_lines(3)"
+skip_state_update = true
+line_regex = '^\s*SESSIONS \(\d+ of \d+\)'
+
+# The approval panel: the selected option as `→ [1] Approve once`, the others indented,
+# and the hint `▲/▼ select  1/2/3/4 choose  ↵ confirm` (`visualize/_approval_panel.py`).
+# While it is up the prompt under it reads
+# `Use ↑/↓ or 1/2/3, then press Enter to respond to the approval request.`
+# (`visualize/_interactive.py`); that line is required, because the same panel words quoted
+# in an answer have the ordinary prompt under them.
+[[rules]]
+id = "approval_panel"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(25)"
+visible_blocker = true
+all = [
+  { line_regex = '^[│\s]*→ \[\d\] (Approve|Reject)' },
+  { line_regex = '^[│\s]*▲/▼ select\s+1/2/3/4 choose\s+↵ confirm' },
+  { contains = "Use ↑/↓ or 1/2/3, then press Enter to respond to the approval request." },
+]
+
+# The question panel: titled `question` in its top border, with the hint
+# `◄/► switch question  ▲/▼ select  ↵ submit  esc exit` (`visualize/_question_panel.py`).
+# The border title is what an answer quoting the words cannot draw.
+[[rules]]
+id = "question_panel"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*╭─+ question ─' },
+  { line_regex = '^[│\s]*◄/► switch question\s+▲/▼ select\s+↵ submit\s+esc exit' },
+]
+
+# First run with no key: `Enter your API key` (`setup.py`), the prompt on the last line.
+[[rules]]
+id = "api_key_setup"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(3)"
+visible_blocker = true
+setup_gate = true
+regex = '(?m)^\s*Enter your API key[^\n]*\z'
+
+# The live line while the model thinks: `Thinking`, a three-cell dot animation, then the
+# elapsed time and ` · <N> tokens` (`visualize/_blocks.py`, _compose_thinking).
+[[rules]]
+id = "thinking_line"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '^\s*Thinking[ .]{3}  \S+ · \d+ tokens'
+
+# The live line while the reply is written, or thinking is streamed: a spinner, then
+# `Composing...` or `Thinking...` (`visualize/_blocks.py`).
+[[rules]]
+id = "spinner_line"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '^\s*\S\s+(Composing|Thinking)\.\.\.'
+
+# The toolbar under the prompt joins its tips with ` | `, among them
+# `ctrl-x: toggle mode` (`prompt.py`).
+[[rules]]
+id = "prompt_toolbar"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+line_regex = '\bctrl-x: toggle mode( \||\s*$)'
+
+# From `src/kimi_cli/cli/__init__.py`: `--session <id>` resumes that session. No latest line:
+# a restore resumes only a conversation whose id was reported.
+[resume]
+session = ["kimi", "--session", "{session}"]

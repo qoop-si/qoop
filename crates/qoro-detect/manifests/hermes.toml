@@ -1,0 +1,141 @@
+# Hermes Agent (Nous Research).
+#
+# Every string below is from NousResearch/hermes-agent at aaf7f199 (2026-10-06). It ships
+# two interfaces: the classic prompt_toolkit one (`hermes`, `hermes_cli/`, strings in
+# `locales/en.yaml`) and the Ink one (`hermes --tui`, `ui-tui/`). Rules say which they read.
+
+id = "hermes"
+version = "1"
+min_engine_version = 2
+
+# Ink: the command palette and the agents panel, by their hint lines
+# (`Type to filter <n> commands ... Esc cancels`, `↑/↓ select · Enter tail ... q/Ctrl+T close`).
+[[rules]]
+id = "palette_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(4)"
+skip_state_update = true
+any = [
+  { line_regex = '^\W*Type to filter \d+ commands . ↑/↓ then Enter inserts, Esc cancels' },
+  { line_regex = '^\W*↑/↓ select · Enter tail.* · x stop · q/Ctrl\+T close' },
+]
+
+# Classic: the approval panel, whose top border carries its title
+# (`╭─ ⚠️  Dangerous Command ───╮`), with rows `❯ 1. Allow once`, `2. Allow for this
+# session`, `Deny` (`hermes_cli/cli_tui_mixin.py`). The bordered title is what an answer
+# quoting the words does not draw.
+[[rules]]
+id = "dangerous_command_panel"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*╭─ .*Dangerous Command ─' },
+  { line_regex = '^\W*❯ \d\. (Allow once|Allow for this session|Add to permanent allowlist|Deny|Show full command)' },
+]
+
+# Without the interface: the plain prompt `Choice [o/s/a/D]: ` (or `[o/s/D]`, `[o/D]`)
+# waiting on the last line (`tools/approval_prompt.py`).
+[[rules]]
+id = "dangerous_command_prompt"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(1)"
+visible_blocker = true
+line_regex = '^\s*Choice \[o(/s)?(/a)?/D\]:\s*$'
+
+# Ink: the approval, confirm and clarify overlays, drawn in a double border, by their hint
+# rows (`↑/↓ select · Enter confirm · 1-<n> quick pick · Esc/Ctrl+C deny` and the others,
+# `ui-tui/src/i18n/en/overlays.ts`).
+[[rules]]
+id = "ink_prompt"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+line_regex = '^\s*║\s*↑/↓ select · Enter \S+ · (1-\d+ quick pick · Esc/Ctrl\+C deny|Y/N quick · Esc cancel|Tab/Shift\+Tab switch question · Esc/Ctrl\+C cancel)'
+
+# Classic: a confirm, clarify, sudo or secret prompt turns the composer's placeholder into
+# its own (`type 1/2/3, or ↑/↓ to select, Enter to confirm`,
+# `type your answer here and press Enter`, `password hidden · Enter to skip`,
+# `secret hidden · Enter to skip`). Read between the composer's two rules.
+[[rules]]
+id = "classic_modal_prompt"
+state = "blocked"
+priority = 300
+region = "prompt_box_body"
+visible_blocker = true
+line_regex = '(type 1/2/3, or ↑/↓ to select, Enter to confirm|type your answer here and press Enter|password hidden · Enter to skip|secret hidden · Enter to skip)'
+
+# Ink: the window title starts `⚠` while an approval, clarify or secret prompt is open
+# (`ui-tui/src/app/useMainApp.ts`).
+[[rules]]
+id = "title_attention"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^⚠ '
+
+# Classic: the composer's placeholder while the agent runs,
+# `msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel`.
+[[rules]]
+id = "classic_running_placeholder"
+state = "working"
+priority = 200
+region = "prompt_box_body"
+visible_working = true
+line_regex = 'msg=interrupt · /queue · /bg · /steer · Ctrl\+C cancel'
+
+# Classic: the spinner line, `<frame> <face> <verb>... (<elapsed>s)`, with one of the
+# thinking verbs (`agent/display.py`).
+[[rules]]
+id = "classic_spinner"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = '\b(pondering|contemplating|musing|cogitating|ruminating|deliberating|mulling|reflecting|processing|reasoning|analyzing|computing|synthesizing|formulating|brainstorming)\b.*\([\d.]+s?\)\s*$'
+
+# Ink: the composer's hint while busy, `Ctrl+C to interrupt…`.
+[[rules]]
+id = "ink_interrupt_hint"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = 'Ctrl\+C to interrupt…'
+
+# Ink: the window title starts `⏳` while busy.
+[[rules]]
+id = "title_busy"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^⏳ '
+
+# Classic: the composer between its two `─` rules, starting with the prompt `❯`.
+[[rules]]
+id = "classic_composer"
+state = "idle"
+priority = 100
+region = "prompt_box_body"
+visible_idle = true
+line_regex = '^\s*❯(\s|$)'
+
+# Ink: the window title starts `✓` at rest.
+[[rules]]
+id = "title_ready"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+line_regex = '^✓ '
+
+# From `hermes_cli/_parser.py`: `--resume <id>`. No latest line: a restore resumes only a
+# conversation whose id was reported.
+[resume]
+session = ["hermes", "--resume", "{session}"]

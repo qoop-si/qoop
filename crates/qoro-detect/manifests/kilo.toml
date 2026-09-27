@@ -1,0 +1,128 @@
+# Kilo Code CLI (Kilo Code), installed as `kilo` and `kilocode`.
+#
+# The strings below are from Kilo-Org/kilocode at 82fddfdd (2026-10-06, @kilocode/cli
+# 7.8.3): the session view in `packages/tui/src` and the Kilo code in
+# `packages/opencode/src/kilocode`. Kilo draws the OpenCode session view, so the busy
+# spinner's glyphs and the cut and fullscreen permission rows follow screens recorded in
+# qoro's own OpenCode sessions. Panels carry a border on their left side, so line
+# patterns allow any non-word glyphs before the text.
+
+id = "kilo"
+version = "1"
+
+# A permission request replaces the composer with a panel headed `△ Permission required`,
+# then `△ Always allow` or `△ Reject permission`, each with the hint `enter confirm` or, on
+# a narrow screen that cuts the hint, its buttons (`routes/session/permission.tsx`). The
+# composer is not drawn while it is up, so the composer at the bottom rules this out (its
+# placeholder within the last five rows, or its status row as the last line): the same words
+# quoted in an answer have the composer under them.
+
+[[rules]]
+id = "permission_panel"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { line_regex = '^[^\w]*△ +(Permission required|Always allow|Reject permission)\s*$' },
+  { any = [
+    { contains = "enter confirm" },
+    { line_regex = '(Allow once\s+(Allow always\s+)?|Allow\s+)Reject\b' },
+  ] },
+]
+not = [
+  { regex = '(Ask anything|Run a command)\.\.\. "[^\n]*(\n[^\n]*){0,4}\z' },
+  { regex = '(?m)\s\S+ commands\s*\z' },
+]
+
+# The same panel expanded to the full screen pushes its header out of any bottom region,
+# but its buttons stay at the bottom, beside or just over the hint `⇆ select`. The Reject
+# stage has no buttons; its input row ends with `enter confirm  esc cancel` instead. The
+# composer and its hints take those last rows whenever the panel is gone, so a quote never
+# reaches them.
+[[rules]]
+id = "permission_buttons"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(4)"
+visible_blocker = true
+any = [
+  { all = [
+    { line_regex = '^[^\w]*(Allow once\s+(Allow always\s+)?Reject|Allow\s+Reject|Confirm\s+Cancel)\b' },
+    { contains = "⇆ select" },
+  ] },
+  { line_regex = '\benter confirm\s+esc cancel\s*\W*$' },
+]
+
+not = [
+  { line_regex = '(Ask anything|Run a command)\.\.\. "' },
+  { line_regex = '\s\S+ commands\s*$' },
+]
+
+# A question from the model replaces the composer too; its footer ends in `esc dismiss`
+# (`routes/session/question.tsx`).
+[[rules]]
+id = "question_prompt"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(3)"
+visible_blocker = true
+line_regex = 'esc dismiss\s*$'
+not = [
+  { line_regex = '(Ask anything|Run a command)\.\.\. "' },
+  { line_regex = '\s\S+ commands\s*$' },
+]
+
+# The window title while something waits on the person starts with `⚠ ` when the
+# `title_icon` setting is `unicode` (`kilocode/cli/cmd/tui/terminal-title.ts`). The default
+# draws no icon, and then this never matches.
+[[rules]]
+id = "title_attention"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^⚠ '
+
+# The row under the composer while busy: a block spinner on the left (`[⋯]` with animations
+# off), `esc interrupt` (with the usage and `commands` hints after it on the same row),
+# `esc again to interrupt` after one press, and while retrying
+# `<message> [retrying in <duration> attempt #<n>]` or `<message> [waiting for network]`
+# (`component/prompt/index.tsx`).
+[[rules]]
+id = "busy_row"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(3)"
+visible_working = true
+any = [
+  { line_regex = '^\s*([⬝■]{8}|\[⋯\])(\s|$)' },
+  { line_regex = '\besc (again to )?interrupt\b' },
+  { line_regex = '\[retrying (in .+ )?attempt #\d+\]' },
+  { line_regex = '\[waiting for network\]' },
+]
+
+# The window title while working starts with `◔ ` under the `unicode` title icons
+# (`terminal-title.ts`).
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^◔ '
+
+# The empty composer: `Ask anything... "<example>"`, or `Run a command... "<example>"` in
+# shell mode, with three ASCII dots (`component/prompt/index.tsx`).
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(8)"
+visible_idle = true
+line_regex = '^[^\w]*(Ask anything|Run a command)\.\.\. "'
+
+# From `packages/opencode/src/cli/cmd/tui.ts`: `--session <id>` continues that session. No
+# latest line: a restore resumes only a conversation whose id was reported.
+[resume]
+session = ["kilo", "--session", "{session}"]

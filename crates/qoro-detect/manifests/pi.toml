@@ -1,0 +1,93 @@
+# pi, the coding agent (Earendil Works), installed as `pi`.
+#
+# Every string below is from badlogic/pi-mono at 26912161 (2026-10-06,
+# @earendil-works/pi-coding-agent 1.0.4), mostly `packages/coding-agent` and
+# `packages/tui`. pi asks no approval before a tool call (`docs/security.md`): the only
+# dialogs that wait on a person are the project trust selector and the confirm dialog an
+# extension raises.
+#
+# Selectors and dialogs are drawn in the editor's place: a full-width `─` border, the
+# block, its hint row (`↑↓ navigate  enter select  escape cancel`, key names as configured),
+# then a closing border, with only the footer under it. That shape is what tells a live
+# dialog from the same words quoted in an answer, which has the editor's two borders under
+# it.
+
+id = "pi"
+version = "1"
+
+# An extension's confirm dialog, also used for `Session cwd not found`: the options `Yes`
+# and `No`, the selected one as `→ Yes` (`interactive-mode.ts` showExtensionConfirm,
+# `components/extension-selector.ts`).
+[[rules]]
+id = "confirm_dialog"
+state = "blocked"
+priority = 400
+region = "bottom_non_empty_lines(12)"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*→ (Yes|No)\s*$' },
+  { line_regex = '^\s+(Yes|No)\s*$' },
+  { regex = '(?m)^\s*↑↓ navigate\s+\S+ select\s+\S+ cancel[^\n]*\n\s*─+\s*(\n\s*[^─\s][^\n]*)*\z' },
+]
+
+# The project trust selector, at startup in a folder with protected project files:
+# `Project trust`, its options, and the hint `↑↓ navigate  enter save  escape cancel`
+# (`components/trust-selector.ts`, `core/trust-manager.ts`). Read by the same shape as the
+# other dialogs: one border, then only the footer, under the hint row.
+[[rules]]
+id = "project_trust"
+state = "blocked"
+priority = 400
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\s*Project trust\s*$' },
+  { regex = '(?m)^\s*↑↓ navigate\s+\S+ save\s+\S+ cancel[^\n]*\n\s*─+\s*(\n\s*[^─\s][^\n]*)*\z' },
+]
+
+# Any other selector with the same hint row: an extension's `ui.select` question, which
+# waits on the person like the confirm dialog, or one of pi's own selectors (model,
+# session, settings, theme, tree, thinking level), which the person opened and which waits
+# on them too (`components/extension-selector.ts` and its siblings). Their titles were not
+# read, so the two cannot be told apart, and both are read as waiting on the person.
+[[rules]]
+id = "select_dialog"
+state = "blocked"
+priority = 350
+region = "bottom_non_empty_lines(12)"
+visible_blocker = true
+regex = '(?m)^\s*↑↓ navigate\s+\S+ select\s+\S+ cancel[^\n]*\n\s*─+\s*(\n\s*[^─\s][^\n]*)*\z'
+
+
+# While the agent works the editor's top border carries the indicator: `── ⠋ Working ───`,
+# a braille spinner then the message, which is `Working (escape to interrupt)` after an
+# extension reload, and `Retrying (...)`, `Compacting context... (escape to cancel)` and
+# the like with their own hint (`components/custom-editor.ts`,
+# `components/status-indicator.ts`, `packages/tui/src/components/loader.ts`).
+[[rules]]
+id = "editor_border_working"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(15)"
+visible_working = true
+any = [
+  { line_regex = '^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ' },
+  { line_regex = '^── .* \(\S+ to (interrupt|cancel)\) ─' },
+]
+
+# The editor at rest is a text area between two plain full-width `─` borders, with no
+# prompt glyph and no placeholder (`packages/tui/src/components/editor.ts`); two footer
+# lines sit under it. While the agent works the top border carries the indicator instead.
+[[rules]]
+id = "editor_idle"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(10)"
+visible_idle = true
+regex = '(^|\n)─{3,}[ \t]*\n([ \t]*[^─\s][^\n]*\n)*─{3,}[ \t]*(\n|\z)'
+
+# From `packages/coding-agent/src/cli/args.ts`: `--session <path|id>` opens that session. No
+# latest line: a restore resumes only a conversation whose id was reported.
+[resume]
+session = ["pi", "--session", "{session}"]

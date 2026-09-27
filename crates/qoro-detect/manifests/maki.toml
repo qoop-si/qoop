@@ -1,0 +1,80 @@
+# maki, a terminal coding agent by Tony Solomonik, installed as `maki`.
+#
+# Every string below is from tontinton/maki at 8d79a38f (2026-10-06, version 0.6.0), the
+# interface in `maki-ui/src`. maki draws the whole terminal, so a dialog over the
+# transcript is on screen wherever it is centred. It writes no window title of its own.
+
+id = "maki"
+version = "1"
+
+# The permission overlay: a form whose border carries the title ` Permission Required `,
+# with the key rows `y  Allow ...` and `n  Deny ...`, or the confirm rows `Enter / y  Confirm
+# ...` and `Enter  Deny` (`components/permission_prompt.rs`). The title in the border is
+# what an answer quoting the words cannot draw.
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+line_regex = '[─┌╭] Permission Required [─┐╮]'
+any = [
+  { line_regex = '\by +Allow\b' },
+  { line_regex = 'Enter / y +Confirm' },
+  { line_regex = '\bEnter +Deny\b' },
+]
+
+# The folder trust card at startup: the border title ` Folder Trust ` and the choice
+# `Trust this folder` (`trust_card.rs`).
+# The composer's placeholder under the same words means they were quoted.
+[[rules]]
+id = "folder_trust"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '[─┌╭] Folder Trust [─┐╮]' },
+  { line_regex = '^\W*(> )?Trust this folder\b' },
+]
+not = [{ line_regex = '^\W*❯ (Ask maki to|Queue )' }]
+
+# The status row while a turn streams starts with a braille spinner frame
+# (`components/status_bar.rs`, `animation.rs`). No word says working; the glyph does.
+[[rules]]
+id = "status_spinner"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = '^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] \S'
+
+# The composer while a turn streams: `❯ Queue another prompt...` or
+# `❯ Queue a message for this subagent...` (`components/input.rs`), and the flash after one
+# Esc, `Press esc again to stop...` (`app/mod.rs`).
+[[rules]]
+id = "working_composer"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+any = [
+  { line_regex = '^\W*❯ Queue (another prompt|a message for this subagent)\.\.\.' },
+  { line_regex = '\bPress esc again to stop\.\.\.' },
+]
+
+# The empty composer: `❯ Ask maki to <suggestion>...` inside its box
+# (`components/input.rs`).
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*❯ Ask maki to .+\.\.\.'
+
+# From `src/cli.rs`: `--resume <id>` resumes that session. No latest line: a restore resumes
+# only a conversation whose id was reported.
+[resume]
+session = ["maki", "--resume", "{session}"]

@@ -1,0 +1,110 @@
+# Qoder CLI (Qoder), installed as `qodercli`.
+#
+# Qoder CLI ships as a bundled script, not as source. Every string below is from the npm
+# package @qoder-ai/qodercli 1.1.65 (`bundle/qodercli.js`, read as text, with its encoded
+# strings decoded).
+
+id = "qodercli"
+version = "1"
+
+# The copy dialog, whose footer is `Enter copy · W write to file · Esc cancel`. The person
+# opened it, and the last reading stands.
+[[rules]]
+id = "copy_dialog"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(6)"
+skip_state_update = true
+line_regex = '^\W*Enter copy · W write to file · Esc cancel'
+
+# A permission dialog: its question (`Allow this command to run?`, `Apply this change?`,
+# `Do you want to proceed?`, `Allow reading this file?`, or the plan's
+# `... Would you like to proceed?`), then a numbered list whose highlighted row carries
+# `❯` before its number. The composer's placeholder rules it out: the same words quoted in
+# an answer have the composer under them.
+[[rules]]
+id = "permission_dialog"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(30)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*(Allow this command to run\?|Apply this change\?|Do you want to proceed\?|Allow reading this file\?|.+ Would you like to proceed\?)' },
+  { line_regex = '^\s*❯\s*\d+\. \S' },
+]
+not = [
+  { contains = "Type your message or @path/to/file" },
+  { contains = "Type your shell command" },
+]
+
+# The window title while a confirmation waits: `▲ <session title> | Action Required`
+# (on by default, `ui.dynamicWindowTitle`).
+[[rules]]
+id = "title_action_required"
+state = "blocked"
+priority = 300
+region = "osc_title"
+visible_blocker = true
+line_regex = '^▲ .*\| Action Required'
+
+# The trust gate: `Do you trust the files in this folder?` over the options `Trust folder`
+# and `Don't trust and exit`.
+# Qoder CLI draws inline: the composer's placeholder under the same words means they were
+# quoted.
+[[rules]]
+id = "trust_folder"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Do you trust the files in this folder\?' },
+  { line_regex = "^\\W*(\\d+\\. )?Don't trust and exit" },
+]
+not = [
+  { contains = "Type your message or @path/to/file" },
+  { contains = "Type your shell command" },
+]
+
+# The loading row: a spinner, a phrase, then `(esc to cancel, <duration>)`.
+[[rules]]
+id = "esc_to_cancel"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '\(esc to cancel, [^()]+\)\s*$'
+
+# The window title while working: `✦ <session title> | Working`.
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^✦ .*\| Working'
+
+# The empty composer: `  Type your message or @path/to/file`, or `  Type your shell command`
+# in shell mode, after the prompt.
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^[│\s]*(\S+\s+)?Type your (message or @path/to/file|shell command)'
+
+# The window title at rest: `◇ <session title> | Ready`.
+[[rules]]
+id = "title_ready"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+line_regex = '^◇ .*\| Ready'
+
+# From the bundle's options: `--resume <id>` resumes that session. No latest line: a restore
+# resumes only a conversation whose id was reported.
+[resume]
+session = ["qodercli", "--resume", "{session}"]

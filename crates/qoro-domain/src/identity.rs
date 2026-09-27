@@ -35,6 +35,13 @@ pub enum AgentIdentity {
     Known {
         program: String,
         generation: GenerationId,
+        /// Whether `program` is a coding agent, decided once where the argv was read.
+        ///
+        /// Carried rather than looked up again from the name, because the name is not
+        /// enough: `pi` is an agent when node is running it and a stranger's tool when it
+        /// is its own executable, and only the argv tells the two apart. Everything that
+        /// asks "is this an agent" later (the index, the reaper, a restore) reads this.
+        agent: bool,
     },
     /// There is a process, and it is behind something we cannot see through.
     ///
@@ -188,6 +195,7 @@ mod tests {
         let id = AgentIdentity::Known {
             program: "claude".into(),
             generation: GenerationId(2),
+            agent: true,
         };
         assert_eq!(id.program(), Some("claude"));
         assert_eq!(id.confidence_ceiling(), Confidence::High);

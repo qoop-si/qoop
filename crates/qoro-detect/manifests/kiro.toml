@@ -1,0 +1,118 @@
+# Kiro CLI (Amazon Web Services), installed as `kiro-cli`.
+#
+# Kiro CLI is closed source. Every string below is from its shipped 2.28.0 package
+# (kirocli-x86_64-linux.zip, build 877b466e): the terminal interface script bundled inside
+# `bin/kiro-cli-chat`, read as text, and the docs at kiro.dev. That interface is the
+# default; the older `--classic` one is not read here.
+
+id = "kiro"
+version = "1"
+
+# A tool approval: the title `<Tool> requires approval`, the options, and the hint row
+# `y approve · n deny · t trust` (`.` instead of `·` in ASCII mode). The composer stays
+# under it with a working placeholder, so the idle placeholder rules it out: the same
+# words quoted in an answer have the idle composer under them.
+[[rules]]
+id = "approval_dialog"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { line_regex = '^\W*\S+ requires approval\b' },
+  { line_regex = '^\W*y approve [·.] n deny [·.] t trust' },
+]
+not = [{ contains = "ask a question or describe a task" }]
+
+# The banner in the crew and shell monitors while chat waits on the person:
+# `The agent needs permission to run a tool` or `The agent is asking a question`, then
+# `press q or Esc to return to chat and respond` on the same row. Those monitors fill the
+# screen, so the whole screen is read.
+[[rules]]
+id = "monitor_banner"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+line_regex = '(The agent needs permission to run a tool|The agent is asking a question)\W*press q or Esc to return to chat and respond'
+
+# Started with `--trust-all-tools`: `Warning: Kiro is running in trust all tools mode` over
+# a list ending in `No, exit`.
+# The composer's placeholder under the same words means they were quoted.
+[[rules]]
+id = "trust_all_tools_warning"
+state = "blocked"
+priority = 300
+region = "whole_screen"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Warning: Kiro is running in trust all tools mode' },
+  { line_regex = '^\W*(\S\s+)?No, exit\s*$' },
+]
+not = [{ line_regex = '^\W*(> |! )?(ask a question or describe a task|Kiro is working)' }]
+
+# Sign-in from the host: `Press enter to continue to the browser or esc to cancel`, the
+# screen's last line while it waits (`bin/kiro-cli`).
+[[rules]]
+id = "sign_in"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(3)"
+visible_blocker = true
+setup_gate = true
+regex = '(?m)^\s*Press enter to continue to the browser or esc to cancel\s*\z'
+
+# The busy row: a phrase (`Thinking...` by default, `Still thinking...` after a minute)
+# then ` (esc to cancel)`, the key being the configured cancel binding.
+[[rules]]
+id = "busy_row"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+line_regex = '\S \([\w+]+ to cancel\)\s*$'
+
+# The composer while a turn runs: `Kiro is working · <elapsed> · Type to steer ...`,
+# `Kiro is working · Type to queue`, or `Initializing · type to queue a message`.
+[[rules]]
+id = "working_placeholder"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = '^\W*(> )?(Kiro is working · |Initializing · type to queue)'
+
+# The window title while working, when `chat.terminalTitle` is on (it is off by default):
+# a quarter-circle frame (`◐ ◓ ◑ ◒`, or `- \ | /` in ASCII mode) then `kiro: <title>`.
+[[rules]]
+id = "title_working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+line_regex = '^[◐◓◑◒/|\\-] kiro: '
+
+# The empty composer: `> ` then `ask a question or describe a task ↵` (`enter` in ASCII
+# mode), with variants in plan and tangent mode that start the same way.
+[[rules]]
+id = "composer_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^\W*(> |! )?ask a question or describe a task( ↵| enter| ·|\s*$)'
+
+# The window title at rest, when enabled: `kiro: <title>`.
+[[rules]]
+id = "title_ready"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+line_regex = '^kiro: '
+
+# From kiro.dev's command reference: `chat --resume-id <ID>` resumes that conversation. No
+# latest line: a restore resumes only a conversation whose id was reported.
+[resume]
+session = ["kiro-cli", "chat", "--resume-id", "{session}"]

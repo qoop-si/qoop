@@ -1,0 +1,18 @@
+# Antigravity CLI (Google), installed as `agy`.
+#
+# No detection rules. Antigravity CLI is closed source: its 1.3.0 release
+# (google-antigravity/antigravity-cli) yields the words of its approval prompts, its working
+# line and its workspace trust dialog (`Do you trust the contents of this project?`,
+# `Yes, I trust this folder`) only as separate strings, with no layout, and its composer is
+# known only from a docs illustration. Nothing sourced tells a live dialog from the same
+# words quoted in an answer, so it is read by the generic rules. What is here is how to
+# carry its conversation across a restart.
+
+id = "antigravity"
+version = "1"
+
+# From the resume docs and the hint printed on exit (`agy --conversation=<id>`):
+# `--conversation <id>` resumes that conversation. No latest line: a restore resumes only a
+# conversation whose id was reported.
+[resume]
+session = ["agy", "--conversation", "{session}"]

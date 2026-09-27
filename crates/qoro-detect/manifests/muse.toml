@@ -1,0 +1,66 @@
+# Muse Code (Meta), installed as `muse`.
+#
+# Muse Code is closed source. What is here is from its 1.4.3 release (channel muse-stable):
+# strings in the shipped binary, and the docs at dev.meta.ai/docs/muse-code.
+#
+# Its approval card, working row and composer are known only as labels with no layout, so
+# a live one cannot be told from the same words quoted in an answer and they are not read;
+# its window title text is unknown.
+
+id = "muse"
+version = "1"
+
+# Full-screen lists the person opened: the session picker (`Resume a previous session`,
+# with `pgup/pgdn page` in its hints) and the rewind picker (`Rewind conversation` over
+# `Creates a new conversation branch. Your files stay unchanged.`). The last reading stands.
+[[rules]]
+id = "picker_open"
+state = "unknown"
+priority = 400
+region = "whole_screen"
+skip_state_update = true
+any = [
+  { all = [
+    { line_regex = '^\W*Resume a previous session\s*$' },
+    { contains = "pgup/pgdn page" },
+  ] },
+  { all = [
+    { line_regex = '^\W*Rewind conversation\s*$' },
+    { line_regex = '^\W*Creates a new conversation branch\. Your files stay unchanged\.' },
+  ] },
+]
+
+# The workspace trust prompt on first entry: `Do you trust this workspace?` and the hint
+# `Use Up/Down or 1/2, then Enter. Esc quits.` as the last line: the same words quoted in an
+# answer have whatever is drawn under the answer below them.
+[[rules]]
+id = "trust_workspace"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*Do you trust this workspace\?' },
+  { regex = '(?m)^\W*Use Up/Down or 1/2, then Enter\. Esc quits\.\s*\z' },
+]
+
+# The hook review before a session starts: the options `Trust all and continue` and
+# `Continue without trusting`, and the hint
+# `Up/Down to choose, Enter to confirm. Esc continues without trusting.` as the last line.
+[[rules]]
+id = "review_hooks"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+all = [
+  { line_regex = '^\W*(\d+\.\s*)?Trust all and continue' },
+  { regex = '(?m)^\W*Up/Down to choose, Enter to confirm\. Esc continues without trusting\.\s*\z' },
+]
+
+# From the docs and the usage text: `muse resume <session>` opens that session. No latest
+# line: a restore resumes only a conversation whose id was reported.
+[resume]
+session = ["muse", "resume", "{session}"]

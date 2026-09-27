@@ -163,6 +163,8 @@ pub struct ReapSnapshot {
     pub generation: GenerationId,
     pub state: AgentRuntimeState,
     pub program: Option<String>,
+    /// The program is a coding agent, as decided where its argv was read.
+    pub agent: bool,
     /// The identity is `Unavailable` (a wrapper the daemon cannot see
     /// through): reads as no program, but must veto, never close.
     pub boundary: bool,
@@ -465,10 +467,10 @@ impl AgentRegistry {
     pub fn reap_snapshot(&self, stream: u32) -> Option<ReapSnapshot> {
         let terminals = self.terminals.lock().unwrap();
         let agent = terminals.get(&stream)?;
-        let (program, boundary) = match &agent.identity {
-            AgentIdentity::Known { program, .. } => (Some(program.clone()), false),
-            AgentIdentity::Unavailable { .. } => (None, true),
-            AgentIdentity::None => (None, false),
+        let (program, is_agent, boundary) = match &agent.identity {
+            AgentIdentity::Known { program, agent, .. } => (Some(program.clone()), *agent, false),
+            AgentIdentity::Unavailable { .. } => (None, false, true),
+            AgentIdentity::None => (None, false, false),
         };
         let idle_since = match (agent.last_active_at_unix, agent.last_io_unix) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -480,6 +482,7 @@ impl AgentRegistry {
             generation: agent.belief.generation,
             state: agent.belief.state,
             program,
+            agent: is_agent,
             boundary,
             setup_gate: agent.setup_gate,
             idle_since,
@@ -697,9 +700,12 @@ impl AgentRegistry {
             }
         } else {
             match program {
+                // Test harness only: a bare name stands in for a process whose argv the
+                // harness cannot give.
                 Some(name) => AgentIdentity::Known {
                     program: name.into(),
                     generation,
+                    agent: qoro_domain::program::identify(name, &[]).agent,
                 },
                 None => AgentIdentity::None,
             }
@@ -743,14 +749,25 @@ impl AgentRegistry {
         self.terminals.lock().unwrap().keys().copied().collect()
     }
 
-    /// The program in a terminal, when it can be read.
+    /// The name to read a terminal's screen by: the program when it is an agent, and
+    /// `generic` for anything else that can be read.
+    ///
+    /// Not the bare program name, because a name is not enough to pick a manifest: a
+    /// stranger's native `pi` or `muse` is not the agent of that name, and reading it with
+    /// the agent's rules (and its idle fallback) would claim states for a program those
+    /// rules were never written for. The carried agent bit decides.
     ///
     /// Its own accessor rather than a field read through `agent()`, because the read loop
     /// asks on every screen evaluation and cloning the whole record for a name is the kind
     /// of cost that only shows up at a hundred terminals.
-    pub fn program_of(&self, stream: u32) -> Option<String> {
+    pub fn rules_name_of(&self, stream: u32) -> Option<String> {
         match &self.terminals.lock().unwrap().get(&stream)?.identity {
-            AgentIdentity::Known { program, .. } => Some(program.clone()),
+            AgentIdentity::Known {
+                program,
+                agent: true,
+                ..
+            } => Some(program.clone()),
+            AgentIdentity::Known { agent: false, .. } => Some("generic".to_string()),
             _ => None,
         }
     }
@@ -812,8 +829,7 @@ impl AgentRegistry {
             // any window short enough to be cheap would have closed first.
             //
             // `RELOOK` is what bounds the cost instead: the read loop asks on every read.
-            let provisional = matches!(&agent.identity, AgentIdentity::Known { program, .. }
-                if !qoro_domain::program::identify(program, &[]).agent);
+            let provisional = matches!(&agent.identity, AgentIdentity::Known { agent: false, .. });
             if !provisional || leader.is_none() {
                 // Settled some other way, an exec into an agent or an exit: nothing is
                 // owed any more, and a debt left here would re-arm an expired timer on
@@ -839,11 +855,11 @@ impl AgentRegistry {
             // generation is how everything else knows something actually changed.
             let current = agent.identity.generation().unwrap_or(GenerationId::FIRST);
             let program = match identity_of(pid, current) {
-                AgentIdentity::Known { program, .. }
-                    if qoro_domain::program::identify(&program, &[]).agent =>
-                {
-                    program
-                }
+                AgentIdentity::Known {
+                    program,
+                    agent: true,
+                    ..
+                } => program,
                 _ => return None,
             };
             // A different program is in this terminal than the one we had been reading, so
@@ -861,6 +877,7 @@ impl AgentRegistry {
             agent.identity = AgentIdentity::Known {
                 program,
                 generation,
+                agent: true,
             };
             drop(terminals);
             self.announce(stream);
@@ -1200,12 +1217,14 @@ fn identity_of(pid: Pid, generation: GenerationId) -> AgentIdentity {
             return AgentIdentity::Known {
                 program: found.name,
                 generation,
+                agent: true,
             };
         }
     }
     AgentIdentity::Known {
         program: leader.name,
         generation,
+        agent: leader.agent,
     }
 }
 
@@ -1233,6 +1252,27 @@ mod tests {
 
     fn registry() -> AgentRegistry {
         AgentRegistry::new().expect("registry")
+    }
+
+    /// A stranger's program sharing an agent's name is read by the generic rules: the
+    /// carried bit, not the name, picks the manifest.
+    #[test]
+    fn a_program_that_is_not_an_agent_is_read_by_the_generic_rules() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let set = |program: &str, agent: bool| {
+            r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
+                program: program.into(),
+                generation: GenerationId::FIRST,
+                agent,
+            };
+        };
+        set("pi", false);
+        assert_eq!(r.rules_name_of(1).as_deref(), Some("generic"));
+        set("pi", true);
+        assert_eq!(r.rules_name_of(1).as_deref(), Some("pi"));
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::None;
+        assert_eq!(r.rules_name_of(1), None);
     }
 
     #[test]
@@ -1322,6 +1362,7 @@ mod tests {
         r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
             program: "claude".into(),
             generation: GenerationId::FIRST,
+            agent: true,
         };
         assert_eq!(r.note_foreground(1, Some(me), NOW), None);
         assert_eq!(r.relook_due(1), None);

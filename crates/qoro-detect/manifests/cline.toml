@@ -1,0 +1,95 @@
+# Cline CLI (Cline Bot Inc.), the interactive terminal interface.
+#
+# Every string below is from cline/cline at cd80a20e (2026-10-06, @cline/cli 3.0.68), the
+# views and components in `apps/cli/src/tui`. Tool calls are approved automatically unless
+# the person turned that off, so the approval panel is often never drawn.
+
+id = "cline"
+version = "1"
+
+# Pickers the person opened, ending on their own hint line: the model selector, the
+# checkpoint picker and confirm, and the theme picker (`model-selector.tsx`,
+# `dialogs/checkpoint-picker.tsx`, `dialogs/checkpoint-confirm.tsx`,
+# `dialogs/theme-picker.tsx`). Nothing waits on the agent there.
+[[rules]]
+id = "picker_open"
+state = "unknown"
+priority = 400
+region = "bottom_non_empty_lines(6)"
+skip_state_update = true
+line_regex = '^\s*(↑/↓ (navigate|preview), Enter to (select|confirm|apply), Esc to (go back|cancel)|Enter to save, Tab to change provider, Esc to close)\s*$'
+
+# The approval panel replaces the input bar: `Cline needs permission`, `Approve tool call?`,
+# the tool and its parameters, then the buttons ` [y] Approve ` and ` [n] Deny ` side by
+# side (`components/inline-tool-response.tsx`, `views/chat-view.tsx`). The input bar's
+# placeholder rules it out: the same words quoted in an answer have the input bar under
+# them.
+[[rules]]
+id = "tool_approval"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*Approve tool call\?\s*$' },
+  { line_regex = '^\s*\[y\] Approve\s+\[n\] Deny\s*$' },
+]
+not = [{ line_regex = '^\W*(Ask anything|Plan something)\.\.\.\s*$' }]
+
+# A question from the model, in the same panel: `Cline is asking a question`, its options,
+# and a last row with the placeholder `Type a response...` (`inline-tool-response.tsx`).
+[[rules]]
+id = "ask_question"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(25)"
+visible_blocker = true
+line_regex = '^\s*Cline is asking a question\s*$'
+not = [{ line_regex = '^\W*(Ask anything|Plan something)\.\.\.\s*$' }]
+
+# First run with no provider: full-screen onboarding whose last line is a hint ending
+# `Esc to go back, Ctrl+C to exit` (`views/onboarding/screens.tsx`).
+[[rules]]
+id = "provider_onboarding"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(3)"
+visible_blocker = true
+setup_gate = true
+regex = '(?m)^\s*(Enter to (save|continue), )?(Tab to switch fields, Enter to save, |R to recheck, )?Esc to go back, Ctrl\+C to exit\s*\z'
+
+# The last row of the transcript while a turn streams: a spinner, then
+# `Thinking... (esc to cancel)` (`components/chat-message-list.tsx`).
+[[rules]]
+id = "thinking_esc_to_cancel"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = '^\s*\S\s+Thinking\.\.\. \(esc to cancel\)\s*$'
+
+# The hint under queued prompts while a turn runs ends `Esc cancels turn`
+# (`components/queued-prompts.tsx`).
+[[rules]]
+id = "queued_prompts"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = 'Esc cancels turn\s*$'
+
+# The empty input bar: `Ask anything...` in act mode, `Plan something...` in plan mode,
+# `What can I do for you?` on the first screen (`views/chat-view.tsx`,
+# `views/home-view.tsx`).
+[[rules]]
+id = "input_placeholder"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(8)"
+visible_idle = true
+line_regex = '^\W*(Ask anything\.\.\.|Plan something\.\.\.|What can I do for you\?)\s*\W*$'
+
+# From `apps/cli/src/commands/program.ts`: `--id <session-id>` resumes that session. There
+# is no flag for the latest one.
+[resume]
+session = ["cline", "--id", "{session}"]

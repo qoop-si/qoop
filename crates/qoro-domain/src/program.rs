@@ -52,7 +52,34 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["qwen"],
     &["grok"],
     &["copilot"],
+    // Spellings that name only the agent: `qoder` is also the name of an IDE, so it is
+    // left out.
+    &["devin", "devin-cli"],
+    &["kiro", "kiro-cli"],
+    &["kimi", "kimi-code", "kimi-cli"],
+    &["cline"],
+    &["antigravity", "agy", "antigravity-cli"],
+    &["qodercli", "qoderclicn"],
+    // Agents whose own name is an ordinary word, so it is never enough on its own: see
+    // `GENERIC_NAMES`. The other spellings are their packages and install directories,
+    // which name nothing else.
+    &["pi", "pi-coding-agent"],
+    &["hermes", "hermes-agent"],
+    &["kilo", "kilo-code", "kilocode", "@kilocode/cli"],
+    &["muse", "muse-code", "muse-cli"],
+    &["maki"],
 ];
+
+/// Agent names that are also ordinary words, and other programs' names.
+///
+/// `pi`, `hermes`, `kilo`, `muse` and `maki` all name something else too, and being an
+/// agent is not a label: it is what lets the idle reaper close a terminal and a restore
+/// run a resume line in it. So the bare executable name never counts for these. What
+/// counts is evidence only the agent leaves: its package (`pi-coding-agent`,
+/// `@kilocode/cli`), its versioned binary (`muse-bin-0.1.0`), or the name as the script
+/// a JavaScript or Python runtime is running, which is how `pi` and `hermes` run: node
+/// retitles itself `pi`, and hermes is a Python entry point.
+const GENERIC_NAMES: &[&str] = &["pi", "hermes", "kilo", "muse", "maki"];
 
 /// Flags whose argument is source text rather than a path.
 ///
@@ -69,9 +96,11 @@ pub fn identify(executable: &str, argv: &[String]) -> Program {
     if is_runtime(base)
         && let Some(script) = wrapped_script(base, argv)
     {
-        return from_path(script);
+        // A shell is a runtime for naming, but a script it runs is any script at all, so
+        // it is not evidence for a generic name.
+        return from_path(script, !is_shell(base));
     }
-    from_path(executable)
+    from_path(executable, false)
 }
 
 /// Runtimes whose first non flag argument is the program a person means.
@@ -136,11 +165,24 @@ fn wrapped_script<'a>(runtime: &str, argv: &'a [String]) -> Option<&'a str> {
 }
 
 /// Resolve one path or bare name into a program.
-fn from_path(path: &str) -> Program {
+///
+/// `wrapped` is a name read out of a JavaScript or Python runtime's argv, the one place a
+/// generic name counts as evidence.
+fn from_path(path: &str, wrapped: bool) -> Program {
     let file = basename(path);
     let package = package_name(path);
-    for candidate in package.into_iter().chain(std::iter::once(file)) {
-        if let Some(canonical) = canonical_agent(candidate) {
+    let scoped = scoped_package(path);
+    let candidates = scoped
+        .into_iter()
+        .chain(package)
+        .chain(std::iter::once(file));
+    for candidate in candidates {
+        if let Some(canonical) = canonical_agent(candidate)
+            && (wrapped
+                || !GENERIC_NAMES
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(strip_script_suffix(candidate))))
+        {
             return Program {
                 name: canonical.to_string(),
                 agent: true,
@@ -167,18 +209,16 @@ fn from_path(path: &str) -> Program {
 /// stripped: a node script named by its file goes through the package-name channel
 /// above instead.
 fn canonical_agent(name: &str) -> Option<&'static str> {
-    let stripped;
-    let mut candidate = name;
-    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
-        // Byte-wise: slicing the str at `len - 4` panics inside a multibyte name.
-        if candidate.len() > suffix.len()
-            && candidate.as_bytes()[candidate.len() - suffix.len()..]
-                .eq_ignore_ascii_case(suffix.as_bytes())
-        {
-            stripped = &candidate[..candidate.len() - suffix.len()];
-            candidate = stripped;
-            break;
-        }
+    let candidate = strip_script_suffix(name);
+    // Muse's launcher resolves the active release and execs `muse-bin-<version>`, so the
+    // running process never carries a bare name. A digit must follow the prefix, so
+    // `muse-binary` and a bare `muse-bin` stay unmatched.
+    if candidate
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
+        && candidate[9..].starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Some("muse");
     }
     AGENT_ALIASES
         .iter()
@@ -187,6 +227,36 @@ fn canonical_agent(name: &str) -> Option<&'static str> {
                 .any(|alias| alias.eq_ignore_ascii_case(candidate))
         })
         .and_then(|row| row.first().copied())
+}
+
+/// A name with its Windows script suffix taken off, for the lookup.
+fn strip_script_suffix(name: &str) -> &str {
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if name.len() > suffix.len()
+            && name.is_char_boundary(name.len() - suffix.len())
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            return &name[..name.len() - suffix.len()];
+        }
+    }
+    name
+}
+
+/// A scoped package as `@scope/name`, for the agents whose package name alone names
+/// nothing: Kilo's is `@kilocode/cli`, and `cli` is every other package too.
+fn scoped_package(path: &str) -> Option<&str> {
+    let tail = path
+        .rsplit_once("/node_modules/")
+        .map(|(_, tail)| tail)
+        .or_else(|| path.strip_prefix("node_modules/"))?;
+    if !tail.starts_with('@') {
+        return None;
+    }
+    let scope_end = tail.find('/')?;
+    let end = tail[scope_end + 1..]
+        .find('/')
+        .map_or(tail.len(), |i| scope_end + 1 + i);
+    (end > scope_end + 1).then(|| &tail[..end])
 }
 
 /// The package an npm install layout puts a script inside.
@@ -342,7 +412,12 @@ mod tests {
     #[test]
     fn every_agent_in_the_table_is_recognised_under_every_spelling() {
         for row in AGENT_ALIASES {
-            for alias in row.iter() {
+            // Generic names and scoped packages have tests of their own below: neither is
+            // an executable name that counts by itself.
+            for alias in row
+                .iter()
+                .filter(|a| !GENERIC_NAMES.contains(a) && !a.starts_with('@'))
+            {
                 let program = identify(alias, &[]);
                 assert!(program.agent, "{alias} should be an agent");
                 assert_eq!(program.name, row[0]);
@@ -491,5 +566,97 @@ mod tests {
         let program = identify("/Users/u/bin/DeployAll", &[]);
         assert_eq!(program.name, "DeployAll");
         assert!(!program.agent);
+    }
+
+    #[test]
+    fn a_generic_name_on_its_own_executable_is_not_an_agent() {
+        // `pi` the math tool, `hermes` the messaging binary, `muse` the music player: the
+        // bare name is theirs as much as the agent's, and an agent bit here lets the
+        // reaper close their terminal.
+        for name in ["pi", "hermes", "kilo", "muse", "maki", "PI", "hermes.exe"] {
+            let program = identify(&format!("/usr/local/bin/{name}"), &argv(&[name]));
+            assert!(!program.agent, "{name} counted on its bare name");
+            assert_eq!(program.name, name, "an unknown program keeps its spelling");
+        }
+    }
+
+    #[test]
+    fn a_generic_name_counts_when_a_runtime_is_running_it() {
+        // Measured on this machine: pi runs under node and retitles itself, so the
+        // process table shows the node executable with an argv of just `pi`.
+        let pi = identify("/Users/u/.fnm/node-versions/v24/bin/node", &argv(&["pi"]));
+        assert_eq!(pi.name, "pi");
+        assert!(pi.agent);
+        // hermes is a Python entry point in its own virtualenv.
+        let hermes = identify(
+            "/Users/u/.hermes/venv/bin/python3.12",
+            &argv(&["python3.12", "/Users/u/.local/bin/hermes"]),
+        );
+        assert_eq!(hermes.name, "hermes");
+        assert!(hermes.agent);
+    }
+
+    #[test]
+    fn a_shell_script_with_a_generic_name_is_not_an_agent() {
+        // A shell runs any script at all, so a script called `muse` is not evidence.
+        let program = identify("/bin/sh", &argv(&["/bin/sh", "/Users/u/bin/muse"]));
+        assert_eq!(program.name, "muse");
+        assert!(!program.agent);
+    }
+
+    #[test]
+    fn a_package_or_versioned_binary_is_evidence_for_a_generic_name() {
+        for (executable, args, shown) in [
+            (
+                "/usr/bin/node",
+                vec![
+                    "node",
+                    "/x/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                ],
+                "pi",
+            ),
+            (
+                "/usr/bin/node",
+                vec!["node", "/x/node_modules/@kilocode/cli/bin/kilo.js"],
+                "kilo",
+            ),
+            (
+                "/Users/u/.muse/releases/muse-bin-0.1.0-R708.1",
+                vec!["muse-bin-0.1.0-R708.1"],
+                "muse",
+            ),
+            ("/usr/local/bin/kilo-code", vec!["kilo-code"], "kilo"),
+            (
+                "/usr/local/bin/hermes-agent",
+                vec!["hermes-agent"],
+                "hermes",
+            ),
+        ] {
+            let program = identify(executable, &argv(&args));
+            assert_eq!(program.name, shown, "{executable} {args:?}");
+            assert!(program.agent, "{executable} {args:?}");
+        }
+        // Near misses stay what they are.
+        for name in ["muse-bin", "muse-binary", "muse-bin-x1"] {
+            assert!(!identify(&format!("/opt/{name}"), &[]).agent, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_new_agents_resolve_to_their_manifest_names() {
+        for (launched, shown) in [
+            ("devin", "devin"),
+            ("kiro-cli", "kiro"),
+            ("kimi", "kimi"),
+            ("cline", "cline"),
+            ("agy", "antigravity"),
+            ("qodercli", "qodercli"),
+        ] {
+            let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
+            assert_eq!(program.name, shown, "{launched}");
+            assert!(program.agent, "{launched}");
+        }
+        // The IDE of the same family is not the CLI.
+        assert!(!identify("/Applications/Qoder.app/Contents/MacOS/qoder", &[]).agent);
     }
 }

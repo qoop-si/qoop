@@ -90,12 +90,16 @@ pub enum ForegroundKind {
     Other,
 }
 
-/// Classify a foreground program name for the reap decision.
-pub fn classify_program(program: Option<&str>) -> ForegroundKind {
+/// Classify a foreground program for the reap decision.
+///
+/// `agent` is the bit carried on the identity, decided where the argv was read: the name
+/// alone cannot say, because `pi` is an agent under node and a stranger's tool as its own
+/// executable, and a tool read as an agent is a terminal the reaper may close.
+pub fn classify_program(program: Option<&str>, agent: bool) -> ForegroundKind {
     match program {
         None => ForegroundKind::Absent,
         Some(name) if is_shell_program(name) => ForegroundKind::Shell,
-        Some(name) if qoro_domain::program::identify(name, &[]).agent => ForegroundKind::Agent,
+        Some(_) if agent => ForegroundKind::Agent,
         Some(_) => ForegroundKind::Other,
     }
 }
@@ -341,10 +345,20 @@ mod tests {
         ] {
             assert!(!is_shell_program(task), "{task}");
         }
-        assert_eq!(classify_program(None), ForegroundKind::Absent);
-        assert_eq!(classify_program(Some("zsh")), ForegroundKind::Shell);
-        assert_eq!(classify_program(Some("claude")), ForegroundKind::Agent);
-        assert_eq!(classify_program(Some("cargo")), ForegroundKind::Other);
+        assert_eq!(classify_program(None, false), ForegroundKind::Absent);
+        assert_eq!(classify_program(Some("zsh"), false), ForegroundKind::Shell);
+        assert_eq!(
+            classify_program(Some("claude"), true),
+            ForegroundKind::Agent
+        );
+        assert_eq!(
+            classify_program(Some("cargo"), false),
+            ForegroundKind::Other
+        );
+        // The carried bit decides, not the name: `pi` as its own executable is somebody
+        // else's tool and vetoes, `pi` under node is the agent.
+        assert_eq!(classify_program(Some("pi"), false), ForegroundKind::Other);
+        assert_eq!(classify_program(Some("pi"), true), ForegroundKind::Agent);
     }
 
     /// The eligibility table: every state against every foreground, plus

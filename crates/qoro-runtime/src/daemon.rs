@@ -1959,7 +1959,7 @@ async fn reap_pass(
             continue;
         };
         let idle_secs = now.saturating_sub(since);
-        let foreground = crate::idle::classify_program(snap.program.as_deref());
+        let foreground = crate::idle::classify_program(snap.program.as_deref(), snap.agent);
         let verdict = crate::idle::eligible_for_reap(
             snap.state,
             foreground,
@@ -2593,17 +2593,19 @@ async fn handle_control(
                 .into_iter()
                 .map(|terminal| {
                     let agent = agents.agent(terminal);
-                    let (program, behind, generation) = match agent.as_ref().map(|a| &a.identity) {
-                        Some(qoro_domain::AgentIdentity::Known {
-                            program,
-                            generation,
-                        }) => (Some(program.clone()), None, Some(generation.0)),
-                        Some(qoro_domain::AgentIdentity::Unavailable {
-                            boundary: qoro_domain::Boundary::Namespace { wrapper },
-                            generation,
-                        }) => (None, Some(wrapper.clone()), Some(generation.0)),
-                        _ => (None, None, None),
-                    };
+                    let (program, behind, generation, is_agent) =
+                        match agent.as_ref().map(|a| &a.identity) {
+                            Some(qoro_domain::AgentIdentity::Known {
+                                program,
+                                generation,
+                                agent,
+                            }) => (Some(program.clone()), None, Some(generation.0), *agent),
+                            Some(qoro_domain::AgentIdentity::Unavailable {
+                                boundary: qoro_domain::Boundary::Namespace { wrapper },
+                                generation,
+                            }) => (None, Some(wrapper.clone()), Some(generation.0), false),
+                            _ => (None, None, None, false),
+                        };
                     let state = agent
                         .as_ref()
                         .map(|a| state_name(a.belief.state))
@@ -2659,10 +2661,7 @@ async fn handle_control(
                         // only what is known. The cost is a row for a `docker ps` that is
                         // not an agent, which is a row too many rather than a terminal
                         // missing.
-                        agent: program
-                            .as_deref()
-                            .is_some_and(|p| qoro_domain::program::identify(p, &[]).agent)
-                            || behind.is_some(),
+                        agent: is_agent || behind.is_some(),
                         program,
                         behind,
                         state,
@@ -3507,14 +3506,46 @@ async fn pump_agent_event(
     }
 }
 
+/// What one look at a screen tells the belief, or nothing when it should be left alone.
+///
+/// A known agent whose screen matches no rule reads as idle, never as its last state.
+/// Without this a turn whose end face has no rule yet (or a manifest with no idle rule at
+/// all) keeps its `working` belief forever, which is the index showing working for agents
+/// that finished long ago. The fallback is deliberately weak evidence: it carries no
+/// visible flag, so it settles a screen-held belief of the same source but never overrides
+/// a hook-held state it cannot see. Only a positively seen composer (an explicit idle rule
+/// with `visible_idle`) clears that.
+///
+/// A winning `skip_state_update` rule is not silence: it is a pager or a menu over the
+/// past, and it says the last reading stands, so it leaves the belief alone.
+fn screen_verdict(reading: qoro_detect::Reading, known: bool) -> Option<qoro_detect::Verdict> {
+    match reading {
+        qoro_detect::Reading::Verdict(v) => Some(v),
+        qoro_detect::Reading::Skip { .. } => None,
+        qoro_detect::Reading::Nothing if known => {
+            Some(qoro_detect::Verdict {
+                state: qoro_domain::AgentRuntimeState::Idle,
+                rule: "known_agent_idle_fallback".into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                // An idle fallback is the absence of any dialog, so it clears a gate
+                // rather than holding one.
+                setup_gate: false,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The agent in a terminal, if what is in it is an agent at all.
 fn agent_program(agents: &Arc<crate::agents::AgentRegistry>, stream: u32) -> Option<String> {
     match agents.agent(stream)?.identity {
-        qoro_domain::AgentIdentity::Known { program, .. }
-            if qoro_domain::program::identify(&program, &[]).agent =>
-        {
-            Some(program)
-        }
+        qoro_domain::AgentIdentity::Known {
+            program,
+            agent: true,
+            ..
+        } => Some(program),
         _ => None,
     }
 }
@@ -4939,60 +4970,36 @@ async fn terminal_task(
                     detect_since = None;
                     // Whether or not anyone is subscribed, deliberately: an agent blocked
                     // in a terminal nobody is looking at is exactly what this notices.
-                    if let Some(program) = agents.program_of(stream)
+                    if let Some(program) = agents.rules_name_of(stream)
                         && let Some(manifest) = qoro_detect::rules_for(&program)
                     {
                         let screen = engine.visible_text();
                         let osc = qoro_detect::OscContext {
                             title: engine.title(),
                         };
-                        let matched = manifest.evaluate_with_osc(&screen, &osc);
-                        // A known agent whose screen matches no rule reads as idle,
-                        // never as its last state. Without this a turn whose end
-                        // face has no rule yet (or a manifest with no idle rule at
-                        // all) keeps its `working` belief forever, which is the
-                        // index showing working for agents that finished long ago.
-                        // The fallback is deliberately weak evidence: it carries
-                        // no visible flag, so it settles a screen-held belief of
-                        // the same source but never overrides a hook-held state
-                        // it cannot see. Only a positively seen composer (an
-                        // explicit idle rule with `visible_idle`) clears that.
-                        let fallback;
-                        let verdict = match matched {
-                            Some(v) => Some(v),
-                            None => {
-                                let known = qoro_detect::for_program(&program).is_some_and(
-                                    |m| m.id.to_lowercase() != "generic",
-                                );
-                                // A program inside its startup grace is still
-                                // drawing: claiming idle from a half drawn first
-                                // frame is what let a task be typed at Claude Code
-                                // over a trust dialog that exits by default. The
-                                // screen is read again when the grace ends, since a
-                                // quiet program would give no other reason to look.
-                                let grace = agents
-                                    .agent(stream)
-                                    .and_then(|a| a.grace_ends(std::time::Instant::now()));
-                                if known && let Some(at) = grace {
-                                    detect_at = Some(tokio::time::Instant::from_std(at));
-                                    None
-                                } else if known {
-                                    fallback = qoro_detect::Verdict {
-                                        state: qoro_domain::AgentRuntimeState::Idle,
-                                        rule: "known_agent_idle_fallback".into(),
-                                        visible_blocker: false,
-                                        visible_idle: false,
-                                        visible_working: false,
-                                        // An idle fallback is the absence of any
-                                        // dialog, so it clears a gate rather than
-                                        // holding one.
-                                        setup_gate: false,
-                                    };
-                                    Some(fallback)
-                                } else {
-                                    None
-                                }
+                        let known = qoro_detect::for_program(&program)
+                            .is_some_and(|m| m.id.to_lowercase() != "generic");
+                        let reading = manifest.read_with_osc(&screen, &osc);
+                        // A program inside its startup grace is still drawing:
+                        // claiming idle from a half drawn first frame is what let a
+                        // task be typed at Claude Code over a trust dialog that exits
+                        // by default. Only the idle fallback waits; a rule that
+                        // matched is read at once. The screen is read again when the
+                        // grace ends, since a quiet program would give no other
+                        // reason to look.
+                        let grace = if known && matches!(reading, qoro_detect::Reading::Nothing) {
+                            agents
+                                .agent(stream)
+                                .and_then(|a| a.grace_ends(std::time::Instant::now()))
+                        } else {
+                            None
+                        };
+                        let verdict = match grace {
+                            Some(at) => {
+                                detect_at = Some(tokio::time::Instant::from_std(at));
+                                None
                             }
+                            None => screen_verdict(reading, known),
                         };
                         if let Some(verdict) = verdict
                             && agents.observe_screen(
@@ -6020,5 +6027,61 @@ mod idle_reap_tests {
         assert!(rx.try_recv().is_err(), "asked nothing");
         assert!(!agents.is_reaped(1), "marked nothing");
         assert!(in_flight.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod screen_fallback_tests {
+    use super::*;
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| (*l).to_string()).collect()
+    }
+
+    /// Claude's transcript viewer is a pager over past turns: while it is open the live
+    /// prompt is not on screen, and the reading taken before it opened must stand. Read as
+    /// silence it went through the idle fallback and a working agent turned idle the
+    /// moment somebody scrolled back.
+    #[test]
+    fn a_transcript_viewer_after_a_working_reading_keeps_working() {
+        let agents = crate::agents::AgentRegistry::new().expect("registry");
+        agents.register(
+            1,
+            qoro_domain::TerminalId::new("1"),
+            crate::agents::mint_token(1),
+        );
+        let claude = qoro_detect::rules_for("claude").expect("claude rules");
+        let osc = qoro_detect::OscContext { title: "" };
+        let look = |lines: &[&str]| {
+            if let Some(v) = screen_verdict(claude.read_with_osc(&screen(lines), &osc), true) {
+                agents.observe_screen(1, &claude.id, &v, 1_750_000_000);
+            }
+        };
+
+        look(&[
+            "\u{23f5} Cogitating\u{2026} (12s \u{b7} esc to interrupt)",
+            "",
+        ]);
+        assert_eq!(
+            agents.agent(1).expect("agent").belief.state,
+            qoro_domain::AgentRuntimeState::Working
+        );
+        look(&[
+            "\u{25cf} an earlier answer",
+            "Showing detailed transcript \u{b7} ctrl+o to toggle",
+        ]);
+        assert_eq!(
+            agents.agent(1).expect("agent").belief.state,
+            qoro_domain::AgentRuntimeState::Working,
+            "the transcript viewer ended a working turn"
+        );
+    }
+
+    #[test]
+    fn a_known_agent_with_nothing_on_screen_still_falls_back_to_idle() {
+        let v = screen_verdict(qoro_detect::Reading::Nothing, true).expect("the fallback");
+        assert_eq!(v.state, qoro_domain::AgentRuntimeState::Idle);
+        assert_eq!(v.rule, "known_agent_idle_fallback");
+        assert_eq!(screen_verdict(qoro_detect::Reading::Nothing, false), None);
     }
 }
