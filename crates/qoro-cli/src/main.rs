@@ -1502,6 +1502,11 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
             return Ok(());
         }
         let before = row.clone();
+        // This connection is done: left open for the wait it would sit subscribed to the
+        // lowest terminal without acknowledging, counting as a watcher of it until the
+        // daemon dropped it as wedged at thirty seconds.
+        drop(rd);
+        drop(wr);
         supervise::finish_turn(supervise::wait_for_turn(&before, timeout).await?)
     })
 }
@@ -1529,7 +1534,11 @@ fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
     let mut timeout: Option<Duration> = None;
     let mut literal = false;
     let mut rest = args.iter().skip(3).peekable();
-    while let Some(arg) = rest.next_if(|a| a.starts_with("--")) {
+    // A word with whitespace in it is text even when it starts with dashes: `"--- notes"`
+    // and `"--resume please"` are one quoted argument, never a flag.
+    while let Some(arg) =
+        rest.next_if(|a| a.starts_with("--") && !a.chars().any(char::is_whitespace))
+    {
         match arg.as_str() {
             "--" => {
                 literal = true;
@@ -2806,6 +2815,10 @@ mod tests {
             opts.text, "run --wait please",
             "flags inside the text are text"
         );
+        for quoted in ["--- notes from review", "--resume please"] {
+            let text = parse_prompt_args(&argv(&["qoro", "prompt", "2", quoted])).unwrap();
+            assert_eq!(text.text, quoted, "a quoted text is text");
+        }
         let dashed =
             parse_prompt_args(&argv(&["qoro", "prompt", "2", "--", "--help", "me"])).unwrap();
         assert_eq!(dashed.text, "--help me");

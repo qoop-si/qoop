@@ -131,11 +131,16 @@ impl Link {
     }
 
     /// One control round trip, plus whatever else arrived while waiting.
+    ///
+    /// A screen that arrived in between is read here, the one place every round trip
+    /// passes: a subscription delivers the current screen inside its own round trip, and
+    /// a `wait --match` that only read screens between round trips never saw text that
+    /// was already there.
     async fn ask(
         &mut self,
         request: &ControlRequest,
     ) -> std::io::Result<(ControlResponse, Vec<client::Incoming>)> {
-        super::control_roundtrip(
+        let (answer, stashed) = super::control_roundtrip(
             &mut self.rd,
             &mut self.wr,
             &mut self.inbuf,
@@ -144,7 +149,24 @@ impl Link {
             request,
             Duration::from_secs(10),
         )
-        .await
+        .await?;
+        for incoming in &stashed {
+            self.note_screen(incoming);
+        }
+        Ok((answer, stashed))
+    }
+
+    /// Update `on_screen` from a render of the `screen_text` terminal; true if it was one.
+    fn note_screen(&mut self, incoming: &client::Incoming) -> bool {
+        match (incoming, &self.screen_text) {
+            (client::Incoming::Render { terminal, snapshot }, Some((watched, text)))
+                if terminal == watched =>
+            {
+                self.on_screen = snapshot.lines.iter().any(|l| l.contains(text.as_str()));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The live index, plus whatever else arrived while asking for it.
@@ -218,17 +240,10 @@ impl Link {
             let mut events = Vec::new();
             let mut screen = false;
             for incoming in self.connection.drain(&mut self.inbuf)? {
-                match incoming {
-                    client::Incoming::Event(event) => events.push(event),
-                    client::Incoming::Render { terminal, snapshot } => {
-                        if let Some((watched, text)) = &self.screen_text
-                            && *watched == terminal
-                        {
-                            self.on_screen = snapshot.lines.iter().any(|l| l.contains(text));
-                            screen = true;
-                        }
-                    }
-                    _ => {}
+                if let client::Incoming::Event(event) = incoming {
+                    events.push(event);
+                } else {
+                    screen |= self.note_screen(&incoming);
                 }
             }
             if !events.is_empty() || screen {
@@ -917,6 +932,65 @@ pub(crate) fn shell_quote(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames as the daemon writes them: `body` on `channel` for `stream`.
+    fn frames(channel: qoro_proto::Channel, stream: u32, body: &str) -> Vec<u8> {
+        let mut out = bytes::BytesMut::new();
+        for frame in qoro_proto::chunk(
+            channel,
+            stream,
+            0,
+            None,
+            bytes::Bytes::from(body.to_string()),
+        ) {
+            frame.encode(&mut out).expect("encode");
+        }
+        out.to_vec()
+    }
+
+    /// The race the live test can only hit sometimes, made certain: the screen of the
+    /// followed terminal lands before the answer to the round trip it arrived inside.
+    #[tokio::test]
+    async fn a_screen_that_lands_inside_a_round_trip_is_read() {
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (rd, wr) = ours.into_split();
+        let mut link = Link {
+            rd,
+            wr,
+            inbuf: bytes::BytesMut::new(),
+            connection: client::Connection::new(),
+            seq: 0,
+            input_seq: BTreeMap::new(),
+            screen_text: Some((3, "STATIC_MARK_7".to_string())),
+            on_screen: false,
+        };
+        let mut wire = frames(
+            qoro_proto::Channel::Terminal,
+            3,
+            r#"{"cols":80,"rows":24,"cursor":[0,0],"lines":["$ echo STATIC_MARK_7","STATIC_MARK_7"]}"#,
+        );
+        wire.extend(frames(
+            qoro_proto::Channel::Control,
+            0,
+            r#"{"op":"Subscribed","id":"sub-1","terminals":[3]}"#,
+        ));
+        theirs
+            .write_all(&wire)
+            .await
+            .expect("the daemon's side writes");
+        let (answer, _) = link
+            .ask(&ControlRequest::Subscribe {
+                id: "sub-1".to_string(),
+                terminals: vec![3],
+            })
+            .await
+            .expect("an answer");
+        assert!(matches!(answer, ControlResponse::Subscribed { .. }));
+        assert!(
+            link.on_screen,
+            "the screen that came with the answer was dropped"
+        );
+    }
 
     #[test]
     fn keys_spell_arrows_by_cursor_mode() {

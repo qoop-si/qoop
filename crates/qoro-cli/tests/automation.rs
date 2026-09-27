@@ -181,6 +181,25 @@ fn wait_match_sees_text_on_the_live_screen() {
 }
 
 #[test]
+fn wait_match_sees_text_already_on_the_screen() {
+    // The screen the subscription delivers can arrive inside its own round trip; text
+    // that is already there has to count, not only text that appears later. Repeated,
+    // because whether it lands inside the round trip or after it is a race.
+    let daemon = Daemon::start();
+    let n = new_terminal(
+        &daemon,
+        &["--", "sh", "-c", "echo STATIC_MARK_7; sleep 300"],
+    );
+    // Not `wait_for_screen`: its reads keep the published screen fresh, which hides the
+    // race. The text is printed well within this; the wait itself is what is measured.
+    std::thread::sleep(Duration::from_secs(2));
+    for _ in 0..8 {
+        let waited = daemon.run(&["wait", &n, "--match", "STATIC_MARK_7", "--timeout", "4"]);
+        assert_eq!(waited.status.code(), Some(0), "{}", text(&waited.stderr));
+    }
+}
+
+#[test]
 fn new_refuses_without_a_session_and_starts_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
