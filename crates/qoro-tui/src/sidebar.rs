@@ -708,25 +708,27 @@ fn content(c: &Column) -> Vec<Row> {
         }
         View::Tree => {
             for space in c.spaces {
-                let kids: Vec<&AgentRow> = c
+                // Every tab in the space, as the tab bar has them: a space whose tabs run
+                // shells read as empty, with its tabs right there above the terminal.
+                let tabs: Vec<&AgentRow> = c
                     .agents
                     .iter()
-                    .filter(|a| a.agent && a.workspace == space.id)
+                    .filter(|a| a.workspace == space.id)
                     .collect();
                 let open = !c.shut.contains(&space.id);
-                out.push((rule(c, space, &kids, open), Some(Hit::Space(space.id))));
-                // A folded space still shows the agent the keyboard is on: the fold hides
+                out.push((rule(c, space, &tabs, open), Some(Hit::Space(space.id))));
+                // A folded space still shows the tab the keyboard is on: the fold hides
                 // what a person is not looking at, never the thing they are typing into.
-                for agent in kids {
-                    if open || agent.terminal == c.focused_terminal {
-                        out.push((tree_line(c, agent), Some(Hit::Terminal(agent.terminal))));
-                        out.push(second_row(
-                            c,
-                            agent,
-                            CHILD_DOT_AT + 2,
-                            place_of(agent, space),
-                        ));
+                for tab in tabs {
+                    if !open && tab.terminal != c.focused_terminal {
+                        continue;
                     }
+                    if !tab.agent {
+                        out.push((tab_line(c, tab, space), Some(Hit::Terminal(tab.terminal))));
+                        continue;
+                    }
+                    out.push((tree_line(c, tab), Some(Hit::Terminal(tab.terminal))));
+                    out.push(second_row(c, tab, CHILD_DOT_AT + 2, place_of(tab, space)));
                 }
             }
             // An agent in a space the client has not heard of yet still draws, under no
@@ -748,15 +750,17 @@ fn content(c: &Column) -> Vec<Row> {
 }
 
 /// A space as a rule: the fold arrow, the name in the space's colour, and how many
-/// agents it holds, drawn in the rule's own grey.
+/// tabs it holds, drawn in the rule's own grey.
 ///
 /// Folded, the arrow and the count take the colour of the most urgent agent under them
 /// when that agent wants a person, so a fold never hides a blocked agent silently. Open,
-/// they stay grey: the agents are right there, wearing their own dots.
+/// they stay grey: the agents are right there, wearing their own dots. Only agents
+/// colour it: a shell never wants a person.
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
     use crate::theme::Role;
     let width = c.width;
-    let hot = if open { None } else { urgent_ink(c, kids) };
+    let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
+    let hot = if open { None } else { urgent_ink(c, &agents) };
     let mark = hot.unwrap_or(Role::Faint);
     let arrow = if kids.is_empty() {
         '\u{b7}'
@@ -1133,6 +1137,35 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         accent: None,
         indicator: Some((CHILD_DOT_AT, 1, role)),
         runs,
+    }
+}
+
+/// A tab with no agent in it: one faint row, the tab's name and where it is, the way an
+/// agent's second row says it. No dot: a shell has no state worth a colour, and it
+/// reaches its terminal like any other row.
+fn tab_line(c: &Column, tab: &AgentRow, space: &WorkspaceRow) -> Line {
+    let name = tab
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            tab.program
+                .as_deref()
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+        })
+        .unwrap_or_else(|| format!("term {}", tab.terminal));
+    let text = match place_of(tab, space) {
+        Some(place) => format!("{name} \u{b7} {place}"),
+        None => name,
+    };
+    let lead = format!("{}\u{b7} ", " ".repeat(CHILD_DOT_AT));
+    let room = c.width.saturating_sub(crate::width::width(&lead));
+    Line {
+        text: fit(&format!("{lead}{}", shorten_middle(&text, room)), c.width),
+        colour: Some(crate::theme::Role::Faint),
+        ..Line::default()
     }
 }
 
@@ -2280,8 +2313,8 @@ mod tests {
     }
 
     /// Two rows per agent, right under its space's rule: the rule already says where, so
-    /// the name row says only who, its second row says which tab, and the next rule
-    /// follows them with nothing in between.
+    /// the name row says only who, and its second row says which tab. The space's shell
+    /// tab follows as one row of its own, then the next rule.
     #[test]
     fn an_agent_is_two_rows_under_its_space_rule() {
         let (spaces, agents) = sample();
@@ -2296,8 +2329,9 @@ mod tests {
             "{texts:?}"
         );
         assert_eq!(texts[head + 1], "     \u{2514} claude", "{texts:?}");
+        assert_eq!(texts[head + 2], "   \u{b7} sh", "{texts:?}");
         assert!(
-            texts[head + 2].starts_with("\u{2500}\u{25be} personal "),
+            texts[head + 3].starts_with("\u{2500}\u{25be} personal "),
             "{texts:?}"
         );
         // No state word on the right: the dot says the state in its colour, three
@@ -2308,24 +2342,31 @@ mod tests {
         );
     }
 
+    /// Every tab the tab bar has, the tree has: a tab running a shell is one faint row
+    /// under its space, with no dot, reaching its terminal, and counted on the rule.
     #[test]
-    fn a_terminal_that_is_not_running_an_agent_is_left_out_of_the_column() {
+    fn a_tab_without_an_agent_is_one_faint_row_in_its_space() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 20);
-        // Terminal 2 is a plain shell. Terminals 1 and 3 have agents and are listed.
+        // Terminal 2 is a plain shell. Terminals 1 and 3 have agents.
         let listed: Vec<Option<Hit>> = (0..20)
             .map(|row| hit(&spaces, &agents, 1, 1, 20, row))
             .collect();
         assert!(listed.contains(&Some(Hit::Terminal(1))));
         assert!(listed.contains(&Some(Hit::Terminal(3))));
-        assert!(!listed.contains(&Some(Hit::Terminal(2))));
-        assert!(!lines.iter().any(|l| l.text.contains("sh ")));
-        // And the shell is not counted on its space's rule either.
+        assert!(listed.contains(&Some(Hit::Terminal(2))));
+        let shell: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.text.trim_end() == "   \u{b7} sh")
+            .collect();
+        assert_eq!(shell.len(), 1, "one row, not two");
+        assert_eq!(shell[0].colour, Some(crate::theme::Role::Faint));
+        assert_eq!(shell[0].indicator, None, "a shell has no state to colour");
         let app = lines
             .iter()
             .find(|l| l.text.starts_with("\u{2500}\u{25be} app "))
             .expect("the app rule");
-        assert!(app.text.ends_with(" 1 \u{2500}"), "{:?}", app.text);
+        assert!(app.text.ends_with(" 2 \u{2500}"), "{:?}", app.text);
     }
 
     #[test]
@@ -2361,7 +2402,7 @@ mod tests {
     }
 
     /// Every space is one rule: the arrow says open, folded or empty, the name wears the
-    /// space's colour, and the count says how many agents live there. The dashes are
+    /// space's colour, and the count says how many tabs live there. The dashes are
     /// the rule's own grey, so the rule reads as structure and never as a row to answer.
     #[test]
     fn every_space_draws_one_rule_with_its_arrow_and_count() {
@@ -2370,7 +2411,7 @@ mod tests {
         let app = rule_row(&rows, 1);
         assert_eq!(
             app.text,
-            format!("\u{2500}\u{25be} app {} 1 \u{2500}", "\u{2500}".repeat(19))
+            format!("\u{2500}\u{25be} app {} 2 \u{2500}", "\u{2500}".repeat(19))
         );
         assert_eq!(
             app.runs,
@@ -2482,6 +2523,14 @@ mod tests {
                             .iter()
                             .find(|s| text.contains(&format!(" {} ", s.name)))
                             .map(|s| Hit::Space(s.id))
+                    } else if text.starts_with("   \u{b7} ") {
+                        // A tab with no agent in it reaches its own terminal.
+                        agents
+                            .iter()
+                            .find(|a| {
+                                !a.agent && a.program.as_deref().is_some_and(|p| text.contains(p))
+                            })
+                            .map(|a| Hit::Terminal(a.terminal))
                     } else {
                         // Everything left is an agent: a flat pin row with its dot at
                         // column one, or a tree row with its dot under the space name.

@@ -929,20 +929,27 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the tab names no program: {:?}",
         ui.tab_bar()
     );
-    // The space's rule has nothing to fold and nothing under it: a plain shell is a tab,
-    // not an agent, so it is not what fills the tree.
+    // The space's rule holds its one tab: a plain shell is a tab, listed as one faint
+    // row with a middle dot where an agent wears its state.
+    assert!(
+        ui.wait_for_agents(|row| row.starts_with("   \u{b7} "), Duration::from_secs(10)),
+        "the shell's tab is not under its space: {:?}",
+        agents_panel(&ui.screen)
+    );
     let list = agents_panel(&ui.screen);
     assert!(
         list.first()
-            .is_some_and(|row| row.trim_end().starts_with("\u{2500}\u{b7} default")),
-        "the only space is not an empty rule first: {list:?}"
+            .is_some_and(|row| row.trim_end().starts_with("\u{2500}\u{25be} default")),
+        "the only space is not an open rule first: {list:?}"
     );
     assert!(
         // An agent row has its mark three columns in: a dot, the failed diamond, or a
         // spinner frame. None of them may be there.
-        !list
-            .iter()
-            .any(|row| row.starts_with("   ") && row.chars().nth(3).is_some_and(|c| c != ' ')),
+        !list.iter().any(|row| row.starts_with("   ")
+            && row
+                .chars()
+                .nth(3)
+                .is_some_and(|c| c != ' ' && c != '\u{b7}')),
         "a plain shell is listed as an agent: {list:?}"
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
@@ -1324,17 +1331,20 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // A new space, which starts with a terminal in it: a space with nothing in it shows an
     // empty pane and a bar with only a `+` on it, and nobody wants to land there.
     ui.create_space("");
+    // Anywhere in the column: the first space's tab sits between the two rules.
     assert!(
-        ui.wait_for_panel(
-            FIRST_SPACE_ROW + 1,
-            |line| line.contains("space 2"),
-            Duration::from_secs(15)
-        )
-        .is_some(),
+        ui.wait_for_agents(|line| line.contains("space 2"), Duration::from_secs(15)),
         "the new space is not in the spaces panel: {:?}, daemon said: {}",
-        ui.panel_line(FIRST_SPACE_ROW + 1),
+        agents_panel(&ui.screen),
         ui.daemon_log()
     );
+
+    // Where the second space's rule is drawn: under the first space and its tab.
+    let second = FIRST_SPACE_ROW
+        + agents_panel(&ui.screen)
+            .iter()
+            .position(|line| line.contains("space 2"))
+            .expect("the rule was just seen");
 
     // Its own tab bar: one tab, which is this space's, and not the other space's as well.
     assert!(
@@ -1365,10 +1375,10 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // The keyboard reaches the other space too, so the pointer is not the only way in.
     ui.command(b's');
     assert!(
-        ui.wait_for_selected(FIRST_SPACE_ROW + 1, Duration::from_secs(15))
+        ui.wait_for_selected(second, Duration::from_secs(15))
             .is_some(),
         "ctrl-a s did not move to the next space: {:?}",
-        ui.panel_line(FIRST_SPACE_ROW + 1)
+        ui.panel_line(second)
     );
     // And backwards, which wraps. From the second of two spaces that is the first one, and
     // its terminal still has the history it had.
@@ -1383,10 +1393,10 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // Backwards again, which wraps the other way, off the front of the list.
     ui.command(b'S');
     assert!(
-        ui.wait_for_selected(FIRST_SPACE_ROW + 1, Duration::from_secs(15))
+        ui.wait_for_selected(second, Duration::from_secs(15))
             .is_some(),
         "ctrl-a S from the first space did not wrap to the last: {:?}",
-        ui.panel_line(FIRST_SPACE_ROW + 1)
+        ui.panel_line(second)
     );
 }
 
@@ -1573,16 +1583,9 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
     ui.create_space("");
 
     assert!(
-        ui.wait_for_panel(
-            FIRST_SPACE_ROW + 2,
-            |line| line.contains("space 3"),
-            Duration::from_secs(15)
-        )
-        .is_some(),
-        "the second space never appeared: {:?} {:?} {:?}, boxes: {}, confirms: {}, daemon said: {}",
-        ui.panel_line(FIRST_SPACE_ROW),
-        ui.panel_line(FIRST_SPACE_ROW + 1),
-        ui.panel_line(FIRST_SPACE_ROW + 2),
+        ui.wait_for_agents(|line| line.contains("space 3"), Duration::from_secs(15)),
+        "the second space never appeared: {:?}, boxes: {}, confirms: {}, daemon said: {}",
+        agents_panel(&ui.screen),
         ui.painted.matches("name the new space").count(),
         ui.painted.matches("starting a space").count(),
         ui.daemon_log()
@@ -1901,8 +1904,13 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     .expect("chmod");
 
     ui.type_in(format!("{}\n", wrapper.display()).as_bytes());
+    // An agent row, not the tab's own faint row: until the agent behind the wrapper is
+    // found, the tab reads as the wrapper, as it does in the tab bar.
     assert!(
-        ui.wait_for_agents(|line| line.contains("codex"), Duration::from_secs(20)),
+        ui.wait_for_agents(
+            |line| line.contains("codex") && !line.starts_with("   \u{b7} "),
+            Duration::from_secs(20)
+        ),
         "the agent behind the wrapper is not on the panel: {:?}\n{}",
         agents_panel(&ui.screen),
         ui.painted
