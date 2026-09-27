@@ -1512,8 +1512,15 @@ async fn serve_client(
         loop {
             let event = tokio::select! {
                 event = pump_agent_event(&mut changes) => event,
-                // A lagged or closed focus lane is not news: the next click is.
-                Ok(terminal) = focus.recv() => Some(crate::control::EventMessage::Focus { terminal }),
+                // Matched here rather than in the branch pattern: a pattern that fails
+                // disables its branch until an agent event ends the select, and on a quiet
+                // session that is every later focus lost. Focuses missed while lagging are
+                // clicks already past.
+                shown = focus.recv() => match shown {
+                    Ok(terminal) => Some(crate::control::EventMessage::Focus { terminal }),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
             };
             let Some(event) = event else {
                 return;

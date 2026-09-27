@@ -124,7 +124,7 @@ fn run() -> std::io::Result<()> {
         Some("context") => run_context(&args),
         Some("agents") => run_agents(&args),
         Some("focus") => run_focus(&args),
-        Some("notch") => notch::run(&args),
+        Some("notch") => notch::run(&args, session_given.then_some(session.as_str())),
         Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
         Some("new") => supervise::run_new(&args),
         Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),

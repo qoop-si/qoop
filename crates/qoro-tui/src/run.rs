@@ -4708,11 +4708,15 @@ where
                                     state.show_when_listed =
                                         Some((terminal, std::time::Instant::now()));
                                     refresh = true;
-                                } else if let Some(bytes) =
-                                    focus(&mut state, terminal, &mut control_seq, &mut seqs)?
-                                {
-                                    wr.write_all(&bytes).await?;
-                                    dirty = true;
+                                } else {
+                                    // The newest ask wins over one still waiting.
+                                    state.show_when_listed = None;
+                                    if let Some(bytes) =
+                                        focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                                    {
+                                        wr.write_all(&bytes).await?;
+                                        dirty = true;
+                                    }
                                 }
                             }
                             Incoming::Control(response) => {
