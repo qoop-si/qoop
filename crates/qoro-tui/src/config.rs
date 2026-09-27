@@ -166,34 +166,48 @@ pub fn read_from(path: &Path) -> Read {
 pub fn parse(text: &str) -> (Config, Vec<Problem>) {
     let mut problems: Vec<Problem> = Vec::new();
     let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
+    // The problem for a construct left open to the end of the file, while it is walked back.
+    let mut open_at: Option<usize> = None;
     let table = loop {
         let error = match text.parse::<toml::Table>() {
             Ok(table) => break table,
             Err(error) => error,
         };
-        let line = error.span().map(|span| line_at(&text, span.start));
-        // Said once: a line already reported, or one with nothing on it to leave out (an
-        // array left open to the end of the file), would only be reported again.
-        if problems.iter().any(|p| p.line == line) {
-            break toml::Table::new();
-        }
-        problems.push(Problem::new(
-            line,
-            &unreadable(&text, line, error.message()),
-        ));
-        let Some(line) = line.filter(|_| problems.len() < MAX_BAD_LINES) else {
+        let lines: Vec<&str> = text.lines().collect();
+        let blamed = error
+            .span()
+            .map(|span| line_at(&text, span.start))
+            .filter(|&line| lines.get(line - 1).is_some_and(|l| !l.trim().is_empty()));
+        // Blamed on nothing (an array or table left open to the end of the file): the cut
+        // walks back from the last line with anything on it, and the one problem it
+        // reports ends on the line that opened the construct.
+        let open = blamed.is_none();
+        let Some(line) = blamed.or_else(|| {
+            lines
+                .iter()
+                .rposition(|l| !l.trim().is_empty())
+                .map(|at| at + 1)
+        }) else {
             break toml::Table::new();
         };
-        if text
-            .lines()
-            .nth(line - 1)
-            .is_none_or(|l| l.trim().is_empty())
-        {
+        let problem = Problem::new(Some(line), &unreadable(&text, Some(line), error.message()));
+        match open_at {
+            Some(at) if open => problems[at] = problem,
+            _ => {
+                // Said once: a line already reported would only be reported again.
+                if problems.iter().any(|p| p.line == Some(line)) {
+                    break toml::Table::new();
+                }
+                problems.push(problem);
+                open_at = open.then(|| problems.len() - 1);
+            }
+        }
+        if problems.len() > MAX_BAD_LINES {
             break toml::Table::new();
         }
         // Leave the line out and read the rest, so one bad line costs one setting.
-        text = text
-            .lines()
+        text = lines
+            .iter()
             .enumerate()
             .map(|(at, l)| if at + 1 == line { "" } else { l })
             .collect::<Vec<_>>()
@@ -537,8 +551,17 @@ mod tests {
     /// A file that stays broken to its end is said once, not once per retry.
     #[test]
     fn an_unclosed_array_is_said_once() {
-        let (_, problems) = parse("theme = \"dark\"\nx = [1,\n");
+        let (config, problems) = parse("theme = \"dark\"\nx = [1,\n");
         assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].line, Some(2), "{problems:?}");
+        assert_eq!(config.theme, Theme::Dark, "the rest is still read");
+        // Open across several lines: said once, at the line that opened it.
+        let text = "prefix = \"ctrl-b\"\nx = [1,\n2,\n";
+        let (config, problems) = parse(text);
+        assert_eq!(config.prefix, 0x02, "{problems:?}");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].line, Some(2), "{problems:?}");
+        assert!(text.lines().count() >= 2);
     }
 
     /// A value refused after parsing still names its line.
