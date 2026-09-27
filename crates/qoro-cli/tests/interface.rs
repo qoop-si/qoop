@@ -355,6 +355,7 @@ impl Interface {
         daemon_cmd
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
@@ -393,6 +394,7 @@ impl Interface {
             // No remote from the machine running the tests: a real one would put ssh
             // connections under every gate here.
             .env("QORO_REMOTES", dir.join("remotes.json"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             // Pinned for the same reason the scale gates pin it: an interactive shell
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")

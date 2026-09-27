@@ -137,6 +137,7 @@ fn start_daemon() -> Daemon {
     let child = Command::new(env!("CARGO_BIN_EXE_qoro"))
         .arg("daemon")
         .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -354,6 +355,7 @@ fn attach(dir: &std::path::Path) -> Child {
         .env("QORO_RUNTIME_DIR", dir)
         // No remote from the machine running the tests: the gate measures this client.
         .env("QORO_REMOTES", dir.join("remotes.json"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

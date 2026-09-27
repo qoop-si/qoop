@@ -363,6 +363,9 @@ struct State {
     /// Whether the outer terminal last said its scheme is light (`CSI ? 997 ; 2 n`).
     #[allow(dead_code)]
     host_light: Option<bool>,
+    /// What `config.toml` said when it was last read: at start, and whenever the settings
+    /// box opens. Every overlay that hands the prefix back to the decoder reads it here.
+    config: crate::config::Config,
     /// Text being selected with the mouse, or selected and still shown.
     ///
     /// Kept after the button comes up rather than cleared, because a person who has just
@@ -849,7 +852,7 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
                 state.menu = None;
                 return MenuOutcome::Closed;
             }
-            0x01 | 0x11 => {
+            byte if byte == state.config.prefix || byte == crate::keys::DETACH => {
                 state.menu = None;
                 return MenuOutcome::Passthrough(bytes[at - 1..].to_vec());
             }
@@ -1108,7 +1111,10 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     text: current,
                 });
             } else {
-                state.message = Some("nothing to rename, ctrl-a c starts a terminal".to_string());
+                state.message = Some(format!(
+                    "nothing to rename, {} c starts a terminal",
+                    crate::keys::prefix_name()
+                ));
             }
             MenuSend::Nothing
         }
@@ -1188,6 +1194,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Nothing
         }
         "settings" => {
+            // Read again on the way in, so the box shows the file as it is now and an
+            // edit made since the start takes effect here, with no watcher and no restart.
+            use_config(state, &crate::config::read());
             state.reading = Some(Reading::Settings);
             MenuSend::Nothing
         }
@@ -1326,6 +1335,7 @@ enum PromptOutcome {
 /// A prefix or a bare detach closes the box and hands the bytes on from there, so
 /// `ctrl-a d` still detaches out of it, which is the same rule the palette follows.
 fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
+    let prefix = state.config.prefix;
     let Some(prompt) = state.prompt.as_mut() else {
         return PromptOutcome::Passthrough(bytes.to_vec());
     };
@@ -1374,7 +1384,7 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                 prompt.text.pop();
             }
             // The prefix, or a bare detach: not this box's keys.
-            0x01 | 0x11 => {
+            byte if *byte == prefix || *byte == crate::keys::DETACH => {
                 state.prompt = None;
                 return PromptOutcome::Passthrough(bytes[at..].to_vec());
             }
@@ -1460,7 +1470,7 @@ fn close_focus(state: &mut State) {
 /// undecided: split across reads, the decoder holds it, and a following `F`
 /// reopens, which is the one keystroke this swallowing misses.
 fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
-    const PREFIX: u8 = crate::keys::PREFIX;
+    let prefix = state.config.prefix;
     let mut scrolled = false;
     let mut at = 0;
     while at < bytes.len() {
@@ -1492,7 +1502,7 @@ fn focus_key(state: &mut State, bytes: &[u8]) -> FocusOutcome {
         // Everything else closes first; what differs is what survives it.
         close_focus(state);
         // The close keystroke itself is dropped; what follows it is typed.
-        let from = if rest[0] == PREFIX && rest.get(1) == Some(&b'F') {
+        let from = if rest[0] == prefix && rest.get(1) == Some(&b'F') {
             at + 2
         } else if rest[0] == b'\r' || rest[0] == b'\n' || rest[0] == b'q' {
             at + 1
@@ -1656,7 +1666,24 @@ where
         outer_focus: None,
         host_colors: [None, None],
         host_light: None,
+        config: crate::config::Config::default(),
     };
+    // The file is read before the first frame, so the first frame already names the
+    // prefix the person chose. What in it could not be used is said once, on the hint row,
+    // beside whatever the caller wanted said.
+    let read = crate::config::read();
+    use_config(&mut state, &read);
+    if let Some(first) = read.problems.first() {
+        let more = match read.problems.len() {
+            1 => String::new(),
+            n => format!(" (and {} more, see settings)", n - 1),
+        };
+        let said = format!("{first}{more}");
+        state.hint = Some(match state.hint.take() {
+            Some(notice) => format!("{notice}; {said}"),
+            None => said,
+        });
+    }
 
     // One sequence per terminal, because a chunk sequence is per stream: sharing a counter
     // across terminals makes the numbers on any one of them non consecutive, and the
@@ -1669,7 +1696,7 @@ where
     // and do nothing. Started from the wall clock in nanoseconds, the way
     // the CLI's `request_id` stays unique.
     let mut request = request_seed();
-    let mut keys = Keys::default();
+    let mut keys = Keys::with_prefix(state.config.prefix);
     let mut connection = Connection::new();
     let mut inbuf = leftover;
     inbuf.reserve(256 * 1024);
@@ -2194,6 +2221,11 @@ where
                         feed = Some(bytes);
                     }
                     if let Some(input) = feed {
+                    // The settings box read the file again and the prefix changed: the
+                    // decoder starts over with the new one.
+                    if keys.prefix() != state.config.prefix {
+                        keys = Keys::with_prefix(state.config.prefix);
+                    }
                     for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
@@ -2677,8 +2709,9 @@ where
                                     .count();
                                 if held > 0 {
                                     state.message = Some(format!(
-                                        "space still holds {held} terminal{}, close them first (ctrl-a x)",
-                                        if held == 1 { "" } else { "s" }
+                                        "space still holds {held} terminal{}, close them first ({} x)",
+                                        if held == 1 { "" } else { "s" },
+                                        crate::keys::prefix_name()
                                     ));
                                     dirty = true;
                                     continue;
@@ -2771,9 +2804,10 @@ where
                                     close_focus(&mut state);
                                     dirty = true;
                                 } else if state.focused == 0 {
-                                    state.message = Some(
-                                        "nothing to focus, ctrl-a c starts a terminal"
-                                            .to_string(),
+                                    state.message = Some(format!(
+                                        "nothing to focus, {} c starts a terminal",
+                                        crate::keys::prefix_name()
+                                        ),
                                     );
                                     dirty = true;
                                 } else {
@@ -2812,9 +2846,10 @@ where
                                 let focused = state.focused;
                                 let space = state.space;
                                 if focused == 0 {
-                                    state.message = Some(
-                                        "nothing to split, ctrl-a c starts a terminal"
-                                            .to_string(),
+                                    state.message = Some(format!(
+                                        "nothing to split, {} c starts a terminal",
+                                        crate::keys::prefix_name()
+                                        ),
                                     );
                                     dirty = true;
                                 } else {
@@ -2936,9 +2971,10 @@ where
                                         }
                                     }
                                     None => {
-                                        state.message = Some(
-                                            "only one pane, ctrl-a x closes its terminal"
-                                                .to_string(),
+                                        state.message = Some(format!(
+                                            "only one pane, {} x closes its terminal",
+                                            crate::keys::prefix_name()
+                                            ),
                                         );
                                         dirty = true;
                                     }
@@ -3205,6 +3241,15 @@ where
     outcome
 }
 
+/// Put a read of `config.toml` in effect: the prefix every overlay and the screen's words
+/// use, and what the settings box describes. The decoder follows the prefix on the next
+/// keystroke (see the stdin arm).
+fn use_config(state: &mut State, read: &crate::config::Read) {
+    state.config = read.config;
+    crate::keys::show_prefix(read.config.prefix);
+    crate::config::show(read);
+}
+
 /// Keep what the terminal said about itself.
 fn note_report(state: &mut State, report: crate::input::Report) {
     use crate::input::Report;
@@ -3256,6 +3301,7 @@ fn adopt_render(state: &State, terminal: u32) -> bool {
 /// keys arrive atomically in practice, and holding a lone `esc` for a next read
 /// that may never come would swallow the one key that closes the palette.
 fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
+    let prefix = state.config.prefix;
     let mut buf = std::mem::take(&mut state.palette_pending);
     buf.extend_from_slice(bytes);
     let Some(palette) = state.palette.as_mut() else {
@@ -3355,7 +3401,7 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
                 palette.backspace();
                 i += 1;
             }
-            0x01 => {
+            byte if byte == prefix => {
                 // `ctrl-a space` toggles the palette shut. Any other command after
                 // the prefix, and a prefix split across the read, belong to the
                 // key decoder.
@@ -3790,7 +3836,10 @@ fn enter_space(
         Some(first) => focus(state, first, control_seq, seqs),
         None => unfocus(
             state,
-            "this space is empty, ctrl-a c starts a terminal",
+            &format!(
+                "this space is empty, {} c starts a terminal",
+                crate::keys::prefix_name()
+            ),
             control_seq,
         ),
     }
@@ -3993,8 +4042,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                             .map(|r| r.terminal)
                     });
                 if state.pending_focus.is_none() {
-                    state.message =
-                        Some("this space is empty, ctrl-a c starts a terminal".to_string());
+                    state.message = Some(format!(
+                        "this space is empty, {} c starts a terminal",
+                        crate::keys::prefix_name()
+                    ));
                 }
             }
             // Nothing left anywhere. The interface is a way into terminals, so with none of
@@ -4257,8 +4308,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                             .map(|r| r.terminal)
                     });
                 if state.pending_focus.is_none() {
-                    state.message =
-                        Some("this space is empty, ctrl-a c starts a terminal".to_string());
+                    state.message = Some(format!(
+                        "this space is empty, {} c starts a terminal",
+                        crate::keys::prefix_name()
+                    ));
                 }
             }
             *dirty = true;
@@ -4620,6 +4673,7 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
             images: std::collections::BTreeMap::new(),
             graphics: crate::graphics::GraphicsCap::off(),
@@ -4758,6 +4812,47 @@ mod tests {
             other => panic!("a detach closed nothing: {other:?}"),
         }
         assert_eq!(state.palette, None);
+    }
+
+    /// With another prefix, every overlay hands that one back and treats ctrl-a as the
+    /// person's own key, and a paste holding a ctrl-a reaches the pane untouched.
+    #[test]
+    fn a_chosen_prefix_is_the_one_every_overlay_hands_back() {
+        let mut state = state();
+        state.config.prefix = 0x02;
+        match palette_key(&mut state, b"\x02d") {
+            PaletteOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02d"),
+            other => panic!("the palette kept the prefix: {other:?}"),
+        }
+        state.palette = Some(Palette::open());
+        assert!(matches!(
+            palette_key(&mut state, b"\x02 "),
+            PaletteOutcome::Closed
+        ));
+        state.menu = Some(0);
+        match menu_key(&mut state, 0, b"\x02c") {
+            MenuOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02c"),
+            _ => panic!("the menu kept the prefix"),
+        }
+        state.prompt = Some(Prompt {
+            what: Naming::Terminal,
+            text: String::new(),
+        });
+        match prompt_key(&mut state, b"\x02d") {
+            PromptOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02d"),
+            _ => panic!("the naming box kept the prefix"),
+        }
+        state.menu = Some(0);
+        assert!(
+            !matches!(
+                menu_key(&mut state, 0, b"\x01"),
+                MenuOutcome::Passthrough(_)
+            ),
+            "ctrl-a is an ordinary key to the menu now"
+        );
+        let paste = b"line one\x01\nline two\n".to_vec();
+        let mut keys = Keys::with_prefix(0x02);
+        assert_eq!(keys.feed(&paste), vec![Action::Input(paste.clone())]);
     }
 
     #[test]
@@ -4941,6 +5036,7 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            config: crate::config::Config::default(),
         }
     }
 
@@ -5015,6 +5111,7 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            config: crate::config::Config::default(),
         };
         let area = pane_area(&state);
         let mut layout = Layout::single(1);

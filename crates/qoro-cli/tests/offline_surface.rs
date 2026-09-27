@@ -84,7 +84,8 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
     command
         .args(args)
         .current_dir(dir.path())
-        .env("QORO_RUNTIME_DIR", dir.path());
+        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"));
     if offline {
         // Blackholed: no proxy, no resolver, nowhere to reach. A subcommand that consulted
         // a control plane would notice.
@@ -143,6 +144,7 @@ fn update_fails_closed_with_the_network_gone() {
     command
         .args(["update", "--check"])
         .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("http_proxy", "http://127.0.0.1:1")
         .env("https_proxy", "http://127.0.0.1:1")
         .env("all_proxy", "http://127.0.0.1:1")
@@ -189,6 +191,7 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
         let out = Command::new(qoro())
             .args(args)
             .env("QORO_RUNTIME_DIR", &not_a_dir)
+            .env("XDG_CONFIG_HOME", not_a_dir.join("config"))
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run qoro");

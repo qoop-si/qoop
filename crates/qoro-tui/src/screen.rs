@@ -556,7 +556,7 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         "ctrl-a: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys"
     };
-    out.push_str(&width::fit(keys, frame.cols as usize));
+    out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize));
     out.push_str(theme::RESET);
 
     // A picture the outer terminal cannot draw, named on the focused pane's last
@@ -1263,11 +1263,22 @@ fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) 
                     .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
                     .count()
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(crate::config::describe(&crate::config::shown()))
+        .collect(),
     };
     let title = match reading {
         crate::run::Reading::Keybinds => " keybinds",
         crate::run::Reading::Settings => " settings",
+    };
+    // The keys are written with ctrl-a and named here, so the list says the prefix this
+    // interface was started with.
+    let lines: Vec<String> = match reading {
+        crate::run::Reading::Keybinds => {
+            lines.iter().map(|line| crate::keys::named(line)).collect()
+        }
+        crate::run::Reading::Settings => lines,
     };
     paint_box(frame, title, &lines, out);
 }

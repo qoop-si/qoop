@@ -31,6 +31,16 @@ pub fn prefix_name() -> String {
     name_of(SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Text written with `ctrl-a` for the prefix, as the screen should say it.
+///
+/// For the long fixed lists (every key on the status bar, the keybinds box), which are
+/// written once with the default and named on the way out. Every prefix a person can
+/// choose is spelled `ctrl-` and one letter, the same width as `ctrl-a`, so nothing
+/// measured against the written text moves.
+pub fn named(text: &str) -> String {
+    text.replace("ctrl-a", &prefix_name())
+}
+
 /// A control byte as a person writes it: `0x02` is `ctrl-b`.
 pub fn name_of(byte: u8) -> String {
     match byte {

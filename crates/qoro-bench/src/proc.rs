@@ -64,6 +64,7 @@ impl DaemonProcess {
         let child = Command::new(bin)
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
             // The harness polls the default session's socket, so a session
             // inherited from the surrounding shell (running the bench inside
             // a qoro session) would make the daemon listen where nobody

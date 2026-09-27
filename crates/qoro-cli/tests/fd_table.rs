@@ -29,6 +29,7 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
         Command::new(env!("CARGO_BIN_EXE_qoro"))
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

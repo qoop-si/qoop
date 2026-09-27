@@ -22,6 +22,7 @@ impl Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_qoro"))
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -42,6 +43,7 @@ impl Daemon {
         let out = Command::new(env!("CARGO_BIN_EXE_qoro"))
             .args(args)
             .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .output()
             .expect("run qoro");
         (

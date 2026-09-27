@@ -59,6 +59,7 @@ fn answering(dir: &std::path::Path, args: &[&str], typed: &str) -> (String, Stri
     let mut child = Command::new(qoro())
         .args(args)
         .env("QORO_RUNTIME_DIR", dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -23,6 +23,7 @@ impl Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_qoro"))
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -41,7 +42,8 @@ impl Daemon {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
         cmd.arg("hook-report");
         cmd.args(args);
-        cmd.env("QORO_RUNTIME_DIR", self.dir.path());
+        cmd.env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"));
         if clear_qoro_env {
             cmd.env_remove("QORO_TERMINAL");
             cmd.env_remove("QORO_TOKEN");
@@ -271,6 +273,7 @@ fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
             "t",
         ])
         .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env_remove("QORO_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -72,6 +72,7 @@ fn start_daemon_with(trace: bool) -> Daemon {
     command
         .arg("daemon")
         .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
         // The shell is pinned, and it is the single most important line in this file.
         //
         // The daemon starts `$SHELL`, so without this the gates below measure whatever

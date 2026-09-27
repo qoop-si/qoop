@@ -33,6 +33,7 @@ impl Drop for Machine {
         let _ = Command::new(qoro())
             .arg("stop")
             .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -52,6 +53,7 @@ impl Machine {
         Command::new("/bin/sh")
             .args(["-c", &format!("exec {} relay", qoro())])
             .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
