@@ -231,10 +231,29 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .map(|row| {
             screen
                 .text(row)
-                .map(|line| line.chars().take(index_width()).collect::<String>())
+                .map(|line| unbox(&line.chars().take(index_width()).collect::<String>()))
                 .unwrap_or_default()
         })
         .collect()
+}
+
+/// A row inside a space's box with the box's sides blanked, column for column, so what it
+/// holds reads at the columns it is drawn at: ` │ ● claude  │` is `   ● claude   `. The
+/// edges of the box, and every other row, as they are.
+fn unbox(line: &str) -> String {
+    match line.strip_prefix(" \u{2502} ") {
+        Some(inside) => {
+            let inside = match inside.trim_end().strip_suffix('\u{2502}') {
+                Some(inner) => {
+                    let pad = inside.chars().count() - inner.chars().count();
+                    format!("{inner}{}", " ".repeat(pad))
+                }
+                None => inside.to_string(),
+            };
+            format!("   {inside}")
+        }
+        None => line.to_string(),
+    }
 }
 
 /// The screen row the list under the title starts on: [`agents_panel`]'s first row.
@@ -696,15 +715,19 @@ impl Interface {
 
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
-    /// Found by its shape rather than by arithmetic: a rule opens with its fold arrow and
-    /// a space, and agents and the pin move the rules down as they come and go.
+    /// Found by its shape rather than by arithmetic: a space's box opens with its corner,
+    /// then its fold arrow and a space, and agents and the pin move the boxes down as
+    /// they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
         (first..=last)
             .filter(|&row| {
                 self.panel_line(row).is_some_and(|line| {
-                    let mut chars = line.chars();
+                    let mut chars = line
+                        .strip_prefix(" \u{256d}\u{2500} ")
+                        .unwrap_or("")
+                        .chars();
                     matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
                         && chars.next() == Some(' ')
                 })
@@ -939,7 +962,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     let list = agents_panel(&ui.screen);
     assert!(
         list.first()
-            .is_some_and(|row| row.trim_end().starts_with("\u{25be} default")),
+            .is_some_and(|row| row.starts_with(" \u{256d}\u{2500} \u{25be} default")),
         "the only space is not an open rule first: {list:?}"
     );
     assert!(

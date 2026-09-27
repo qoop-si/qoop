@@ -4419,18 +4419,21 @@ mod tests {
                 usage: None,
                 heads: None,
             },
-            39,
+            44,
         );
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
+        // Under the title: the pin's boxes above it hold the same rows.
         assert_eq!(
             texts
                 .iter()
-                .filter(
-                    |t| t.starts_with("   \u{25cf} claude") || t.starts_with("   \u{25c6} claude")
-                )
+                .skip_while(|t| !t.starts_with(" spaces"))
+                .filter(|t| {
+                    t.starts_with(" \u{2502} \u{25cf} claude")
+                        || t.starts_with(" \u{2502} \u{25c6} claude")
+                })
                 .count(),
             9,
             "agents lost rows: {texts:?}"
