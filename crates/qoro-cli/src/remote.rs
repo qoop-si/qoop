@@ -65,6 +65,17 @@ fn add(rest: &[String], session: &str) -> io::Result<()> {
             "{name} is already added; `qoro remote rm {name}` first to change it"
         )));
     }
+    // The same machine and session under a second name would list every one of its spaces
+    // twice, once under each name, both driving the same terminals.
+    if let Some(same) = list
+        .iter()
+        .find(|r| &r.target == target && r.session == session)
+    {
+        return Err(refuse(format!(
+            "{target} session {session} is already added as {}",
+            same.name
+        )));
+    }
     let remote = Remote {
         name: name.clone(),
         target: target.clone(),
