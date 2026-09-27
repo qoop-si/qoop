@@ -1707,7 +1707,13 @@ fn subscribe(
     stream: u32,
 ) -> bool {
     if subscriptions.lock().unwrap().contains_key(&stream) {
-        // Subscribing twice is not an error and must not double the traffic.
+        // Subscribing twice is not an error and must not double the traffic: no second
+        // task. It still asks for the live screen, once, because a client that subscribes
+        // wants one, and one that had dropped its copy would otherwise wait on a quiet
+        // terminal for a screen that never comes.
+        if let Some(handle) = terminals.get(stream) {
+            let _ = handle.commands.try_send(ClientCommand::Refresh);
+        }
         return true;
     }
     let Some(handle) = terminals.get(stream) else {
@@ -5018,6 +5024,9 @@ async fn terminal_task(
     let mut engine = AlacrittyEngine::new(INITIAL_SIZE.cols, INITIAL_SIZE.rows);
     let mut buf = vec![0u8; 64 * 1024];
     let mut policy = SizePolicy::Unowned;
+    // Writable clients refused a size while another owned the terminal, oldest first, with
+    // the size each last asked for. Empty unless two clients size one terminal.
+    let mut waiting: Vec<(ClientId, PtySize)> = Vec::new();
     // Bounded by bytes, with capacity reserved for terminal replies so a saturated input
     // queue cannot deadlock an application waiting for a cursor position report.
     let mut writes = WriteQueue::new(1024 * 1024, 64 * 1024);
@@ -5115,9 +5124,22 @@ async fn terminal_task(
                         }
                         ClientCommand::Resize { from, writable, cols, rows } => {
                             let size = PtySize { cols, rows };
-                            if arbitrate_resize(&mut policy, &from, writable, size)
-                                == ResizeOutcome::Applied
-                            {
+                            let outcome = arbitrate_resize(&mut policy, &from, writable, size);
+                            // A refused writable client's size is kept for when the owner
+                            // leaves, in the order they were first refused; an applied
+                            // one is no longer waiting.
+                            match waiting.iter_mut().find(|(c, _)| *c == from) {
+                                Some(entry) if outcome == ResizeOutcome::NotOwner => {
+                                    entry.1 = size;
+                                }
+                                _ => {
+                                    waiting.retain(|(c, _)| *c != from);
+                                    if outcome == ResizeOutcome::NotOwner {
+                                        waiting.push((from, size));
+                                    }
+                                }
+                            }
+                            if outcome == ResizeOutcome::Applied {
                                 if needs_nudge(current_size, size) {
                                     // Same size, so the ioctl below would be a
                                     // no-op for the child and a reattaching
@@ -5207,8 +5229,32 @@ async fn terminal_task(
                         }
                     }
                         ClientCommand::Detached { client } => {
+                            waiting.retain(|(c, _)| *c != client);
                             if policy == SizePolicy::Owner(client) {
                                 policy = policy.apply(OwnershipEvent::OwnerDisconnected, None);
+                                // ADR-007: the geometry passes to the writable client
+                                // refused a size first, and the size it last asked for
+                                // with it. Without this a second window sat at
+                                // the first one's size after it closed, since nothing made it
+                                // ask again.
+                                if !waiting.is_empty() {
+                                    let (next, size) = waiting.remove(0);
+                                    policy = SizePolicy::Owner(next);
+                                    let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
+                                    if size != canonical {
+                                        nudge_restore = None;
+                                        sys::resize(master_raw, size.cols, size.rows)?;
+                                        engine.resize(size.cols, size.rows);
+                                        current_size = size;
+                                        if let Some(handle) = terminals.get(stream) {
+                                            handle.last_dims.store(
+                                                ((size.cols as u64) << 32) | (size.rows as u64),
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                                    }
+                                }
                             }
                         }
                     }

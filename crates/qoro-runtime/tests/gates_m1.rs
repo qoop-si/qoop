@@ -917,6 +917,35 @@ async fn ending_a_connection_really_closes_its_socket() {
     );
 }
 
+/// When the owner leaves, a client that asked for a size and was refused gets the geometry
+/// and its size at once, without asking again (ADR-007: ownership passes to the
+/// longest-attached writable client). A second window otherwise sat at the first one's
+/// size after it closed, until something happened to resize again.
+#[tokio::test]
+async fn a_refused_size_takes_effect_when_the_owner_leaves() {
+    let d = TestDaemon::start().await;
+    let mut desktop = d.attach("desktop").await;
+    desktop.resize(132, 43).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut laptop = d.attach("laptop").await;
+    laptop.resize(90, 30).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    laptop.input(b"stty size\n").await;
+    assert!(
+        laptop.wait_for_text("43 132", PATIENCE).await,
+        "the refused size took effect while the owner was there"
+    );
+
+    drop(desktop);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    laptop.forget_seen();
+    laptop.input(b"stty size\n").await;
+    assert!(
+        laptop.wait_for_text("30 90", PATIENCE).await,
+        "the waiting client's size never took after the owner left"
+    );
+}
+
 /// The size owner releasing ownership must not depend on how its connection ended.
 ///
 /// The cleanup used to sit after the read loop and be reachable only by the `break` paths,
