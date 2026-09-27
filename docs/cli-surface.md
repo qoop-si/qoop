@@ -33,7 +33,7 @@ a claim nobody has to keep.
 | `qoro hook-report --session-id <id>` | report only the agent's conversation id, without claiming a state | no |
 | `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel | no |
 | `qoro send <terminal> --key <name>` | press named keys in another terminal, one frame each: `enter esc tab shift-tab backspace space up down left right home end pageup pagedown ctrl-a..ctrl-z`; arrows follow the program's cursor key mode | no |
-| `qoro read <terminal>` | print another terminal's current screen | no |
+| `qoro read <terminal> [--lines N]` | print another terminal's current screen | no |
 | `qoro prompt <target> [--wait] [--timeout SECS] [--] <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt. Flags go right after the target; the first other word starts the text, `--` lets the text start with a dash, and a text ending in `--wait` or `--timeout N` is refused as a misplaced flag unless it follows `--`. `--wait` then waits for the turn the prompt caused, with the exit status of `qoro wait`: from a stopped agent it ends on the first stop after the agent took the prompt; from a busy one (which may fold the prompt into its running turn or queue it) it ends once the agent has stayed stopped for 2 s. Blocked counts as stopped, since it needs a person | no |
 | `qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]` | block until a target reaches a state (default `idle,done,blocked,failed`; no target means every agent terminal but the caller's), print the matching rows; exits 124 on timeout and 1 when a target closes. A target already there returns at once, so after writing to one use `prompt --wait`. `--match` names one target and waits for TEXT on its live screen (never the scrollback); with `--until` both must hold | no |
 | `qoro new [--name N] [--cwd DIR] [--space ID\|NAME] [-- command...]` | open a terminal in the caller's directory, print its number, and type the command into its shell once it has drawn a prompt, quoted so each argument stays one word; nothing is typed after 10 s. `--space` takes an id or a name, and a new name is made once however many callers race for it. Refused when no session runs: it never starts one | no |
@@ -44,7 +44,7 @@ a claim nobody has to keep.
 | `qoro history <target> [--last N] [--role user\|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user\|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
-| `qoro agents explain <target>` | one terminal: state, the source holding it, the screen rule that last matched and its manifest | no |
+| `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
 | `qoro hooks status` | which agents' hooks are installed, and whether they are current | no |
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |
