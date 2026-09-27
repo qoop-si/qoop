@@ -193,6 +193,29 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "search the history from copy mode",
+            method: || {
+                Method::Control(ControlRequest::SearchScrollback {
+                    id: "a".into(),
+                    terminal: 1,
+                    query: "error".into(),
+                    from: 0,
+                    backward: true,
+                })
+            },
+        },
+        Action {
+            name: "copy a selection longer than the screen from copy mode",
+            method: || {
+                Method::Control(ControlRequest::Scrollback {
+                    id: "a".into(),
+                    terminal: 1,
+                    up: 500,
+                    rows: 500,
+                })
+            },
+        },
+        Action {
             name: "end this session",
             method: || Method::Control(ControlRequest::Shutdown { id: "a".into() }),
         },
@@ -356,6 +379,13 @@ fn every_control_method_is_reachable_from_some_action() {
             up: 0,
             rows: 0,
         },
+        ControlRequest::SearchScrollback {
+            id: String::new(),
+            terminal: 0,
+            query: String::new(),
+            from: 0,
+            backward: false,
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -414,6 +444,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
+            | ControlRequest::SearchScrollback { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

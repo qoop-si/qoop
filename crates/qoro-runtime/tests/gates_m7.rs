@@ -118,6 +118,15 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             fg: [0, 0, 0],
             bg: [255, 255, 255],
         },
+        // A search reads history and answers where it matched: a query, never bytes for
+        // the child.
+        ControlRequest::SearchScrollback {
+            id: "x21".into(),
+            terminal,
+            query: "READY".into(),
+            from: 0,
+            backward: true,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -143,6 +152,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
+            | ControlRequest::SearchScrollback { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }

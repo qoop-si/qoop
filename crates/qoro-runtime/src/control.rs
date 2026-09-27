@@ -62,6 +62,24 @@ pub enum ControlRequest {
         up: usize,
         rows: usize,
     },
+    /// Look for text in what has scrolled past, one bounded step at a time.
+    ///
+    /// A step and not a whole search, because a week of history is millions of rows and a
+    /// scan of all of them is seconds of disk: the daemon looks until a time and a byte
+    /// budget run out, then answers with where to carry on, so the person sees progress and
+    /// a keystroke is never queued behind a scan. The rows are the ones `Scrollback` counts,
+    /// from the oldest written.
+    SearchScrollback {
+        id: String,
+        terminal: TerminalStream,
+        query: String,
+        /// The first row looked at. Clamped to the newest row there is.
+        #[serde(default)]
+        from: u64,
+        /// Toward older rows rather than newer ones.
+        #[serde(default)]
+        backward: bool,
+    },
     /// End this daemon, and with it every terminal it owns.
     ///
     /// A request rather than a signal, so the daemon tears its terminals down the way
@@ -258,6 +276,7 @@ impl ControlRequest {
             | Self::RenameWorkspace { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
+            | Self::SearchScrollback { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -322,6 +341,25 @@ pub enum ControlResponse {
         from: u64,
         total: u64,
         lines: Vec<String>,
+    },
+    /// Where a `SearchScrollback` step got to.
+    ///
+    /// `row` is the first match in the direction asked, `None` when this step found none.
+    /// `resume` is where the next step should start when the step ran out of budget before
+    /// the end of the history, and `None` when the history was searched to its end.
+    ///
+    /// `col` is the cell the match starts in: one cell per character of the stored row, so
+    /// the daemon never reasons about how wide anything is drawn. The client turns it into
+    /// a screen column with its own width module.
+    ScrollbackMatch {
+        id: String,
+        terminal: TerminalStream,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<u64>,
+        #[serde(default)]
+        col: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<u64>,
     },
     /// The daemon heard, and is going. The count is what it is ending.
     Stopping {
@@ -585,6 +623,7 @@ impl ControlResponse {
             | Self::Renamed { id, .. }
             | Self::Stopping { id, .. }
             | Self::Scrollback { id, .. }
+            | Self::ScrollbackMatch { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
@@ -912,6 +951,35 @@ mod tests {
         let encoded = serde_json::to_vec(&response).expect("encode");
         let decoded: ControlResponse = serde_json::from_slice(&encoded).expect("decode");
         assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn a_scrollback_search_round_trips_and_a_miss_carries_no_row_on_the_wire() {
+        let request = ControlRequest::SearchScrollback {
+            id: "search-1".into(),
+            terminal: 3,
+            query: "ERROR".into(),
+            from: 70_000,
+            backward: true,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        let decoded: ControlRequest = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(request, decoded);
+        let miss = ControlResponse::ScrollbackMatch {
+            id: "search-1".into(),
+            terminal: 3,
+            row: None,
+            col: 0,
+            resume: Some(12_000),
+        };
+        assert_eq!(request.request_id(), miss.request_id());
+        let text = serde_json::to_string(&miss).expect("encode");
+        assert!(
+            !text.contains("\"row\""),
+            "an absent row is left off: {text}"
+        );
+        let decoded: ControlResponse = serde_json::from_str(&text).expect("decode");
+        assert_eq!(miss, decoded);
     }
 
     #[test]

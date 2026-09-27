@@ -1295,6 +1295,11 @@ async fn serve_client(
     let writer_progress = progress.clone();
     let renders = Arc::new(RenderQueue::new(outbound.clone()));
     let (control_tx, mut control_rx) = mpsc::channel::<BytesMut>(32);
+    // Which history search of this connection may still run. Each one takes the next
+    // number and stops at its next chunk once the number has moved on: a newer search from
+    // the same person makes the older one moot, and a connection that is gone makes every
+    // one of them moot, so neither keeps a blocking thread reading disk for nobody.
+    let searching = Arc::new(AtomicU64::new(0));
     // Subscription tasks, one per terminal this connection is watching. Kept so that
     // unsubscribing, and ending the connection, actually stop them.
     let subscriptions: Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>> =
@@ -1461,6 +1466,50 @@ async fn serve_client(
                 };
                 if channel == Channel::Control {
                     let response = match serde_json::from_slice::<ControlRequest>(&message.body) {
+                        // Spawned off this loop and answered through the connection's
+                        // outbound channel, the way events are: a search step is a
+                        // tenth of a second of disk, and the next keystroke on this
+                        // connection must not wait behind it.
+                        Ok(ControlRequest::SearchScrollback {
+                            id,
+                            terminal,
+                            query,
+                            from,
+                            backward,
+                        }) => {
+                            let dir = history_of(&terminals, history_dir.as_ref(), terminal);
+                            let step = searching.fetch_add(1, Ordering::SeqCst) + 1;
+                            let searching = searching.clone();
+                            let tx = control_tx.clone();
+                            tokio::spawn(async move {
+                                let response = match dir {
+                                    Ok(dir) => {
+                                        search_scrollback(
+                                            id,
+                                            terminal,
+                                            query,
+                                            from,
+                                            backward,
+                                            dir,
+                                            move || searching.load(Ordering::Relaxed) != step,
+                                        )
+                                        .await
+                                    }
+                                    Err(reason) => ControlResponse::Failed { id, reason },
+                                };
+                                let Ok(body) = serde_json::to_vec(&response) else {
+                                    return;
+                                };
+                                let mut out = BytesMut::new();
+                                if Frame::new(Channel::Control, 0, Bytes::from(body))
+                                    .encode(&mut out)
+                                    .is_ok()
+                                {
+                                    let _ = tx.send(out).await;
+                                }
+                            });
+                            continue;
+                        }
                         Ok(request) => {
                             handle_control(
                                 request,
@@ -1568,6 +1617,7 @@ async fn serve_client(
     // One exit. Aborting the writer is what drops the write half and closes the socket, so
     // it has to happen however the loop ended.
     events_task.abort();
+    searching.fetch_add(1, Ordering::SeqCst);
     renders.close();
     // This connection stops watching: drop its subscriptions from the
     // daemon-wide watch counts the idle reaper reads, and stop the tasks.
@@ -2361,20 +2411,9 @@ async fn handle_control(
         ControlRequest::Scrollback {
             terminal, up, rows, ..
         } => {
-            // A terminal that does not exist is a refusal, not an empty answer. Opening a
-            // history creates the directory it is given, so answering `{total: 0}` for an
-            // id nobody has would quietly leave an empty directory per bad request.
-            if terminals.get(terminal).is_none() {
-                return ControlResponse::Failed {
-                    id,
-                    reason: format!("there is no terminal {terminal}"),
-                };
-            }
-            let Some(dir) = history_dir.as_ref().map(|d| d.join(terminal.to_string())) else {
-                return ControlResponse::Failed {
-                    id,
-                    reason: "this daemon keeps no history".to_string(),
-                };
+            let dir = match history_of(terminals, history_dir.as_ref(), terminal) {
+                Ok(dir) => dir,
+                Err(reason) => return ControlResponse::Failed { id, reason },
             };
             // Capped, because the count comes from a client and a client that asks for a
             // hundred million rows would be asking the daemon to allocate them.
@@ -2410,6 +2449,18 @@ async fn handle_control(
                 },
             }
         }
+        // The connection loop spawns these rather than coming here; answered inline for any
+        // other caller, which has no newer search to be superseded by.
+        ControlRequest::SearchScrollback {
+            terminal,
+            query,
+            from,
+            backward,
+            ..
+        } => match history_of(terminals, history_dir.as_ref(), terminal) {
+            Ok(dir) => search_scrollback(id, terminal, query, from, backward, dir, || false).await,
+            Err(reason) => ControlResponse::Failed { id, reason },
+        },
         ControlRequest::Shutdown { .. } => {
             // Set before anything is closed. Every terminal is about to end, and a
             // terminal ending after this is the daemon going rather than a person closing
@@ -3883,6 +3934,235 @@ pub(crate) fn unparsable(error: &str) -> String {
 /// A window's worth and then some. The count is a number from a client, and a client is
 /// not to be trusted with how much memory the daemon allocates.
 pub const MAX_SCROLLBACK_ROWS: usize = 500;
+
+/// How long one search step reads before it answers with where to carry on.
+///
+/// A tenth of a second is under what a person notices as a wait, and long enough to cover
+/// hundreds of thousands of rows: most searches end in the first step.
+pub const SEARCH_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How many bytes of rows one search step reads, whatever the clock says.
+///
+/// The clock alone lets a fast disk read a gigabyte between two answers, and the step
+/// exists so that a search costs about the same on every machine: a person pressing `n`
+/// again is cheaper than a daemon reading history nobody asked to see.
+pub const SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Rows read per disk call while searching: large enough that the seek and the segment
+/// listing are a rounding error, small enough that a step overshoots its budget by little.
+const SEARCH_CHUNK: u64 = 16_384;
+
+/// Where a terminal's history lives, or why it cannot be read.
+///
+/// A terminal that does not exist is a refusal, not an empty answer. Opening a history
+/// creates the directory it is given, so answering `{total: 0}` for an id nobody has would
+/// quietly leave an empty directory per bad request.
+fn history_of(
+    terminals: &TerminalRegistry,
+    history_dir: Option<&PathBuf>,
+    terminal: u32,
+) -> Result<PathBuf, String> {
+    if terminals.get(terminal).is_none() {
+        return Err(format!("there is no terminal {terminal}"));
+    }
+    history_dir
+        .map(|d| d.join(terminal.to_string()))
+        .ok_or_else(|| "this daemon keeps no history".to_string())
+}
+
+/// One search step over a terminal's history, answered as a `ScrollbackMatch`.
+///
+/// On the blocking pool with a deadline, like every other read of a disk (ADR-011). `stop`
+/// is asked between chunks: true once the search is moot, and the step then answers with
+/// where it got to like a step that ran out of budget.
+async fn search_scrollback(
+    id: String,
+    terminal: u32,
+    query: String,
+    from: u64,
+    backward: bool,
+    dir: PathBuf,
+    stop: impl Fn() -> bool + Send + 'static,
+) -> ControlResponse {
+    if query.is_empty() {
+        return ControlResponse::Failed {
+            id,
+            reason: "there is nothing to search for".to_string(),
+        };
+    }
+    let scan = tokio::time::timeout(
+        crate::store::STORE_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            let history = qoro_store::History::open(&dir)?;
+            scan_history(
+                &history,
+                &query,
+                from,
+                backward,
+                SEARCH_STEP,
+                SEARCH_BYTES,
+                stop,
+            )
+        }),
+    )
+    .await;
+    match scan {
+        Ok(Ok(Ok((found, resume)))) => ControlResponse::ScrollbackMatch {
+            id,
+            terminal,
+            row: found.map(|(row, _)| row),
+            col: found.map_or(0, |(_, cell)| cell),
+            resume,
+        },
+        Ok(Ok(Err(e))) => ControlResponse::Failed {
+            id,
+            reason: format!("the scrollback could not be searched: {e}"),
+        },
+        _ => ControlResponse::Failed {
+            id,
+            reason: "the scrollback search did not answer in time".to_string(),
+        },
+    }
+}
+
+/// Where a search step got to: the match as (row, cell), and where the next step starts.
+type SearchStep = (Option<(u64, usize)>, Option<u64>);
+
+/// Look through a history from row `from`, toward older rows with `backward`, until a row
+/// holds `query` or a budget runs out.
+///
+/// Answers the match as (row, cell), and where the next step should start when a budget
+/// ran out first. Both `None`: the history was searched to its end in that direction.
+pub(crate) fn scan_history(
+    history: &qoro_store::History,
+    query: &str,
+    from: u64,
+    backward: bool,
+    time: std::time::Duration,
+    bytes: u64,
+    stop: impl Fn() -> bool,
+) -> Result<SearchStep, qoro_store::StoreError> {
+    let total = history.len();
+    if total == 0 || (!backward && from >= total) {
+        return Ok((None, None));
+    }
+    let started = std::time::Instant::now();
+    let mut read = 0u64;
+    // The next row to look at.
+    let mut at = from.min(total - 1);
+    loop {
+        let start = if backward {
+            (at + 1).saturating_sub(SEARCH_CHUNK)
+        } else {
+            at
+        };
+        let count = if backward {
+            at + 1 - start
+        } else {
+            SEARCH_CHUNK.min(total - at)
+        };
+        let rows = history.read(start, count as usize)?;
+        if rows.is_empty() {
+            return Ok((None, None));
+        }
+        for k in 0..rows.len() {
+            let i = if backward { rows.len() - 1 - k } else { k };
+            read += rows[i].len() as u64;
+            if let Some(cell) = find_in_row(&rows[i], query, None, backward) {
+                return Ok((Some((start + i as u64, cell)), None));
+            }
+        }
+        if backward {
+            let Some(next) = start.checked_sub(1) else {
+                return Ok((None, None));
+            };
+            at = next;
+        } else {
+            at = start + rows.len() as u64;
+            if at >= total {
+                return Ok((None, None));
+            }
+        }
+        if stop() || started.elapsed() >= time || read >= bytes {
+            return Ok((None, Some(at)));
+        }
+    }
+}
+
+/// Where `query` occurs in one row, as a cell: one per character of the row, which is how
+/// a grid row is stored.
+///
+/// With `bound`, the first match starting after that cell, or with `backward` the last one
+/// starting before it; without, the first or last in the whole row. Smart case, as in vim
+/// and less: a query with a capital letter in it means exactly that, and one without means
+/// any case.
+///
+/// Public because the client searches the rows on its screen with the same rule before it
+/// asks for the history, and two rules would find two different things.
+pub fn find_in_row(row: &str, query: &str, bound: Option<usize>, backward: bool) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    let exact = query.chars().any(char::is_uppercase);
+    let keep = |cell: usize| match (bound, backward) {
+        (None, _) => true,
+        (Some(bound), false) => cell > bound,
+        (Some(bound), true) => cell < bound,
+    };
+    // Plain ASCII, which is nearly every row a search reads: a byte is a cell and there is
+    // no spacer to step over, so the match is a byte comparison.
+    if row.is_ascii() && query.is_ascii() {
+        let mut starts: Box<dyn Iterator<Item = usize> + '_> = if exact {
+            Box::new(row.match_indices(query).map(|(at, _)| at))
+        } else {
+            let (q, bytes) = (query.as_bytes(), row.as_bytes());
+            Box::new(
+                (0..=bytes.len().saturating_sub(q.len())).filter(move |&at| {
+                    bytes.len() >= q.len() && bytes[at..at + q.len()].eq_ignore_ascii_case(q)
+                }),
+            )
+        };
+        return if backward {
+            starts.filter(|&cell| keep(cell)).last()
+        } else {
+            starts.find(|&cell| keep(cell))
+        };
+    }
+    // Anything else is matched on the characters as drawn: the spacer cell the grid keeps
+    // after a wide character is stepped over, or `世界` would never match the stored
+    // `世 界 `, and each match is mapped back to the cell it starts in.
+    let mut after_wide = false;
+    let drawn: Vec<(char, usize)> = row
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| {
+            let spacer = after_wide && *c == ' ';
+            after_wide = !spacer && unicode_width::UnicodeWidthChar::width(*c) == Some(2);
+            !spacer
+        })
+        .map(|(cell, c)| (c, cell))
+        .collect();
+    let q: Vec<char> = query.chars().collect();
+    let same = |c: char, want: char| {
+        if exact {
+            c == want
+        } else {
+            c.to_lowercase().eq(want.to_lowercase())
+        }
+    };
+    let mut starts = (0..(drawn.len() + 1).saturating_sub(q.len()))
+        .filter(|&at| {
+            q.iter()
+                .enumerate()
+                .all(|(i, want)| same(drawn[at + i].0, *want))
+        })
+        .map(|at| drawn[at].1);
+    if backward {
+        starts.rev().find(|&cell| keep(cell))
+    } else {
+        starts.find(|&cell| keep(cell))
+    }
+}
 
 /// How long a shutdown waits for its terminals to end before going anyway.
 ///
@@ -6235,5 +6515,202 @@ mod screen_fallback_tests {
         assert_eq!(v.state, qoro_domain::AgentRuntimeState::Idle);
         assert_eq!(v.rule, "known_agent_idle_fallback");
         assert_eq!(screen_verdict(qoro_detect::Reading::Nothing, false), None);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{find_in_row, scan_history};
+    use std::time::Duration;
+
+    fn history(rows: &[String]) -> (tempfile::TempDir, qoro_store::History) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut history = qoro_store::History::open(dir.path()).expect("open");
+        history.append(rows).expect("append");
+        history.flush().expect("flush");
+        let history = qoro_store::History::open(dir.path()).expect("reopen");
+        (dir, history)
+    }
+
+    #[test]
+    fn a_lowercase_query_matches_any_case_and_a_capital_means_exactly_that() {
+        assert_eq!(find_in_row("an Error here", "error", None, false), Some(3));
+        assert_eq!(find_in_row("an Error here", "Error", None, false), Some(3));
+        assert_eq!(find_in_row("an error here", "Error", None, false), None);
+        assert_eq!(find_in_row("GÜNEŞ güneş", "güneş", None, false), Some(0));
+        assert_eq!(find_in_row("GÜNEŞ güneş", "Güneş", None, false), None);
+    }
+
+    #[test]
+    fn a_bound_finds_the_next_match_after_it_or_the_last_one_before_it() {
+        let row = "ab ab ab";
+        assert_eq!(find_in_row(row, "ab", None, false), Some(0));
+        assert_eq!(find_in_row(row, "ab", None, true), Some(6));
+        assert_eq!(find_in_row(row, "ab", Some(0), false), Some(3));
+        assert_eq!(find_in_row(row, "ab", Some(6), true), Some(3));
+        assert_eq!(find_in_row(row, "ab", Some(6), false), None);
+        assert_eq!(find_in_row(row, "ab", Some(0), true), None);
+    }
+
+    /// A cell is a character of the stored row, spacer included: the client turns it into a
+    /// screen column, the daemon never measures anything.
+    #[test]
+    fn the_answer_counts_cells_and_not_bytes() {
+        // `世` then its spacer cell, then `x`.
+        assert_eq!(find_in_row("\u{4e16} x", "x", None, false), Some(2));
+    }
+
+    /// Found in review: a stored row keeps a spacer cell after every wide character, so a
+    /// query of two of them never matched until the spacers were stepped over.
+    #[test]
+    fn a_query_of_wide_characters_matches_across_their_spacers() {
+        let row = "a\u{4e16} \u{754c} x \u{4e16} \u{754c} ";
+        assert_eq!(find_in_row(row, "\u{4e16}\u{754c}", None, false), Some(1));
+        assert_eq!(find_in_row(row, "\u{4e16}\u{754c}", None, true), Some(7));
+        assert_eq!(
+            find_in_row(row, "\u{4e16}\u{754c}", Some(1), false),
+            Some(7)
+        );
+        assert_eq!(find_in_row(row, "\u{754c}x", None, false), Some(3));
+        assert_eq!(
+            find_in_row(row, "\u{754c} x", None, false),
+            None,
+            "the spacer is not a space"
+        );
+    }
+
+    #[test]
+    fn a_search_finds_the_nearest_row_in_either_direction() {
+        let rows: Vec<String> = (0..50_000)
+            .map(|i| {
+                if i % 10_000 == 5 {
+                    format!("mark {i}")
+                } else {
+                    format!("row {i}")
+                }
+            })
+            .collect();
+        let (_dir, h) = history(&rows);
+        let never = || false;
+        let long = Duration::from_secs(30);
+        assert_eq!(
+            scan_history(&h, "mark", 49_999, true, long, u64::MAX, never).unwrap(),
+            (Some((40_005, 0)), None)
+        );
+        assert_eq!(
+            scan_history(&h, "mark", 40_004, true, long, u64::MAX, never).unwrap(),
+            (Some((30_005, 0)), None)
+        );
+        assert_eq!(
+            scan_history(&h, "mark", 10_006, false, long, u64::MAX, never).unwrap(),
+            (Some((20_005, 0)), None)
+        );
+        // Past either end is the end of the search, not an error.
+        assert_eq!(
+            scan_history(&h, "mark", 4, true, long, u64::MAX, never).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            scan_history(&h, "mark", 40_006, false, long, u64::MAX, never).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            scan_history(&h, "mark", 90_000, false, long, u64::MAX, never).unwrap(),
+            (None, None)
+        );
+    }
+
+    /// The step budgets on a history the size of G2.6's (7.1 million `seq` rows), without
+    /// the socket: how long a step reads, and how long a search back to the first row takes.
+    #[ignore = "writes 7.1 million rows; run it deliberately, in release"]
+    #[test]
+    fn a_step_over_seven_million_rows_keeps_to_its_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut h = qoro_store::History::open(dir.path()).expect("open");
+        h.append(&["OLDEST-MARKER-42".to_string()]).expect("append");
+        for round in 0..40u32 {
+            let rows: Vec<String> = (1..=177_500u32).map(|i| (i + round).to_string()).collect();
+            h.append(&rows).expect("append");
+        }
+        h.flush().expect("flush");
+        let h = qoro_store::History::open(dir.path()).expect("reopen");
+        let total = h.len();
+        let mut steps = Vec::new();
+        let mut wholes = Vec::new();
+        for _ in 0..5 {
+            let whole = std::time::Instant::now();
+            let mut from = total - 1;
+            loop {
+                let at = std::time::Instant::now();
+                let (found, resume) = scan_history(
+                    &h,
+                    "oldest-marker-42",
+                    from,
+                    true,
+                    super::SEARCH_STEP,
+                    super::SEARCH_BYTES,
+                    || false,
+                )
+                .unwrap();
+                steps.push(at.elapsed());
+                if found.is_some() {
+                    break;
+                }
+                from = resume.expect("the marker is there to find");
+            }
+            wholes.push(whole.elapsed());
+        }
+        steps.sort();
+        wholes.sort();
+        let pct = |v: &[Duration], p: usize| v[(v.len() * p / 100).min(v.len() - 1)];
+        println!(
+            "{total} rows: step n={} p50 {:?} p95 {:?}; whole search p50 {:?} p95 {:?}",
+            steps.len(),
+            pct(&steps, 50),
+            pct(&steps, 95),
+            pct(&wholes, 50),
+            pct(&wholes, 95)
+        );
+        assert!(pct(&steps, 95) < Duration::from_millis(250));
+    }
+
+    /// The budget is what keeps a step short: spent, the step answers where to carry on,
+    /// and carrying on from there reaches the match a single long step would have.
+    #[test]
+    fn a_spent_budget_answers_where_to_carry_on_and_carrying_on_arrives() {
+        let rows: Vec<String> = (0..60_000)
+            .map(|i| {
+                if i == 7 {
+                    "needle".to_string()
+                } else {
+                    format!("row {i}")
+                }
+            })
+            .collect();
+        let (_dir, h) = history(&rows);
+        let long = Duration::from_secs(30);
+        let mut from = 59_999;
+        let mut steps = 0;
+        let found = loop {
+            steps += 1;
+            match scan_history(&h, "needle", from, true, long, 1, || false).unwrap() {
+                (Some(found), None) => break found,
+                (None, Some(resume)) => {
+                    assert!(resume < from, "no progress from {from}");
+                    from = resume;
+                }
+                other => panic!("the search ended without the needle: {other:?}"),
+            }
+        };
+        assert_eq!(found, (7, 0));
+        assert!(
+            steps > 1,
+            "a one byte budget still searched everything at once"
+        );
+        // A search that is moot stops at its first chunk, with somewhere to carry on.
+        let (found, resume) =
+            scan_history(&h, "needle", 59_999, true, long, u64::MAX, || true).unwrap();
+        assert_eq!(found, None);
+        assert!(resume.is_some());
     }
 }

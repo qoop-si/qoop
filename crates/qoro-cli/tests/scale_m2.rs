@@ -641,24 +641,23 @@ async fn g2_2_idle_cost_does_not_depend_on_the_rest_of_the_machine() {
     );
 }
 
-/// G2.6: attaching to a terminal with a large history is not slower than attaching to an
-/// empty one.
-///
-/// History is on disk in segments with an index precisely so that attach is a seek. A
-/// version that read the whole history to attach would pass every correctness test and
-/// make a long lived terminal unusable.
-#[ignore = "writes a hundred megabytes; run it deliberately"]
-#[tokio::test(flavor = "multi_thread")]
-async fn g2_6_attaching_to_a_large_history_is_not_slower() {
-    let daemon = start_daemon();
+/// Two terminals, the second with about a hundred megabytes of rows behind its screen
+/// (seven million or so), preceded by `first` when it is not empty: the fixture of G2.6,
+/// and of the search latency below.
+async fn large_history(
+    daemon: &Daemon,
+    first: &[u8],
+    patience: Duration,
+) -> (TestClient, u32, u32, u64) {
     let (mut client, streams) = fill(&daemon.socket, 2).await;
     let (empty, large) = (streams[0], streams[1]);
-
-    // About a hundred megabytes of rows.
+    if !first.is_empty() {
+        client.input_to(large, first).await;
+    }
     client
         .input_to(large, b"for i in $(seq 1 40); do seq 1 200000; done\n")
         .await;
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + patience;
     let dir = daemon
         .socket
         .parent()
@@ -679,6 +678,98 @@ async fn g2_6_attaching_to_a_large_history_is_not_slower() {
         rows > 1_000_000,
         "only {rows} rows were written, so this is not a large history"
     );
+    (client, empty, large, rows)
+}
+
+/// Copy mode's history search on the G2.6 history: how long one step takes to answer, and
+/// how long a search for a row at the very start of seven million takes in all.
+///
+/// Each step is bounded by the daemon (a tenth of a second or 64 MiB), so the per step
+/// latency is the longest a person waits to hear something back, and the whole search is
+/// what a search that has to go all the way back costs in all.
+#[ignore = "writes a hundred megabytes; run it deliberately"]
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_6_searching_a_large_history_answers_in_bounded_steps() {
+    let daemon = start_daemon();
+    // Waited for whole, however long a loaded machine takes to write it: the number is
+    // about seven million rows, not about however many fit in three minutes.
+    let (_filler, _empty, large, rows) = large_history(
+        &daemon,
+        b"echo OLDEST-MARKER-$((6*7))\n",
+        Duration::from_secs(900),
+    )
+    .await;
+    // A connection of its own: the filler has read nothing for minutes, and the daemon is
+    // right to have given up on it (ADR-013).
+    let (stream, inbuf) = qoro_runtime::client::connect(&daemon.socket, "searcher")
+        .await
+        .expect("connect");
+    let mut client = TestClient::from_parts(stream, inbuf, large);
+    println!("search: {rows} rows on disk");
+
+    let mut steps = Vec::new();
+    let mut wholes = Vec::new();
+    for round in 0..5 {
+        let started = Instant::now();
+        let mut from = rows - 1;
+        let found = loop {
+            let at = Instant::now();
+            let answer = client
+                .control(
+                    &ControlRequest::SearchScrollback {
+                        id: format!("s{round}-{}", steps.len()),
+                        terminal: large,
+                        query: "oldest-marker-42".into(),
+                        from,
+                        backward: true,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("a search step answers");
+            steps.push(at.elapsed());
+            match answer {
+                ControlResponse::ScrollbackMatch { row: Some(row), .. } => break row,
+                ControlResponse::ScrollbackMatch {
+                    resume: Some(resume),
+                    ..
+                } => from = resume,
+                other => panic!("the search ended without the marker: {other:?}"),
+            }
+        };
+        wholes.push(started.elapsed());
+        assert!(found < 100, "the marker is at the start, found at {found}");
+    }
+    steps.sort();
+    wholes.sort();
+    let pct = |v: &[Duration], p: usize| v[(v.len() * p / 100).min(v.len() - 1)];
+    println!(
+        "search step: n={} p50 {:?} p95 {:?} max {:?}; whole search of {rows} rows: p50 {:?} p95 {:?} ({} steps each)",
+        steps.len(),
+        pct(&steps, 50),
+        pct(&steps, 95),
+        steps.last().expect("steps"),
+        pct(&wholes, 50),
+        pct(&wholes, 95),
+        steps.len() / wholes.len(),
+    );
+    assert!(
+        pct(&steps, 95) < Duration::from_millis(250),
+        "a search step is meant to answer in about a tenth of a second"
+    );
+}
+
+/// G2.6: attaching to a terminal with a large history is not slower than attaching to an
+/// empty one.
+///
+/// History is on disk in segments with an index precisely so that attach is a seek. A
+/// version that read the whole history to attach would pass every correctness test and
+/// make a long lived terminal unusable.
+#[ignore = "writes a hundred megabytes; run it deliberately"]
+#[tokio::test(flavor = "multi_thread")]
+async fn g2_6_attaching_to_a_large_history_is_not_slower() {
+    let daemon = start_daemon();
+    let (_client, empty, large, rows) = large_history(&daemon, b"", Duration::from_secs(180)).await;
     println!("G2.6: {rows} rows on disk");
 
     // Both sides go through the same path: connect, subscribe, wait for the first screen.
