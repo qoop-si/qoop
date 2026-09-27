@@ -26,6 +26,13 @@ pub const APPEND_DEADLINE: Duration = Duration::from_secs(5);
 /// path may wait for a disk, so the handover is a bounded buffer with a drop counter.
 pub const OBSERVATION_CAPACITY: usize = 4096;
 
+/// How long observations gather before the daemon writes them, as one batch.
+pub const OBSERVATION_BATCH: Duration = Duration::from_secs(1);
+
+/// How long the log keeps an event. The idempotency ledger only has to outlive a client's
+/// retry, which is seconds, and forensics on a reap or a crash look back days, not months.
+pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error("the log did not answer within {APPEND_DEADLINE:?}")]
@@ -88,7 +95,7 @@ impl EventLog {
         let written = crate::blocking::run_within(APPEND_DEADLINE, move || {
             store
                 .lock()
-                .expect("the log lock is never poisoned in place")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .append(at, &entries)
                 .map_err(|e| e.to_string())
         })
@@ -102,7 +109,10 @@ impl EventLog {
     /// recording it never needs a slot in the buffer that is by definition full, which is
     /// the failure the whole mechanism exists to prevent.
     pub fn observe(&self, stream: Stream, body: Body) {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pending.entries.len() >= OBSERVATION_CAPACITY {
             let now = now_unix();
             if pending.dropped == 0 {
@@ -124,28 +134,53 @@ impl EventLog {
 
     /// Write what is waiting. Returns how many events were written.
     pub async fn flush(&self) -> Result<usize, LogError> {
-        let (mut entries, gap) = {
-            let mut pending = self.pending.lock().unwrap();
+        let (mut entries, dropped, first_unix, last_unix) = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entries = std::mem::take(&mut pending.entries);
-            let gap = (pending.dropped > 0).then(|| Body::Gap {
-                dropped: pending.dropped,
-                first_unix: pending.first_unix,
-                last_unix: pending.last_unix,
-                reason: "observation buffer full".into(),
-            });
-            pending.dropped = 0;
-            (entries, gap)
+            let dropped = std::mem::take(&mut pending.dropped);
+            (entries, dropped, pending.first_unix, pending.last_unix)
         };
-        if let Some(gap) = gap {
+        let observed = entries.len() as u64;
+        if dropped > 0 {
             // Appended alongside what did fit, not through the buffer it describes: a gap
             // pushed into a full buffer is lost with the observations it is about.
-            entries.push((Stream::Workspace(0), gap));
+            entries.push((
+                Stream::Workspace(0),
+                Body::Gap {
+                    dropped,
+                    first_unix,
+                    last_unix,
+                    reason: "observation buffer full".into(),
+                },
+            ));
         }
         if entries.is_empty() {
             return Ok(0);
         }
         let count = entries.len();
-        self.append_durable(entries).await?;
+        if let Err(e) = self.append_durable(entries).await {
+            // The batch is gone, which is a loss like any other (ADR-005 rule 3): counted
+            // back, so the next flush that lands writes the gap. A flush that timed out but
+            // landed anyway is then counted twice, which errs on the safe side: a reader
+            // told of a gap re-reads rather than trusting what it folded.
+            let now = now_unix();
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let first = if dropped > 0 { first_unix } else { now };
+            pending.first_unix = if pending.dropped == 0 {
+                first
+            } else {
+                pending.first_unix.min(first)
+            };
+            pending.last_unix = pending.last_unix.max(now);
+            pending.dropped += observed + dropped;
+            return Err(e);
+        }
         Ok(count)
     }
 
@@ -194,7 +229,11 @@ impl EventLog {
     }
 
     pub fn pending_observations(&self) -> usize {
-        self.pending.lock().unwrap().entries.len()
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
     }
 
     /// How many observations have been dropped since the last flush.
@@ -203,7 +242,10 @@ impl EventLog {
     /// drops what arrives while it is full, so whether a particular observation was lost is
     /// a fact about the buffer at that moment, not about the size of the burst around it.
     pub fn dropped_observations(&self) -> u64 {
-        self.pending.lock().unwrap().dropped
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped
     }
 
     /// Rebuild a projection from the whole log.
@@ -212,7 +254,7 @@ impl EventLog {
         let events = crate::blocking::run_within(APPEND_DEADLINE, move || {
             store
                 .lock()
-                .expect("the log lock is never poisoned in place")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .replay()
                 .map_err(|e| e.to_string())
         })
@@ -234,7 +276,7 @@ impl EventLog {
         crate::blocking::run_within(APPEND_DEADLINE, move || {
             store
                 .lock()
-                .expect("the log lock is never poisoned in place")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .applied(&key)
                 .map_err(|e| e.to_string())
         })
@@ -248,8 +290,23 @@ impl EventLog {
         crate::blocking::run_within(APPEND_DEADLINE, move || {
             store
                 .lock()
-                .expect("the log lock is never poisoned in place")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .unreconciled()
+                .map_err(|e| e.to_string())
+        })
+        .await?
+        .map_err(LogError::Store)
+    }
+
+    /// Forget what is older than `RETENTION`, on the store pool like every other write.
+    pub async fn prune(&self) -> Result<(), LogError> {
+        let store = self.store.clone();
+        let before = now_unix() - RETENTION.as_secs() as i64;
+        crate::blocking::run_within(APPEND_DEADLINE, move || {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .prune(before)
                 .map_err(|e| e.to_string())
         })
         .await?
@@ -347,6 +404,29 @@ mod tests {
             view.gaps.len(),
             1,
             "the same loss was reported twice, which double counts it"
+        );
+    }
+
+    /// ADR-005 rule 3 on the failure it is written for: a batch the disk refused is a loss,
+    /// and the loss is counted so the next flush that lands records the gap.
+    #[tokio::test]
+    async fn a_batch_the_disk_refused_is_counted_as_dropped() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("events.db");
+        let l = EventLog::new(EventStore::open(&path).expect("open"));
+        for i in 0..3 {
+            l.observe(Stream::Terminal(1), observation(i));
+        }
+        // Another connection takes the table away, so the append fails.
+        rusqlite::Connection::open(&path)
+            .expect("a second connection")
+            .execute_batch("DROP TABLE event")
+            .expect("drop");
+        assert!(l.flush().await.is_err(), "the append was meant to fail");
+        assert_eq!(
+            l.dropped_observations(),
+            3,
+            "a failed flush lost its batch without counting it"
         );
     }
 

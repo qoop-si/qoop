@@ -61,6 +61,10 @@ pub enum BlockingError {
     Abandoned(Duration),
     #[error("{0} is degraded and is not being probed")]
     Degraded(String),
+    /// Every probe thread is taken. Refused at once and not counted: the job never ran, so
+    /// it says nothing about its own path.
+    #[error("every probe thread is busy")]
+    Busy,
     #[error("the call panicked")]
     Panicked,
 }
@@ -106,7 +110,8 @@ pub fn is_degraded(prefix: &str) -> bool {
         .lock()
         .unwrap()
         .iter()
-        .any(|(p, n)| *n >= DEGRADE_AFTER && prefix.starts_with(p.as_str()))
+        // By path component: a degraded `/Volumes/nas/a` says nothing about `/Volumes/nas/ab`.
+        .any(|(p, n)| *n >= DEGRADE_AFTER && std::path::Path::new(prefix).starts_with(p))
 }
 
 /// Every prefix currently marked degraded, for status.
@@ -134,13 +139,20 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let _permit = semaphore(pool)
+    let permit = semaphore(pool)
         .acquire()
         .await
         .map_err(|_| BlockingError::Closed)?;
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|_| BlockingError::Panicked)
+    // The permit goes with the job, not with this future. A caller that stops waiting
+    // (`run_within`'s deadline) drops the future while the thread is still blocked, and a
+    // permit released then is a thread handed out twice: a hung database grew one blocked
+    // thread per store call.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|_| BlockingError::Panicked)
 }
 
 /// The store pool, which is where metadata and history go.
@@ -177,23 +189,64 @@ where
     if is_degraded(prefix) {
         return Err(BlockingError::Degraded(prefix.to_string()));
     }
-    // The permit is held by the spawned task rather than by this future, so that a timeout
+    // A permit is waited for inside the same deadline: a create behind a few quick probes
+    // takes its turn. Only a pool held for the whole deadline refuses, as `Busy`, and that
+    // is not counted against this path, because this path never ran.
+    let deadline = tokio::time::Instant::now() + within;
+    let permit = tokio::time::timeout_at(deadline, semaphore(Pool::Probe).acquire())
+        .await
+        .map_err(|_| BlockingError::Busy)?
+        .map_err(|_| BlockingError::Closed)?;
+    let result = run_probe(permit, deadline, within, f).await;
+    if matches!(result, Err(BlockingError::Abandoned(_))) {
+        *pools()
+            .abandoned_by_prefix
+            .lock()
+            .unwrap()
+            .entry(prefix.to_string())
+            .or_insert(0) += 1;
+    }
+    result
+}
+
+/// The same on the probe pool, counted against no prefix: for work that asks about no one
+/// path, where a refusal means an absent answer rather than a failure.
+pub async fn try_probe<T, F>(within: Duration, f: F) -> Result<T, BlockingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // Taken now or not at all (ADR-011: jobs are rejected when the pool is full): what
+    // this answers is optional, and waiting behind stuck probes would only delay the
+    // call it is part of.
+    let permit = semaphore(Pool::Probe)
+        .try_acquire()
+        .map_err(|_| BlockingError::Busy)?;
+    run_probe(permit, tokio::time::Instant::now() + within, within, f).await
+}
+
+/// Run `f` holding a probe permit until `deadline`.
+async fn run_probe<T, F>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    deadline: tokio::time::Instant,
+    within: Duration,
+    f: F,
+) -> Result<T, BlockingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // The permit is held by the blocking job rather than by this future, so that a timeout
     // here does not release capacity the blocked thread is still using.
-    let handle = tokio::spawn(async move {
-        let _permit = semaphore(Pool::Probe).acquire().await.ok()?;
-        tokio::task::spawn_blocking(f).await.ok()
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
     });
-    match tokio::time::timeout(within, handle).await {
-        Ok(Ok(Some(value))) => Ok(value),
-        Ok(_) => Err(BlockingError::Panicked),
+    match tokio::time::timeout_at(deadline, handle).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(BlockingError::Panicked),
         Err(_) => {
-            let p = pools();
-            p.abandoned.fetch_add(1, Ordering::Relaxed);
-            *p.abandoned_by_prefix
-                .lock()
-                .unwrap()
-                .entry(prefix.to_string())
-                .or_insert(0) += 1;
+            pools().abandoned.fetch_add(1, Ordering::Relaxed);
             Err(BlockingError::Abandoned(within))
         }
     }
@@ -204,6 +257,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    /// The probe pool is one per process, and a job a test abandoned keeps its permit until
+    /// its sleep ends. So a probe test takes this, and waits for the pool to drain, or one
+    /// test's stuck jobs are another test's busy pool.
+    async fn exclusive_probe_pool() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let held = LOCK.lock().await;
+        while semaphore(Pool::Probe).available_permits() < PROBE_THREADS {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        held
+    }
 
     fn unique(prefix: &str) -> String {
         format!(
@@ -247,6 +312,7 @@ mod tests {
     /// teardown need.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stuck_probe_does_not_starve_lifecycle_work() {
+        let _pool = exclusive_probe_pool().await;
         let prefix = unique("/hung");
         // Fill the probe pool with jobs that will not return for a long time.
         for _ in 0..(PROBE_THREADS * 2) {
@@ -277,6 +343,7 @@ mod tests {
     /// Abandonment: the caller is told, and the count grows.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_probe_that_does_not_return_is_abandoned_and_counted() {
+        let _pool = exclusive_probe_pool().await;
         let prefix = unique("/slow");
         let before = abandoned_count();
         let result = probe(&prefix, Duration::from_millis(50), || {
@@ -293,6 +360,7 @@ mod tests {
     /// And enough of them stop the next one from spending a thread at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn enough_abandonments_mark_the_prefix_degraded() {
+        let _pool = exclusive_probe_pool().await;
         let prefix = unique("/dead");
         for _ in 0..DEGRADE_AFTER {
             let _ = probe(&prefix, Duration::from_millis(30), || {
@@ -319,6 +387,59 @@ mod tests {
 
         clear_degraded(&prefix);
         assert!(!is_degraded(&prefix));
+    }
+
+    /// A full pool is a refusal, not an abandonment. A healthy path queued behind four stuck
+    /// probes never ran, so counting it would mark a prefix degraded for another's hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_refused_by_a_full_pool_is_busy_and_not_counted() {
+        let _pool = exclusive_probe_pool().await;
+        let stuck = unique("/stuck");
+        for _ in 0..PROBE_THREADS {
+            let stuck = stuck.clone();
+            tokio::spawn(async move {
+                let _ = probe(&stuck, Duration::from_millis(50), || {
+                    std::thread::sleep(Duration::from_secs(1))
+                })
+                .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let healthy = unique("/healthy");
+        let result = probe(&healthy, Duration::from_millis(50), || 1u8).await;
+        assert!(matches!(result, Err(BlockingError::Busy)), "{result:?}");
+        assert!(!is_degraded(&healthy));
+        assert!(
+            !pools()
+                .abandoned_by_prefix
+                .lock()
+                .unwrap()
+                .contains_key(&healthy),
+            "a probe that never ran was counted against its prefix"
+        );
+        clear_degraded(&stuck);
+    }
+
+    /// A path behind a pool of quick probes waits its turn inside its deadline. Refused at
+    /// once, four tabs opened together made the fifth fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_behind_quick_ones_gets_its_turn() {
+        let _pool = exclusive_probe_pool().await;
+        let quick = unique("/quick");
+        for _ in 0..PROBE_THREADS {
+            let quick = quick.clone();
+            tokio::spawn(async move {
+                let _ = probe(&quick, Duration::from_secs(2), || {
+                    std::thread::sleep(Duration::from_millis(50))
+                })
+                .await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let waiting = unique("/waiting");
+        let result = probe(&waiting, Duration::from_secs(2), || 7u8).await;
+        assert!(matches!(result, Ok(7)), "{result:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

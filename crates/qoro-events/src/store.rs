@@ -179,6 +179,21 @@ impl EventStore {
         Ok(out)
     }
 
+    /// Forget every event and ledger row older than `before_unix`, in one transaction.
+    ///
+    /// The retention ADR-017 leaves to the caller. Sequences stay dense for what comes next,
+    /// because `append` allocates from what remains.
+    pub fn prune(&mut self, before_unix: i64) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM event WHERE at_unix < ?1", params![before_unix])?;
+        tx.execute(
+            "DELETE FROM applied WHERE at_unix < ?1",
+            params![before_unix],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Commands with no outcome. What a restart has to reconcile.
     pub fn unreconciled(&self) -> Result<Vec<String>, StoreError> {
         let mut keys = Vec::new();
@@ -338,5 +353,38 @@ mod tests {
         let events = s.replay().expect("replay");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].at_unix, 5);
+    }
+
+    /// The log keeps a window, not everything: old events and old ledger rows go, newer
+    /// ones stay, and a new event after a prune still gets the next sequence.
+    #[test]
+    fn a_prune_drops_what_is_older_than_the_cutoff_and_nothing_newer() {
+        let mut s = store();
+        let outcome = |key: &str| Body::Outcome {
+            idempotency_key: key.into(),
+            ok: true,
+            detail: serde_json::json!({}),
+        };
+        s.append(10, &[(Stream::Command("old".into()), outcome("old"))])
+            .expect("append");
+        s.append(20, &[(Stream::Command("new".into()), outcome("new"))])
+            .expect("append");
+        s.append(20, &[(Stream::Terminal(1), command("t"))])
+            .expect("append");
+
+        s.prune(15).expect("prune");
+        assert_eq!(s.replay().expect("replay").len(), 2);
+        assert_eq!(s.applied("old").expect("lookup"), None);
+        assert!(s.applied("new").expect("lookup").is_some());
+
+        s.append(30, &[(Stream::Terminal(1), command("u"))])
+            .expect("append");
+        let sequences: Vec<u64> = s
+            .stream(&Stream::Terminal(1))
+            .expect("stream")
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
     }
 }

@@ -80,6 +80,15 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
             understood: SCHEMA_VERSION,
         });
     }
+    // Written only when it changes: every open writing it made a read-only `qoro ls` a
+    // writer, racing the daemon's own writes for the lock.
+    if found >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    // One transaction for the ALTERs and the stamp, which SQLite makes atomic for DDL too.
+    // Separate, a kill between two of them left a version 1 database with one column added,
+    // and every later open failed on the duplicate column.
+    let tx = conn.unchecked_transaction()?;
     // A fresh database has every column already, because the CREATE statements above are
     // the current shape. Only a database that predates a column needs the ALTER.
     if found != 0 && found < 2 {
@@ -87,14 +96,11 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
             "ALTER TABLE terminal ADD COLUMN agent TEXT",
             "ALTER TABLE terminal ADD COLUMN agent_session TEXT",
         ] {
-            conn.execute(statement, [])?;
+            tx.execute(statement, [])?;
         }
     }
-    // Written only when it changes: every open writing it made a read-only `qoro ls` a
-    // writer, racing the daemon's own writes for the lock.
-    if found < SCHEMA_VERSION {
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -564,6 +570,49 @@ mod tests {
         // And it is a version 2 database afterwards, so the next open does no work.
         drop(store);
         Store::open(&path).expect("reopen");
+    }
+
+    /// A migration that fails halfway leaves nothing behind: the ALTERs and the version
+    /// stamp are one transaction, so a kill between two of them cannot leave a version 1
+    /// database with one new column that every later open trips over.
+    #[test]
+    fn a_migration_that_fails_halfway_changes_nothing() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("half.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            // A version 1 terminal table that already has the second column, so the second
+            // ALTER fails after the first one ran.
+            conn.execute_batch(
+                "CREATE TABLE terminal (
+                     id INTEGER PRIMARY KEY,
+                     workspace INTEGER NOT NULL,
+                     title TEXT,
+                     cwd TEXT NOT NULL,
+                     argv TEXT NOT NULL,
+                     agent_session TEXT,
+                     created_at INTEGER NOT NULL,
+                     closed_at INTEGER
+                 );",
+            )
+            .expect("write the schema");
+            conn.pragma_update(None, "user_version", 1i64)
+                .expect("stamp");
+        }
+        assert!(Store::open(&path).is_err(), "the second ALTER must fail");
+
+        let conn = Connection::open(&path).expect("reopen");
+        let has_agent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('terminal') WHERE name = 'agent'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("columns");
+        assert_eq!(
+            has_agent, 0,
+            "the first ALTER outlived the failed migration"
+        );
     }
 
     #[test]

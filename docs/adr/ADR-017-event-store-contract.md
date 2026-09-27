@@ -42,9 +42,11 @@ Three kinds, and the kind decides the durability rule:
 - **Observation**, something we noticed. Lossy under pressure, and the loss is recorded as
   a gap (ADR-005 rule 3).
 
-Terminal output is not an event. It is history, it has its own segmented store, and the log
-records only that a terminal produced output between two points, which is what a projection
-needs to know that it should go and read the history.
+Terminal output is not an event, not even its range. It is history, it has its own
+segmented store, and the history records how far output has reached; a range per parse slice
+grew the log with how chatty a build was. Observations are written in one batch a second,
+and the log keeps 30 days: long enough for forensics on a reap or a crash, and the
+idempotency ledger only has to outlive a client's retry.
 
 ### Every event carries what it was derived from
 

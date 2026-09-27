@@ -365,6 +365,15 @@ impl AgentRegistry {
         self.masters.lock().unwrap().insert(stream, master);
     }
 
+    /// Forget a terminal's master before its descriptor closes.
+    ///
+    /// Left until the terminal was forgotten, the number outlived the descriptor: a new
+    /// terminal opened meanwhile can be handed the same number, and a foreground re-read
+    /// through the stale entry read that other terminal's group and recorded its leader here.
+    pub fn detach_master(&self, stream: u32) {
+        self.masters.lock().unwrap().remove(&stream);
+    }
+
     /// Re-read a terminal's foreground group and apply any change.
     ///
     /// Called after a process event rather than on a timer. A shell forks, then moves the

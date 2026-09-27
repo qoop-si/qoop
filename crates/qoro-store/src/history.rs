@@ -30,6 +30,11 @@ pub const INDEX_EVERY: u64 = 256;
 /// everything and a retention policy has something to delete.
 pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The most segment bytes a terminal keeps. Past it the oldest segments are removed when
+/// a new one is opened, so a runaway log cannot fill a disk. Enough for the attach figure
+/// the README quotes, about 170 MB of rows.
+pub const MAX_HISTORY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// A row longer than this is truncated on the way in, with the truncation recorded.
 ///
 /// A terminal row is bounded by its width, so this is far above any real one. It exists
@@ -43,6 +48,8 @@ pub struct History {
     /// Ordinal of the next row to be written. Never resets, so a row's ordinal is stable
     /// for the life of the terminal.
     next_ordinal: u64,
+    /// `MAX_HISTORY_BYTES`, a field so a test can reach it with small segments.
+    max_bytes: u64,
 }
 
 struct Segment {
@@ -76,6 +83,7 @@ impl History {
             dir: dir.to_path_buf(),
             segment: None,
             next_ordinal,
+            max_bytes: MAX_HISTORY_BYTES,
         })
     }
 
@@ -166,27 +174,46 @@ impl History {
             bytes,
             rows: 0,
         });
+        self.trim(first)
+    }
+
+    /// Remove the oldest segments while the kept ones are over the cap, never the one
+    /// being written. Run on a roll, so a live tab can pass the cap by one segment.
+    fn trim(&self, current: u64) -> Result<(), StoreError> {
+        let mut kept: Vec<(u64, PathBuf, u64)> = segments(&self.dir)?
+            .into_iter()
+            .map(|(o, p)| {
+                let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+                (o, p, size)
+            })
+            .collect();
+        let mut total: u64 = kept.iter().map(|(_, _, size)| size).sum();
+        kept.reverse();
+        while total > self.max_bytes
+            && let Some((ordinal, path, size)) = kept.pop()
+            && ordinal != current
+        {
+            // An old segment that will not go stops the trim, not the append: the rows
+            // being written matter more than the cap, which the next roll tries again.
+            if std::fs::remove_file(&path).is_err() {
+                break;
+            }
+            let _ = std::fs::remove_file(path.with_extension("idx"));
+            total -= size;
+        }
         Ok(())
     }
 
-    /// Read up to `count` rows starting at `from`.
+    /// Read up to `count` rows starting at `from`, or at the oldest row still kept when
+    /// `from` is older than that ([`first_ordinal`](Self::first_ordinal)).
     ///
     /// The seek is what makes attaching to a large history cheap: the segment is chosen by
     /// name, the starting offset comes from the index, and only the rows between the last
     /// index entry and `from` are scanned.
     pub fn read(&self, from: u64, count: usize) -> Result<Vec<String>, StoreError> {
-        let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.dir)
-            .map_err(io)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("seg"))
-            .filter_map(|p| segment_ordinal(&p).map(|o| (o, p)))
-            .collect();
-        segments.sort_by_key(|(o, _)| *o);
-
         let mut out = Vec::new();
         let mut wanted = from;
-        for (first, path) in segments {
+        for (first, path) in segments(&self.dir)? {
             if out.len() >= count {
                 break;
             }
@@ -194,6 +221,9 @@ impl History {
             if wanted >= first + rows_here {
                 continue;
             }
+            // Rows below this segment were trimmed away: the read starts here, and counts
+            // from here, or every later segment would be read from the wrong row.
+            wanted = wanted.max(first);
             let skip_to = wanted.saturating_sub(first);
             let index_entry = skip_to / INDEX_EVERY;
             let mut offset = 0u64;
@@ -230,6 +260,14 @@ impl History {
 
     pub fn is_empty(&self) -> bool {
         self.next_ordinal == 0
+    }
+
+    /// The ordinal of the oldest row still on disk, 0 when there is none.
+    ///
+    /// Not always 0: the oldest segments are removed past the cap, and a reader asking for
+    /// rows below this gets them from here rather than from where it asked.
+    pub fn first_ordinal(&self) -> Result<u64, StoreError> {
+        Ok(segments(&self.dir)?.first().map_or(0, |(o, _)| *o))
     }
 
     /// The segment currently being written, for diagnostics.
@@ -273,11 +311,16 @@ fn read_row(file: &mut BufReader<File>) -> Result<Option<String>, StoreError> {
 /// against a five second deadline.
 ///
 /// A missing or empty index gives the old behaviour rather than a wrong answer, and so does
-/// an index written ahead of the data a crash lost: the scan starts from the last offset
-/// the index knows and counts whatever is actually there.
+/// an index written ahead of the data a crash lost. The two writers flush on their own
+/// schedules, so the last entry can point past the end of the data on disk; that entry is
+/// not trusted and the segment is scanned from the start, which only happens after a crash.
 fn count_rows(path: &Path) -> Result<u64, StoreError> {
-    let (covered, offset) = index_tail(&path.with_extension("idx"));
-    let mut file = BufReader::new(File::open(path).map_err(io)?);
+    let (mut covered, mut offset) = index_tail(&path.with_extension("idx"));
+    let file = File::open(path).map_err(io)?;
+    if offset > file.metadata().map_err(io)?.len() {
+        (covered, offset) = (0, 0);
+    }
+    let mut file = BufReader::new(file);
     if offset > 0 {
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
     }
@@ -310,6 +353,19 @@ fn index_tail(idx: &Path) -> (u64, u64) {
     // Entry `i` is the offset of row `i * INDEX_EVERY`, so the last entry has that many
     // rows before it.
     ((entries - 1) * INDEX_EVERY, u64::from_le_bytes(buf))
+}
+
+/// Every segment in a directory, oldest first.
+fn segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, StoreError> {
+    let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+        .map_err(io)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("seg"))
+        .filter_map(|p| segment_ordinal(&p).map(|o| (o, p)))
+        .collect();
+    segments.sort_by_key(|(o, _)| *o);
+    Ok(segments)
 }
 
 fn segment_ordinal(path: &Path) -> Option<u64> {
@@ -437,5 +493,63 @@ mod tests {
         // crash between the two writes leaves behind.
         std::fs::remove_file(segment.with_extension("idx")).expect("remove the index");
         assert_eq!(count_rows(&segment).expect("count"), rows.len() as u64);
+    }
+
+    /// A crash can leave the index ahead of the data: the two writers flush on their own
+    /// schedules, so the last index entry can point past the end of the segment on disk.
+    /// The count is what the data holds, not what the index promised.
+    #[test]
+    fn an_index_ahead_of_the_data_counts_only_the_rows_that_exist() {
+        let dir = tempfile::tempdir().expect("a directory");
+        {
+            let mut h = History::open(dir.path()).expect("open");
+            h.append(&rows(600, "r")).expect("append");
+            h.flush().expect("flush");
+        }
+        let segment = dir.path().join("000000000000.seg");
+        // The byte offset of row 300, walked from the rows' own length prefixes.
+        let data = std::fs::read(&segment).expect("read");
+        let mut offset = 0usize;
+        for _ in 0..300 {
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4 + len as usize;
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .expect("open the segment")
+            .set_len(offset as u64)
+            .expect("truncate");
+
+        let h = History::open(dir.path()).expect("reopen");
+        assert_eq!(h.len(), 300, "rows the data does not hold were counted");
+    }
+
+    /// A live tab keeps a bounded amount of history: the oldest segments go first, and a
+    /// read below what is kept starts at the first row that is.
+    #[test]
+    fn the_oldest_segments_are_removed_past_the_cap() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let row = "z".repeat(1000);
+        // A segment per open, which is what a daemon start makes. Each holds 100 rows of
+        // about 1 KiB, and the cap holds a little over three of them.
+        for _ in 0..6 {
+            let mut h = History::open(dir.path()).expect("open");
+            h.max_bytes = 350_000;
+            h.append(&vec![row.clone(); 100]).expect("append");
+            h.flush().expect("flush");
+        }
+        let segments = std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|e| e.to_str()) == Some("seg"))
+            .count();
+        assert!(segments <= 4, "{segments} segments kept past the cap");
+
+        let h = History::open(dir.path()).expect("reopen");
+        assert_eq!(h.len(), 600, "the ordinal must not move back");
+        let first = h.first_ordinal().expect("first");
+        assert!(first >= 200, "the oldest rows were kept: first is {first}");
+        assert_eq!(h.read(first, 1).expect("read").len(), 1);
     }
 }

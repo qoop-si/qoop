@@ -36,7 +36,8 @@ pub struct WorkspaceView {
     pub terminals: Vec<u32>,
     /// The last state believed of each terminal's agent, and where it came from.
     pub agent_state: BTreeMap<u32, AgentSummary>,
-    /// History ordinals a client has not read yet, per terminal.
+    /// History ordinals a client has not read yet, per terminal. Only a log written before
+    /// output stopped being logged (ADR-017) fills this; nothing writes `Output` now.
     pub output_to: BTreeMap<u32, u64>,
     /// Everything the log admits it lost.
     pub gaps: Vec<GapSummary>,

@@ -76,7 +76,9 @@ writing a file, or sending an outbound message. It explicitly does not mean deli
 keystroke to a child, which is irreversible but is never journalled, per rule 1. On restart, an intent with no outcome is reconciled rather than assumed:
 a spawn intent with no outcome causes the daemon to look for the process, a teardown
 intent with no outcome causes teardown to re-run from its idempotent step. The window is
-therefore never "did this happen", it is always "check and converge".
+therefore never "did this happen", it is always "check and converge". For `CreateTerminal` the
+store row is the reconciliation: the row is written before the spawn and closed when it
+fails, and restore reopens every open row.
 
 ## Consequences
 - A durable, replayable event log exists from milestone 4, which is a capability

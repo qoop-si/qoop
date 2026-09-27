@@ -83,7 +83,8 @@ pub enum Body {
         last_unix: i64,
         reason: String,
     },
-    /// A terminal produced output between two history ordinals. Not the output.
+    /// A terminal produced output between two history ordinals. Not the output. Read from
+    /// older logs only: nothing writes it since output stopped being logged (ADR-017).
     Output {
         terminal: u32,
         from_ordinal: u64,

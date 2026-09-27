@@ -51,18 +51,22 @@ impl StoreHandle {
         F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
     {
         let inner = self.inner.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        // On the store pool, not a raw blocking thread: a hung `qoro.db` then holds the
+        // pool's threads and no more, where every call used to add one blocked thread.
+        let work = crate::blocking::run_within(STORE_DEADLINE, move || {
+            // A panic under the lock leaves SQLite consistent (an unfinished transaction
+            // rolls back when its statement drops), so the lock is taken back rather than
+            // failing every later call for the rest of the daemon's life.
             let mut guard = inner
                 .lock()
-                .expect("the store lock is never poisoned in place");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             f(&mut guard)
         });
-        match tokio::time::timeout(STORE_DEADLINE, work).await {
-            Ok(Ok(result)) => Ok(result?),
-            // The blocking task itself panicked or was cancelled. Reported as a timeout
-            // rather than unwrapped, because taking the daemon down with it would turn one
-            // failed write into every terminal ending.
-            Ok(Err(_)) => Err(HandleError::Timeout),
+        match work.await {
+            Ok(result) => Ok(result?),
+            // Out of time, or the job itself panicked. Reported as a timeout rather than
+            // unwrapped, because taking the daemon down with it would turn one failed write
+            // into every terminal ending.
             Err(_) => Err(HandleError::Timeout),
         }
     }
@@ -184,6 +188,21 @@ mod tests {
         let open = handle.open_terminals(ws).await.expect("list");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, t);
+    }
+
+    /// One panic under the lock must not take the store away for the rest of the daemon's
+    /// life: the next call works, rather than timing out forever with a message about disks.
+    #[tokio::test]
+    async fn a_panic_under_the_lock_does_not_poison_the_store_for_good() {
+        let handle = StoreHandle::new(Store::in_memory().expect("open"));
+        let panicked = handle
+            .run(|_| -> Result<(), StoreError> { panic!("a bug under the lock") })
+            .await;
+        assert!(panicked.is_err());
+        handle
+            .create_workspace("w".into())
+            .await
+            .expect("the store works again after a panic");
     }
 
     #[tokio::test]

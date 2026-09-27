@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 use qoro_runtime::control::{ControlRequest, ControlResponse};
 use qoro_testkit::{PATIENCE, TestClient, TestDaemon};
 
+/// Held by the gate that fills the probe pool with stuck jobs, and by every gate here that
+/// creates a terminal in a directory, which needs a probe. The pool is one per process, so
+/// without this a create checked while G2.9 held all four threads was refused as busy.
+static PROBE_POOL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn terminal_of(response: &ControlResponse) -> u32 {
     match response {
         ControlResponse::TerminalCreated { terminal, .. } => *terminal,
@@ -239,6 +244,7 @@ async fn a_control_request_that_cannot_be_answered_is_refused_in_words() {
 /// way to find out.
 #[tokio::test]
 async fn a_created_terminal_starts_where_the_client_asked() {
+    let _pool = PROBE_POOL.lock().await;
     let d = TestDaemon::start().await;
     let mut c = d.attach("cwd").await;
 
@@ -276,6 +282,7 @@ async fn a_created_terminal_starts_where_the_client_asked() {
 
 #[tokio::test]
 async fn a_working_directory_that_cannot_be_used_is_refused_in_words() {
+    let _pool = PROBE_POOL.lock().await;
     let d = TestDaemon::start().await;
     let mut c = d.attach("bad-cwd").await;
 
@@ -320,6 +327,7 @@ async fn a_working_directory_that_cannot_be_used_is_refused_in_words() {
 /// survives is what a person asked for, which is the difference between metadata and state.
 #[tokio::test]
 async fn terminal_metadata_survives_a_restart() {
+    let _pool = PROBE_POOL.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(
         dir.path(),
@@ -354,7 +362,10 @@ async fn terminal_metadata_survives_a_restart() {
             )
             .await
             .expect("a response");
-        assert!(matches!(created, ControlResponse::TerminalCreated { .. }));
+        assert!(
+            matches!(created, ControlResponse::TerminalCreated { .. }),
+            "{created:?}"
+        );
         serving.abort();
     }
 
@@ -418,6 +429,90 @@ async fn g2_7_rows_that_scroll_off_reach_the_disk_in_order() {
             pair[1]
         );
     }
+}
+
+/// A tab closed for good takes its history with it.
+///
+/// Nothing deleted a history directory, so every tab ever opened stayed on disk, and a new
+/// tab handed an old number after a closed space's rows were removed showed the old tab's
+/// scrollback.
+#[tokio::test]
+async fn a_closed_terminal_takes_its_history_with_it() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("closer").await;
+    let terminal = d.terminals().streams()[0];
+    c.input_to(terminal, b"seq 1 3000\n").await;
+    assert!(
+        c.wait_for_text_on(terminal, "3000", PATIENCE).await,
+        "the shell never finished printing"
+    );
+    let dir = d.dir().join("history").join(terminal.to_string());
+    let deadline = Instant::now() + PATIENCE;
+    while !dir.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(dir.exists(), "the history never reached the disk");
+
+    c.control(
+        &ControlRequest::CloseTerminal {
+            id: "gone".into(),
+            terminal,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("a response");
+    let deadline = Instant::now() + PATIENCE;
+    while dir.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!dir.exists(), "a closed tab's history stayed on disk");
+}
+
+/// A start removes history no open row owns, before any new id is minted, and leaves an
+/// open row's history alone.
+#[tokio::test]
+async fn a_start_removes_history_that_no_open_terminal_owns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(
+        dir.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("chmod");
+    qoro_runtime::paths::ensure_private_dir(dir.path()).expect("private dir");
+
+    {
+        let mut store = qoro_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+        let space = store.create_workspace("w", 1).expect("workspace");
+        store
+            .create_terminal(5, space, &dir.path().display().to_string(), "/bin/sh", 1)
+            .expect("an open row");
+    }
+    let history = dir.path().join("history");
+    for name in ["5", "99", "notes"] {
+        std::fs::create_dir_all(history.join(name)).expect("mkdir");
+        std::fs::write(history.join(name).join("000000000000.seg"), b"").expect("write");
+    }
+
+    let daemon = {
+        let _binding = qoro_testkit::BINDING.lock().await;
+        qoro_runtime::Daemon::bind(dir.path(), std::path::Path::new("/bin/sh"))
+            .await
+            .expect("bind")
+    };
+    assert!(
+        !history.join("99").exists(),
+        "history with no open row survived a start"
+    );
+    assert!(
+        history.join("5").join("000000000000.seg").exists(),
+        "a restored tab lost its history"
+    );
+    assert!(
+        history.join("notes").exists(),
+        "something that is not a terminal's history was removed"
+    );
+    drop(daemon);
 }
 
 /// G2.7b: a burst larger than the spill ring still reaches the disk whole.
@@ -765,6 +860,7 @@ async fn g2_15_no_mouse_report_reaches_the_child_after_a_reattach() {
 #[tokio::test(flavor = "multi_thread")]
 async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
     use qoro_runtime::blocking;
+    let _pool = PROBE_POOL.lock().await;
 
     let d = TestDaemon::start().await;
     let mut c = d.attach("survivor").await;
@@ -779,6 +875,7 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
     // the three abandonments that mark a prefix degraded.
     assert!(blocking::PROBE_THREADS as u64 >= blocking::DEGRADE_AFTER);
     let before_abandoned = blocking::abandoned_count();
+    let stuck_until = Instant::now() + Duration::from_secs(6);
     for _ in 0..blocking::PROBE_THREADS {
         let prefix = prefix.clone();
         tokio::spawn(async move {
@@ -859,6 +956,9 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
         "the probes finished before the assertions, so the pool was not full"
     );
     blocking::clear_degraded(&prefix);
+    // Held until the stuck jobs have let their threads go, so the next gate that needs a
+    // probe finds the pool empty rather than full.
+    tokio::time::sleep_until(stuck_until.into()).await;
 }
 
 /// G2.13: a hundred terminals change foreground process at the same moment, and every one
@@ -1573,6 +1673,7 @@ async fn two_clients_hold_different_terminals_with_no_shared_focus() {
 /// the next start brought back a tab the client had been told was never made.
 #[tokio::test]
 async fn a_terminal_whose_spawn_failed_leaves_no_tab_and_no_row() {
+    let _pool = PROBE_POOL.lock().await;
     use std::os::unix::fs::PermissionsExt;
 
     let d = TestDaemon::start().await;

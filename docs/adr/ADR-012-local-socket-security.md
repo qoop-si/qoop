@@ -23,8 +23,9 @@ stale, unlink it and bind its own, leaving two daemons and one unreachable works
   directory, not a symlink, owned by our uid, with no group or other permission bits. If
   verification fails the daemon refuses to start. It never chmods someone else's
   directory into compliance.
-- The socket itself is created with a restrictive umask so it is never briefly world
-  writable between `bind` and `chmod`.
+- The socket itself is chmodded `0600` right after `bind`. In between it has default
+  permissions, and what protects it then is the verified `0700` directory around it. A
+  umask around `bind` would change it for every thread of the process at once.
 
 ### Test and debugging override
 

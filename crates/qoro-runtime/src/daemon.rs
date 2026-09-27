@@ -560,8 +560,9 @@ impl Daemon {
         let socket = paths::socket_path(dir);
         remove_stale_socket(&socket)?;
         let listener = UnixListener::bind(&socket)?;
-        // Restrict before anyone can connect. A umask race would otherwise leave a window
-        // in which the socket exists with default permissions.
+        // Restricted right after bind. Between the two the socket has default permissions,
+        // and what protects it then is the verified 0700 directory around it: nobody else
+        // can reach a path inside it. A umask around the bind would race every other thread.
         std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
@@ -599,6 +600,9 @@ impl Daemon {
         if restarting {
             let _ = events.note_restart_gap(last_seen).await;
         }
+        // The log keeps a window (ADR-017), trimmed once a start: it grows by what people
+        // and agents did, and without this it grew for as long as qoro was installed.
+        let _ = events.prune().await;
         let agents = Arc::new(crate::agents::AgentRegistry::new()?);
         let scanner = Arc::new(ContainmentScanner::default());
         // One pass before the first terminal exists, so a terminal created immediately has
@@ -794,6 +798,20 @@ impl Daemon {
                 scanning.wait_for_activity().await;
                 tokio::time::sleep(CONTAINMENT_SCAN_INTERVAL).await;
                 scanning.refresh().await;
+            }
+        });
+
+        // The observation writer (ADR-005 rule 3, ADR-017). Parked until something is
+        // observed, so an idle daemon still makes no wakeups, then one batch per window:
+        // observations are frequent and a write per observation would put the disk on the
+        // path of every state change. Nothing called `flush` before this, so every
+        // observation stayed in memory and the loss past the buffer was never written.
+        let observed = self.events.clone();
+        tokio::spawn(async move {
+            loop {
+                observed.wait_for_observations().await;
+                tokio::time::sleep(crate::eventlog::OBSERVATION_BATCH).await;
+                let _ = observed.flush().await;
             }
         });
 
@@ -2257,13 +2275,26 @@ async fn handle_control(
                         reason: format!("cwd {} is not absolute", path.display()),
                     };
                 }
-                Some(path) if !path.is_dir() => {
-                    return ControlResponse::Failed {
-                        id,
-                        reason: format!("cwd {} is not a directory", path.display()),
-                    };
-                }
-                Some(path) => Some(path),
+                // A path the client chose, so on the probe pool with a deadline (ADR-011):
+                // a hung mount answers in two seconds instead of holding a runtime thread.
+                // A busy pool is refused like any other failed check: it means probes
+                // are stuck, and a spawn into an unchecked path would do its `chdir` on
+                // this runtime thread, where a hung mount holds it for good.
+                Some(path) => match is_dir_probed(&path).await {
+                    Ok(true) => Some(path),
+                    Ok(false) => {
+                        return ControlResponse::Failed {
+                            id,
+                            reason: format!("cwd {} is not a directory", path.display()),
+                        };
+                    }
+                    Err(e) => {
+                        return ControlResponse::Failed {
+                            id,
+                            reason: format!("cwd {} could not be checked: {e}", path.display()),
+                        };
+                    }
+                },
             };
             // Recorded before it is started, and acknowledged only once the row is
             // durable (ADR-005 rule 2). A create acknowledged before the write is a create
@@ -2472,28 +2503,31 @@ async fn handle_control(
             // Capped, because the count comes from a client and a client that asks for a
             // hundred million rows would be asking the daemon to allocate them.
             let rows = rows.min(MAX_SCROLLBACK_ROWS);
-            // On the blocking pool with a deadline, like every other read of a disk
-            // (ADR-011): a hung filesystem under the history must not hang the daemon.
-            let read = tokio::time::timeout(
-                crate::store::STORE_DEADLINE,
-                tokio::task::spawn_blocking(move || {
-                    let history = qoro_store::History::open(&dir)?;
-                    let total = history.len();
-                    let from = total.saturating_sub(up as u64);
-                    let lines = history.read(from, rows)?;
-                    Ok::<_, qoro_store::StoreError>((total, from, lines))
-                }),
-            )
+            // On the store pool with a deadline, like every other read of a disk
+            // (ADR-011): a hung filesystem under the history must not hang the daemon, and
+            // a raw blocking thread per request is not a bound.
+            let read = crate::blocking::run_within(crate::store::STORE_DEADLINE, move || {
+                let history = qoro_store::History::open(&dir)?;
+                let total = history.len();
+                // Not below the oldest row still kept: past the cap the oldest segments
+                // are gone, and a read from below them answers from the first kept row
+                // while claiming to start where it was asked.
+                let from = total
+                    .saturating_sub(up as u64)
+                    .max(history.first_ordinal()?);
+                let lines = history.read(from, rows)?;
+                Ok::<_, qoro_store::StoreError>((total, from, lines))
+            })
             .await;
             match read {
-                Ok(Ok(Ok((total, from, lines)))) => ControlResponse::Scrollback {
+                Ok(Ok((total, from, lines))) => ControlResponse::Scrollback {
                     id,
                     terminal,
                     from,
                     total,
                     lines,
                 },
-                Ok(Ok(Err(e))) => ControlResponse::Failed {
+                Ok(Err(e)) => ControlResponse::Failed {
                     id,
                     reason: format!("the scrollback could not be read: {e}"),
                 },
@@ -2690,6 +2724,27 @@ async fn handle_control(
             }
         }
         ControlRequest::ListAgents { .. } => {
+            // Titles come out of the agents' own storage: a directory walk, a megabyte of
+            // transcript per Claude tab, a database for opencode, on a disk the user
+            // chose. All of them at once on the probe pool with a deadline (ADR-011),
+            // rather than on this runtime thread during the call a sidebar polls. Not
+            // counted against a prefix, because no one path is being asked about, and
+            // refused at once when the pool is full rather than queued behind stuck
+            // probes. A title not read in time is absent, and the panel shows the short id.
+            let sessions: Vec<(u32, Option<String>)> = terminals
+                .streams()
+                .into_iter()
+                .map(|t| (t, terminals.session_of(t)))
+                .collect();
+            let titles: BTreeMap<u32, String> =
+                crate::blocking::try_probe(PROBE_DEADLINE, move || {
+                    sessions
+                        .into_iter()
+                        .filter_map(|(t, s)| Some((t, agent_title(s.as_deref())?)))
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
             // Read from the registry rather than by walking the process table here: the
             // registry is what the process watcher and the observation precedence in
             // ADR-008 already maintain, and a second reader would be a second answer.
@@ -2719,10 +2774,8 @@ async fn handle_control(
                         .map(|a| state_name(a.belief.state))
                         .unwrap_or("unknown")
                         .to_string();
-                    // The session id is read once: the title resolves from the
-                    // same id, so one lookup serves both fields.
                     let agent_session = terminals.session_of(terminal);
-                    let agent_title = agent_title(agent_session.as_deref());
+                    let agent_title = titles.get(&terminal).cloned();
                     // The explanation rides the row: what holds the belief,
                     // and what the screen last matched. A client that does
                     // not know these fields ignores them; `qoro agents
@@ -3571,8 +3624,9 @@ pub fn open_terminal(
     terminals.insert(stream, handle.clone());
     let registry = terminals.clone();
     let spill = crate::spill::SpillRing::new();
-    if let Some(dir) = history_dir {
-        spawn_history_writer(dir.join(stream.to_string()), spill.clone(), behind.clone());
+    let history = history_dir.map(|dir| dir.join(stream.to_string()));
+    if let Some(dir) = &history {
+        spawn_history_writer(dir.clone(), spill.clone(), behind.clone());
     }
     let forgetting = agents.clone();
     let unregister = agents.clone();
@@ -3620,6 +3674,9 @@ pub fn open_terminal(
                 }
             });
             registry.remove(stream);
+            // A slept tab keeps its history like it keeps its row in the index, for the rest
+            // of this daemon's life; the next start, which has no tombs, removes it.
+            let for_good = tomb.is_none();
             match tomb {
                 Some(tomb) => forgetting.entomb(stream, tomb),
                 None => forgetting.forget(stream),
@@ -3631,7 +3688,17 @@ pub fn open_terminal(
                 && !books.stopping.load(std::sync::atomic::Ordering::SeqCst)
             {
                 tokio::spawn(async move {
-                    let _ = books.store.close_terminal(stream as i64).await;
+                    let closed = books.store.close_terminal(stream as i64).await;
+                    // History lives as long as the tab can come back, and a closed row
+                    // never does. Only after the close landed: a row still open is
+                    // restored with its history. The writer may still be on its last
+                    // flush; it writes to unlinked files, which is harmless.
+                    if closed.is_ok()
+                        && for_good
+                        && let Some(dir) = history
+                    {
+                        let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
+                    }
                 });
             }
         },
@@ -3939,21 +4006,33 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
         return report;
     };
     report.spaces = spaces.len();
+    // Every open row, for the history sweep below, and whether every list was read: a
+    // failed read must never make an open row look like it has no history to keep.
+    let mut open = std::collections::BTreeSet::new();
+    let mut read_all = true;
     for space in spaces {
         let Ok(rows) = into.books.store.open_terminals(space.id).await else {
+            read_all = false;
             continue;
         };
         for row in rows {
             report.terminals += 1;
             let stream = row.id as u32;
+            open.insert(stream);
             // The registry has to keep minting above what came back, or the next new
             // terminal takes the number of one already on screen.
             into.terminals.mint_above(stream);
             let cwd = PathBuf::from(&row.cwd);
             // A directory that is gone is not a reason to lose the tab. The shell starts
             // where the daemon is instead, which is visible and recoverable, unlike a tab
-            // that silently did not come back.
-            let cwd = cwd.is_dir().then_some(cwd);
+            // that silently did not come back. Probed with a deadline, because this runs
+            // before the socket is served and a hung mount held the whole start. A busy
+            // pool counts as unchecked, and an unchecked path is not spawned into: its
+            // `chdir` would run on this thread. The row keeps its directory either way.
+            let cwd = match is_dir_probed(&cwd).await {
+                Ok(true) => Some(cwd),
+                _ => None,
+            };
             let opened = open_terminal(
                 &into.terminals,
                 stream,
@@ -4022,7 +4101,33 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
             }
         }
     }
+    // History no open row owns: tabs closed before history was deleted with them, tabs
+    // slept in the last run, crash leftovers. Before any new id is minted, so a new tab
+    // handed a number whose row a closed space removed does not open the old history.
+    if read_all && let Some(dir) = into.history_dir.clone() {
+        let _ = crate::blocking::run(move || sweep_history(&dir, &open)).await;
+    }
     report
+}
+
+/// Remove every terminal's history directory under `dir` whose id is not in `open`.
+///
+/// Only numbered entries: anything else in the directory is not a terminal's history and
+/// is not this sweep's to remove.
+fn sweep_history(dir: &Path, open: &std::collections::BTreeSet<u32>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let orphan = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_some_and(|id| !open.contains(&id));
+        if orphan {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// One command line, quoted so a shell runs the argv that was meant.
@@ -4093,6 +4198,20 @@ pub const SEARCH_BYTES: u64 = 64 * 1024 * 1024;
 /// listing are a rounding error, small enough that a step overshoots its budget by little.
 const SEARCH_CHUNK: u64 = 16_384;
 
+/// How long a check of a directory the user chose may take before it is abandoned.
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a path the user chose is a directory, asked on the probe pool (ADR-011).
+///
+/// Keyed by the full path, so a mount that hangs degrades only itself and what is below it.
+async fn is_dir_probed(path: &Path) -> Result<bool, crate::blocking::BlockingError> {
+    let owned = path.to_path_buf();
+    crate::blocking::probe(&path.display().to_string(), PROBE_DEADLINE, move || {
+        owned.is_dir()
+    })
+    .await
+}
+
 /// Where a terminal's history lives, or why it cannot be read.
 ///
 /// A terminal that does not exist is a refusal, not an empty answer. Opening a history
@@ -4131,31 +4250,28 @@ async fn search_scrollback(
             reason: "there is nothing to search for".to_string(),
         };
     }
-    let scan = tokio::time::timeout(
-        crate::store::STORE_DEADLINE,
-        tokio::task::spawn_blocking(move || {
-            let history = qoro_store::History::open(&dir)?;
-            scan_history(
-                &history,
-                &query,
-                from,
-                backward,
-                SEARCH_STEP,
-                SEARCH_BYTES,
-                stop,
-            )
-        }),
-    )
+    let scan = crate::blocking::run_within(crate::store::STORE_DEADLINE, move || {
+        let history = qoro_store::History::open(&dir)?;
+        scan_history(
+            &history,
+            &query,
+            from,
+            backward,
+            SEARCH_STEP,
+            SEARCH_BYTES,
+            stop,
+        )
+    })
     .await;
     match scan {
-        Ok(Ok(Ok((found, resume)))) => ControlResponse::ScrollbackMatch {
+        Ok(Ok((found, resume))) => ControlResponse::ScrollbackMatch {
             id,
             terminal,
             row: found.map(|(row, _)| row),
             col: found.map_or(0, |(_, cell)| cell),
             resume,
         },
-        Ok(Ok(Err(e))) => ControlResponse::Failed {
+        Ok(Err(e)) => ControlResponse::Failed {
             id,
             reason: format!("the scrollback could not be searched: {e}"),
         },
@@ -4189,11 +4305,18 @@ pub(crate) fn scan_history(
     }
     let started = std::time::Instant::now();
     let mut read = 0u64;
+    // Nothing below the oldest row still kept: past the cap the oldest segments are gone,
+    // and a chunk that started below them would be read from the first kept row while
+    // being labelled from where it was asked.
+    let first = history.first_ordinal()?;
+    if total <= first {
+        return Ok((None, None));
+    }
     // The next row to look at.
-    let mut at = from.min(total - 1);
+    let mut at = from.min(total - 1).max(first);
     loop {
         let start = if backward {
-            (at + 1).saturating_sub(SEARCH_CHUNK)
+            (at + 1).saturating_sub(SEARCH_CHUNK).max(first)
         } else {
             at
         };
@@ -4214,7 +4337,7 @@ pub(crate) fn scan_history(
             }
         }
         if backward {
-            let Some(next) = start.checked_sub(1) else {
+            let Some(next) = start.checked_sub(1).filter(|next| *next >= first) else {
                 return Ok((None, None));
             };
             at = next;
@@ -4600,6 +4723,10 @@ fn spawn_terminal(
             started_in,
         ))
         .await;
+        // Again for a panic, whose unwinding closed the descriptor without the line at the
+        // end of the task: the fallback teardown below takes seconds, and the reaper and
+        // the foreground re-read would read a number that may be another terminal's.
+        agents.detach_master(stream);
         match classify_task_end(outcome) {
             TaskEnd::Clean => {}
             TaskEnd::Ended { error } => {
@@ -4761,7 +4888,8 @@ async fn fallback_teardown(
         let child_gone = child
             .zip(child_start)
             .is_none_or(|(pid, start)| !qoro_pty::sys::still_alive(pid, start));
-        let groups = set.groups_to_signal(round, &qoro_pty::sys::still_alive);
+        let groups =
+            set.groups_to_signal(round, &qoro_pty::sys::still_alive, &qoro_pty::sys::in_group);
         if groups.is_empty() && child_gone {
             break;
         }
@@ -4774,7 +4902,7 @@ async fn fallback_teardown(
     reap_child(child_pid).await;
     set.prune(&qoro_pty::sys::still_alive);
     if !set
-        .groups_to_signal(round, &qoro_pty::sys::still_alive)
+        .groups_to_signal(round, &qoro_pty::sys::still_alive, &qoro_pty::sys::in_group)
         .is_empty()
     {
         eprintln!("qorod: fallback teardown for pid {child_pid} left processes behind");
@@ -5074,8 +5202,6 @@ async fn terminal_task(
     // are constructed with above, and updated on every applied resize, so
     // the equal-size decision never reads a converted snapshot.
     let mut current_size = INITIAL_SIZE;
-    // How far this terminal's history has reached, so the log can say where to read from.
-    let mut history_to = 0u64;
     let trace = trace_latency();
 
     // The loop is a closure whose result is captured, so that teardown runs however it
@@ -5352,20 +5478,10 @@ async fn terminal_task(
                                 effects.append(&mut fx);
                                 let scrolled = engine.take_scrolled_off();
                                 if !scrolled.is_empty() {
-                                    // The log records that output happened and how far the
-                                    // history now reaches, never the output itself: a log
-                                    // holding megabytes a second of terminal text would be
-                                    // mostly noise and would take as long to replay as the
-                                    // session took to happen (ADR-017).
-                                    history_to += scrolled.len() as u64;
-                                    events.observe(
-                                        qoro_events::Stream::Terminal(stream),
-                                        qoro_events::Body::Output {
-                                            terminal: stream,
-                                            from_ordinal: history_to - scrolled.len() as u64,
-                                            to_ordinal: history_to,
-                                        },
-                                    );
+                                    // No log entry for output, not even its range: one per
+                                    // slice grew the log with how chatty a build was, which
+                                    // ADR-017 rules out, and cost a lock on the busiest path
+                                    // here. The history records where output reached.
                                     // Handed over by value, never written from here. This
                                     // is the read loop, and the read loop never waits on
                                     // storage: an exiting child cannot complete until its
@@ -5677,6 +5793,9 @@ async fn terminal_task(
         &scanner,
     )
     .await;
+    // While `afd` still holds the descriptor: returning closes it, and the number must not
+    // be readable through the registry once another terminal can be handed it.
+    agents.detach_master(stream);
     outcome
 }
 
@@ -5879,6 +5998,7 @@ async fn tear_down(
             reaped,
             containment,
             &qoro_pty::sys::still_alive,
+            &qoro_pty::sys::in_group,
         );
         match step {
             Step::CloseMaster => break,

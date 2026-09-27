@@ -50,10 +50,17 @@ async fn g4_1_a_projection_replays_byte_for_byte_twice() {
     );
     events.flush().await.expect("flush");
 
-    let first = events.workspace_view().await.expect("project");
+    // One read of the log, replayed twice. The daemon keeps writing its own observations
+    // once a second, so two reads of the live log would differ for a reason that is not
+    // the projection.
+    let log = qoro_events::EventStore::open(&d.dir().join("events.db"))
+        .expect("open the log")
+        .replay()
+        .expect("replay");
+    let first = <WorkspaceView as qoro_events::Projection>::rebuild(&log);
     // Long enough that anything reading the wall clock produces a different answer.
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    let second = events.workspace_view().await.expect("project");
+    let second = <WorkspaceView as qoro_events::Projection>::rebuild(&log);
 
     assert_eq!(
         serde_json::to_string(&first).expect("encode"),
@@ -275,6 +282,56 @@ async fn g4_2_observations_are_lossy_and_the_loss_is_recorded() {
         recorded, over as u64,
         "the gap does not account for what was dropped"
     );
+}
+
+/// An observation the daemon records reaches the log on its own, within the batch window.
+///
+/// Nothing but a test ever called `flush`, so every observation was held until the buffer
+/// filled and everything after it only bumped a counter that was never written either.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observation_reaches_the_log_without_anyone_flushing() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut c = d.attach("hook").await;
+    c.control(
+        &ControlRequest::ReportAgentState {
+            id: "flushed".into(),
+            terminal,
+            token,
+            state: "blocked".into(),
+            visible_blocker: true,
+            visible_idle: false,
+            visible_working: false,
+            clock: 0,
+            session: None,
+            event: None,
+            label: None,
+        },
+        PATIENCE,
+    )
+    .await
+    .expect("an answer");
+
+    let events = d.events();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = false;
+    while Instant::now() < deadline && !seen {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        seen = events
+            .workspace_view()
+            .await
+            .expect("project")
+            .agent_state
+            .contains_key(&terminal);
+    }
+    assert!(seen, "the hook's observation never reached the log");
 }
 
 /// G8.3: cleanup with a process holding a file inside the tree.

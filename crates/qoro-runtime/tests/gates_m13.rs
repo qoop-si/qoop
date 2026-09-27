@@ -14,6 +14,12 @@ use std::time::{Duration, Instant};
 use qoro_runtime::paths;
 use qoro_runtime::{Daemon, control::ControlRequest};
 
+/// Held for the whole of every test that installs an agent override.
+///
+/// The override table is process wide, and a reload sets it to what one directory holds:
+/// another test's reload, or its clean-up, drops this test's override mid-run.
+static OVERRIDES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A private directory a daemon will accept, kept alive by the returned handle.
 fn runtime_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a directory");
@@ -172,6 +178,7 @@ async fn g13_4_a_closed_tab_number_is_not_minted_again_after_a_restart() {
 /// somebody for it.
 #[tokio::test]
 async fn g13_5_an_agent_is_continued_and_a_saved_command_is_never_re_run() {
+    let _overrides = OVERRIDES.lock().await;
     let dir = runtime_dir();
     let evidence = tempfile::tempdir().expect("a directory");
     // A path with a space in it, because the argv is typed into a shell and an unquoted
@@ -289,11 +296,11 @@ async fn g13_3_a_stop_ends_the_terminals_without_ending_the_session() {
 /// plain, and moved directory. A single count would call all of these "3 panes".
 #[tokio::test]
 async fn a_restart_reports_resumed_agents_shell_fallbacks_and_moved_directories() {
+    let _overrides = OVERRIDES.lock().await;
     let dir = runtime_dir();
 
-    // A manifest id no other test uses. The override table is process wide and a
-    // missing-directory reload does not clear it, so sharing `claude` with g13_5
-    // would let the two tests swap each other's resume command mid-run.
+    // A manifest id no other test uses, so a leftover from another test cannot be
+    // mistaken for this one's.
     let overrides = tempfile::tempdir().expect("a directory");
     std::fs::write(
         overrides.path().join("restore-probe-xyz.toml"),
@@ -867,6 +874,7 @@ async fn a_rename_is_recorded_before_the_answer_and_a_cleared_name_forgets() {
 /// is newest. With an id per tab the restore asks each agent for its own.
 #[tokio::test]
 async fn two_tabs_in_one_directory_resume_distinct_conversations() {
+    let _overrides = OVERRIDES.lock().await;
     let dir = runtime_dir();
     let evidence = tempfile::tempdir().expect("a directory");
 

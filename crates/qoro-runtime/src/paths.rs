@@ -5,7 +5,7 @@
 //! security contract; these checks are.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Overrides the runtime directory: the place every session of this user lives under. It
@@ -82,23 +82,30 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
 /// The person's own qoro configuration directory: `$XDG_CONFIG_HOME/qoro`, else
 /// `~/.config/qoro`.
 ///
-/// One resolver, because the hooks, the agent-detection overrides, the avatar and the
-/// interface's own settings all live here, and three copies of this lookup had already
-/// been written by the time a fourth was needed. Not verified like the runtime directory:
-/// this is the person's own configuration, with the same trust as their shell rc, and a
-/// missing directory simply means nothing has been configured.
+/// One resolver, because the hooks, the agent-detection overrides, the avatar, the saved
+/// remotes and the interface's own settings all live here, and three copies of this lookup
+/// had already been written by the time a fourth was needed. Not verified like the runtime
+/// directory: this is the person's own configuration, with the same trust as their shell
+/// rc, and a missing directory simply means nothing has been configured.
+///
+/// The XDG spec's rule, which the hand-copied lookups skipped: an empty or relative
+/// `XDG_CONFIG_HOME` is ignored. Taken as is, a relative one put the hook scripts under
+/// whatever directory `qoro hooks install` ran in, and registered a relative command that
+/// broke from every other directory.
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .ok()
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("qoro")
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// The same answer from given values, so a test never sets the process environment.
+fn config_dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("qoro")
 }
 
 pub fn socket_path(dir: &Path) -> PathBuf {
@@ -287,11 +294,15 @@ pub fn current_uid() -> u32 {
 
 /// Create the directory if absent, then verify it. Verification happens after creation
 /// either way, because the interesting case is the directory someone else created first.
+///
+/// Created 0700 in the one call, never chmodded afterwards: a chmod follows a symlink, and
+/// one planted between an existence check and the create had its target's mode changed
+/// before verification refused the link.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PathError> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     verify_private_dir(dir)
 }
 
@@ -333,6 +344,25 @@ mod tests {
     /// between another's `set_var` and its read failed it at random.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The XDG spec: an empty or relative XDG_CONFIG_HOME is ignored, because a relative
+    /// one would put a person's configuration under whatever directory a command ran in.
+    #[test]
+    fn an_empty_or_relative_config_home_falls_back_to_home() {
+        let home = Some(std::ffi::OsString::from("/Users/a"));
+        let fallback = PathBuf::from("/Users/a/.config/qoro");
+        assert_eq!(config_dir_from(Some("".into()), home.clone()), fallback);
+        assert_eq!(config_dir_from(Some("cfg".into()), home.clone()), fallback);
+        assert_eq!(config_dir_from(None, home.clone()), fallback);
+        assert_eq!(
+            config_dir_from(Some("/x/cfg".into()), home),
+            PathBuf::from("/x/cfg/qoro")
+        );
+        assert_eq!(
+            config_dir_from(None, None),
+            std::env::temp_dir().join("qoro")
+        );
+    }
+
     #[test]
     fn a_fresh_directory_is_created_private() {
         let base = tempfile::tempdir().unwrap();
@@ -340,6 +370,24 @@ mod tests {
         ensure_private_dir(&dir).expect("must accept a directory it created");
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    /// A symlink where the directory should be is refused, and nothing is done through it:
+    /// its target keeps the mode it had.
+    #[test]
+    fn a_symlink_in_place_of_the_directory_is_refused_and_its_target_left_alone() {
+        let base = tempfile::tempdir().unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let planted = base.path().join("rt");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(matches!(
+            ensure_private_dir(&planted).unwrap_err(),
+            PathError::IsSymlink(_)
+        ));
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link's target was changed");
     }
 
     #[test]
