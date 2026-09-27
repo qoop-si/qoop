@@ -1516,3 +1516,54 @@ async fn two_clients_hold_different_terminals_with_no_shared_focus() {
         "the shared index is missing a terminal: {from_a:?}"
     );
 }
+
+/// A terminal whose shell never started is not a terminal.
+///
+/// A directory that exists but cannot be entered passes the up-front check and fails the
+/// spawn. That used to leave the tab listed with nothing behind it, and its row open, so
+/// the next start brought back a tab the client had been told was never made.
+#[tokio::test]
+async fn a_terminal_whose_spawn_failed_leaves_no_tab_and_no_row() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("ghost").await;
+    let locked = tempfile::tempdir().expect("a directory");
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let before = d.terminals().streams();
+
+    let answer = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "ghost-1".into(),
+                cwd: Some(locked.path().display().to_string()),
+                workspace: None,
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod back");
+
+    assert!(
+        matches!(answer, ControlResponse::Failed { .. }),
+        "a shell that cannot enter its directory was reported started: {answer:?}"
+    );
+    assert_eq!(
+        d.terminals().streams(),
+        before,
+        "the failed tab is still listed"
+    );
+    let open = d
+        .store()
+        .open_terminals(d.workspace())
+        .await
+        .expect("the rows");
+    assert_eq!(
+        open.iter().map(|r| r.id as u32).collect::<Vec<_>>(),
+        before,
+        "the failed tab's row is still open, so the next start brings it back"
+    );
+}

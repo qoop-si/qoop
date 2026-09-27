@@ -145,6 +145,10 @@ impl StoreHandle {
         self.run(move |s| s.close_terminal(id, now())).await
     }
 
+    pub async fn max_terminal_id(&self) -> Result<i64, HandleError> {
+        self.run(|s| s.max_terminal_id()).await
+    }
+
     pub async fn open_terminals(&self, workspace: i64) -> Result<Vec<TerminalRow>, HandleError> {
         self.run(move |s| s.open_terminals(workspace)).await
     }

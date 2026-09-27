@@ -123,7 +123,19 @@ fn hello(client_id: &str) -> ClientHello {
 /// blank screen until something else happened to change. It passed every unit test and
 /// failed the first time a person ran it.
 pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, BytesMut)> {
-    handshake(UnixStream::connect(socket).await?, client_id).await
+    // Bounded: a daemon that accepts and never answers (wedged, or a stale socket held by
+    // something else) otherwise hangs every caller, a hook inside an agent's turn included.
+    // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
+    tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
+        handshake(UnixStream::connect(socket).await?, client_id).await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the daemon did not answer the handshake",
+        )
+    })?
 }
 
 /// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`
@@ -434,10 +446,9 @@ impl RenderStream {
                 self.received += 1;
                 all.push(snapshot);
             } else if serde_json::from_slice::<ImageWire>(&message.body).is_ok() {
-                // A picture on a snapshot-only reader: skipped, but counted. The
-                // acknowledgement reports channel traffic, and an uncounted message
-                // reads as a wedged reader to the daemon's deadline.
-                self.received += 1;
+                // A picture on a snapshot-only reader: skipped. Not counted either,
+                // because the daemon counts only screens as sent; a count here ran the
+                // acknowledgement ahead of what was sent and hid a reader that stopped.
             }
         }
         Ok(all)
@@ -562,9 +573,10 @@ impl Connection {
                         // An older daemon never sends this shape; a newer client reads
                         // it here, an older client fails the snapshot parse above and
                         // skips it. Hostile or truncated images decode to `None` and
-                        // are skipped the same way.
+                        // are skipped the same way. Not counted: the daemon counts only
+                        // screens as sent, and a count on one side alone is a deficit
+                        // an older client could never repay.
                         if let Some(mut image) = wire.decode() {
-                            self.renders.received += 1;
                             image.terminal = terminal;
                             out.push(Incoming::Image { terminal, image });
                         }

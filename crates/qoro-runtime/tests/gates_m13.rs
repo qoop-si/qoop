@@ -123,6 +123,41 @@ async fn g13_4_a_stopped_session_comes_back_with_its_tabs_their_names_and_their_
     assert_eq!(brought_back, 3);
 }
 
+/// G13.4: a tab closed before the stop keeps its number, so the next start does not reuse it.
+///
+/// The closed row stays in the store under its id. Minting above only the tabs that came
+/// back handed that id out again and the new tab's insert failed on it.
+#[tokio::test]
+async fn g13_4_a_closed_tab_number_is_not_minted_again_after_a_restart() {
+    let dir = runtime_dir();
+    let closed = with_daemon(dir.path(), |daemon| async move {
+        let terminals = daemon.terminals();
+        let store = daemon.store();
+        let closed = terminals.mint();
+        store
+            .create_terminal(
+                closed as i64,
+                daemon.workspace(),
+                "/tmp".into(),
+                "/bin/sh".into(),
+            )
+            .await
+            .expect("a row");
+        assert!(store.close_terminal(closed as i64).await.expect("close"));
+        closed
+    })
+    .await;
+
+    with_daemon(dir.path(), |daemon| async move {
+        let next = daemon.terminals().mint();
+        assert!(
+            next > closed,
+            "a new tab would take the number {next} of a closed one ({closed})"
+        );
+    })
+    .await;
+}
+
 /// G13.5: an agent comes back continued, and a command does not come back at all.
 ///
 /// The asymmetry is the whole rule. A conversation is worth carrying on; an effect is not

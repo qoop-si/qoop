@@ -90,7 +90,11 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
             conn.execute(statement, [])?;
         }
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    // Written only when it changes: every open writing it made a read-only `qoro ls` a
+    // writer, racing the daemon's own writes for the lock.
+    if found < SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(())
 }
 
@@ -107,6 +111,10 @@ impl Store {
     }
 
     fn prepare(conn: Connection) -> Result<Self, StoreError> {
+        // Wait for a lock the daemon holds rather than failing at once, before anything
+        // below can need one: a `qoro ls` landing on a daemon write printed "0 tabs".
+        // Five seconds, the runtime's own deadline for a store call.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL so a reader never blocks the writer, and `foreign_keys` because a layout row
         // pointing at a terminal that does not exist is not a state worth representing.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -256,6 +264,18 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// The highest terminal id ever written, open or closed, or 0 for none.
+    ///
+    /// What a restart mints above: a closed row keeps its id as the primary key, so
+    /// minting above the open rows alone hands out an id that already exists.
+    pub fn max_terminal_id(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM terminal", [], |r| {
+                r.get(0)
+            })?)
+    }
+
     /// The open terminals of a workspace, in layout order.
     pub fn open_terminals(&self, workspace: i64) -> Result<Vec<TerminalRow>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -382,6 +402,8 @@ mod tests {
         assert!(s.open_terminals(ws).unwrap().is_empty());
         // Closing twice is not a second close, which is what makes a retry safe.
         assert!(!s.close_terminal(a, 300).unwrap());
+        // And its id is still taken, which is what a restart has to mint above.
+        assert_eq!(s.max_terminal_id().unwrap(), a);
     }
 
     #[test]

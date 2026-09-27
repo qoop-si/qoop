@@ -311,9 +311,76 @@ pub fn scan_all_pids() -> Vec<i32> {
         .unwrap_or_default()
 }
 
-#[cfg(target_os = "macos")]
 pub fn enumerate_tty(dev: u64) -> Vec<Member> {
     enumerate_tty_reporting(dev).0
+}
+
+/// Every process in the session led by `sid`, plus how many of them could not be inspected.
+///
+/// The key teardown still has once the leader is dead: POSIX revokes the controlling
+/// terminal then, so a tty scan finds nothing, but `getsid` keeps answering with the dead
+/// leader's pid. A job started and orphaned inside one scan interval is only reachable
+/// this way. `getsid` answers for other users' processes too, so a member we cannot read
+/// (a `sudo` job) is counted rather than silently missed.
+///
+/// Sound only while the leader is unreaped: the kernel does not hand out a pid that is
+/// still a session id, and an unreaped leader holds its pid. After the reap the number
+/// can belong to a new session, so callers read this before the leader can be reaped.
+pub fn enumerate_session(sid: Pid) -> (Vec<Member>, usize) {
+    let mut out = Vec::new();
+    let mut opaque = 0usize;
+    for pid in scan_all_pids() {
+        // The leader is the caller's own child and reached through its handle; a zombie
+        // leader cannot be read and would count as opaque on every plain `exit`.
+        // SAFETY: getsid and getpgid only read the process table.
+        if pid == sid.0 || unsafe { libc::getsid(pid) } != sid.0 {
+            continue;
+        }
+        // Group and start time from one read, then the session asked again: a pid that
+        // died and came back as a stranger between the reads is not recorded as ours.
+        match group_and_start(Pid(pid)) {
+            // SAFETY: as above.
+            Some((pgid, start_time)) if unsafe { libc::getsid(pid) } == sid.0 => {
+                if pgid > 1 {
+                    out.push(Member {
+                        pid: Pid(pid),
+                        pgid: Pgid(pgid),
+                        start_time,
+                    });
+                }
+            }
+            Some(_) => {}
+            None => opaque += 1,
+        }
+    }
+    (out, opaque)
+}
+
+/// A process's group and start time, read together.
+#[cfg(target_os = "macos")]
+fn group_and_start(pid: Pid) -> Option<(i32, u64)> {
+    // SAFETY: zeroed proc_bsdinfo is a valid out-param.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: info is live and correctly sized.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid.0,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (rc == size).then_some((info.pbi_pgid as i32, info.pbi_start_tvsec))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn group_and_start(pid: Pid) -> Option<(i32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.0)).ok()?;
+    let after = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let f: Vec<&str> = after.split_whitespace().collect();
+    (f.len() > 19).then(|| (f[2].parse().unwrap_or(-1), f[19].parse().unwrap_or(0)))
 }
 
 /// The program a pid is running, as a path.
@@ -820,7 +887,7 @@ pub fn enumerate_tty_reporting(dev: u64) -> (Vec<Member>, usize) {
             }
         }
     }
-    out
+    (out, opaque)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1107,10 +1174,19 @@ mod real_agents {
             // failure would be asserting that the repl cannot exist.
             let base = executable.rsplit('/').next().unwrap_or(&executable);
             let is_runtime = matches!(base, "node" | "bun" | "deno") || base.starts_with("python");
+            // The value of an inline-code flag is code, not a script: `bun -e '...'` really
+            // is bun, and counting the code as a script failed this on any machine with a
+            // one-liner running.
+            let inline =
+                |a: &String| matches!(a.as_str(), "-e" | "--eval" | "-p" | "--print" | "-c");
             let has_script = argv
                 .iter()
                 .skip(1)
-                .any(|a| !a.starts_with('-') && !a.is_empty());
+                .scan(false, |after_inline, a| {
+                    let value_of_inline = std::mem::replace(after_inline, inline(a));
+                    Some(!value_of_inline && !a.starts_with('-') && !a.is_empty())
+                })
+                .any(|script| script);
             if is_runtime && has_script {
                 assert_ne!(
                     program.name, base,

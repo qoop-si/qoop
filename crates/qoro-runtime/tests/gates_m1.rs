@@ -676,6 +676,86 @@ fn g1_14_enumerating_after_the_leader_dies_finds_an_empty_set() {
     );
 }
 
+/// G1.14, the session outlives the revoke: a job orphaned by the leader's death is still
+/// found by its session id while the leader is unreaped.
+///
+/// The tty scan runs 50 ms after output, so `nohup job &` followed at once by `exit` was
+/// never on any scan, and the revoke then hid it from every later one. Measured before
+/// the session read existed: the cleanup gate's holder survived teardown every run.
+#[test]
+fn g1_14_a_job_orphaned_by_the_leader_is_found_by_its_session() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let pty = qoro_pty::sys::open_pty(80, 24).expect("pty");
+    let tty_dev = qoro_pty::sys::tty_dev(pty.slave.as_raw_fd()).expect("tty dev");
+    let pid_file = tempfile::NamedTempFile::new().expect("tempfile");
+
+    let slave = pty.slave.as_raw_fd();
+    let mut command = std::process::Command::new("/bin/sh");
+    // `set -m` puts the job in its own group, like an interactive shell does, so only the
+    // containment set can reach it.
+    command.args([
+        "-c",
+        &format!(
+            "set -m; sleep 30 >/dev/null 2>&1 & echo $! > {}; exec sleep 30",
+            pid_file.path().display()
+        ),
+    ]);
+    // SAFETY: the closure runs post-fork and calls only async-signal-safe syscalls with no
+    // allocation. This is the same session setup the daemon performs.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for target in 0..3 {
+                if libc::dup2(slave, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn");
+    drop(pty.slave);
+    let leader = child.id() as i32;
+    qoro_testkit::track_pid(leader);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let job: i32 = loop {
+        if let Ok(Ok(pid)) = std::fs::read_to_string(pid_file.path()).map(|s| s.trim().parse()) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the job never wrote its pid");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    qoro_testkit::track_pid(job);
+
+    // SAFETY: a signal to a child this test spawned. Deliberately not reaped yet.
+    unsafe { libc::kill(leader, libc::SIGKILL) };
+    std::thread::sleep(Duration::from_millis(300));
+
+    let on_tty = qoro_pty::sys::enumerate_tty(tty_dev);
+    assert!(
+        on_tty.iter().all(|m| m.pid.0 != job),
+        "the job is still on the revoked tty, so this gate no longer proves anything"
+    );
+    let (session, _) = qoro_pty::sys::enumerate_session(qoro_pty::teardown::Pid(leader));
+    let found = session.iter().any(|m| m.pid.0 == job);
+
+    // SAFETY: signals to processes this test spawned.
+    unsafe { libc::kill(job, libc::SIGKILL) };
+    let _ = child.wait();
+    assert!(
+        found,
+        "the orphaned job {job} is not in its dead leader's session"
+    );
+}
+
 /// G1.14, enumerator completeness. A truncating enumerator would pass every containment
 /// test by finding only recently created processes, which are exactly the ones a test
 /// creates. An earlier version read a quarter of the process table, oldest first.

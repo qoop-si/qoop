@@ -235,6 +235,14 @@ impl ConnectionRegistry {
         self.inner.lock().unwrap().retain(|c| &c.client != client);
     }
 
+    fn contains(&self, client: &ClientId) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| &c.client == client)
+    }
+
     /// Ask the connection that is furthest behind to end, and say which one that was.
     ///
     /// The rank is how far behind the connection is, and only then how long it has been
@@ -722,12 +730,11 @@ impl Daemon {
             }
         });
 
-        // The containment scan, once for the whole daemon. It only runs while at least one
-        // terminal exists, so an idle daemon makes no syscalls at all, which is what gate
+        // The containment scan, once for the whole daemon. It only runs after a terminal
+        // said something, so an idle daemon makes no syscalls at all, which is what gate
         // G2.2 asserts: the cost of being idle cannot depend on how many unrelated
         // processes the host happens to be running.
         let scanning = self.scanner.clone();
-        let scanned_terminals = self.terminals.clone();
         tokio::spawn(async move {
             loop {
                 // Parked until something happens, then rate limited. Nothing changed, so
@@ -735,11 +742,11 @@ impl Daemon {
                 // it on a timer regardless of activity made a hundred idle terminals cost
                 // 1.09 seconds of CPU a minute against a 50 millisecond budget. A process
                 // cannot join a terminal without that terminal saying something first.
+                // No check for an empty terminal set here: skipping the scan also skipped
+                // clearing the flag, and the loop woke every interval until a terminal
+                // appeared. The last terminal's final output costs one scan, then this parks.
                 scanning.wait_for_activity().await;
                 tokio::time::sleep(CONTAINMENT_SCAN_INTERVAL).await;
-                if scanned_terminals.is_empty() {
-                    continue;
-                }
                 scanning.refresh().await;
             }
         });
@@ -817,7 +824,26 @@ impl Daemon {
 
         let mut next_client = 0u64;
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            // One failed accept is one connection, not the daemon: `?` here ended `serve`
+            // and took every terminal with it on the first EMFILE. A peer that gave up
+            // mid-accept is skipped; anything else waits a beat so a persistent error
+            // cannot spin.
+            let stream = match self.listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("qorod: accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             next_client += 1;
             // Per connection, never per client program: ownership must end when the
             // connection does, and a stable identity would survive a crash and strand the
@@ -855,6 +881,15 @@ impl Daemon {
             let served_agents = self.agents.clone();
             let served_events = self.events.clone();
             let served_watched = self.watched.clone();
+            // Registered before the task exists, so the task's own `remove` on exit always
+            // finds it: registering after the spawn let a connection that closed at once
+            // remove nothing and then stay listed, counted against the budget forever.
+            self.connections.register(Connection {
+                client,
+                progress,
+                shutdown,
+                admitted: std::time::Instant::now(),
+            });
             tokio::spawn(async move {
                 // Milestone 1 has one attach mode and it is writable. Read-only observers
                 // are a milestone 2 surface; the arbitration below already refuses them.
@@ -877,6 +912,7 @@ impl Daemon {
                         agents: served_agents,
                         events: served_events,
                         watched: served_watched,
+                        connections: registry.clone(),
                     },
                 )
                 .await;
@@ -884,12 +920,6 @@ impl Daemon {
                     eprintln!("qorod: client ended: {e}");
                 }
                 registry.remove(&registered);
-            });
-            self.connections.register(Connection {
-                client,
-                progress,
-                shutdown,
-                admitted: std::time::Instant::now(),
             });
         }
     }
@@ -1170,6 +1200,8 @@ pub struct ServeContext {
     /// Which terminals live connections watch. Incremented on subscribe,
     /// decremented on unsubscribe and disconnect; the idle reaper reads it.
     pub watched: crate::idle::WatchCounts,
+    /// Every live connection, so a stop can wait for the one that asked to hang up.
+    pub connections: Arc<ConnectionRegistry>,
 }
 
 async fn serve_client(
@@ -1193,6 +1225,7 @@ async fn serve_client(
         agents,
         events,
         watched,
+        connections,
     } = context;
     // Filesystem permissions are the first gate, not the only one. A peer from another uid
     // is closed with no protocol response at all.
@@ -1207,22 +1240,39 @@ async fn serve_client(
     let mut inbuf = BytesMut::with_capacity(64 * 1024);
     let mut read = [0u8; 16 * 1024];
 
-    // Handshake first, on channel 0, before anything else is accepted.
-    let hello = loop {
-        let n = stream.read(&mut read).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        inbuf.extend_from_slice(&read[..n]);
-        if let Some(frame) = Frame::decode(&mut inbuf).map_err(to_io)? {
-            if frame.channel != Channel::Handshake {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "first frame must be a handshake",
-                ));
+    // Handshake first, on channel 0, before anything else is accepted. Bounded like any
+    // other message in flight: a peer that connects and says nothing held its socket and
+    // this task forever, even after the connection budget evicted it.
+    let handshake = tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
+        loop {
+            let n = stream.read(&mut read).await?;
+            if n == 0 {
+                return Ok(None);
             }
-            break serde_json::from_slice::<qoro_proto::ClientHello>(&frame.body)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            inbuf.extend_from_slice(&read[..n]);
+            if let Some(frame) = Frame::decode(&mut inbuf).map_err(to_io)? {
+                if frame.channel != Channel::Handshake {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "first frame must be a handshake",
+                    ));
+                }
+                return serde_json::from_slice::<qoro_proto::ClientHello>(&frame.body)
+                    .map(Some)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        }
+    })
+    .await;
+    let hello = match handshake {
+        Ok(Ok(Some(hello))) => hello,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no handshake within the deadline",
+            ));
         }
     };
 
@@ -1428,6 +1478,7 @@ async fn serve_client(
                                 &agents,
                                 &events,
                                 &watched,
+                                &connections,
                             )
                             .await
                         }
@@ -1502,8 +1553,11 @@ async fn serve_client(
                         rows,
                     },
                 };
+                // A terminal whose task has ended is one stale address, not the end of
+                // this read: breaking here left every later frame of the read in the
+                // buffer until the peer happened to send more.
                 if handle.commands.send(cmd).await.is_err() {
-                    break;
+                    continue;
                 }
             }
         }
@@ -2060,6 +2114,7 @@ async fn handle_control(
     agents: &Arc<crate::agents::AgentRegistry>,
     events: &crate::eventlog::EventLog,
     watched: &crate::idle::WatchCounts,
+    connections: &Arc<ConnectionRegistry>,
 ) -> ControlResponse {
     let id = request.request_id().to_string();
 
@@ -2146,6 +2201,9 @@ async fn handle_control(
                 )])
                 .await
             {
+                // The row is already written and nothing will run in it: closed here, or
+                // the next start brings back a tab the client was told was never made.
+                let _ = store.close_terminal(stream as i64).await;
                 return ControlResponse::Failed {
                     id,
                     reason: format!("could not record the intent: {e}"),
@@ -2202,10 +2260,14 @@ async fn handle_control(
                         terminal: stream,
                     }
                 }
-                Err(e) => ControlResponse::Failed {
-                    id,
-                    reason: format!("cannot create a terminal: {e}"),
-                },
+                Err(e) => {
+                    // The same: a spawn that failed leaves no tab behind to come back.
+                    let _ = store.close_terminal(stream as i64).await;
+                    ControlResponse::Failed {
+                        id,
+                        reason: format!("cannot create a terminal: {e}"),
+                    }
+                }
             }
         }
         ControlRequest::CloseTerminal { terminal, .. } => match terminals.get(terminal) {
@@ -2367,14 +2429,21 @@ async fn handle_control(
                 }
             }
             let terminals = terminals.clone();
+            let connections = connections.clone();
+            let asker = client.clone();
             let counted = live.len();
             tokio::spawn(async move {
                 // The answer goes out on the connection this handler returns to, so the
-                // exit waits for the terminals to actually go, and gives up on the ones
-                // that will not. Either way the process ends: a stop that leaves a daemon
-                // running because one shell ignored a hangup is not a stop.
+                // exit waits for the terminals to actually go and for the asker to hang
+                // up, which it does once it has read the answer: with no terminals the
+                // first check used to pass at once and the process could end before the
+                // answer was written, failing `qoro stop` on a stop that worked. It gives
+                // up on both at the deadline: a stop that leaves a daemon running because
+                // one shell ignored a hangup is not a stop.
                 let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
-                while tokio::time::Instant::now() < deadline && !terminals.streams().is_empty() {
+                while tokio::time::Instant::now() < deadline
+                    && (!terminals.streams().is_empty() || connections.contains(&asker))
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 std::process::exit(0);
@@ -3278,7 +3347,8 @@ pub fn open_terminal(
         spawn_history_writer(dir.join(stream.to_string()), spill.clone(), behind.clone());
     }
     let forgetting = agents.clone();
-    spawn_terminal(
+    let unregister = agents.clone();
+    let spawned = spawn_terminal(
         TerminalSpawn {
             shell: shell.to_path_buf(),
             cwd: cwd.map(Path::to_path_buf),
@@ -3337,7 +3407,16 @@ pub fn open_terminal(
                 });
             }
         },
-    )?;
+    );
+    // Nothing started, so nothing stays listed: left in, the tab was a ghost with no
+    // process behind it. The store row is the caller's call, because a restore that
+    // failed for a moment must not close a tab for good. The writer ends on its own
+    // once the ring handed to the failed spawn is dropped.
+    if let Err(e) = spawned {
+        terminals.remove(stream);
+        unregister.forget(stream);
+        return Err(e);
+    }
     Ok(handle)
 }
 
@@ -3531,6 +3610,12 @@ pub async fn restore(into: &Restore) -> usize {
 /// number. See [`RestoreReport`] for why the split matters.
 pub async fn restore_report(into: &Restore) -> RestoreReport {
     let mut report = RestoreReport::default();
+    // Above every id ever written, not only the ones coming back: a closed tab keeps its
+    // row, and a new tab minted onto its number fails the insert.
+    if let Ok(max) = into.books.store.max_terminal_id().await {
+        into.terminals
+            .mint_above(u32::try_from(max).unwrap_or(u32::MAX));
+    }
     let Ok(spaces) = into.books.store.workspaces().await else {
         return report;
     };
@@ -3727,6 +3812,9 @@ fn spawn_history_writer(
                 spill.wait().await;
                 true
             };
+            // Asked before the take: asked after, the terminal could push its last rows
+            // and go in between, and the writer would leave them in the ring.
+            let finished = spill.orphaned();
             let (rows, gap) = spill.take();
             if gap.rows > 0 {
                 // Recorded, never silent. The rows are gone; saying how many and when is
@@ -3740,7 +3828,9 @@ fn spawn_history_writer(
                 );
             }
             if rows.is_empty() {
-                if unflushed && !woken {
+                // The terminal is gone and took its handle with it: nothing will arrive
+                // again, so flush what is buffered and let the files go.
+                if unflushed && (!woken || finished) {
                     let flushed = crate::blocking::run(move || {
                         let _ = history.flush();
                         history
@@ -3751,6 +3841,9 @@ fn spawn_history_writer(
                         Err(_) => return,
                     }
                     unflushed = false;
+                }
+                if finished {
+                    return;
                 }
                 continue;
             }
@@ -3787,6 +3880,15 @@ fn spawn_history_writer(
                     eprintln!("qorod: history write failed: {e}");
                 }
                 Err(_) => return,
+            }
+            // The last batch of a terminal that is gone, written or not: nothing will
+            // wake this again, so it ends here rather than parking for good, which a
+            // failed write (a full disk) otherwise made it do.
+            if finished {
+                if unflushed {
+                    let _ = crate::blocking::run(move || history.flush()).await;
+                }
+                return;
             }
         }
     });
@@ -4045,8 +4147,11 @@ fn classify_task_end(outcome: Result<std::io::Result<()>, tokio::task::JoinError
 /// Only the scanner snapshot is trusted, never a fresh enumeration: the master
 /// is already dropped, so the device number may be recycled under a new
 /// terminal, and signalling a fresh enumeration could kill that terminal's
-/// processes. A job the last scan never captured is the accepted residual;
-/// the count is returned so the caller logs what the fallback saw.
+/// processes. Not the session either: the panic may have come after the
+/// ordered teardown reaped the child, and a reaped leader's pid may already
+/// lead another terminal's session. A job the last scan never captured is the
+/// accepted residual; the count is returned so the caller logs what the
+/// fallback saw.
 ///
 /// Deliberately not the ordered teardown: there is no master to drain, only
 /// orphans to stop and one child to reap. A tree that outlives the last round
@@ -4995,7 +5100,6 @@ async fn terminal_task(
 #[derive(Default)]
 pub struct ContainmentScanner {
     by_tty: std::sync::Mutex<std::collections::HashMap<u64, Vec<qoro_pty::teardown::Member>>>,
-    opaque: AtomicU64,
     scans: AtomicU64,
     /// Set by any terminal that produced output. Nothing else can add a process to a
     /// terminal without the terminal saying something, so an unset flag means the answer
@@ -5016,12 +5120,6 @@ impl ContainmentScanner {
             .get(&qoro_pty::sys::scan_key(tty_dev))
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Processes that could not be inspected in the last scan. ADR-014 requires this to be
-    /// reported rather than silently skipped.
-    pub fn opaque(&self) -> u64 {
-        self.opaque.load(Ordering::Relaxed)
     }
 
     pub fn scans(&self) -> u64 {
@@ -5058,7 +5156,9 @@ impl ContainmentScanner {
     /// Run one scan now, on the blocking pool.
     pub async fn refresh(&self) {
         self.dirty.store(false, Ordering::Relaxed);
-        let Ok((by_tty, opaque)) = crate::blocking::run_on(
+        // The scan's own unreadable count is every other user's process on the machine,
+        // which says nothing about one terminal. Teardown reports the ones in its session.
+        let Ok((by_tty, _)) = crate::blocking::run_on(
             crate::blocking::Pool::Lifecycle,
             qoro_pty::sys::enumerate_all,
         )
@@ -5067,7 +5167,6 @@ impl ContainmentScanner {
             return;
         };
         *self.by_tty.lock().unwrap() = by_tty;
-        self.opaque.store(opaque as u64, Ordering::Relaxed);
         self.scans.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -5156,11 +5255,21 @@ async fn tear_down(
     // the kernel has already revoked the association, so a fresh pass would find nothing
     // anyway, and the scan is not this task's to run.
     containment.absorb(scanner.members(tty_dev));
-    let opaque = scanner.opaque();
+    // And the session, which the revoke does not erase: a job started and orphaned inside
+    // one scan interval (`nohup job &` then `exit`) was never on any scan. Read once, here,
+    // before the first `try_wait` below can reap the leader, because only an unreaped
+    // leader keeps its pid from becoming some other session's id.
+    let leader = qoro_pty::teardown::Pid(child_pid);
+    let (session, opaque) = crate::blocking::run_on(crate::blocking::Pool::Lifecycle, move || {
+        qoro_pty::sys::enumerate_session(leader)
+    })
+    .await
+    .unwrap_or_default();
+    containment.absorb(session);
     if opaque > 0 {
         eprintln!(
-            "qorod: teardown for pid {child_pid}: {opaque} processes could not be inspected \
-             and may still hold this terminal"
+            "qorod: teardown for pid {child_pid}: {opaque} processes in its session could not \
+             be inspected and may still hold this terminal"
         );
     }
 

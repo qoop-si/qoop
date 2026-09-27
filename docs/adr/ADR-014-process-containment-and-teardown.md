@@ -332,6 +332,19 @@ that job ever being seen. The first value was 250 milliseconds, which sounded co
 and was useless: a scripted session that starts a background job and exits runs end to end
 in about 110 milliseconds, so the scan never ran once.
 
+50 milliseconds was still a window, and on a faster machine it was the whole story: the
+cleanup gate starts `nohup ... &`, prints, and types `exit` inside one interval, so the only
+scan in the terminal's life was the one at its start, and the job survived teardown on every
+run. What closes it is the session, which the revoke does not erase. `getsid` of a process
+whose session leader has died still answers with the dead leader's pid, measured on macOS
+and true on Linux, and neither kernel hands out a pid that is still a session id. So
+teardown also absorbs every process in the leader's session, read once, before its first
+`try_wait` can reap the leader: after the reap the number may lead another terminal's
+session. The fallback teardown, which runs after a panic and cannot know whether the child
+was already reaped, does not read the session at all. On Linux this also catches a job
+that dropped its tty with `TIOCNOTTY`. A job that called `setsid` has left the session too,
+and is still caught only if a scan saw it first.
+
 ## Consequences
 
 - Teardown costs one process enumeration before the first signal plus one per escalation

@@ -100,11 +100,41 @@ impl SpillRing {
     pub fn wake(&self) {
         self.notify.notify_one();
     }
+
+    /// Whether this is the last handle, so nobody will push again. The writer's cue to
+    /// finish: it parks on `wait` holding its own clone, and without this it waited for
+    /// the rest of the daemon's life after its terminal ended, holding the files open.
+    pub fn orphaned(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
+    }
+}
+
+/// Dropping a handle wakes the other one, so the writer notices it is the last. A stored
+/// permit covers a drop that lands while the writer is busy writing. The shared rows are
+/// let go first: fields drop after this runs, so notifying first woke a writer that could
+/// still count two handles, park again, and never be woken.
+impl Drop for SpillRing {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.inner));
+        self.notify.notify_one();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_writer_is_woken_and_orphaned_when_the_terminal_side_drops() {
+        let writer = SpillRing::new();
+        let terminal = writer.clone();
+        assert!(!writer.orphaned());
+        drop(terminal);
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer.wait())
+            .await
+            .expect("the drop woke the writer");
+        assert!(writer.orphaned());
+    }
 
     #[test]
     fn rows_come_out_in_the_order_they_went_in() {
