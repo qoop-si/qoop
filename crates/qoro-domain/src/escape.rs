@@ -24,7 +24,13 @@ pub enum EscapeState {
     /// There is no "saw ESC" flag any more. ESC leaves this state from the transition
     /// table above, so `ESC \` ends the string by way of `Escape` rather than by a flag
     /// that had to be kept in step with it.
-    String { bel_terminates: bool },
+    ///
+    /// `c1_st` is set for DCS only: vte ends a DCS at the 8-bit ST, 0x9C, and returns to
+    /// ground, and a scanner that did not held ordinary output as payload after it. OSC,
+    /// SOS, PM and APC do not end there in vte, so they do not here. vte honours it only
+    /// after the DCS final byte; before that this reaches ground slightly early, which is
+    /// harmless because vte holds only bounded parameters in those states.
+    String { bel_terminates: bool, c1_st: bool },
     /// A two byte sequence, for example ESC ( B. One more byte to go.
     TwoByte,
 }
@@ -54,9 +60,15 @@ impl EscapeState {
                 b'[' => EscapeState::Csi,
                 b']' => EscapeState::String {
                     bel_terminates: true,
+                    c1_st: false,
                 },
-                b'P' | b'_' | b'^' | b'X' => EscapeState::String {
+                b'P' => EscapeState::String {
                     bel_terminates: false,
+                    c1_st: true,
+                },
+                b'_' | b'^' | b'X' => EscapeState::String {
+                    bel_terminates: false,
+                    c1_st: false,
                 },
                 // ESC ( , ESC ) , ESC # and friends take one more byte.
                 b'(' | b')' | b'*' | b'+' | b'#' | b' ' | b'%' => EscapeState::TwoByte,
@@ -74,11 +86,14 @@ impl EscapeState {
                     EscapeState::Csi
                 }
             }
-            EscapeState::String { bel_terminates } => {
-                if bel_terminates && b == 0x07 {
+            EscapeState::String {
+                bel_terminates,
+                c1_st,
+            } => {
+                if (bel_terminates && b == 0x07) || (c1_st && b == 0x9c) {
                     EscapeState::Ground
                 } else {
-                    EscapeState::String { bel_terminates }
+                    self
                 }
             }
             EscapeState::TwoByte => EscapeState::Ground,

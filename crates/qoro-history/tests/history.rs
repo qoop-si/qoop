@@ -126,7 +126,7 @@ fn gemini_matches_embedded_session_id() {
     let chats = dir.path().join("gemini/h1/chats");
     std::fs::create_dir_all(&chats).unwrap();
     std::fs::write(
-        chats.join("session-2026-03-24T11-21-gem.json"),
+        chats.join("session-2026-03-24T11-21-gem-9.json"),
         gemini_fixture(),
     )
     .unwrap();
@@ -287,20 +287,26 @@ fn oversize_gemini_file_is_not_a_match() {
     );
 }
 
-/// Gemini is the one scan left with a cap: its id lives only inside the file.
+/// Gemini names a chat by the first eight characters of its id, so the lookup is by name
+/// and no count of projects or chats can make it give up.
 #[test]
-fn scan_caps_are_loud() {
+fn gemini_is_found_past_any_number_of_projects() {
     let dir = tempfile::tempdir().unwrap();
     let gemini = dir.path().join("gemini");
     for i in 0..210 {
-        std::fs::create_dir_all(gemini.join(format!("h{i}"))).unwrap();
+        std::fs::create_dir_all(gemini.join(format!("h{i}/chats"))).unwrap();
     }
+    let id = "abcdef12-3456-7890-abcd-ef1234567890";
+    let mut doc: serde_json::Value = serde_json::from_str(&gemini_fixture()).unwrap();
+    doc["sessionId"] = id.into();
+    std::fs::write(
+        gemini.join("h209/chats/session-2026-03-05T02-42-abcdef12.json"),
+        doc.to_string(),
+    )
+    .unwrap();
     let d = dirs(dir.path());
-    let err = history("gemini", Some("whatever"), &d, 10, None).unwrap_err();
-    assert!(
-        matches!(err, qoro_history::Error::ScanCap { .. }),
-        "{err:?}"
-    );
+    let w = history("gemini", Some(id), &d, 10, None).unwrap();
+    assert_eq!(w.messages.len(), 2);
 }
 
 #[test]

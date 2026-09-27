@@ -218,4 +218,17 @@ mod tests {
         f.feed(b"\x1b\\next", &mut out);
         assert_eq!(out, b"next");
     }
+
+    /// vte ends a DCS at the 8-bit ST, 0x9C, and goes back to ground. A scanner that stayed
+    /// in the string held everything after it, and past 4 KiB dropped a plain text file
+    /// printed after the sequence.
+    #[test]
+    fn a_dcs_ends_at_the_eight_bit_string_terminator() {
+        let mut f = ControlStringFilter::default();
+        let mut out = Vec::new();
+        f.feed(b"\x1bPq#0\x9c", &mut out);
+        f.feed(&vec![b'x'; 5000], &mut out);
+        assert_eq!(out.iter().filter(|&&b| b == b'x').count(), 5000);
+        assert_eq!(f.discarded(), (0, 0));
+    }
 }

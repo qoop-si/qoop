@@ -709,13 +709,15 @@ pub struct ReloadOutcome {
 /// parse are reported and leave the previous rules in place; files that parse
 /// replace the entry for their id, including ids no bundled manifest has.
 /// A missing directory is an empty success, not an error.
+///
+/// An override whose file is gone is dropped, and a directory that is gone drops
+/// them all: deleting the file is how a person takes an override back, and a
+/// reload that only ever inserted kept the rules until the daemon restarted.
 pub fn reload_overrides(dir: &std::path::Path) -> ReloadOutcome {
     let mut outcome = ReloadOutcome::default();
-    let entries = match std::fs::read_dir(dir) {
-        Err(_) => return outcome,
-        Ok(entries) => entries,
-    };
-    let mut files: Vec<std::path::PathBuf> = entries
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
@@ -724,6 +726,13 @@ pub fn reload_overrides(dir: &std::path::Path) -> ReloadOutcome {
     let Ok(mut overrides) = OVERRIDES.write() else {
         return outcome;
     };
+    overrides.retain(|id, _| {
+        files.iter().any(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(id))
+        })
+    });
     for path in files {
         let stem = path
             .file_stem()
@@ -2026,6 +2035,43 @@ contains = "esc to interrupt"
             );
             let outcome = reload_overrides(dir.path());
             assert!(outcome.errors.iter().any(|(f, _)| f == "codex"));
+        });
+    }
+
+    /// Deleting an override file is how a person takes an override back, so the next
+    /// reload has to drop its rules, and a directory that is gone drops every one.
+    #[test]
+    fn a_deleted_override_file_stops_overriding() {
+        with_clean_overrides(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_override(
+                dir.path(),
+                "zzl3.toml",
+                "id = \"zzl3\"\nversion = \"test\"\n\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = \"x\"\n",
+            );
+            reload_overrides(dir.path());
+            assert!(for_program("zzl3").is_some());
+
+            std::fs::remove_file(dir.path().join("zzl3.toml")).expect("remove");
+            reload_overrides(dir.path());
+            assert!(
+                for_program("zzl3").is_none(),
+                "a deleted file kept its rules"
+            );
+
+            write_override(
+                dir.path(),
+                "zzl3.toml",
+                "id = \"zzl3\"\nversion = \"test\"\n\n[[rules]]\nid = \"r\"\nstate = \"idle\"\ncontains = \"x\"\n",
+            );
+            reload_overrides(dir.path());
+            let gone = dir.path().to_path_buf();
+            drop(dir);
+            reload_overrides(&gone);
+            assert!(
+                for_program("zzl3").is_none(),
+                "a removed directory kept its rules"
+            );
         });
     }
 

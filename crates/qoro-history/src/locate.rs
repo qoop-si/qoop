@@ -1,8 +1,8 @@
 //! Finding the transcript file for a `(product, session id)` pair.
 //!
-//! One strategy per product, no guessing. Claude and Codex look an id up by
-//! name, which costs one stat per project or one name test per file however
-//! much history there is; Gemini still scans, and its scan is bounded. A missing id is
+//! One strategy per product, no guessing. Claude, Codex and Gemini look an id
+//! up by name, which costs one stat per project or one name test per file
+//! however much history there is, and opens only a file whose name fits. A missing id is
 //! always a refusal upstream, never a "newest file" pick: this module only
 //! answers exact ids. Every returned path is canonicalized and checked
 //! against its product base directory, so a smuggled symlink cannot escape.
@@ -12,10 +12,6 @@ use std::path::{Path, PathBuf};
 use crate::Error;
 use crate::model::Product;
 
-/// How many directories the Gemini scan may enter.
-const MAX_SCAN_DIRS: usize = 200;
-/// How many candidate files the Gemini scan may visit.
-const MAX_SCAN_FILES: usize = 2000;
 /// Upper bound for reading a Codex first line: `session_meta` is small, but
 /// a pathological first line must not grow the probe without limit.
 const HEAD_FIRST_LINE_MAX: u64 = 1024 * 1024;
@@ -167,10 +163,15 @@ fn locate_opencode(_id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
     }
 }
 
-/// `tmp/<hash>/chats/session-*.json` matched on the embedded `sessionId`.
+/// `tmp/<hash>/chats/session-<time>-<first 8 of the id>.json`, confirmed on the
+/// embedded `sessionId`.
+///
+/// By name, like Claude and Codex: only a file whose name ends in the id's first eight
+/// characters is opened. The scan it replaces opened every chat and gave up past 200
+/// directories or 2000 files, so a long Gemini history could never be read at all.
 fn locate_gemini(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
-    let mut visited = 0;
-    let mut dirs_seen = 0;
+    // Ids are allowlisted ASCII upstream, so a byte slice is a character slice.
+    let suffix = format!("-{}.json", &id[..id.len().min(8)]);
     let mut stack = vec![dirs.gemini.clone()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -179,23 +180,14 @@ fn locate_gemini(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
         for f in entries.flatten() {
             let p = f.path();
             if is_plain_dir(&p) {
-                dirs_seen += 1;
-                if dirs_seen > MAX_SCAN_DIRS {
-                    return Err(Error::ScanCap { cap: MAX_SCAN_DIRS });
-                }
                 stack.push(p);
                 continue;
             }
-            if !p.is_file() || p.extension().is_some_and(|e| e != "json") {
-                continue;
-            }
-            visited += 1;
-            if visited > MAX_SCAN_FILES {
-                return Err(Error::ScanCap {
-                    cap: MAX_SCAN_FILES,
-                });
-            }
-            if gemini_file_matches(&p, id)? {
+            let named = f
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("session-") && n.ends_with(&suffix));
+            if named && p.is_file() && gemini_file_matches(&p, id)? {
                 return Ok(Located::File(checked(&p, &dirs.gemini)?));
             }
         }

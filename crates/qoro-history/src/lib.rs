@@ -62,8 +62,6 @@ pub enum Error {
     NoReader { product: String },
     #[error("no {product} transcript for session id {id}")]
     NotFound { product: &'static str, id: String },
-    #[error("transcript scan exceeded {cap} files")]
-    ScanCap { cap: usize },
     #[error("transcript file is larger than the readable size")]
     TooLarge,
     #[error("transcript database unreadable: {0}")]
