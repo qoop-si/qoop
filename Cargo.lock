@@ -1041,6 +1041,7 @@ dependencies = [
  "qoro-proto",
  "qoro-runtime",
  "qrcode",
+ "rustls 0.23.45",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1505,6 +1506,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki 0.103.15",
  "subtle",
