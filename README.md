@@ -41,11 +41,15 @@ percent of a core while they turn, nothing once the agent stops, and `QORO_MOTIO
 
 On a Mac the same news sits in the notch, with no window open: your pet, an amber badge
 counting the agents that need you, and how many are working and idle. A click drops the
-list, and a click on a row switches the interface to that terminal and brings the app it
-runs in forward (inside tmux the switch happens and nothing is raised, since the tmux
-server has no app to find). The installer turns it on; `qoro notch uninstall` turns it
-off, and `qoro notch install` back on. It is built into the macOS binary, so it needs no
-download or signature of its own.
+list; a click on a row opens that agent's terminal right under it, live and in its own
+colours, the same grid the interface draws and never resized for it. Scrolling up goes
+back past the screen: into the terminal's history, or for an agent on the full screen,
+into its conversation. Under it is a line to answer the agent, or a button per option
+when it is waiting on a numbered menu, and "open in qoro" to switch the interface there
+and bring its app forward (inside tmux the switch happens and nothing is raised, since
+the tmux server has no app to find). The installer turns it on; `qoro notch uninstall`
+turns it off, and `qoro notch install` back on. It is built into the macOS binary, so it
+needs no download or signature of its own.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
 [ADR-021](docs/adr/ADR-021-windows.md) says what one would have to include.

@@ -25,7 +25,7 @@ pub fn columns(c: char) -> usize {
 /// bidirectional override or isolate, which a terminal that implements bidi would obey
 /// and use to turn the rest of a row around. Names and labels come from other machines and
 /// other programs; either would reach this terminal as a command rather than as text.
-fn drawn(c: char) -> bool {
+pub fn drawn(c: char) -> bool {
     !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 

@@ -332,6 +332,184 @@ pub(crate) fn run_watch(
     })
 }
 
+/// The least time between two screens `read --watch` prints. An agent streaming output
+/// renders far faster than anyone reads; a viewer gets the newest screen at this pace.
+const WATCH_GAP: Duration = Duration::from_millis(150);
+
+/// `qoro read <terminal> --watch`: the screen now, then again each time it changes.
+///
+/// A viewer of the same grid the interface draws, on one connection subscribed to that
+/// terminal alone. It never sends a size: the grid belongs to its owner (ADR-007), so
+/// watching changes nothing for the agent. Ends when the terminal or the daemon does.
+pub(crate) fn run_read_watch(
+    terminal: u32,
+    emit: impl Fn(&qoro_runtime::daemon::SnapshotWire) -> std::io::Result<String>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut link = Link::open("qoro-read").await?;
+        let (agents, _) = link.agents().await?;
+        // The daemon subscribes a new connection to its lowest terminal; any other one
+        // goes back before its renders cost anything.
+        let others: Vec<u32> = agents
+            .iter()
+            .map(|r| r.terminal)
+            .filter(|t| *t != terminal)
+            .collect();
+        if !others.is_empty() {
+            link.ask(&ControlRequest::Unsubscribe {
+                id: super::request_id("read"),
+                terminals: others,
+            })
+            .await?;
+        }
+        let (answer, stashed) = link
+            .ask(&ControlRequest::Subscribe {
+                id: super::request_id("read"),
+                terminals: vec![terminal],
+            })
+            .await?;
+        match answer {
+            ControlResponse::Subscribed { terminals, .. } if terminals.contains(&terminal) => {}
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "no such terminal: {terminal}"
+                )));
+            }
+        }
+        let mut pending = None;
+        for incoming in stashed {
+            if let client::Incoming::Render {
+                terminal: t,
+                snapshot,
+            } = incoming
+                && t == terminal
+            {
+                pending = Some(snapshot);
+            }
+        }
+        let mut last = String::new();
+        let mut shown = Instant::now() - WATCH_GAP;
+        let mut read = [0u8; 64 * 1024];
+        loop {
+            if pending.is_some() && shown.elapsed() >= WATCH_GAP {
+                let text = emit(pending.as_ref().expect("checked"))?;
+                pending = None;
+                shown = Instant::now();
+                if text != last {
+                    let mut out = std::io::stdout().lock();
+                    // A reader that went away ends the watch, rather than a panic on write.
+                    if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
+                        return Ok(());
+                    }
+                    last = text;
+                }
+            }
+            if let Some(ack) = link.connection.renders().due_ack(Instant::now()) {
+                link.wr.write_all(&ack).await?;
+            }
+            // Asleep until the next render, woken each second only to acknowledge.
+            let wait = if pending.is_some() {
+                WATCH_GAP.saturating_sub(shown.elapsed())
+            } else {
+                Duration::from_secs(1)
+            };
+            let n = match tokio::time::timeout(wait, link.rd.read(&mut read)).await {
+                Err(_) => {
+                    // Adopted by launchd: whoever started this watch is gone, and a quiet
+                    // terminal would never make a write fail to say so. Holding the
+                    // subscription would also keep the tab from being put to sleep.
+                    if std::os::unix::process::parent_id() == 1 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Ok(n) => n?,
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            link.inbuf.extend_from_slice(&read[..n]);
+            let mut changed = false;
+            for incoming in link.connection.drain(&mut link.inbuf)? {
+                changed |= note(incoming, terminal, &mut pending);
+            }
+            // A change to this terminal may be its end, and so may news that was missed.
+            // Asked again until an answer comes with no news of its own: a change that
+            // arrived during the question may be the end, and nothing will say so twice.
+            while changed {
+                let (agents, meanwhile) = link.agents().await?;
+                // A screen that arrived while asking is the newest one there is: kept, or a
+                // terminal that then goes quiet would stay on the screen before it.
+                changed = false;
+                for incoming in meanwhile {
+                    changed |= note(incoming, terminal, &mut pending);
+                }
+                // Gone, or put to sleep: either way there is no screen left to follow.
+                if !agents
+                    .iter()
+                    .any(|r| r.terminal == terminal && r.state != "sleeping")
+                {
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
+/// One arrival on a `read --watch` connection: a screen of the watched terminal is kept
+/// as the newest, and true says the index should be read again (a change to that terminal,
+/// or news that was dropped).
+fn note(
+    incoming: client::Incoming,
+    terminal: u32,
+    pending: &mut Option<qoro_runtime::daemon::SnapshotWire>,
+) -> bool {
+    match incoming {
+        client::Incoming::Render {
+            terminal: t,
+            snapshot,
+        } if t == terminal => {
+            *pending = Some(snapshot);
+            false
+        }
+        client::Incoming::Event(EventMessage::AgentChanged { terminal: t }) => t == terminal,
+        client::Incoming::Event(EventMessage::Resync) => true,
+        _ => false,
+    }
+}
+
+/// `qoro read <terminal> --back UP --lines N`: history rows, the first of them `up` rows
+/// before the newest one written, with where they start and how many there are.
+pub(crate) fn read_back(
+    terminal: u32,
+    up: usize,
+    rows: usize,
+) -> std::io::Result<(u64, u64, Vec<String>)> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut link = Link::open("qoro-read").await?;
+        match link
+            .ask(&ControlRequest::Scrollback {
+                id: super::request_id("back"),
+                terminal,
+                up,
+                rows,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Scrollback {
+                from, total, lines, ..
+            } => Ok((from, total, lines)),
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a history read")),
+        }
+    })
+}
+
 /// `qoro focus <terminal>`: every attached interface shows that terminal, and the pids of
 /// the ones that were asked are handed back for whoever wants to raise their windows.
 pub(crate) fn run_focus(terminal: u32) -> std::io::Result<Vec<u32>> {

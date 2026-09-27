@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 mod avatar;
 mod hooks;
+mod mirror;
 mod mobile;
 mod notch;
 mod remote;
@@ -167,7 +168,8 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
                   \x20                 pageup pagedown ctrl-a..ctrl-z\n\
-                  \x20 qoro read <terminal> [--lines N]  print another terminal's screen\n\
+                  \x20 qoro read <terminal> [--lines N] [--json] [--watch]  print another\n\
+                  \x20                 terminal's screen; --back UP reads its history\n\
                   \x20 qoro prompt <target> [--wait] [--timeout SECS] [--] <text>  send text\n\
                   \x20                 plus Enter, unless blocked; --wait returns once the\n\
                   \x20                 agent took the turn and stopped\n\
@@ -1346,30 +1348,73 @@ fn trim_rows(mut rows: Vec<String>, lines: Option<usize>) -> Vec<String> {
 /// `qoro read`: print another terminal's current screen.
 ///
 /// Subscribes, takes the first snapshot for that terminal and prints it.
-/// Trailing blank rows are trimmed; `--lines N` keeps the last N rows.
+/// Trailing blank rows are trimmed; `--lines N` keeps the last N rows. `--json` prints
+/// the screen as styled runs (see `mirror`), `--watch` prints it again on each change,
+/// and `--back UP` reads history instead: `--lines` rows (200 when not said), the first
+/// of them UP rows before the newest one written.
 fn run_read(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro read <terminal> [--lines N]";
+    let help = "usage: qoro read <terminal> [--lines N] [--json] [--watch]\n       \
+                qoro read <terminal> --back UP [--lines N] [--json]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| usage(help))?;
     let mut lines: Option<usize> = None;
+    let mut back: Option<usize> = None;
+    let (mut json, mut watch) = (false, false);
     let mut rest = args.iter().skip(3);
     while let Some(arg) = rest.next() {
-        if arg == "--lines" {
-            lines = Some(
-                rest.next()
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| usage(help))?,
-            );
-        } else {
-            return Err(usage(format!("unknown flag {arg}; {help}")));
+        let mut number = || -> std::io::Result<usize> {
+            rest.next()
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| usage(help))
+        };
+        match arg.as_str() {
+            "--lines" => lines = Some(number()?),
+            "--back" => back = Some(number()?),
+            "--json" => json = true,
+            "--watch" => watch = true,
+            _ => return Err(usage(format!("unknown flag {arg}; {help}"))),
         }
+    }
+    if let Some(up) = back {
+        if watch {
+            return Err(usage(format!("--back reads history once; {help}")));
+        }
+        let (from, total, rows) = supervise::read_back(terminal, up, lines.unwrap_or(200))?;
+        if json {
+            println!("{}", mirror::history(from, total, &rows));
+        } else {
+            for row in &rows {
+                println!("{row}");
+            }
+        }
+        return Ok(());
+    }
+    // A screen as JSON is every row, since a reader lines its runs up with the cursor and
+    // the rows behind it; --lines is for the text form.
+    if json && lines.is_some() {
+        return Err(usage(format!(
+            "--lines cuts the text screen; --json prints every row: {help}"
+        )));
+    }
+    if watch {
+        return supervise::run_read_watch(terminal, |snapshot| {
+            Ok(if json {
+                mirror::screen(snapshot).to_string()
+            } else {
+                trim_rows(snapshot.lines.clone(), lines).join("\n") + "\n"
+            })
+        });
     }
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let snapshot = fetch_snapshot(terminal, "qoro-read").await?;
+        if json {
+            println!("{}", mirror::screen(&snapshot));
+            return Ok(());
+        }
         for row in &trim_rows(snapshot.lines, lines) {
             println!("{row}");
         }
