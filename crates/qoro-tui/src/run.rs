@@ -3066,6 +3066,21 @@ where
                                         // nothing else will say so.
                                         | ControlResponse::Renamed { .. }
                                 );
+                                // A row in a space this client does not list: another
+                                // client (`qoro new --space`) made it, and no answer
+                                // here said so. Asked for once the first list is in,
+                                // so the bootstrap does not ask twice. A slept row can
+                                // outlive its space, and would ask on every refresh.
+                                if let ControlResponse::Agents { agents, .. } = &response
+                                    && !state.spaces.is_empty()
+                                    && agents.iter().any(|r| {
+                                        r.state != "sleeping"
+                                            && r.workspace != 0
+                                            && !state.spaces.iter().any(|s| s.id == r.workspace)
+                                    })
+                                {
+                                    refresh_spaces = true;
+                                }
                                 apply(&mut state, response, &mut dirty);
                             }
                         }
