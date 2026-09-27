@@ -324,6 +324,11 @@ struct State {
     /// The spaces folded away under their rule. Client-local like `view`: the daemon
     /// never knows, and a space that goes away leaves this set with the next index.
     shut: sidebar::Shut,
+    /// The last press landed in the left column, and no key has gone to the pane since:
+    /// the key row names what the column answers to.
+    in_column: bool,
+    /// `ctrl-a` came last and the next key is a command: the key row names them all.
+    prefix_pending: bool,
     /// The done rows this client has already looked at, as (terminal, generation).
     ///
     /// Client-local, like the focus itself: reading a done agent here does not
@@ -534,6 +539,15 @@ impl State {
             image_notice: None,
             chrome: screen::Chrome {
                 shut: self.shut.clone(),
+                keys: if self.prefix_pending {
+                    screen::KeyContext::Prefix
+                } else if self.in_column
+                    && screen::left_for(self.cols, self.collapsed, self.sidebar_width) > 0
+                {
+                    screen::KeyContext::Sidebar
+                } else {
+                    screen::KeyContext::Pane
+                },
             },
         }
     }
@@ -2580,6 +2594,10 @@ where
         view: sidebar::View::default(),
 
         shut: sidebar::Shut::new(),
+
+        in_column: false,
+
+        prefix_pending: false,
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
         tick: 0,
@@ -2759,6 +2777,12 @@ where
             // At most one frame per `FRAME`. The first render after a quiet spell goes out
             // at once, so a keystroke echoes with no added wait; renders arriving closer
             // together than that wait for the timer arm below and go out as one frame.
+            // `ctrl-a` waiting for its letter produces no action of its own, so the key row
+            // learns it here: a flip either way repaints the row.
+            if keys.prefix_pending() != state.prefix_pending {
+                state.prefix_pending = keys.prefix_pending();
+                dirty = true;
+            }
             if dirty && presented.elapsed() >= FRAME {
                 // One frame for both paints: a single clock for tiers, order
                 // and the hit testing below, and its time remembered for the
@@ -3287,6 +3311,10 @@ where
                                 // The hint has been read or it has not; either way the
                                 // person is working now.
                                 state.hint = None;
+                                // A key for the pane moves the keyboard's attention back there.
+                                if std::mem::take(&mut state.in_column) {
+                                    dirty = true;
+                                }
                                 // Typing is talking to the program, and the program is at
                                 // the bottom. A key pressed while scrolled back would
                                 // answer into a view of an hour ago, and the person would
@@ -3336,6 +3364,23 @@ where
                                 dirty = true;
                             }
                             Action::Click { row, col, shift } => {
+                                // Where the press landed is where the key row points next.
+                                let in_column = {
+                                    let left = screen::left_for(
+                                        state.cols,
+                                        state.collapsed,
+                                        state.sidebar_width,
+                                    );
+                                    left > 0
+                                        && (col as usize) <= left
+                                        && (row as usize)
+                                            <= (state.lines as usize)
+                                                .saturating_sub(screen::STATUS)
+                                };
+                                if state.in_column != in_column {
+                                    state.in_column = in_column;
+                                    dirty = true;
+                                }
                                 // A new press ends whatever gesture came before: a
                                 // release swallowed elsewhere (the palette, a divider
                                 // drag) must not leave the program owed one.
@@ -6257,6 +6302,10 @@ mod tests {
             view: sidebar::View::default(),
 
             shut: sidebar::Shut::new(),
+
+            in_column: false,
+
+            prefix_pending: false,
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6707,6 +6756,10 @@ mod tests {
             view: sidebar::View::default(),
 
             shut: sidebar::Shut::new(),
+
+            in_column: false,
+
+            prefix_pending: false,
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6795,6 +6848,10 @@ mod tests {
             view: sidebar::View::default(),
 
             shut: sidebar::Shut::new(),
+
+            in_column: false,
+
+            prefix_pending: false,
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,

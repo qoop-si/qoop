@@ -113,6 +113,8 @@ pub struct Frame<'a> {
 pub struct Chrome {
     /// The spaces folded away under their rule.
     pub shut: sidebar::Shut,
+    /// Where the keyboard's attention is, for the key row.
+    pub keys: KeyContext,
 }
 
 impl Frame<'_> {
@@ -134,8 +136,178 @@ impl Frame<'_> {
     }
 }
 
-/// Every command the prefix takes, for a window wide enough to read them all.
-const EVERY_KEY: &str = "ctrl-a: n tab  c new  r rename  R space name  w new space  W close space  x close  s space  space find  g view  F focus  [ copy  e resize  = equalize  m menu  ? keys  d detach  U update";
+/// Where the keyboard's attention is, for the key row to name what works there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyContext {
+    /// Typing goes to the terminal; the prefix commands are what work.
+    #[default]
+    Pane,
+    /// The last press landed in the left column: what the column answers to.
+    Sidebar,
+    /// `ctrl-a` is down and the next key is a command: every command there is.
+    Prefix,
+}
+
+/// One entry of the key row: the key, what it does, and how soon it goes when the row
+/// is short, where zero never goes. An entry with no action is a label, the prefix
+/// named once before the letters it applies to.
+type Hint = (&'static str, Option<&'static str>, u8);
+
+/// What the key row offers in each place, most useful first within each rank.
+fn all_hints(context: KeyContext) -> &'static [Hint] {
+    match context {
+        KeyContext::Pane => &[
+            ("ctrl-a:", None, 0),
+            ("space", Some("find"), 1),
+            ("c", Some("new tab"), 2),
+            ("n", Some("next"), 3),
+            ("m", Some("menu"), 4),
+            ("v", Some("split"), 5),
+            ("f", Some("fold"), 6),
+            ("F", Some("focus"), 6),
+            ("[", Some("copy"), 5),
+            ("?", Some("keys"), 2),
+            ("d", Some("detach"), 0),
+        ],
+        KeyContext::Sidebar => &[
+            ("click", Some("open"), 1),
+            ("\u{25b8}", Some("fold"), 2),
+            ("drag edge", Some("resize"), 7),
+            ("ctrl-a:", None, 0),
+            ("g", Some("tree/priority"), 3),
+            ("w", Some("new space"), 2),
+            ("R", Some("rename space"), 4),
+            ("b", Some("hide column"), 5),
+            ("d", Some("detach"), 0),
+        ],
+        KeyContext::Prefix => &[
+            ("n", Some("next"), 1),
+            ("p", Some("prev"), 3),
+            ("o", Some("next pane"), 3),
+            ("c", Some("new"), 1),
+            ("x", Some("close"), 2),
+            ("r", Some("rename"), 4),
+            ("v", Some("split \u{2502}"), 4),
+            ("-", Some("split \u{2500}"), 4),
+            ("z", Some("zoom"), 5),
+            ("[", Some("copy"), 5),
+            ("e", Some("resize"), 6),
+            ("=", Some("equalize"), 7),
+            ("s", Some("space"), 3),
+            ("w", Some("new space"), 5),
+            ("R", Some("rename space"), 6),
+            ("W", Some("close space"), 7),
+            ("space", Some("find"), 1),
+            ("f", Some("fold"), 5),
+            ("F", Some("focus"), 5),
+            ("g", Some("view"), 6),
+            ("m", Some("menu"), 4),
+            ("?", Some("keys"), 2),
+            ("U", Some("update"), 7),
+            ("d", Some("detach"), 0),
+        ],
+    }
+}
+
+/// What the column can do right now, which decides which of its keys the row offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Place {
+    /// A space can fold: the tree is showing and the column is open.
+    pub fold: bool,
+    /// The column is folded away to its strip.
+    pub collapsed: bool,
+}
+
+/// The entries that are true right now: no fold where nothing folds, no divider to drag on
+/// the strip, and the strip's `b` shows the column rather than hiding it.
+fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
+    all_hints(context)
+        .iter()
+        .filter(|h| place.fold || h.1 != Some("fold"))
+        .filter(|h| !place.collapsed || h.0 != "drag edge")
+        .map(|h| {
+            if place.collapsed && h.1 == Some("hide column") {
+                (h.0, Some("show column"), h.2)
+            } else {
+                *h
+            }
+        })
+        .collect()
+}
+/// The columns one entry takes: ` [key→action]`, or ` label` for the prefix.
+fn hint_width(hint: &Hint) -> usize {
+    match hint.1 {
+        Some(action) => 4 + width::width(hint.0) + width::width(action),
+        None => 1 + width::width(hint.0),
+    }
+}
+
+/// The entries that fit in `cols`: the highest rank goes first, the latest of a rank
+/// before the earliest, and rank zero never goes, so the way out is always on the row.
+fn fitted(context: KeyContext, place: Place, cols: usize) -> Vec<Hint> {
+    let mut kept: Vec<Hint> = hints(context, place);
+    while kept.iter().map(hint_width).sum::<usize>() > cols {
+        let Some(worst) = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.2 > 0)
+            .max_by_key(|(at, h)| (h.2, *at))
+            .map(|(at, _)| at)
+        else {
+            break;
+        };
+        kept.remove(worst);
+    }
+    // Still too wide with only what never goes: the prefix label gives way to the way out.
+    if kept.iter().map(hint_width).sum::<usize>() > cols {
+        kept.retain(|h| h.1.is_some());
+    }
+    kept
+}
+
+/// The key row in brackets, `[key→action]`, in the status colours, exactly `cols` wide.
+///
+/// The key wears the brand orange so the eye finds the letters first; the arrow and
+/// brackets are quiet, the action is detail.
+fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for hint in fitted(context, place, cols) {
+        let wide = hint_width(&hint);
+        if used + wide > cols {
+            break;
+        }
+        used += wide;
+        match hint.1 {
+            None => {
+                out.push_str(&theme::status_in(theme::Role::Faint));
+                out.push(' ');
+                out.push_str(hint.0);
+            }
+            Some(action) => {
+                out.push_str(&theme::status_in(theme::Role::Rule));
+                out.push_str(" [");
+                out.push_str(&theme::status_in(theme::Role::Brand));
+                out.push_str(hint.0);
+                out.push_str(&theme::status_in(theme::Role::Faint));
+                out.push('\u{2192}');
+                out.push_str(&theme::status_in(theme::Role::Detail));
+                out.push_str(action);
+                out.push_str(&theme::status_in(theme::Role::Rule));
+                out.push(']');
+            }
+        }
+    }
+    out.push_str(&theme::status());
+    if used == 0 {
+        // Narrower than one bracketed entry: the way out, plainly, cut to what fits.
+        let plain = width::fit(" d detach", cols);
+        used = width::width(&plain);
+        out.push_str(&plain);
+    }
+    out.push_str(&" ".repeat(cols.saturating_sub(used)));
+    out
+}
 
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = 1;
@@ -551,29 +723,33 @@ pub fn paint(frame: &Frame) -> String {
     // Raised, not reverse. A full width bar of reverse video is the brightest thing on the
     // screen, and the key list is the least urgent thing on it.
     out.push_str(&theme::status());
-    // The prefix once, then the letters. Spelled out for every key it took 96 columns, and
-    // a person on an eighty column window was told about the first three commands and not
-    // about the one that gets them out.
-    //
     // A mode names its own keys, because in a mode the others do not work.
-    let keys = if frame.prompt.is_some() {
-        "enter to make it  esc to stop"
+    let mode = if frame.prompt.is_some() {
+        Some("enter to make it  esc to stop")
     } else if frame.palette.is_some() {
-        "ctrl-a space find  enter go  esc back"
+        Some("ctrl-a space find  enter go  esc back")
     } else if frame.menu.is_some() {
-        "up/down or j/k move  enter choose  esc close"
+        Some("up/down or j/k move  enter choose  esc close")
     } else if frame.reading.is_some() {
-        "any key to close"
-    } else if (frame.cols as usize) >= width::width(EVERY_KEY) {
-        // Every key when there is room for every key. On a narrower window the list is cut
-        // from the right, so the way out is not last: the cut takes the update key
-        // first, and a person stuck in here can still read the one that gets them out.
-        EVERY_KEY
+        Some("any key to close")
     } else {
-        "ctrl-a: n tab  c new  r rename  F focus  d detach  space find  m menu  ? keys  [ copy"
+        None
     };
-    // Written with ctrl-a and named on the way out, like the keys box.
-    out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize));
+    // Otherwise the keys of the place the keyboard is: the pane, the column after a click
+    // in it, or every command while `ctrl-a` waits for its letter. A short window drops
+    // the least used first and never the way out.
+    match mode {
+        // Written with ctrl-a and named on the way out, like the keys box.
+        Some(keys) => out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize)),
+        None => out.push_str(&crate::keys::named(&key_row(
+            frame.chrome.keys,
+            Place {
+                fold: frame.view == sidebar::View::Tree && !frame.collapsed,
+                collapsed: frame.collapsed,
+            },
+            frame.cols as usize,
+        ))),
+    }
     out.push_str(theme::RESET);
 
     // A picture the outer terminal cannot draw, named on the focused pane's last
@@ -2122,7 +2298,7 @@ mod tests {
         // Once on the tab and once in the column: the bar says what is open in this
         // space and the panel says what it is doing.
         assert!(painted.matches("claude").count() >= 2, "{painted:?}");
-        assert!(painted.contains("d detach"));
+        assert!(strip(&painted).contains("d\u{2192}detach"));
         assert!(painted.contains("spaces"), "no spaces panel: {painted:?}");
         assert!(
             painted.contains("app"),
@@ -2856,6 +3032,57 @@ mod tests {
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
     }
 
+    /// The key row follows the keyboard: the prefix commands in the pane, what the column
+    /// answers to after a click in it, every command while `ctrl-a` waits. Each drops its
+    /// least used entries on a short row and keeps the way out on every one.
+    #[test]
+    fn the_key_row_follows_the_keyboard_and_keeps_the_way_out() {
+        let open = Place {
+            fold: true,
+            collapsed: false,
+        };
+        let plain = |context, cols| strip(&key_row(context, open, cols));
+        let pane = plain(KeyContext::Pane, 200);
+        assert!(pane.starts_with(" ctrl-a: [space\u{2192}find]"), "{pane:?}");
+        let column = plain(KeyContext::Sidebar, 200);
+        assert!(column.contains("[click\u{2192}open]"), "{column:?}");
+        assert!(column.contains("[g\u{2192}tree/priority]"), "{column:?}");
+        let prefix = plain(KeyContext::Prefix, 200);
+        assert!(
+            !prefix.contains("ctrl-a:"),
+            "the prefix is already down: {prefix:?}"
+        );
+        assert!(prefix.contains("[z\u{2192}zoom]"), "{prefix:?}");
+        for context in [KeyContext::Pane, KeyContext::Sidebar, KeyContext::Prefix] {
+            for cols in [5usize, 10, 11, 18, 20, 40, 80, 120, 200] {
+                let row = plain(context, cols);
+                assert_eq!(width::width(&row), cols, "{context:?} at {cols}: {row:?}");
+                // Under one bracketed entry the way out is said plainly, cut to fit.
+                assert!(
+                    row.contains("d\u{2192}detach") || (cols < 11 && row.starts_with(" d")),
+                    "{context:?} at {cols}: {row:?}"
+                );
+            }
+        }
+        // The cut takes the highest rank first, the latest of a rank first: at eighty
+        // columns fold, focus and split go and the rest stay in order.
+        assert_eq!(
+            plain(KeyContext::Pane, 80).trim_end(),
+            " ctrl-a: [space\u{2192}find] [c\u{2192}new tab] [n\u{2192}next] [m\u{2192}menu] [?\u{2192}keys] [d\u{2192}detach]"
+        );
+        // Where nothing folds the row offers no fold, and the strip has no edge to drag.
+        let strip_place = Place {
+            fold: false,
+            collapsed: true,
+        };
+        let strip_row = strip(&key_row(KeyContext::Sidebar, strip_place, 200));
+        assert!(!strip_row.contains("fold"), "{strip_row:?}");
+        assert!(!strip_row.contains("drag edge"), "{strip_row:?}");
+        assert!(
+            strip_row.contains("[b\u{2192}show column]"),
+            "{strip_row:?}"
+        );
+    }
     /// The way out is the one key a person stuck in here has to be able to read, so it is
     /// never the one the cut takes.
     #[test]
@@ -2895,7 +3122,7 @@ mod tests {
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
-                keys.contains("d detach") || cols < 52,
+                keys.contains("d\u{2192}detach"),
                 "{cols} columns: no way out on the key row: {keys:?}"
             );
             assert!(
@@ -3519,7 +3746,7 @@ mod tests {
             image_notice: None,
             chrome: Default::default(),
         });
-        assert!(painted.contains("d detach"), "{painted:?}");
+        assert!(strip(&painted).contains("d\u{2192}detach"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
     }
 

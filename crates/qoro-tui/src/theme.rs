@@ -303,7 +303,7 @@ fn tab_on_fg() -> u8 {
 /// The same roles for a light background.
 ///
 /// Chosen by measuring each candidate in the 256 palette against white rather than by
-/// darkening the dark table: text at least 4.5 to 1, a state, a space, an ember step, the
+/// darkening the dark table: text at least 4.5 to 1, a state, a space, a sweep step, the
 /// mark and the tab at least 3 to 1 (they are glyphs a person finds, not sentences they
 /// read), the rule exempt because a rule is only there to be barely seen. The dark table's
 /// hue for each job is kept where the palette has a dark enough step of it: working a
@@ -326,7 +326,9 @@ const fn light_ink(role: Role) -> u8 {
         Role::Unobserved => 244,
         Role::AvatarHair(ink) => light_pet(ink),
         Role::AvatarBody(ink) => light_pet(ink),
-        Role::Ember(n) => LIGHT_EMBER_INKS[n % LIGHT_EMBER_INKS.len()],
+        // On white the sweep darkens toward black rather than brightening toward white: the
+        // quiet row is a light grey here, and emphasis on a light page is a darker ink.
+        Role::Shimmer(level) => 244 - if level > 11 { 11 } else { level },
         Role::Space(n) => LIGHT_SPACE_INKS[n % LIGHT_SPACE_INKS.len()],
     }
 }
@@ -334,10 +336,6 @@ const fn light_ink(role: Role) -> u8 {
 /// The identity wheel on white: the same six families, one step darker each (violet,
 /// teal, pure blue, olive green, deep sky, olive gold), so no space reads as a state.
 const LIGHT_SPACE_INKS: [u8; 6] = [92, 30, 20, 64, 24, 100];
-
-/// The amber wheel on white: the brand orange, then darker ambers out to brown. 130 is
-/// blocked's here, the way 208 is in the dark wheel.
-const LIGHT_EMBER_INKS: [u8; 5] = [202, 166, 136, 137, 94];
 
 /// Raised backgrounds on white: the selected row a shade under the page, the status bar
 /// a shade lighter still, the same order of depth as the dark table.
@@ -717,7 +715,7 @@ mod tests {
             .into_iter()
             .chain([Role::Brand])
             .chain((0..LIGHT_SPACE_INKS.len()).map(Role::Space))
-            .chain((0..LIGHT_EMBER_INKS.len()).map(Role::Ember))
+            .chain((1..=9).map(Role::Shimmer))
             .chain(avatar::HAIR_INKS.map(Role::AvatarHair));
         for role in found {
             let ratio = contrast(light_ink(role), WHITE);
@@ -740,7 +738,7 @@ mod tests {
 
     /// The light table keeps the dark one's rules: nothing themed, the states that want a
     /// person apart from the calm ones, spaces apart from states, chrome, the tab and the
-    /// ember wheel, and the wheel starting on the mark.
+    /// sweep.
     #[test]
     fn the_light_table_keeps_the_rules_of_the_dark_one() {
         let chrome = [
@@ -770,19 +768,15 @@ mod tests {
         distinct.dedup();
         assert_eq!(distinct.len(), states.len(), "two states share an ink");
         taken.push(LIGHT_TAB_ON_FG);
-        let ember: Vec<u8> = LIGHT_EMBER_INKS.to_vec();
+        let sweep: Vec<u8> = (1..=9).map(|n| light_ink(Role::Shimmer(n))).collect();
         for space in LIGHT_SPACE_INKS {
             assert!(
                 !taken.contains(&space),
                 "space {space} already means something"
             );
-            assert!(!ember.contains(&space), "space {space} is an ember step");
+            assert!(!sweep.contains(&space), "space {space} is a sweep step");
         }
-        assert!(!ember.contains(&LIGHT_TAB_ON_FG));
-        assert_eq!(light_ink(Role::Ember(0)), light_ink(Role::Brand));
-        for step in &ember[1..] {
-            assert!(!taken.contains(step), "ember {step} wears a taken colour");
-        }
+        assert!(!sweep.contains(&LIGHT_TAB_ON_FG));
     }
 
     #[test]

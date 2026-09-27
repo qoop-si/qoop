@@ -308,6 +308,11 @@ impl Keys {
         self.prefix
     }
 
+    /// Whether the prefix came last and the next key is a command.
+    pub fn prefix_pending(&self) -> bool {
+        self.after_prefix
+    }
+
     /// Decode one read. May return several actions, and may keep state for the next read.
     ///
     /// Ordinary bytes are coalesced into as few `Input` actions as the commands between
