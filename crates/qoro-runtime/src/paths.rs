@@ -112,6 +112,52 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("qorod.sock")
 }
 
+/// The same directory as `config_dir`, for the files a key depends on: the paired devices
+/// and the hub. `None` rather than a fallback when neither variable is set to an absolute
+/// path, because a device list written to `/tmp` or to the current directory is one anyone
+/// can edit or commit.
+pub fn strict_config_dir() -> Option<PathBuf> {
+    let base =
+        absolute_env("XDG_CONFIG_HOME").or_else(|| Some(absolute_env("HOME")?.join(".config")))?;
+    Some(base.join("qoro"))
+}
+
+/// An environment variable naming a directory, only when it is absolute. An empty or
+/// relative value is invalid by the XDG rules and, taken at face value, resolves against
+/// the current directory: a key written there could end up committed to whatever
+/// repository a person ran the command in.
+fn absolute_env(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// `$XDG_DATA_HOME/qoro`, else `~/Library/Application Support/qoro` on macOS and
+/// `~/.local/share/qoro` elsewhere: where this machine's own key lives.
+///
+/// Not the config directory on purpose. Config directories end up in dotfiles repositories,
+/// and a machine key that lands in one is a key anyone who reads the repository can use to
+/// pose as this Mac.
+pub fn data_dir() -> Option<PathBuf> {
+    if let Some(xdg) = absolute_env("XDG_DATA_HOME") {
+        return Some(xdg.join("qoro"));
+    }
+    let home = absolute_env("HOME")?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/qoro")
+    } else {
+        home.join(".local/share/qoro")
+    })
+}
+
+/// Where a running bridge listens for "look again" (the doorbell).
+///
+/// Beside the sessions, in the runtime base, so a daemon can find it from its own session
+/// directory without resolving the base again (which creates directories).
+pub fn bridge_socket(runtime: &Path) -> PathBuf {
+    runtime.join("bridge.sock")
+}
+
 /// Where every session lives.
 pub fn sessions_dir(runtime: &Path) -> PathBuf {
     runtime.join("sessions")

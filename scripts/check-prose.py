@@ -17,8 +17,8 @@ EN = "\u2013"
 # rule that is enforced over the documentation and not over the code is enforced over the
 # smaller half. `skills` and `hooks` are copied into people's own agent directories, so
 # they ship as surely as the binary does.
-roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "README.md", ".github"]
-skip = ("ref/", "target/")
+roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "mobile", "README.md", ".github"]
+skip = ("ref/", "target/", "node_modules/")
 
 fail = []
 files = []
@@ -27,7 +27,7 @@ for r in roots:
     if p.is_file():
         files.append(p)
     elif p.is_dir():
-        files.extend(x for x in p.rglob("*") if x.suffix in {".md", ".py", ".sh", ".yml", ".rs", ".js"})
+        files.extend(x for x in p.rglob("*") if x.suffix in {".md", ".py", ".sh", ".yml", ".rs", ".js", ".ts", ".tsx"})
 
 for f in files:
     if any(s in str(f) for s in skip):
@@ -47,7 +47,7 @@ for f in files:
         # A Rust doc comment is prose and is checked; the code around it is not. Everywhere
         # else a comment marker means a shell or python line, where a double hyphen is a
         # flag rather than a dash.
-        is_rust_prose = f.suffix == ".rs" and line.lstrip().startswith(("///", "//!", "//"))
+        is_rust_prose = f.suffix in {".rs", ".ts", ".tsx"} and line.lstrip().startswith(("///", "//!", "//"))
         is_code = not is_rust_prose and (
             in_fence
             or f.suffix != ".md"

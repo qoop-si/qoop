@@ -4,8 +4,8 @@ Owned by `qoro-cli` and grown with it from milestone 1 onward, so that the enume
 exists before a gate needs it rather than being invented when one does.
 
 Gate G9.1 reads this file: with the control-plane host blackholed, every subcommand here
-produces the same result as when it is reachable. Four rows are listed but not run by it:
-`qoro`, `qoro attach` and `qoro daemon` do not return, and `qoro relay` starts a daemon and then prints
+produces the same result as when it is reachable. Five rows are listed but not run by it:
+`qoro`, `qoro attach`, `qoro daemon` and `qoro bridge` do not return, and `qoro relay` starts a daemon and then prints
 whatever that daemon says to a client rather than a result of its own. They are still
 required to be here, and the gate asserts that this table and `qoro --help` name the same
 set, which is what stopped `relay` from staying undocumented after milestone 6 added it.
@@ -57,6 +57,10 @@ a claim nobody has to keep.
 | `qoro avatar show` | print the picked avatar | no |
 | `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
 | `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
+| `qoro pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |
+| `qoro devices ls` | the phones paired with this machine, with their key fingerprints | no |
+| `qoro devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
+| `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to a running session | yes |
 | `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
@@ -85,16 +89,18 @@ A word that is not a subcommand is an error naming it, not the interface: `qoro 
 says so and exits 1. Every error prints as one `qoro: ...` line on stderr and exits
 nonzero.
 
-Every row says no except one, and the one is the point: `qoro update` is the only
-subcommand that reaches the network, and only a person runs it. There is no control
-plane in the product, no background version check anywhere, and if anything else ever
-needs the network it is an addition to this table with a yes, plus a row in the gate
-saying what happens when it is unreachable.
+Three rows say yes, and each is the point of its row: `qoro update` reaches GitHub
+Releases, and `qoro pair` and `qoro bridge` reach the hub a phone uses, and only once a
+person has asked for a phone. Nothing else touches the network: no control plane, no
+background version check, and a machine that never pairs a phone never opens a
+connection to a hub. Anything else that ever needs the network is an addition to this
+table with a yes, plus a row in the gate saying what happens when it is unreachable.
 
-The gate skips the rows that say yes: with the network blackholed they fail closed
-with "cannot reach GitHub Releases", which is the same failure a person without a
-network gets, and asserting byte-identical output for them would be asserting that
-the network is reachable.
+The gate skips the rows that say yes: with the network blackholed `qoro update` fails
+closed with "cannot reach GitHub Releases" and `qoro pair` fails naming the hub it could
+not reach, leaving no key, device list or service behind; both are the failure a person
+without a network gets, and asserting byte-identical output for them would be asserting
+that the network is reachable.
 
 ## What "the same result" means
 

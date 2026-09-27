@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 mod avatar;
 mod hooks;
+mod mobile;
 mod remote;
 mod skills;
 mod supervise;
@@ -132,6 +133,9 @@ fn run() -> std::io::Result<()> {
         Some("avatar") => avatar::run(&args),
         Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
+        Some("pair") => mobile::run_pair(&args),
+        Some("devices") => mobile::run_devices(&args),
+        Some("bridge") => mobile::run_bridge(),
         Some("ls") => run_list_sessions(),
         Some("stop") => run_stop(&args, &session),
         Some("--version" | "-V") => {
@@ -196,6 +200,11 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoro avatar show  print the picked pet\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
+                 \x20 qoro pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
+                 \x20 qoro devices ls  the phones paired with this machine\n\
+                 \x20 qoro devices rm <name>  unpair one; its open streams close at once\n\
+                 \x20 qoro bridge     run the phones' end in the foreground (the service\n\
+                 \x20                 that pairing installs runs exactly this)\n\
                  \x20 qoro update [--check]  fetch the newest release, and install it when\n\
                  \x20                 nothing is live\n\
                  \x20 qoro --version\n\

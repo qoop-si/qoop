@@ -59,7 +59,10 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
         // daemons alive per run against runtime directories the test had already deleted.
         // Both are still required to be in the table, which the agreement assertion below
         // covers.
-        if matches!(args.first().map(String::as_str), Some("daemon" | "relay")) {
+        if matches!(
+            args.first().map(String::as_str),
+            Some("daemon" | "relay" | "bridge")
+        ) {
             continue;
         }
         if args.is_empty() {
@@ -164,6 +167,61 @@ fn update_fails_closed_with_the_network_gone() {
         !dir.path().join("update-available").exists(),
         "a failed check left a notice behind, and the interface would advertise a version nobody saw"
     );
+}
+
+/// `qoro pair` with the hub unreachable fails closed and leaves nothing behind: no machine
+/// key, no device list, no service. HOME and every XDG directory point at a temp dir, so a
+/// real home is never touched even if the check regressed.
+#[test]
+fn pair_fails_closed_with_the_hub_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(
+        dir.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("chmod");
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    // An installed qoro, as `scripts/install.sh` leaves one, so the run gets as far as the
+    // network rather than stopping at "install qoro first".
+    let installed = home.join(".local/bin/qoro");
+    std::fs::create_dir_all(installed.parent().expect("parent")).expect("bin dir");
+    std::os::unix::fs::symlink(qoro(), &installed).expect("symlink");
+    let out = Command::new(qoro())
+        .args(["pair", "--hub", "ws://127.0.0.1:1"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("QORO_RUNTIME_DIR", dir.path().join("rt"))
+        .output()
+        .expect("run qoro");
+    assert!(!out.status.success(), "`qoro pair` succeeded with no hub");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("127.0.0.1:1"),
+        "the failure does not say what it could not reach: {stderr}"
+    );
+    let left: Vec<_> = walk(&home)
+        .into_iter()
+        .filter(|p| p != &installed)
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a failed pairing left files behind: {left:?}"
+    );
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// A mistyped `--check` is not a request to install: it is refused before anything

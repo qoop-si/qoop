@@ -17,6 +17,9 @@ qoro-tui = { path = "../qoro-tui" }
 qoro-remote = { path = "../qoro-remote" }
 tempfile = { workspace = true }
 qoro-history = { path = "../qoro-history" }
+qoro-bridge = { path = "../qoro-bridge" }
+qoro-hub = { path = "../qoro-hub" }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 bytes = { workspace = true }
 serde = { workspace = true }

@@ -886,6 +886,30 @@ impl Daemon {
             }
         });
 
+        // Ring the bridge's doorbell, if there is a bridge: "a session just started, look
+        // again". A connect and a close, nothing written, errors ignored, on its own task so
+        // a wedged bridge can never hold up the accept loop. Rung here and not at bind,
+        // because bind is still restoring terminals and a watcher that arrived then would
+        // wait in the backlog.
+        if let Some(runtime) = self
+            .socket
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        {
+            let bell = paths::bridge_socket(runtime);
+            tokio::spawn(async move {
+                // Held open until the bridge closes it, so it can read our uid (macOS cannot
+                // once the peer is gone). Nothing is written.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    if let Ok(mut s) = tokio::net::UnixStream::connect(bell).await {
+                        let _ = tokio::io::AsyncReadExt::read(&mut s, &mut [0u8; 1]).await;
+                    }
+                })
+                .await;
+            });
+        }
+
         let mut next_client = 0u64;
         loop {
             // One failed accept is one connection, not the daemon: `?` here ended `serve`
