@@ -840,17 +840,18 @@ fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) ->
     let mut runs = vec![(at, 1, Role::Rule)];
     let rest = room.saturating_sub(crate::width::width(&tab) + 3);
     let after = match (doing, place) {
-        (Some((what, ink)), _) => Some((what, ink)),
-        (None, Some(place)) => Some((place, Role::Faint)),
+        (Some((what, ink)), _) => Some((what, ink, true)),
+        (None, Some(place)) => Some((place, Role::Faint, false)),
         (None, None) => None,
     };
-    if let Some((what, ink)) = after.filter(|_| rest >= 2) {
+    if let Some((what, ink, doing)) = after.filter(|_| rest >= 2) {
         let what = shorten_middle(&what, rest);
         let at_what = crate::width::width(&text) + 3;
         runs.push((at_what - 2, 1, Role::Rule));
-        if agent.state == "working" && c.tick > 0 {
+        if doing && agent.state == "working" && c.tick > 0 {
             // While it works and the column moves, a band of brighter greys crosses what
             // it is doing, left to right: the row says "alive" without a word for it.
+            // Only what it is doing: a worktree name is a place, and a place never moves.
             runs.extend(sweep(&what, at_what, c.tick));
         } else if ink != Role::Faint {
             runs.push((at_what, crate::width::width(&what), ink));
@@ -3499,6 +3500,32 @@ mod tests {
                 .iter()
                 .any(|(_, _, r)| matches!(r, crate::theme::Role::Shimmer(_))),
             "frame zero drew a band: {:?}",
+            row.0
+        );
+        // Working with no activity reported, mid sweep: the worktree after the tab is a
+        // place, and a place never shimmers.
+        working.activity = None;
+        let moving = column(
+            &spaces,
+            std::slice::from_ref(&working),
+            1,
+            9,
+            SWEEP_TICKS / 2,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let row = second_row(&moving, &working, CHILD_DOT_AT + 2, Some("qoro".into()));
+        assert_eq!(row.0.text.trim_end(), "     \u{2514} claude \u{b7} qoro");
+        assert!(
+            !row.0
+                .runs
+                .iter()
+                .any(|(_, _, r)| matches!(r, crate::theme::Role::Shimmer(_))),
+            "the worktree shimmered: {:?}",
             row.0
         );
     }
