@@ -66,7 +66,7 @@ fn main() {
         lines: 16,
         message: Some(message),
         hint: None,
-        view: sidebar::View::Grouped,
+        view: sidebar::View::Tree,
         seen: &seen,
         unseen: &unseen,
         palette: None,
@@ -84,6 +84,7 @@ fn main() {
         tiles: Vec::new(),
         behind: &behind,
         image_notice: None,
+        chrome: Default::default(),
     });
     print!("{painted}");
     use std::io::Write;

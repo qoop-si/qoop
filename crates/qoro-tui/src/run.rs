@@ -306,8 +306,11 @@ struct State {
     /// before either answer came back both counted the same list and both produced
     /// `space 2`, so the panel showed two rows with one name on them.
     creating: usize,
-    /// How the agents panel orders its rows: daemon order, or flat by urgency.
+    /// How the column orders its agents: the tree of spaces, or flat by urgency.
     view: sidebar::View,
+    /// The spaces folded away under their rule. Client-local like `view`: the daemon
+    /// never knows, and a space that goes away leaves this set with the next index.
+    shut: sidebar::Shut,
     /// The done rows this client has already looked at, as (terminal, generation).
     ///
     /// Client-local, like the focus itself: reading a done agent here does not
@@ -515,6 +518,9 @@ impl State {
             // the outer terminal cannot draw. `None` here keeps `frame()` pure:
             // capability is a client property, not daemon state.
             image_notice: None,
+            chrome: screen::Chrome {
+                shut: self.shut.clone(),
+            },
         }
     }
 
@@ -825,98 +831,45 @@ impl State {
         // The column, which starts at the top row and runs down to the status line.
         let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
         let column_rows = (self.lines as usize).saturating_sub(screen::STATUS);
+        // The last painted frame's clock, and frame zero of the animation: tiers move
+        // rows, the tick never does, and a click maps onto what the paint drew.
+        let column = self.column(now_unix, 0);
         let hit = if self.collapsed {
-            sidebar::rows_collapsed(
-                &self.spaces,
-                &self.rows,
-                self.space.unwrap_or_default(),
-                self.focused,
-                column_rows,
-            )
-            .into_iter()
-            .nth(within)
-            .and_then(|(_, hit)| hit)
+            sidebar::rows_collapsed(&column, column_rows)
         } else {
-            sidebar::hit_folded(
-                &self.spaces,
-                &self.rows,
-                self.space.unwrap_or_default(),
-                self.focused,
-                column_rows,
-                within,
-                self.view,
-                &self.seen_done,
-                &self.unseen_finished,
-                // The last painted frame's clock, not a fresh one: tiers move
-                // rows, and a click maps onto what the paint drew.
-                now_unix,
-                self.sidebar_width,
-                // The paint reserves art rows above the foot when a pet is
-                // picked, so the click maps onto the same layout it drew.
-                sidebar::current_avatar().as_ref(),
-            )
-        };
-        // The row between the panels answers by which half was clicked, so the column has
-        // to ask a second question the row itself cannot answer.
-        // The spaces title's `+` corner asks a second question too: the row
-        // itself is a no-op, only the corner cell makes a space.
-        let hit = hit
-            .or_else(|| {
-                (within == 0 && !self.collapsed)
-                    .then(|| sidebar::spaces_title_hit(col as usize, self.sidebar_width))?
-            })
-            .or_else(|| {
-                let rows = sidebar::rows_folded(
-                    &self.spaces,
-                    &self.rows,
-                    self.space.unwrap_or_default(),
-                    self.focused,
-                    column_rows,
-                    // Hit testing does not depend on the animation frame.
-                    0,
-                    self.view,
-                    &self.seen_done,
-                    &self.unseen_finished,
-                    now_unix,
-                    self.sidebar_width,
-                    sidebar::current_avatar().as_ref(),
-                );
-                let is_footer = rows
-                    .get(within)
-                    .is_some_and(|(line, _)| line.text.contains("menu"));
-                (is_footer && !self.collapsed)
-                    .then(|| sidebar::footer_hit(col as usize, self.sidebar_width))?
-            })
-            .or_else(|| {
-                let rows = sidebar::rows_folded(
-                    &self.spaces,
-                    &self.rows,
-                    self.space.unwrap_or_default(),
-                    self.focused,
-                    column_rows,
-                    // Hit testing does not depend on the animation frame.
-                    0,
-                    self.view,
-                    &self.seen_done,
-                    &self.unseen_finished,
-                    now_unix,
-                    self.sidebar_width,
-                    sidebar::current_avatar().as_ref(),
-                );
-                let is_agents_title = rows
-                    .get(within)
-                    .is_some_and(|(line, _)| line.text.starts_with(" agents"));
-                (is_agents_title && !self.collapsed).then(|| {
-                    sidebar::agents_title_hit(self.view, col as usize, self.sidebar_width)
-                })?
-            });
-        match hit? {
-            sidebar::Hit::Space(space) => Some(Clicked::Space(space)),
-            sidebar::Hit::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
-            sidebar::Hit::NewSpace => Some(Clicked::NewSpace),
-            sidebar::Hit::Menu => Some(Clicked::Menu),
-            sidebar::Hit::View => Some(Clicked::View),
-            sidebar::Hit::Collapse => Some(Clicked::Collapse),
+            // The paint reserves art rows above the foot when a pet is picked, so the
+            // click maps onto the same layout it drew.
+            sidebar::rows_folded(&column, column_rows, sidebar::current_avatar().as_ref())
+        }
+        .into_iter()
+        .nth(within)
+        .and_then(|(_, hit)| hit)?;
+        // A row that does two things answers with the row; the column decides which.
+        match sidebar::act(hit, col as usize, &column, self.collapsed)? {
+            sidebar::Act::Space(space) => Some(Clicked::Space(space)),
+            sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
+            sidebar::Act::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
+            sidebar::Act::NewSpace => Some(Clicked::NewSpace),
+            sidebar::Act::Menu => Some(Clicked::Menu),
+            sidebar::Act::View => Some(Clicked::View),
+            sidebar::Act::Collapse => Some(Clicked::Collapse),
+        }
+    }
+
+    /// The pieces the left column is drawn from, at a given clock and animation frame.
+    fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
+        sidebar::Column {
+            spaces: &self.spaces,
+            agents: &self.rows,
+            focused_space: self.space.unwrap_or_default(),
+            focused_terminal: self.focused,
+            tick,
+            view: self.view,
+            seen: &self.seen_done,
+            unseen: &self.unseen_finished,
+            now_unix,
+            width: self.sidebar_width,
+            shut: &self.shut,
         }
     }
 
@@ -1071,7 +1024,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ),
     ("resize panes", "e", "h j k l move the nearest divider"),
     ("equalize panes", "=", "every pane the same share"),
-    ("toggle agents view", "g", "agents grouped or by urgency"),
+    ("toggle view", "g", "spaces as a tree or agents by urgency"),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "what this daemon is set to"),
     (
@@ -1369,7 +1322,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             equalize(state);
             MenuSend::Nothing
         }
-        "toggle agents view" => {
+        "toggle view" => {
             state.view = state.view.toggle();
             MenuSend::Nothing
         }
@@ -2500,6 +2453,7 @@ fn copy_cursor(state: &State) -> Option<(usize, usize)> {
 /// What the interface drew where a person clicked.
 enum Clicked {
     Menu,
+    Fold(i64),
     View,
     Collapse,
     Space(i64),
@@ -2610,6 +2564,8 @@ where
         done: false,
 
         view: sidebar::View::default(),
+
+        shut: sidebar::Shut::new(),
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
         tick: 0,
@@ -3460,6 +3416,12 @@ where
                                         state.menu = Some(0);
                                         dirty = true;
                                     }
+                                    Some(Clicked::Fold(space)) => {
+                                        if !state.shut.remove(&space) {
+                                            state.shut.insert(space);
+                                        }
+                                        dirty = true;
+                                    }
                                     Some(Clicked::View) => {
                                         state.view = state.view.toggle();
                                         dirty = true;
@@ -3880,6 +3842,19 @@ where
                             }
                             Action::ToggleView => {
                                 state.view = state.view.toggle();
+                                dirty = true;
+                            }
+                            // Only in the tree, and only a space with agents in it: a fold with
+                            // nothing under it shows nothing, and would hide the first agent that
+                            // arrives later without anybody having seen it fold.
+                            Action::FoldSpace => {
+                                if let Some(space) = state.space
+                                    && state.view == sidebar::View::Tree
+                                    && state.rows.iter().any(|a| a.agent && a.workspace == space)
+                                    && !state.shut.remove(&space)
+                                {
+                                    state.shut.insert(space);
+                                }
                                 dirty = true;
                             }
                             Action::Focus => {
@@ -5438,6 +5413,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 }
             }
             state.spaces = workspaces;
+            // A fold outlives nothing it folded: a space that went away takes its fold
+            // with it, so a later space reusing the id does not start folded.
+            let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
+            state.shut.retain(|id| live.contains(id));
             *dirty = true;
         }
         ControlResponse::WorkspaceCreated { workspace, .. } => {
@@ -6198,6 +6177,8 @@ mod tests {
             done: false,
 
             view: sidebar::View::default(),
+
+            shut: sidebar::Shut::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6646,6 +6627,8 @@ mod tests {
             creating: 0,
 
             view: sidebar::View::default(),
+
+            shut: sidebar::Shut::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -6732,6 +6715,8 @@ mod tests {
             reading: None,
 
             view: sidebar::View::default(),
+
+            shut: sidebar::Shut::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
             tick: 0,
@@ -7408,7 +7393,7 @@ mod tests {
                 "copy mode",
                 "resize panes",
                 "equalize panes",
-                "toggle agents view",
+                "toggle view",
                 "keybinds",
                 "settings",
                 "reload manifests",
@@ -7483,7 +7468,7 @@ mod tests {
         // View flips locally and sends nothing.
         let view = MENU
             .iter()
-            .position(|(n, _, _)| *n == "toggle agents view")
+            .position(|(n, _, _)| *n == "toggle view")
             .unwrap();
         let before = state.view;
         assert!(matches!(

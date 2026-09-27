@@ -1,13 +1,11 @@
-//! The left column: the spaces above, the agents below.
+//! The left column: who needs a person on top, then every space with its agents under it.
 //!
-//! Two panels and not one list, because the two questions a person asks of this column are
-//! different questions. "Which project am I in" is answered by a short list that barely
-//! changes, and "who needs me" is answered by a long list that changes constantly. Stacked,
-//! the short list stays put while the long one moves under it, so the eye keeps its place.
-//!
-//! The agents panel crosses spaces on purpose. An agent that blocked in a space a person is
-//! not looking at is exactly the one they need to be told about, and a panel that only
-//! listed the current space would hide it until they went looking.
+//! One column and not two panels. The two questions a person asks of it are still two
+//! questions, and each keeps a place of its own: "who needs me" is the pin at the top,
+//! which crosses spaces on purpose and exists only while somebody does, and "which
+//! project am I in" is the tree below it, one rule per space with that space's agents
+//! under it. An agent that blocked in a space a person is not looking at is exactly the
+//! one they need to be told about, so the pin lists it even when its space is folded.
 //!
 //! An agent's first row opens with its state dot, painted in the state's
 //! own colour through [`Line::indicator`]. The caller paints the raised
@@ -22,24 +20,26 @@ use qoro_runtime::control::{AgentRow, WorkspaceRow};
 /// The colour travels with the text because the state is known here: a painter that had to
 /// parse the state back out of the string it was handed would be reading text this module
 /// just finished writing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line {
     pub text: String,
     /// What this row is, which is what decides how it is painted. `None` for a row with
     /// nothing to say about itself, which the painter draws as ordinary text.
     pub colour: Option<crate::theme::Role>,
     /// A run inside the row painted in a role of its own: the column it starts at, how
-    /// many columns it covers, and what it is.
-    ///
-    /// One run and not a general list of them, because there is exactly one thing on a row
-    /// that is not about the row's own state: the name of the space it belongs to, in that
-    /// space's colour. A row saying two things in two colours would be a row a person
-    /// parses rather than reads.
+    /// many columns it covers, and what it is. The name of a space, in that space's
+    /// colour, wherever a row names one.
     pub accent: Option<(usize, usize, crate::theme::Role)>,
     /// The row's opening sign: the state dot at the start of an agent's
-    /// first row, in the state's own colour. `None` on every other row:
-    /// selection is the raised background the painter adds, never a mark.
+    /// row, or the fold arrow of a space rule, in the colour of the state it
+    /// speaks for. Selection is the raised background the painter adds, never a mark.
     pub indicator: Option<(usize, usize, crate::theme::Role)>,
+    /// Any further runs: the dashes of a space rule, a count, a quiet worktree name, a
+    /// sweeping activity. The painter merges them with the two above by column; runs
+    /// never overlap by construction. Still few per row: a row saying five things in
+    /// five colours is a row a person parses rather than reads, so every run here is
+    /// quieter than the row's own text or the same state colour the dot already wears.
+    pub runs: Vec<(usize, usize, crate::theme::Role)>,
 }
 
 /// The colour a state earns.
@@ -91,19 +91,29 @@ pub const SIDEBAR_MAX: usize = 36;
 /// on a narrow window rather than a last resort.
 pub const COLLAPSED: usize = 4;
 
-/// Titles, which are rows of the panels and not decoration the caller adds.
+/// Titles, which are rows of the column and not decoration the caller adds.
 ///
-/// A person opening this for the first time sees two lists of names with nothing saying
+/// A person opening this for the first time sees lists of names with nothing saying
 /// what either is. Keeping the titles inside the returned rows also keeps the arithmetic in
 /// one place: a caller that drew its own titles would have to know how many rows this
 /// function had already spent on them.
 const SPACES_TITLE: &str = "spaces";
-const AGENTS_TITLE: &str = "agents";
+const PIN_TITLE: &str = "needs you";
 
-/// The column a space's name starts at in the spaces panel: one leading space.
-/// No focus mark: the keyboard's row is the raised background alone, so a
-/// screenshot, a test assertion and a pipe into a file all answer the same.
-const SPACE_NAME_AT: usize = 1;
+/// The most agents the pin lists before it says how many more there are.
+///
+/// Five: the pin is a place to glance at, and past five rows it is a second list
+/// competing with the tree for the column. The rest are counted, and every one of them
+/// is still a row in its space below.
+const PIN_MOST: usize = 5;
+
+/// Where an agent's dot sits under its space rule: three columns in, so the dot lines
+/// up under the space name the rule carries.
+const CHILD_DOT_AT: usize = 3;
+
+/// The columns of a space rule a click folds with: the leading dash, the arrow and the
+/// space after it. Anywhere else on the rule moves to the space.
+pub const FOLD_CELLS: usize = 3;
 
 /// The state dot at the start of an agent's first row: one leading space,
 /// then the dot. The dot says the state in the state's own colour, so no
@@ -118,8 +128,6 @@ const DOT: char = '\u{25cf}';
 const FAILED_DOT: char = '\u{25c6}';
 /// The column the state dot sits at: one leading space.
 const DOT_AT: usize = 1;
-/// Columns the state dot covers: one glyph, one column.
-const DOT_LEN: usize = 1;
 
 /// Which mark a state dot wears: the diamond for failed, the circle for the rest.
 ///
@@ -139,50 +147,51 @@ fn dot_glyph(role: crate::theme::Role) -> char {
 /// is false.
 const UNNAMED: &str = "agent";
 
-/// The percentage of the column the spaces panel holds, its title and the blank rows under
-/// it included.
-///
-/// A little under half. The spaces list is short and barely changes, the agents list is
-/// long and changes constantly, so the growing one gets the larger half and the anchored
-/// one gets a place that does not move.
-const SPACES_TOP_SHARE: usize = 45;
-
-/// Blank rows held under the spaces, so the panel below starts somewhere of its own.
-const BREATHE: usize = 2;
-
-/// The fewest rows the spaces panel takes, its title included, however few spaces there
-/// are. Below this the two panels stop reading as two.
-const SPACES_FLOOR: usize = 4;
-
 /// What the left column drew on one screen row, so a click can act on it.
+///
+/// One answer per row. The rows that do two things answer with the row, and the
+/// column a click landed on decides which, through [`act`]: a space rule folds at its
+/// arrow and moves to the space anywhere else, the title flips the order at its word and
+/// makes a space at its `+`, the foot opens the menu at its word and folds the column
+/// anywhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Space(i64),
     Terminal(u32),
-    /// The `+` at the corner of the spaces title: a space, named first.
+    /// The `spaces` title, with the order word and the `+` at its right.
+    Title,
+    /// The foot of the column: the brand, `menu`, and the mark that folds the column.
+    Foot,
+}
+
+/// What a click on the column asks for, once the column it landed on is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    Space(i64),
+    /// Fold a space's agents away under its rule, or open them again.
+    Fold(i64),
+    Terminal(u32),
+    /// The `+` of the title: a space, named first.
     NewSpace,
-    /// The `menu` at the foot of the spaces panel: everything that is not a space, a tab or an agent.
-    Menu,
-    /// The `grouped` or `priority` word at the corner of the agents title:
-    /// the order the rows below are in, and the switch that flips it.
+    /// The `tree` or `priority` word of the title: the order below, and its switch.
     View,
-    /// The mark at the foot of the column: fold the whole column away, and back.
+    /// Everything that is not a space, a tab or an agent.
+    Menu,
+    /// Fold the whole column away to its strip, and back.
     Collapse,
 }
 
-/// How the agents panel orders its rows: daemon order, or flat by urgency.
+/// How the column orders its agents: the tree of spaces, or flat by urgency.
 ///
-/// Grouped is the panel a person already knows: the daemon's order, kept
-/// across state changes, so a row never moves under the eye. Priority is the
-/// same rows sorted so the one that needs a person is always on top: the
-/// inbox view of the fleet. Both are flat lists: the state dot carries the
-/// state, and no header tree sits above calm rows. The title names the order.
-/// Toggled with `ctrl-a g`, or with a click on the `grouped`/`priority` word
-/// itself.
+/// Tree is the column a person already knows: every space as a rule with its agents
+/// under it in the daemon's order, kept across state changes, so a row never moves
+/// under the eye. Priority is the same agents in one list sorted so the one that
+/// needs a person is always on top: the inbox view of the fleet. The title names the
+/// order. Toggled with `ctrl-a g`, or with a click on the `tree`/`priority` word itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
     #[default]
-    Grouped,
+    Tree,
     Priority,
 }
 
@@ -190,11 +199,17 @@ impl View {
     /// The other one: a toggle carries no state of its own.
     pub fn toggle(self) -> View {
         match self {
-            View::Grouped => View::Priority,
-            View::Priority => View::Grouped,
+            View::Tree => View::Priority,
+            View::Priority => View::Tree,
         }
     }
 }
+
+/// The spaces whose agents a person folded away under their rule.
+///
+/// Client-local, like the column's own fold and the order: folding a space here does
+/// not fold it for another client. Pruned by the caller when a space goes away.
+pub type Shut = std::collections::BTreeSet<i64>;
 
 /// The done rows a person has already looked at, as (terminal, generation).
 ///
@@ -231,8 +246,7 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
 ///
 /// A daemon `done` nobody looked at, or an idle or done row that finished
 /// while the keyboard was away. The focused row is never new: standing on it
-/// is reading it. Same sage dot as `done`, no new theme; the folded panel
-/// lists it under its own open `new` header.
+/// is reading it. Same sage dot as `done`, no new theme, and the pin lists it.
 pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
     if agent.terminal == focused {
         return false;
@@ -362,476 +376,592 @@ pub fn wants_tick(rows: &[AgentRow], now_unix: i64) -> Option<i64> {
         .min()
 }
 
-/// Both panels of the left column, painted into `height` rows.
+/// Everything the column is drawn from, besides the rows it is given.
 ///
-/// Always exactly `height` lines of exactly [`WIDTH`] columns, so the caller can paint them
+/// One value and not a dozen arguments: the paint, the hit test and the strip all read
+/// the same pieces, and a list of loose arguments is how two of them came to disagree
+/// about which order the pieces went in.
+#[derive(Clone, Copy, Debug)]
+pub struct Column<'a> {
+    pub spaces: &'a [WorkspaceRow],
+    pub agents: &'a [AgentRow],
+    pub focused_space: i64,
+    pub focused_terminal: u32,
+    /// The animation frame. Hit testing passes zero: where a row is never depends on it.
+    pub tick: u64,
+    pub view: View,
+    pub seen: &'a Seen,
+    pub unseen: &'a Unseen,
+    /// Paint-time unix seconds, read once per frame by the caller so one paint never
+    /// disagrees with itself.
+    pub now_unix: i64,
+    /// The live column width, at or above [`SIDEBAR_MIN`] on the live path.
+    pub width: usize,
+    pub shut: &'a Shut,
+}
+
+/// One row of the column, and what a click on it means.
+type Row = (Line, Option<Hit>);
+
+/// Whether a row wants a person: blocked, failed, or finished while nobody looked.
+///
+/// One answer for every place that asks: the pin at the top of the column, the colour of
+/// a folded space's arrow, and the status line's triage.
+pub fn needs_person(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
+    matches!(agent.state.as_str(), "blocked" | "failed") || is_new(agent, focused, seen, unseen)
+}
+
+/// The most urgent row among `rows` that wants a person, the first one on a tie: blocked,
+/// then failed, then finished while nobody looked. One answer for the pin, a folded
+/// space's arrow, the strip and the status line's triage.
+pub fn most_urgent<'a>(
+    rows: impl IntoIterator<Item = &'a AgentRow>,
+    focused: u32,
+    seen: &Seen,
+    unseen: &Unseen,
+) -> Option<&'a AgentRow> {
+    rows.into_iter()
+        .filter(|a| needs_person(a, focused, seen, unseen))
+        .fold(None, |best: Option<&AgentRow>, a| match best {
+            Some(b)
+                if priority_of(b, focused, seen, unseen)
+                    <= priority_of(a, focused, seen, unseen) =>
+            {
+                Some(b)
+            }
+            _ => Some(a),
+        })
+}
+
+/// The colour the most urgent of `rows` lends a folded space: its state's own, or done's
+/// sage for news. `None` when nobody among them wants a person.
+fn urgent_ink(c: &Column, rows: &[&AgentRow]) -> Option<crate::theme::Role> {
+    most_urgent(rows.iter().copied(), c.focused_terminal, c.seen, c.unseen).map(|a| {
+        if is_new(a, c.focused_terminal, c.seen, c.unseen) {
+            crate::theme::of("done")
+        } else {
+            crate::theme::of(&a.state)
+        }
+    })
+}
+
+/// The open column, painted into `height` rows: the pin, the title, the tree or the
+/// priority list, the pet and the foot.
+///
+/// Always exactly `height` lines of exactly `width` columns, so the caller can paint them
 /// blindly: a short line would leave the previous frame's pixels behind, and a long one
 /// would spill into the terminal on the right.
 ///
-/// Neither `focused_space` nor `focused_terminal` need appear in the lists. The daemon's
-/// answer and the client's idea of what has the keyboard are two messages that can cross,
-/// and a client that panicked on the overlap would die exactly when a terminal exited.
-pub fn render(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
+/// Shared by the paint and the hit test, so a click lands on the row a person aimed at
+/// by construction: the same function built both answers.
+pub(crate) fn rows_folded(
+    c: &Column,
     height: usize,
-) -> Vec<Line> {
-    rows(spaces, agents, focused_space, focused_terminal, height)
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+) -> Vec<Row> {
+    if height == 0 {
+        return Vec::new();
+    }
+    // The foot and the pet over it are taken first, so the list above is laid out in the
+    // rows that are really its own and a scroll never keeps the focused row under the pet.
+    let pet = if avatar_fits(height, c.width, avatar.is_some()) {
+        qoro_runtime::avatar::ART_ROWS
+    } else {
+        0
+    };
+    let room = height - 1 - pet;
+    let mut out: Vec<Row> = Vec::with_capacity(height);
+    // Who needs a person, across every space, in the tree only: the priority list is
+    // already that list, and a pin over it would say everything twice.
+    if c.view == View::Tree {
+        out.extend(pin(c, room));
+    }
+    if out.len() < room {
+        out.push((title_line(c), Some(Hit::Title)));
+    }
+    let body = room - out.len();
+    out.extend(window(content(c), body, c, c.width));
+    for _ in 0..pet {
+        out.push(blank(c.width));
+    }
+    out.push(collapse_row_with(
+        false,
+        c.width,
+        avatar,
+        update_available().as_deref(),
+    ));
+    out
+}
+
+/// The open column as lines alone, for a caller that paints and never clicks.
+pub fn render_folded(c: &Column, height: usize) -> Vec<Line> {
+    rows_folded(c, height, None)
         .into_iter()
         .map(|(line, _)| line)
         .collect()
 }
 
-/// Both panels of the left column, painted into `height` rows.
+/// The pin: who needs a person, most urgent first, with the space each one is in.
 ///
-/// Same contract as [`render`]: exactly `height` lines of exactly `width`
-/// columns. One flat list: every agent draws its rows, nothing folds and no
-/// group header sits above calm rows.
-///
-/// Eight arguments and not a context struct: every caller already holds each
-/// piece separately, and a struct would move the same list one line down.
-///
-/// Ten with the clock: paint-time unix seconds, read once per frame by the
-/// caller so one paint never disagrees with itself.
-///
-/// Eleven with the width: the live panel width, defaulting to [`WIDTH`] on
-/// the legacy surface below.
-#[allow(clippy::too_many_arguments)]
-pub fn render_folded(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-    tick: u64,
-    view: View,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-) -> Vec<Line> {
-    rows_folded(
-        spaces,
-        agents,
-        focused_space,
-        focused_terminal,
-        height,
-        tick,
-        view,
-        seen,
-        unseen,
-        now_unix,
-        width,
-        None,
-    )
-    .into_iter()
-    .map(|(line, _)| line)
-    .collect()
-}
-
-/// What a click on one screen row of the left column means, counted from zero.
-///
-/// `None` for a title and for a blank row, so a click on the word `agents` does nothing
-/// rather than something arbitrary.
-pub fn hit(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-    row: usize,
-) -> Option<Hit> {
-    rows(spaces, agents, focused_space, focused_terminal, height)
-        .into_iter()
-        .nth(row)
-        .and_then(|(_, hit)| hit)
-}
-
-/// What a click on one screen row of the column means, counted from zero.
-///
-/// Ten arguments, like [`render_folded`]: same pieces, same reason. The
-/// clock rides along so a click maps onto the rows the paint drew: tiers
-/// and recency move rows, and a hit test on a different clock could aim at
-/// the row above the one meant.
-#[allow(clippy::too_many_arguments)]
-pub fn hit_folded(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-    row: usize,
-    view: View,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-    avatar: Option<&qoro_runtime::avatar::Avatar>,
-) -> Option<Hit> {
-    rows_folded(
-        spaces,
-        agents,
-        focused_space,
-        focused_terminal,
-        height,
-        // Hit testing does not depend on the animation frame.
-        0,
-        view,
-        seen,
-        unseen,
-        now_unix,
-        width,
-        avatar,
-    )
-    .into_iter()
-    .nth(row)
-    .and_then(|(_, hit)| hit)
-}
-
-/// Every row of the column, with what a click on it means.
-///
-/// One function and not two, because [`render`] and [`hit`] have to agree on every row and
-/// the same scrolling sum written out twice is how a click lands on the row above the one a
-/// person aimed at. Building the answer once makes the agreement true by construction, and
-/// the test below only has to confirm it.
-fn rows(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    if height == 0 {
+/// Nothing at all while nobody does, so a calm fleet gives the whole column to the tree.
+/// At most half the rows it is offered and at most [`PIN_MOST`] agents; past that it
+/// counts the rest. Every agent listed here is also a row under its own space.
+fn pin(c: &Column, room: usize) -> Vec<Row> {
+    let mut needing: Vec<&AgentRow> = c
+        .agents
+        .iter()
+        // The agent the keyboard is on is not repeated: it is on screen already, and a
+        // second raised row for it would be a second place the keyboard seems to be.
+        .filter(|a| {
+            a.agent
+                && a.terminal != c.focused_terminal
+                && needs_person(a, c.focused_terminal, c.seen, c.unseen)
+        })
+        .collect();
+    // A title, one agent and the rule under them, or nothing: a pin that cannot show
+    // one agent is a title with nothing under it.
+    let budget = room / 2;
+    if needing.is_empty() || budget < 3 {
         return Vec::new();
     }
-    // The unfolded panel shows every agent, so what it wants is a title and two
-    // lines each.
-    let wanted = 1 + 2 * agents.iter().filter(|a| a.agent).count();
-    let split = spaces_rows(spaces.len(), height, wanted);
-    // The legacy surface paints at the default width: production goes
-    // through `rows_folded` with the live width.
-    let mut out = spaces_panel(spaces, focused_space, split, WIDTH);
-    // A rule between the panels, glued to both like a border, so the column
-    // reads as two stacked boxes. It takes its row from the agents side, and
-    // only when the agents side keeps at least its title: a divider that ate
-    // the title would divide nothing from nothing.
-    let rest = height - split;
-    if rest >= 2 {
-        out.push(divider(WIDTH));
-        out.extend(agents_panel(spaces, agents, focused_terminal, rest - 1));
+    // Stable, so the daemon's order breaks every tie and rows do not trade places.
+    needing.sort_by_key(|a| priority_of(a, c.focused_terminal, c.seen, c.unseen));
+    let total = needing.len();
+    let fits = (budget - 2).min(PIN_MOST);
+    // Past what fits, the last row counts the rest, unless the pin has room for one
+    // agent only: then it shows that agent and the title's count says the rest.
+    let shown = if total <= fits || fits == 1 {
+        total.min(fits)
     } else {
-        out.extend(agents_panel(spaces, agents, focused_terminal, rest));
-    }
-    out
-}
-
-/// How many rows the spaces panel gets, its title included.
-///
-/// A share of the column, held whether or not the spaces fill it, so the two panels sit in
-/// the same places on every screen. Content hugging put the whole column in a clump at the
-/// top with the rest of it black: the agents panel moved up and down as spaces came and
-/// went, and a list whose heading moves is a list a person has to find before they can
-/// read it. The blank rows under the spaces are not waste, they are what makes the agents
-/// panel a place.
-///
-/// It still shrinks to what is needed when what is needed is less than the share, but only
-/// on a column too short to give both panels room: below that a fixed share would leave a
-/// two line agents panel under eight blanks.
-fn spaces_rows(spaces: usize, height: usize, agents_wanted: usize) -> usize {
-    // The column divides at a share of its height, so the lower panel is a place: its
-    // heading sits in the same row whatever is in the upper one. Hugging the content
-    // instead put both panels in a clump at the top with the rest of the column black,
-    // and moved the agents heading up and down as spaces came and went, which is a
-    // heading a person has to find before they can read it.
-    //
-    // The share yields when the lower panel actually needs the room. That is the one that
-    // grows, and a division holding its half while nine agents scrolled underneath would
-    // be a place bought at the price of the thing it is a place for.
-    let share = (height * SPACES_TOP_SHARE / 100).max(1);
-    // Never less than what the spaces themselves need, plus room to breathe under them,
-    // and never demanding more than the share on their behalf: the list scrolls inside
-    // whatever it gets, so thirty spaces do not get to ask for thirty rows.
-    let least = (1 + spaces + BREATHE)
-        .min(share)
-        .max(SPACES_FLOOR)
-        .min(height);
-    let most = height.saturating_sub(agents_wanted + 1).max(least);
-    share.max(least).min(most).min(height)
-}
-
-/// The spaces panel: its title, then one row per space, scrolled to keep the focused one on
-/// screen and padded out to the rows it was given.
-///
-/// The `+` at the title's right corner makes a space directly: the same
-/// naming box `ctrl-a w` opens, without the key first.
-fn spaces_panel(
-    spaces: &[WorkspaceRow],
-    focused: i64,
-    height: usize,
-    width: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let mut out = vec![(spaces_title(width), None)];
-    // The last row of this panel is the two things that are not a space: starting one more
-    // terminal, and everything else. They sit at the foot of the upper panel rather than in
-    // a bar of their own, because the column has two panels and a third strip would be a
-    // third place to look.
-    let footer = usize::from(height > 2);
-    let window = height - 1 - footer;
-    let first = scrolled(
-        spaces.len(),
-        spaces.iter().position(|s| s.id == focused),
-        window,
-    );
-    for offset in 0..window {
-        out.push(match spaces.get(first + offset) {
-            Some(space) => (
-                Line {
-                    // No state colour on the row: a workspace has no state to have one
-                    // about. Its name carries its own colour instead, which is the same
-                    // colour the agents panel puts on the space name there.
-                    // No focus mark: the selected row is the raised background
-                    // alone, so there is no hollow circle on every row and no
-                    // filled white dot on the selected one.
-                    text: fit(&format!(" {}", space.name), width),
-                    colour: None,
-                    accent: Some((
-                        SPACE_NAME_AT,
-                        crate::width::width(&space.name),
-                        crate::theme::space_of(space.id),
-                    )),
-                    indicator: None,
-                },
-                Some(Hit::Space(space.id)),
+        fits - 1
+    };
+    let count = total.to_string();
+    let mut out = vec![(
+        Line {
+            text: format!(
+                "{}{count} ",
+                fit_to(
+                    &format!(" {PIN_TITLE}"),
+                    c.width.saturating_sub(crate::width::width(&count) + 1)
+                )
             ),
-            None => blank(width),
-        });
+            colour: Some(crate::theme::Role::Title),
+            ..Line::default()
+        },
+        None,
+    )];
+    for agent in needing.iter().take(shown) {
+        out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
     }
-    if footer == 1 {
-        out.push(footer_row(width));
-    }
-    out
-}
-
-/// The agents panel: its title, then two rows per agent, scrolled to keep the
-/// focused one's first row on screen.
-///
-/// Terminals that are not running an agent are dropped here and only here. They are still
-/// tabs, because a person needs to reach the shell they opened, but they are not something
-/// that can want attention, and a panel that listed them would bury the rows that do.
-///
-/// The row's own flag decides, not its state. Filtering on the state string instead looked
-/// the same until a shell ran a command nobody has detection rules for, at which point its
-/// state became `unknown` and the row vanished from the panel mid task, which reads as a
-/// terminal that died.
-fn agents_panel(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused: u32,
-    height: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let mut out = vec![(title(AGENTS_TITLE, WIDTH), None)];
-    let body = height - 1;
-    if body == 0 {
-        return out;
-    }
-    let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
-    if listed.is_empty() {
-        // Said, rather than left as a void. An empty panel under a title reads as a panel
-        // that is broken; an empty panel that says what would go in it reads as a panel
-        // waiting for one.
+    if shown < total && fits > 1 {
         out.push((
             Line {
-                text: fit(" no agents yet", WIDTH),
+                text: fit(&format!("   +{} more", total - shown), c.width),
                 colour: Some(crate::theme::Role::Faint),
-                accent: None,
-                indicator: None,
+                ..Line::default()
             },
             None,
         ));
-        while out.len() < height {
-            out.push(blank(WIDTH));
-        }
-        return out;
     }
-    // Two rows per agent, so the window is twice the rows there are. The scroll
-    // keeps the focused agent's first row on screen with room for its second:
-    // a focused pair split across the foot of the panel reads as one agent
-    // becoming two.
-    let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
-    for agent in &listed {
-        // The unfolded panel does not animate: it is the test-facing surface,
-        // and frame zero is the spinner's opening frame. The live folded panel
-        // below spends the real tick. Tiers need a clock this surface does
-        // not take, so it paints at zero, where no positive stamp can read
-        // as stale.
-        push_agent_lines(
-            &mut content,
-            spaces,
-            agent,
-            focused,
-            0,
-            &Seen::new(),
-            &Unseen::new(),
-            0,
-            WIDTH,
-        );
-    }
-    let focus_row = content
-        .iter()
-        .position(|(_, hit)| *hit == Some(Hit::Terminal(focused)));
-    let first = match focus_row {
-        Some(i) if content.len() > body => i
-            .saturating_sub(body.saturating_sub(2))
-            .min(content.len() - body),
-        _ => 0,
-    };
-    for offset in 0..body {
-        match content.get(first + offset) {
-            Some(row) => out.push(row.clone()),
-            None => out.push(blank(WIDTH)),
-        }
-    }
-    out.truncate(height);
+    out.push(divider(c.width));
     out
 }
 
-/// The two rows an open agent takes, with what a click on either means.
+/// The title: `spaces` on the left, the order word and the `+` on the right.
+fn title_line(c: &Column) -> Line {
+    let right = format!("{} +", title_mode(c.view));
+    Line {
+        text: format!(
+            "{}{right}",
+            fit_to(
+                &format!(" {SPACES_TITLE}"),
+                c.width.saturating_sub(crate::width::width(&right))
+            )
+        ),
+        colour: Some(crate::theme::Role::Title),
+        ..Line::default()
+    }
+}
+
+/// The word on the right of the title: the order the agents below are in.
+fn title_mode(view: View) -> &'static str {
+    match view {
+        View::Tree => "tree",
+        View::Priority => "priority",
+    }
+}
+
+/// Every row under the title, before it is scrolled into the rows it gets.
+fn content(c: &Column) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::new();
+    let listed = c.agents.iter().filter(|a| a.agent);
+    match c.view {
+        View::Priority => {
+            // The same agents sorted so what wants a person is on top. Recency breaks
+            // ties inside the calm ranks only (`done`, `idle`, the rest): urgency answers
+            // "who needs a person" and the second question must not reorder the first.
+            // The sort is stable, so daemon order still breaks every remaining tie, and
+            // rows without a stamp sink below stamped ones within their rank.
+            let mut ordered: Vec<&AgentRow> = listed.collect();
+            ordered.sort_by_key(|a| {
+                let rank = priority_of(a, c.focused_terminal, c.seen, c.unseen);
+                if matches!(rank, 5..=7) {
+                    match a.last_active_at_unix {
+                        Some(ts) => (rank, 0u8, std::cmp::Reverse(ts)),
+                        None => (rank, 1u8, std::cmp::Reverse(0)),
+                    }
+                } else {
+                    (rank, 0u8, std::cmp::Reverse(0))
+                }
+            });
+            for agent in ordered {
+                out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
+            }
+            if out.is_empty() {
+                // Said, rather than left as a void: an empty list under a title reads as
+                // broken, one that says what would go in it reads as waiting for one.
+                out.push((
+                    Line {
+                        text: fit(" no agents yet", c.width),
+                        colour: Some(crate::theme::Role::Faint),
+                        ..Line::default()
+                    },
+                    None,
+                ));
+            }
+        }
+        View::Tree => {
+            for space in c.spaces {
+                let kids: Vec<&AgentRow> = c
+                    .agents
+                    .iter()
+                    .filter(|a| a.agent && a.workspace == space.id)
+                    .collect();
+                let open = !c.shut.contains(&space.id);
+                out.push((rule(c, space, &kids, open), Some(Hit::Space(space.id))));
+                // A folded space still shows the agent the keyboard is on: the fold hides
+                // what a person is not looking at, never the thing they are typing into.
+                for agent in kids {
+                    if open || agent.terminal == c.focused_terminal {
+                        out.push((
+                            tree_line(c, agent, space),
+                            Some(Hit::Terminal(agent.terminal)),
+                        ));
+                    }
+                }
+            }
+            // An agent in a space the client has not heard of yet still draws, under no
+            // rule, rather than vanishing until the index catches up.
+            for agent in c
+                .agents
+                .iter()
+                .filter(|a| a.agent && !c.spaces.iter().any(|s| s.id == a.workspace))
+            {
+                out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
+            }
+        }
+    }
+    out
+}
+
+/// A space as a rule: the fold arrow, the name in the space's colour, and how many
+/// agents it holds, drawn in the rule's own grey.
 ///
-/// First the session, then where it lives: ` ● abc123ef` above
-/// `app - release`. Both rows reach the same terminal, so a click on either
-/// lands on the agent.
+/// Folded, the arrow and the count take the colour of the most urgent agent under them
+/// when that agent wants a person, so a fold never hides a blocked agent silently. Open,
+/// they stay grey: the agents are right there, wearing their own dots.
+fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
+    use crate::theme::Role;
+    let width = c.width;
+    let hot = if open { None } else { urgent_ink(c, kids) };
+    let mark = hot.unwrap_or(Role::Faint);
+    let arrow = if kids.is_empty() {
+        '\u{b7}'
+    } else if open {
+        '\u{25be}'
+    } else {
+        '\u{25b8}'
+    };
+    let count = if kids.is_empty() {
+        String::new()
+    } else {
+        kids.len().to_string()
+    };
+    // `─▾ ` then the name, a space, the dashes, and ` 2 ─` (or a last dash with no
+    // agents). The name gives way before the count and the arrow do.
+    let tail = if count.is_empty() {
+        1
+    } else {
+        crate::width::width(&count) + 3
+    };
+    let room = width.saturating_sub(FOLD_CELLS + 1 + 1 + tail);
+    let name = shorten_middle(&space.name, room);
+    let name_w = crate::width::width(&name);
+    let fill = width.saturating_sub(FOLD_CELLS + name_w + 1 + tail);
+    let dashes_at = FOLD_CELLS + name_w + 1;
+    let mut runs = vec![(0, 1, Role::Rule)];
+    let text = if count.is_empty() {
+        runs.push((dashes_at, fill + 1, Role::Rule));
+        format!("\u{2500}{arrow} {name} {}", "\u{2500}".repeat(fill + 1))
+    } else {
+        runs.push((dashes_at, fill, Role::Rule));
+        let count_at = dashes_at + fill + 1;
+        runs.push((count_at, crate::width::width(&count), mark));
+        runs.push((count_at + crate::width::width(&count) + 1, 1, Role::Rule));
+        format!(
+            "\u{2500}{arrow} {name} {} {count} \u{2500}",
+            "\u{2500}".repeat(fill)
+        )
+    };
+    Line {
+        text: fit(&text, width),
+        colour: None,
+        accent: Some((FOLD_CELLS, name_w, crate::theme::space_of(space.id))),
+        indicator: Some((1, 1, mark)),
+        runs,
+    }
+}
+
+/// The dot an agent wears, and whether its whole row goes quiet.
 ///
-/// Static: the state is the dot at the start of the first row, in the
-/// state's own colour (and failed's own diamond: shape tells failed from
-/// blocked where their oranges will not), and no state word is drawn on the
-/// right. An unread done keeps the done sage on its dot. `tick` is ignored so
-/// a still panel is byte for byte the panel it was. The keyboard's row is the
-/// raised background the painter adds; no filled dot ever marks selection.
-///
-/// One helper and not the same pushes at each caller, because the unfolded
-/// panel and the folded one have to draw the same rows for the same agent.
-///
-/// Eight arguments, like the callers: every one already holds each piece
-/// separately.
-#[allow(clippy::too_many_arguments)]
-fn push_agent_lines(
-    out: &mut Vec<(Line, Option<Hit>)>,
-    spaces: &[WorkspaceRow],
-    agent: &AgentRow,
-    focused: u32,
-    _tick: u64,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-) {
-    let hit = Some(Hit::Terminal(agent.terminal));
-    let tab = label(agent);
-    let space = spaces.iter().find(|s| s.id == agent.workspace);
-    // Line one names the session: the agent's own conversation id, and
-    // nothing else. The program never stands beside it: four rows reading
-    // `opencode` identify nothing, and the tab below already says what runs
-    // where. Static: the dot carries the state so the name keeps the row.
-    //
-    // A session longer than the row ends in an ellipsis rather than a hard
-    // cut, and only then: a session that fits keeps today's bytes exactly.
-    // The name resolves first and the column cut runs after, so an id that
-    // already ends in `…` never grows a second one.
-    let session = session_name(agent);
-    // The room the name may take: the dot and its two spaces never shrink,
-    // and a width below the prefix saturates rather than panics (public
-    // callers may pass anything; the live path only ever sends pulled
-    // widths at or above `SIDEBAR_MIN`).
-    let session = shorten_middle(&session, width.saturating_sub(3));
-    let fresh = is_new(agent, focused, seen, unseen);
-    // A derived idle-after-work keeps the done sage: it is news, not calm.
-    let dot = if fresh {
+/// News keeps the done sage: a derived idle-after-work is news, not calm. A stale idle
+/// row dims as a whole, but only off focus and only when it is not news: standing on it
+/// is reading it, and news never shows faded.
+fn dot_of(c: &Column, agent: &AgentRow) -> (crate::theme::Role, bool) {
+    let fresh = is_new(agent, c.focused_terminal, c.seen, c.unseen);
+    let stale = !fresh
+        && agent.terminal != c.focused_terminal
+        && tier_of(&agent.state, agent.last_active_at_unix, c.now_unix) == Some(Tier::Stale);
+    let role = if stale {
+        crate::theme::Role::Faint
+    } else if fresh {
         crate::theme::of("done")
     } else {
         crate::theme::of(&agent.state)
     };
-    // A stale idle row dims as a whole, but only off focus and only when it
-    // is not news: standing on it is reading it, and news never shows faded.
-    // The space accent is identity and never dims with the state: where the
-    // agent lives stays readable while what it is doing goes quiet.
-    let stale = !fresh
-        && agent.terminal != focused
-        && tier_of(&agent.state, agent.last_active_at_unix, now_unix) == Some(Tier::Stale);
-    let first_colour = stale.then_some(crate::theme::Role::Faint);
-    let dot_role = if stale {
-        crate::theme::Role::Faint
-    } else {
-        dot
-    };
-    out.push((
-        Line {
-            text: fit(&format!(" {} {session}", dot_glyph(dot_role)), width),
-            colour: first_colour,
-            // The space lives on the second row now, so the first row carries
-            // no space accent: the keyboard's row is the raised background.
-            accent: None,
-            indicator: Some((DOT_AT, DOT_LEN, dot_role)),
-        },
-        hit,
-    ));
-    // Where it lives, underneath: the space and then the tab, in the quiet
-    // colour, so the first row keeps the eye and the second keeps the place.
-    // The space name starts where the first row's text starts, one column in
-    // from the dot's own indent. A space the client has not heard of yet
-    // still draws, under the tab alone, rather than vanishing until the
-    // index catches up. The space keeps its colour here, so it still wears
-    // one colour in both panels.
-    //
-    // When the terminal sits in a directory the space name does not already
-    // say, the directory's own basename joins the row between them: the
-    // worktree a session runs in, in the common case, without asking git on
-    // every frame. The middle shortens first and the space head and tab tail
-    // are never cut for it; too narrow for even that and the row is today's.
-    let place_middle: Option<String> = space.as_ref().and_then(|space| {
-        let base = cwd_basename(agent.cwd.as_deref())?;
-        (!base.eq_ignore_ascii_case(&space.name))
-            .then(|| middle_room(&space.name, &tab, width))
-            .flatten()
-            .map(|room| shorten_middle(&base, room))
-    });
-    let (place, place_accent) = match (space, place_middle) {
-        (Some(space), Some(base)) => (
-            format!("{} - {base} - {tab}", space.name),
-            Some((
-                3,
-                crate::width::width(&space.name),
-                crate::theme::space_of(agent.workspace),
-            )),
-        ),
-        (Some(space), None) => (
-            format!("{} - {tab}", space.name),
-            Some((
-                3,
-                crate::width::width(&space.name),
-                crate::theme::space_of(agent.workspace),
-            )),
-        ),
-        (None, _) => (tab.clone(), None),
-    };
-    out.push((
-        Line {
-            text: fit_to(&format!("   {place}"), width),
-            colour: Some(crate::theme::Role::Faint),
-            accent: place_accent,
-            indicator: None,
-        },
-        hit,
-    ));
+    (role, stale)
 }
 
+/// An agent under its space's rule: the dot, the session, and the directory it runs in,
+/// quietly, when that says something the space name does not.
+fn tree_line(c: &Column, agent: &AgentRow, space: &WorkspaceRow) -> Line {
+    let (role, stale) = dot_of(c, agent);
+    let lead = CHILD_DOT_AT + 2;
+    let room = c.width.saturating_sub(lead);
+    let name = shorten_middle(&session_name(agent), room);
+    let mut text = format!("{}{} {name}", " ".repeat(CHILD_DOT_AT), dot_glyph(role));
+    let mut runs = Vec::new();
+    // The worktree a session runs in, in the common case, without asking git on every
+    // frame: the directory's own basename, when it is not the space's name and there is
+    // room for more than a letter of it. The name never shortens for it.
+    let left = room.saturating_sub(crate::width::width(&name) + 1);
+    if let Some(place) = cwd_basename(agent.cwd.as_deref())
+        .filter(|base| !base.eq_ignore_ascii_case(&space.name))
+        .filter(|_| left >= 2)
+    {
+        let place = shorten_middle(&place, left);
+        runs.push((
+            crate::width::width(&text) + 1,
+            crate::width::width(&place),
+            crate::theme::Role::Faint,
+        ));
+        text.push(' ');
+        text.push_str(&place);
+    }
+    Line {
+        text: fit(&text, c.width),
+        colour: stale.then_some(crate::theme::Role::Faint),
+        accent: None,
+        indicator: Some((CHILD_DOT_AT, 1, role)),
+        runs,
+    }
+}
+
+/// An agent in a flat list, the pin or the priority view: the dot, the session, and the
+/// space it lives in on the right, in the space's own colour.
+fn flat_line(c: &Column, agent: &AgentRow) -> Line {
+    let (role, stale) = dot_of(c, agent);
+    let space = c
+        .spaces
+        .iter()
+        .find(|s| s.id == agent.workspace)
+        .map(|s| shorten_middle(&s.name, c.width / 3))
+        .unwrap_or_default();
+    let space_w = crate::width::width(&space);
+    // The dot and its two spaces, the name, a gap, the space and a trailing space.
+    let right = if space.is_empty() { 0 } else { space_w + 2 };
+    let room = c.width.saturating_sub(DOT_AT + 2 + right);
+    let name = shorten_middle(&session_name(agent), room);
+    let left = fit_to(
+        &format!("{}{} {name}", " ".repeat(DOT_AT), dot_glyph(role)),
+        c.width.saturating_sub(right),
+    );
+    let (text, accent) = if space.is_empty() {
+        (left, None)
+    } else {
+        let at = crate::width::width(&left) + 1;
+        (
+            fit(&format!("{left} {space} "), c.width),
+            Some((at, space_w, crate::theme::space_of(agent.workspace))),
+        )
+    };
+    Line {
+        text,
+        colour: stale.then_some(crate::theme::Role::Faint),
+        accent,
+        indicator: Some((DOT_AT, 1, role)),
+        runs: Vec::new(),
+    }
+}
+
+/// The rows under the title, scrolled into `body` rows and padded out to them.
+///
+/// Stateless: the window is whatever keeps the keyboard's agent on screen, its space's
+/// rule too when both fit, and the top of the list otherwise. A list that fits never
+/// scrolls, so a calm column is the same rows in the same places on every paint.
+fn window(content: Vec<Row>, body: usize, c: &Column, width: usize) -> Vec<Row> {
+    let len = content.len();
+    let first = if len <= body {
+        0
+    } else {
+        let target = content
+            .iter()
+            .rposition(|(_, hit)| *hit == Some(Hit::Terminal(c.focused_terminal)))
+            .or_else(|| {
+                content
+                    .iter()
+                    .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
+            });
+        // The last row of the target goes at the foot of the window at the latest; the
+        // rule above it stays on screen whenever the two fit together.
+        target.map_or(0, |last| (last + 1).saturating_sub(body).min(len - body))
+    };
+    let mut out: Vec<Row> = content.into_iter().skip(first).take(body).collect();
+    while out.len() < body {
+        out.push(blank(width));
+    }
+    out
+}
+
+/// What a click asks for, from the row it landed on and the column within the sidebar it
+/// landed at, counted from one.
+///
+/// `collapsed` is the strip: there every space row moves to the space and the foot
+/// opens the column again.
+pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
+    match hit {
+        Hit::Terminal(terminal) => Some(Act::Terminal(terminal)),
+        Hit::Space(id) => {
+            // The arrow folds; a rule with nothing under it has nothing to fold, so
+            // every cell of it moves to the space.
+            let folds = !collapsed
+                && c.view == View::Tree
+                && col <= FOLD_CELLS
+                && c.agents.iter().any(|a| a.agent && a.workspace == id);
+            Some(if folds { Act::Fold(id) } else { Act::Space(id) })
+        }
+        Hit::Title => {
+            // `+` is the last cell; the order word sits before the space in front of it.
+            if col == c.width {
+                return Some(Act::NewSpace);
+            }
+            let end = c.width.saturating_sub(2);
+            let start = end.saturating_sub(title_mode(c.view).len());
+            (col > start && col <= end).then_some(Act::View)
+        }
+        Hit::Foot => {
+            if collapsed {
+                return Some(Act::Collapse);
+            }
+            // `menu « ` closes the row: the word, a space, the mark and a space.
+            let end = c.width.saturating_sub(FOOT_TAIL - MENU_LABEL.len());
+            let start = end.saturating_sub(MENU_LABEL.len());
+            Some(if col > start && col <= end {
+                Act::Menu
+            } else {
+                Act::Collapse
+            })
+        }
+    }
+}
+
+/// The columns `menu « ` takes at the right of the foot.
+const FOOT_TAIL: usize = 7;
+
+const MENU_LABEL: &str = "menu";
+
+/// The column folded away to a strip: a space's number, then its agents' marks under it.
+///
+/// What a glance wants is colour and count, and both survive four columns. The names come
+/// back with the column, and the terminal gets twenty six columns in the meantime. The
+/// order is the tree's, so a mark sits under the number of the space it is in; a folded
+/// space shows only its number, and the keyboard's own agent.
+pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let strip_row = |agent: &AgentRow| {
+        let role = colour_for(&agent.state).unwrap_or(crate::theme::Role::Idle);
+        (
+            Line {
+                text: strip_agent(role),
+                colour: colour_for(&agent.state),
+                // The space mark sits on the first pad cell, never on the glyph: the glyph
+                // column keeps the state colour, so the strip carries state and space side
+                // by side instead of painting one over the other.
+                accent: Some((2, 1, crate::theme::space_of(agent.workspace))),
+                ..Line::default()
+            },
+            Some(Hit::Terminal(agent.terminal)),
+        )
+    };
+    let mut content: Vec<Row> = Vec::new();
+    for (at, space) in c.spaces.iter().enumerate() {
+        let kids: Vec<&AgentRow> = c
+            .agents
+            .iter()
+            .filter(|a| a.agent && a.workspace == space.id)
+            .collect();
+        let open = !c.shut.contains(&space.id) || kids.is_empty();
+        let number = (at + 1).to_string();
+        // A folded space says so with the rule's own arrow after its number, in the colour
+        // of whoever under it wants a person: the strip hides names, never a blocked agent.
+        let (text, indicator) = if open {
+            (strip_space(at + 1), None)
+        } else {
+            let mark = urgent_ink(c, &kids).unwrap_or(crate::theme::Role::Faint);
+            (
+                fit(&format!(" {number}\u{25b8}"), COLLAPSED),
+                Some((1 + number.len(), 1, mark)),
+            )
+        };
+        content.push((
+            Line {
+                text,
+                accent: Some((1, number.len(), crate::theme::space_of(space.id))),
+                indicator,
+                ..Line::default()
+            },
+            Some(Hit::Space(space.id)),
+        ));
+        for agent in kids {
+            if open || agent.terminal == c.focused_terminal {
+                content.push(strip_row(agent));
+            }
+        }
+    }
+    for agent in c
+        .agents
+        .iter()
+        .filter(|a| a.agent && !c.spaces.iter().any(|s| s.id == a.workspace))
+    {
+        content.push(strip_row(agent));
+    }
+    // Scrolled like the open column, so a long fleet keeps the keyboard's row reachable.
+    let mut out = window(content, height - 1, c, COLLAPSED);
+    out.push(collapse_row(true, COLLAPSED));
+    out
+}
 /// What the first row names: the agent's own conversation title, and only
 /// that. The title is what the agent calls the conversation, and it follows
 /// renames on its own because the daemon re-resolves it while the
@@ -868,21 +998,9 @@ fn cwd_basename(cwd: Option<&str>) -> Option<String> {
     Some(base.to_string())
 }
 
-/// Columns left for the middle of `space - middle - tab` once the parts that
-/// are never cut are paid for, or `None` when even the shortest middle costs
-/// more room than the row has.
-fn middle_room(space: &str, tab: &str, width: usize) -> Option<usize> {
-    // Three leading spaces and two ` - ` separators around the three names.
-    let fixed = 3 + crate::width::width(space) + 3 + 3 + crate::width::width(tab);
-    let room = width.checked_sub(fixed)?;
-    // A middle narrower than an ellipsis and one letter explains nothing;
-    // the row without it says more.
-    (room >= 2).then_some(room)
-}
-
 /// The middle shortened to `room` columns, tail-cut with an ellipsis, or the
-/// whole middle when it already fits. Called only after [`middle_room`]
-/// answered, so `room` always holds at least the ellipsis and one letter.
+/// whole middle when it already fits. A room under two columns still yields the
+/// ellipsis, which the caller's own fit then cuts to the row.
 fn shorten_middle(middle: &str, room: usize) -> String {
     if crate::width::width(middle) <= room {
         return middle.to_string();
@@ -919,148 +1037,6 @@ fn short_session(session: Option<&str>) -> Option<String> {
     } else {
         Some(base.to_string())
     }
-}
-
-/// Every row of the column, with what a click on it means.
-///
-/// Same contract as [`rows`]: [`render_folded`] and [`hit_folded`] share this one
-/// function so a click lands on the row a person aimed at by construction.
-/// Also shared with the screen painter, which needs the hits to mark the
-/// keyboard's own rows: the text alone cannot say which row is selected.
-///
-/// Eight arguments, like [`render_folded`]: same pieces, same reason, plus
-/// the paint-time clock and the live width: twelve in total.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rows_folded(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-    tick: u64,
-    view: View,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-    avatar: Option<&qoro_runtime::avatar::Avatar>,
-) -> Vec<(Line, Option<Hit>)> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let mut out = rows_open(
-        spaces,
-        agents,
-        focused_space,
-        focused_terminal,
-        height,
-        tick,
-        view,
-        seen,
-        unseen,
-        now_unix,
-        width,
-    );
-    // The pet stands on the foot: five blank rows for the overlay to stamp,
-    // taken off the list above rather than off the foot. Short or narrow
-    // columns keep every row for the list and show dots and name only.
-    if avatar_fits(height, width, avatar.is_some()) {
-        let blank = || {
-            (
-                Line {
-                    text: " ".repeat(width),
-                    colour: None,
-                    accent: None,
-                    indicator: None,
-                },
-                None,
-            )
-        };
-        let n = out.len();
-        for line in out.iter_mut().skip(n.saturating_sub(6)).take(5) {
-            *line = blank();
-        }
-    }
-    // The mark that folds the column away, at its foot, where the eye lands last.
-    if let Some(last) = out.last_mut() {
-        *last = collapse_row_with(false, width, avatar, update_available().as_deref());
-    }
-    out
-}
-
-/// The column folded away to a strip: a state mark per row, and nothing else.
-///
-/// What a glance wants is colour and count, and both survive four columns. The names come
-/// back with the column, and the terminal gets twenty six columns in the meantime.
-pub(crate) fn rows_collapsed(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    let mut out: Vec<(Line, Option<Hit>)> = Vec::new();
-    for (at, space) in spaces.iter().enumerate() {
-        if out.len() + 2 >= height {
-            break;
-        }
-        // No focus mark on the strip either: the selected row is the raised
-        // background alone. The index tells one space row from another.
-        let _ = (focused_space, focused_terminal);
-        out.push((
-            Line {
-                text: strip_space(at + 1),
-                colour: None,
-                accent: Some((1, 1, crate::theme::space_of(space.id))),
-                indicator: None,
-            },
-            Some(Hit::Space(space.id)),
-        ));
-    }
-    out.push((
-        Line {
-            text: " ".repeat(COLLAPSED),
-            colour: Some(crate::theme::Role::Rule),
-            accent: None,
-            indicator: None,
-        },
-        None,
-    ));
-    let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
-    for agent in listed {
-        if out.len() + 2 > height {
-            break;
-        }
-        let role = colour_for(&agent.state).unwrap_or(crate::theme::Role::Idle);
-        out.push((
-            Line {
-                text: strip_agent(role),
-                colour: colour_for(&agent.state),
-                // The space mark sits on the first pad cell, never on the glyph:
-                // the glyph column keeps the state colour, so the strip carries
-                // state and space side by side instead of painting one over the other.
-                accent: Some((2, 1, crate::theme::space_of(agent.workspace))),
-                indicator: None,
-            },
-            Some(Hit::Terminal(agent.terminal)),
-        ));
-    }
-    while out.len() + 1 < height {
-        out.push((
-            Line {
-                text: " ".repeat(COLLAPSED),
-                colour: None,
-                accent: None,
-                indicator: None,
-            },
-            None,
-        ));
-    }
-    if out.len() < height {
-        out.push(collapse_row(true, COLLAPSED));
-    }
-    out.truncate(height);
-    out
 }
 
 /// One row of the folded strip for an agent: the state mark, then the space's
@@ -1187,8 +1163,9 @@ fn collapse_row_with(
                 colour: Some(crate::theme::Role::Faint),
                 accent: None,
                 indicator: None,
+                runs: Vec::new(),
             },
-            Some(Hit::Collapse),
+            Some(Hit::Foot),
         );
     }
     // The foot of the column says what this is and what version of it, the way a product
@@ -1210,12 +1187,21 @@ fn collapse_row_with(
         Some(new) => format!("{VERSION}>{new} "),
         None => format!("{VERSION} "),
     };
+    // `menu « ` closes the row: the way to everything that is not a space, a tab or an
+    // agent, then the fold mark. Both always fit. The version gives way before them, and
+    // the pet's name before the version.
+    let tail = format!("{MENU_LABEL} {mark} ");
+    let fixed = crate::width::width(&brand) + 1 + crate::width::width(&tail);
+    let version = if fixed + crate::width::width(&version) <= width {
+        version
+    } else {
+        String::new()
+    };
     let name = avatar
         .as_ref()
         .map(|found| found.name())
         .unwrap_or_default();
-    let room = width
-        .saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&version) + 2 + 1);
+    let room = width.saturating_sub(fixed + crate::width::width(&version) + 1);
     let shown = if name.is_empty() || room < 5 {
         String::new()
     } else if crate::width::width(&name) <= room {
@@ -1229,13 +1215,15 @@ fn collapse_row_with(
         short
     };
     // The row is the mark and name, a space, the version and the pet name, the
-    // gap, then the fold mark and its own trailing space.
+    // gap, then the menu, the fold mark and its own trailing space.
     let mid = if shown.is_empty() {
         version
     } else {
         format!("{version}{shown} ")
     };
-    let gap = width.saturating_sub(crate::width::width(&brand) + 1 + crate::width::width(&mid) + 2);
+    let gap = width.saturating_sub(
+        crate::width::width(&brand) + 1 + crate::width::width(&mid) + crate::width::width(&tail),
+    );
     let (accent, indicator) = match avatar {
         // Two inks need two runs: the hair dot opens the row, the body dot closes
         // the opening, and the painter never overlaps them by construction.
@@ -1252,12 +1240,13 @@ fn collapse_row_with(
     };
     (
         Line {
-            text: format!("{brand} {mid}{}{mark} ", " ".repeat(gap)),
+            text: fit(&format!("{brand} {mid}{}{tail}", " ".repeat(gap)), width),
             colour: Some(crate::theme::Role::Faint),
             accent,
             indicator,
+            runs: Vec::new(),
         },
-        Some(Hit::Collapse),
+        Some(Hit::Foot),
     )
 }
 
@@ -1278,245 +1267,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn update_available() -> Option<String> {
     let seen = qoro_runtime::paths::read_update_notice()?;
     qoro_runtime::paths::is_newer_version(&seen, VERSION).then_some(seen)
-}
-
-/// The column as it is when it is not folded away.
-///
-/// Ten arguments, like [`render_folded`]: same pieces, same reason.
-#[allow(clippy::too_many_arguments)]
-fn rows_open(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused_space: i64,
-    focused_terminal: u32,
-    height: usize,
-    tick: u64,
-    view: View,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    // What the lower panel wants, asked before the column is divided. The division is a
-    // place and not a consequence of how many spaces there happen to be, but a panel that
-    // held its half while the list below it scrolled would be a place at the wrong price.
-    let (content, shown, total) = agents_content(
-        spaces,
-        agents,
-        focused_terminal,
-        tick,
-        view,
-        seen,
-        unseen,
-        now_unix,
-        width,
-    );
-    let split = spaces_rows(spaces.len(), height, content.len() + 1);
-    let mut out = spaces_panel(spaces, focused_space, split, width);
-    let rest = height - split;
-    if rest >= 2 {
-        out.push(divider(width));
-        out.extend(lay_out_agents(
-            content,
-            shown,
-            total,
-            focused_terminal,
-            rest - 1,
-            view,
-            width,
-        ));
-    } else {
-        out.extend(lay_out_agents(
-            content,
-            shown,
-            total,
-            focused_terminal,
-            rest,
-            view,
-            width,
-        ));
-    }
-    out
-}
-
-/// The agents panel: one flat list in daemon order, then by urgency in the
-/// priority view.
-///
-/// Every agent draws exactly the rows [`agents_panel`] draws for it. Nothing
-/// folds and nothing hides: the state dot carries the state.
-#[allow(clippy::too_many_arguments)]
-fn agents_content(
-    spaces: &[WorkspaceRow],
-    agents: &[AgentRow],
-    focused: u32,
-    tick: u64,
-    view: View,
-    seen: &Seen,
-    unseen: &Unseen,
-    now_unix: i64,
-    width: usize,
-) -> (Vec<(Line, Option<Hit>)>, usize, usize) {
-    let listed: Vec<&AgentRow> = agents.iter().filter(|a| a.agent).collect();
-    if listed.is_empty() {
-        // Said, rather than left as a void, for the reason the unfolded panel says it.
-        return (
-            vec![(
-                Line {
-                    text: fit(" no agents yet", width),
-                    colour: Some(crate::theme::Role::Faint),
-                    accent: None,
-                    indicator: None,
-                },
-                None,
-            )],
-            0,
-            0,
-        );
-    }
-    // The priority view: the same rows sorted so what wants a person is on
-    // top. Both views are flat lists; the order is the only difference.
-    //
-    // Recency breaks ties inside the calm ranks only (`done`, `idle`, and
-    // the rest): urgency ranks answer "who needs a person" and the second
-    // question must not reorder the first, so a burst of working activity
-    // never shuffles the rows being tracked. The sort is stable, so daemon
-    // order still breaks every remaining tie, and rows without a stamp sink
-    // below stamped ones within their rank.
-    if view == View::Priority {
-        let mut ordered: Vec<&AgentRow> = listed.to_vec();
-        ordered.sort_by_key(|a| {
-            let rank = priority_of(a, focused, seen, unseen);
-            if matches!(rank, 5..=7) {
-                match a.last_active_at_unix {
-                    Some(ts) => (rank, 0u8, std::cmp::Reverse(ts)),
-                    None => (rank, 1u8, std::cmp::Reverse(0)),
-                }
-            } else {
-                (rank, 0u8, std::cmp::Reverse(0))
-            }
-        });
-        let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
-        for agent in &ordered {
-            push_agent_lines(
-                &mut content,
-                spaces,
-                agent,
-                focused,
-                tick,
-                seen,
-                unseen,
-                now_unix,
-                width,
-            );
-        }
-        return (content, ordered.len(), listed.len());
-    }
-    // Grouped is the daemon's order, untouched: a row never moves under the
-    // eye while its state changes. Urgency lives in the priority view, the
-    // status line, the tab dots and the palette, never in this order.
-    let mut content: Vec<(Line, Option<Hit>)> = Vec::new();
-    for agent in &listed {
-        push_agent_lines(
-            &mut content,
-            spaces,
-            agent,
-            focused,
-            tick,
-            seen,
-            unseen,
-            now_unix,
-            width,
-        );
-    }
-    (content, listed.len(), listed.len())
-}
-
-/// One built agents panel, scrolled and padded into the rows it was given.
-#[allow(clippy::too_many_arguments)]
-fn lay_out_agents(
-    content: Vec<(Line, Option<Hit>)>,
-    shown: usize,
-    total: usize,
-    focused: u32,
-    height: usize,
-    view: View,
-    width: usize,
-) -> Vec<(Line, Option<Hit>)> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let mut out = vec![(agents_title(view, shown, total, width), None)];
-    // One breath between the title and the rows: the header is a switch now,
-    // and the gap keeps the first agent from reading as part of it.
-    out.push(blank(width));
-    let body = height.saturating_sub(2);
-    if body == 0 {
-        out.truncate(height);
-        return out;
-    }
-    // Flat scroll keeping the focused agent's first line visible with room for
-    // its second.
-    let focus_row = content
-        .iter()
-        .position(|(_, hit)| *hit == Some(Hit::Terminal(focused)));
-    let first = match focus_row {
-        Some(i) if content.len() > body => i
-            .saturating_sub(body.saturating_sub(2))
-            .min(content.len() - body),
-        _ => 0,
-    };
-    for offset in 0..body {
-        match content.get(first + offset) {
-            Some(row) => out.push(row.clone()),
-            None => out.push(blank(width)),
-        }
-    }
-    out.truncate(height);
-    out
-}
-
-/// The agents title, carrying the sort order on its right.
-///
-/// Grouped or priority, the way the rows below are ordered: the header is the
-/// one place that says which. The counts ride along when the list scrolls past
-/// the window, so a clipped panel still says how much of itself is hidden.
-/// (`shown` always equals `total` today: every listed agent draws. The branch
-/// stays for the day one does not.)
-fn agents_title(view: View, shown: usize, total: usize, width: usize) -> Line {
-    let mode = title_mode(view);
-    let left = if shown == total {
-        format!(" {AGENTS_TITLE}")
-    } else {
-        format!(" {AGENTS_TITLE} {shown} of {total}")
-    };
-    let text = format!(
-        "{}{mode}",
-        fit_to(&left, width.saturating_sub(mode.len() + 1)),
-    );
-    Line {
-        text: format!("{text} "),
-        colour: Some(crate::theme::Role::Title),
-        accent: None,
-        indicator: None,
-    }
-}
-
-/// The word on the right of the agents title: the order the rows below are in.
-fn title_mode(view: View) -> &'static str {
-    match view {
-        View::Grouped => "grouped",
-        View::Priority => "priority",
-    }
-}
-
-/// What a click at one column of the agents title means.
-///
-/// Only the `grouped`/`priority` corner word flips the view: it sits at the
-/// right edge, ahead of the trailing space, both words plain ASCII. A click on
-/// the `agents` word itself is a click on nothing.
-pub fn agents_title_hit(view: View, col: usize, width: usize) -> Option<Hit> {
-    let mode = title_mode(view);
-    (col + 1 >= width.saturating_sub(mode.len())).then_some(Hit::View)
 }
 
 /// What to call the program in the terminal.
@@ -1544,87 +1294,7 @@ pub(crate) fn label(agent: &AgentRow) -> String {
     }
 }
 
-/// The first entry of a panel that is on screen.
-///
-/// Scrolls only as far as it takes to bring the focused entry back into view, and never past
-/// the end, so a list stays still while the focus moves inside the window.
-fn scrolled(len: usize, focused: Option<usize>, window: usize) -> usize {
-    match focused {
-        Some(i) if window > 0 => i.saturating_sub(window - 1).min(len.saturating_sub(window)),
-        _ => 0,
-    }
-}
-
-/// The row at the foot of the spaces panel: `menu` on the right.
-///
-/// One row for what is neither a space nor an agent: the menu. Which half a
-/// click lands on decides what it meant, and the halves are the word itself
-/// rather than the halves of the column: a click on the empty rest is a click
-/// on nothing. The `new` half is gone: the tab bar and the spaces title both
-/// carry their own `+` already.
-fn footer_row(width: usize) -> (Line, Option<Hit>) {
-    let right = format!("{MENU_LABEL} ");
-    let gap = width.saturating_sub(crate::width::width(&right));
-    (
-        Line {
-            text: format!("{}{right}", " ".repeat(gap)),
-            colour: Some(crate::theme::Role::Faint),
-            accent: None,
-            indicator: None,
-        },
-        // The row itself answers nothing: the caller asks again with the column.
-        None,
-    )
-}
-
-/// What a click at one column of the spaces title means.
-///
-/// Only the `+` cell itself, the last cell of the row: the rule column beside
-/// it and the word beside that are nothing, the way the footer's halves are
-/// exact cells rather than a whole row.
-pub fn spaces_title_hit(col: usize, width: usize) -> Option<Hit> {
-    (col == width).then_some(Hit::NewSpace)
-}
-
-/// What a click at one column of the footer row means.
-pub fn footer_hit(col: usize, width: usize) -> Option<Hit> {
-    if col + 1 >= width.saturating_sub(crate::width::width(MENU_LABEL)) {
-        return Some(Hit::Menu);
-    }
-    None
-}
-
-const MENU_LABEL: &str = "menu";
-
-/// A panel title, which is a row like any other and therefore the full width.
-fn title(text: &str, width: usize) -> Line {
-    Line {
-        text: fit(&format!(" {text}"), width),
-        colour: Some(crate::theme::Role::Title),
-        accent: None,
-        indicator: None,
-    }
-}
-
-/// The spaces title, carrying its `+` at the right corner.
-///
-/// The row itself answers nothing: only the corner cell makes a space, so a
-/// click on the word `spaces` is a no-op rather than a space nobody asked
-/// for. The caller asks again with the column, the way the footer's
-/// `new`/`menu` halves do.
-fn spaces_title(width: usize) -> Line {
-    Line {
-        text: format!(
-            "{}+",
-            fit_to(&format!(" {SPACES_TITLE}"), width.saturating_sub(1))
-        ),
-        colour: Some(crate::theme::Role::Title),
-        accent: None,
-        indicator: None,
-    }
-}
-
-/// The rule between the spaces panel and the agents panel: one row of box
+/// The rule under the pin, joined to the column's edge: one row of box
 /// drawing, clickable as nothing, so a click on it does nothing rather than
 /// something arbitrary.
 fn divider(width: usize) -> (Line, Option<Hit>) {
@@ -1634,6 +1304,7 @@ fn divider(width: usize) -> (Line, Option<Hit>) {
             colour: Some(crate::theme::Role::Rule),
             accent: None,
             indicator: None,
+            runs: Vec::new(),
         },
         None,
     )
@@ -1647,6 +1318,7 @@ fn blank(width: usize) -> (Line, Option<Hit>) {
             colour: None,
             accent: None,
             indicator: None,
+            runs: Vec::new(),
         },
         None,
     )
@@ -1672,6 +1344,224 @@ mod tests {
 
     /// A fixed paint-time clock: tests pin behavior at exact ages, never time.
     const NOW: i64 = 1_750_000_000;
+
+    /// The pieces of a column, spelled out: every test names what it varies.
+    #[allow(clippy::too_many_arguments)]
+    fn column<'a>(
+        spaces: &'a [WorkspaceRow],
+        agents: &'a [AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        tick: u64,
+        view: View,
+        seen: &'a Seen,
+        unseen: &'a Unseen,
+        now_unix: i64,
+        width: usize,
+        shut: &'a Shut,
+    ) -> Column<'a> {
+        Column {
+            spaces,
+            agents,
+            focused_space,
+            focused_terminal,
+            tick,
+            view,
+            seen,
+            unseen,
+            now_unix,
+            width,
+            shut,
+        }
+    }
+
+    /// The open column at the default width in the tree, nothing seen and nothing folded.
+    fn render(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+    ) -> Vec<Line> {
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        render_folded(
+            &column(
+                spaces,
+                agents,
+                focused_space,
+                focused_terminal,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                0,
+                WIDTH,
+                &shut,
+            ),
+            height,
+        )
+    }
+
+    /// What a click on `row` of [`render`]'s column hits.
+    fn hit(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+        row: usize,
+    ) -> Option<Hit> {
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            spaces,
+            agents,
+            focused_space,
+            focused_terminal,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            0,
+            WIDTH,
+            &shut,
+        );
+        rows_folded(&c, height, None)
+            .into_iter()
+            .nth(row)
+            .and_then(|(_, hit)| hit)
+    }
+
+    /// The open column with every piece named, nothing folded.
+    #[allow(clippy::too_many_arguments)]
+    fn folded(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+        tick: u64,
+        view: View,
+        seen: &Seen,
+        unseen: &Unseen,
+        now_unix: i64,
+        width: usize,
+    ) -> Vec<Line> {
+        let shut = Shut::new();
+        render_folded(
+            &column(
+                spaces,
+                agents,
+                focused_space,
+                focused_terminal,
+                tick,
+                view,
+                seen,
+                unseen,
+                now_unix,
+                width,
+                &shut,
+            ),
+            height,
+        )
+    }
+
+    /// [`folded`] with the hits and a pet, nothing folded.
+    #[allow(clippy::too_many_arguments)]
+    fn rows12(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+        tick: u64,
+        view: View,
+        seen: &Seen,
+        unseen: &Unseen,
+        now_unix: i64,
+        width: usize,
+        avatar: Option<&qoro_runtime::avatar::Avatar>,
+    ) -> Vec<Row> {
+        let shut = Shut::new();
+        rows_folded(
+            &column(
+                spaces,
+                agents,
+                focused_space,
+                focused_terminal,
+                tick,
+                view,
+                seen,
+                unseen,
+                now_unix,
+                width,
+                &shut,
+            ),
+            height,
+            avatar,
+        )
+    }
+
+    /// What a click on `row` of [`rows12`]'s column hits, at frame zero.
+    #[allow(clippy::too_many_arguments)]
+    fn hit12(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+        row: usize,
+        view: View,
+        seen: &Seen,
+        unseen: &Unseen,
+        now_unix: i64,
+        width: usize,
+        avatar: Option<&qoro_runtime::avatar::Avatar>,
+    ) -> Option<Hit> {
+        rows12(
+            spaces,
+            agents,
+            focused_space,
+            focused_terminal,
+            height,
+            0,
+            view,
+            seen,
+            unseen,
+            now_unix,
+            width,
+            avatar,
+        )
+        .into_iter()
+        .nth(row)
+        .and_then(|(_, hit)| hit)
+    }
+
+    /// The strip at the default pieces, nothing folded.
+    fn collapsed5(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        height: usize,
+    ) -> Vec<Row> {
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        rows_collapsed(
+            &column(
+                spaces,
+                agents,
+                focused_space,
+                focused_terminal,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                0,
+                WIDTH,
+                &shut,
+            ),
+            height,
+        )
+    }
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
@@ -1750,14 +1640,107 @@ mod tests {
         )
     }
 
+    /// [`sample`] with its codex blocked, so the pin draws above the tree.
+    fn sample_pinned() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
+        let (spaces, mut agents) = sample();
+        agents[2].state = "blocked".into();
+        (spaces, agents)
+    }
+
+    /// Every row's text with its trailing pad cut, so an assertion reads the row.
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect()
+    }
+
+    /// The tree at the default width with the given spaces folded, nothing seen.
+    fn tree_rows(
+        spaces: &[WorkspaceRow],
+        agents: &[AgentRow],
+        focused_terminal: u32,
+        height: usize,
+        seen: &Seen,
+        shut: &Shut,
+    ) -> Vec<Row> {
+        let unseen = Unseen::new();
+        rows_folded(
+            &column(
+                spaces,
+                agents,
+                1,
+                focused_terminal,
+                0,
+                View::Tree,
+                seen,
+                &unseen,
+                NOW,
+                WIDTH,
+                shut,
+            ),
+            height,
+            None,
+        )
+    }
+
+    /// The terminals the list under the title draws, in order, each once. The pin above
+    /// the title repeats agents on purpose, so it is never the order a test pins.
+    fn order(rows: &[Row]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (_, hit) in rows.iter().skip_while(|(_, h)| *h != Some(Hit::Title)) {
+            if let Some(Hit::Terminal(t)) = hit
+                && !out.contains(t)
+            {
+                out.push(*t);
+            }
+        }
+        out
+    }
+
+    /// The terminals the pin lists, in order: every agent row above the title.
+    fn pinned(rows: &[Row]) -> Vec<u32> {
+        rows.iter()
+            .take_while(|(_, h)| *h != Some(Hit::Title))
+            .filter_map(|(_, h)| match h {
+                Some(Hit::Terminal(t)) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The row a terminal draws under its space rule: the last row that reaches it, since
+    /// the pin, when it lists the same terminal, is always above the tree.
+    fn tree_row(rows: &[Row], terminal: u32) -> &Line {
+        rows.iter()
+            .rev()
+            .find(|(_, h)| *h == Some(Hit::Terminal(terminal)))
+            .map(|(l, _)| l)
+            .unwrap_or_else(|| panic!("terminal {terminal} is not drawn"))
+    }
+
+    /// The rule a space draws.
+    fn rule_row(rows: &[Row], id: i64) -> &Line {
+        rows.iter()
+            .find(|(_, h)| *h == Some(Hit::Space(id)))
+            .map(|(l, _)| l)
+            .unwrap_or_else(|| panic!("space {id} has no rule"))
+    }
+
+    /// The text a run of a row covers, for rows of single column characters.
+    fn run_text(line: &Line, at: usize, len: usize) -> String {
+        line.text.chars().skip(at).take(len).collect()
+    }
+
     #[test]
     fn every_line_is_exactly_the_column_width() {
-        let (spaces, agents) = sample();
-        for height in [1usize, 2, 3, 5, 9, 14, 40] {
-            let lines = render(&spaces, &agents, 1, 1, height);
-            assert_eq!(lines.len(), height, "height {height}");
-            for line in &lines {
-                assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+        for (spaces, agents) in [sample(), sample_pinned()] {
+            for height in [1usize, 2, 3, 5, 9, 14, 40] {
+                let lines = render(&spaces, &agents, 1, 1, height);
+                assert_eq!(lines.len(), height, "height {height}");
+                for line in &lines {
+                    assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+                }
             }
         }
     }
@@ -1772,64 +1755,58 @@ mod tests {
         }
     }
 
+    /// The one title names the column, then the order the agents below are in and the
+    /// `+` that makes a space, so a person reads both switches off the row they live on.
     #[test]
-    fn both_panels_carry_their_own_title() {
+    fn the_title_names_the_order_and_ends_in_the_plus() {
         let (spaces, agents) = sample();
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            1,
-            14,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let texts: Vec<&str> = lines.iter().map(|l| l.text.trim_end()).collect();
-        // The spaces title carries its `+` at the right corner; the agents
-        // title names the sort order there instead.
-        assert!(
-            texts[0].starts_with(&format!(" {SPACES_TITLE}")) && texts[0].ends_with('+'),
-            "{texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with(&format!(" {AGENTS_TITLE}")) && t.ends_with("grouped")),
-            "{texts:?}"
-        );
+        for (view, word) in [(View::Tree, "tree"), (View::Priority, "priority")] {
+            let lines = folded(
+                &spaces,
+                &agents,
+                1,
+                1,
+                14,
+                0,
+                view,
+                &Seen::new(),
+                &Unseen::new(),
+                NOW,
+                WIDTH,
+            );
+            let title = &lines[0];
+            assert!(
+                title.text.starts_with(&format!(" {SPACES_TITLE} ")),
+                "{:?}",
+                title.text
+            );
+            assert!(
+                title.text.ends_with(&format!(" {word} +")),
+                "{:?}",
+                title.text
+            );
+            assert_eq!(title.colour, Some(crate::theme::Role::Title));
+        }
     }
 
     #[test]
     fn the_focused_space_and_the_focused_terminal_are_found_by_hit_not_by_glyph() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 2, 3, 14);
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
+        let texts = texts(&render(&spaces, &agents, 2, 3, 14));
         // No selection marks anywhere: no hollow ring on every row and no
         // second dot on the selected one. The keyboard's row is the raised
         // background the painter adds. The state dot opens every agent's
-        // first row, so it is expected; a spinner never is.
+        // row, so it is expected; a spinner never is.
         for bad in ['\u{25cb}', '\u{25cc}', '\u{25a1}', '\u{2809}'] {
             assert!(
                 !texts.iter().any(|t| t.contains(bad)),
                 "a selection mark or spinner leaked: {texts:?}"
             );
         }
-        // The focused space and agent still draw their names.
-        assert!(texts.iter().any(|t| t.contains("personal")), "{texts:?}");
-        // Terminal 3 is the focused agent: its session on the first row, its
-        // tab and space on the second. The first row answers "what", the
-        // second "where".
-        assert!(
-            texts.iter().any(|t| t.starts_with(" \u{25cf} codex")),
-            "{texts:?}"
-        );
+        // The focused space and agent still draw their names, the agent under its
+        // space's rule with the same dot every other agent wears.
+        assert!(texts.iter().any(|t| t.contains(" personal ")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "   \u{25cf} codex"), "{texts:?}");
         // And hits still know which rows have the keyboard.
         let hits: Vec<Option<Hit>> = (0..14)
             .map(|row| hit(&spaces, &agents, 2, 3, 14, row))
@@ -1838,35 +1815,35 @@ mod tests {
         assert!(hits.contains(&Some(Hit::Terminal(3))));
     }
 
+    /// One row per agent, right under its space's rule: the rule already says where, so
+    /// the row says only what, and the next rule follows it with nothing in between.
     #[test]
-    fn an_agent_shows_its_session_then_its_tab_and_space() {
+    fn an_agent_is_one_row_under_its_space_rule() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 14);
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
+        let texts = texts(&lines);
         let head = texts
             .iter()
-            .position(|t| t.starts_with(" \u{25cf} claude"))
+            .position(|t| t == "   \u{25cf} claude")
             .unwrap_or_else(|| panic!("{texts:?}"));
-        // Two rows, and together they carry everything: the session behind
-        // the state dot, and the tab and space underneath. No state word on
-        // the right: the dot at the start says the state in its colour.
-        assert_eq!(texts[head], " \u{25cf} claude", "{texts:?}");
-        assert_eq!(texts[head + 1], "   app - claude");
-        // And the dot wears the working colour.
+        assert!(
+            texts[head - 1].starts_with("\u{2500}\u{25be} app "),
+            "{texts:?}"
+        );
+        assert!(
+            texts[head + 1].starts_with("\u{2500}\u{25be} personal "),
+            "{texts:?}"
+        );
+        // No state word on the right: the dot says the state in its colour, three
+        // columns in, under the space name the rule carries.
         assert_eq!(
-            lines
-                .iter()
-                .find(|l| l.text.trim_end() == " \u{25cf} claude")
-                .and_then(|l| l.indicator),
-            Some((DOT_AT, DOT_LEN, crate::theme::of("working")))
+            lines[head].indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::of("working")))
         );
     }
 
     #[test]
-    fn a_terminal_that_is_not_running_an_agent_is_left_out_of_the_agents_panel() {
+    fn a_terminal_that_is_not_running_an_agent_is_left_out_of_the_column() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 20);
         // Terminal 2 is a plain shell. Terminals 1 and 3 have agents and are listed.
@@ -1877,136 +1854,175 @@ mod tests {
         assert!(listed.contains(&Some(Hit::Terminal(3))));
         assert!(!listed.contains(&Some(Hit::Terminal(2))));
         assert!(!lines.iter().any(|l| l.text.contains("sh ")));
+        // And the shell is not counted on its space's rule either.
+        let app = lines
+            .iter()
+            .find(|l| l.text.starts_with("\u{2500}\u{25be} app "))
+            .expect("the app rule");
+        assert!(app.text.ends_with(" 1 \u{2500}"), "{:?}", app.text);
     }
 
     #[test]
-    fn an_agent_row_carries_its_state_on_the_dot_and_a_title_carries_no_state() {
+    fn an_agent_row_carries_its_state_on_the_dot_and_a_title_or_rule_carries_none() {
         let (spaces, agents) = sample();
         let lines = render(&spaces, &agents, 1, 1, 14);
-        // A title has a look of its own, and it is never a state's: a panel heading that
+        // A title has a look of its own, and it is never a state's: a heading that
         // came out the colour of `blocked` would be a heading somebody answers.
-        assert_eq!(
-            lines[0].colour,
-            Some(crate::theme::Role::Title),
-            "the spaces title"
-        );
+        assert_eq!(lines[0].colour, Some(crate::theme::Role::Title));
         let rows: Vec<&Line> = lines.iter().filter(|l| l.text.contains("claude")).collect();
-        // Two rows for the one agent: the first is plain text with the
-        // state's colour on its dot, the tab and space underneath stay quiet.
-        assert_eq!(rows.len(), 2);
+        // One row for the one agent: plain text with the state's colour on its dot.
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].colour, None);
         assert_eq!(
             rows[0].indicator,
-            Some((DOT_AT, DOT_LEN, crate::theme::of("working")))
+            Some((CHILD_DOT_AT, 1, crate::theme::of("working")))
         );
-        assert_eq!(rows[1].colour, Some(crate::theme::Role::Faint));
-        assert_eq!(rows[1].indicator, None);
-        // A space row has no state to have a colour about; it wears its own instead, as an
-        // accent on its name rather than on the whole row. Agent second rows
-        // (`tab - space`) are excluded: they name a space but are not space rows.
-        assert!(
-            lines
-                .iter()
-                .filter(|l| l.text.contains("personal") && !l.text.contains(" - "))
-                .all(|l| l.colour.is_none() && l.accent.is_some())
+        // A rule has no state to have a colour about: it wears the space's own colour
+        // on the name, and its open arrow stays the rule's quiet grey.
+        let personal = lines
+            .iter()
+            .find(|l| l.text.contains(" personal "))
+            .expect("the personal rule");
+        assert_eq!(personal.colour, None);
+        assert_eq!(
+            personal.accent,
+            Some((FOLD_CELLS, 8, crate::theme::space_of(2)))
         );
+        assert_eq!(personal.indicator, Some((1, 1, crate::theme::Role::Faint)));
     }
 
+    /// Every space is one rule: the arrow says open, folded or empty, the name wears the
+    /// space's colour, and the count says how many agents live there. The dashes are
+    /// the rule's own grey, so the rule reads as structure and never as a row to answer.
     #[test]
-    fn each_panel_scrolls_on_its_own_to_keep_its_focused_row_visible() {
-        let spaces: Vec<WorkspaceRow> = (1..=8).map(|n| space(n, &format!("s{n}"))).collect();
-        let agents: Vec<AgentRow> = (1..=12)
-            .map(|n| agent(n as u32, 1, "claude", "idle"))
-            .collect();
-        for focused_space in 1..=8i64 {
-            for focused_terminal in 1..=12u32 {
-                let drawn: Vec<Hit> = (0..15)
-                    .filter_map(|row| {
-                        hit(&spaces, &agents, focused_space, focused_terminal, 15, row)
-                    })
-                    .collect();
-                assert!(
-                    drawn.contains(&Hit::Space(focused_space)),
-                    "space {focused_space} fell out"
-                );
-                assert!(
-                    drawn.contains(&Hit::Terminal(focused_terminal)),
-                    "terminal {focused_terminal} fell out"
-                );
-            }
+    fn every_space_draws_one_rule_with_its_arrow_and_count() {
+        let (spaces, agents) = sample();
+        let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
+        let app = rule_row(&rows, 1);
+        assert_eq!(
+            app.text,
+            format!("\u{2500}\u{25be} app {} 1 \u{2500}", "\u{2500}".repeat(19))
+        );
+        assert_eq!(
+            app.runs,
+            vec![
+                (0, 1, crate::theme::Role::Rule),
+                (7, 19, crate::theme::Role::Rule),
+                (27, 1, crate::theme::Role::Faint),
+                (29, 1, crate::theme::Role::Rule),
+            ]
+        );
+        // An empty space has nothing to fold and nothing to count: a dot for the arrow,
+        // and the dashes run to the edge.
+        let dub = rule_row(&rows, 3);
+        assert_eq!(
+            dub.text,
+            format!("\u{2500}\u{b7} dub {}", "\u{2500}".repeat(23))
+        );
+        // Folded, the arrow points right and the count stays.
+        let shut = Shut::from([1]);
+        let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &shut);
+        assert!(
+            rule_row(&rows, 1).text.starts_with("\u{2500}\u{25b8} app "),
+            "{:?}",
+            rule_row(&rows, 1).text
+        );
+        for line in rows.iter().map(|(l, _)| l) {
+            assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
     }
 
+    /// The window is stateless: whatever keeps the keyboard's agent on screen, with its
+    /// space's rule above it when both fit. A long tree scrolls; a short one never does.
     #[test]
-    fn the_spaces_panel_never_takes_more_than_its_share_of_the_column() {
-        let spaces: Vec<WorkspaceRow> = (1..=30).map(|n| space(n, &format!("s{n}"))).collect();
-        let agents = vec![agent(1, 1, "claude", "idle")];
-        let lines = render(&spaces, &agents, 1, 1, 30);
-        let agents_title = lines
-            .iter()
-            .position(|l| l.text.trim_end() == format!(" {AGENTS_TITLE}"))
-            .unwrap_or_else(|| panic!("no agents panel"));
-        // Thirty spaces cannot take the whole column: the panel below them is the one that
-        // grows, so the short list is held to its share and scrolls inside it.
-        assert_eq!(agents_title, 14);
+    fn the_window_scrolls_to_keep_the_focused_agent_visible() {
+        let spaces: Vec<WorkspaceRow> = (1..=10).map(|n| space(n, &format!("s{n}"))).collect();
+        let agents: Vec<AgentRow> = (1..=30u32)
+            .map(|n| agent(n, i64::from((n - 1) / 3 + 1), "claude", "idle"))
+            .collect();
+        for focused in 1..=30u32 {
+            let home = i64::from((focused - 1) / 3 + 1);
+            let drawn: Vec<Hit> = (0..15)
+                .filter_map(|row| hit(&spaces, &agents, home, focused, 15, row))
+                .collect();
+            assert!(
+                drawn.contains(&Hit::Terminal(focused)),
+                "terminal {focused} fell out: {drawn:?}"
+            );
+            assert!(
+                drawn.contains(&Hit::Space(home)),
+                "the rule of {focused} fell out: {drawn:?}"
+            );
+        }
+        // With no agent to keep, the focused space's rule is what stays.
+        for focused_space in 1..=10i64 {
+            let drawn: Vec<Hit> = (0..15)
+                .filter_map(|row| hit(&spaces, &agents, focused_space, 99, 15, row))
+                .collect();
+            assert!(
+                drawn.contains(&Hit::Space(focused_space)),
+                "space {focused_space} fell out: {drawn:?}"
+            );
+        }
+        // A tree that fits never scrolls: the first rule sits under the title.
+        let (spaces, agents) = sample();
+        assert_eq!(hit(&spaces, &agents, 3, 3, 14, 1), Some(Hit::Space(1)));
     }
 
     #[test]
-    fn a_height_too_small_for_both_panels_still_returns_that_many_lines() {
-        let (spaces, agents) = sample();
-        for height in 0..6 {
-            let lines = render(&spaces, &agents, 1, 1, height);
-            assert_eq!(lines.len(), height);
-            assert!(lines.iter().all(|l| crate::width::width(&l.text) == WIDTH));
+    fn a_height_too_small_for_the_column_still_returns_that_many_lines() {
+        for (spaces, agents) in [sample(), sample_pinned()] {
+            for height in 0..8 {
+                let lines = render(&spaces, &agents, 1, 1, height);
+                assert_eq!(lines.len(), height);
+                assert!(lines.iter().all(|l| crate::width::width(&l.text) == WIDTH));
+            }
         }
     }
 
     #[test]
     fn hit_returns_exactly_what_render_drew_on_every_row() {
-        let (spaces, agents) = sample();
-        for height in [1usize, 2, 3, 4, 7, 9, 14, 25] {
-            let lines = render(&spaces, &agents, 2, 3, height);
-            for (row, line) in lines.iter().enumerate() {
-                let text = line.text.trim_end().to_string();
-                let got = hit(&spaces, &agents, 2, 3, height, row);
-                let want = if text == format!(" {AGENTS_TITLE}") || text.is_empty() {
-                    None
-                } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
-                    // Row-granular hit: the corner cell is asked with the
-                    // column elsewhere, so here the title is nothing.
-                    None
-                } else if let Some(s) = spaces.iter().find(|s| text == format!(" {}", s.name)) {
-                    Some(Hit::Space(s.id))
-                } else {
-                    // Everything left is one agent's two rows: the first names
-                    // the session behind the state dot, the second the tab
-                    // and the space under it. Both reach the same terminal.
-                    // Either dot glyph opens the first row: the circle for every
-                    // state but failed, the diamond for failed.
-                    agents
-                        .iter()
-                        .find(|a| {
-                            let space = spaces
-                                .iter()
-                                .find(|s| s.id == a.workspace)
-                                .map(|s| s.name.as_str())
-                                .unwrap_or("");
-                            let first = |glyph: char| format!(" {glyph} {}", session_name(a));
-                            let place = if space.is_empty() {
-                                label(a)
-                            } else {
-                                format!("{space} - {}", label(a))
-                            };
-                            text.starts_with(&first(DOT))
-                                || text.starts_with(&first(FAILED_DOT))
-                                || (text.starts_with("   ")
-                                    && text.trim_end() == format!("   {place}"))
-                        })
-                        .map(|a| Hit::Terminal(a.terminal))
-                };
-                assert_eq!(got, want, "row {row} of {height}: {text:?}");
+        for (spaces, agents) in [sample(), sample_pinned()] {
+            for height in [1usize, 2, 3, 4, 7, 9, 14, 25] {
+                let lines = render(&spaces, &agents, 2, 3, height);
+                for (row, line) in lines.iter().enumerate() {
+                    let text = line.text.trim_end();
+                    let got = hit(&spaces, &agents, 2, 3, height, row);
+                    let want = if text.is_empty()
+                        || text.chars().all(|c| c == '\u{2500}')
+                        || text.starts_with(&format!(" {PIN_TITLE}"))
+                    {
+                        // Blank rows, the rule under the pin and the pin's own title
+                        // do nothing when clicked.
+                        None
+                    } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
+                        Some(Hit::Title)
+                    } else if text.contains(BRAND) && text.ends_with('\u{ab}') {
+                        Some(Hit::Foot)
+                    } else if text.starts_with('\u{2500}') {
+                        spaces
+                            .iter()
+                            .find(|s| text.contains(&format!(" {} ", s.name)))
+                            .map(|s| Hit::Space(s.id))
+                    } else {
+                        // Everything left is an agent: a flat pin row with its dot at
+                        // column one, or a tree row with its dot under the space name.
+                        // Either glyph: the circle, or the diamond for failed.
+                        agents
+                            .iter()
+                            .find(|a| {
+                                [DOT, FAILED_DOT].iter().any(|g| {
+                                    let name = session_name(a);
+                                    text.starts_with(&format!(" {g} {name}"))
+                                        || text.starts_with(&format!("   {g} {name}"))
+                                })
+                            })
+                            .map(|a| Hit::Terminal(a.terminal))
+                    };
+                    assert_eq!(got, want, "row {row} of {height}: {text:?}");
+                }
+                assert_eq!(hit(&spaces, &agents, 2, 3, height, height), None);
             }
-            assert_eq!(hit(&spaces, &agents, 2, 3, height, height), None);
         }
     }
 
@@ -2018,6 +2034,8 @@ mod tests {
         assert_eq!(render(&[], &[], 1, 1, 5).len(), 5);
     }
 
+    /// An agent whose space the client has not heard of yet draws as a flat row after
+    /// the tree, under no rule, rather than vanishing until the index catches up.
     #[test]
     fn an_agent_in_a_space_the_client_has_not_heard_of_still_draws_its_row() {
         let agents = vec![agent(4, 77, "codex", "blocked")];
@@ -2025,8 +2043,19 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.text.starts_with(" \u{25cf} codex")),
             "{:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            texts(&lines)
         );
+        let spaces = vec![space(1, "app")];
+        let agents = vec![agent(4, 77, "codex", "idle"), agent(5, 1, "claude", "idle")];
+        let rows = tree_rows(&spaces, &agents, 5, 14, &Seen::new(), &Shut::new());
+        assert_eq!(order(&rows), vec![5, 4], "the stranger follows the tree");
+        let stray = tree_row(&rows, 4);
+        assert!(
+            stray.text.starts_with(" \u{25cf} codex"),
+            "{:?}",
+            stray.text
+        );
+        assert_eq!(stray.accent, None, "no space to name");
     }
 
     fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
@@ -2052,55 +2081,96 @@ mod tests {
     }
 
     fn agent_texts(spaces: &[WorkspaceRow], agents: &[AgentRow], focused: u32) -> Vec<String> {
-        render(spaces, agents, 1, focused, 20)
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect()
+        texts(&render(spaces, agents, 1, focused, 20))
     }
 
-    /// The user's panel: four rows reading `opencode` identify nothing. Each
-    /// pair's second row names where it lives, so each pair says which one
-    /// needs them.
+    /// The priority list, as text.
+    fn priority_texts(spaces: &[WorkspaceRow], agents: &[AgentRow]) -> Vec<String> {
+        texts(&folded(
+            spaces,
+            agents,
+            1,
+            9,
+            20,
+            0,
+            View::Priority,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+        ))
+    }
+
+    /// The user's column: four rows reading `opencode` identify nothing on their own, so
+    /// each sits under the rule of the space it lives in and the rule says which.
     #[test]
-    fn agents_sharing_a_label_carry_their_space_names() {
+    fn agents_sharing_a_label_sit_under_their_own_space_rules() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
         let agents = vec![
             agent(1, 1, "opencode", "idle"),
             agent(2, 2, "opencode", "idle"),
         ];
-        let texts = agent_texts(&spaces, &agents, 1);
-        assert!(
-            texts.iter().any(|t| t.contains("app - opencode")),
-            "{texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("personal - opencode")),
-            "{texts:?}"
-        );
+        let rows = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::new());
+        for (terminal, id) in [(1u32, 1i64), (2, 2)] {
+            let at = rows
+                .iter()
+                .position(|(_, h)| *h == Some(Hit::Terminal(terminal)))
+                .expect("an agent row");
+            assert_eq!(rows[at - 1].1, Some(Hit::Space(id)), "{terminal}");
+            assert_eq!(rows[at].0.text.trim_end(), "   \u{25cf} opencode");
+        }
     }
 
-    /// Every pair names where it lives on its second row: the mark's colour
-    /// says where it lives, and the words beside it say it again, so no pair
-    /// ever stands on its colour alone.
+    /// Off the tree there is no rule above a row, so a flat row names its space on the
+    /// right, in the space's own colour: the words say it and the colour says it again.
     #[test]
-    fn a_label_nobody_shares_still_names_its_space() {
+    fn a_flat_row_names_its_space_on_the_right() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
         let agents = vec![
             agent(1, 1, "opencode", "idle"),
             agent(2, 2, "opencode", "idle"),
             agent(3, 1, "claude", "idle"),
         ];
-        let texts = agent_texts(&spaces, &agents, 1);
+        let texts = priority_texts(&spaces, &agents);
+        for want in ["opencode", "claude"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.starts_with(&format!(" \u{25cf} {want}")) && t.ends_with(" app")),
+                "{texts:?}"
+            );
+        }
         assert!(
-            texts.iter().any(|t| t.contains("app - claude")),
+            texts
+                .iter()
+                .any(|t| t.starts_with(" \u{25cf} opencode") && t.ends_with(" personal")),
             "{texts:?}"
         );
-        // And the second row still says where the tab lives.
-        assert!(texts.iter().any(|t| *t == "   app - claude"), "{texts:?}");
+        let lines = folded(
+            &spaces,
+            &agents,
+            1,
+            9,
+            20,
+            0,
+            View::Priority,
+            &Seen::new(),
+            &Unseen::new(),
+            NOW,
+            WIDTH,
+        );
+        let row = lines
+            .iter()
+            .find(|l| l.text.trim_end().ends_with(" personal"))
+            .expect("the personal row");
+        let (at, len, role) = row.accent.expect("the space is accented");
+        assert_eq!(role, crate::theme::space_of(2));
+        assert_eq!(run_text(row, at, len), "personal");
     }
 
-    /// A chosen name picked twice in two spaces is still two pairs that cannot
-    /// be told from one another, so each second row names where it lives.
+    /// A chosen name picked twice in two spaces is still two rows that cannot be told
+    /// apart by name, so each names where it lives: by its rule in the tree, on its
+    /// right in a flat list.
     #[test]
     fn a_chosen_name_shared_by_two_agents_names_both_spaces() {
         let spaces = vec![space(1, "app"), space(2, "personal")];
@@ -2108,26 +2178,29 @@ mod tests {
             named(1, 1, "release", "opencode", "idle"),
             named(2, 2, "release", "claude", "idle"),
         ];
+        let flat = priority_texts(&spaces, &agents);
+        assert!(
+            flat.iter()
+                .any(|t| t.starts_with(" \u{25cf} release") && t.ends_with(" app")),
+            "{flat:?}"
+        );
+        assert!(
+            flat.iter()
+                .any(|t| t.starts_with(" \u{25cf} release") && t.ends_with(" personal")),
+            "{flat:?}"
+        );
+        // Without a reported session the row falls back to the tab's own label, so
+        // both tree rows read the chosen name behind the dot.
         let texts = agent_texts(&spaces, &agents, 1);
-        assert!(
-            texts.iter().any(|t| t.contains("app - release")),
-            "{texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("personal - release")),
-            "{texts:?}"
-        );
-        // Without a reported session the first row falls back to the tab's
-        // own label, so both first rows read the chosen name behind the dot.
         assert_eq!(
-            texts.iter().filter(|t| *t == " \u{25cf} release").count(),
+            texts.iter().filter(|t| *t == "   \u{25cf} release").count(),
             2,
             "{texts:?}"
         );
     }
 
     /// Two tabs of one space share the program, and still tell apart: their
-    /// dots differ in the states' colours, and each pair keeps its own hits.
+    /// dots differ in the states' colours, and each row keeps its own hit.
     #[test]
     fn two_tabs_of_one_space_share_the_space_name_but_not_the_dot() {
         let spaces = vec![space(1, "app")];
@@ -2135,53 +2208,54 @@ mod tests {
             agent(1, 1, "opencode", "idle"),
             agent(2, 1, "opencode", "blocked"),
         ];
-        let lines = render(&spaces, &agents, 1, 1, 20);
-        let dots: Vec<_> = lines.iter().filter_map(|l| l.indicator).collect();
+        let rows = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::new());
+        let dots: Vec<_> = [1u32, 2]
+            .iter()
+            .map(|t| tree_row(&rows, *t).indicator)
+            .collect();
         assert_eq!(
             dots,
             vec![
-                (DOT_AT, DOT_LEN, crate::theme::of("idle")),
-                (DOT_AT, DOT_LEN, crate::theme::of("blocked")),
-            ],
-            "{dots:?}"
+                Some((CHILD_DOT_AT, 1, crate::theme::of("idle"))),
+                Some((CHILD_DOT_AT, 1, crate::theme::of("blocked"))),
+            ]
         );
-        // No state word on the right of either row.
-        for line in &lines {
+        // No state word on the right of any row.
+        for (line, _) in &rows {
             for word in ["idle", "blocked", "working"] {
                 assert!(
-                    !line.text.trim_end().ends_with(word) || line.text.contains(" - "),
+                    !line.text.trim_end().ends_with(word),
                     "a state word leaked: {:?}",
                     line.text
                 );
             }
         }
-        // Both pairs reach their own terminal, first row and second row alike.
-        let hits: Vec<Option<Hit>> = (0..20)
-            .map(|row| hit(&spaces, &agents, 1, 1, 20, row))
-            .collect();
-        assert!(hits.contains(&Some(Hit::Terminal(1))));
-        assert!(hits.contains(&Some(Hit::Terminal(2))));
+        assert_eq!(order(&rows), vec![1, 2]);
     }
 
+    /// The row is the session id behind the dot, and nothing else: no program beside
+    /// it, so four live sessions never all read `opencode`, and no tab label either,
+    /// since the rule above already says where the row lives.
     #[test]
-    fn a_reported_session_names_the_first_row_alone_and_the_tab_names_the_second() {
+    fn a_reported_session_names_the_row_alone() {
         let spaces = vec![space(1, "app")];
         let mut a = agent(1, 1, "opencode", "idle");
         a.name = Some("release".to_string());
         a.agent_session = Some("abc123".to_string());
         let texts = agent_texts(&spaces, &[a], 1);
-        // The first row is the session id behind the dot: no program beside
-        // it, so four live sessions never all read `opencode`.
-        assert!(texts.iter().any(|t| *t == " \u{25cf} abc123"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "   \u{25cf} abc123"), "{texts:?}");
         assert!(
             !texts.iter().any(|t| t.contains("opencode")),
             "the program leaked onto a reported session row: {texts:?}"
         );
-        assert!(texts.iter().any(|t| *t == "   app - release"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("release")),
+            "the tab label leaked onto a calm row: {texts:?}"
+        );
     }
 
     #[test]
-    fn a_reported_title_names_the_first_row_and_follows_renames() {
+    fn a_reported_title_names_the_row_and_follows_renames() {
         let spaces = vec![space(1, "app")];
         let mut a = agent(1, 1, "opencode", "idle");
         a.agent_session = Some("ses_abc".to_string());
@@ -2220,12 +2294,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_session_the_first_row_falls_back_to_the_tab() {
+    fn without_a_session_the_row_falls_back_to_the_tab() {
         let spaces = vec![space(1, "app")];
         let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
         // No reported session, so the tab's own label answers behind the dot.
-        assert!(texts.iter().any(|t| *t == " \u{25cf} codex"), "{texts:?}");
-        assert!(texts.iter().any(|t| *t == "   app - codex"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "   \u{25cf} codex"), "{texts:?}");
     }
 
     #[test]
@@ -2253,7 +2326,7 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.text.contains("behind")),
             "{:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            texts(&lines)
         );
         assert!(!lines.iter().any(|l| l.text.contains("     docker")));
     }
@@ -2285,48 +2358,52 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.text.contains("behind docker")),
             "{:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            texts(&lines)
         );
         assert!(!lines.iter().any(|l| l.text.contains(UNKNOWN)));
     }
 
-    /// The panel composes its own rows, so every space in one was put there deliberately.
+    /// The column composes its own rows, so every space in one was put there deliberately.
     /// Cutting them with the grid's rule, where a space after a full width character is a
     /// spacer the engine added, eats padding this module meant and slides the right hand
     /// column one place left.
     #[test]
-    fn a_wide_name_does_not_cost_the_row_a_space_the_panel_put_there() {
+    fn a_wide_name_does_not_cost_the_row_a_space_the_column_put_there() {
         let agents = vec![agent(1, 1, "\u{4e2d}\u{4e2d}", "idle")];
-        let lines = render(&[space(1, "\u{4e2d}\u{6587}")], &agents, 1, 1, 8);
-        // The space's own row: the pad after its name is one this module wrote, and the
-        // grid's rule would have eaten it.
-        let space_row = lines
-            .iter()
-            .find(|l| l.text.contains('\u{6587}'))
-            .unwrap_or_else(|| panic!("no space row"));
-        assert_eq!(crate::width::width(&space_row.text), WIDTH);
-        // The agent's first row opens with the state dot and then the name;
-        // the pad after the wide name is one this module wrote.
-        let row = lines
-            .iter()
-            .find(|l| l.indicator.is_some())
-            .unwrap_or_else(|| panic!("no agent row"));
-        assert!(row.text.starts_with(" \u{25cf} "), "{:?}", row.text);
+        let spaces = vec![space(1, "\u{4e2d}\u{6587}")];
+        let rows = tree_rows(&spaces, &agents, 1, 8, &Seen::new(), &Shut::new());
+        // The space's own rule: the space after its name is one this module wrote, and
+        // the grid's rule would have eaten it.
+        let rule = rule_row(&rows, 1);
+        assert!(
+            rule.text
+                .starts_with("\u{2500}\u{25be} \u{4e2d}\u{6587} \u{2500}"),
+            "{:?}",
+            rule.text
+        );
+        assert_eq!(crate::width::width(&rule.text), WIDTH);
+        // The agent's row opens with the state dot and then the name.
+        let row = tree_row(&rows, 1);
+        assert!(row.text.starts_with("   \u{25cf} "), "{:?}", row.text);
         assert_eq!(crate::width::width(&row.text), WIDTH);
     }
 
     #[test]
     fn an_absurdly_long_state_never_eats_the_session() {
         let agents = vec![agent(1, 1, "claude", &"z".repeat(80))];
-        let lines = render(&[space(1, "app")], &agents, 1, 1, 8);
+        let rows = tree_rows(
+            &[space(1, "app")],
+            &agents,
+            1,
+            8,
+            &Seen::new(),
+            &Shut::new(),
+        );
         // No state word is drawn at all: the row is the dot and the session,
         // however long the daemon's state string runs.
-        let row = lines
-            .iter()
-            .find(|l| l.indicator.is_some())
-            .unwrap_or_else(|| panic!("no agent row"));
+        let row = tree_row(&rows, 1);
         assert_eq!(crate::width::width(&row.text), WIDTH);
-        assert_eq!(row.text.trim_end(), " \u{25cf} claude", "{:?}", row.text);
+        assert_eq!(row.text.trim_end(), "   \u{25cf} claude", "{:?}", row.text);
         assert!(!row.text.contains('z'));
     }
 
@@ -2348,76 +2425,67 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_draws_its_rows_in_daemon_order_and_no_headers() {
+    fn every_agent_draws_one_row_in_daemon_order_under_its_space() {
         let (spaces, agents) = many_agents();
         // Terminal 5 is done and already looked at.
         let mut seen = Seen::new();
         seen.insert((5, 0));
-        let lines = render_folded(
+        let rows = rows12(
             &spaces,
             &agents,
             2,
             1,
             40,
             0,
-            View::Grouped,
+            View::Tree,
             &seen,
             &Unseen::new(),
             NOW,
             WIDTH,
+            None,
         );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        // Every agent draws its rows, in the daemon's order: terminal 1
-        // (blocked) first because it is listed first, not because of what it
-        // needs.
-        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
+        let texts = texts(&lines);
+        // Every agent draws one row under its space, in the daemon's order inside it:
+        // terminal 1 (blocked) first because it is listed first, not because of what
+        // it needs. Urgency is the pin's job, which lists who needs a person except
+        // terminal 1: it has the keyboard, so it is on screen already.
+        assert_eq!(order(&rows), vec![1, 3, 5, 6, 9, 2, 4, 7, 8]);
+        assert_eq!(pinned(&rows), vec![2]);
         // Static: running agents carry the working dot, no spinner, and no
         // state word on the right.
         assert!(
             lines
                 .iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("working")))),
+                .any(|l| l.indicator == Some((CHILD_DOT_AT, 1, crate::theme::of("working")))),
             "{texts:?}"
         );
         assert!(
             !texts.iter().any(|t| t.ends_with("working")),
             "a state word leaked: {texts:?}"
         );
-        // No group headers and no fold lines anywhere: the state dot carries
-        // the state. (Agent programs here never contain these words, so any
-        // hit is chrome.)
-        for header in ["needs you", "running", "finished", "idle", "▸"] {
+        // No group headers and no folded rules: the state dot carries the state.
+        // (Agent programs here never contain these words, so any hit is chrome.)
+        for header in ["running", "finished", "idle", "\u{25b8}"] {
             assert!(
                 !texts.iter().any(|t| t.contains(header)),
                 "a group header leaked: {header}: {texts:?}"
             );
         }
-        // All nine agents draw their pairs, in the daemon's order.
+        // Nine tree rows, and the one the pin repeats.
         assert_eq!(
             texts
                 .iter()
                 .filter(|t| t.contains("claude") || t.contains("codex"))
                 .count(),
-            18,
+            10,
             "{texts:?}"
         );
-        let first_codex = texts
-            .iter()
-            .position(|t| t.contains("codex"))
-            .expect("codex");
-        let first_claude = texts
-            .iter()
-            .position(|t| t.contains("claude"))
-            .expect("claude");
-        assert!(first_codex < first_claude, "{texts:?}");
-        // The title names the sort order on its right.
+        // The title names the order on its right.
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
+                .any(|t| t.starts_with(&format!(" {SPACES_TITLE}")) && t.ends_with("tree +")),
             "{texts:?}"
         );
         for line in &lines {
@@ -2426,32 +2494,29 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_agent_draws_its_rows_like_a_working_one() {
+    fn an_idle_agent_draws_its_row_like_a_working_one() {
         let (spaces, agents) = sample();
-        let folded = render_folded(
+        let texts = texts(&folded(
             &spaces,
             &agents,
             1,
             1,
             14,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &Unseen::new(),
             NOW,
             WIDTH,
-        );
-        let texts: Vec<String> = folded
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        // Nothing folds: the working agent and the idle one both keep their
-        // rows, each pair with its own state dot.
-        assert!(texts.iter().any(|t| t.contains("claude")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        ));
+        // Nothing folds on its own: the working agent and the idle one both keep
+        // their rows, each with its own state dot.
+        assert!(texts.iter().any(|t| t == "   \u{25cf} claude"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "   \u{25cf} codex"), "{texts:?}");
     }
+
     #[test]
-    fn the_foot_of_the_column_carries_the_mark_the_name_and_the_version() {
+    fn the_foot_of_the_column_carries_the_mark_the_name_the_version_and_the_menu() {
         let (line, hit) = collapse_row(false, WIDTH);
         assert_eq!(
             crate::width::width(&line.text),
@@ -2467,21 +2532,42 @@ mod tests {
             line.text
         );
         assert!(
-            line.text.contains('\u{ab}'),
-            "the fold mark shares the row rather than losing it: {:?}",
+            line.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+            "the menu and the fold mark close the row: {:?}",
             line.text
         );
-        assert_eq!(hit, Some(Hit::Collapse), "and clicking the row still folds");
+        assert_eq!(hit, Some(Hit::Foot));
+        // The word opens the menu and the rest of the row folds the column.
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let menu_at = WIDTH - 6;
+        assert_eq!(act(Hit::Foot, menu_at, &c, false), Some(Act::Menu));
+        assert_eq!(act(Hit::Foot, WIDTH - 1, &c, false), Some(Act::Collapse));
+        assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Collapse));
         // The mark and the name wear the accent, and nothing else on the row does.
         let (at, len, role) = line.accent.expect("a wordmark is accented");
         assert_eq!(role, crate::theme::Role::Brand);
-        let painted: String = line.text.chars().skip(at).take(len).collect();
-        assert_eq!(painted, format!("{BRAND_MARK} {BRAND}"), "{:?}", line.text);
+        assert_eq!(run_text(&line, at, len), format!("{BRAND_MARK} {BRAND}"));
 
         // Folded to a strip there is no room for a name, and the fold mark is the row.
-        let (strip, _) = collapse_row(true, WIDTH);
+        let (strip, hit) = collapse_row(true, WIDTH);
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
+        assert_eq!(hit, Some(Hit::Foot));
+        assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
     /// A picked avatar signs the foot with its own two dots, hair beside body,
@@ -2504,6 +2590,7 @@ mod tests {
         );
         assert!(line.text.contains(BRAND), "{:?}", line.text);
         assert!(line.text.contains(VERSION), "{:?}", line.text);
+        assert!(line.text.contains(MENU_LABEL), "{:?}", line.text);
         assert!(line.text.contains('\u{ab}'), "{:?}", line.text);
         let marks: String = line.text.chars().skip(1).take(2).collect();
         assert_eq!(
@@ -2512,11 +2599,15 @@ mod tests {
             "hair dot beside body dot: {:?}",
             line.text
         );
+        // The menu word shares the row, so at thirty columns the name is cut, and
+        // at the widest column it reads whole.
         assert!(
-            line.text.contains("Mohawk Pink"),
+            line.text.contains("Mohawk\u{2026}"),
             "the pet name reads off the foot: {:?}",
             line.text
         );
+        let (widest, _) = collapse_row_with(false, SIDEBAR_MAX, Some(&pet), None);
+        assert!(widest.text.contains("Mohawk Pink"), "{widest:?}");
         assert_eq!(
             line.accent,
             Some((1, 1, crate::theme::Role::AvatarHair(212))),
@@ -2527,7 +2618,7 @@ mod tests {
             Some((2, 1, crate::theme::Role::AvatarBody(33))),
             "{line:?}"
         );
-        assert_eq!(hit, Some(Hit::Collapse));
+        assert_eq!(hit, Some(Hit::Foot));
     }
 
     /// A long pet name is cut with an ellipsis rather than pushing the fold
@@ -2548,7 +2639,11 @@ mod tests {
             wide.text.contains('\u{2026}'),
             "fourteen characters never fit at thirty columns: {wide:?}"
         );
-        assert!(wide.text.contains("Thin 4 Bloc"), "{wide:?}");
+        assert!(wide.text.contains("Thin 4\u{2026}"), "{wide:?}");
+        assert!(
+            wide.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+            "{wide:?}"
+        );
         let (narrow, _) = collapse_row_with(false, 18, Some(&pet), None);
         assert_eq!(crate::width::width(&narrow.text), 18);
         assert!(
@@ -2556,6 +2651,7 @@ mod tests {
             "no smudge at eighteen columns: {narrow:?}"
         );
         assert!(narrow.text.contains(BRAND), "{narrow:?}");
+        assert!(narrow.text.contains(MENU_LABEL), "{narrow:?}");
     }
 
     /// Without an avatar the foot is byte for byte what it always was.
@@ -2590,23 +2686,31 @@ mod tests {
         assert!(!avatar_fits(11, 30, true));
     }
 
+    /// Thirty working agents in one space: more than a thirty row column holds, so the
+    /// rows above the foot are list rows unless a pet takes them.
+    fn crowd() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
+        (
+            vec![space(1, "app")],
+            (1..=30u32)
+                .map(|i| agent(i, 1, "claude", "working"))
+                .collect(),
+        )
+    }
+
     /// With a pet the five rows above the foot go blank for the overlay, the
     /// foot keeps its dots and name, and the column keeps its exact height.
     #[test]
     fn a_pet_reserves_five_blank_rows_above_the_foot() {
         let pet = art_pet();
-        let spaces = vec![space(1, "app")];
-        let agents: Vec<AgentRow> = (1..=10u32)
-            .map(|i| agent(i, 1, "claude", "working"))
-            .collect();
-        let rows = rows_folded(
+        let (spaces, agents) = crowd();
+        let rows = rows12(
             &spaces,
             &agents,
             1,
             1,
             30,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &Unseen::new(),
             NOW,
@@ -2618,26 +2722,30 @@ mod tests {
             assert_eq!(line.text, " ".repeat(WIDTH), "{line:?}");
             assert_eq!(*hit, None);
         }
-        let (foot, _) = &rows[29];
-        assert!(foot.text.contains("Mohawk Pink"), "{foot:?}");
+        // The list is laid out in the rows above the pet: its last row is an agent.
+        assert!(
+            matches!(rows[23].1, Some(Hit::Terminal(_))),
+            "{:?}",
+            rows[23]
+        );
+        let (foot, hit) = &rows[29];
+        assert!(foot.text.contains("Mohawk"), "{foot:?}");
+        assert_eq!(*hit, Some(Hit::Foot));
     }
 
     /// The reservation eats list rows, not padding: without a pet those rows
     /// carry agents.
     #[test]
     fn without_a_pet_those_rows_carry_agents() {
-        let spaces = vec![space(1, "app")];
-        let agents: Vec<AgentRow> = (1..=10u32)
-            .map(|i| agent(i, 1, "claude", "working"))
-            .collect();
-        let plain = rows_folded(
+        let (spaces, agents) = crowd();
+        let plain = rows12(
             &spaces,
             &agents,
             1,
             1,
             30,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &Unseen::new(),
             NOW,
@@ -2647,8 +2755,8 @@ mod tests {
         assert!(
             plain[24..29]
                 .iter()
-                .any(|(line, _)| line.text.trim().len() > 1),
-            "ten agents must reach rows 24 to 28"
+                .all(|(_, hit)| matches!(hit, Some(Hit::Terminal(_)))),
+            "thirty agents must reach rows 24 to 28"
         );
     }
 
@@ -2701,6 +2809,11 @@ mod tests {
             "the longer row still fills the column exactly: {:?}",
             line.text
         );
+        assert!(
+            line.text.contains(MENU_LABEL),
+            "the notice never pushes the menu off: {:?}",
+            line.text
+        );
         let (plain, _) = collapse_row_with(false, WIDTH, None, None);
         assert!(
             !plain.text.contains('>'),
@@ -2713,8 +2826,7 @@ mod tests {
     /// and no receipt in the seen set.
     #[test]
     fn unread_is_a_done_row_nobody_has_looked_at() {
-        let (spaces, agents) = many_agents();
-        let _ = spaces;
+        let (_, agents) = many_agents();
         let done = agents.iter().find(|a| a.terminal == 5).unwrap();
         let empty = Seen::new();
         assert!(is_unread(done, 1, &empty));
@@ -2730,11 +2842,10 @@ mod tests {
     }
 
     /// An idle row that finished while the keyboard was away is news too, not
-    /// calm: same `new` word and sage as a daemon done, until focused.
+    /// calm: the same sage as a daemon done, until focused.
     #[test]
     fn new_is_an_idle_row_that_finished_while_away() {
-        let (spaces, agents) = many_agents();
-        let _ = spaces;
+        let (_, agents) = many_agents();
         let idle = agents.iter().find(|a| a.terminal == 7).unwrap();
         assert_eq!(idle.state, "idle");
         let seen = Seen::new();
@@ -2748,37 +2859,11 @@ mod tests {
         let calm = agents.iter().find(|a| a.terminal == 8).unwrap();
         assert!(!is_new(calm, 1, &seen, &Unseen::new()));
     }
+
     #[test]
-    fn priority_view_sorts_by_urgency_without_headers() {
+    fn priority_view_sorts_by_urgency_without_headers_or_a_pin() {
         let (spaces, agents) = many_agents();
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            2,
-            1,
-            40,
-            0,
-            View::Priority,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        for header in ["needs you", "running", "finished"] {
-            assert!(
-                !texts.iter().any(|t| t.trim_start().starts_with(header)),
-                "a group header leaked into the priority view: {texts:?}"
-            );
-        }
-        // Urgency order without state words: the dots carry the states, so
-        // the terminals' first appearance runs blocked, failed, the unread
-        // done, then running. Terminals: 1 blocked, 2 failed, 5 unread
-        // done, 3 and 4 working.
-        let order: Vec<u32> = rows_folded(
+        let rows = rows12(
             &spaces,
             &agents,
             2,
@@ -2791,13 +2876,24 @@ mod tests {
             NOW,
             WIDTH,
             None,
-        )
-        .into_iter()
-        .filter_map(|(_, hit)| match hit {
-            Some(Hit::Terminal(t)) => Some(t),
-            _ => None,
-        })
-        .collect();
+        );
+        let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
+        let texts = texts(&lines);
+        for header in [PIN_TITLE, "running", "finished"] {
+            assert!(
+                !texts.iter().any(|t| t.trim_start().starts_with(header)),
+                "a header leaked into the priority view: {texts:?}"
+            );
+        }
+        // The title opens the column: the list is already who needs a person.
+        assert_eq!(rows[0].1, Some(Hit::Title));
+        assert!(texts[0].ends_with("priority +"), "{texts:?}");
+        // No rules either: a flat list.
+        assert!(!rows.iter().any(|(_, h)| matches!(h, Some(Hit::Space(_)))));
+        // Urgency order without state words: the dots carry the states, so
+        // the terminals run blocked, failed, the unread done, then running.
+        // Terminals: 1 blocked, 2 failed, 5 unread done, 3 and 4 working.
+        let order = order(&rows);
         let first = |t: u32| {
             order
                 .iter()
@@ -2808,31 +2904,31 @@ mod tests {
         assert!(first(2) < first(5), "{order:?}");
         assert!(first(5) < first(3), "{order:?}");
         assert!(first(3) < first(6), "{order:?}");
-        // Every agent draws, folded or not: nine pairs, eighteen name rows.
+        // Every agent draws one row.
         assert_eq!(
             texts
                 .iter()
                 .filter(|t| t.contains("claude") || t.contains("codex"))
                 .count(),
-            18,
+            9,
             "{texts:?}"
         );
     }
 
-    /// Static panel: the tick changes nothing, every dot keeps its colour
+    /// Static column: the tick changes nothing, every dot keeps its colour
     /// and no state word is ever drawn.
     #[test]
-    fn the_panel_is_static_across_ticks() {
+    fn the_column_is_static_across_ticks() {
         let (spaces, agents) = many_agents();
         let at = |tick: u64| {
-            rows_folded(
+            rows12(
                 &spaces,
                 &agents,
                 2,
                 1,
                 40,
                 tick,
-                View::Grouped,
+                View::Tree,
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
@@ -2840,23 +2936,22 @@ mod tests {
                 None,
             )
         };
-        let zero: Vec<Line> = at(0).iter().map(|(l, _)| l.clone()).collect();
-        let four: Vec<Line> = at(4).iter().map(|(l, _)| l.clone()).collect();
-        assert_eq!(zero, four, "the tick repainted a static panel");
-        // Every agent's first row opens with its state dot, steady.
-        assert!(
-            zero.iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("blocked")))),
+        let zero = at(0);
+        assert_eq!(zero, at(4), "the tick repainted a static column");
+        // Every agent's row opens with its state dot, steady.
+        assert_eq!(
+            tree_row(&zero, 1).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::of("blocked"))),
             "no static blocked dot"
         );
         // An unread done keeps the done sage on its dot, steady.
-        assert!(
-            zero.iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
+        assert_eq!(
+            tree_row(&zero, 5).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::of("done"))),
             "no static unread dot"
         );
-        // And no state word on the right of any agent row.
-        for line in zero.iter().filter(|l| l.indicator.is_some()) {
+        // And no state word on the right of any row.
+        for (line, _) in &zero {
             for word in ["working", "blocked", "failed", "done", "idle"] {
                 assert!(
                     !line.text.trim_end().ends_with(word),
@@ -2876,71 +2971,49 @@ mod tests {
             assert_eq!(dot_glyph(crate::theme::of(state)), DOT, "{state}");
         }
         assert_eq!(dot_glyph(crate::theme::of("failed")), FAILED_DOT);
-        // And a failed agent renders the diamond in its row text, steady,
-        // carrying the failed colour on its indicator.
+        // A failed agent renders the diamond in both of its rows, steady: flat in the
+        // pin and under its rule in the tree, each carrying the failed colour and each
+        // reaching the failed terminal. The keyboard is elsewhere, or the pin would
+        // leave the failed agent to its own row.
+        let spaces = vec![space(2, "webshop")];
         let agents = vec![agent(2, 2, "claude", "failed")];
-        let lines = render(&[space(2, "webshop")], &agents, 2, 2, 8);
-        let row = lines
-            .iter()
-            .find(|l| l.text.starts_with(" \u{25c6} "))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no diamond row: {:?}",
-                    lines.iter().map(|l| &l.text).collect::<Vec<_>>()
-                )
-            });
-        assert_eq!(
-            row.indicator,
-            Some((DOT_AT, DOT_LEN, crate::theme::of("failed")))
-        );
-        // Hitting the diamond row reaches the failed terminal.
-        let at = lines
-            .iter()
-            .position(|l| l.text.starts_with(" \u{25c6} "))
-            .unwrap();
-        assert_eq!(
-            hit(&[space(2, "webshop")], &agents, 2, 2, 8, at),
-            Some(Hit::Terminal(2))
-        );
-        // The folded panel draws the same diamond.
-        let folded = render_folded(
-            &[space(2, "webshop")],
-            &agents,
-            2,
-            2,
-            40,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        assert!(
-            folded.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
-            "no folded diamond: {:?}",
-            folded.iter().map(|l| &l.text).collect::<Vec<_>>()
-        );
+        let lines = render(&spaces, &agents, 2, 99, 8);
+        for (prefix, at) in [
+            (" \u{25c6} claude", DOT_AT),
+            ("   \u{25c6} claude", CHILD_DOT_AT),
+        ] {
+            let row = lines
+                .iter()
+                .position(|l| l.text.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no diamond row {prefix:?}: {:?}", texts(&lines)));
+            assert_eq!(
+                lines[row].indicator,
+                Some((at, 1, crate::theme::of("failed")))
+            );
+            assert_eq!(hit(&spaces, &agents, 2, 99, 8, row), Some(Hit::Terminal(2)));
+        }
         // An unseen failed finish keeps the diamond: failed is never news.
         let mut unseen = Unseen::new();
         unseen.insert((2, gen_of(&agents[0])));
-        let fresh_lines = render_folded(
-            &[space(2, "webshop")],
+        let fresh_lines = folded(
+            &spaces,
             &agents,
             2,
             1,
             40,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &unseen,
             NOW,
             WIDTH,
         );
         assert!(
-            fresh_lines.iter().any(|l| l.text.starts_with(" \u{25c6} ")),
+            fresh_lines
+                .iter()
+                .any(|l| l.text.starts_with("   \u{25c6} ")),
             "unseen failed lost its diamond: {:?}",
-            fresh_lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            texts(&fresh_lines)
         );
     }
 
@@ -2954,7 +3027,7 @@ mod tests {
             agent(1, 1, "codex", "blocked"),
             agent(2, 2, "claude", "failed"),
         ];
-        let lines = rows_collapsed(&[space(1, "app"), space(2, "webshop")], &agents, 1, 1, 12);
+        let lines = collapsed5(&[space(1, "app"), space(2, "webshop")], &agents, 1, 1, 12);
         let texts: Vec<String> = lines.iter().map(|(l, _)| l.text.clone()).collect();
         assert!(
             texts.iter().any(|t| t.starts_with(" \u{25c6}\u{b7}")),
@@ -2975,6 +3048,68 @@ mod tests {
         assert_eq!(failed.accent, Some((2, 1, crate::theme::space_of(2))));
     }
 
+    /// The strip is the tree in four columns: each space's number, then its agents'
+    /// marks right under it, so a mark sits under the space it is in. A folded space
+    /// keeps its number and the keyboard's own agent only; a stranger comes last.
+    #[test]
+    fn the_collapsed_strip_lists_each_space_with_its_agents_under_it() {
+        let spaces = vec![space(1, "app"), space(2, "dub")];
+        let agents = vec![
+            agent(1, 2, "codex", "idle"),
+            agent(2, 1, "claude", "working"),
+            agent(3, 2, "claude", "blocked"),
+            agent(4, 77, "claude", "idle"),
+            agent(5, 1, "codex", "idle"),
+        ];
+        let strip = |focused: u32, shut: &Shut| {
+            let (seen, unseen) = (Seen::new(), Unseen::new());
+            rows_collapsed(
+                &column(
+                    &spaces,
+                    &agents,
+                    1,
+                    focused,
+                    0,
+                    View::Tree,
+                    &seen,
+                    &unseen,
+                    NOW,
+                    WIDTH,
+                    shut,
+                ),
+                12,
+            )
+        };
+        let rows = strip(9, &Shut::new());
+        let hits: Vec<Hit> = rows.iter().filter_map(|(_, h)| *h).collect();
+        assert_eq!(
+            hits,
+            vec![
+                Hit::Space(1),
+                Hit::Terminal(2),
+                Hit::Terminal(5),
+                Hit::Space(2),
+                Hit::Terminal(1),
+                Hit::Terminal(3),
+                Hit::Terminal(4),
+                Hit::Foot,
+            ]
+        );
+        assert_eq!(rows[0].0.text, " 1  ");
+        assert_eq!(rows[3].0.text, " 2  ");
+        assert_eq!(rows.len(), 12);
+        for (line, _) in &rows {
+            assert_eq!(crate::width::width(&line.text), COLLAPSED, "{line:?}");
+        }
+        // Folding app keeps its number and the focused agent, and drops the other.
+        let rows = strip(5, &Shut::from([1]));
+        let hits: Vec<Hit> = rows.iter().filter_map(|(_, h)| *h).collect();
+        assert_eq!(
+            &hits[..3],
+            &[Hit::Space(1), Hit::Terminal(5), Hit::Space(2)]
+        );
+    }
+
     /// Freshness points at done: an idle agent finished while the keyboard was
     /// away wears the done circle, never a diamond, because failed is never news.
     #[test]
@@ -2983,46 +3118,51 @@ mod tests {
         let mut unseen = Unseen::new();
         unseen.insert((6, gen_of(&agents[0])));
         assert!(is_new(&agents[0], 1, &Seen::new(), &unseen));
-        let lines = render_folded(
+        let rows = rows12(
             &[space(1, "app")],
             &agents,
             1,
             1,
             40,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &unseen,
             NOW,
             WIDTH,
+            None,
         );
-        let row = lines
+        // Both its rows, the pin's and the tree's, wear the done circle.
+        let mine: Vec<&Line> = rows
             .iter()
-            .find(|l| l.indicator.is_some())
-            .expect("no agent row");
-        assert!(
-            row.text.starts_with(" \u{25cf} "),
-            "fresh idle is not a circle: {:?}",
-            row.text
-        );
-        assert_eq!(
-            row.indicator,
-            Some((DOT_AT, DOT_LEN, crate::theme::of("done")))
-        );
+            .filter(|(_, h)| *h == Some(Hit::Terminal(6)))
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(mine.len(), 2);
+        for row in mine {
+            let (at, _, role) = row.indicator.expect("a dot");
+            assert_eq!(
+                row.text.chars().nth(at),
+                Some(DOT),
+                "fresh idle is not a circle: {:?}",
+                row.text
+            );
+            assert_eq!(role, crate::theme::of("done"));
+        }
     }
 
     #[test]
-    fn view_toggle_flips_between_grouped_and_priority() {
-        assert_eq!(View::Grouped.toggle(), View::Priority);
-        assert_eq!(View::Priority.toggle(), View::Grouped);
-        assert_eq!(View::default(), View::Grouped);
+    fn view_toggle_flips_between_tree_and_priority() {
+        assert_eq!(View::Tree.toggle(), View::Priority);
+        assert_eq!(View::Priority.toggle(), View::Tree);
+        assert_eq!(View::default(), View::Tree);
     }
 
     /// The reported bug: a working agent listed after idle ones must stay
-    /// last while grouped, and so must a blocked one. Grouped never reorders;
+    /// last in the tree, and so must a blocked one. The tree never reorders;
     /// urgency is the priority view's job, where both jump to the top.
     #[test]
-    fn grouped_keeps_daemon_order_while_priority_sorts_by_urgency() {
+    fn the_tree_keeps_daemon_order_while_priority_sorts_by_urgency() {
         let spaces = vec![space(1, "app")];
         for agents in [
             vec![
@@ -3036,8 +3176,8 @@ mod tests {
                 agent(3, 1, "claude", "blocked"),
             ],
         ] {
-            for view in [View::Grouped, View::Priority] {
-                let rows = rows_folded(
+            for view in [View::Tree, View::Priority] {
+                let rows = rows12(
                     &spaces,
                     &agents,
                     1,
@@ -3051,22 +3191,9 @@ mod tests {
                     WIDTH,
                     None,
                 );
-                let terminals: Vec<u32> = rows
-                    .iter()
-                    .filter_map(|(_, hit)| match hit {
-                        Some(Hit::Terminal(t)) => Some(*t),
-                        _ => None,
-                    })
-                    .collect();
-                // Two rows per agent, first row first: dedup keeps the order.
-                let mut order = Vec::new();
-                for t in terminals {
-                    if !order.contains(&t) {
-                        order.push(t);
-                    }
-                }
-                if view == View::Grouped {
-                    assert_eq!(order, vec![1, 2, 3], "grouped reordered: {order:?}");
+                let order = order(&rows);
+                if view == View::Tree {
+                    assert_eq!(order, vec![1, 2, 3], "the tree reordered: {order:?}");
                 } else {
                     assert_eq!(order, vec![3, 1, 2], "priority did not sort: {order:?}");
                 }
@@ -3074,147 +3201,433 @@ mod tests {
         }
     }
 
+    /// A column for the click tests: the sample, in the given order and width.
+    fn clicks<'a>(
+        spaces: &'a [WorkspaceRow],
+        agents: &'a [AgentRow],
+        view: View,
+        width: usize,
+        none: &'a (Seen, Unseen, Shut),
+    ) -> Column<'a> {
+        column(
+            spaces, agents, 1, 1, 0, view, &none.0, &none.1, NOW, width, &none.2,
+        )
+    }
+
+    /// Only the order word flips the view and only the `+` makes a space: a click on
+    /// the word `spaces`, or in the gap, does nothing anybody did not ask for.
     #[test]
-    fn only_the_mode_word_of_the_agents_title_flips_the_view() {
-        for view in [View::Grouped, View::Priority] {
-            assert_eq!(
-                agents_title_hit(view, 0, WIDTH),
-                None,
-                "the agents word is nothing"
-            );
-            assert_eq!(
-                agents_title_hit(view, 5, WIDTH),
-                None,
-                "mid title is nothing"
-            );
-            assert_eq!(
-                agents_title_hit(view, WIDTH - 1, WIDTH),
-                Some(Hit::View),
-                "the mode corner flips"
-            );
+    fn only_the_mode_word_of_the_title_flips_the_view() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        for view in [View::Tree, View::Priority] {
+            let c = clicks(&spaces, &agents, view, WIDTH, &none);
+            assert_eq!(act(Hit::Title, 1, &c, false), None, "the spaces word");
+            assert_eq!(act(Hit::Title, 5, &c, false), None, "mid title");
+            assert_eq!(act(Hit::Title, WIDTH - 1, &c, false), None, "the gap");
+            assert_eq!(act(Hit::Title, WIDTH - 2, &c, false), Some(Act::View));
+            assert_eq!(act(Hit::Title, WIDTH, &c, false), Some(Act::NewSpace));
         }
     }
 
+    /// Where the painted words are, the clicks are: at every width the columns that
+    /// flip the view spell the order word, the ones that open the menu spell `menu`,
+    /// the `+` is the last column, and the fold cells are the rule's dash and arrow.
     #[test]
-    fn one_breath_sits_between_the_agents_title_and_the_rows() {
+    fn act_resolves_title_foot_and_space_by_column_at_every_width() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
+            for view in [View::Tree, View::Priority] {
+                let c = clicks(&spaces, &agents, view, width, &none);
+                let rows = rows_folded(&c, 20, None);
+                let title = rows
+                    .iter()
+                    .find(|(_, h)| *h == Some(Hit::Title))
+                    .map(|(l, _)| l.text.clone())
+                    .expect("a title");
+                let word: String = (1..=width)
+                    .filter(|col| act(Hit::Title, *col, &c, false) == Some(Act::View))
+                    .filter_map(|col| title.chars().nth(col - 1))
+                    .collect();
+                assert_eq!(word, title_mode(view), "width {width}: {title:?}");
+                assert_eq!(title.chars().nth(width - 1), Some('+'));
+                assert_eq!(act(Hit::Title, width, &c, false), Some(Act::NewSpace));
+                assert_eq!(act(Hit::Title, 1, &c, false), None);
+
+                let foot = rows.last().map(|(l, _)| l.text.clone()).expect("a foot");
+                let menu: String = (1..=width)
+                    .filter(|col| act(Hit::Foot, *col, &c, false) == Some(Act::Menu))
+                    .filter_map(|col| foot.chars().nth(col - 1))
+                    .collect();
+                assert_eq!(menu, MENU_LABEL, "width {width}: {foot:?}");
+                for col in [1, width - 1, width] {
+                    assert_eq!(
+                        act(Hit::Foot, col, &c, false),
+                        Some(Act::Collapse),
+                        "width {width} col {col}"
+                    );
+                }
+
+                // A rule folds at its dash and arrow, in the tree only, and only when
+                // there is something under it to fold.
+                for col in 1..=width {
+                    let want = if view == View::Tree && col <= FOLD_CELLS {
+                        Act::Fold(1)
+                    } else {
+                        Act::Space(1)
+                    };
+                    assert_eq!(act(Hit::Space(1), col, &c, false), Some(want));
+                    assert_eq!(act(Hit::Space(3), col, &c, false), Some(Act::Space(3)));
+                }
+                assert_eq!(act(Hit::Space(1), 1, &c, true), Some(Act::Space(1)));
+                assert_eq!(act(Hit::Foot, 1, &c, true), Some(Act::Collapse));
+                assert_eq!(act(Hit::Terminal(3), 1, &c, false), Some(Act::Terminal(3)));
+            }
+        }
+        // The fold cells are exactly the rule's dash, arrow and the space after them.
+        let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
+        let head: String = rule_row(&rows, 1).text.chars().take(FOLD_CELLS).collect();
+        assert_eq!(head, "\u{2500}\u{25be} ");
+    }
+
+    /// No breath between the title and the tree any more: the first rule is itself a
+    /// separator, so the row under the title is already the first space.
+    #[test]
+    fn the_tree_opens_right_under_the_title() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "idle")];
-        let (content, shown, total) = agents_content(
-            &spaces,
-            &agents,
-            1,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let laid = lay_out_agents(content, shown, total, 1, 10, View::Grouped, WIDTH);
-        assert!(
-            laid[0].0.text.starts_with(" agents"),
-            "{:?}",
-            laid[0].0.text
-        );
-        assert_eq!(laid[1].0.text.trim(), "", "no gap under the switch");
-        assert!(laid[1].1.is_none(), "the gap is not clickable");
+        let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
+        assert_eq!(rows[0].1, Some(Hit::Title));
+        assert_eq!(rows[1].1, Some(Hit::Space(1)));
+        assert_eq!(rows[2].1, Some(Hit::Terminal(1)));
     }
 
-    /// A blocked agent draws its two rows and nothing else: no headers for
-    /// groups with nobody in them.
+    /// A blocked agent is pinned at the top, where a person looks first, and still
+    /// draws its row under its space: the pin is a place to glance, not a move. The
+    /// pin ends in a rule of its own grey, clickable as nothing.
     #[test]
-    fn a_blocked_agent_draws_two_rows_and_no_headers() {
+    fn a_blocked_agent_is_pinned_and_still_drawn_under_its_space() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "blocked")];
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            1,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(texts.iter().any(|t| t.contains("codex")), "{texts:?}");
+        let rows = tree_rows(&spaces, &agents, 9, 10, &Seen::new(), &Shut::new());
+        let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
+        let texts = texts(&lines);
+        assert!(texts[0].starts_with(&format!(" {PIN_TITLE}")), "{texts:?}");
+        assert!(texts[0].ends_with(" 1"), "{texts:?}");
+        assert_eq!(lines[0].colour, Some(crate::theme::Role::Title));
+        assert_eq!(rows[0].1, None);
+        assert!(texts[1].starts_with(" \u{25cf} codex"), "{texts:?}");
+        assert!(texts[1].ends_with(" app"), "{texts:?}");
+        assert_eq!(rows[1].1, Some(Hit::Terminal(1)));
+        assert_eq!(lines[2].text, "\u{2500}".repeat(WIDTH));
+        assert_eq!(lines[2].colour, Some(crate::theme::Role::Rule));
+        assert_eq!(rows[2].1, None);
+        assert_eq!(rows[3].1, Some(Hit::Title));
+        assert_eq!(order(&rows), vec![1]);
         assert!(!texts.iter().any(|t| t.contains("idle")), "{texts:?}");
+    }
+
+    /// The pin exists only while somebody needs a person, and lists them by what they
+    /// need: blocked first, then failed, then a finish nobody has read. Working and
+    /// calm agents are the tree's business alone.
+    #[test]
+    fn the_pin_appears_only_when_needed_and_lists_blocked_then_failed_then_unread_done() {
+        let spaces = vec![space(1, "app"), space(2, "dub")];
+        let agents = vec![
+            agent(1, 1, "claude", "done"),
+            agent(2, 1, "codex", "failed"),
+            agent(3, 2, "claude", "working"),
+            agent(4, 2, "codex", "blocked"),
+        ];
+        let rows = tree_rows(&spaces, &agents, 9, 20, &Seen::new(), &Shut::new());
+        assert_eq!(pinned(&rows), vec![4, 2, 1]);
+        assert!(rows[0].0.text.trim_end().ends_with(" 3"), "{:?}", rows[0].0);
+        // Each pinned row names the space it lives in, in the space's colour.
+        let blocked = &rows[1].0;
+        assert!(blocked.text.trim_end().ends_with(" dub"), "{blocked:?}");
+        assert_eq!(
+            blocked.accent.map(|(_, _, role)| role),
+            Some(crate::theme::space_of(2))
+        );
+        assert_eq!(
+            blocked.indicator,
+            Some((DOT_AT, 1, crate::theme::Role::Blocked))
+        );
+        // Calm the fleet down and the pin is gone: the title opens the column.
+        let mut calm = agents.clone();
+        calm[1].state = "idle".into();
+        calm[3].state = "working".into();
+        let mut seen = Seen::new();
+        seen.insert((1, 0));
+        let rows = tree_rows(&spaces, &calm, 9, 20, &seen, &Shut::new());
+        assert_eq!(rows[0].1, Some(Hit::Title));
+        assert!(pinned(&rows).is_empty());
         assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
-            "{texts:?}"
+            !rows.iter().any(|(l, _)| l.text.contains(PIN_TITLE)),
+            "an empty pin drew"
         );
     }
 
-    /// Only the `+` corner of the spaces title opens a space: the title row
-    /// itself is a no-op, so a click on the word `spaces` never makes a space
-    /// nobody asked for.
+    /// Every height from nothing to a tall window, every pulled width, with and without a
+    /// pet, a pin and a three digit count: always exactly the rows asked for, each exactly
+    /// the width, open or folded to the strip. A short row leaves the last frame's pixels
+    /// behind and a long one spills into the terminal beside the column.
     #[test]
-    fn only_the_plus_corner_of_the_spaces_title_opens_a_space() {
-        let (spaces, agents) = sample();
-        let lines = render_folded(
+    fn every_height_and_width_paints_exact_rows_with_pet_pin_and_big_counts() {
+        let spaces = vec![
+            space(1, "a-rather-long-space-name"),
+            space(2, "\u{4e2d}\u{6587}"),
+        ];
+        let mut agents: Vec<AgentRow> = (0..120)
+            .map(|i| {
+                agent(
+                    i + 1,
+                    1,
+                    "claude",
+                    if i % 7 == 0 { "blocked" } else { "working" },
+                )
+            })
+            .collect();
+        agents.push(agent(500, 2, "codex", "failed"));
+        let pet = qoro_runtime::avatar::Avatar {
+            body: qoro_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "big".into(),
+            hair_ink: 212,
+            body_ink: 33,
+        };
+        let (seen, unseen) = (Seen::new(), Unseen::new());
+        for shut in [Shut::new(), Shut::from([1])] {
+            for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+                for height in 0..=40 {
+                    for avatar in [None, Some(&pet)] {
+                        let c = column(
+                            &spaces,
+                            &agents,
+                            1,
+                            3,
+                            0,
+                            View::Tree,
+                            &seen,
+                            &unseen,
+                            NOW,
+                            width,
+                            &shut,
+                        );
+                        let rows = rows_folded(&c, height, avatar);
+                        assert_eq!(rows.len(), height, "width {width} height {height}");
+                        for (line, _) in &rows {
+                            assert_eq!(
+                                crate::width::width(&line.text),
+                                width,
+                                "width {width} height {height}: {:?}",
+                                line.text
+                            );
+                            let end = crate::width::width(&line.text);
+                            for (at, len, _) in line.runs.iter().chain(line.accent.iter()) {
+                                assert!(at + len <= end, "a run past the row: {line:?}");
+                            }
+                        }
+                        let strip = rows_collapsed(&c, height);
+                        assert_eq!(strip.len(), height, "strip height {height}");
+                        for (line, _) in &strip {
+                            assert_eq!(crate::width::width(&line.text), COLLAPSED, "{line:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// A pin with room for one agent shows that agent, and the title's count says how
+    /// many more there are: a title over a `+2 more` and nobody is a pin that names no one.
+    #[test]
+    fn a_pin_with_room_for_one_agent_shows_it() {
+        let spaces = vec![space(1, "app")];
+        let agents = vec![
+            agent(8, 1, "claude", "blocked"),
+            agent(9, 1, "codex", "blocked"),
+        ];
+        let rows = tree_rows(&spaces, &agents, 1, 8, &Seen::new(), &Shut::new());
+        assert_eq!(pinned(&rows), vec![8], "{rows:?}");
+        assert!(
+            rows[0].0.text.trim_end().ends_with('2'),
+            "the title counts both: {:?}",
+            rows[0].0.text
+        );
+        assert!(
+            !rows.iter().any(|(l, _)| l.text.contains("more")),
+            "no room was left for a count row: {rows:?}"
+        );
+    }
+
+    /// The pin is a glance, not a second list: five rows at most, and past that four
+    /// agents and a count of the rest, so the tree keeps the column. Every agent it
+    /// leaves out is still a row under its space.
+    #[test]
+    fn the_pin_caps_at_five_and_counts_the_rest() {
+        let spaces = vec![space(1, "app")];
+        let blocked = |n: u32| -> Vec<AgentRow> {
+            (1..=n).map(|t| agent(t, 1, "claude", "blocked")).collect()
+        };
+        let five = blocked(5);
+        let rows = tree_rows(&spaces, &five, 9, 40, &Seen::new(), &Shut::new());
+        assert_eq!(pinned(&rows), vec![1, 2, 3, 4, 5]);
+        assert!(!rows.iter().any(|(l, _)| l.text.contains("more")));
+
+        let eight = blocked(8);
+        let rows = tree_rows(&spaces, &eight, 9, 40, &Seen::new(), &Shut::new());
+        assert_eq!(pinned(&rows), vec![1, 2, 3, 4]);
+        assert!(rows[0].0.text.trim_end().ends_with(" 8"), "{:?}", rows[0].0);
+        let more = &rows[5];
+        assert_eq!(more.0.text.trim_end(), "   +4 more");
+        assert_eq!(more.0.colour, Some(crate::theme::Role::Faint));
+        assert_eq!(more.1, None);
+        assert_eq!(rows[6].0.colour, Some(crate::theme::Role::Rule));
+        assert_eq!(order(&rows), (1..=8).collect::<Vec<u32>>());
+
+        // A short column holds the pin to half its rows.
+        let rows = tree_rows(&spaces, &eight, 9, 12, &Seen::new(), &Shut::new());
+        assert_eq!(pinned(&rows), vec![1, 2]);
+        assert!(rows.iter().any(|(l, _)| l.text.trim_end() == "   +6 more"));
+    }
+
+    /// The priority list is already who needs a person, on top, so a pin over it would
+    /// say everything twice.
+    #[test]
+    fn the_pin_is_hidden_in_the_priority_view() {
+        let (spaces, agents) = sample_pinned();
+        let rows = rows12(
             &spaces,
             &agents,
             1,
-            1,
-            14,
+            9,
+            20,
             0,
-            View::Grouped,
+            View::Priority,
             &Seen::new(),
             &Unseen::new(),
             NOW,
             WIDTH,
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(texts[0].ends_with('+'), "{texts:?}");
-        assert_eq!(
-            hit_folded(
-                &spaces,
-                &agents,
-                1,
-                1,
-                14,
-                0,
-                View::Grouped,
-                &Seen::new(),
-                &Unseen::new(),
-                NOW,
-                WIDTH,
-                None,
-            ),
             None,
-            "the title row must not open a space: {texts:?}"
         );
-        assert_eq!(spaces_title_hit(5, WIDTH), None);
-        assert_eq!(spaces_title_hit(WIDTH, WIDTH), Some(Hit::NewSpace));
+        assert_eq!(rows[0].1, Some(Hit::Title));
+        assert!(!rows.iter().any(|(l, _)| l.text.contains(PIN_TITLE)));
+        assert_eq!(
+            order(&rows)[0],
+            3,
+            "the blocked agent leads the list instead"
+        );
     }
 
-    /// The keyboard's rows are always drawn: nothing folds them away, so a
+    /// A folded space hides the agents a person is not looking at, never the one the
+    /// keyboard is on: folding is tidying, not closing a tab somebody is typing into.
+    #[test]
+    fn a_folded_space_hides_calm_agents_but_keeps_the_focused_one() {
+        let spaces = vec![space(1, "app"), space(2, "dub")];
+        let agents = vec![
+            agent(1, 1, "claude", "idle"),
+            agent(2, 1, "codex", "idle"),
+            agent(3, 1, "claude", "working"),
+            agent(4, 2, "codex", "idle"),
+        ];
+        let shut = Shut::from([1]);
+        let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
+        assert_eq!(order(&rows), vec![2, 4]);
+        let app = rule_row(&rows, 1);
+        assert!(
+            app.text.starts_with("\u{2500}\u{25b8} app "),
+            "{:?}",
+            app.text
+        );
+        assert!(
+            app.text.ends_with(" 3 \u{2500}"),
+            "the count keeps every agent"
+        );
+        // Off the space, the fold hides all three.
+        let rows = tree_rows(&spaces, &agents, 4, 14, &Seen::new(), &shut);
+        assert_eq!(order(&rows), vec![4]);
+        // And the open space next to it is untouched.
+        assert!(
+            rule_row(&rows, 2).text.starts_with("\u{2500}\u{25be} dub "),
+            "{:?}",
+            rule_row(&rows, 2).text
+        );
+    }
+
+    /// A fold never hides a blocked agent silently: a folded rule's arrow and count
+    /// take the colour of its most urgent child that needs a person, and stay the
+    /// quiet grey while every child is calm. Open, they stay grey: the dots are right
+    /// there.
+    #[test]
+    fn a_folded_rule_wears_the_colour_of_its_most_urgent_child() {
+        use crate::theme::Role;
+        let spaces = vec![space(1, "app")];
+        let paint = |states: &[&str], shut: &Shut| -> Line {
+            let agents: Vec<AgentRow> = states
+                .iter()
+                .enumerate()
+                .map(|(i, s)| agent(i as u32 + 1, 1, "claude", s))
+                .collect();
+            let rows = tree_rows(&spaces, &agents, 9, 20, &Seen::new(), shut);
+            rule_row(&rows, 1).clone()
+        };
+        // The colour of the arrow and of the count, read off the painted runs.
+        let marks = |rule: &Line| -> (Role, Role) {
+            let arrow = rule.indicator.expect("an arrow").2;
+            let (_, _, count) = rule
+                .runs
+                .iter()
+                .find(|(at, len, _)| {
+                    run_text(rule, *at, *len)
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                })
+                .copied()
+                .expect("a count run");
+            (arrow, count)
+        };
+        let shut = Shut::from([1]);
+        assert_eq!(
+            marks(&paint(&["idle", "failed", "blocked"], &shut)),
+            (Role::Blocked, Role::Blocked)
+        );
+        assert_eq!(
+            marks(&paint(&["idle", "failed"], &shut)),
+            (Role::Failed, Role::Failed)
+        );
+        assert_eq!(
+            marks(&paint(&["idle", "done"], &shut)),
+            (Role::Done, Role::Done),
+            "an unread finish is news"
+        );
+        assert_eq!(
+            marks(&paint(&["idle", "working"], &shut)),
+            (Role::Faint, Role::Faint)
+        );
+        assert_eq!(
+            marks(&paint(&["idle", "blocked"], &Shut::new())),
+            (Role::Faint, Role::Faint),
+            "an open rule stays grey"
+        );
+    }
+
+    /// The keyboard's row is always drawn: nothing folds it away on its own, so a
     /// focused terminal never reads as a terminal that died.
     #[test]
-    fn the_focused_agent_always_draws_its_rows() {
+    fn the_focused_agent_always_draws_its_row() {
         let (spaces, agents) = many_agents();
         for focused in [1u32, 5, 9] {
             let hits: Vec<u32> = (0..30)
                 .filter_map(|row| {
-                    hit_folded(
+                    hit12(
                         &spaces,
                         &agents,
                         1,
                         focused,
                         30,
                         row,
-                        View::Grouped,
+                        View::Tree,
                         &Seen::new(),
                         &Unseen::new(),
                         NOW,
@@ -3241,67 +3654,32 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let mut agents = vec![agent(1, 1, "sh", "unknown")];
         agents[0].agent = true;
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            1,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(texts.iter().any(|t| t.contains("sh")), "{texts:?}");
+        let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
+        assert_eq!(tree_row(&rows, 1).text.trim_end(), "   \u{25cf} sh");
     }
 
-    /// An unread done draws inline with the done sage on its dot: news, not
-    /// calm, and no header above it.
+    /// An unread done draws inline in its space with the done sage on its dot: news,
+    /// not calm, and no header above it.
     #[test]
-    fn an_unread_done_draws_inline_with_the_done_dot() {
+    fn an_unread_done_draws_in_its_space_with_the_done_dot() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "claude", "done")];
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            2,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
-            "{texts:?}"
+        let rows = tree_rows(&spaces, &agents, 2, 10, &Seen::new(), &Shut::new());
+        assert_eq!(
+            tree_row(&rows, 1).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::of("done")))
         );
         assert!(
-            !texts.iter().any(|t| t.contains('\u{25b8}')),
-            "a fold line leaked: {texts:?}"
+            !rows.iter().any(|(l, _)| l.text.contains('\u{25b8}')),
+            "a folded rule leaked: {rows:?}"
         );
     }
 
-    /// G1: a stale idle row dims as a whole and sinks below fresh idle of the
-    /// same rank in the priority view, while the grouped view never moves.
+    /// A stale idle row dims as a whole and sinks below fresh idle of the
+    /// same rank in the priority view, while the tree never moves.
     ///
-    /// Dim is exact roles: first line `Faint` with a `Faint` dot, second line
-    /// `Faint`, and the space accent still the space's own ink. News beats
-    /// dim: a stale row the keyboard has not read keeps its done sage.
+    /// Dim is exact roles: the row `Faint` with a `Faint` dot, and the space accent
+    /// still the space's own ink. And only off focus: standing on a row is reading it.
     #[test]
     fn idle_stale_dims_and_sinks_in_priority_only() {
         let spaces = vec![space(1, "app")];
@@ -3309,7 +3687,7 @@ mod tests {
             agent_at(1, 1, "claude", "idle", 10_000),
             agent_at(2, 1, "codex", "idle", 60),
         ];
-        let priority = render_folded(
+        let priority = folded(
             &spaces,
             &agents,
             1,
@@ -3322,40 +3700,34 @@ mod tests {
             NOW,
             WIDTH,
         );
-        let order: Vec<String> = priority
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        // First lines carry the program (no titles on these rows); the fresh
-        // codex sorts above the stale claude of the same rank.
-        let fresh_at = order
+        let listed: Vec<String> = texts(&priority);
+        // The fresh codex sorts above the stale claude of the same rank.
+        let fresh_at = listed
             .iter()
             .position(|t| t.contains("codex"))
             .expect("fresh row");
-        let stale_at = order
+        let stale_at = listed
             .iter()
             .position(|t| t.contains("claude"))
             .expect("stale row");
-        // Second lines read `app - <tab>`; first lines carry the session.
-        // The fresh idle sorts above the stale one of the same rank.
-        assert!(fresh_at < stale_at, "{order:?}");
-        let stale_first = &priority[stale_at];
-        assert_eq!(stale_first.colour, Some(crate::theme::Role::Faint));
+        assert!(fresh_at < stale_at, "{listed:?}");
+        let stale = &priority[stale_at];
+        assert_eq!(stale.colour, Some(crate::theme::Role::Faint));
         assert_eq!(
-            stale_first.indicator,
-            Some((DOT_AT, DOT_LEN, crate::theme::Role::Faint))
+            stale.indicator,
+            Some((DOT_AT, 1, crate::theme::Role::Faint))
         );
-        let stale_second = &priority[stale_at + 1];
-        assert_eq!(stale_second.colour, Some(crate::theme::Role::Faint));
         assert_eq!(
-            stale_second.accent,
-            Some((3, crate::width::width("app"), crate::theme::space_of(1))),
+            stale.accent,
+            Some((
+                WIDTH - 4,
+                crate::width::width("app"),
+                crate::theme::space_of(1)
+            )),
             "the space accent never dims with the state"
         );
-        // Dim is roles only: the stale row's texts read exactly as its
-        // undimmed twin's. Compared per row, not per column: recency moves
-        // the fresh twin above, which is the sink this test already pinned.
-        let twins = render_folded(
+        // Dim is roles only: the stale row's text reads exactly as its undimmed twin's.
+        let twins = folded(
             &spaces,
             &[
                 agent_at(1, 1, "claude", "idle", 60),
@@ -3371,47 +3743,31 @@ mod tests {
             NOW,
             WIDTH,
         );
-        let twin_claude: Vec<String> = twins
+        let twin = twins
             .iter()
-            .filter(|l| l.text.contains("claude") || l.text.contains("app - claude"))
-            .map(|l| l.text.clone())
-            .collect();
-        let stale_texts: Vec<String> = priority[stale_at..stale_at + 2]
-            .iter()
-            .map(|l| l.text.clone())
-            .collect();
-        assert_eq!(stale_texts, twin_claude);
+            .find(|l| l.text.contains("claude"))
+            .expect("the twin");
+        assert_eq!(stale.text, twin.text);
+        assert_eq!(twin.colour, None);
 
-        // Grouped keeps daemon order, dimmed or not.
-        let grouped = render_folded(
-            &spaces,
-            &agents,
-            1,
-            9,
-            14,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
+        // The tree keeps daemon order, dimmed or not.
+        let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &Shut::new());
+        assert_eq!(order(&rows), vec![1, 2], "the tree moved a row");
+        assert_eq!(
+            tree_row(&rows, 1).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::Role::Faint))
         );
-        let gorder: Vec<String> = grouped
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .collect();
-        let g1 = gorder
-            .iter()
-            .position(|t| t.contains("claude"))
-            .expect("row 1");
-        let g2 = gorder
-            .iter()
-            .position(|t| t.contains("codex"))
-            .expect("row 2");
-        assert!(g1 < g2, "grouped moved a row: {gorder:?}");
+        assert_eq!(tree_row(&rows, 1).colour, Some(crate::theme::Role::Faint));
+        // Focused, the same stale row is read, and reads at full strength.
+        let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
+        assert_eq!(tree_row(&rows, 1).colour, None);
+        assert_eq!(
+            tree_row(&rows, 1).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::of("idle")))
+        );
     }
 
-    /// G1: staleness never fades news. A stale idle that finished while the
+    /// Staleness never fades news. A stale idle that finished while the
     /// keyboard was away keeps the done sage instead of dimming.
     #[test]
     fn news_beats_stale_dim() {
@@ -3419,7 +3775,7 @@ mod tests {
         let agents = vec![agent_at(1, 1, "claude", "idle", 10_000)];
         let mut unseen = Unseen::new();
         unseen.insert((1, 0));
-        let lines = render_folded(
+        let lines = folded(
             &spaces,
             &agents,
             1,
@@ -3435,29 +3791,24 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::of("done")))),
+                .any(|l| l.indicator == Some((DOT_AT, 1, crate::theme::of("done")))),
             "a new row dimmed instead of keeping its sage: {:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            texts(&lines)
         );
         assert!(
             !lines
                 .iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::Role::Faint))),
+                .any(|l| l.indicator == Some((DOT_AT, 1, crate::theme::Role::Faint))),
             "a new row faded"
         );
         let first = lines
             .iter()
             .find(|l| l.indicator.is_some())
             .expect("a dot row");
-        assert_eq!(
-            first.colour,
-            None,
-            "a new row's first line dimmed: {:?}",
-            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
-        );
+        assert_eq!(first.colour, None, "a new row dimmed: {:?}", texts(&lines));
     }
 
-    /// G2: an idle row without a stamp paints byte for byte as it always did,
+    /// An idle row without a stamp paints byte for byte as it always did,
     /// at every clock: the whole painted column is identical, not just the
     /// dot.
     #[test]
@@ -3465,14 +3816,14 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "claude", "idle")];
         let paint = |now| {
-            render_folded(
+            folded(
                 &spaces,
                 &agents,
                 1,
                 1,
                 14,
                 0,
-                View::Grouped,
+                View::Tree,
                 &Seen::new(),
                 &Unseen::new(),
                 now,
@@ -3483,7 +3834,7 @@ mod tests {
         assert_eq!(paint(NOW), paint(NOW + 1_000_000));
     }
 
-    /// G3: tier boundaries resolve at paint, exactly at 900 and 7200 seconds.
+    /// Tier boundaries resolve at paint, exactly at 900 and 7200 seconds.
     /// A repaint with no arrival between the two clocks shows the crossing,
     /// which is the contract the deadline arm relies on.
     #[test]
@@ -3505,7 +3856,7 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent_at(1, 1, "claude", "idle", 7199)];
         let paint = |now| {
-            render_folded(
+            folded(
                 &spaces,
                 &agents,
                 1,
@@ -3523,19 +3874,19 @@ mod tests {
         assert!(
             before
                 .iter()
-                .all(|l| l.indicator != Some((DOT_AT, DOT_LEN, crate::theme::Role::Faint))),
+                .all(|l| l.indicator != Some((DOT_AT, 1, crate::theme::Role::Faint))),
             "plain row already dim"
         );
         let after = paint(NOW + 2);
         assert!(
             after
                 .iter()
-                .any(|l| l.indicator == Some((DOT_AT, DOT_LEN, crate::theme::Role::Faint))),
+                .any(|l| l.indicator == Some((DOT_AT, 1, crate::theme::Role::Faint))),
             "stale row never dimmed without an arrival"
         );
     }
 
-    /// G3: the deadline arm fires at most twice per idle row, minute-rounded
+    /// The deadline arm fires at most twice per idle row, minute-rounded
     /// up, and asks for nothing when there is nothing to cross.
     #[test]
     fn the_deadline_arms_once_per_crossing_and_nothing_more() {
@@ -3563,13 +3914,18 @@ mod tests {
         assert_eq!(wants_tick(&rows, NOW), Some(((NOW + 840) + 59) / 60 * 60));
     }
 
-    /// G6: recency orders the calm ranks newest-first and nothing else. A
+    /// Recency orders the calm ranks newest-first and nothing else. A
     /// blocked row stays above every idle no matter how fresh the idle is,
     /// working rows keep daemon order under recency change, equal stamps
     /// fall back to daemon order, and unstamped rows sink within rank.
     #[test]
     fn priority_recency_breaks_calm_ties_only() {
         let spaces = vec![space(1, "app")];
+        let listed = |agents: &[AgentRow], focused: u32, view, seen: &Seen, unseen: &Unseen| {
+            order(&rows12(
+                &spaces, agents, 1, focused, 40, 0, view, seen, unseen, NOW, WIDTH, None,
+            ))
+        };
         let agents = vec![
             agent_at(1, 1, "codex", "idle", 60),
             agent(2, 1, "claude", "blocked"),
@@ -3578,47 +3934,16 @@ mod tests {
             agent_at(5, 1, "amp", "idle", 5000),
             agent(6, 1, "droid", "idle"),
         ];
-        let terminal_order = |view| {
-            rows_folded(
-                &spaces,
-                &agents,
-                1,
-                9,
-                40,
-                0,
-                view,
-                &Seen::new(),
-                &Unseen::new(),
-                NOW,
-                WIDTH,
-                None,
-            )
-            .into_iter()
-            .filter_map(|(_, hit)| match hit {
-                Some(Hit::Terminal(t)) => Some(t),
-                _ => None,
-            })
-            // Two rows per agent: keep first appearances.
-            .fold(
-                (Vec::new(), std::collections::BTreeSet::new()),
-                |(mut v, mut s), t| {
-                    if s.insert(t) {
-                        v.push(t);
-                    }
-                    (v, s)
-                },
-            )
-            .0
-        };
+        let none = (Seen::new(), Unseen::new());
         assert_eq!(
-            terminal_order(View::Priority),
+            listed(&agents, 9, View::Priority, &none.0, &none.1),
             vec![2, 3, 4, 1, 5, 6],
             "blocked first, working in daemon order, idle newest-first, unstamped last"
         );
         assert_eq!(
-            terminal_order(View::Grouped),
+            listed(&agents, 9, View::Tree, &none.0, &none.1),
             vec![1, 2, 3, 4, 5, 6],
-            "grouped keeps daemon order"
+            "the tree keeps daemon order"
         );
 
         // Done rows take recency too: an older done sinks below a fresh idle
@@ -3632,37 +3957,8 @@ mod tests {
         let mut seen = Seen::new();
         seen.insert((1, 0));
         seen.insert((3, 0));
-        let done_order: Vec<u32> = rows_folded(
-            &spaces,
-            &agents,
-            1,
-            9,
-            40,
-            0,
-            View::Priority,
-            &seen,
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-            None,
-        )
-        .into_iter()
-        .filter_map(|(_, hit)| match hit {
-            Some(Hit::Terminal(t)) => Some(t),
-            _ => None,
-        })
-        .fold(
-            (Vec::new(), std::collections::BTreeSet::new()),
-            |(mut v, mut s), t| {
-                if s.insert(t) {
-                    v.push(t);
-                }
-                (v, s)
-            },
-        )
-        .0;
         assert_eq!(
-            done_order,
+            listed(&agents, 9, View::Priority, &seen, &none.1),
             vec![3, 1, 2],
             "done newest-first, then the fresher rank below"
         );
@@ -3676,74 +3972,23 @@ mod tests {
         let mut unseen = Unseen::new();
         unseen.insert((1, 0));
         unseen.insert((2, 0));
-        let order: Vec<u32> = rows_folded(
-            &spaces,
-            &agents,
-            1,
-            1,
-            40,
-            0,
-            View::Priority,
-            &Seen::new(),
-            &unseen,
-            NOW,
-            WIDTH,
-            None,
-        )
-        .into_iter()
-        .filter_map(|(_, hit)| match hit {
-            Some(Hit::Terminal(t)) => Some(t),
-            _ => None,
-        })
-        .fold(
-            (Vec::new(), std::collections::BTreeSet::new()),
-            |(mut v, mut s), t| {
-                if s.insert(t) {
-                    v.push(t);
-                }
-                (v, s)
-            },
-        )
-        .0;
         // Terminal 2 is new (rank 2) and leads; terminal 1 is focused, so it
         // is not new and stays in its calm rank behind it.
-        assert_eq!(order, vec![2, 1]);
+        assert_eq!(
+            listed(&agents, 1, View::Priority, &none.0, &unseen),
+            vec![2, 1]
+        );
 
         // Equal stamps fall back to daemon order.
         let agents = vec![
             agent_at(2, 1, "codex", "idle", 500),
             agent_at(1, 1, "claude", "idle", 500),
         ];
-        let order: Vec<u32> = rows_folded(
-            &spaces,
-            &agents,
-            1,
-            9,
-            40,
-            0,
-            View::Priority,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-            None,
-        )
-        .into_iter()
-        .filter_map(|(_, hit)| match hit {
-            Some(Hit::Terminal(t)) => Some(t),
-            _ => None,
-        })
-        .fold(
-            (Vec::new(), std::collections::BTreeSet::new()),
-            |(mut v, mut s), t| {
-                if s.insert(t) {
-                    v.push(t);
-                }
-                (v, s)
-            },
-        )
-        .0;
-        assert_eq!(order, vec![2, 1], "equal stamps keep daemon order");
+        assert_eq!(
+            listed(&agents, 9, View::Priority, &none.0, &none.1),
+            vec![2, 1],
+            "equal stamps keep daemon order"
+        );
     }
 
     /// A session longer than the row ends in an ellipsis rather than a hard
@@ -3758,250 +4003,152 @@ mod tests {
         long.agent_title = Some(long_title.into());
         let mut wide = agent(3, 1, "claude", "working");
         wide.agent_title = Some("程程程程程程程程程程程程程程程".into());
-        let lines = render_folded(
+        let rows = tree_rows(
             &spaces,
             &[fitting, long, wide],
-            1,
             9,
             20,
-            0,
-            View::Grouped,
             &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
+            &Shut::new(),
         );
-        let firsts: Vec<String> = lines
-            .iter()
-            .filter(|l| l.indicator.is_some())
-            .map(|l| l.text.clone())
-            .collect();
-        assert_eq!(firsts.len(), 3);
-        for first in &firsts {
-            assert_eq!(crate::width::width(first), WIDTH, "{first:?}");
-            assert!(!first.contains('\u{fffd}'));
+        let rows: Vec<String> = (1..=3).map(|t| tree_row(&rows, t).text.clone()).collect();
+        for row in &rows {
+            assert_eq!(crate::width::width(row), WIDTH, "{row:?}");
+            assert!(!row.contains('\u{fffd}'));
         }
         // Fitting session: today's bytes, no ellipsis.
-        assert_eq!(firsts[0].trim_end(), " \u{25cf} claude");
+        assert_eq!(rows[0].trim_end(), "   \u{25cf} claude");
         // Cut sessions: the dot and the ellipsis frame the text.
-        assert!(firsts[1].trim_end().ends_with('…'), "{:?}", firsts[1]);
+        assert!(rows[1].trim_end().ends_with('…'), "{:?}", rows[1]);
         assert!(
-            firsts[1].starts_with(" \u{25cf} Implement"),
+            rows[1].starts_with("   \u{25cf} Implement"),
             "{:?}",
-            firsts[1]
+            rows[1]
         );
-        assert!(firsts[2].trim_end().ends_with('…'), "{:?}", firsts[2]);
+        assert!(rows[2].trim_end().ends_with('…'), "{:?}", rows[2]);
         // A session that already ends in an ellipsis is cut once, not twice.
         let mut dotty = agent(4, 1, "claude", "working");
         dotty.agent_session = Some("abcdefghijklmnop…".into());
-        let lines = render_folded(
-            &spaces,
-            &[dotty],
-            1,
-            9,
-            20,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let first = lines
-            .iter()
-            .find(|l| l.indicator.is_some())
-            .expect("a dot row");
-        assert_eq!(first.text.chars().filter(|c| *c == '…').count(), 1);
-        assert_eq!(crate::width::width(&first.text), WIDTH);
+        let rows = tree_rows(&spaces, &[dotty], 9, 20, &Seen::new(), &Shut::new());
+        let row = tree_row(&rows, 4);
+        assert_eq!(row.text.chars().filter(|c| *c == '…').count(), 1);
+        assert_eq!(crate::width::width(&row.text), WIDTH);
     }
 
-    /// G4: the place row shows the worktree basename when the space name
-    /// does not already say it, and the edge cases stay today's row.
+    /// The row an agent with this cwd draws under a space of this name.
+    fn worktree_row(space_name: &str, cwd: Option<&str>, program: &str) -> Line {
+        let spaces = vec![space(1, space_name)];
+        let mut row = agent(1, 1, program, "idle");
+        row.cwd = cwd.map(str::to_string);
+        tree_row(
+            &tree_rows(&spaces, &[row], 9, 10, &Seen::new(), &Shut::new()),
+            1,
+        )
+        .clone()
+    }
+
+    /// The row shows the worktree basename, quietly, when the space name does not
+    /// already say it, and the edge cases keep the bare row.
     #[test]
-    fn place_line_shows_the_worktree_basename_when_different() {
-        fn second_row(space_name: &str, cwd: Option<&str>, tab_program: &str) -> String {
-            let spaces = vec![space(1, space_name)];
-            let mut row = agent(1, 1, tab_program, "idle");
-            row.cwd = cwd.map(str::to_string);
-            render_folded(
-                &spaces,
-                &[row],
-                1,
-                9,
-                10,
-                0,
-                View::Grouped,
-                &Seen::new(),
-                &Unseen::new(),
-                NOW,
-                WIDTH,
-            )
-            .into_iter()
-            .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("   ") && t.contains(" - "))
-            .expect("a place row")
-        }
-        // Different: space, worktree, tab.
+    fn the_row_shows_the_worktree_basename_when_different() {
+        let row = |cwd| {
+            worktree_row("app", cwd, "claude")
+                .text
+                .trim_end()
+                .to_string()
+        };
+        // Different: the session, then the worktree.
         assert_eq!(
-            second_row("app", Some("/home/u/app-feat-x"), "claude"),
-            "   app - app-feat-x - claude"
+            row(Some("/home/u/app-feat-x")),
+            "   \u{25cf} claude app-feat-x"
         );
         // Trailing slash is not a name.
         assert_eq!(
-            second_row("app", Some("/home/u/app-feat-x/"), "claude"),
-            "   app - app-feat-x - claude"
+            row(Some("/home/u/app-feat-x/")),
+            "   \u{25cf} claude app-feat-x"
         );
-        // Same name in any case: today's row.
-        assert_eq!(
-            second_row("app", Some("/home/u/app"), "claude"),
-            "   app - claude"
-        );
-        assert_eq!(
-            second_row("app", Some("/home/u/app"), "claude"),
-            "   app - claude"
-        );
-        // Root, empty, blank: no basename, today's row.
-        assert_eq!(second_row("app", Some("/"), "claude"), "   app - claude");
-        assert_eq!(second_row("app", Some(""), "claude"), "   app - claude");
-        assert_eq!(second_row("app", Some("   "), "claude"), "   app - claude");
-        // No cwd at all: today's row.
-        assert_eq!(second_row("app", None, "claude"), "   app - claude");
+        // Same name in any case: the bare row.
+        assert_eq!(row(Some("/home/u/app")), "   \u{25cf} claude");
+        assert_eq!(row(Some("/home/u/app")), "   \u{25cf} claude");
+        // Root, empty, blank: no basename, the bare row.
+        assert_eq!(row(Some("/")), "   \u{25cf} claude");
+        assert_eq!(row(Some("")), "   \u{25cf} claude");
+        assert_eq!(row(Some("   ")), "   \u{25cf} claude");
+        // No cwd at all: the bare row.
+        assert_eq!(row(None), "   \u{25cf} claude");
         // A tilde and dots are names and pass through untouched.
-        assert_eq!(
-            second_row("app", Some("~"), "claude"),
-            "   app - ~ - claude"
-        );
-        assert_eq!(
-            second_row("app", Some("/home/u/."), "claude"),
-            "   app - . - claude"
-        );
+        assert_eq!(row(Some("~")), "   \u{25cf} claude ~");
+        assert_eq!(row(Some("/home/u/.")), "   \u{25cf} claude .");
+        // The worktree is a quiet run of its own, after the name and a space.
+        let line = worktree_row("app", Some("/home/u/app-feat-x"), "claude");
+        assert_eq!(line.runs, vec![(12, 10, crate::theme::Role::Faint)]);
+        assert_eq!(run_text(&line, 12, 10), "app-feat-x");
+        assert!(worktree_row("app", None, "claude").runs.is_empty());
     }
 
-    /// G4: the same worktree name under two spaces stays ambiguous on
-    /// purpose: each row names its own space first, so the space tells the
-    /// two apart while the middle reads the same.
+    /// The same worktree name under two spaces stays ambiguous on purpose: each row
+    /// sits under its own space's rule, so the rule tells the two apart while the
+    /// worktree reads the same.
     #[test]
-    fn the_same_basename_under_two_spaces_keeps_both_space_names() {
+    fn the_same_basename_under_two_spaces_sits_under_both_rules() {
         let spaces = vec![space(1, "app"), space(2, "dub")];
         let mut a = agent(1, 1, "claude", "idle");
         a.cwd = Some("/home/u/x".into());
         let mut b = agent(2, 2, "codex", "idle");
         b.cwd = Some("/home/u/x".into());
-        let lines = render_folded(
-            &spaces,
-            &[a, b],
-            1,
-            9,
-            16,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let seconds: Vec<String> = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .filter(|t| t.starts_with("   ") && t.contains(" - "))
-            .collect();
-        assert_eq!(seconds, vec!["   app - x - claude", "   dub - x - codex"]);
+        let rows = tree_rows(&spaces, &[a, b], 9, 16, &Seen::new(), &Shut::new());
+        let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
+        let texts = texts(&lines);
+        assert_eq!(texts[1], rule_row(&rows, 1).text.trim_end());
+        assert_eq!(texts[2], "   \u{25cf} claude x");
+        assert_eq!(texts[3], rule_row(&rows, 2).text.trim_end());
+        assert_eq!(texts[4], "   \u{25cf} codex x");
     }
 
-    /// G4: a long middle shortens tail-first with an ellipsis while the space
-    /// head and tab tail survive; too narrow for even that and the middle
-    /// drops out entirely.
+    /// A long worktree shortens tail-first with an ellipsis while the session keeps
+    /// every letter it had; a name too long to leave room drops the worktree whole.
     #[test]
-    fn place_line_shortens_the_middle_first() {
-        let spaces = vec![space(1, "app")];
-        let mut row = agent(1, 1, "claude", "idle");
-        row.cwd = Some("/home/u/a-very-long-worktree-name-that-keeps-going".into());
-        let lines = render_folded(
-            &spaces,
-            &[row],
-            1,
-            9,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
+    fn a_long_worktree_shortens_and_the_name_never_does() {
+        let line = worktree_row(
+            "app",
+            Some("/home/u/a-very-long-worktree-name-that-keeps-going"),
+            "claude",
         );
-        let second = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("   ") && t.contains(" - "))
-            .expect("a place row");
-        assert!(second.starts_with("   app - "), "{second:?}");
-        assert!(second.ends_with(" - claude"), "{second:?}");
-        assert!(second.contains('…'), "{second:?}");
-        assert_eq!(crate::width::width(&second), WIDTH);
+        assert!(
+            line.text.starts_with("   \u{25cf} claude a-very"),
+            "{:?}",
+            line.text
+        );
+        assert!(line.text.ends_with('…'), "{:?}", line.text);
+        assert_eq!(crate::width::width(&line.text), WIDTH);
 
-        // A tab so long the middle cannot fit at all: today's row, intact.
-        let mut row = agent(1, 1, &"c".repeat(40), "idle");
-        row.cwd = Some("/home/u/somewhere".into());
-        let lines = render_folded(
-            &spaces,
-            &[row],
-            1,
-            9,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        let second = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("   ") && t.contains(" - "))
-            .expect("a place row");
-        assert!(!second.contains("somewhere"), "{second:?}");
+        // A tab so long the worktree cannot fit at all: the bare row, the name cut.
+        let line = worktree_row("app", Some("/home/u/somewhere"), &"c".repeat(40));
+        assert!(!line.text.contains("somewhere"), "{:?}", line.text);
+        assert!(line.runs.is_empty(), "{line:?}");
     }
 
-    /// G4: an overlong wide middle shortens by columns, never splitting a
-    /// wide character, and the row stays thirty columns.
+    /// An overlong wide worktree shortens by columns, never splitting a wide
+    /// character, and the row stays thirty columns.
     #[test]
-    fn place_line_shortens_a_wide_middle_by_columns() {
-        let spaces = vec![space(1, "app")];
-        let mut row = agent(1, 1, "claude", "idle");
-        row.cwd = Some("/home/u/程程程程程程程程程程程程".into());
-        let lines = render_folded(
-            &spaces,
-            &[row],
-            1,
-            9,
-            10,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
+    fn a_wide_worktree_shortens_by_columns() {
+        let line = worktree_row("app", Some("/home/u/程程程程程程程程程程程程"), "claude");
+        // Eighteen columns are left after the name: eight wide letters and the
+        // ellipsis, plus the pad column `fit` adds to reach thirty.
+        assert_eq!(
+            line.text.trim_end(),
+            "   \u{25cf} claude 程程程程程程程程…",
+            "{:?}",
+            line.text
         );
-        let second = lines
-            .iter()
-            .map(|l| l.text.trim_end().to_string())
-            .find(|t| t.starts_with("   ") && t.contains(" - "))
-            .expect("a place row");
-        // Room is twelve columns: five wide letters and the ellipsis, plus
-        // the pad column `fit_to` adds to reach thirty.
-        assert_eq!(second, "   app - 程程程程程… - claude", "{second:?}");
-        assert_eq!(crate::width::width(&second), WIDTH - 1);
-        let raw = lines
-            .iter()
-            .find(|l| l.text.trim_end().starts_with("   ") && l.text.contains(" - "))
-            .expect("a raw place row");
-        assert_eq!(crate::width::width(&raw.text), WIDTH);
-        assert!(!second.contains('\u{fffd}'));
+        assert_eq!(crate::width::width(line.text.trim_end()), WIDTH - 1);
+        assert_eq!(crate::width::width(&line.text), WIDTH);
+        assert_eq!(line.runs, vec![(12, 17, crate::theme::Role::Faint)]);
+        assert!(!line.text.contains('\u{fffd}'));
     }
 
-    /// G5/G13: worktree middles, wide names and long names all still
-    /// measure exactly thirty columns, and accents never leave the space name.
+    /// Worktrees, wide names and long names all still measure exactly thirty columns
+    /// in both orders, and accents and runs never leave the row.
     #[test]
     fn every_decorated_row_still_measures_thirty_columns() {
         let spaces = vec![space(1, "app")];
@@ -4017,57 +4164,51 @@ mod tests {
         rows[1].cwd = Some("/home/u/app-feat-x".into());
         rows[2].cwd = Some("/home/u/程".repeat(8));
         rows[5].name = Some("release".into());
-        let lines = render_folded(
-            &spaces,
-            &rows,
-            1,
-            9,
-            30,
-            0,
-            View::Priority,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        for line in &lines {
-            assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
-            assert!(!line.text.contains('\u{fffd}'));
-            if let Some((at, len, _)) = line.accent {
-                assert!(at + len <= WIDTH, "accent runs past the row: {line:?}");
+        for view in [View::Tree, View::Priority] {
+            let lines = folded(
+                &spaces,
+                &rows,
+                1,
+                9,
+                30,
+                0,
+                view,
+                &Seen::new(),
+                &Unseen::new(),
+                NOW,
+                WIDTH,
+            );
+            for line in &lines {
+                assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
+                assert!(!line.text.contains('\u{fffd}'));
+                for (at, len, _) in line.accent.iter().chain(&line.runs) {
+                    assert!(at + len <= WIDTH, "a run past the row: {line:?}");
+                }
             }
         }
     }
 
-    /// G13: a space name longer than the row cannot break the painter. The
-    /// accent that would run past the row is dropped where every overflowing
-    /// run is dropped, and the row still measures thirty columns. Pre-existing
-    /// behavior, pinned because the place row carries the accent.
+    /// A space name longer than the row cannot break the painter: the rule shortens
+    /// the name before it gives up the arrow or the count, the accent stays on the
+    /// row, and the row still measures thirty columns.
     #[test]
-    fn a_space_name_longer_than_the_row_drops_its_accent_gracefully() {
+    fn a_space_name_longer_than_the_row_shortens_on_its_rule() {
         let spaces = vec![space(1, &"s".repeat(40))];
         let agents = vec![agent(1, 1, "claude", "working")];
-        let lines = render_folded(
-            &spaces,
-            &agents,
-            1,
-            9,
-            14,
-            0,
-            View::Grouped,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-        );
-        for line in &lines {
+        let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &Shut::new());
+        for (line, _) in &rows {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
+        let rule = rule_row(&rows, 1);
+        assert!(rule.text.ends_with(" 1 \u{2500}"), "{:?}", rule.text);
+        assert!(rule.text.contains('…'), "{:?}", rule.text);
+        let (at, len, _) = rule.accent.expect("the name is accented");
+        assert!(at + len <= WIDTH);
     }
 
     /// Wrapper rows and unknown programs keep the dot alone: the wrapper
     /// reads as what stands in its way, the unknown program under its own
-    /// name, neither with an accent on the first row.
+    /// name, neither with an accent on the row.
     #[test]
     fn wrapper_and_unknown_rows_keep_the_dot_alone() {
         let spaces = vec![space(1, "app")];
@@ -4076,37 +4217,32 @@ mod tests {
         wrapper.behind = Some("docker".into());
         let mut strange = agent(3, 1, "sh", "working");
         strange.program = Some("Muse".into());
-        let lines = render_folded(
+        let rows = tree_rows(
             &spaces,
             &[wrapper, strange],
-            1,
             9,
             30,
-            0,
-            View::Grouped,
             &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
+            &Shut::new(),
         );
-        let firsts: Vec<&Line> = lines.iter().filter(|l| l.indicator.is_some()).collect();
-        assert_eq!(firsts.len(), 2);
-        for bare in &firsts {
-            assert_eq!(bare.accent, None, "{:?}", bare.text);
+        for t in [2, 3] {
+            assert_eq!(tree_row(&rows, t).accent, None, "{t}");
         }
         assert!(
-            firsts[0].text.starts_with(" \u{25cf} behind docker"),
+            tree_row(&rows, 2)
+                .text
+                .starts_with("   \u{25cf} behind docker"),
             "{:?}",
-            firsts[0].text
+            tree_row(&rows, 2).text
         );
         assert!(
-            firsts[1].text.starts_with(" \u{25cf} Muse"),
+            tree_row(&rows, 3).text.starts_with("   \u{25cf} Muse"),
             "{:?}",
-            firsts[1].text
+            tree_row(&rows, 3).text
         );
     }
 
-    /// G11: the collapsed strip is byte-for-byte what it was: worktrees
+    /// The collapsed strip is byte-for-byte what it was: worktrees
     /// upstream change nothing in four columns.
     #[test]
     fn the_collapsed_strip_ignores_worktrees() {
@@ -4115,18 +4251,18 @@ mod tests {
         a.cwd = Some("/home/u/app-feat-x".into());
         let mut b = agent(2, 2, "codex", "blocked");
         b.cwd = Some("/home/u/dub".into());
-        let before = rows_collapsed(&spaces, &[a, b], 1, 1, 12);
+        let before = collapsed5(&spaces, &[a, b], 1, 1, 12);
         let plain_a = agent(1, 1, "sh", "idle");
         let plain_b = agent(2, 2, "sh", "blocked");
-        let after = rows_collapsed(&spaces, &[plain_a, plain_b], 1, 1, 12);
+        let after = collapsed5(&spaces, &[plain_a, plain_b], 1, 1, 12);
         assert_eq!(before, after);
         for (line, _) in &before {
             assert_eq!(crate::width::width(&line.text), COLLAPSED);
         }
     }
 
-    /// G12: reordered priority rows keep hit parity: every painted agent row
-    /// still opens its own terminal, and the focused row never scrolls out.
+    /// Reordered priority rows keep hit parity: every painted agent row still opens
+    /// its own terminal, and the focused row never scrolls out.
     #[test]
     fn hit_parity_holds_under_priority_reorder() {
         let spaces = vec![space(1, "app")];
@@ -4135,10 +4271,8 @@ mod tests {
             agent_at(2, 1, "claude", "idle", 5000),
             agent(3, 1, "gemini", "blocked"),
         ];
-        // Tiny heights collapse the panel to its title, and the fold mark
-        // eats the last row: parity is pinned where agent pairs draw whole.
-        for height in [10usize, 14, 30] {
-            let rows = rows_folded(
+        for height in [4usize, 6, 10, 14, 30] {
+            let rows = rows12(
                 &spaces,
                 &agents,
                 1,
@@ -4157,32 +4291,63 @@ mod tests {
                 rows.iter().any(|(_, hit)| *hit == Some(Hit::Terminal(3))),
                 "focused row scrolled out at height {height}"
             );
-            for (row, (_, hit)) in rows.iter().enumerate() {
-                assert_eq!(
-                    hit_folded(
-                        &spaces,
-                        &agents,
-                        1,
-                        3,
-                        height,
-                        row,
-                        View::Priority,
-                        &Seen::new(),
-                        &Unseen::new(),
-                        NOW,
-                        WIDTH,
-                        None,
-                    ),
-                    *hit,
-                    "hit disagrees with paint at row {row}, height {height}"
+            for (line, hit) in &rows {
+                let Some(Hit::Terminal(t)) = hit else {
+                    continue;
+                };
+                let a = agents.iter().find(|a| a.terminal == *t).expect("an agent");
+                assert!(
+                    line.text.contains(&session_name(a)),
+                    "row for {t} reads {:?} at height {height}",
+                    line.text
                 );
             }
         }
     }
 
-    /// Phase B: the same rows paint at any pulled width and measure exactly
-    /// that, titles and place rows included. The default width reads what it
-    /// always read.
+    /// Every row is exactly the pulled width at every width the column drags to, with
+    /// the pin and without it, in both orders: a short row leaves pixels behind and a
+    /// long one spills into the terminal on the right.
+    #[test]
+    fn every_row_is_exactly_the_pulled_width_with_and_without_the_pin() {
+        for (spaces, agents) in [sample(), sample_pinned()] {
+            let pinned_fleet = agents.iter().any(|a| a.state == "blocked");
+            for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+                for view in [View::Tree, View::Priority] {
+                    let lines = folded(
+                        &spaces,
+                        &agents,
+                        1,
+                        1,
+                        20,
+                        0,
+                        view,
+                        &Seen::new(),
+                        &Unseen::new(),
+                        NOW,
+                        width,
+                    );
+                    assert_eq!(
+                        lines[0].text.starts_with(&format!(" {PIN_TITLE}")),
+                        pinned_fleet && view == View::Tree,
+                        "width {width}: {:?}",
+                        lines[0].text
+                    );
+                    for line in &lines {
+                        assert_eq!(
+                            crate::width::width(&line.text),
+                            width,
+                            "width {width}: {line:?}"
+                        );
+                        assert!(!line.text.contains('\u{fffd}'));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same rows paint at any pulled width and measure exactly that. The default
+    /// width reads what it always read.
     #[test]
     fn the_same_rows_paint_at_any_pulled_width() {
         let spaces = vec![space(1, "app")];
@@ -4192,14 +4357,14 @@ mod tests {
         b.agent_title = Some("Wire retry budget into dispatcher".into());
         let agents = vec![a, b];
         for width in [SIDEBAR_MIN, 22, WIDTH, SIDEBAR_MAX] {
-            let lines = render_folded(
+            let lines = folded(
                 &spaces,
                 &agents,
                 1,
                 9,
                 20,
                 0,
-                View::Grouped,
+                View::Tree,
                 &Seen::new(),
                 &Unseen::new(),
                 NOW,
@@ -4213,60 +4378,34 @@ mod tests {
                 );
                 assert!(!line.text.contains('\u{fffd}'));
             }
-            // The worktree middle survives at every width; the narrowest
-            // column keeps at least its shortened form.
+            // The space name survives on its rule at every width.
             assert!(
-                lines.iter().any(|l| l.text.contains("app")),
+                lines.iter().any(|l| l.text.contains(" app ")),
                 "width {width}: space name lost"
             );
-            // Corners and geometry follow the pulled width, not the default.
-            assert_eq!(
-                agents_title_hit(View::Grouped, width, width),
-                Some(Hit::View),
-                "width {width}: mode corner missed"
-            );
-            assert_eq!(
-                spaces_title_hit(width, width),
-                Some(Hit::NewSpace),
-                "width {width}: plus corner missed"
-            );
-            assert_eq!(
-                footer_hit(width - 1, width),
-                Some(Hit::Menu),
-                "width {width}: menu corner missed"
-            );
+            // The corners follow the pulled width, not the default.
+            let none = (Seen::new(), Unseen::new(), Shut::new());
+            let c = clicks(&spaces, &agents, View::Tree, width, &none);
+            assert_eq!(act(Hit::Title, width, &c, false), Some(Act::NewSpace));
+            assert_eq!(act(Hit::Title, width - 2, &c, false), Some(Act::View));
+            assert_eq!(act(Hit::Foot, width - 3, &c, false), Some(Act::Menu));
+            assert_eq!(act(Hit::Foot, width, &c, false), Some(Act::Collapse));
         }
-        // Default width reads what the legacy surface always read: every
-        // agent row the legacy panel draws appears verbatim in the live one
-        // (the live panel adds a breath under its title and a fold mark at
-        // its foot, which are chrome, not rows).
-        let live = render_folded(
+        // The default width is what `render` paints, row for row.
+        let live = folded(
             &spaces,
             &agents,
             1,
             9,
             20,
             0,
-            View::Grouped,
+            View::Tree,
             &Seen::new(),
             &Unseen::new(),
-            NOW,
+            0,
             WIDTH,
         );
-        let legacy = render(&spaces, &agents, 1, 9, 20);
-        for row in &legacy {
-            let text = row.text.trim_end();
-            if text.contains("claude")
-                || text.contains("codex")
-                || text.contains("app -")
-                || text.contains("Wire retry")
-            {
-                assert!(
-                    live.iter().any(|l| l.text == row.text),
-                    "legacy row lost: {text:?}"
-                );
-            }
-        }
+        assert_eq!(live, render(&spaces, &agents, 1, 9, 20));
     }
 
     /// Sleeping earns the violet indicator and sinks below idle: settled,
@@ -4284,6 +4423,7 @@ mod tests {
         assert!(!is_unread(&slept, focused, &seen));
         assert!(!is_new(&slept, focused, &seen, &unseen));
         assert!(!tab_is_new(&slept, focused, &unseen));
+        assert!(!needs_person(&slept, focused, &seen, &unseen));
         assert_eq!(
             priority_of(&slept, focused, &seen, &unseen),
             7,
@@ -4291,5 +4431,12 @@ mod tests {
         );
         let idle = agent(8, 1, "claude", "idle");
         assert_eq!(priority_of(&idle, focused, &seen, &unseen), 6);
+        // In the tree it wears the mauve dot, and never earns a pin.
+        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 10, &seen, &Shut::new());
+        assert_eq!(
+            tree_row(&rows, 7).indicator,
+            Some((CHILD_DOT_AT, 1, crate::theme::Role::Sleeping))
+        );
+        assert!(pinned(&rows).is_empty());
     }
 }

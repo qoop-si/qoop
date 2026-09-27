@@ -156,8 +156,10 @@ pub enum Action {
     Tab(usize),
     /// ctrl-a space: the search palette over spaces, agents, tabs and actions.
     Palette,
-    /// ctrl-a g: the agents panel grouped or by urgency.
+    /// ctrl-a g: the column as the tree of spaces or by urgency.
     ToggleView,
+    /// ctrl-a f: fold the focused space's agents under its rule, or open them again.
+    FoldSpace,
     /// ctrl-a F: the focus view over the focused terminal: the user's last
     /// prompt, the agent's last turns, and one row per tool call.
     ///
@@ -378,6 +380,7 @@ impl Keys {
                     // biggest key.
                     b' ' => Action::Palette,
                     b'g' => Action::ToggleView,
+                    b'f' => Action::FoldSpace,
                     b'F' => Action::Focus,
                     b'v' => Action::SplitV,
                     b'-' => Action::SplitH,
@@ -572,10 +575,10 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_f_opens_the_focus_view_while_lowercase_is_dropped() {
+    fn uppercase_f_opens_the_focus_view_while_lowercase_folds_the_space() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01F"), vec![Action::Focus]);
-        assert_eq!(keys.feed(b"\x01f"), Vec::<Action>::new());
+        assert_eq!(keys.feed(b"\x01f"), vec![Action::FoldSpace]);
     }
 
     #[test]

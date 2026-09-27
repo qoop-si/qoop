@@ -45,7 +45,7 @@ pub struct Frame<'a> {
     /// Something worth saying while nothing else is happening, said until the person does
     /// anything. Under everything urgent, and never in place of it.
     pub hint: Option<&'a str>,
-    /// How the agents panel orders its rows: daemon order, or flat by urgency.
+    /// How the column orders its agents: the tree of spaces, or flat by urgency.
     pub view: sidebar::View,
     /// The done rows this client has already looked at.
     pub seen: &'a sidebar::Seen,
@@ -101,6 +101,37 @@ pub struct Frame<'a> {
     /// means one terminal filling the pane, drawn from `snapshot` exactly as
     /// before, so a single pane paints pixel for pixel what it always has.
     pub tiles: Vec<Tile<'a>>,
+    /// What this client alone decided about how things look, beside the daemon's rows.
+    pub chrome: Chrome,
+}
+
+/// Client-local display state: owned, small, and cloned into each frame.
+///
+/// Kept together so a frame gains one field when the client learns one more thing to
+/// remember, rather than one more field at every place a frame is built.
+#[derive(Clone, Debug, Default)]
+pub struct Chrome {
+    /// The spaces folded away under their rule.
+    pub shut: sidebar::Shut,
+}
+
+impl Frame<'_> {
+    /// The pieces the left column is drawn from, at this frame's clock and tick.
+    pub fn column(&self) -> sidebar::Column<'_> {
+        sidebar::Column {
+            spaces: self.spaces,
+            agents: self.rows,
+            focused_space: self.space.unwrap_or_default(),
+            focused_terminal: self.focused,
+            tick: self.tick,
+            view: self.view,
+            seen: self.seen,
+            unseen: self.unseen,
+            now_unix: self.now_unix,
+            width: self.sidebar_width,
+            shut: &self.chrome.shut,
+        }
+    }
 }
 
 /// Every command the prefix takes, for a window wide enough to read them all.
@@ -322,29 +353,11 @@ pub fn paint(frame: &Frame) -> String {
     // The pet stands on the foot of the column. Read once per frame so the
     // reservation below and the overlay further down paint the same pet.
     let avatar = sidebar::current_avatar();
+    let column = frame.column();
     let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
-        sidebar::rows_collapsed(
-            frame.spaces,
-            frame.rows,
-            frame.space.unwrap_or_default(),
-            frame.focused,
-            column_rows,
-        )
+        sidebar::rows_collapsed(&column, column_rows)
     } else if wide_enough {
-        sidebar::rows_folded(
-            frame.spaces,
-            frame.rows,
-            frame.space.unwrap_or_default(),
-            frame.focused,
-            column_rows,
-            frame.tick,
-            frame.view,
-            frame.seen,
-            frame.unseen,
-            frame.now_unix,
-            frame.sidebar_width,
-            avatar.as_ref(),
-        )
+        sidebar::rows_folded(&column, column_rows, avatar.as_ref())
     } else {
         Vec::new()
     };
@@ -362,10 +375,7 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
-                Some(sidebar::Hit::NewSpace | sidebar::Hit::Menu)
-                | Some(sidebar::Hit::Collapse)
-                | Some(sidebar::Hit::View)
-                | None => false,
+                Some(sidebar::Hit::Title | sidebar::Hit::Foot) | None => false,
             };
             let base = match (selected, line.colour) {
                 (true, Some(role)) => theme::selected_in(role),
@@ -374,13 +384,13 @@ pub fn paint(frame: &Frame) -> String {
                 (false, None) => theme::fg(theme::Role::Text),
             };
             out.push_str(&base);
-            // The coloured runs inside the row: the space's name on the number, the
-            // opening sign at column zero. Painted by cutting the row at their edges
-            // rather than by drawing over it, so the row is still written once and left to
-            // right, and a wide character in a name cannot be split. The two runs never
-            // overlap by construction (one opens the row, one closes it); ordered by
-            // column, the paint below reads as one pass over the text.
-            let mut runs: Vec<(usize, usize, theme::Role)> = Vec::new();
+            // The coloured runs inside the row: the space's name, the opening sign, and
+            // whatever else the row carries (rule dashes, a count, a quiet worktree).
+            // Painted by cutting the row at their edges rather than by drawing over it, so
+            // the row is still written once and left to right, and a wide character in a
+            // name cannot be split. Runs never overlap by construction; ordered by column,
+            // the paint below reads as one pass over the text.
+            let mut runs: Vec<(usize, usize, theme::Role)> = line.runs.clone();
             if let Some(run) = line.accent {
                 runs.push(run);
             }
@@ -679,14 +689,7 @@ fn triage(
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
 ) -> Option<String> {
-    let row = rows
-        .iter()
-        .find(|r| r.state == "blocked")
-        .or_else(|| rows.iter().find(|r| r.state == "failed"))
-        .or_else(|| {
-            rows.iter()
-                .find(|r| sidebar::is_new(r, focused, seen, unseen))
-        })?;
+    let row = sidebar::most_urgent(rows, focused, seen, unseen)?;
     let space = spaces
         .iter()
         .find(|s| s.id == row.workspace)
@@ -742,20 +745,13 @@ fn waiting(
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
 ) -> Option<theme::Role> {
-    rows.iter()
-        .find(|r| r.state == "blocked")
-        .or_else(|| rows.iter().find(|r| r.state == "failed"))
-        .or_else(|| {
-            rows.iter()
-                .find(|r| sidebar::is_new(r, focused, seen, unseen))
-        })
-        .map(|r| {
-            if sidebar::is_new(r, focused, seen, unseen) {
-                theme::of("done")
-            } else {
-                theme::of(&r.state)
-            }
-        })
+    sidebar::most_urgent(rows, focused, seen, unseen).map(|r| {
+        if sidebar::is_new(r, focused, seen, unseen) {
+            theme::of("done")
+        } else {
+            theme::of(&r.state)
+        }
+    })
 }
 
 /// What a terminal is called outside the tab bar: its program's last segment, the
@@ -1273,7 +1269,8 @@ pub(crate) fn keybind_lines() -> Vec<String> {
         cmd("W", "close an empty space"),
         cmd("R", "rename space"),
         cmd("space", "find anything"),
-        cmd("g", "agents: group or rank"),
+        cmd("g", "spaces: tree or rank"),
+        cmd("f", "fold this space"),
         cmd("F", "agent focus view"),
         cmd("b", "fold the left column"),
         cmd("m", "menu"),
@@ -2005,7 +2002,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2018,6 +2015,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // The box is centred: ` > ab` starts three cells past its left edge,
         // so the caret lands on the cell right after the `b`.
@@ -2057,7 +2055,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2070,6 +2068,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains(" keybinds"), "no keybinds box on 80x24");
         assert!(
@@ -2103,7 +2102,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2116,9 +2115,10 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("hello from the shell"));
-        // Once on the tab and once in the agents panel: the bar says what is open in this
+        // Once on the tab and once in the column: the bar says what is open in this
         // space and the panel says what it is doing.
         assert!(painted.matches("claude").count() >= 2, "{painted:?}");
         assert!(painted.contains("d detach"));
@@ -2155,7 +2155,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2168,6 +2168,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // The tab bar is the first row: between the cursor address and the reset.
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
@@ -2208,7 +2209,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2221,6 +2222,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
         let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
@@ -2263,7 +2265,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2276,6 +2278,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
         let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
@@ -2309,7 +2312,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2322,6 +2325,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("new tab"), "menu missing row: {painted:?}");
         assert!(
@@ -2401,7 +2405,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2414,6 +2418,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let (pane_cols, _) = pane_size(40, 5);
         // Exactly the pane's width of it, and not one column more.
@@ -2445,7 +2450,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2458,6 +2463,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("starting a terminal"));
     }
@@ -2498,7 +2504,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2511,6 +2517,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // Bold and red on, the text, and then off again: a run that is not closed leaks its
         // colour into the rest of the screen, which is the whole pane and then the status
@@ -2547,7 +2554,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2560,6 +2567,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // The row the shell printed, found by what it printed and then read as bytes. The
         // chrome around it resets after every piece it paints, so the pane's own run
@@ -2611,7 +2619,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2624,6 +2632,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
         assert!(painted.contains("\x1b[32mX"), "{painted:?}");
@@ -2674,7 +2683,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2687,6 +2696,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // One row down for the tab bar, and the pane starts after the column and its rule.
         let want = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
@@ -2725,7 +2735,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2738,6 +2748,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let placed = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
         assert!(!painted.contains(&placed), "hid cursor placed: {painted:?}");
@@ -2774,7 +2785,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -2782,6 +2793,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                chrome: Default::default(),
             });
             // Every positioned run, measured as a terminal measures it.
             for run in painted.split("\x1b[").skip(1) {
@@ -2824,7 +2836,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -2837,6 +2849,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("\x1b[?25l"));
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
@@ -2869,7 +2882,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -2877,6 +2890,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                chrome: Default::default(),
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
@@ -2891,7 +2905,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 34;
+    const COMMANDS: usize = 35;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -2944,6 +2958,7 @@ mod tests {
             Action::Resize => (const { place(31) }, Some("ctrl-a e")),
             Action::Equalize => (const { place(32) }, Some("ctrl-a =")),
             Action::CopyMode => (const { place(33) }, Some("ctrl-a [")),
+            Action::FoldSpace => (const { place(34) }, Some("ctrl-a f")),
         }
     }
 
@@ -3002,6 +3017,7 @@ mod tests {
             Action::Resize,
             Action::Equalize,
             Action::CopyMode,
+            Action::FoldSpace,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -3047,7 +3063,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -3055,6 +3071,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                chrome: Default::default(),
             });
             let shown = strip(&painted);
             for line in keybind_lines() {
@@ -3092,7 +3109,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -3100,6 +3117,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                chrome: Default::default(),
             });
             // The two status rows own the bottom of the screen, so nothing else may
             // address either of them: the notice is the row above the keys.
@@ -3131,10 +3149,10 @@ mod tests {
         }
     }
 
-    /// A space's colour has to reach the agents panel, or it says nothing that the word
-    /// beside it did not already say.
+    /// A space wears its own colour on its rule, and the agent under it keeps the colour of
+    /// its state: a person reads where from the rule and what from the dot.
     #[test]
-    fn a_space_wears_one_colour_in_both_panels() {
+    fn a_space_wears_its_colour_on_its_rule_and_the_agent_its_state() {
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
             rows: &rows,
@@ -3157,7 +3175,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3170,14 +3188,14 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let ink = theme::fg(theme::space_of(1));
         let raised = theme::selected_in(theme::space_of(1));
-        // Once in the spaces panel, once beside the agent that lives there. Either form,
-        // because the row may also have the keyboard.
+        // On the rule of the space. Either form, because the row may also have the keyboard.
         let worn = painted.matches(ink.as_str()).count() + painted.matches(raised.as_str()).count();
         assert!(
-            worn >= 2,
+            worn >= 1,
             "the space colour appears {worn} times: {painted:?}"
         );
         // And the state the agent is in is still its own colour, not the space's.
@@ -3215,7 +3233,7 @@ mod tests {
                 tick,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -3228,6 +3246,7 @@ mod tests {
                     total: 0,
                 },
                 image_notice: None,
+                chrome: Default::default(),
             })
         };
         let first = paint_at(0);
@@ -3284,7 +3303,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3297,6 +3316,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(!painted.contains('\u{fffd}'), "a name was cut in half");
         // Every panel row still ends where the rule begins.
@@ -3371,7 +3391,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3384,6 +3404,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(!painted.contains('\u{fffd}'));
     }
@@ -3436,7 +3457,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3449,6 +3470,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(
             painted.contains("next: app/codex is blocked"),
@@ -3482,7 +3504,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3495,6 +3517,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("d detach"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
@@ -3525,7 +3548,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3538,6 +3561,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("starting a terminal"), "{painted:?}");
     }
@@ -3574,7 +3598,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3587,6 +3611,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let shown = strip(&painted);
         assert!(shown.contains("中文ab codex"), "{shown:?}");
@@ -3619,7 +3644,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3632,6 +3657,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         // Read as a terminal shows it: the row is painted in pieces now, since the space
         // wears its own colour and the state wears its own.
@@ -3701,7 +3727,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3714,6 +3740,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let w = palette_width(80);
         let left = (80usize.saturating_sub(w)) / 2;
@@ -3779,7 +3806,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3792,6 +3819,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            chrome: Default::default(),
         });
         let shown = strip(&painted);
         assert!(shown.contains("> working"), "{shown:?}");
@@ -3799,7 +3827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_panel_fits_nine_agents_without_scrolling() {
+    fn a_tree_fits_nine_agents_without_scrolling() {
         let spaces = vec![WorkspaceRow {
             id: 1,
             name: "app".to_string(),
@@ -3831,36 +3859,45 @@ mod tests {
                 slept_at_unix: None,
             })
             .collect();
-        // Nothing folds: all nine agents draw their pairs, no headers and no
-        // counted lines, and the title names the sort order.
+        // Nothing scrolls: all nine agents draw their row under the space's rule, and
+        // the title names the order.
+        let shut = sidebar::Shut::new();
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
         let lines = sidebar::render_folded(
-            &spaces,
-            &rows,
-            1,
-            1,
+            &sidebar::Column {
+                spaces: &spaces,
+                agents: &rows,
+                focused_space: 1,
+                focused_terminal: 1,
+                tick: 0,
+                view: sidebar::View::Tree,
+                seen: &seen,
+                unseen: &unseen,
+                now_unix: 0,
+                width: sidebar::WIDTH,
+                shut: &shut,
+            },
             39,
-            0,
-            sidebar::View::Grouped,
-            &sidebar::Seen::new(),
-            &sidebar::Unseen::new(),
-            0,
-            sidebar::WIDTH,
         );
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
         assert_eq!(
-            texts.iter().filter(|t| t.contains("app - claude")).count(),
+            texts
+                .iter()
+                .filter(
+                    |t| t.starts_with("   \u{25cf} claude") || t.starts_with("   \u{25c6} claude")
+                )
+                .count(),
             9,
             "agents lost rows: {texts:?}"
         );
-        assert!(!texts.iter().any(|t| t.contains("finished")), "{texts:?}");
         assert!(!texts.iter().any(|t| t.contains('\u{25b8}')), "{texts:?}");
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with(" agents") && t.ends_with("grouped")),
+                .any(|t| t.starts_with(" spaces") && t.ends_with("tree +")),
             "{texts:?}"
         );
     }
@@ -3893,7 +3930,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -3901,6 +3938,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &crate::run::Behind::default(),
             image_notice: None,
+            chrome: Default::default(),
         });
         // The five columns under the drag are reversed, and the escape is written once at
         // each edge of them rather than around every character.
@@ -3955,7 +3993,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -3963,6 +4001,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                chrome: Default::default(),
             })
         };
         assert_eq!(
@@ -4006,7 +4045,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             // Pinned to the second to last row written, so the pane shows the last two
@@ -4015,6 +4054,7 @@ mod tests {
             rows_back: 2,
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
             tiles: Vec::new(),
         });
         // Two rows back: the last two rows written, then the screen from its top.
@@ -4066,7 +4106,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             anchor: 0,
@@ -4074,6 +4114,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
         });
         assert!(painted.contains("live 0") && painted.contains("live 1"));
         assert!(!painted.contains("gone"), "{painted:?}");
@@ -4219,11 +4260,12 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
         })
     }
 
@@ -4258,11 +4300,12 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
         });
         let tiled = paint(&Frame {
             rows: &rows,
@@ -4298,11 +4341,12 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &sidebar::Seen::new(),
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
         });
         assert_eq!(tiled, legacy);
     }
@@ -4343,11 +4387,12 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &seen,
             unseen: &unseen,
             behind: &behind,
             image_notice: notice,
+            chrome: Default::default(),
         };
         let plain = paint(&frame_of(None));
         assert!(!plain.contains("[image"), "{plain:?}");
@@ -4527,7 +4572,7 @@ mod tests {
                 tick: 0,
                 now_unix: TEST_NOW,
                 sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Grouped,
+                view: sidebar::View::Tree,
                 seen: &sidebar::Seen::new(),
                 unseen: &sidebar::Unseen::new(),
                 anchor: 0,
@@ -4540,6 +4585,7 @@ mod tests {
                     total: 0,
                 },
                 image_notice: None,
+                chrome: Default::default(),
             },
             crate::run::Reading::Settings,
             &mut out,
@@ -4582,7 +4628,7 @@ mod tests {
             tick: 0,
             now_unix: TEST_NOW,
             sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Grouped,
+            view: sidebar::View::Tree,
             seen: &seen,
             unseen: &unseen,
             anchor: 0,
@@ -4590,6 +4636,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            chrome: Default::default(),
         };
         let slept = here(&frame(2));
         assert!(slept.ends_with(", sleeping  ctrl-a x dismiss"), "{slept:?}");

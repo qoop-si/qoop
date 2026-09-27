@@ -12,17 +12,21 @@ no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you 
 the same one.
 
 ```
- 1 zsh          idle│~/my-project $ cargo test
->2 claude    blocked│
- 3 sh          idle │
-                    │
+ needs you                  1 │ 1 zsh  2 claude  +
+ ● claude          my-project │~/my-project $ cargo test
+──────────────────────────────┤
+ spaces                 tree +│
+─▾ my-project ──────────── 1 ─│
+   ● claude                   │
+─· notes ─────────────────────│
 terminal 2 is blocked
 ```
 
-The index says which terminal each agent is in and what it is doing. An agent waiting for an
-answer lights its row and rings the bell, so you find out without looking. The name is
-the one you would say, not the runtime underneath it: an agent installed as a node package
-reads as itself, not as `node`.
+The index says which space each agent is in and what it is doing: every space is a rule
+with its agents under it, and `ctrl-a f` folds one away. An agent waiting for an answer is
+pinned at the top, lights its row and rings the bell, so you find out without looking, even
+when its space is folded. The name is the one you would say, not the runtime underneath it:
+an agent installed as a node package reads as itself, not as `node`.
 
 `ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches.
 Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a

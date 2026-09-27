@@ -94,6 +94,7 @@ pub fn render(
         colour: None,
         accent: None,
         indicator: None,
+        runs: Vec::new(),
     }
 }
 

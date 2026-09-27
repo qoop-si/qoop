@@ -202,31 +202,26 @@ impl Drop for Interface {
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// The screen row the spaces panel's title is drawn on. Taken from the interface rather
-/// than written as `1`, so this test cannot disagree with the layout the next time the
-/// layout changes. The tab bar is over the pane, not over this column, so the column
-/// starts at the very top.
+/// The screen row the column's title is drawn on while nobody needs a person, so no pin
+/// sits over it. Taken from the interface rather than written as `1`, so this test cannot
+/// disagree with the layout the next time the layout changes. The tab bar is over the
+/// pane, not over this column, so the column starts at the very top.
 const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP;
 
-/// The screen row the first space is drawn on, directly under that title.
+/// The screen row the first space's rule is drawn on, directly under that title. The next
+/// space's rule follows it directly while the first space holds no agent.
 const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 
-/// The first line of the first agent, on a window this size with one space in the daemon.
+/// Every row of the list under the column's title, from its first row down to the bottom
+/// of the column: the space rules and the agents under them.
 ///
-/// The spaces panel holds a section of its own rather than hugging its content, so the
-/// rows under the spaces are blank and the agents panel starts below them. Worked out from
-/// the panel's own arithmetic rather than counted off a screenshot, so it follows the
-/// layout instead of pinning it.
-/// Every row of the agents panel, from its first line down to the bottom of the column.
-///
-/// Read off the screen rather than worked out from the layout. The column divides at a
-/// share of its height that yields to whatever the lower panel needs, so where the panel
-/// starts depends on the window and on what is running in it: a row number computed in a
-/// test would be a second copy of that arithmetic, and a wrong one the first time either
-/// changed. It also has to be read again on every poll, because the division moves as
-/// agents arrive.
+/// Read off the screen rather than worked out from the layout. The pin over the title
+/// comes and goes with whoever needs a person, so where the list starts depends on what is
+/// running: a row number computed in a test would be a second copy of that arithmetic, and
+/// a wrong one the first time either changed. It also has to be read again on every poll,
+/// because the pin moves the title as agents arrive.
 fn agents_panel(screen: &Screen) -> Vec<String> {
-    let Some(first) = agents_title_row(screen).map(|row| row + 2) else {
+    let Some(first) = agents_title_row(screen).map(|row| row + 1) else {
         return Vec::new();
     };
     // The column stops where the status rows start. Reading into them picked up the notice,
@@ -242,20 +237,14 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .collect()
 }
 
-/// The screen row the agents panel's first line is drawn on.
-///
-/// Found on the screen rather than worked out from the layout. The column divides at a
-/// share of its height that yields to whatever the lower panel needs, so where the agents
-/// panel starts depends on the window and on what is running in it: a number computed here
-/// would be a second copy of that arithmetic, and a wrong one the first time either
-/// changed.
+/// The screen row the list under the title starts on: [`agents_panel`]'s first row.
 fn first_agent_row_of(screen: &Screen) -> usize {
     agents_title_row(screen)
-        .map(|row| row + 2)
-        .unwrap_or_else(|| panic!("the agents panel is not on screen:\n{screen}"))
+        .map(|row| row + 1)
+        .unwrap_or_else(|| panic!("the column title is not on screen:\n{screen}"))
 }
 
-/// Where the agents panel's own title is, if a whole frame of it has arrived.
+/// Where the column's ` spaces` title is, if a whole frame of it has arrived.
 ///
 /// An answer rather than a panic, because the caller is usually waiting rather than
 /// asserting: what has been read so far can be half a frame, with the title in the part
@@ -268,7 +257,7 @@ fn agents_title_row(screen: &Screen) -> Option<usize> {
                 .take(index_width())
                 .collect::<String>()
                 .trim_end()
-                .starts_with(" agents")
+                .starts_with(" spaces")
         })
     })
 }
@@ -356,6 +345,9 @@ impl Interface {
             .arg("daemon")
             .env("QORO_RUNTIME_DIR", dir)
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            // A test run from inside a qoro terminal inherits that terminal's session, which
+            // moves the socket to a path this harness never looks at.
+            .env_remove("QORO_SESSION")
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
@@ -391,6 +383,9 @@ impl Interface {
         let stderr = slave.try_clone().expect("dup");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
         cmd.env("QORO_RUNTIME_DIR", dir)
+            .env_remove("QORO_SESSION")
+            .env_remove("QORO_TERMINAL")
+            .env_remove("QORO_TOKEN")
             // No remote from the machine running the tests: a real one would put ssh
             // connections under every gate here.
             .env("QORO_REMOTES", dir.join("remotes.json"))
@@ -686,8 +681,35 @@ impl Interface {
     /// the keyboard is, so this reads the raw bytes (escapes intact) rather
     /// than the stripped text `panel_line` returns.
     fn wait_for_space(&mut self, nth: usize, within: Duration) -> bool {
-        let row = FIRST_SPACE_ROW + nth - 1;
-        self.wait_for_selected(row, within).is_some()
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if self
+                .space_row(nth)
+                .is_some_and(|row| self.panel_selected(row))
+            {
+                return true;
+            }
+            let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
+        }
+        false
+    }
+
+    /// The screen row the nth space's rule is drawn on, counted down the tree from one.
+    ///
+    /// Found by its shape rather than by arithmetic: a rule opens with a dash and then
+    /// its fold arrow, and agents and the pin move the rules down as they come and go.
+    fn space_row(&self, nth: usize) -> Option<usize> {
+        let first = agents_title_row(&self.screen)? + 1;
+        let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
+        (first..=last)
+            .filter(|&row| {
+                self.panel_line(row).is_some_and(|line| {
+                    let mut chars = line.chars();
+                    chars.next() == Some('\u{2500}')
+                        && matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
+                })
+            })
+            .nth(nth - 1)
     }
 
     /// Whether one index row carries the keyboard, read out of the raw bytes.
@@ -870,18 +892,10 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         .panel_line(SPACES_TITLE_ROW)
         .map(|l| l.trim_end().to_string())
         .unwrap_or_default();
+    // One title over the whole column: the order word, then the corner that makes a space.
     assert!(
-        title.starts_with(" spaces") && title.ends_with('+'),
-        "the spaces title lost its new-space corner: {title:?}"
-    );
-    let agents_title = ui
-        .panel_line(first_agent_row_of(&ui.screen) - 2)
-        .map(|l| l.trim_end().to_string())
-        .unwrap_or_default();
-    assert!(
-        agents_title.starts_with(" agents") && agents_title.ends_with("grouped"),
-        "the agents panel has no title: {:?}",
-        ui.panel_line(first_agent_row_of(&ui.screen) - 2)
+        title.starts_with(" spaces") && title.ends_with("tree +"),
+        "the title lost its order word or its new-space corner: {title:?}"
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
     // answers "who needs me", and a shell is only ever the first of those, so the panel is
@@ -915,14 +929,17 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the tab names no program: {:?}",
         ui.tab_bar()
     );
-    // The panel says it is empty rather than leaving a void under its own title, and a
-    // plain shell is not what fills it.
-    assert_eq!(
-        ui.panel_line(first_agent_row_of(&ui.screen))
-            .map(|l| l.trim_end().to_string()),
-        Some(" no agents yet".to_string()),
-        "a plain shell is listed as an agent: {:?}",
-        ui.panel_line(first_agent_row_of(&ui.screen))
+    // The space's rule has nothing to fold and nothing under it: a plain shell is a tab,
+    // not an agent, so it is not what fills the tree.
+    let list = agents_panel(&ui.screen);
+    assert!(
+        list.first()
+            .is_some_and(|row| row.trim_end().starts_with("\u{2500}\u{b7} default")),
+        "the only space is not an empty rule first: {list:?}"
+    );
+    assert!(
+        !list.iter().any(|row| row.starts_with("   \u{25cf}")),
+        "a plain shell is listed as an agent: {list:?}"
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
     ui.type_in(b"echo INTERFACE_$((6*7))\n");
@@ -1666,9 +1683,9 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
         ui.tab_bar()
     );
     assert!(
-        ui.panel_selected(FIRST_SPACE_ROW + 1),
-        "the spaces panel still marks the space that was left: {:?}",
-        ui.panel_line(FIRST_SPACE_ROW + 1)
+        ui.wait_for_space(2, Duration::from_secs(10)),
+        "the column still marks the space that was left: {:?}",
+        agents_panel(&ui.screen)
     );
 }
 
@@ -1927,7 +1944,7 @@ fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
 }
 
 #[test]
-fn g12_21_clicking_the_agents_mode_word_flips_grouped_and_priority() {
+fn g12_21_clicking_the_order_word_flips_tree_and_priority() {
     let mut ui = Interface::start();
     let title = ui
         .wait_for_panel(
@@ -1939,44 +1956,47 @@ fn g12_21_clicking_the_agents_mode_word_flips_grouped_and_priority() {
             agents_title_row(&ui.screen).and_then(|row| {
                 ui.wait_for_panel(
                     row,
-                    |line| line.trim_end().ends_with("grouped"),
+                    |line| line.trim_end().ends_with("tree +"),
                     Duration::from_secs(15),
                 )
                 .map(|_| row)
             })
         })
-        .unwrap_or_else(|| panic!("the agents title never said grouped:\n{}", ui.painted));
-    // The corner word flips the view, like `ctrl-a g`: the same rows, urgency first.
-    ui.click(28, title as u16);
+        .unwrap_or_else(|| panic!("the title never said tree:\n{}", ui.painted));
+    // The order word flips the view, like `ctrl-a g`: the same agents, urgency first. The
+    // word ends two columns short of the edge, before the space and the `+`, and both
+    // words cover the column clicked here.
+    let word = index_width() as u16 - 3;
+    ui.click(word, title as u16);
     assert!(
         ui.wait_for_panel(
             title,
-            |line| line.trim_end().ends_with("priority"),
+            |line| line.trim_end().ends_with("priority +"),
             Duration::from_secs(10)
         )
         .is_some(),
-        "a click on grouped did not flip to priority:\n{}",
+        "a click on tree did not flip to priority:\n{}",
         ui.painted
     );
     // And back again with a second click.
-    ui.click(28, title as u16);
+    ui.click(word, title as u16);
     assert!(
         ui.wait_for_panel(
             title,
-            |line| line.trim_end().ends_with("grouped"),
+            |line| line.trim_end().ends_with("tree +"),
             Duration::from_secs(10)
         )
         .is_some(),
-        "a click on priority did not flip back to grouped:\n{}",
+        "a click on priority did not flip back to tree:\n{}",
         ui.painted
     );
-    // The `agents` word itself is nothing: a click there leaves the view alone.
+    // The `spaces` word itself is nothing: a click there leaves the view alone.
     ui.click(5, title as u16);
     let _ = ui.wait_for("never appears", Duration::from_secs(2));
     assert!(
         ui.panel_line(title)
-            .is_some_and(|line| line.trim_end().ends_with("grouped")),
-        "a click on the agents word moved the view:\n{}",
+            .is_some_and(|line| line.trim_end().ends_with("tree +")),
+        "a click on the spaces word moved the view:\n{}",
         ui.painted
     );
 }
@@ -2054,14 +2074,14 @@ fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
     );
 }
 
-/// Radar G10: the grouped view keeps creation order on live rows.
+/// Radar G10: the tree view keeps creation order on live rows.
 ///
 /// Two stand-in agents, because real ones cannot be installed by a test. The
 /// stale dim cannot be driven live (two hours is not a test), so it stays
-/// pinned at the unit level by G1; what is live here is a grouped-order
+/// pinned at the unit level by G1; what is live here is a tree-order
 /// snapshot with both agents settled.
 #[test]
-fn radar_grouped_order_holds_creation_order() {
+fn radar_tree_order_holds_creation_order() {
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
@@ -2111,7 +2131,7 @@ fn radar_grouped_order_holds_creation_order() {
         .iter()
         .position(|line| line.contains("● codex"))
         .unwrap_or_else(|| panic!("codex left the panel: {panel:?}"));
-    assert!(claude < codex, "grouped order moved a row: {panel:?}");
+    assert!(claude < codex, "tree order moved a row: {panel:?}");
 }
 
 /// Radar G12: dragging the divider resizes the panel, clamps at both ends,
