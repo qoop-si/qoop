@@ -314,7 +314,11 @@ impl TestClient {
             }
             match tokio::time::timeout(remaining, self.rd.read(&mut read)).await {
                 Ok(Ok(0)) | Err(_) => return false,
-                Ok(Ok(n)) => self.inbuf.extend_from_slice(&read[..n]),
+                Ok(Ok(n)) => {
+                    self.inbuf.extend_from_slice(&read[..n]);
+                    self.decode_buffered();
+                    self.ack_if_due().await;
+                }
                 Ok(Err(_)) => return false,
             }
         }
@@ -439,14 +443,20 @@ impl TestClient {
             return Some(s);
         }
         while Instant::now() < deadline {
+            // Acknowledged as it reads and on a quiet tick, the way the real client does: a
+            // wait longer than the daemon's no-acknowledgement deadline otherwise ends with
+            // a disconnect.
+            self.ack_if_due().await;
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let n = match tokio::time::timeout(remaining, self.rd.read(&mut buf)).await {
-                Ok(Ok(0)) | Err(_) => break,
+            let tick = remaining.min(client::ACK_INTERVAL);
+            let n = match tokio::time::timeout(tick, self.rd.read(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Ok(0)) | Ok(Err(_)) => break,
                 Ok(Ok(n)) => n,
-                Ok(Err(_)) => break,
             };
             self.inbuf.extend_from_slice(&buf[..n]);
             if let Some(s) = self.drain_buffered(&pred) {
+                self.ack_if_due().await;
                 return Some(s);
             }
         }
