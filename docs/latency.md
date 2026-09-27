@@ -26,6 +26,20 @@ number a statement about the build.
 | typing in a terminal that is itself streaming ~1 MiB/s | round trip p50 0.33 ms, p95 0.46 to 0.70 ms; the daemon's share, input to the pty write, p95 0.05 ms | 8 ms |
 | one terminal streaming ~1 MiB/s | 0.71 of a core | none stated |
 
+## A frame limit that held the echo
+
+Measured again on 2026-09-27, the quiet echo read 17.5 ms at the median against a 2 ms
+budget and the gate above 12.6 ms at p95. The daemon was answering input in 66
+microseconds; the rest was waiting. Screens had been limited to one every 16 ms
+(`PUBLISH_EVERY`), and a shell echoes a burst of typing over several reads, so every read
+after the first waited for the next frame. Before the limit the same bench read 0.10 ms.
+
+The limit stays, because a screen per read is a string per row for screens nobody sees. What
+changed is that output inside one frame of an input is its echo and goes out at once, up to
+`ECHO_SCREENS` screens per input: a count and not a shorter time, because a timer rounds up to
+the next millisecond, which measured 2.3 ms. After it: quiet p50 0.06 ms, the gate above p95
+1.4 ms, and 100 idle terminals still 0 ns of CPU.
+
 ## The measurement was measuring a prompt
 
 For most of this project the gate read 38 to 99 milliseconds, and every attempt to explain

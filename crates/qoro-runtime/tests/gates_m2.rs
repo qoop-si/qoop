@@ -903,6 +903,28 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
         "a hung filesystem under one terminal stopped another one"
     );
 
+    // A terminal in a healthy directory can still be made while the probe pool is held:
+    // the stuck probes are another path's problem, and refusing this one left no directory
+    // anyone could open a tab in for the rest of the daemon's life.
+    let elsewhere = d.dir().join("healthy");
+    std::fs::create_dir(&elsewhere).expect("mkdir");
+    let in_a_directory = c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "healthy-while-hung".into(),
+                cwd: Some(elsewhere.display().to_string()),
+                workspace: None,
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a response");
+    assert!(
+        matches!(in_a_directory, ControlResponse::TerminalCreated { .. }),
+        "a full probe pool refused a healthy directory: {in_a_directory:?}"
+    );
+
     // A new terminal can still be created, which needs the lifecycle pool that the probes
     // must not have taken.
     let created = c

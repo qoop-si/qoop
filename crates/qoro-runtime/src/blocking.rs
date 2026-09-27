@@ -47,7 +47,10 @@ pub const LIFECYCLE_THREADS: usize = 2;
 pub const STORE_THREADS: usize = 2;
 pub const PROBE_THREADS: usize = 4;
 
-/// The most blocking threads the daemon will ever have at once.
+/// The most pooled blocking threads the daemon will ever have at once. The one exception
+/// is [`probe_asked`], which runs a check a person is waiting on outside the pool while
+/// the pool is held by stuck probes: one thread per such request, bounded by a person's
+/// pace and by the path degrading after `DEGRADE_AFTER` of them.
 pub const MAX_BLOCKING_THREADS: usize = LIFECYCLE_THREADS + STORE_THREADS + PROBE_THREADS;
 
 /// How many abandoned probes against one prefix before it is refused outright.
@@ -199,14 +202,64 @@ where
         .map_err(|_| BlockingError::Closed)?;
     let result = run_probe(permit, deadline, within, f).await;
     if matches!(result, Err(BlockingError::Abandoned(_))) {
-        *pools()
-            .abandoned_by_prefix
-            .lock()
-            .unwrap()
-            .entry(prefix.to_string())
-            .or_insert(0) += 1;
+        note_abandoned(prefix);
     }
     result
+}
+
+/// A probe a person is waiting on, which never queues behind others.
+///
+/// A free probe thread runs it. With every probe thread held by stuck probes it runs on a
+/// thread of its own instead, with the same deadline: stuck probes on one dead mount could
+/// otherwise hold the whole pool, and then no tab could be opened in any directory, a
+/// healthy home included, for the rest of the daemon's life. That costs one thread per
+/// such request, which a person's pace bounds, and it is counted against its path either
+/// way, so a dead path still degrades and is then refused without a thread at all.
+pub async fn probe_asked<T, F>(prefix: &str, within: Duration, f: F) -> Result<T, BlockingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if is_degraded(prefix) {
+        return Err(BlockingError::Degraded(prefix.to_string()));
+    }
+    let result = match semaphore(Pool::Probe).try_acquire() {
+        Ok(permit) => run_probe(permit, tokio::time::Instant::now() + within, within, f).await,
+        Err(_) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // A system out of threads is a busy pool, not a panic in the control handler.
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    let _ = tx.send(f());
+                })
+                .is_err()
+            {
+                return Err(BlockingError::Busy);
+            }
+            match tokio::time::timeout(within, rx).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(_)) => Err(BlockingError::Panicked),
+                Err(_) => {
+                    pools().abandoned.fetch_add(1, Ordering::Relaxed);
+                    Err(BlockingError::Abandoned(within))
+                }
+            }
+        }
+    };
+    if matches!(result, Err(BlockingError::Abandoned(_))) {
+        note_abandoned(prefix);
+    }
+    result
+}
+
+/// Count one abandoned probe against a path, which is what degrades it.
+fn note_abandoned(prefix: &str) {
+    *pools()
+        .abandoned_by_prefix
+        .lock()
+        .unwrap()
+        .entry(prefix.to_string())
+        .or_insert(0) += 1;
 }
 
 /// The same on the probe pool, counted against no prefix: for work that asks about no one

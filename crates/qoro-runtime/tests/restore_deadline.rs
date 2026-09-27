@@ -72,8 +72,14 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
     // Every probe thread taken before the restore starts.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // A shell whose startup moves it, as a login shell's rc file can: where it ends up is
+    // not a directory the person chose for this tab.
+    let moving_shell = dir.path().join("moving-shell");
+    std::fs::write(&moving_shell, "#!/bin/sh\ncd /\nexec /bin/sh\n").expect("write");
+    std::fs::set_permissions(&moving_shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
     let started = Instant::now();
-    let daemon = Daemon::bind(dir.path(), Path::new("/bin/sh"))
+    let daemon = Daemon::bind(dir.path(), &moving_shell)
         .await
         .expect("the daemon binds");
     let took = started.elapsed();
@@ -90,4 +96,22 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
     // daemon's directory because nothing could say its own was there.
     assert_eq!(report.brought_back, TABS + 1, "{report:?}");
     assert_eq!(report.cwd_fallback, TABS + 1, "{report:?}");
+
+    // And each row still names its own directory once the shells are up and have been read:
+    // starting somewhere else because the directory was slow is not the person moving, and
+    // written back, the next start would have lost the directory for good.
+    let serving = tokio::spawn(async move { daemon.serve().await });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    serving.abort();
+    let store = qoro_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+    let workspace = store.workspaces().expect("workspaces")[0].id;
+    let rows = store.open_terminals(workspace).expect("rows");
+    for i in 0..TABS {
+        let asked = cwd.join(i.to_string()).display().to_string();
+        assert!(
+            rows.iter().any(|r| r.cwd == asked),
+            "the row for {asked} lost its directory: {:?}",
+            rows.iter().map(|r| &r.cwd).collect::<Vec<_>>()
+        );
+    }
 }

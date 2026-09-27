@@ -2418,12 +2418,12 @@ async fn handle_control(
                         reason: format!("cwd {} is not absolute", path.display()),
                     };
                 }
-                // A path the client chose, so on the probe pool with a deadline (ADR-011):
-                // a hung mount answers in two seconds instead of holding a runtime thread.
-                // A busy pool is refused like any other failed check: it means probes
-                // are stuck, and a spawn into an unchecked path would do its `chdir` on
-                // this runtime thread, where a hung mount holds it for good.
-                Some(path) => match is_dir_probed(&path).await {
+                // A path the client chose, so probed with a deadline (ADR-011): a hung mount
+                // answers in two seconds instead of holding a runtime thread. A person is
+                // waiting, so it never queues behind stuck probes: a dead mount elsewhere
+                // cannot stop tabs opening in every other directory. Never spawned into
+                // unchecked, because the spawn's `chdir` runs on this runtime thread.
+                Some(path) => match probe_dir_asked(&path).await {
                     Ok(true) => Some(path),
                     Ok(false) => {
                         return ControlResponse::Failed {
@@ -4043,8 +4043,17 @@ fn note_cwd(
     if last_cwd.as_deref() == Some(now.as_path()) {
         return;
     }
+    // The first read of a terminal that started without a directory of its own is where it
+    // started, not a move: written, it replaced a restored tab's real directory, which had
+    // only been slow to answer, with the daemon's.
+    let first = last_cwd.is_none();
     *last_cwd = Some(now.clone());
+    // The live index is told either way: it is what a new tab or split opened from here
+    // follows, and it has to say where the shell is.
     terminals.set_cwd(stream, Some(now.display().to_string()));
+    if first {
+        return;
+    }
     if let Some(books) = books.clone() {
         tokio::spawn(async move {
             let _ = books
@@ -4404,6 +4413,16 @@ async fn existing_dirs(
         }
     }
     found
+}
+
+/// Whether a directory a person is waiting on exists: like [`is_dir_probed`], but never
+/// queued behind stuck probes.
+async fn probe_dir_asked(path: &Path) -> Result<bool, crate::blocking::BlockingError> {
+    let owned = path.to_path_buf();
+    crate::blocking::probe_asked(&path.display().to_string(), PROBE_DEADLINE, move || {
+        owned.is_dir()
+    })
+    .await
 }
 
 /// Whether a path the user chose is a directory, asked on the probe pool (ADR-011).
@@ -4826,9 +4845,11 @@ fn spawn_terminal(
         books,
     } = spawn;
     let register_master = agents.clone();
-    // What the row says this terminal's directory is: the one asked for, or the daemon's
-    // own, which is where a child with no directory of its own starts.
-    let started_in = cwd.clone().unwrap_or_else(here);
+    // The directory the row already holds for this terminal, when one was asked for. None
+    // when it starts where the daemon is: a restored tab whose directory did not answer in
+    // time keeps its real one in the row, and must not have it replaced by where it
+    // happened to start.
+    let started_in = cwd.clone();
     let shell = shell.as_path();
     let cwd = cwd.as_deref();
     let pty = sys::open_pty(INITIAL_SIZE.cols, INITIAL_SIZE.rows)?;
@@ -5348,7 +5369,7 @@ async fn terminal_task(
     terminals: Arc<TerminalRegistry>,
     books: Option<Bookkeeping>,
     // Where this terminal was started, which is what its row already says.
-    started_in: PathBuf,
+    started_in: Option<PathBuf>,
 ) -> io::Result<()> {
     let master_raw = master.as_raw_fd();
     let child_pid = child.id() as i32;
@@ -5372,8 +5393,9 @@ async fn terminal_task(
     // And the directory last written down, for the same reason. Seeded with the one this
     // terminal was started in, because that is already in the row: without it the first
     // read writes the same value back and a daemon that has done nothing has still
-    // written to its database.
-    let mut last_cwd: Option<PathBuf> = Some(started_in);
+    // written to its database. Unseeded when it started without one of its own: then the
+    // first read is only where it started, and only a move from there is written.
+    let mut last_cwd: Option<PathBuf> = started_in;
     // When to read the directory once more, because the throttle below skipped a read.
     // A `cd` prints its prompt within the throttle window of the output before it, and
     // with nothing printed after that a quiet tab kept its old directory for good: the
@@ -5387,6 +5409,18 @@ async fn terminal_task(
     // `None` while nothing is held back, so a quiet terminal has no timer.
     let mut published: Option<tokio::time::Instant> = None;
     let mut publish_at: Option<tokio::time::Instant> = None;
+    // Until when output is the echo of what was just typed, which goes out at once whatever
+    // the frame limit says. A shell echoes a burst of typing over several reads, so it is a
+    // window of one frame after the input, not only the next read. Held for a frame, every
+    // key typed within 16 ms of the last screen waited up to 16 ms for its own echo:
+    // measured, a quiet echo went from 0.1 ms to 17.5 ms at the median when the limit came
+    // in.
+    let mut echo_until: Option<tokio::time::Instant> = None;
+    // How many screens the echo window may still publish at once. A count and not a time
+    // floor: a timer rounds up to the next millisecond and more, which put a quiet echo at
+    // 2.3 ms against a 2 ms budget; a count waits for nothing, and a key held down in a
+    // terminal that streams still publishes only a few screens per key, not one per read.
+    let mut echo_left: u8 = 0;
     // When recent pictures arrived, for the flood guard below. Empty while the
     // terminal draws no pictures, like every other arm in this loop.
     let mut image_at: std::collections::VecDeque<std::time::Instant> =
@@ -5425,6 +5459,8 @@ async fn terminal_task(
                         ClientCommand::Input { bytes, from } => {
                         let arrived = std::time::Instant::now();
                         pending_input = Some(arrived);
+                        echo_until = Some(tokio::time::Instant::now() + PUBLISH_EVERY);
+                        echo_left = ECHO_SCREENS;
                             // Live input is traffic; restore replay is not:
                             // replayed bytes must not refresh the idle clock
                             // of a tab that has been quiet for hours.
@@ -5524,6 +5560,7 @@ async fn terminal_task(
                             // has to be right: the next start opens the tab here.
                             if let Some(now) =
                                 qoro_pty::sys::cwd_of(qoro_pty::teardown::Pid(child_pid))
+                                && last_cwd.is_some()
                                 && last_cwd.as_deref() != Some(now.as_path())
                             {
                                 terminals.set_cwd(stream, Some(now.display().to_string()));
@@ -5772,15 +5809,22 @@ async fn terminal_task(
                             // read is a string per row each time for screens nobody sees.
                             // The first read after a quiet spell goes out at once, so an
                             // echoed key is not held; the rest wait for the arm below.
-                            if updates.receiver_count() > 0 && publish_at.is_none() {
-                                let now = tokio::time::Instant::now();
+                            let now = tokio::time::Instant::now();
+                            let echo = echo_left > 0 && echo_until.is_some_and(|until| now < until);
+                            if !echo {
+                                echo_until = None;
+                            }
+                            if updates.receiver_count() > 0 && (publish_at.is_none() || echo) {
                                 match published {
-                                    Some(at) if now < at + PUBLISH_EVERY => {
+                                    Some(at) if now < at + PUBLISH_EVERY && !echo => {
                                         publish_at = Some(at + PUBLISH_EVERY);
                                     }
                                     _ => {
                                         let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                                         published = Some(now);
+                                        // What was held is in this screen too.
+                                        publish_at = None;
+                                        echo_left = echo_left.saturating_sub(u8::from(echo));
                                     }
                                 }
                             }
@@ -6124,6 +6168,11 @@ pub const CONTAINMENT_SCAN_INTERVAL: std::time::Duration = std::time::Duration::
 /// The shortest gap between two published screens of one terminal: sixty a second, the
 /// same as the interface's own frame, since a screen published faster is never drawn.
 pub const PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How many screens the frame after an input may publish at once: enough for an echo that
+/// a shell writes over a few reads, and a bound on what one key costs a terminal that
+/// streams.
+pub const ECHO_SCREENS: u8 = 4;
 
 /// How long a terminal has to be quiet before its screen is read for what the agent is
 /// doing.
