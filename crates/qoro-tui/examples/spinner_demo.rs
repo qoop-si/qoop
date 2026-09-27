@@ -1,12 +1,12 @@
-//! The agents panel, static: run it and read.
+//! The left column at frame zero: run it and read.
 //!
 //! ```sh
 //! cargo run -p qoro-tui --example spinner_demo
 //! ```
 //!
-//! Every state says its word on the right, an unread done says `new`, and no
-//! tick ever changes a cell. Everything on screen comes through the same
-//! [`paint`] the interface uses, so what you see is what the panel draws.
+//! Every state wears its dot, an unread done wears the done sage, and at frame zero
+//! nothing moves. Everything on screen comes through the same [`paint`] the interface
+//! uses, so what you see is what the column draws.
 
 use qoro_runtime::control::{AgentRow, WorkspaceRow};
 use qoro_tui::screen::{self, Frame};

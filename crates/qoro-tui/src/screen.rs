@@ -369,7 +369,7 @@ pub fn paint(frame: &Frame) -> String {
         //
         // The keyboard's own rows also carry the raised background, which is
         // what the designs draw as a selected background. No marker character:
-        // the rows are static text and the background alone says where the
+        // the rows are text and the background alone says where the
         // keyboard is.
         if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
@@ -3207,10 +3207,10 @@ mod tests {
         );
     }
 
-    /// The frame is static: two ticks paint the same bytes, the working
-    /// row says its word on the right, and no spinner glyph ever appears.
+    /// Frame zero is still; past it the working row turns the spinner, and only that
+    /// row changes. The status sentence keeps the word either way.
     #[test]
-    fn the_working_row_is_static_across_ticks() {
+    fn the_working_row_turns_the_spinner_past_frame_zero() {
         let rows = [row(1, "claude", "working")];
         let paint_at = |tick: u64| {
             paint(&Frame {
@@ -3251,19 +3251,17 @@ mod tests {
             })
         };
         let first = paint_at(0);
-        let second = paint_at(1);
-        assert_eq!(first, second, "the tick repainted a static screen");
-        // The working row says its word on the right instead of spinning.
-        assert!(
-            strip(&first).contains("working"),
-            "the working word never reached the screen: {first:?}"
-        );
-        for glyph in ['\u{2809}', '\u{2838}', '\u{28c0}', '\u{2807}'] {
+        for glyph in ['\u{280b}', '\u{2819}', '\u{2839}'] {
             assert!(
                 !strip(&first).contains(glyph),
-                "a spinner frame leaked onto the screen: {first:?}"
+                "frame zero moved: {first:?}"
             );
         }
+        let second = paint_at(1);
+        assert!(
+            strip(&second).contains('\u{2819}'),
+            "the working row did not turn the spinner: {second:?}"
+        );
         // The status sentence keeps the word on purpose: it says what the focused
         // terminal is doing in prose, which is a different surface from the panel.
         // Only the panel trades the word for the spinner.

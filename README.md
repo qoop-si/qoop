@@ -30,7 +30,10 @@ an agent installed as a node package reads as itself, not as `node`.
 
 `ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches.
 Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a
-minute, and the state is read off a terminal's screen only once it stops changing.
+minute, and the state is read off a terminal's screen only once it stops changing. The one
+motion is the spinner and sweep beside an agent that is working and on screen: about 0.3
+percent of a core while they turn, nothing once the agent stops, and `QORO_MOTION=0` or
+`NO_COLOR` keeps them still.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
 [ADR-021](docs/adr/ADR-021-windows.md) says what one would have to include.

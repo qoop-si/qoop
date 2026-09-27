@@ -146,6 +146,16 @@ const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// How long an index request may stay unanswered before the next change asks again.
 const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How often the column's spinner and sweep step while an agent works: twelve frames a
+/// second, enough for a sweep across thirty columns to read as motion rather than jumps.
+const MOTION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Whether the column may move at all: yes, unless `QORO_MOTION=0` or `NO_COLOR` is set.
+fn motion_on() -> bool {
+    std::env::var("QORO_MOTION").map_or(true, |v| v.trim() != "0")
+        && std::env::var_os("NO_COLOR").is_none()
+}
+
 /// One mouse report in the form a program that asked for the mouse expects.
 ///
 /// SGR (`CSI ? 1006`), which every program that asks for the mouse these days understands
@@ -327,10 +337,11 @@ struct State {
     /// the transition, cleared on focus, pruned with the rows. Same sage,
     /// same `new` word, no new theme.
     unseen_finished: sidebar::Unseen,
-    /// Unused animation step, kept so the frame shape stays stable.
+    /// The column's animation frame: the working spinner and the activity sweep.
     ///
-    /// The panel is static and the tick never advances it; it stays zero so a
-    /// still screen never repaints.
+    /// Zero is the still column. The loop advances it every [`MOTION_TICK`] only while
+    /// an agent is working, the column is drawn and motion is on, so a screen with
+    /// nothing working never repaints on its own.
     tick: u64,
     /// How wide the open left column paints, clamped to the sidebar range.
     ///
@@ -2712,6 +2723,10 @@ where
     // change is never lost. A request unanswered for [`INDEX_PATIENCE`] is taken as lost.
     let mut index_asked: Option<tokio::time::Instant> = None;
     let mut index_owed = false;
+    // The column moves only while something works and motion is on: `QORO_MOTION=0` or
+    // `NO_COLOR` keeps it still. The next frame's deadline, when one is armed.
+    let motion = motion_on();
+    let mut motion_at: Option<tokio::time::Instant> = None;
     presented = presented.checked_sub(FRAME).unwrap_or(presented);
 
     let outcome: io::Result<()> = async {
@@ -2890,6 +2905,16 @@ where
             // One shot and not an interval: the arm below sleeps until it and
             // then goes back to never. Folded away, the strip shows no tiers,
             // so nothing is armed. See `sidebar::wants_tick`.
+            // A working agent on a drawn column arms the next animation frame; nothing
+            // working disarms it, and the column stops on whatever frame it was on.
+            let moving = motion
+                && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0
+                && sidebar::moves(&state.column(0, 0));
+            if !moving {
+                motion_at = None;
+            } else if motion_at.is_none() {
+                motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
+            }
             let tier_at = if state.collapsed {
                 None
             } else {
@@ -4311,6 +4336,19 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    dirty = true;
+                }
+                // The next animation frame, armed only while an agent works. It only
+                // marks the frame dirty: the FRAME arm still decides when it goes out,
+                // and the presenter writes only the cells the frame changed.
+                _ = async {
+                    match motion_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    state.tick = state.tick.wrapping_add(1).max(1);
+                    motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
                     dirty = true;
                 }
                 // A change owed to an index request that never answered: after

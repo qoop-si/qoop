@@ -29,8 +29,7 @@ pub enum Role {
     /// The rules between the panels and beside the pane.
     Rule,
     /// The product's own mark: the logo orange, one steady wearer on the screen.
-    /// An accent spent twice is an accent that points at nothing. (The ember
-    /// wheel starts on it transiently while it breathes; that is motion, not a mark.)
+    /// An accent spent twice is an accent that points at nothing.
     Brand,
     /// An agent's state.
     Working,
@@ -44,15 +43,11 @@ pub enum Role {
     /// say is "this one is not running any more". A settled state with a
     /// hue, like done: idle stays the uncoloured background.
     Sleeping,
-    /// The working spinner's head, one step of the brand's own ambers.
-    ///
-    /// The sidebar steps these five times per loop while its glyph cycles four
-    /// circle frames, so the (glyph, step) combination repeats every twenty ticks.
-    /// Amber and not violet-pink on purpose: the wheel starts on the brand's own
-    /// orange and breathes outward through gold to tan, and aliveness wants its
-    /// own channel rather than a louder state colour. 208 is skipped: it belongs
-    /// to blocked now, so the wheel steps 216 instead.
-    Ember(usize),
+    /// One step of the sweep that crosses a working agent's activity: the grey ramp
+    /// from 244 up to white at 255, level 0 to 11. Grey and not a hue on purpose: the
+    /// sweep says "alive", and a colour would say a state it is not. Its darkest step is
+    /// still brighter than the quiet row it crosses, so the band always reads.
+    Shimmer(u8),
     /// A terminal nothing has said anything about yet.
     Unobserved,
     /// Which space a thing belongs to, as a colour rather than as a word.
@@ -94,9 +89,8 @@ pub fn space_of(id: i64) -> Role {
 /// are 37 apart. Measured in CIELAB over the 256 entries, with an L* floor near
 /// 55 and contrast 5+:1 on dark grounds (the old 27 blue failed both, at L* 46
 /// and 3.6:1 against STATUS_BG 233; the new floor is 5.3:1 on the same ground).
-/// The set leans blue-cyan (33, 51, 117) with lightness doing the telling apart;
-/// the thinnest cross-exclusion margin is the yellow 226 against the ember gold
-/// 220 (23 apart), carried by position plus motion. Order round the wheel:
+/// The set leans blue-cyan (33, 51, 117) with lightness doing the telling apart.
+/// Order round the wheel:
 /// violet 135, cyan 51, azure 33, lime light 155, sky 117, yellow 226.
 /// 33 is the brighter step of the `0044D7` blue family (the anchor 26 is too dim);
 /// 226 carries the bonus `F7F245` yellow at a safe distance from lime. The two
@@ -105,14 +99,6 @@ pub fn space_of(id: i64) -> Role {
 /// A space ink always sits on the space name on the row below while a state sits
 /// on the first-row dot, so working-adjacent blues never compete for one slot.
 const SPACE_INKS: [u8; 6] = [135, 51, 33, 155, 117, 226];
-
-/// The spinner's amber wheel, from the brand accent out toward tan.
-///
-/// `FD4B03` is 202, which is also [`Role::Brand`]'s ink: the spinner starts on the
-/// product's own mark and breathes outward, and a blocked row wears steady orange
-/// beside it. 208 would be the next amber step but belongs to blocked, so the wheel
-/// steps 214, 216, 220 and 222 instead.
-const EMBER_INKS: [u8; 5] = [202, 214, 216, 220, 222];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
@@ -175,7 +161,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Unobserved => 238,
         Role::AvatarHair(ink) => ink,
         Role::AvatarBody(ink) => ink,
-        Role::Ember(n) => EMBER_INKS[n % EMBER_INKS.len()],
+        Role::Shimmer(level) => 244 + if level > 11 { 11 } else { level },
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
     }
 }
@@ -412,7 +398,7 @@ mod tests {
         ]
         .into_iter()
         .chain((0..SPACE_INKS.len()).map(Role::Space))
-        .chain((0..EMBER_INKS.len()).map(Role::Ember))
+        .chain((0..=11).map(Role::Shimmer))
         {
             assert!(ink(role) >= 16, "{role:?} uses a themed colour");
         }
@@ -583,23 +569,20 @@ mod tests {
         }
     }
 
-    /// Identity and aliveness share no ink: a spinner step the colour of a space
-    /// would read as a project, and a space the colour of a spinner step as motion.
-    /// The selected tab is neither pool's nor any state's: it must not read as
-    /// a project, a spinner step, or a state from the bar.
+    /// Identity and aliveness share no ink: a sweep step the colour of a space would
+    /// read as a project, and a space the colour of a sweep step as motion. The
+    /// selected tab is neither pool's nor any state's: it must not read as a project,
+    /// a sweep, or a state from the bar.
     #[test]
-    fn a_space_is_never_an_ember_step_and_the_tab_is_neither() {
-        let ember: Vec<u8> = (0..EMBER_INKS.len()).map(|n| ink(Role::Ember(n))).collect();
+    fn a_space_is_never_a_sweep_step_and_the_tab_is_neither() {
+        let sweep: Vec<u8> = (0..=11).map(|n| ink(Role::Shimmer(n))).collect();
         for n in 0..SPACE_INKS.len() {
             assert!(
-                !ember.contains(&ink(Role::Space(n))),
-                "space {n} wears an ember step"
+                !sweep.contains(&ink(Role::Space(n))),
+                "space {n} wears a sweep step"
             );
         }
-        for (name, pool) in [
-            ("space", SPACE_INKS.to_vec()),
-            ("ember", EMBER_INKS.to_vec()),
-        ] {
+        for (name, pool) in [("space", SPACE_INKS.to_vec()), ("sweep", sweep.clone())] {
             assert!(
                 !pool.contains(&TAB_ON_FG),
                 "the selected tab wears a {name} pool colour"
@@ -662,56 +645,18 @@ mod tests {
         }
     }
 
-    /// The ember wheel is five distinct steps that come back round, so the spinner
-    /// breathes out from the brand orange toward tan and back rather than jumping
-    /// between two hues.
+    /// The sweep climbs the grey ramp to white in twelve distinct steps, every one
+    /// brighter than the quiet row it crosses, and a level past the top stays white.
     #[test]
-    fn the_ember_wheel_is_five_distinct_steps_that_wrap() {
-        let mut seen = std::collections::BTreeSet::new();
-        for n in 0..EMBER_INKS.len() {
-            assert!(seen.insert(ink(Role::Ember(n))), "ember {n} repeats a step");
-        }
-        assert_eq!(ink(Role::Ember(0)), ink(Role::Brand));
-        assert_eq!(
-            ink(Role::Ember(EMBER_INKS.len())),
-            ink(Role::Ember(0)),
-            "the wheel does not come back round"
+    fn the_sweep_climbs_distinct_greys_above_the_quiet_row_to_white() {
+        let steps: Vec<u8> = (0..=11).map(|n| ink(Role::Shimmer(n))).collect();
+        assert!(steps.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+        assert!(
+            steps[0] > ink(Role::Faint),
+            "the darkest step must still read"
         );
-    }
-
-    /// An ember is never a state colour: the spinner's aliveness must not read as
-    /// blocked, failed, working or done. Nor as chrome: a spinner step in a panel
-    /// grey would read as furniture instead of motion.
-    #[test]
-    fn an_ember_is_never_the_colour_of_a_state() {
-        let taken = [
-            Role::Working,
-            Role::Blocked,
-            Role::Done,
-            Role::Failed,
-            Role::Idle,
-            Role::Sleeping,
-            Role::Unobserved,
-            Role::Title,
-            Role::Text,
-            Role::Focused,
-            Role::Detail,
-            Role::Faint,
-            Role::Rule,
-        ]
-        .map(ink)
-        .to_vec();
-        for n in 0..EMBER_INKS.len() {
-            // Ember(0) is Brand's own ink by design (see above); the rest of the
-            // wheel must belong to nobody else.
-            if n == 0 {
-                continue;
-            }
-            assert!(
-                !taken.contains(&ink(Role::Ember(n))),
-                "ember {n} wears a taken colour"
-            );
-        }
+        assert_eq!(steps[11], 255);
+        assert_eq!(ink(Role::Shimmer(200)), 255);
     }
 
     /// A 256 palette entry as rgb, the way xterm defines the cube and the greys.

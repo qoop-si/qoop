@@ -7,11 +7,11 @@
 //! under it. An agent that blocked in a space a person is not looking at is exactly the
 //! one they need to be told about, so the pin lists it even when its space is folded.
 //!
-//! An agent's first row opens with its state dot, painted in the state's
-//! own colour through [`Line::indicator`]. The caller paints the raised
-//! background over the keyboard's rows, so the dot never marks selection:
-//! a screenshot, a test assertion, a pipe into a file and a terminal with
-//! no colour all read the same static rows.
+//! An agent's row opens with its state dot, painted in the state's own colour through
+//! [`Line::indicator`]; while it works and the column moves, the dot turns a spinner.
+//! The caller paints the raised background over the keyboard's rows, so the dot never
+//! marks selection. At frame zero, which is what a test, a pipe and `QORO_MOTION=0` get,
+//! the rows are the same static text every time.
 
 use qoro_runtime::control::{AgentRow, WorkspaceRow};
 
@@ -746,11 +746,17 @@ fn activity_row(c: &Column, agent: &AgentRow, at: usize) -> Option<Row> {
     let (text, colour) = said(agent)?;
     let lead = format!("{}\u{2514} ", " ".repeat(at));
     let body = shorten_middle(&text, c.width.saturating_sub(crate::width::width(&lead)));
+    let mut runs = vec![(at, 1, Role::Rule)];
+    // While it works and the column moves, a band of brighter greys crosses what it is
+    // doing, left to right: the row says "alive" without a word for it.
+    if c.tick > 0 && agent.state == "working" {
+        runs.extend(sweep(&body, crate::width::width(&lead), c.tick));
+    }
     Some((
         Line {
             text: fit(&format!("{lead}{body}"), c.width),
             colour: Some(colour),
-            runs: vec![(at, 1, Role::Rule)],
+            runs,
             ..Line::default()
         },
         Some(Hit::Terminal(agent.terminal)),
@@ -845,6 +851,78 @@ pub fn humanize(raw: &str) -> String {
         _ => raw.to_string(),
     }
 }
+
+/// The braille wheel a working agent's dot turns into while the column moves.
+const SPIN: [char; 10] = [
+    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280f}',
+];
+
+/// Frames one sweep takes to cross a row: twenty five at the run loop's eighty
+/// milliseconds is two seconds, the pace Codex's own sweep keeps.
+const SWEEP_TICKS: u64 = 25;
+
+/// Whether anything the column draws is moving: a working agent whose row is on it.
+///
+/// A working agent folded away under its space's rule draws no row, so it moves nothing
+/// and arms no timer; the keyboard's own agent always draws. The run loop asks this
+/// before it arms the next frame.
+/// ponytail: an agent scrolled out of the window still counts, a scroll-aware check
+/// would need the window's arithmetic twice.
+pub fn moves(c: &Column) -> bool {
+    c.agents.iter().any(|a| {
+        a.agent
+            && a.state == "working"
+            && (c.view == View::Priority
+                || !c.shut.contains(&a.workspace)
+                || a.terminal == c.focused_terminal)
+    })
+}
+
+/// The mark an agent's row opens with: its state dot, or, while it works and the
+/// column moves, the spinner's frame in the working colour.
+///
+/// Frame zero is the still column: hit testing, `QORO_MOTION=0` and a column with
+/// nothing working all paint at zero, where every mark is its dot.
+fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> char {
+    if c.tick > 0 && agent.state == "working" {
+        SPIN[(c.tick % SPIN.len() as u64) as usize]
+    } else {
+        dot_glyph(role)
+    }
+}
+
+/// The sweep over `text`, which starts at column `from`, at animation frame `tick`: a
+/// raised-cosine band of brighter greys, a little wider than a tenth of the text and
+/// never under three columns each side, crossing left to right once every
+/// [`SWEEP_TICKS`]. Cells outside the band keep the row's own colour.
+fn sweep(text: &str, from: usize, tick: u64) -> Vec<(usize, usize, crate::theme::Role)> {
+    let mut cells = Vec::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let wide = crate::width::columns(ch);
+        cells.push((col, wide));
+        col += wide;
+    }
+    let span = col as f64;
+    let half = (span * 0.1).max(3.0);
+    let pos = (tick % SWEEP_TICKS) as f64 / SWEEP_TICKS as f64 * (span + 2.0 * half) - half;
+    cells
+        .into_iter()
+        .filter(|(_, wide)| *wide > 0)
+        .filter_map(|(start, wide)| {
+            let distance = (start as f64 - pos).abs() / half;
+            if distance >= 1.0 {
+                return None;
+            }
+            let lift = 0.5 * (1.0 + (std::f64::consts::PI * distance).cos());
+            // Nine steps, not eleven: the ramp's top two are the focused row's own white,
+            // and a sweep on the keyboard's row must not read as a second focus.
+            let level = (lift * 9.0).round() as u8;
+            (level > 0).then_some((from + start, wide, crate::theme::Role::Shimmer(level)))
+        })
+        .collect()
+}
 /// The dot an agent wears, and whether its whole row goes quiet.
 ///
 /// News keeps the done sage: a derived idle-after-work is news, not calm. A stale idle
@@ -872,7 +950,11 @@ fn tree_line(c: &Column, agent: &AgentRow, space: &WorkspaceRow) -> Line {
     let lead = CHILD_DOT_AT + 2;
     let room = c.width.saturating_sub(lead);
     let name = shorten_middle(&session_name(agent), room);
-    let mut text = format!("{}{} {name}", " ".repeat(CHILD_DOT_AT), dot_glyph(role));
+    let mut text = format!(
+        "{}{} {name}",
+        " ".repeat(CHILD_DOT_AT),
+        mark_of(c, agent, role)
+    );
     let mut runs = Vec::new();
     // The worktree a session runs in, in the common case, without asking git on every
     // frame: the directory's own basename, when it is not the space's name and there is
@@ -929,7 +1011,7 @@ fn flat_line(c: &Column, agent: &AgentRow, inline: bool) -> Line {
         room
     };
     let name = shorten_middle(&session_name(agent), name_room);
-    let mut head = format!("{}{} {name}", " ".repeat(DOT_AT), dot_glyph(role));
+    let mut head = format!("{}{} {name}", " ".repeat(DOT_AT), mark_of(c, agent, role));
     let mut runs = Vec::new();
     let rest = room.saturating_sub(crate::width::width(&name));
     if let Some((what, ink)) = said.filter(|_| rest >= 6) {
@@ -1049,7 +1131,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
         let role = colour_for(&agent.state).unwrap_or(crate::theme::Role::Idle);
         (
             Line {
-                text: strip_agent(role),
+                text: strip_agent(mark_of(c, agent, role)),
                 colour: colour_for(&agent.state),
                 // The space mark sits on the first pad cell, never on the glyph: the glyph
                 // column keeps the state colour, so the strip carries state and space side
@@ -1189,8 +1271,8 @@ fn short_session(session: Option<&str>) -> Option<String> {
 /// so a space accent on a padding blank would be invisible: the space needs its
 /// own visible mark. Failed is the diamond, every other state the circle, and
 /// the middle dot always the space. No filled dot for the selected row.
-fn strip_agent(role: crate::theme::Role) -> String {
-    let text = format!(" {}\u{b7}", dot_glyph(role));
+fn strip_agent(mark: char) -> String {
+    let text = format!(" {mark}\u{b7}");
     let pad = COLLAPSED.saturating_sub(crate::width::width(&text));
     format!("{text}{}", " ".repeat(pad))
 }
@@ -1943,7 +2025,7 @@ mod tests {
         // No selection marks anywhere: no hollow ring on every row and no
         // second dot on the selected one. The keyboard's row is the raised
         // background the painter adds. The state dot opens every agent's
-        // row, so it is expected; a spinner never is.
+        // row, so it is expected; a spinner never is at frame zero.
         for bad in ['\u{25cb}', '\u{25cc}', '\u{25a1}', '\u{2809}'] {
             assert!(
                 !texts.iter().any(|t| t.contains(bad)),
@@ -2602,7 +2684,7 @@ mod tests {
         // terminal 1: it has the keyboard, so it is on screen already.
         assert_eq!(order(&rows), vec![1, 3, 5, 6, 9, 2, 4, 7, 8]);
         assert_eq!(pinned(&rows), vec![2]);
-        // Static: running agents carry the working dot, no spinner, and no
+        // At frame zero running agents carry the working dot, no spinner, and no
         // state word on the right.
         assert!(
             lines
@@ -3065,10 +3147,11 @@ mod tests {
         );
     }
 
-    /// Static column: the tick changes nothing, every dot keeps its colour
-    /// and no state word is ever drawn.
+    /// Frame zero is the still column, every mark its dot. Past it only a working agent
+    /// moves: its dot turns the spinner, in the working colour, while every calm row is
+    /// byte for byte what it was. No state word is ever drawn.
     #[test]
-    fn the_column_is_static_across_ticks() {
+    fn only_a_working_agent_moves_and_frame_zero_is_still() {
         let (spaces, agents) = many_agents();
         let at = |tick: u64| {
             rows12(
@@ -3087,21 +3170,42 @@ mod tests {
             )
         };
         let zero = at(0);
-        assert_eq!(zero, at(4), "the tick repainted a static column");
-        // Every agent's row opens with its state dot, steady.
-        assert_eq!(
-            tree_row(&zero, 1).indicator,
-            Some((CHILD_DOT_AT, 1, crate::theme::of("blocked"))),
-            "no static blocked dot"
-        );
+        let (four, five) = (at(4), at(5));
+        let mut moved = 0;
+        for agent in agents.iter().filter(|a| a.agent) {
+            let still = tree_row(&zero, agent.terminal).clone();
+            assert!(
+                !still.text.chars().any(|c| SPIN.contains(&c)),
+                "frame zero moved: {still:?}"
+            );
+            let (a, b) = (
+                tree_row(&four, agent.terminal),
+                tree_row(&five, agent.terminal),
+            );
+            if agent.state == "working" {
+                moved += 1;
+                assert!(
+                    a.text.contains(SPIN[4]) && b.text.contains(SPIN[5]),
+                    "{a:?} {b:?}"
+                );
+                assert_eq!(
+                    b.indicator,
+                    Some((CHILD_DOT_AT, 1, crate::theme::of("working")))
+                );
+            } else {
+                assert_eq!(a, b, "a calm row moved: {a:?}");
+                assert_eq!(*a, still, "a calm row differs from the still column: {a:?}");
+            }
+        }
+        assert!(moved > 0, "the fixture has no working agent to move");
         // An unread done keeps the done sage on its dot, steady.
         assert_eq!(
-            tree_row(&zero, 5).indicator,
+            tree_row(&five, 5).indicator,
             Some((CHILD_DOT_AT, 1, crate::theme::of("done"))),
-            "no static unread dot"
+            "no steady unread dot"
         );
         // And no state word on the right of any row.
-        for (line, _) in &zero {
+        for (line, _) in &five {
             for word in ["working", "blocked", "failed", "done", "idle"] {
                 assert!(
                     !line.text.trim_end().ends_with(word),
@@ -3110,6 +3214,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sweep crosses a working agent's activity once every two seconds, brighter
+    /// greys in a band and the row's own colour outside it; frame zero has no band.
+    #[test]
+    fn the_sweep_crosses_a_working_activity_and_frame_zero_has_none() {
+        assert!(
+            sweep("editing sidebar.rs", 7, 0).len() <= 3,
+            "a band parked at the edge"
+        );
+        let mid = sweep("editing sidebar.rs", 7, SWEEP_TICKS / 2);
+        assert!(!mid.is_empty(), "no band mid sweep");
+        for (at, len, role) in &mid {
+            assert!(*at >= 7 && *len == 1, "{mid:?}");
+            assert!(
+                matches!(role, crate::theme::Role::Shimmer(1..=11)),
+                "{mid:?}"
+            );
+        }
+        assert_eq!(
+            sweep("editing sidebar.rs", 7, 3),
+            sweep("editing sidebar.rs", 7, 3 + SWEEP_TICKS),
+            "the sweep does not come back round"
+        );
+        let spaces = vec![space(1, "app")];
+        let mut working = agent(1, 1, "claude", "working");
+        working.activity = Some("Edit src/sidebar.rs".into());
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let still = column(
+            &spaces,
+            std::slice::from_ref(&working),
+            1,
+            9,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let row = activity_row(&still, &working, CHILD_DOT_AT + 2).expect("a sub-row");
+        assert_eq!(row.0.runs.len(), 1, "frame zero drew a band: {:?}", row.0);
     }
 
     /// Shape says failed: the diamond for failed, the circle for the rest, so the
@@ -3680,6 +3827,101 @@ mod tests {
             rows.iter()
                 .map(|(l, _)| l.text.trim_end())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The column moves only for a working agent whose row it draws: a folded space
+    /// hides its agents and arms nothing, the keyboard's own agent always draws, and
+    /// the priority list folds nothing.
+    #[test]
+    fn only_a_drawn_working_agent_moves_the_column() {
+        let spaces = vec![space(1, "app"), space(2, "dub")];
+        let agents = vec![
+            agent(1, 1, "claude", "idle"),
+            agent(2, 2, "codex", "working"),
+        ];
+        let (seen, unseen) = (Seen::new(), Unseen::new());
+        let open = Shut::new();
+        let folded = Shut::from([2]);
+        let c = |shut, focused, view| {
+            column(
+                &spaces, &agents, 1, focused, 0, view, &seen, &unseen, NOW, WIDTH, shut,
+            )
+        };
+        assert!(
+            moves(&c(&open, 1, View::Tree)),
+            "an open working agent moves"
+        );
+        assert!(
+            !moves(&c(&folded, 1, View::Tree)),
+            "a folded one moves nothing"
+        );
+        assert!(
+            moves(&c(&folded, 2, View::Tree)),
+            "the keyboard's own always draws"
+        );
+        assert!(
+            moves(&c(&folded, 1, View::Priority)),
+            "priority folds nothing"
+        );
+        let calm = vec![agent(1, 1, "claude", "idle")];
+        let still = column(
+            &spaces,
+            &calm,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &open,
+        );
+        assert!(!moves(&still), "nothing working, nothing moving");
+    }
+
+    /// Past frame zero a working agent's activity carries the band and a waiting one's
+    /// never does, and the strip turns the working agent's mark too.
+    #[test]
+    fn the_band_rides_working_rows_only_and_the_strip_spins() {
+        let spaces = vec![space(1, "app")];
+        let mut working = agent(1, 1, "claude", "working");
+        working.activity = Some("Edit src/sidebar.rs".into());
+        let mut blocked = agent(2, 1, "codex", "blocked");
+        blocked.activity = Some("Bash bun test".into());
+        let agents = vec![working.clone(), blocked.clone()];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let moving = column(
+            &spaces,
+            &agents,
+            1,
+            9,
+            SWEEP_TICKS / 2,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let band = |a: &AgentRow| {
+            activity_row(&moving, a, CHILD_DOT_AT + 2)
+                .expect("a sub-row")
+                .0
+                .runs
+                .iter()
+                .filter(|(_, _, r)| matches!(r, crate::theme::Role::Shimmer(_)))
+                .count()
+        };
+        assert!(band(&working) > 0, "the working activity has no band");
+        assert_eq!(band(&blocked), 0, "a waiting agent swept");
+        let strip = rows_collapsed(&moving, 10);
+        assert!(
+            strip
+                .iter()
+                .any(|(l, _)| l.text.contains(SPIN[(SWEEP_TICKS / 2 % 10) as usize])),
+            "the strip did not spin: {strip:?}"
         );
     }
     /// A pin with room for one agent shows that agent, and the title's count says how
