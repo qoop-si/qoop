@@ -1527,12 +1527,15 @@ async fn serve_client(
         loop {
             // The reassembly deadline is only evaluated when a frame arrives, so a peer that
             // sends one chunk and goes quiet would hold its buffers until it disconnected.
-            // The tick is what makes the deadline real.
+            // The tick is what makes the deadline real, and it runs only while a sequence is
+            // open: with nothing to expire, an idle connection (a phone's watcher, an
+            // attached client) wakes the daemon for nothing once a second.
+            let open = reassembler.pending_sequences() > 0;
             let n = tokio::select! {
                 biased;
                 _ = shutdown.notified() => return Ok(()),
                 read_result = rd.read(&mut read) => read_result?,
-                _ = tokio::time::sleep(SWEEP_INTERVAL) => {
+                _ = tokio::time::sleep(SWEEP_INTERVAL), if open => {
                     reassembler.expire(std::time::Instant::now());
                     continue;
                 }
