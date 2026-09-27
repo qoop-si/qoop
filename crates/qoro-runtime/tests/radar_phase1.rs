@@ -181,3 +181,37 @@ async fn the_row_carries_where_the_terminal_is_and_never_blank() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A terminal started with no directory is where the daemon is, and says so
+/// from birth. Unseeded, a tab that never moved stayed `cwd: None` for good,
+/// which `qoro worktree rm` has to read as "may be inside" and refuse.
+#[tokio::test]
+async fn a_terminal_started_without_a_directory_is_where_the_daemon_is() {
+    let d = TestDaemon::start().await;
+    let mut client = d.attach("here").await;
+    let created = client
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "mk".into(),
+                cwd: None,
+                workspace: None,
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await;
+    let terminal = match created {
+        Some(ControlResponse::TerminalCreated { terminal, .. }) => terminal,
+        other => panic!("a terminal was expected: {other:?}"),
+    };
+    let here = std::env::current_dir()
+        .expect("a directory")
+        .display()
+        .to_string();
+    let rows = agents_of(&mut client, "l1").await;
+    assert_eq!(
+        row_of(&rows, terminal).cwd.as_deref(),
+        Some(here.as_str()),
+        "a terminal made without a directory has none on its row"
+    );
+}

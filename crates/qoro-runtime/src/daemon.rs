@@ -3326,9 +3326,15 @@ pub fn open_terminal(
     let handle = TerminalHandle {
         name,
         session: None,
-        // Seeded with what the terminal was asked for: the task writes the
-        // registry whenever its throttled read sees a change after this.
-        cwd: cwd.map(|p| p.display().to_string()),
+        // Seeded with where the shell starts: what was asked for, or the
+        // daemon's own directory. The task writes the registry only when its
+        // throttled read sees a change from there, so an unseeded tab that
+        // never moves would stay unknown for good.
+        cwd: Some(
+            cwd.map_or_else(here, Path::to_path_buf)
+                .display()
+                .to_string(),
+        ),
         workspace,
         history: behind.clone(),
         id: terminal_id,
