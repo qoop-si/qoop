@@ -256,6 +256,16 @@ struct State {
     prompt: Option<Prompt>,
     /// The open menu, and which of its items is selected.
     menu: Option<usize>,
+    /// Which list the menu box shows while `menu` is open.
+    menu_kind: MenuKind,
+    /// The machine being connected from the `+`, between its address and its session.
+    connecting: Option<String>,
+    /// The id of the session list last asked for. An answer to any other is late, and a
+    /// list that opened over whatever the person has moved on to would steal the keys.
+    probing: Option<String>,
+    /// A machine just connected from here, whose first tab the screen moves to when it
+    /// arrives. Forgotten as soon as the person goes anywhere themselves.
+    joining: Option<String>,
     /// Whether the left column is folded away to a strip.
     collapsed: bool,
     /// Whether the focus list covers the pane: the last prompt, the last
@@ -406,7 +416,7 @@ impl State {
             now_unix: sidebar::now_unix(),
             palette: self.palette.as_ref(),
             prompt: self.prompt.as_ref(),
-            menu: self.menu,
+            menu: self.menu.map(|selected| (selected, &self.menu_kind)),
             collapsed: self.collapsed,
             reading: self.reading,
             selection: self.selection,
@@ -791,6 +801,7 @@ enum MenuOutcome {
 /// A prefix or a bare detach closes the menu and hands the bytes on, so `ctrl-a d` still
 /// detaches out of it.
 fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
+    let last = menu_rows(&state.menu_kind).len().saturating_sub(1);
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
@@ -802,7 +813,7 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
                     return MenuOutcome::Moved;
                 }
                 Some(b'B') => {
-                    state.menu = Some((selected + 1).min(MENU.len() - 1));
+                    state.menu = Some((selected + 1).min(last));
                     return MenuOutcome::Moved;
                 }
                 _ => match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
@@ -834,11 +845,14 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
                     return MenuOutcome::Moved;
                 }
                 if letter == b'j' {
-                    state.menu = Some((selected + 1).min(MENU.len() - 1));
+                    state.menu = Some((selected + 1).min(last));
                     return MenuOutcome::Moved;
                 }
                 // A row's own key first, so `r` means rename tab and never
                 // reload; then the first letter of a keyless row.
+                if state.menu_kind != MenuKind::Main {
+                    continue;
+                }
                 if let Some(found) = MENU
                     .iter()
                     .position(|(_, key, _)| key.as_bytes().first() == Some(&letter))
@@ -881,8 +895,75 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "",
         "re-read the agent detection overrides",
     ),
+    ("connect a machine", "", "another machine's qoro, over ssh"),
     ("detach", "d", "leave, and keep everything running"),
 ];
+
+/// Which list the menu box is showing. One box, one set of keys and clicks, three lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MenuKind {
+    /// Everything, from `ctrl-a m` or the word at the foot of the column.
+    #[default]
+    Main,
+    /// What the `+` beside "spaces" offers.
+    Plus,
+    /// The sessions on a machine about to be connected, then a row to start a new one.
+    Sessions {
+        target: String,
+        sessions: Vec<qoro_runtime::control::RemoteSession>,
+    },
+}
+
+/// The rows the menu box shows: a name on the left, and on the right its key or what
+/// state it is in.
+pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
+    match kind {
+        MenuKind::Main => MENU
+            .iter()
+            .map(|(name, key, _)| {
+                let right = if key.is_empty() {
+                    String::new()
+                } else {
+                    format!("^a {key}")
+                };
+                (name.to_string(), right)
+            })
+            .collect(),
+        MenuKind::Plus => vec![
+            ("new space".to_string(), "^a w".to_string()),
+            ("connect a machine (ssh)".to_string(), String::new()),
+        ],
+        MenuKind::Sessions { sessions, .. } => {
+            let mut rows: Vec<(String, String)> = sessions
+                .iter()
+                .map(|s| {
+                    let tabs = match s.tabs {
+                        1 => "1 tab".to_string(),
+                        n => format!("{n} tabs"),
+                    };
+                    let state = if s.running { "running" } else { "stopped" };
+                    (s.name.clone(), format!("{state}  {tabs}"))
+                })
+                .collect();
+            // Nothing there yet: the session it would open anyway, named, so the first
+            // choice is not a blank.
+            if rows.is_empty() {
+                rows.push(("default".to_string(), "new".to_string()));
+            }
+            rows.push(("new session".to_string(), "name it".to_string()));
+            rows
+        }
+    }
+}
+
+/// What the menu box says it is.
+pub fn menu_title(kind: &MenuKind) -> String {
+    match kind {
+        MenuKind::Main => " menu".to_string(),
+        MenuKind::Plus => " spaces".to_string(),
+        MenuKind::Sessions { target, .. } => format!(" sessions on {target}"),
+    }
+}
 
 /// What choosing a menu row asks the daemon for, if anything.
 enum MenuSend {
@@ -944,7 +1025,48 @@ fn next_space_name(state: &State) -> String {
 /// caller only sends the returned request. One function for the keyboard and
 /// the mouse, so the two cannot disagree about what a row does.
 fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuSend {
+    let ask = |what| {
+        Some(Prompt {
+            what,
+            text: String::new(),
+        })
+    };
+    match std::mem::take(&mut state.menu_kind) {
+        MenuKind::Main => {}
+        MenuKind::Plus => {
+            state.prompt = ask(if item == 0 {
+                Naming::Space
+            } else {
+                Naming::Remote
+            });
+            return MenuSend::Nothing;
+        }
+        MenuKind::Sessions { target, sessions } => {
+            // The last row names a new session; every row before it is one to open, or
+            // the default when the machine had none (see `menu_rows`).
+            let picked = if item >= sessions.len().max(1) {
+                state.connecting = Some(target);
+                state.prompt = ask(Naming::RemoteSession);
+                return MenuSend::Nothing;
+            } else {
+                sessions
+                    .get(item)
+                    .map_or_else(|| "default".to_string(), |s| s.name.clone())
+            };
+            *request += 1;
+            state.message = Some(format!("connecting to {target}"));
+            return MenuSend::Control(ControlRequest::ConnectRemote {
+                id: format!("connect-{request}"),
+                target,
+                session: picked,
+            });
+        }
+    }
     match MENU[item].0 {
+        "connect a machine" => {
+            state.prompt = ask(Naming::Remote);
+            MenuSend::Nothing
+        }
         "new tab" => {
             state.prompt = Some(Prompt {
                 what: Naming::Terminal,
@@ -1072,7 +1194,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
 /// `Some(Some(row))` is a press on a row, `Some(None)` a press anywhere else,
 /// `None` no press in these bytes at all. Wheel, motion, releases and other
 /// buttons are not a choice, so they read as no press rather than as outside.
-fn menu_click(bytes: &[u8], cols: u16, lines: u16) -> Option<Option<usize>> {
+fn menu_click(bytes: &[u8], cols: u16, lines: u16, kind: &MenuKind) -> Option<Option<usize>> {
+    let rows = menu_rows(kind);
+    let title = menu_title(kind);
     let mut at = 0;
     let mut found: Option<Option<usize>> = None;
     while let Some(start) = bytes[at..].windows(3).position(|w| w == b"\x1b[<") {
@@ -1093,7 +1217,9 @@ fn menu_click(bytes: &[u8], cols: u16, lines: u16) -> Option<Option<usize>> {
                 let motion = button & 32 != 0;
                 let plain = button & 0b0000_0011;
                 if press && !wheel && !motion && plain == 0 {
-                    found = Some(crate::screen::menu_row_at(cols, lines, row, col));
+                    found = Some(crate::screen::menu_row_at(
+                        cols, lines, &rows, &title, row, col,
+                    ));
                 }
             }
         }
@@ -1128,6 +1254,10 @@ pub enum Naming {
     /// still in an hour later doing the thing it should have been called after.
     RenameSpace(i64),
     RenameTerminal(u32),
+    /// The ssh address of a machine to connect, from the `+` beside the spaces.
+    Remote,
+    /// A new session on the machine being connected.
+    RemoteSession,
 }
 
 impl Naming {
@@ -1138,6 +1268,17 @@ impl Naming {
             Naming::Terminal => "name the new terminal",
             Naming::RenameSpace(_) => "rename this space",
             Naming::RenameTerminal(_) => "rename this tab",
+            Naming::Remote => "ssh address of the machine",
+            Naming::RemoteSession => "name the new session",
+        }
+    }
+
+    /// How many columns an answer may take. An address is longer than a name and is shown
+    /// in the box, which is wider than the column a name has to fit.
+    pub fn limit(self) -> usize {
+        match self {
+            Naming::Remote => 56,
+            _ => NAME_LIMIT,
         }
     }
 
@@ -1153,6 +1294,8 @@ impl Naming {
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
             Naming::RenameSpace(_) => "enter to rename, esc to stop",
+            Naming::Remote => "like admin@10.0.0.5; enter lists its sessions, esc to stop",
+            Naming::RemoteSession => "enter to connect, esc to stop, empty for default",
         }
     }
 }
@@ -1233,7 +1376,7 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                 return PromptOutcome::Passthrough(bytes[at..].to_vec());
             }
             byte if (byte.is_ascii_graphic() || *byte == b' ')
-                && crate::width::width(&prompt.text) < NAME_LIMIT =>
+                && crate::width::width(&prompt.text) < prompt.what.limit() =>
             {
                 prompt.text.push(*byte as char);
             }
@@ -1493,6 +1636,10 @@ where
         sidebar_sized: sidebar::WIDTH,
         palette: None,
         palette_pending: Vec::new(),
+        menu_kind: MenuKind::Main,
+        connecting: None,
+        probing: None,
+        joining: None,
         selection: None,
         anchor: None,
         behind: Behind::default(),
@@ -1771,6 +1918,11 @@ where
                 }
                 typed = stdin_rx.recv() => {
                     let Some(bytes) = typed else { return Ok(()) };
+                    // The person is doing something: a machine they connected a moment
+                    // ago no longer gets to move the screen when it arrives, and a list
+                    // of its sessions no longer gets to open under their next key.
+                    state.joining = None;
+                    state.probing = None;
                     // Ahead of the keystroke itself: a resize behind the input
                     // loses the race with the shell reading it.
                     drain_adopt_resize(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
@@ -1823,7 +1975,7 @@ where
                         // A click chooses a row, or closes on the box around it. Checked
                         // before the keyboard owns the bytes, or the press reads as an
                         // escape and the menu shuts without choosing anything.
-                        if let Some(hit) = menu_click(&bytes, state.cols, state.lines) {
+                        if let Some(hit) = menu_click(&bytes, state.cols, state.lines, &state.menu_kind) {
                             match hit {
                                 Some(item) => {
                                     state.menu = None;
@@ -1945,6 +2097,29 @@ where
                                         // name this counted before anybody was asked.
                                         name: name.unwrap_or_else(|| next_space_name(&state)),
                                     },
+                                    Naming::Remote => {
+                                        // An address is what the box is for: empty is a
+                                        // cancel, as with a space's name.
+                                        let Some(target) = name else {
+                                            dirty = true;
+                                            continue;
+                                        };
+                                        let id = format!("probe-{request}");
+                                        state.probing = Some(id.clone());
+                                        state.connecting = Some(target.clone());
+                                        ControlRequest::ListRemoteSessions { id, target }
+                                    }
+                                    Naming::RemoteSession => {
+                                        let Some(target) = state.connecting.clone() else {
+                                            dirty = true;
+                                            continue;
+                                        };
+                                        ControlRequest::ConnectRemote {
+                                            id: format!("connect-{request}"),
+                                            target,
+                                            session: name.unwrap_or_else(|| "default".into()),
+                                        }
+                                    }
                                 };
                                 if matches!(what, Naming::Space) {
                                     state.creating += 1;
@@ -1958,6 +2133,14 @@ where
                                     Naming::RenameSpace(_) | Naming::RenameTerminal(_) => {
                                         "renamed".to_string()
                                     }
+                                    Naming::Remote => format!(
+                                        "looking at {}",
+                                        state.connecting.as_deref().unwrap_or_default()
+                                    ),
+                                    Naming::RemoteSession => format!(
+                                        "connecting to {}",
+                                        state.connecting.as_deref().unwrap_or_default()
+                                    ),
                                 });
                                 dirty = true;
                             }
@@ -2117,11 +2300,12 @@ where
                                         });
                                         dirty = true;
                                     }
+                                    // Two things a new space can be: one here, or the
+                                    // spaces of another machine. `ctrl-a w` still goes
+                                    // straight to the first.
                                     Some(Clicked::NewSpace) => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Space,
-                                            text: String::new(),
-                                        });
+                                        state.menu_kind = MenuKind::Plus;
+                                        state.menu = Some(0);
                                         dirty = true;
                                     }
                                     Some(Clicked::Space(space)) => {
@@ -2133,6 +2317,7 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::Menu) => {
+                                        state.menu_kind = MenuKind::Main;
                                         state.menu = Some(0);
                                         dirty = true;
                                     }
@@ -2467,6 +2652,7 @@ where
                             }
                             Action::Rename => {}
                             Action::Menu => {
+                                state.menu_kind = MenuKind::Main;
                                 state.menu = Some(0);
                                 dirty = true;
                             }
@@ -2780,6 +2966,8 @@ where
                                     }
                                 }
                             }
+                            // Only a raw connection says this, and this one is not.
+                            Incoming::Raw { .. } => {}
                             Incoming::Image { terminal, image } => {
                                 // Stored for the frame painter (overlay or
                                 // placeholder in Faz 3). Newest wins per
@@ -3696,6 +3884,25 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             // them it is a screen a person has to know a key to escape from. Ending is what
             // every multiplexer does when its last window closes, and the daemon stays: it
             // is the client that goes.
+            // A machine just connected from here has its first tab listed: the screen goes
+            // there, which is what the person connected it for.
+            if let Some(name) = state.joining.clone() {
+                let prefix = format!("{name}:");
+                let arrived = agents.iter().find(|r| {
+                    r.state != "sleeping"
+                        && !state.panes.contains(&r.terminal)
+                        && state
+                            .spaces
+                            .iter()
+                            .any(|w| w.id == r.workspace && w.name.starts_with(&prefix))
+                });
+                if let Some(row) = arrived {
+                    state.joining = None;
+                    state.space = Some(row.workspace);
+                    state.pending_focus = Some(row.terminal);
+                    state.message = None;
+                }
+            }
             // Nothing focused, nothing on its way, and the space on screen has a tab: that
             // tab, through the subscribing path. This is what brings the keyboard back to a
             // remote space when its host reconnects, and a tab that appears in the empty
@@ -3940,6 +4147,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Failed { id, reason, .. } => {
+            if state.probing.as_deref() == Some(id.as_str()) {
+                state.probing = None;
+            }
             // A space that was refused is not coming: it no longer counts toward the next
             // numbered name.
             if id.starts_with("space-") {
@@ -3966,6 +4176,62 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::Subscribed { .. } => {}
+
+        // The sessions on the machine being connected. Opened only as the answer to the
+        // question still standing, and only over nothing else: an answer can take seconds,
+        // and a list that opened over a box the person has moved on to would take their
+        // keys.
+        ControlResponse::RemoteSessions {
+            id,
+            target,
+            mut sessions,
+        } => {
+            if state.probing.as_deref() != Some(id.as_str()) {
+                return;
+            }
+            state.probing = None;
+            let rows = menu_rows(&MenuKind::Sessions {
+                target: target.clone(),
+                sessions: sessions.clone(),
+            });
+            let title = menu_title(&MenuKind::Sessions {
+                target: target.clone(),
+                sessions: Vec::new(),
+            });
+            // A list that does not fit is not painted but would still own the keys.
+            let fits = crate::screen::menu_rect(state.cols, state.lines, &rows, &title).is_some();
+            let busy = state.menu.is_some()
+                || state.prompt.is_some()
+                || state.palette.is_some()
+                || state.reading.is_some()
+                || state.focus;
+            if !fits || busy {
+                state.message = Some(if fits {
+                    format!("{target} answered while a box was open; connect again to pick")
+                } else {
+                    format!("the window is too small for the sessions on {target}")
+                });
+                *dirty = true;
+                return;
+            }
+            // What is running first, then what holds the most, then by name.
+            sessions.sort_by(|a, b| {
+                b.running
+                    .cmp(&a.running)
+                    .then(b.tabs.cmp(&a.tabs))
+                    .then(a.name.cmp(&b.name))
+            });
+            state.message = None;
+            state.menu_kind = MenuKind::Sessions { target, sessions };
+            state.menu = Some(0);
+            *dirty = true;
+        }
+        ControlResponse::RemoteAdded { name, .. } => {
+            state.connecting = None;
+            state.message = Some(format!("connecting to {name}"));
+            state.joining = Some(name);
+            *dirty = true;
+        }
 
         ControlResponse::FocusEvents {
             terminal, events, ..
@@ -4167,6 +4433,10 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
+            menu_kind: MenuKind::Main,
+            connecting: None,
+            probing: None,
+            joining: None,
             selection: None,
             anchor: None,
             behind: Behind::default(),
@@ -4465,6 +4735,10 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
+            menu_kind: MenuKind::Main,
+            connecting: None,
+            probing: None,
+            joining: None,
             selection: None,
             anchor: None,
             behind: Behind::default(),
@@ -4531,6 +4805,10 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
+            menu_kind: MenuKind::Main,
+            connecting: None,
+            probing: None,
+            joining: None,
             selection: None,
             anchor: None,
             behind: Behind::default(),
@@ -4879,6 +5157,7 @@ mod tests {
                 "keybinds",
                 "settings",
                 "reload manifests",
+                "connect a machine",
                 "detach",
             ]
         );
@@ -4984,19 +5263,22 @@ mod tests {
     fn a_menu_click_lands_on_a_row_or_outside_it() {
         let cols = 80;
         let lines = 24;
-        let Some((left, top, w, _)) = crate::screen::menu_rect(cols, lines) else {
+        let main = MenuKind::Main;
+        let Some((left, top, w, _)) =
+            crate::screen::menu_rect(cols, lines, &menu_rows(&main), &menu_title(&main))
+        else {
             panic!("no menu rect on 80x24");
         };
         // The third row's middle cell.
         let row = (top + 2 + 2 + 1) as u16;
         let col = (left + w / 2 + 1) as u16;
         let press = format!("\x1b[<0;{col};{row}M").into_bytes();
-        assert_eq!(menu_click(&press, cols, lines), Some(Some(2)));
+        assert_eq!(menu_click(&press, cols, lines, &main), Some(Some(2)));
         // Far away from the centred box is outside.
-        assert_eq!(menu_click(b"\x1b[<0;1;1M", cols, lines), Some(None));
+        assert_eq!(menu_click(b"\x1b[<0;1;1M", cols, lines, &main), Some(None));
         // A release is not a choice.
         let release = format!("\x1b[<0;{col};{row}m").into_bytes();
-        assert_eq!(menu_click(&release, cols, lines), None);
+        assert_eq!(menu_click(&release, cols, lines, &main), None);
     }
     #[test]
     fn a_first_render_from_another_space_never_adopts() {
@@ -5419,5 +5701,152 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(state.creating, 0);
+    }
+
+    /// The `+` offers a space here or another machine, and each opens its own box.
+    #[test]
+    fn the_plus_offers_a_space_or_a_machine() {
+        let mut state = bare_state();
+        let mut request = 0;
+        state.menu_kind = MenuKind::Plus;
+        assert!(matches!(
+            apply_menu_choice(&mut state, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        assert!(
+            state
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.what == Naming::Space)
+        );
+        state.prompt = None;
+        state.menu_kind = MenuKind::Plus;
+        apply_menu_choice(&mut state, 1, &mut request);
+        assert!(
+            state
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.what == Naming::Remote)
+        );
+        // The choice spends the list: the next menu opened is the main one again.
+        assert_eq!(state.menu_kind, MenuKind::Main);
+    }
+
+    fn remote(name: &str, running: bool, tabs: usize) -> qoro_runtime::control::RemoteSession {
+        qoro_runtime::control::RemoteSession {
+            name: name.to_string(),
+            running,
+            tabs,
+        }
+    }
+
+    /// The sessions come back sorted into a list to pick from; a pick connects to it, and
+    /// the last row asks for a new session's name instead.
+    #[test]
+    fn a_session_is_picked_from_the_machine_or_named_new() {
+        let mut state = bare_state();
+        state.probing = Some("probe-1".into());
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::RemoteSessions {
+                id: "probe-1".into(),
+                target: "admin@10.0.0.5".into(),
+                sessions: vec![remote("old", false, 5), remote("work", true, 2)],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.menu, Some(0));
+        let rows = menu_rows(&state.menu_kind);
+        assert_eq!(rows[0].0, "work", "running sorts first: {rows:?}");
+        assert_eq!(rows[1].0, "old");
+        assert_eq!(rows[2].0, "new session");
+        let mut request = 0;
+        match apply_menu_choice(&mut state, 0, &mut request) {
+            MenuSend::Control(ControlRequest::ConnectRemote {
+                target, session, ..
+            }) => {
+                assert_eq!(target, "admin@10.0.0.5");
+                assert_eq!(session, "work");
+            }
+            _ => panic!("picking a session does not connect to it"),
+        }
+
+        state.menu_kind = MenuKind::Sessions {
+            target: "admin@10.0.0.5".into(),
+            sessions: vec![],
+        };
+        assert_eq!(menu_rows(&state.menu_kind)[0].0, "default");
+        match apply_menu_choice(&mut state, 0, &mut request) {
+            MenuSend::Control(ControlRequest::ConnectRemote { session, .. }) => {
+                assert_eq!(session, "default")
+            }
+            _ => panic!("a machine with no sessions does not offer the default"),
+        }
+        state.menu_kind = MenuKind::Sessions {
+            target: "admin@10.0.0.5".into(),
+            sessions: vec![],
+        };
+        apply_menu_choice(&mut state, 1, &mut request);
+        assert!(
+            state
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.what == Naming::RemoteSession)
+        );
+        assert_eq!(state.connecting.as_deref(), Some("admin@10.0.0.5"));
+    }
+
+    /// An answer to a question no longer standing, or one that lands on an open box, never
+    /// opens a list over what the person is doing.
+    #[test]
+    fn a_late_session_list_does_not_take_the_keys() {
+        let mut state = bare_state();
+        let mut dirty = false;
+        let answer = |id: &str| ControlResponse::RemoteSessions {
+            id: id.into(),
+            target: "h".into(),
+            sessions: vec![remote("default", true, 1)],
+        };
+        state.probing = Some("probe-2".into());
+        apply(&mut state, answer("probe-1"), &mut dirty);
+        assert_eq!(state.menu, None, "a stale answer opened the list");
+        state.prompt = Some(Prompt {
+            what: Naming::Space,
+            text: String::new(),
+        });
+        apply(&mut state, answer("probe-2"), &mut dirty);
+        assert_eq!(state.menu, None, "the list opened over a box");
+        assert!(state.message.is_some());
+    }
+
+    /// A machine connected from here moves the screen to its first tab when that arrives,
+    /// and not before.
+    #[test]
+    fn a_connected_machine_is_joined_when_its_first_tab_arrives() {
+        let mut state = bare_state();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::RemoteAdded {
+                id: "connect-1".into(),
+                name: "devbox".into(),
+            },
+            &mut dirty,
+        );
+        let there = (1i64 << 40) | 1;
+        let tab = crate::mux::REMOTE_TERMINAL | 1 << 24 | 1;
+        state.spaces = vec![space(1, "space 1"), space(there, "devbox:default")];
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "mux".into(),
+                agents: vec![agent(1, 1, "zsh", "idle"), agent(tab, there, "zsh", "idle")],
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.space, Some(there));
+        assert_eq!(state.pending_focus, Some(tab));
+        assert_eq!(state.joining, None);
     }
 }

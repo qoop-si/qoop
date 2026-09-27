@@ -4,8 +4,8 @@
 //! and workspace numbers. Rather than teach every part of it about hosts, this sits
 //! between the interface and the daemons and gives each remote its own range of numbers:
 //! a remote terminal is `2^31 | link << 24 | id`, a remote workspace `link << 40 | id`.
-//! Local numbers pass through unchanged, and with no remote configured none of this is in
-//! the path at all.
+//! Local numbers pass through unchanged, and renders from any daemon are relayed as they
+//! came, never decoded: with no remote added this costs a byte copy per screen.
 //!
 //! What a remote looks like from the interface: its spaces are listed after the local
 //! ones, named `<remote>:<space>`, and everything that addresses one of its terminals or
@@ -24,11 +24,11 @@ use qoro_proto::{Channel, Frame, Reassembler};
 use qoro_remote::Remote;
 use qoro_runtime::client::{self, Connection, Incoming};
 use qoro_runtime::control::{
-    AgentRow, ControlRequest, ControlResponse, EventMessage, WorkspaceRow,
+    AgentRow, ControlRequest, ControlResponse, EventMessage, RemoteSession, WorkspaceRow,
 };
-use qoro_runtime::daemon::{ClientWire, ImageWire, SnapshotWire};
+use qoro_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// The bit every remote terminal number carries. Local terminal numbers are below it.
 pub const REMOTE_TERMINAL: u32 = 1 << 31;
@@ -37,7 +37,7 @@ const WORKSPACE_SHIFT: u32 = 40;
 /// How many remotes fit in the numbering: seven bits of link, zero being local.
 pub const MAX_REMOTES: usize = 127;
 /// The longest wait between attempts to reach a remote that is down.
-const BACKOFF_CAP: Duration = Duration::from_secs(30);
+const BACKOFF_CAP: Duration = Duration::from_secs(10);
 
 pub fn is_remote_terminal(terminal: u32) -> bool {
     terminal & REMOTE_TERMINAL != 0
@@ -118,12 +118,24 @@ enum FromLink {
         conn: u64,
         reason: String,
     },
+    /// The sessions on a machine the interface asked about, or why they could not be read.
+    Probed {
+        id: String,
+        target: String,
+        result: Result<Vec<RemoteSession>, String>,
+    },
 }
 
 /// One daemon as the mux keeps it.
 struct Link {
     /// Empty for the local daemon.
     name: String,
+    /// Where it is and which session, for a remote; `None` for the local daemon.
+    remote: Option<Remote>,
+    /// Rung when something is asked of this link while it is down, so the next attempt
+    /// to reach it happens now rather than at the end of its backoff: a person clicking
+    /// on an offline machine is the best sign there is that its network is back.
+    wake: Arc<Notify>,
     /// The connection now up, if any, and its number, so a message from a connection that
     /// has since been replaced is recognised and dropped.
     conn: Option<(u64, mpsc::UnboundedSender<BytesMut>)>,
@@ -157,9 +169,11 @@ struct Link {
 }
 
 impl Link {
-    fn new(name: String) -> Self {
+    fn new(name: String, remote: Option<Remote>) -> Self {
         Self {
             name,
+            remote,
+            wake: Arc::new(Notify::new()),
             conn: None,
             control_seq: 0,
             seqs: BTreeMap::new(),
@@ -236,6 +250,8 @@ struct Mux<W> {
     pushed_spaces: Vec<i64>,
     /// The link of the terminal last typed into or sized, which is the focused one.
     last_link: usize,
+    /// For the tasks the mux starts itself: a new link's supervisor, a session list.
+    events: mpsc::Sender<FromLink>,
 }
 
 impl<W: AsyncWrite + Unpin> Mux<W> {
@@ -243,9 +259,14 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         self.links.get_mut(link).and_then(Option::as_mut)
     }
 
-    async fn write(&mut self, channel: Channel, stream: u32, body: Vec<u8>) -> io::Result<()> {
+    async fn write(
+        &mut self,
+        channel: Channel,
+        stream: u32,
+        body: impl Into<Bytes>,
+    ) -> io::Result<()> {
         let seq = self.down_seqs.entry((channel as u8, stream)).or_default();
-        let frames = qoro_proto::chunk(channel, stream, *seq, None, Bytes::from(body));
+        let frames = qoro_proto::chunk(channel, stream, *seq, None, body.into());
         *seq = seq.wrapping_add(frames.len() as u32);
         let mut buf = BytesMut::new();
         for frame in &frames {
@@ -328,6 +349,101 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             .collect()
     }
 
+    /// Start keeping `remote` connected, as a new link. `None` when the numbering is full.
+    fn add_remote(&mut self, remote: Remote) -> Option<usize> {
+        if self.links.len() > MAX_REMOTES {
+            return None;
+        }
+        let link = self.links.len();
+        let entry = Link::new(remote.name.clone(), Some(remote.clone()));
+        tokio::spawn(supervise(
+            link,
+            remote,
+            self.events.clone(),
+            entry.wake.clone(),
+        ));
+        self.links.push(Some(entry));
+        Some(link)
+    }
+
+    /// Something was asked of a link that is down: try it now rather than after the wait.
+    fn wake(&mut self, link: usize) {
+        if let Some(l) = self.link(link)
+            && l.conn.is_none()
+        {
+            l.wake.notify_one();
+        }
+    }
+
+    /// Add the machine at `target` from the interface, keep it in the list of remotes,
+    /// and say under what name it will appear.
+    async fn connect_remote(
+        &mut self,
+        id: String,
+        target: String,
+        session: String,
+    ) -> io::Result<()> {
+        let session = if session.trim().is_empty() {
+            "default".to_string()
+        } else {
+            session.trim().to_string()
+        };
+        if !qoro_remote::saved::valid_target(&target) {
+            return self
+                .failed(id, format!("{target:?} is not an ssh address"))
+                .await;
+        }
+        if !qoro_runtime::paths::valid_session_name(&session) {
+            return self
+                .failed(id, format!("{session:?} cannot be a session name"))
+                .await;
+        }
+        // Before anything is kept: a machine saved that this interface cannot show would
+        // appear only on the next start, as if added then.
+        if self.links.len() > MAX_REMOTES {
+            return self.failed(id, "no room for another machine".into()).await;
+        }
+        let file = qoro_remote::saved::path();
+        // Read again right before writing, so a remote added from a shell a moment ago is
+        // kept rather than written over, and counted when checking names. A file that does
+        // not parse is refused rather than replaced: it is what the person wrote.
+        let mut saved = match qoro_remote::saved::load_from(&file) {
+            Ok(saved) => saved,
+            Err(e) => return self.failed(id, format!("remotes not loaded: {e}")).await,
+        };
+        let known: Vec<Remote> = self
+            .links
+            .iter()
+            .flatten()
+            .filter_map(|l| l.remote.clone())
+            .chain(saved.iter().cloned())
+            .collect();
+        if let Some(same) = known
+            .iter()
+            .find(|r| r.target == target && r.session == session)
+        {
+            let name = same.name.clone();
+            return self
+                .failed(id, format!("{target} {session} is already here as {name}"))
+                .await;
+        }
+        let taken: Vec<&str> = known.iter().map(|r| r.name.as_str()).collect();
+        let remote = Remote {
+            name: qoro_remote::saved::name_for(&target, &taken),
+            target,
+            session,
+        };
+        saved.push(remote.clone());
+        if let Err(e) = qoro_remote::saved::save_to(&file, &saved) {
+            return self.failed(id, format!("remotes not saved: {e}")).await;
+        }
+        let name = remote.name.clone();
+        self.add_remote(remote);
+        self.push_lists("mux").await?;
+        self.respond(&ControlResponse::RemoteAdded { id, name })
+            .await
+    }
+
     /// Send a request that names one daemon, or answer for a daemon that is not there.
     async fn send_one(&mut self, link: usize, request: ControlRequest) -> io::Result<()> {
         let id = request.request_id().to_string();
@@ -341,6 +457,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         if sent {
             return Ok(());
         }
+        self.wake(link);
         let reason = match self.link(link) {
             Some(l) if !l.name.is_empty() => format!("{} is offline", l.name),
             _ => "no such daemon".to_string(),
@@ -366,6 +483,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     l.send_wire(id, &wire);
                     self.last_link = link;
                 }
+                self.wake(link);
                 Ok(())
             }
             FromTui::Control(request) => self.control(request).await,
@@ -529,6 +647,38 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
+            R::ListRemoteSessions { id, target } => {
+                if !qoro_remote::saved::valid_target(&target) {
+                    return self
+                        .failed(id, format!("{target:?} is not an ssh address"))
+                        .await;
+                }
+                // ssh can take seconds, and the mux has renders to pass meanwhile: asked in a
+                // task of its own, answered when it reports back.
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let result = crate::link::list_sessions(&target)
+                        .await
+                        .map(|listed| {
+                            listed
+                                .into_iter()
+                                .map(|s| RemoteSession {
+                                    name: s.name,
+                                    running: s.running,
+                                    tabs: s.tabs,
+                                })
+                                .collect()
+                        })
+                        .map_err(|e| e.to_string());
+                    let _ = events.send(FromLink::Probed { id, target, result }).await;
+                });
+                Ok(())
+            }
+            R::ConnectRemote {
+                id,
+                target,
+                session,
+            } => self.connect_remote(id, target, session).await,
             // Everything else the interface sends names no terminal: it is about the daemon
             // this machine runs, or the one remote when there is no local one.
             other => self.send_one(self.home, other).await,
@@ -586,6 +736,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 self.push_lists("mux").await
             }
+            FromLink::Probed { id, target, result } => match result {
+                Ok(sessions) => {
+                    self.respond(&ControlResponse::RemoteSessions {
+                        id,
+                        target,
+                        sessions,
+                    })
+                    .await
+                }
+                Err(reason) => self.failed(id, reason).await,
+            },
             FromLink::Said {
                 link,
                 conn,
@@ -604,28 +765,19 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 
     async fn said(&mut self, link: usize, incoming: Incoming) -> io::Result<()> {
         match incoming {
-            Incoming::Render { terminal, snapshot } => {
+            // A screen or a picture, passed on as it came: only the terminal it is for is
+            // renumbered, and the body is never parsed.
+            Incoming::Raw { terminal, body } => {
                 if !self.wanted(link, terminal) {
                     return Ok(());
                 }
                 let Some(out) = terminal_out(link, terminal) else {
                     return Ok(());
                 };
-                let body =
-                    serde_json::to_vec::<SnapshotWire>(&snapshot).map_err(io::Error::other)?;
                 self.write(Channel::Terminal, out, body).await
             }
-            Incoming::Image { terminal, image } => {
-                if !self.wanted(link, terminal) {
-                    return Ok(());
-                }
-                let Some(out) = terminal_out(link, terminal) else {
-                    return Ok(());
-                };
-                let body =
-                    serde_json::to_vec(&ImageWire::from(&image)).map_err(io::Error::other)?;
-                self.write(Channel::Terminal, out, body).await
-            }
+            // Links are read raw, so these never arrive here.
+            Incoming::Render { .. } | Incoming::Image { .. } => Ok(()),
             Incoming::Event(EventMessage::AgentChanged { terminal }) => {
                 let Some(terminal) = terminal_out(link, terminal) else {
                     return Ok(());
@@ -669,7 +821,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 
     async fn answer(&mut self, link: usize, response: ControlResponse) -> io::Result<()> {
         use ControlResponse as C;
-        let id = response_id(&response).to_string();
+        let id = response.request_id().to_string();
         let Some(l) = self.link(link) else {
             return Ok(());
         };
@@ -822,29 +974,6 @@ impl<W> Mux<W> {
     }
 }
 
-fn response_id(response: &ControlResponse) -> &str {
-    use ControlResponse as C;
-    match response {
-        C::TerminalCreated { id, .. }
-        | C::TerminalClosed { id, .. }
-        | C::Terminals { id, .. }
-        | C::Agents { id, .. }
-        | C::Workspaces { id, .. }
-        | C::WorkspaceCreated { id, .. }
-        | C::WorkspaceClosed { id, .. }
-        | C::Scrollback { id, .. }
-        | C::Stopping { id, .. }
-        | C::Renamed { id }
-        | C::Subscribed { id, .. }
-        | C::OwnershipRequested { id, .. }
-        | C::OwnershipGranted { id, .. }
-        | C::AgentStateReported { id, .. }
-        | C::ManifestsReloaded { id, .. }
-        | C::Failed { id, .. }
-        | C::FocusEvents { id, .. } => id,
-    }
-}
-
 /// Interface terminal numbers grouped by the daemon they belong to, in its numbering.
 fn split(terminals: &[u32]) -> BTreeMap<usize, Vec<u32>> {
     let mut by: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
@@ -939,7 +1068,7 @@ async fn pump<S>(
         writer.abort();
         return;
     }
-    let mut connection = Connection::new();
+    let mut connection = Connection::raw();
     let mut inbuf = leftover;
     let mut tick = tokio::time::interval(client::ACK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -977,11 +1106,12 @@ async fn pump<S>(
 }
 
 /// Keep one remote connected for as long as the mux runs.
-async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>) {
+async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>, wake: Arc<Notify>) {
     let mut backoff = Duration::from_secs(1);
     let mut conn = 0u64;
     loop {
         conn += 1;
+        let attempted = Instant::now();
         match crate::link::open(&remote, true).await {
             Ok(opened) => {
                 let crate::link::Link {
@@ -1019,8 +1149,18 @@ async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>) 
                 }
             }
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_CAP);
+        // Until the backoff runs out, or until somebody asks for this machine: then at once,
+        // and from the shortest wait again, since a person reaching for it now is a good
+        // sign the network is back.
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => backoff = (backoff * 2).min(BACKOFF_CAP),
+            _ = wake.notified() => {
+                backoff = Duration::from_secs(1);
+                // At most one attempt a second however fast the asking: every keystroke
+                // into an offline space rings this, and each ring is not an ssh to start.
+                tokio::time::sleep_until((attempted + backoff).into()).await;
+            }
+        }
     }
 }
 
@@ -1045,7 +1185,7 @@ pub async fn serve<D>(
     let mut links: Vec<Option<Link>> = vec![None];
     let has_local = local.is_some();
     if let Some((stream, leftover)) = local {
-        links[0] = Some(Link::new(String::new()));
+        links[0] = Some(Link::new(String::new(), None));
         let events = link_tx.clone();
         tokio::spawn(async move {
             pump(0, 1, stream, leftover, &events).await;
@@ -1058,12 +1198,7 @@ pub async fn serve<D>(
                 .await;
         });
     }
-    for (i, remote) in remotes.into_iter().take(MAX_REMOTES).enumerate() {
-        let link = i + 1;
-        links.push(Some(Link::new(remote.name.clone())));
-        tokio::spawn(supervise(link, remote, link_tx.clone()));
-    }
-    drop(link_tx);
+    // With no local daemon, the first remote is where requests naming nothing go.
     let home = if has_local { 0 } else { 1 };
     let mut mux = Mux {
         links,
@@ -1072,7 +1207,11 @@ pub async fn serve<D>(
         down_seqs: BTreeMap::new(),
         pushed_spaces: Vec::new(),
         last_link: home,
+        events: link_tx,
     };
+    for remote in remotes {
+        mux.add_remote(remote);
+    }
     route(&mut mux, &mut tui_rx, &mut link_rx, has_local).await;
     // However the mux ended, the interface is told: it is waiting on a read, and a stream
     // that is only abandoned rather than closed leaves it painting its last screen until

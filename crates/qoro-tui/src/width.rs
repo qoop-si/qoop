@@ -36,6 +36,12 @@ pub fn width(s: &str) -> usize {
 fn painted(row: &str) -> impl Iterator<Item = char> + '_ {
     let mut skip_spacer = false;
     row.chars().filter(move |c| {
+        // A control character is never text here. The interface paints names and
+        // messages that can come from another machine, and an escape in one of those
+        // would reach this terminal as a command rather than as a name.
+        if c.is_control() {
+            return false;
+        }
         if skip_spacer && *c == ' ' {
             skip_spacer = false;
             return false;
@@ -70,6 +76,15 @@ pub fn fit(row: &str, cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text from another machine can carry an escape. It is dropped, never drawn: an OSC 52
+    /// in a session name would otherwise write to this terminal's clipboard.
+    #[test]
+    fn a_control_character_is_never_painted() {
+        let out = fit("a\x1b]52;c;aGk=\x07b\r", 12);
+        assert!(!out.chars().any(char::is_control), "{out:?}");
+        assert!(out.starts_with("a]52;c;aGk=b"), "{out:?}");
+    }
 
     #[test]
     fn a_row_of_ascii_is_unchanged_and_padded() {

@@ -289,6 +289,10 @@ fn exactly(text: &str, cols: usize) -> String {
     let mut out = String::with_capacity(cols);
     let mut used = 0;
     for c in text.chars() {
+        // A tab's name can come from another machine: an escape in it is never drawn.
+        if c.is_control() {
+            continue;
+        }
         let wide = crate::width::columns(c);
         if used + wide > cols {
             break;

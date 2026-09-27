@@ -1664,6 +1664,11 @@ fn fit_to(text: &str, cols: usize) -> String {
     let mut out = String::with_capacity(cols);
     let mut used = 0;
     for c in text.chars() {
+        // Names can come from another machine or a program's own title: an escape in
+        // one is never drawn, or it would reach this terminal as a command.
+        if c.is_control() {
+            continue;
+        }
         let wide = crate::width::columns(c);
         if used + wide > cols {
             break;

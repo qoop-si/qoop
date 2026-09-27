@@ -72,8 +72,8 @@ pub struct Frame<'a> {
     /// The open naming box, drawn over everything when a person is being asked what to
     /// call the thing they just asked for.
     pub prompt: Option<&'a crate::run::Prompt>,
-    /// The open menu, and which of its rows is selected.
-    pub menu: Option<usize>,
+    /// The open menu: which of its rows is selected, and which list it is showing.
+    pub menu: Option<(usize, &'a crate::run::MenuKind)>,
     /// Whether the left column is folded away to a strip.
     pub collapsed: bool,
     /// A read only overlay opened from the menu.
@@ -600,8 +600,8 @@ pub fn paint(frame: &Frame) -> String {
     if let Some(prompt) = frame.prompt {
         paint_prompt(frame, prompt, &mut out);
     }
-    if let Some(selected) = frame.menu {
-        paint_menu(frame, selected, &mut out);
+    if let Some((selected, kind)) = frame.menu {
+        paint_menu(frame, selected, kind, &mut out);
     }
     if let Some(reading) = frame.reading {
         paint_reading(frame, reading, &mut out);
@@ -1048,25 +1048,28 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
 /// title row, one row per menu entry and one hint row. Shared with hit testing,
 /// so a click and a repaint agree on which row is which and a second copy of
 /// this arithmetic cannot drift.
-pub(crate) fn menu_rect(cols: u16, lines: u16) -> Option<(usize, usize, usize, usize)> {
+pub(crate) fn menu_rect(
+    cols: u16,
+    lines: u16,
+    rows: &[(String, String)],
+    title: &str,
+) -> Option<(usize, usize, usize, usize)> {
     let cols = cols as usize;
     let lines = lines as usize;
-    let (max_name, max_key) = crate::run::MENU
-        .iter()
-        .fold((0, 0), |(n, k), (name, key, _)| {
-            let keypart = if key.is_empty() {
-                0
-            } else {
-                3 + width::width(key)
-            };
-            (n.max(width::width(name)), k.max(keypart))
-        });
+    let (max_name, max_key) = rows.iter().fold((0, 0), |(n, k), (name, right)| {
+        let keypart = if right.is_empty() {
+            0
+        } else {
+            width::width(right)
+        };
+        (n.max(width::width(name)), k.max(keypart))
+    });
     let hint = "arrows/jk move  enter choose  esc close";
     let inner = (1 + max_name + 1 + max_key)
-        .max(width::width(" menu") + 1)
+        .max(width::width(title) + 1)
         .max(width::width(hint) + 1);
     let w = inner + 2;
-    let height = crate::run::MENU.len() + 4;
+    let height = rows.len() + 4;
     if cols < w + 2 || lines < height + 2 {
         return None;
     }
@@ -1076,15 +1079,22 @@ pub(crate) fn menu_rect(cols: u16, lines: u16) -> Option<(usize, usize, usize, u
 }
 
 /// Which menu row a one based screen position lands on, if it lands on one.
-pub(crate) fn menu_row_at(cols: u16, lines: u16, row: u16, col: u16) -> Option<usize> {
-    let (left, top, w, height) = menu_rect(cols, lines)?;
+pub(crate) fn menu_row_at(
+    cols: u16,
+    lines: u16,
+    rows: &[(String, String)],
+    title: &str,
+    row: u16,
+    col: u16,
+) -> Option<usize> {
+    let (left, top, w, height) = menu_rect(cols, lines, rows, title)?;
     let r = (row as usize).checked_sub(1)?;
     let c = (col as usize).checked_sub(1)?;
     if c < left || c >= left + w || r < top || r >= top + height {
         return None;
     }
     let item = r.checked_sub(top + 2)?;
-    (item < crate::run::MENU.len()).then_some(item)
+    (item < rows.len()).then_some(item)
 }
 
 /// The menu, centred over the pane like the palette.
@@ -1094,8 +1104,10 @@ pub(crate) fn menu_row_at(cols: u16, lines: u16, row: u16, col: u16) -> Option<u
 /// than a choice. A short list opened from a word at the foot of the column is
 /// still a modal choice, so it gets the modal treatment: centred, with a title
 /// and a hint row, painted last over everything except the read only overlay.
-fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
-    let Some((left, top, w, _)) = menu_rect(frame.cols, frame.lines) else {
+fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: &mut String) {
+    let rows = crate::run::menu_rows(kind);
+    let title = crate::run::menu_title(kind);
+    let Some((left, top, w, _)) = menu_rect(frame.cols, frame.lines, &rows, &title) else {
         return;
     };
     let inner = w.saturating_sub(2);
@@ -1116,11 +1128,11 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
     out.push_str(&border);
     out.push('\u{2502}');
     out.push_str(&theme::fg(theme::Role::Title));
-    out.push_str(&width::fit(" menu", inner));
+    out.push_str(&width::fit(&title, inner));
     out.push_str(&border);
     out.push('\u{2502}');
     out.push_str(theme::RESET);
-    for (i, (name, key, _)) in crate::run::MENU.iter().enumerate() {
+    for (i, (name, keypart)) in rows.iter().enumerate() {
         let row = top + 2 + i;
         out.push_str(&at(row + 1, left + 1));
         out.push_str(&border);
@@ -1130,21 +1142,16 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
         } else {
             theme::fg(theme::Role::Text)
         });
-        // The name on the left, its key on the right: the menu teaches the
-        // shortcut it replaces, so the next visit skips the menu entirely.
-        let keypart = if key.is_empty() {
-            String::new()
-        } else {
-            format!("^a {key}")
-        };
-        let gap = inner.saturating_sub(1 + width::width(name) + width::width(&keypart));
+        // The name on the left, its key or its state on the right: the main menu
+        // teaches the shortcut each row replaces, so the next visit skips it.
+        let gap = inner.saturating_sub(1 + width::width(name) + width::width(keypart));
         let cell = format!(" {name}{}{keypart}", " ".repeat(gap));
         out.push_str(&width::fit(&cell, inner));
         out.push_str(&border);
         out.push('\u{2502}');
         out.push_str(theme::RESET);
     }
-    let hint_row = top + 2 + crate::run::MENU.len();
+    let hint_row = top + 2 + rows.len();
     out.push_str(&at(hint_row + 1, left + 1));
     out.push_str(&border);
     out.push('\u{2502}');
@@ -1158,7 +1165,7 @@ fn paint_menu(frame: &Frame, selected: usize, out: &mut String) {
     out.push_str(theme::RESET);
     edge(
         out,
-        top + 3 + crate::run::MENU.len(),
+        top + 3 + rows.len(),
         '\u{2570}',
         '\u{2500}',
         '\u{256f}',
@@ -1455,6 +1462,13 @@ pub(crate) fn paint_row(
     // once at each edge of it rather than before every character.
     let mut reversed = false;
     for (cell, c) in line.chars().enumerate() {
+        // A grid cell never holds a control character when this machine's engine filled
+        // it, but a screen relayed from another machine is only as honest as that
+        // machine: an escape in one would reach this terminal as a command. Still counted
+        // as a cell, so the styles after it stay aligned.
+        if c.is_control() {
+            continue;
+        }
         if skip_spacer && c == ' ' {
             skip_spacer = false;
             continue;
@@ -1716,6 +1730,16 @@ mod tests {
         assert!(
             avatar_overlay_paint(38, sidebar::WIDTH, false, true, Some(&pet), false).is_empty()
         );
+    }
+
+    /// A screen relayed from another machine can hold an escape in a cell. The styled path
+    /// draws cells one by one, and it must drop it as the plain path does.
+    #[test]
+    fn a_relayed_screen_cannot_smuggle_an_escape() {
+        let out = paint_row("a\x1b]52;c;aGk=\x07b", &[], 20, Some(0..3));
+        assert!(!out.contains('\x07'), "{out:?}");
+        assert!(!out.contains("\x1b]"), "{out:?}");
+        assert!(out.contains('b'), "{out:?}");
     }
 
     /// An agent TUI survives the paint byte for byte: truecolour runs, box
@@ -2052,7 +2076,7 @@ mod tests {
             hint: None,
             palette: None,
             prompt: None,
-            menu: Some(0),
+            menu: Some((0, &crate::run::MenuKind::Main)),
             collapsed: false,
             reading: None,
             selection: None,
@@ -2092,7 +2116,8 @@ mod tests {
 
     #[test]
     fn the_menu_is_centred_not_hugging_the_column() {
-        let Some((left, top, w, height)) = menu_rect(80, 24) else {
+        let rows = crate::run::menu_rows(&crate::run::MenuKind::Main);
+        let Some((left, top, w, height)) = menu_rect(80, 24, &rows, " menu") else {
             panic!("no menu rect on 80x24");
         };
         assert_eq!(height, crate::run::MENU.len() + 4);
@@ -2104,13 +2129,22 @@ mod tests {
     #[test]
     fn a_menu_click_address_matches_the_painted_rows() {
         // Row 0 sits two rows under the box top: border plus title.
-        let Some((left, top, _, _)) = menu_rect(80, 24) else {
+        let rows = crate::run::menu_rows(&crate::run::MenuKind::Main);
+        let Some((left, top, _, _)) = menu_rect(80, 24, &rows, " menu") else {
             panic!("no menu rect on 80x24");
         };
         let row = (top + 2 + 4 + 1) as u16;
         let col = (left + 3 + 1) as u16;
-        assert_eq!(menu_row_at(80, 24, row, col), Some(4), "close tab row");
-        assert_eq!(menu_row_at(80, 24, 1, 1), None, "outside reads as a row");
+        assert_eq!(
+            menu_row_at(80, 24, &rows, " menu", row, col),
+            Some(4),
+            "close tab row"
+        );
+        assert_eq!(
+            menu_row_at(80, 24, &rows, " menu", 1, 1),
+            None,
+            "outside reads as a row"
+        );
     }
 
     #[test]

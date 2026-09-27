@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use qoro_remote::SshTransport;
-use qoro_remote::saved::{MARKER_LIMIT, RELAY_MARKER, Remote, remote_command};
+use qoro_remote::saved::{
+    ListedSession, MARKER_LIMIT, RELAY_MARKER, Remote, parse_sessions, remote_command,
+};
 use qoro_runtime::client;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -139,6 +141,85 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
             "the remote did not answer in time",
         ))
         .await),
+    }
+}
+
+/// The sessions on the machine at `target`, as its own `qoro ls` lists them.
+///
+/// Asked from inside the interface, where nobody can answer a prompt: it never asks, and
+/// it takes a host key it has not seen before, since the person just typed that address.
+/// What ssh says when it cannot get in is the error, word for word.
+pub async fn list_sessions(target: &str) -> io::Result<Vec<ListedSession>> {
+    // Its codec first: a machine this build cannot talk to is said so now, rather than
+    // added and then shown offline for good.
+    let hello: qoro_remote::RemoteHello = serde_json::from_str(&ask(target, "--hello").await?)
+        .map_err(|_| io::Error::other(format!("{target} answered something that is not qoro")))?;
+    qoro_remote::compatibility(&hello).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(parse_sessions(&ask(target, "ls").await?))
+}
+
+/// Run qoro's `verb` on the machine at `target` and return what it printed after the marker.
+async fn ask(target: &str, verb: &str) -> io::Result<String> {
+    let mut transport = SshTransport::new(target).batch().accept_new_host();
+    if let Some(path) = control_path() {
+        transport = transport.with_control_path(path);
+    }
+    let argv = transport.argv(&remote_command("default", verb));
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    // Read to a bound, not to the end: the other end is a machine the person only just
+    // typed the address of, and a shell that prints forever would otherwise be held here
+    // whole for as long as the deadline lets it.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let out = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("ssh has no stdout"))?;
+    let err = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("ssh has no stderr"))?;
+    let limit = MARKER_LIMIT as u64;
+    let finished = tokio::time::timeout(OPEN_DEADLINE, async {
+        let (mut out, mut err) = (out.take(limit), err.take(limit));
+        let (a, b) = tokio::join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr));
+        // Closed before waiting: a remote still printing past the bound gets a broken pipe
+        // now rather than a full one it would sit on until the deadline.
+        drop((out, err));
+        a?;
+        b?;
+        child.wait().await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the machine did not answer in time",
+        )
+    })??;
+    let stderr = String::from_utf8_lossy(&stderr);
+    // What ssh or the remote said, as one plain line: it is shown on the status line, and
+    // an escape in it would reach this terminal as a command.
+    let said = |otherwise: &str| {
+        let last = stderr.lines().rfind(|l| !l.trim().is_empty());
+        let plain: String = last
+            .unwrap_or(otherwise)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        io::Error::other(plain.trim().to_string())
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    match text.split_once(RELAY_MARKER) {
+        None => Err(said("ssh failed")),
+        Some(_) if !finished.success() => Err(said("qoro there did not answer")),
+        Some((_, answer)) => Ok(answer.trim().to_string()),
     }
 }
 

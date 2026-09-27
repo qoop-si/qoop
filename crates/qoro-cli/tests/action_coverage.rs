@@ -211,6 +211,25 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "list the sessions on another machine before connecting it",
+            method: || {
+                Method::Control(ControlRequest::ListRemoteSessions {
+                    id: "a".into(),
+                    target: "me@devbox".into(),
+                })
+            },
+        },
+        Action {
+            name: "connect another machine from the interface",
+            method: || {
+                Method::Control(ControlRequest::ConnectRemote {
+                    id: "a".into(),
+                    target: "me@devbox".into(),
+                    session: "default".into(),
+                })
+            },
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -347,6 +366,15 @@ fn every_control_method_is_reachable_from_some_action() {
             terminal: 0,
             last_n: 0,
         },
+        ControlRequest::ListRemoteSessions {
+            id: String::new(),
+            target: String::new(),
+        },
+        ControlRequest::ConnectRemote {
+            id: String::new(),
+            target: String::new(),
+            session: String::new(),
+        },
     ];
     for request in &all {
         match request {
@@ -365,6 +393,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ListFocusEvents { .. }
+            | ControlRequest::ListRemoteSessions { .. }
+            | ControlRequest::ConnectRemote { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

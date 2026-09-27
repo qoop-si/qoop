@@ -103,6 +103,16 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal,
             last_n: 10,
         },
+        // The interface's own requests: a daemon refuses them, and refusing writes nothing.
+        ControlRequest::ListRemoteSessions {
+            id: "x18".into(),
+            target: "me@devbox".into(),
+        },
+        ControlRequest::ConnectRemote {
+            id: "x19".into(),
+            target: "me@devbox".into(),
+            session: "default".into(),
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -122,6 +132,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ListFocusEvents { .. }
+            | ControlRequest::ListRemoteSessions { .. }
+            | ControlRequest::ConnectRemote { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

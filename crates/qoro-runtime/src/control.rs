@@ -221,6 +221,20 @@ pub enum ControlRequest {
         terminal: TerminalStream,
         last_n: usize,
     },
+    /// The sessions on another machine, reached over ssh. Answered by the interface's own
+    /// connection to its daemons, never by a daemon: a daemon has no business opening ssh
+    /// connections on a client's behalf.
+    ListRemoteSessions {
+        id: String,
+        target: String,
+    },
+    /// Add a machine to the interface, and keep it: its spaces are listed from now on.
+    /// Answered by the interface's connection, like `ListRemoteSessions`.
+    ConnectRemote {
+        id: String,
+        target: String,
+        session: String,
+    },
 }
 
 impl ControlRequest {
@@ -244,6 +258,8 @@ impl ControlRequest {
             | Self::ReportAgentSession { id, .. }
             | Self::ListFocusEvents { id, .. }
             | Self::ReloadAgentManifests { id }
+            | Self::ListRemoteSessions { id, .. }
+            | Self::ConnectRemote { id, .. }
             | Self::GrantOwnership { id, .. } => id,
         }
     }
@@ -343,6 +359,24 @@ pub enum ControlResponse {
         terminal: TerminalStream,
         events: Vec<FocusEvent>,
     },
+    RemoteSessions {
+        id: String,
+        target: String,
+        sessions: Vec<RemoteSession>,
+    },
+    /// The machine is added under `name`, and its spaces are on their way.
+    RemoteAdded {
+        id: String,
+        name: String,
+    },
+}
+
+/// One session on another machine, as `qoro ls` there describes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSession {
+    pub name: String,
+    pub running: bool,
+    pub tabs: usize,
 }
 
 /// One hook event, as the focus view draws it.
@@ -539,6 +573,8 @@ impl ControlResponse {
             | Self::AgentStateReported { id, .. }
             | Self::ManifestsReloaded { id, .. }
             | Self::FocusEvents { id, .. }
+            | Self::RemoteSessions { id, .. }
+            | Self::RemoteAdded { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }

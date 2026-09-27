@@ -227,22 +227,21 @@ fn run_client() -> std::io::Result<()> {
             agents.join(", ")
         )),
     };
-    // With remotes added, their spaces are listed beside this machine's. Without any, the
-    // interface talks to the daemon directly, exactly as it always has.
-    match qoro_remote::saved::load() {
-        Ok(remotes) if !remotes.is_empty() => {
-            rt.block_on(qoro_tui::mux::run(Some(&socket), remotes, notice))
-        }
-        Ok(_) => rt.block_on(qoro_tui::run_with_notice(&socket, notice)),
+    // Always through the mux, remotes or not: a machine connected from the `+` has to have
+    // somewhere to go without restarting the interface. With none added it relays this
+    // machine's renders as they come, undecoded.
+    let (remotes, notice) = match qoro_remote::saved::load() {
+        Ok(remotes) => (remotes, notice),
         Err(e) => {
             let broken = format!("remotes not loaded: {e}");
-            let notice = Some(match notice {
+            let notice = match notice {
                 Some(hooks) => format!("{broken}; {hooks}"),
                 None => broken,
-            });
-            rt.block_on(qoro_tui::run_with_notice(&socket, notice))
+            };
+            (Vec::new(), Some(notice))
         }
-    }
+    };
+    rt.block_on(qoro_tui::mux::run(Some(&socket), remotes, notice))
 }
 
 /// `qoro --remote <name|target>`: the interface for another machine's qoro alone.

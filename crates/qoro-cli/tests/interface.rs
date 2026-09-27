@@ -390,6 +390,9 @@ impl Interface {
         let stderr = slave.try_clone().expect("dup");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
         cmd.env("QORO_RUNTIME_DIR", dir)
+            // No remote from the machine running the tests: a real one would put ssh
+            // connections under every gate here.
+            .env("QORO_REMOTES", dir.join("remotes.json"))
             // Pinned for the same reason the scale gates pin it: an interactive shell
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")

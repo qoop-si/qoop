@@ -75,7 +75,11 @@ pub fn save_to(path: &Path, remotes: &[Remote]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(remotes).map_err(std::io::Error::other)?;
-    std::fs::write(path, text + "\n")
+    // Written beside it and renamed over it, so a reader never sees half a list and a
+    // write cut short leaves the old one whole.
+    let partial = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&partial, text + "\n")?;
+    std::fs::rename(&partial, path)
 }
 
 /// Whether a name can be a remote's name.
@@ -128,9 +132,114 @@ pub fn remote_command(session: &str, verb: &str) -> String {
     )
 }
 
+/// One session as `qoro ls` prints it: name, whether it is running, how many tabs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedSession {
+    pub name: String,
+    pub running: bool,
+    pub tabs: usize,
+}
+
+/// The sessions in `qoro ls` output, read from the text every released version prints
+/// (`* name  running  3 tabs`) rather than from a newer flag an older remote would not
+/// know. A line that does not read that way is skipped, not guessed at.
+pub fn parse_sessions(text: &str) -> Vec<ListedSession> {
+    text.lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.trim_start_matches('*').split_whitespace().collect();
+            let [name, state, tabs, unit] = words.as_slice() else {
+                return None;
+            };
+            let running = match *state {
+                "running" => true,
+                "stopped" => false,
+                _ => return None,
+            };
+            if !matches!(*unit, "tab" | "tabs") {
+                return None;
+            }
+            // A name is shown and typed back: one with a control character in it is
+            // not a session name any qoro would have made.
+            if name.chars().any(char::is_control) {
+                return None;
+            }
+            Some(ListedSession {
+                name: name.to_string(),
+                running,
+                tabs: tabs.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// A name for a machine added by its address: the host, without the user, with anything a
+/// name cannot hold turned into `-`, and a number after it when the name is taken.
+pub fn name_for(target: &str, taken: &[&str]) -> String {
+    let host = target.rsplit_once('@').map_or(target, |(_, host)| host);
+    let base: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(20)
+        .collect();
+    // Never a leading dash: the name is typed after `qoro remote rm`, where it would read
+    // as a flag.
+    let mut base = base.trim_start_matches('-').to_string();
+    if base.is_empty() {
+        base = "remote".to_string();
+    }
+    let mut name = base.clone();
+    let mut n = 2;
+    while taken.contains(&name.as_str()) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_are_read_from_the_text_every_version_prints() {
+        let text = "  idle-e2e             stopped  0 tabs\n\
+                    * work                 running  1 tab\n\
+                    \x1b]52;c;aGk=\x07 running 1 tab\n\
+                    no sessions yet. `qoro` starts the default one.\n\
+                    \n";
+        assert_eq!(
+            parse_sessions(text),
+            vec![
+                ListedSession {
+                    name: "idle-e2e".into(),
+                    running: false,
+                    tabs: 0
+                },
+                ListedSession {
+                    name: "work".into(),
+                    running: true,
+                    tabs: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_machine_is_named_after_its_host_and_never_twice_the_same() {
+        assert_eq!(name_for("admin@10.0.0.5", &[]), "10.0.0.5");
+        assert_eq!(name_for("devbox", &[]), "devbox");
+        assert_eq!(name_for("me@devbox", &["devbox"]), "devbox-2");
+        assert_eq!(name_for("me@devbox", &["devbox", "devbox-2"]), "devbox-3");
+        assert_eq!(name_for("me@[fe80::1]", &[]), "fe80--1-");
+        assert!(valid_name(&name_for("me@[fe80::1]", &[])));
+        assert_eq!(name_for("me@", &[]), "remote");
+    }
 
     #[test]
     fn a_missing_file_is_an_empty_list_and_a_broken_one_is_an_error() {

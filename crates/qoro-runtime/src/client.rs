@@ -480,6 +480,11 @@ pub enum Incoming {
         terminal: u32,
         image: StoredImage,
     },
+    /// A render or a picture, undecoded, from a [`Connection::raw`].
+    Raw {
+        terminal: u32,
+        body: Bytes,
+    },
     Control(crate::control::ControlResponse),
     /// Something changed that nobody asked about. A client that ignores these still works,
     /// it just finds out later.
@@ -496,11 +501,24 @@ pub struct Connection {
     renders: RenderStream,
     control: Reassembler,
     events: Reassembler,
+    /// Hand terminal-channel messages on as they arrived instead of decoding them. For a
+    /// relay of renders, which needs to know which terminal a message is for and nothing
+    /// else: parsing a whole screen to write the same screen out again is the one cost
+    /// such a relay would add to every frame.
+    raw: bool,
 }
 
 impl Connection {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A connection whose renders and pictures arrive as [`Incoming::Raw`].
+    pub fn raw() -> Self {
+        Self {
+            raw: true,
+            ..Self::default()
+        }
     }
 
     /// How many renders have arrived, which is what an acknowledgement reports.
@@ -527,6 +545,16 @@ impl Connection {
             let Some(message) = message else { continue };
             match channel {
                 Channel::Terminal => {
+                    if self.raw {
+                        // Counted like a decoded one: the acknowledgement reports messages
+                        // taken off the lane, whatever the reader then does with them.
+                        self.renders.received += 1;
+                        out.push(Incoming::Raw {
+                            terminal,
+                            body: message.body,
+                        });
+                        continue;
+                    }
                     if let Ok(snapshot) = serde_json::from_slice::<SnapshotWire>(&message.body) {
                         self.renders.received += 1;
                         out.push(Incoming::Render { terminal, snapshot });

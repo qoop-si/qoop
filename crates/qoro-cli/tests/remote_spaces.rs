@@ -29,6 +29,16 @@ fn private_dir() -> tempfile::TempDir {
     dir
 }
 
+fn stop_session(runtime: &Path, session: &str) {
+    let _ = Command::new(qoro())
+        .args(["--session", session, "stop"])
+        .env("QORO_RUNTIME_DIR", runtime)
+        .env_remove("QORO_SESSION")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn stop(runtime: &Path) {
     let _ = Command::new(qoro())
         .arg("stop")
@@ -148,6 +158,7 @@ fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
             format!("{}:/usr/bin:/bin", ssh.parent().expect("bin").display()),
         );
         std::env::set_var("XDG_CACHE_HOME", home.path().join("cache"));
+        std::env::set_var("QORO_REMOTES", home.path().join("remotes.json"));
         std::env::remove_var("QORO_SESSION");
     }
 
@@ -347,6 +358,85 @@ fn a_remote_space_is_listed_driven_and_comes_back_after_a_drop() {
                 s.iter().any(|w| w.id == space && w.name == "devbox:work")
             })
             .await;
+
+            // From the `+`: the sessions on a machine by its address, as its qoro lists them.
+            tui.ask(ControlRequest::ListRemoteSessions {
+                id: "probe-1".into(),
+                target: "admin@10.0.0.5".into(),
+            })
+            .await;
+            let sessions = tui
+                .until("the remote's sessions", |incoming| match incoming {
+                    Incoming::Control(ControlResponse::RemoteSessions { id, sessions, .. })
+                        if id == "probe-1" =>
+                    {
+                        Some(sessions.clone())
+                    }
+                    Incoming::Control(ControlResponse::Failed { id, reason })
+                        if id == "probe-1" =>
+                    {
+                        panic!("the sessions were not listed: {reason}")
+                    }
+                    _ => None,
+                })
+                .await;
+            assert!(
+                sessions.iter().any(|s| s.name == "default" && s.running),
+                "the running remote session is not listed: {sessions:?}"
+            );
+
+            // Connected from there, into a new session: it is kept, named after its host,
+            // and its spaces arrive without the interface restarting.
+            tui.ask(ControlRequest::ConnectRemote {
+                id: "connect-1".into(),
+                target: "admin@10.0.0.5".into(),
+                session: "work".into(),
+            })
+            .await;
+            let name = tui
+                .until("the machine to be added", |incoming| match incoming {
+                    Incoming::Control(ControlResponse::RemoteAdded { id, name })
+                        if id == "connect-1" =>
+                    {
+                        Some(name.clone())
+                    }
+                    Incoming::Control(ControlResponse::Failed { id, reason })
+                        if id == "connect-1" =>
+                    {
+                        panic!("the machine was not added: {reason}")
+                    }
+                    _ => None,
+                })
+                .await;
+            assert_eq!(name, "10.0.0.5");
+            let kept = qoro_remote::saved::load_from(&home.path().join("remotes.json"))
+                .expect("remotes saved");
+            assert!(
+                kept.iter()
+                    .any(|r| r.target == "admin@10.0.0.5" && r.session == "work"),
+                "the machine was not kept: {kept:?}"
+            );
+            tui.spaces_where("the new machine's space", |s| {
+                s.iter()
+                    .any(|w| is_remote_workspace(w.id) && w.name.starts_with("10.0.0.5:"))
+            })
+            .await;
+            // Asking twice names the one already there instead of adding it again.
+            tui.ask(ControlRequest::ConnectRemote {
+                id: "connect-2".into(),
+                target: "admin@10.0.0.5".into(),
+                session: "work".into(),
+            })
+            .await;
+            tui.until("a second add to be refused", |incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id, reason }) if id == "connect-2" => {
+                    assert!(reason.contains("10.0.0.5"), "{reason}");
+                    Some(())
+                }
+                _ => None,
+            })
+            .await;
+            stop_session(remote.path(), "work");
 
             // The local daemon going away ends the interface, as it does without a mux: the
             // stream closes rather than going quiet.

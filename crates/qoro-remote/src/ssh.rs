@@ -14,7 +14,11 @@ use crate::transport::{Output, RemoteTransport, TransportError};
 /// when the user has not set them: an explicit setting in the user's own config is a
 /// decision they made, and overriding it would be this program deciding it knows better
 /// about their network.
-pub const KEEPALIVE_SECONDS: u32 = 15;
+///
+/// Five seconds and three misses: a network that went away is noticed in fifteen, which is
+/// how soon a remote space reads as offline and starts being retried, and three small
+/// packets a quarter of a minute cost nothing a person would measure.
+pub const KEEPALIVE_SECONDS: u32 = 5;
 pub const KEEPALIVE_MISSES: u32 = 3;
 
 pub struct SshTransport {
@@ -27,6 +31,9 @@ pub struct SshTransport {
     /// Never prompt. A connection made in the background has nobody to answer a password
     /// or a host key question, and a prompt nobody sees is a connection that hangs.
     batch: bool,
+    /// Take a host key ssh has never seen, as typing `yes` at its question would. A key
+    /// that changed is still refused: that is the case the question exists for.
+    accept_new: bool,
 }
 
 impl SshTransport {
@@ -36,12 +43,19 @@ impl SshTransport {
             control_path: None,
             user_set: Vec::new(),
             batch: false,
+            accept_new: false,
         }
     }
 
     /// Fail rather than ask: for a connection nobody is watching.
     pub fn batch(mut self) -> Self {
         self.batch = true;
+        self
+    }
+
+    /// Trust a host on first contact, for a connection a person just asked for by address.
+    pub fn accept_new_host(mut self) -> Self {
+        self.accept_new = true;
         self
     }
 
@@ -85,6 +99,10 @@ impl SshTransport {
             argv.push("BatchMode=yes".into());
             argv.push("-o".into());
             argv.push("ConnectTimeout=10".into());
+        }
+        if self.accept_new {
+            argv.push("-o".into());
+            argv.push("StrictHostKeyChecking=accept-new".into());
         }
         // No pseudo terminal: this transport carries commands, and the terminal is carried
         // by the protocol inside it. Asking ssh for a tty here would put a second line
@@ -179,6 +197,24 @@ mod tests {
         assert!(quiet.iter().any(|a| a.starts_with("ConnectTimeout=")));
         let asked = SshTransport::new("host").argv("true");
         assert!(!asked.iter().any(|a| a == "BatchMode=yes"));
+    }
+
+    /// First contact takes an unknown key and nothing else: never `no`, which would also
+    /// take a changed one.
+    #[test]
+    fn only_an_asked_for_connection_trusts_a_new_host_key() {
+        let first = SshTransport::new("host")
+            .batch()
+            .accept_new_host()
+            .argv("true");
+        assert!(
+            first
+                .iter()
+                .any(|a| a == "StrictHostKeyChecking=accept-new")
+        );
+        assert!(!first.iter().any(|a| a == "StrictHostKeyChecking=no"));
+        let later = SshTransport::new("host").batch().argv("true");
+        assert!(!later.iter().any(|a| a.starts_with("StrictHostKeyChecking")));
     }
 
     #[test]

@@ -352,6 +352,8 @@ fn attach(dir: &std::path::Path) -> Child {
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_qoro"))
         .env("QORO_RUNTIME_DIR", dir)
+        // No remote from the machine running the tests: the gate measures this client.
+        .env("QORO_REMOTES", dir.join("remotes.json"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
