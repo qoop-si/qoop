@@ -315,10 +315,31 @@ fn apply_usage(
     state.usage = next;
 }
 
-/// Whether the column may move at all: yes, unless `QORO_MOTION=0` or `NO_COLOR` is set.
+/// Whether the column may move at all: yes, unless `QORO_MOTION=0` is set.
+/// Motion has its own flag on purpose. `NO_COLOR` stops colour, not movement;
+/// the shimmer that needs colour already degrades to a still marker through
+/// the colour level, so the two switches never fight.
 fn motion_on() -> bool {
     std::env::var("QORO_MOTION").map_or(true, |v| v.trim() != "0")
-        && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Whether the outer terminal reports the mouse usefully, decided from the
+/// environment. Terminal.app has no usable mouse reporting, and a terminal
+/// that cannot be asked anything (`dumb`, the `linux` console) answers no
+/// mouse mode either. Keyboard-only operation always works: the mouse is
+/// enhancement, never the input.
+fn mouse_on() -> bool {
+    mouse_on_for(
+        std::env::var("TERM").ok(),
+        std::env::var("TERM_PROGRAM").ok(),
+    )
+}
+
+fn mouse_on_for(term: Option<String>, program: Option<String>) -> bool {
+    if term.as_deref() == Some("linux") || term.as_deref() == Some("dumb") {
+        return false;
+    }
+    program.as_deref() != Some("Apple_Terminal")
 }
 
 /// One mouse report in the form a program that asked for the mouse expects.
@@ -3024,15 +3045,24 @@ where
     // either, which is what this used to be and which has no motion at all: without motion
     // a drag is a press and a release in two different places, and a person dragging
     // across a line of an answer selects nothing.
+    // The colour level, decided once before anything is painted: every painter below
+    // reads it, so the first frame already honours NO_COLOR and dumb terminals.
+    crate::colorlevel::apply();
     // `1006` asks for those reports in the extended form, because the original one cannot
     // express a column past 223 and this interface is regularly wider than that.
-    out.write_all(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h")?;
+    out.write_all(b"\x1b[?1049h")?;
+    // Mouse press, release and drag where the terminal reports them usefully.
+    // Everywhere else clicks stay inert and the keyboard runs everything.
+    if mouse_on() {
+        out.write_all(b"\x1b[?1002h\x1b[?1006h")?;
+    }
     // Focus reports (`CSI ? 1004 h`), so the interface knows when the person looked away,
     // and the questions about the terminal's own colours. See `input`.
     out.write_all(b"\x1b[?1004h")?;
     if may_ask_terminal() {
-        out.write_all(ASK_COLORS)?;
-        out.write_all(ASK_SCHEME)?;
+        let tmux = std::env::var_os("TMUX").is_some();
+        out.write_all(&crate::colorlevel::tmux_wrapped(ASK_COLORS, tmux))?;
+        out.write_all(&crate::colorlevel::tmux_wrapped(ASK_SCHEME, tmux))?;
     }
     out.flush()?;
     // The pet and the update notice, read once so the first frame has them; the
@@ -3051,8 +3081,8 @@ where
     // can be answered once per machine, and a late answer must not open the gate early.
     let mut index_id = String::new();
     let mut index_owed = false;
-    // The column moves only while something works and motion is on: `QORO_MOTION=0` or
-    // `NO_COLOR` keeps it still. The next frame's deadline, when one is armed.
+    // The column moves only while something works and motion is on: `QORO_MOTION=0`
+    // keeps it still. The next frame's deadline, when one is armed.
     let motion = motion_on();
     let mut motion_at: Option<tokio::time::Instant> = None;
     // Costs are sampled only when asked for, the first time straight away.
@@ -3375,7 +3405,11 @@ where
                         retheme(&state);
                     }
                     if ask_again && may_ask_terminal() {
-                        out.write_all(ASK_COLORS)?;
+                        // Both questions again, not colours alone: a scheme capable
+                        // terminal that switched while away converges on refocus.
+                        let tmux = std::env::var_os("TMUX").is_some();
+                        out.write_all(&crate::colorlevel::tmux_wrapped(ASK_COLORS, tmux))?;
+                        out.write_all(&crate::colorlevel::tmux_wrapped(ASK_SCHEME, tmux))?;
                         out.flush()?;
                     }
                     if let Some(tell) = host_colors_request(&mut state, &mut request) {
@@ -5018,9 +5052,22 @@ where
             let _ = out.write_all(&cleanup);
         }
     }
-    let _ = out.write_all(b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l");
+    let _ = out.write_all(&exit_trailer());
     let _ = out.flush();
     outcome
+}
+
+/// The bytes that leave the host terminal usable, built pure so tests pin them.
+///
+/// Modes off in the reverse order of enable, then the cursor forced visible and
+/// the attributes reset, then out of the alternate screen. The visible cursor
+/// and reset are the point: a program that hid the cursor must not leave the
+/// host cursor invisible, and no chrome colour may leak into the next prompt.
+fn exit_trailer() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    out.extend_from_slice(b"\x1b[?25h\x1b[0m\x1b[?1049l");
+    out
 }
 
 /// Put a read of `config.toml` in effect: the prefix every overlay and the screen's words
@@ -5069,9 +5116,10 @@ const ASK_COLORS: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
 const ASK_SCHEME: &[u8] = b"\x1b[?2031h\x1b[?996n";
 
 /// Whether the terminal may be asked at all. The Linux console answers none of these and
-/// has been seen to print the question instead.
+/// has been seen to print the question instead; a `dumb` terminal is a pipe, and asking
+/// a pipe prints garbage into whatever reads next.
 fn may_ask_terminal() -> bool {
-    std::env::var("TERM").map_or(true, |term| term != "linux")
+    std::env::var("TERM").map_or(true, |term| term != "linux" && term != "dumb")
 }
 
 /// Pick the palette from what is known, most certain first: the file, then the background
@@ -6828,6 +6876,35 @@ fn closes_reading(actions: &[Action]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Leaving restores the host: modes off, the cursor forced visible, the
+    /// attributes reset, and only then out of the alternate screen. A program
+    /// that hid the cursor must not keep it hidden.
+    #[test]
+    fn leaving_shows_the_cursor_resets_and_leaves_last() {
+        assert_eq!(
+            exit_trailer(),
+            b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l"
+                .to_vec(),
+            "the exit sequence changed shape"
+        );
+    }
+
+    /// The mouse is enabled where it reports usefully and nowhere else:
+    /// Terminal.app clicks are inert, and a pipe or console answers nothing.
+    /// The keyboard runs everything either way.
+    #[test]
+    fn the_mouse_stays_off_where_it_reports_nothing_useful() {
+        let on = |term: Option<&str>, program: Option<&str>| {
+            mouse_on_for(term.map(str::to_string), program.map(str::to_string))
+        };
+        assert!(on(Some("xterm-256color"), None));
+        assert!(on(Some("xterm-256color"), Some("iTerm.app")));
+        assert!(on(Some("wezterm"), Some("WezTerm")));
+        assert!(!on(Some("xterm-256color"), Some("Apple_Terminal")));
+        assert!(!on(Some("dumb"), None));
+        assert!(!on(Some("linux"), None));
+    }
 
     /// A finished row says the first line of the answer as a person reads it: the heading
     /// and emphasis marks are the page's, not the words.

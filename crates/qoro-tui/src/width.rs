@@ -34,6 +34,23 @@ pub fn width(s: &str) -> usize {
     s.chars().map(columns).sum()
 }
 
+/// Whether composed chrome text is free of the sequences terminals disagree on:
+/// no joiners, no variation selectors, no regional indicators, no tag characters,
+/// no keycap combiners. Chrome is built from a fixed glyph set (box lines, state
+/// dots, braille, half blocks), so anything failing this check is a bug in the
+/// chrome, not in the world. Pane content may carry such sequences, and there
+/// alignment is best effort on both desktop and phone.
+pub fn chrome_safe(s: &str) -> bool {
+    s.chars().all(|c| {
+        !(c == '\u{200d}'
+            || c == '\u{fe0e}'
+            || c == '\u{fe0f}'
+            || c == '\u{20e3}'
+            || ('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
+            || ('\u{e0020}'..='\u{e007f}').contains(&c))
+    })
+}
+
 /// One grid row as the characters to paint, with the spacer after each wide character
 /// dropped.
 ///
@@ -168,5 +185,33 @@ mod tests {
     #[test]
     fn an_emoji_is_two_columns_and_its_spacer_goes_too() {
         assert_eq!(fit("🌍 x", 3), "🌍x");
+    }
+
+    /// The chrome's whole glyph set settles everywhere: box lines, state dots,
+    /// braille steps and half blocks carry no joiner, selector, regional
+    /// indicator, tag or keycap. The literals below mirror the sidebar and
+    /// screen constants (`DOT`, `FAILED_DOT`, `BRAND_MARK`, the spinner ramp,
+    /// the pet half block, the box corners); a glyph added to the chrome
+    /// belongs in this string too.
+    #[test]
+    fn the_chrome_glyph_set_is_free_of_disputed_sequences() {
+        let chrome = "─│╭╮╰╯┤●◆⡋⠙⢹⢸⢼⢴⠦⠧⠇⠏▀";
+        assert!(chrome_safe(chrome), "{chrome:?}");
+        for c in chrome.chars() {
+            assert!(columns(c) <= 2, "{c:?} takes more than two columns");
+        }
+    }
+
+    /// The sequences terminals disagree on never pass as chrome: a ZWJ family,
+    /// a flag pair, a keycap and a selector forced emoji all fail, so none of
+    /// them can be painted where columns must line up.
+    #[test]
+    fn disputed_sequences_fail_the_chrome_check() {
+        assert!(!chrome_safe("👨\u{200d}👩\u{200d}👧"));
+        assert!(!chrome_safe("🇹🇷"));
+        assert!(!chrome_safe("1\u{20e3}"));
+        assert!(!chrome_safe("❤\u{fe0f}"));
+        assert!(!chrome_safe("plain\u{e007f}tag"));
+        assert!(chrome_safe("blocked ●, failed ◆, ok"));
     }
 }

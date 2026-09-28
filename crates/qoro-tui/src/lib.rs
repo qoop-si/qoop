@@ -6,6 +6,7 @@
 //! that drives them is small enough to read in one sitting.
 
 pub mod answer;
+pub mod colorlevel;
 pub mod config;
 pub mod copy;
 pub mod graphics;

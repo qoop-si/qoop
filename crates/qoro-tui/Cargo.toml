@@ -17,10 +17,10 @@ qoro-remote = { path = "../qoro-remote" }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Already in the lock file by way of the terminal engine, so this adds a name and not a
-# download. A multiplexer that counts characters where the terminal counts columns puts
-# every wide character one column out.
-unicode-width = "0.2"
+# Pinned exact, not floating: desktop column counts must never drift under a
+# `cargo update`. Bump only with a VT corpus re-run, because the engine has
+# its own width table and the two must agree on every wide character.
+unicode-width = "=0.2.2"
 # Already in the lock file by way of qoro-detect and qoro-setup. config.toml is read as
 # TOML, so dotted keys, inline tables and quoting behave the way the format says.
 toml = { workspace = true }

@@ -15,8 +15,9 @@
 //! the grid and survive repaints, so every way the screen can change (focus, resize,
 //! scrollback, hide) must delete the stale placement. One function sees them all: it
 //! compares what is on the outer screen (`shown`) with what should be (`desired`) and
-//! emits deletes for the difference. iTerm2 has no remote delete, so its placements
-//! are forgotten rather than removed, which the plan documents as a known limit.
+//! emits deletes for the difference. Neither iTerm2 nor sixel has a remote delete,
+//! so their placements are forgotten rather than removed, which the plan documents
+//! as a known protocol limit.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +28,10 @@ use qoro_runtime::daemon::{ImageProtocol, StoredImage};
 pub struct GraphicsCap {
     pub kitty: bool,
     pub iterm2: bool,
+    /// Sixel is never in the default allowlist: no outer sixel support is
+    /// verified on a device yet. `QORO_GRAPHICS=sixel` or `all` turns it on,
+    /// and then envelopes pass through verbatim like the other two.
+    pub sixel: bool,
 }
 
 impl GraphicsCap {
@@ -34,6 +39,7 @@ impl GraphicsCap {
         Self {
             kitty: false,
             iterm2: false,
+            sixel: false,
         }
     }
 
@@ -41,20 +47,24 @@ impl GraphicsCap {
         match protocol {
             ImageProtocol::Kitty => self.kitty,
             ImageProtocol::ITerm2 => self.iterm2,
+            ImageProtocol::Sixel => self.sixel,
         }
     }
 }
 
 /// What the outer terminal speaks, read once at startup.
 ///
-/// An explicit override first (`QORO_GRAPHICS=kitty|iterm2|all|off`), because
+/// An explicit override first (`QORO_GRAPHICS=kitty|iterm2|sixel|all|off`), because
 /// terminal identification lies: under ssh or tmux the variables name the outer
 /// multiplexer rather than the emulator behind it, and a wrong positive prints raw
 /// base64. Without an override, a conservative allowlist: Kitty where the
 /// variables say kitty or Ghostty (both document the protocol), iTerm2 inline
 /// where they say iTerm, and Kitty there too, because iTerm2 documents the Kitty
-/// protocol beside its own. WezTerm is off by default, its graphics support being
-/// unverified; one variable turns it on.
+/// protocol beside its own. WezTerm gets Kitty and iTerm2: its features page
+/// documents both, and the Kitty specification names it as an implementer.
+/// (Kitty graphics historically needed `enable_kitty_graphics` in the WezTerm
+/// config; a WezTerm that swallows the envelope still shows the picture's
+/// absence rather than garbage, and one variable turns the whole thing off.)
 pub fn detect() -> GraphicsCap {
     match std::env::var("QORO_GRAPHICS")
         .unwrap_or_default()
@@ -66,18 +76,28 @@ pub fn detect() -> GraphicsCap {
             return GraphicsCap {
                 kitty: true,
                 iterm2: false,
+                sixel: false,
             };
         }
         "iterm2" | "iterm" => {
             return GraphicsCap {
                 kitty: false,
                 iterm2: true,
+                sixel: false,
+            };
+        }
+        "sixel" => {
+            return GraphicsCap {
+                kitty: false,
+                iterm2: false,
+                sixel: true,
             };
         }
         "all" | "both" => {
             return GraphicsCap {
                 kitty: true,
                 iterm2: true,
+                sixel: true,
             };
         }
         _ => {}
@@ -87,12 +107,15 @@ pub fn detect() -> GraphicsCap {
         .unwrap_or_default()
         .to_lowercase();
     let iterm = program.contains("iterm");
+    let wezterm = program.contains("wezterm") || term.starts_with("wezterm");
     GraphicsCap {
         kitty: term.contains("kitty")
             || program.contains("kitty")
             || program.contains("ghostty")
-            || iterm,
-        iterm2: iterm,
+            || iterm
+            || wezterm,
+        iterm2: iterm || wezterm,
+        sixel: false,
     }
 }
 
@@ -116,7 +139,9 @@ pub fn placeholder(image: &StoredImage) -> String {
 ///
 /// Kitty states `s=` (width) and `v=` (height) in the comma list before the first
 /// `;`. iTerm2 states `width=` and `height=` among the colon list after `File=`.
-/// Anything unparseable reads as unstated rather than as zero.
+/// Sixel states pixel width and height as the third and fourth numbers after the
+/// `"` raster introducer (`"Pan;Pad;Ph;Pv`). Anything unparseable reads as
+/// unstated rather than as zero.
 fn dimensions(image: &StoredImage) -> Option<(u32, u32)> {
     match image.protocol {
         ImageProtocol::Kitty => {
@@ -155,6 +180,21 @@ fn dimensions(image: &StoredImage) -> Option<(u32, u32)> {
             }
             Some((dims[0]?, dims[1]?))
         }
+        ImageProtocol::Sixel => {
+            let text = std::str::from_utf8(&image.bytes).ok()?;
+            let raster = text.split('"').nth(1)?;
+            let mut fields = raster.split(';');
+            let (w, h) = (fields.nth(2)?, fields.next()?);
+            let digits = |v: &str| {
+                let head: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if head.is_empty() || head.len() > 5 {
+                    None
+                } else {
+                    head.parse::<u32>().ok()
+                }
+            };
+            Some((digits(w)?, digits(h)?))
+        }
     }
 }
 
@@ -183,6 +223,9 @@ fn is_placeable(image: &StoredImage) -> bool {
     let (open, close) = match image.protocol {
         ImageProtocol::Kitty => (3, 2),
         ImageProtocol::ITerm2 => (2, if image.bytes.ends_with(b"\x07") { 1 } else { 2 }),
+        // `ESC P` introducer, `ST` terminator. Sixel data lives in the same
+        // printable range the shared check below enforces.
+        ImageProtocol::Sixel => (2, 2),
     };
     let printable = image
         .bytes
@@ -203,14 +246,28 @@ fn is_placeable(image: &StoredImage) -> bool {
                 image.bytes.starts_with(b"\x1b]1337;File=")
                     && (image.bytes.ends_with(b"\x07") || image.bytes.ends_with(b"\x1b\\"))
             }
+            ImageProtocol::Sixel => {
+                image.bytes.starts_with(b"\x1bP")
+                    && image.bytes.ends_with(b"\x1b\\")
+                    && image
+                        .bytes
+                        .get(2..image.bytes.len() - 2)
+                        .is_some_and(|body| {
+                            // Parameters, then the `q` that opens sixel data.
+                            let mut parts = body.splitn(2, |&b| b == b'q');
+                            let params = parts.next().unwrap_or_default();
+                            params.iter().all(|b| (0x30..=0x3b).contains(b))
+                                && parts.next().is_some()
+                        })
+            }
         }
 }
 
 /// One thing the image block must do on the outer terminal.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ImageOp {
-    /// Remove a Kitty placement by id. iTerm2 has no remote delete, so it never
-    /// appears here: its placements are forgotten, not removed.
+    /// Remove a Kitty placement by id. Neither iTerm2 nor sixel has a remote
+    /// delete, so their placements are forgotten, never removed.
     Delete { id: u64 },
     /// Draw an envelope with its top-left cell at (`row`, `col`), one based.
     Place {
@@ -346,10 +403,20 @@ mod tests {
         }
     }
 
+    fn sixel(id: u64) -> StoredImage {
+        StoredImage {
+            terminal: 1,
+            id,
+            protocol: ImageProtocol::Sixel,
+            bytes: b"\x1bP1;1;800;600q\"1;1;800;600#0;2;0;0;0$-\x1b\\".to_vec(),
+        }
+    }
+
     fn cap() -> GraphicsCap {
         GraphicsCap {
             kitty: true,
             iterm2: true,
+            sixel: true,
         }
     }
 
@@ -486,6 +553,59 @@ mod tests {
     }
 
     #[test]
+    fn a_sixel_image_names_pixel_dimensions_serves_a_placeholder_and_places_on_cap() {
+        let img = sixel(7);
+        assert_eq!(
+            placeholder(&img),
+            format!("[image 800x600, {}B]", img.bytes.len())
+        );
+        // Off by default: no outer sixel support is verified on a device.
+        let (ops, next) = plan(
+            1,
+            Some(&img),
+            &Shown::new(),
+            GraphicsCap::off(),
+            false,
+            false,
+            Some((20, 5)),
+        );
+        assert!(ops.is_empty());
+        assert!(next.is_empty());
+        // On: the envelope passes through verbatim like the other two.
+        let (ops, next) = plan(
+            1,
+            Some(&img),
+            &Shown::new(),
+            cap(),
+            false,
+            false,
+            Some((20, 5)),
+        );
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            ImageOp::Place {
+                row: 20,
+                col: 5,
+                ..
+            }
+        ));
+        assert_eq!(next.get(&1), Some(&(7, ImageProtocol::Sixel)));
+    }
+
+    #[test]
+    fn a_sixel_placement_is_forgotten_never_deleted() {
+        // No remote delete exists for sixel either: the stale one cannot be
+        // removed, so it is dropped from tracking and the new one goes up.
+        let img = sixel(8);
+        let shown: Shown = [(1, (7, ImageProtocol::Sixel))].into_iter().collect();
+        let (ops, next) = plan(1, Some(&img), &shown, cap(), false, false, Some((20, 5)));
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], ImageOp::Place { .. }));
+        assert_eq!(next.get(&1), Some(&(8, ImageProtocol::Sixel)));
+    }
+
+    #[test]
     fn hostile_dimensions_read_as_unstated() {
         let img = kitty(1, "f=100,s=999999,v=abc", "eA==");
         assert!(placeholder(&img).starts_with("[image "));
@@ -577,6 +697,7 @@ mod tests {
                 GraphicsCap {
                     kitty: true,
                     iterm2: false,
+                    sixel: false,
                 },
             ),
             (
@@ -584,6 +705,15 @@ mod tests {
                 GraphicsCap {
                     kitty: false,
                     iterm2: true,
+                    sixel: false,
+                },
+            ),
+            (
+                "sixel",
+                GraphicsCap {
+                    kitty: false,
+                    iterm2: false,
+                    sixel: true,
                 },
             ),
             (
@@ -591,6 +721,7 @@ mod tests {
                 GraphicsCap {
                     kitty: true,
                     iterm2: true,
+                    sixel: true,
                 },
             ),
         ] {
@@ -611,6 +742,7 @@ mod tests {
                 GraphicsCap {
                     kitty: true,
                     iterm2: true,
+                    sixel: false,
                 },
             ),
             (
@@ -619,6 +751,7 @@ mod tests {
                 GraphicsCap {
                     kitty: true,
                     iterm2: false,
+                    sixel: false,
                 },
             ),
             (
@@ -627,6 +760,19 @@ mod tests {
                 GraphicsCap {
                     kitty: true,
                     iterm2: false,
+                    sixel: false,
+                },
+            ),
+            // WezTerm documents Kitty graphics and iTerm2 inline images on its
+            // features page, and the Kitty specification names it as an
+            // implementer. Sixel stays override only: marked experimental there.
+            (
+                "wezterm",
+                "WezTerm",
+                GraphicsCap {
+                    kitty: true,
+                    iterm2: true,
+                    sixel: false,
                 },
             ),
             ("xterm-256color", "", GraphicsCap::off()),

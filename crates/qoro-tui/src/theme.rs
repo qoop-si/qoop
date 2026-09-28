@@ -173,7 +173,23 @@ const fn dark_ink(role: Role) -> u8 {
 /// it: measured against a real agent, the search box came out in the agent's own dim grey
 /// and read as having dissolved into the output behind it.
 pub fn fg(role: Role) -> String {
-    format!("\x1b[0;38;5;{}m", ink(role))
+    fg_for(role, crate::colorlevel::level())
+}
+
+/// The escape for a role at an explicit colour level. Pure, so the monochrome
+/// path is tested without touching process globals.
+///
+/// In monochrome there is no colour to spend: bold carries focus (titles and
+/// the focused row), everything else is plain. State still reads because the
+/// sidebar pairs every state with a shape and a label, never colour alone.
+pub fn fg_for(role: Role, level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => match role {
+            Role::Title | Role::Focused => "\x1b[0;1m".to_string(),
+            _ => RESET.to_string(),
+        },
+        _ => format!("\x1b[0;38;5;{}m", ink(role)),
+    }
 }
 
 /// The escape for a row that has the keyboard: its own ink on a raised background.
@@ -187,29 +203,79 @@ pub fn fg(role: Role) -> String {
 /// [`selected_in`]). White text would make the selected row the brightest thing on the
 /// screen, which is exactly what the background was chosen not to do.
 pub fn selected() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(Role::Detail))
+    selected_for(crate::colorlevel::level())
+}
+
+/// The selected row escape at an explicit colour level. Pure, see [`fg_for`].
+/// In monochrome the row is bold with no raised background.
+pub fn selected_for(level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(Role::Detail)),
+    }
 }
 
 /// A selected row that also has a state to say, so the state keeps its colour on the
 /// raised background.
 pub fn selected_in(role: Role) -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(role))
+    selected_in_for(role, crate::colorlevel::level())
+}
+
+/// A selected row that also has a state to say, at an explicit colour level.
+/// Pure, see [`fg_for`]. In monochrome the state is carried by the row's
+/// shape and label, so the escape matches [`selected_for`].
+pub fn selected_in_for(role: Role, level: crate::colorlevel::Level) -> String {
+    let _ = role;
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(role)),
+    }
 }
 
 /// The bar at the bottom: raised, like the selected row, and never reverse.
 pub fn status() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Detail))
+    status_for(crate::colorlevel::level())
+}
+
+/// The status bar escape at an explicit colour level. Pure, see [`fg_for`].
+/// In monochrome the bar is plain; key names stay bold through
+/// [`status_key_for`].
+pub fn status_for(level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => RESET.to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Detail)),
+    }
 }
 
 /// A key name inside the status bar, which is the part a person is looking for.
 pub fn status_key() -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Focused))
+    status_key_for(crate::colorlevel::level())
+}
+
+/// A key name inside the status bar, at an explicit colour level. Pure, see
+/// [`fg_for`]. Bold in both modes: in monochrome it is the only thing that
+/// marks a key as findable.
+pub fn status_key_for(level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(Role::Focused)),
+    }
 }
 
 /// Something in the status bar that wants a person, which is the one thing there allowed
 /// to be loud.
 pub fn status_in(role: Role) -> String {
-    format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(role))
+    status_in_for(role, crate::colorlevel::level())
+}
+
+/// A loud status bar item at an explicit colour level. Pure, see [`fg_for`].
+/// In monochrome loudness is bold, matching [`status_key_for`].
+pub fn status_in_for(role: Role, level: crate::colorlevel::Level) -> String {
+    let _ = role;
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().1, ink(role)),
+    }
 }
 
 /// The tab with the keyboard: bold pink on the raised background.
@@ -219,7 +285,16 @@ pub fn status_in(role: Role) -> String {
 /// Pink (212, `FF8FD9`) stands clear of the warm alarm pair and every state;
 /// amber would read as alarm, so the tab left amber behind.
 pub fn tab_on() -> String {
-    format!("\x1b[0;1;48;5;{};38;5;{}m", raised().0, tab_on_fg())
+    tab_on_for(crate::colorlevel::level())
+}
+
+/// The focused tab escape at an explicit colour level. Pure, see [`fg_for`].
+/// Bold in monochrome: focus outranks belonging with or without colour.
+pub fn tab_on_for(level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ => format!("\x1b[0;1;48;5;{};38;5;{}m", raised().0, tab_on_fg()),
+    }
 }
 
 /// Every other tab: the focused space's own colour, so the bar reads as that
@@ -227,7 +302,16 @@ pub fn tab_on() -> String {
 /// of them and never turns to confetti. The focused tab keeps the pink pill:
 /// focus outranks belonging.
 pub fn tab_in(role: Role) -> String {
-    format!("\x1b[0;38;5;{}m", ink(role))
+    tab_in_for(role, crate::colorlevel::level())
+}
+
+/// Any other tab at an explicit colour level. Pure, see [`fg_for`].
+pub fn tab_in_for(role: Role, level: crate::colorlevel::Level) -> String {
+    let _ = role;
+    match level {
+        crate::colorlevel::Level::Mono => RESET.to_string(),
+        _ => format!("\x1b[0;38;5;{}m", ink(role)),
+    }
 }
 
 /// Back to the terminal's own colours.
@@ -270,6 +354,11 @@ pub fn is_light_background([r, g, b]: [u8; 3]) -> bool {
 /// The first guess, from `COLORFGBG` (`fg;bg`, sometimes `fg;default;bg`), which some
 /// terminals set and which costs no round trip: a background of 7 or 9 to 15 is a light
 /// one, 0 to 6 or 8 a dark one, anything else says nothing.
+///
+/// The return is three states, and the distinction matters. `None` is unknown, not
+/// dark: the caller keeps dark as the default (which is what a light Terminal.app
+/// window gets until the device probe in `colorlevel` lands, documented there),
+/// but an unknown must never be mistaken for a measured dark further down the line.
 pub fn colorfgbg_is_light(value: &str) -> Option<bool> {
     match value.rsplit(';').next()?.trim().parse::<u8>().ok()? {
         7 | 9..=15 => Some(true),
@@ -795,5 +884,43 @@ mod tests {
         assert_eq!(colorfgbg_is_light("7;8"), Some(false));
         assert_eq!(colorfgbg_is_light("default;default"), None);
         assert_eq!(colorfgbg_is_light(""), None);
+    }
+
+    /// Monochrome chrome carries no SGR colour anywhere: no foreground, no
+    /// background, only reset and bold. Focus stays findable through bold.
+    #[test]
+    fn monochrome_chrome_emits_no_colour_and_keeps_focus_bold() {
+        use crate::colorlevel::Level::Mono;
+        let escapes = vec![
+            fg_for(Role::Title, Mono),
+            fg_for(Role::Text, Mono),
+            fg_for(Role::Focused, Mono),
+            fg_for(Role::Blocked, Mono),
+            selected_for(Mono),
+            selected_in_for(Role::Failed, Mono),
+            status_for(Mono),
+            status_key_for(Mono),
+            status_in_for(Role::Blocked, Mono),
+            tab_on_for(Mono),
+            tab_in_for(Role::Space(0), Mono),
+        ];
+        for escape in &escapes {
+            assert!(
+                !escape.contains("38;") && !escape.contains("48;"),
+                "colour leaked into monochrome chrome: {escape:?}"
+            );
+        }
+        for escape in [
+            fg_for(Role::Title, Mono),
+            fg_for(Role::Focused, Mono),
+            selected_for(Mono),
+            status_key_for(Mono),
+            tab_on_for(Mono),
+        ] {
+            assert!(
+                escape.contains(";1m"),
+                "focus lost its bold in monochrome: {escape:?}"
+            );
+        }
     }
 }

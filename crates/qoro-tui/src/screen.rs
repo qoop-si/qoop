@@ -831,7 +831,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.collapsed,
             wide_enough,
             avatar.as_ref(),
-            std::env::var("NO_COLOR").is_err(),
+            crate::colorlevel::level() != crate::colorlevel::Level::Mono,
         ));
     }
 
@@ -1957,8 +1957,16 @@ pub fn paint_answer(frame: &Frame, answer: &crate::answer::Answer, out: &mut Str
     out.push_str("\x1b[?25l");
 }
 
-/// The escape sequence for one run's style.
+/// The escape sequence for one run's style, at the session's colour level.
 fn sgr(span: &SpanWire) -> String {
+    sgr_in(span, crate::colorlevel::level())
+}
+
+/// The escape sequence for one run's style at an explicit colour level. Pure,
+/// so the downgrade is tested without touching process globals. Attributes
+/// (bold, inverse and the rest) always survive: they are not colour, and under
+/// `NO_COLOR` they are what is left to tell runs apart.
+fn sgr_in(span: &SpanWire, level: crate::colorlevel::Level) -> String {
     let mut parts: Vec<String> = Vec::new();
     for (bit, code) in [
         (attrs::BOLD, "1"),
@@ -1973,10 +1981,14 @@ fn sgr(span: &SpanWire) -> String {
         }
     }
     if let Some(fg) = span.fg {
-        parts.push(colour(fg, true));
+        if let Some(colour) = colour_in(fg, true, level) {
+            parts.push(colour);
+        }
     }
     if let Some(bg) = span.bg {
-        parts.push(colour(bg, false));
+        if let Some(colour) = colour_in(bg, false, level) {
+            parts.push(colour);
+        }
     }
     format!("\x1b[{}m", parts.join(";"))
 }
@@ -1986,18 +1998,41 @@ fn sgr(span: &SpanWire) -> String {
 /// The first sixteen palette entries get their own short codes rather than `38;5;n`,
 /// because those are the ones a person has themed and some terminals treat the two spellings
 /// differently.
-fn colour(c: ColourWire, foreground: bool) -> String {
-    match c {
-        ColourWire::Indexed { i } if i < 8 => {
-            format!("{}", if foreground { 30 + i } else { 40 + i })
-        }
-        ColourWire::Indexed { i } if i < 16 => {
-            format!("{}", if foreground { 82 + i } else { 92 + i })
-        }
-        ColourWire::Indexed { i } => format!("{};5;{i}", if foreground { 38 } else { 48 }),
-        ColourWire::Rgb { r, g, b } => {
-            format!("{};2;{r};{g};{b}", if foreground { 38 } else { 48 })
-        }
+/// A colour at an explicit colour level, or nothing when the level leaves no
+/// colour to spend. Pure, see [`sgr_in`]. Indexed entries pass through
+/// untouched at every coloured level: 0 to 15 belong to the pane program's
+/// own theme. RGB values pass through on truecolour and map to the nearest
+/// palette entry in 16 to 255 on the palette level, never into the themed
+/// range (see `colorlevel::nearest_256`).
+fn colour_in(c: ColourWire, foreground: bool, level: crate::colorlevel::Level) -> Option<String> {
+    use crate::colorlevel::Level as ColourLevel;
+    match level {
+        ColourLevel::Mono => None,
+        ColourLevel::True => Some(match c {
+            ColourWire::Indexed { i } if i < 8 => {
+                format!("{}", if foreground { 30 + i } else { 40 + i })
+            }
+            ColourWire::Indexed { i } if i < 16 => {
+                format!("{}", if foreground { 82 + i } else { 92 + i })
+            }
+            ColourWire::Indexed { i } => format!("{};5;{i}", if foreground { 38 } else { 48 }),
+            ColourWire::Rgb { r, g, b } => {
+                format!("{};2;{r};{g};{b}", if foreground { 38 } else { 48 })
+            }
+        }),
+        ColourLevel::Palette => Some(match c {
+            ColourWire::Indexed { i } if i < 8 => {
+                format!("{}", if foreground { 30 + i } else { 40 + i })
+            }
+            ColourWire::Indexed { i } if i < 16 => {
+                format!("{}", if foreground { 82 + i } else { 92 + i })
+            }
+            ColourWire::Indexed { i } => format!("{};5;{i}", if foreground { 38 } else { 48 }),
+            ColourWire::Rgb { r, g, b } => {
+                let near = crate::colorlevel::nearest_256(r, g, b);
+                format!("{};5;{near}", if foreground { 38 } else { 48 })
+            }
+        }),
     }
 }
 
@@ -2174,6 +2209,66 @@ mod tests {
             plain.push(c);
         }
         assert_eq!(crate::width::width(&plain), 40, "{plain:?}");
+    }
+
+    /// Under `NO_COLOR` a pane run keeps its attributes and loses its colours:
+    /// bold survives, truecolour and indexed runs do not.
+    #[test]
+    fn a_monochrome_run_keeps_attributes_and_drops_colour() {
+        use crate::colorlevel::Level;
+        let span = SpanWire {
+            at: 0,
+            len: 3,
+            fg: Some(ColourWire::Rgb {
+                r: 92,
+                g: 156,
+                b: 245,
+            }),
+            bg: Some(ColourWire::Indexed { i: 200 }),
+            attrs: attrs::BOLD,
+            link: None,
+        };
+        let mono = sgr_in(&span, Level::Mono);
+        assert!(mono.contains('1'), "bold lost: {mono:?}");
+        assert!(
+            !mono.contains("38;") && !mono.contains("48;"),
+            "colour leaked into a monochrome run: {mono:?}"
+        );
+    }
+
+    /// On the palette level an RGB run arrives as the nearest 256 entry and
+    /// never as truecolour; indexed runs pass through untouched.
+    #[test]
+    fn a_palette_run_downgrades_rgb_and_passes_indexed_through() {
+        use crate::colorlevel::Level;
+        let rgb = SpanWire {
+            at: 0,
+            len: 1,
+            fg: Some(ColourWire::Rgb {
+                r: 92,
+                g: 156,
+                b: 245,
+            }),
+            bg: None,
+            attrs: 0,
+            link: None,
+        };
+        let downgraded = sgr_in(&rgb, Level::Palette);
+        assert!(downgraded.contains("38;5;75"), "{downgraded:?}");
+        assert!(!downgraded.contains("38;2"), "{downgraded:?}");
+        let indexed = SpanWire {
+            at: 0,
+            len: 1,
+            fg: Some(ColourWire::Indexed { i: 3 }),
+            bg: Some(ColourWire::Indexed { i: 200 }),
+            attrs: 0,
+            link: None,
+        };
+        let kept = sgr_in(&indexed, Level::Palette);
+        assert!(kept.contains("33"), "{kept:?}");
+        assert!(kept.contains("48;5;200"), "{kept:?}");
+        let full = sgr_in(&rgb, Level::True);
+        assert!(full.contains("38;2;92;156;245"), "{full:?}");
     }
 
     fn linked(at: usize, len: usize, link: u32) -> SpanWire {

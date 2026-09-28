@@ -5,7 +5,7 @@
 //! always larger than the 4 KiB `ControlStringFilter` bound, so it never even reaches
 //! the parser. Either way the user sees nothing where an agent pasted a picture.
 //!
-//! This sniffer is a tap, not a filter. It watches a copy of the child's bytes for two
+//! This sniffer is a tap, not a filter. It watches a copy of the child's bytes for three
 //! envelopes and hands completed ones to the caller as `CapturedImage`, while the bytes
 //! it consumed never reach the parser at all: an image is a side channel, not grid
 //! cells, so the parser must neither draw it nor count it as discarded.
@@ -35,6 +35,9 @@ pub const IMAGE_DEADLINE: Duration = Duration::from_secs(10);
 pub enum ImageProtocol {
     Kitty,
     ITerm2,
+    /// DEC sixel: `DCS params q data ST`. No chunking, no assembly; one envelope
+    /// is one picture, emitted whole.
+    Sixel,
 }
 
 /// One completed image envelope, verbatim, terminator included.
@@ -83,6 +86,11 @@ enum State {
     OscKind,
     /// Inside an iTerm2 envelope, after its whole address.
     OscBody,
+    /// `ESC P` seen, matching sixel parameters (`0-9`, `:`, `;`) up to the `q`.
+    DcsKind,
+    /// Inside a sixel envelope, after `DCS params q`. Ends at ST only: BEL is
+    /// payload here, not a terminator the way it is for iTerm2.
+    SixelBody,
     /// Over budget or past deadline: swallowing until the terminator.
     Discarding {
         kitty: bool,
@@ -181,6 +189,7 @@ impl ImageSniffer {
                 match b {
                     b'_' => self.state = State::ApcKind,
                     b']' => self.state = State::OscKind,
+                    b'P' => self.state = State::DcsKind,
                     0x1b => {
                         // The old ESC was ordinary text; the new one may open.
                         self.staged.clear();
@@ -208,7 +217,7 @@ impl ImageSniffer {
                     self.flush_to_clean(clean);
                 }
             }
-            State::ApcBody => self.body_step(b, true, clean),
+            State::ApcBody => self.body_step(b, ImageProtocol::Kitty, clean),
             State::OscKind => {
                 if b == 0x1b {
                     self.flush_to_clean(clean);
@@ -236,8 +245,31 @@ impl ImageSniffer {
                     self.flush_to_clean(clean);
                     return;
                 }
-                self.body_step(b, false, clean)
+                self.body_step(b, ImageProtocol::ITerm2, clean)
             }
+            State::DcsKind => {
+                if b == 0x1b {
+                    self.flush_to_clean(clean);
+                    self.begin_stage();
+                    self.state = State::SawEsc;
+                    return;
+                }
+                self.staged.push(b);
+                if b == b'q' {
+                    // Sixel introducer complete: `DCS params q`. Parameters are
+                    // digits and separators only; anything else was never sixel.
+                    let params = &self.staged[2..self.staged.len() - 1];
+                    if params.iter().all(|b| (0x30..=0x3b).contains(b)) {
+                        self.state = State::SixelBody;
+                        self.body_esc = false;
+                    } else {
+                        self.flush_to_clean(clean);
+                    }
+                } else if !(0x30..=0x3b).contains(&b) {
+                    self.flush_to_clean(clean);
+                }
+            }
+            State::SixelBody => self.body_step(b, ImageProtocol::Sixel, clean),
             State::Discarding { kitty } => {
                 self.discarded_bytes += 1;
                 if b == 0x07 && !kitty {
@@ -260,17 +292,13 @@ impl ImageSniffer {
         }
     }
 
-    /// One body byte of a Kitty (`kitty = true`) or iTerm2 envelope.
-    fn body_step(&mut self, b: u8, kitty: bool, clean: &mut Vec<u8>) {
+    /// One body byte of a Kitty, iTerm2 or sixel envelope.
+    fn body_step(&mut self, b: u8, protocol: ImageProtocol, clean: &mut Vec<u8>) {
         if self.body_esc {
             self.body_esc = false;
             self.staged.push(b);
             if b == b'\\' {
-                self.complete(if kitty {
-                    ImageProtocol::Kitty
-                } else {
-                    ImageProtocol::ITerm2
-                });
+                self.complete(protocol);
                 return;
             }
             // An ESC that does not open ST ends the envelope, as it ends the string for
@@ -290,8 +318,9 @@ impl ImageSniffer {
             self.staged.push(b);
             return;
         }
-        // BEL terminates OSC (iTerm2) but not APC (Kitty), where it would be payload.
-        if b == 0x07 && !kitty {
+        // BEL terminates an iTerm2 OSC body. In Kitty APC and sixel bodies it is
+        // payload: only ST ends those envelopes.
+        if b == 0x07 && protocol == ImageProtocol::ITerm2 {
             self.staged.push(b);
             self.complete(ImageProtocol::ITerm2);
             return;
@@ -339,6 +368,8 @@ impl ImageSniffer {
         let held = match protocol {
             ImageProtocol::Kitty => self.assemble_chunk(&bytes),
             ImageProtocol::ITerm2 => self.assemble_part(&bytes),
+            // Sixel has no chunking: one envelope is the whole picture.
+            ImageProtocol::Sixel => false,
         };
         if held {
             // A piece of a chain: held for the rest of it, not emitted.
@@ -541,7 +572,8 @@ impl ImageSniffer {
         if self.staged.len() > MAX_IMAGE_BYTES {
             self.discarded_envelopes += 1;
             self.discarded_bytes += self.staged.len() as u64;
-            let kitty = self.state == State::ApcBody;
+            // BEL ends a discard the way it ends the envelope: for iTerm2 only.
+            let kitty = matches!(self.state, State::ApcBody | State::SixelBody);
             self.staged.clear();
             self.staged_since = None;
             self.body_esc = false;
@@ -650,6 +682,40 @@ mod tests {
         assert_eq!(clean, b"after");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].bytes, b"\x1b_Gf=100,a=T;Zm9vYmFy\x1b\\");
+    }
+
+    /// Sixel is the third envelope: `DCS params q data ST` is captured verbatim
+    /// and hidden from the parser, with the text around it intact.
+    #[test]
+    fn a_sixel_envelope_is_captured_and_hidden_from_the_parser() {
+        let img = b"\x1bP1;1;10;10q#0;2;0;0;0#1;2;100;100;0-$\x1b\\";
+        let (clean, images) = run(&[b"before", img, b"after"]);
+        assert_eq!(clean, b"beforeafter");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].protocol, ImageProtocol::Sixel);
+        assert_eq!(images[0].bytes, img);
+        assert_eq!(images[0].id, 1);
+    }
+
+    /// BEL is sixel payload, not a terminator the way it is for iTerm2: only
+    /// ST ends the envelope.
+    #[test]
+    fn a_bel_inside_sixel_does_not_end_the_envelope() {
+        let (clean, images) = run(&[b"\x1bPq#0\x07$-#1\x1b\\tail"]);
+        assert_eq!(clean, b"tail");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].protocol, ImageProtocol::Sixel);
+    }
+
+    /// A DCS that is not sixel is ordinary output: other finals and parameter
+    /// characters outside the sixel introducer pass through byte for byte.
+    #[test]
+    fn a_non_sixel_dcs_passes_through() {
+        for seq in [&b"\x1bPXhello\x1b\\"[..], b"\x1bP1$r0 q\x1b\\", b"\x1bP*q\x1b\\"] {
+            let (clean, images) = run(&[seq]);
+            assert!(images.is_empty(), "{seq:?} was captured");
+            assert_eq!(clean, seq, "{seq:?} left the stream");
+        }
     }
 
     #[test]

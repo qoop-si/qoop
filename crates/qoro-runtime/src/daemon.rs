@@ -3548,6 +3548,7 @@ impl ImageWire {
         match protocol {
             qoro_terminal::ImageProtocol::Kitty => "kitty",
             qoro_terminal::ImageProtocol::ITerm2 => "iterm2",
+            qoro_terminal::ImageProtocol::Sixel => "sixel",
         }
     }
 
@@ -3555,6 +3556,7 @@ impl ImageWire {
         match name {
             "kitty" => Some(qoro_terminal::ImageProtocol::Kitty),
             "iterm2" => Some(qoro_terminal::ImageProtocol::ITerm2),
+            "sixel" => Some(qoro_terminal::ImageProtocol::Sixel),
             _ => None,
         }
     }
@@ -6480,7 +6482,7 @@ mod image_wire_tests {
         wire.v = 2;
         assert!(wire.decode().is_none());
         let mut wire = ImageWire::from(&stored());
-        wire.protocol = "sixel".to_string();
+        wire.protocol = "bogus".to_string();
         assert!(wire.decode().is_none());
         let mut wire = ImageWire::from(&stored());
         wire.data = "!!!not-base64!!!".to_string();
