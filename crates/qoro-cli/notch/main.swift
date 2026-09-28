@@ -1,7 +1,7 @@
 // The notch: qoro's agents at the top of the screen.
 //
 // Closed, it is the camera housing grown two ears: the person's pet on the left with
-// an amber badge counting the agents that need them, and on the right how many are
+// a badge counting the agents that need them, and on the right how many are
 // working and idle. Clicked, it drops an inbox of every agent, grouped by what it is
 // doing; clicking a row switches the qoro interface to that terminal and brings its
 // window forward. With no qoro running, or no agents in it, the notch is left alone.
@@ -47,6 +47,8 @@ struct Row: Decodable, Equatable, Identifiable {
         if state == "failed" { return "failed" }
         return agent_title ?? (kind == .waiting ? "needs you" : "")
     }
+    /// Blocked or Failed for a row that needs you, nothing for the rest.
+    var ink: Color? { state == "failed" ? failed : kind == .waiting ? blocked : nil }
 }
 
 struct Pet: Decodable {
@@ -138,6 +140,8 @@ final class Store: ObservableObject {
     }
 
     var waiting: Int { rows.filter { $0.kind == .waiting }.count }
+    /// The worst state that needs you, as the TUI ranks them: blocked, then failed.
+    var needInk: Color { rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? failed : blocked }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
 
@@ -582,7 +586,11 @@ func hostApp(of pid: pid_t) -> NSRunningApplication? {
 
 // MARK: views
 
-let amber = Color(red: 0.984, green: 0.749, blue: 0.141)
+// The TUI's roles on a dark ground (crates/qoro-tui/src/theme.rs), so an agent wears
+// the same ink here as in the sidebar and on the phone.
+let blocked = hex("#ff8700")!
+let failed = hex("#ff00ff")!
+let focus = hex("#ff87d7")!
 let spring = Animation.spring(response: 0.42, dampingFraction: 0.74)
 
 /// The concave-shouldered shape of the camera housing, grown to any size.
@@ -663,6 +671,7 @@ struct LivePet: View {
 
 struct Badge: View {
     let n: Int
+    let ink: Color
     var body: some View {
         Text("\(n)")
             .font(.system(size: 9, weight: .bold))
@@ -670,7 +679,7 @@ struct Badge: View {
             .contentTransition(.numericText())
             .padding(.horizontal, 3.5)
             .frame(minWidth: 14, minHeight: 14)
-            .background(Capsule().fill(amber))
+            .background(Capsule().fill(ink))
             .overlay(Capsule().stroke(.black, lineWidth: 2))
             .scaleEffect(n > 0 ? 1 : 0.01)
             .opacity(n > 0 ? 1 : 0)
@@ -709,7 +718,7 @@ struct RowView: View {
                 .rotationEffect(.degrees(open ? 90 : 0))
             Text(row.label)
                 .fontWeight(.medium)
-                .foregroundStyle(row.kind == .waiting ? amber : row.kind == .idle ? .white.opacity(0.6) : .white)
+                .foregroundStyle(row.ink ?? (row.kind == .idle ? .white.opacity(0.6) : .white))
             Text([row.place, row.detail].filter { !$0.isEmpty }.joined(separator: " \u{00b7} "))
                 .foregroundStyle(.white.opacity(0.42))
                 .lineLimit(1)
@@ -723,7 +732,7 @@ struct RowView: View {
         .padding(.horizontal, 8)
         .frame(height: 30)
         .background(RoundedRectangle(cornerRadius: 8).fill(
-            row.kind == .waiting ? amber.opacity(over || open ? 0.18 : 0.1) : .white.opacity(over || open ? 0.08 : 0)))
+            row.ink?.opacity(over || open ? 0.18 : 0.1) ?? .white.opacity(over || open ? 0.08 : 0)))
         .contentShape(Rectangle())
         .onHover { over = $0 }
     }
@@ -879,7 +888,7 @@ struct TermPeek: View {
             .defaultScrollAnchor(.bottomLeading)
             .frame(height: TermPeek.height)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color(white: 0.05)))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(typing ? amber.opacity(0.8) : .white.opacity(0.08), lineWidth: typing ? 1.5 : 1))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(typing ? focus.opacity(0.8) : .white.opacity(0.08), lineWidth: typing ? 1.5 : 1))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .focusable()
             .focusEffectDisabled()
@@ -895,10 +904,10 @@ struct TermPeek: View {
             }
             HStack(spacing: 8) {
                 if let note = store.note {
-                    Text(note).foregroundStyle(amber).lineLimit(1).truncationMode(.tail)
+                    Text(note).foregroundStyle(blocked).lineLimit(1).truncationMode(.tail)
                 } else {
                     Text(typing ? "typing into terminal \(row.terminal); click outside to stop" : "click to type into terminal \(row.terminal)")
-                        .foregroundStyle(typing ? amber.opacity(0.9) : .white.opacity(0.4))
+                        .foregroundStyle(typing ? focus.opacity(0.9) : .white.opacity(0.4))
                 }
                 Spacer(minLength: 8)
                 Button { open(row.terminal) } label: {
@@ -943,7 +952,7 @@ struct Island: View {
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
                 Spacer()
                 HStack(spacing: 12) {
-                    Text("\(s.waiting) waiting").foregroundStyle(amber)
+                    Text("\(s.waiting) waiting").foregroundStyle(s.needInk)
                     Text("\(s.working) working").foregroundStyle(.white)
                     Text("\(s.idle) idle").foregroundStyle(.white.opacity(0.45))
                 }
@@ -954,7 +963,7 @@ struct Island: View {
             if let note = s.note, s.expanded == nil {
                 Text(note)
                     .font(.system(size: 12))
-                    .foregroundStyle(amber)
+                    .foregroundStyle(blocked)
                     .lineLimit(2)
                     .padding(.top, 6)
                     .transition(.opacity)
@@ -1053,7 +1062,7 @@ struct NotchView: View {
                 HStack(spacing: 0) {
                     ZStack(alignment: .topTrailing) {
                         LivePet(s: s, px: 2.5)
-                        Badge(n: s.waiting).offset(x: 14, y: -5)
+                        Badge(n: s.waiting, ink: s.needInk).offset(x: 14, y: -5)
                     }
                     .padding(.leading, 20)
                     Spacer(minLength: g.notch.width)
