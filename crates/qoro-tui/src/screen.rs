@@ -1980,16 +1980,8 @@ fn sgr_in(span: &SpanWire, level: crate::colorlevel::Level) -> String {
             parts.push(code.to_string());
         }
     }
-    if let Some(fg) = span.fg {
-        if let Some(colour) = colour_in(fg, true, level) {
-            parts.push(colour);
-        }
-    }
-    if let Some(bg) = span.bg {
-        if let Some(colour) = colour_in(bg, false, level) {
-            parts.push(colour);
-        }
-    }
+    parts.extend(span.fg.and_then(|fg| colour_in(fg, true, level)));
+    parts.extend(span.bg.and_then(|bg| colour_in(bg, false, level)));
     format!("\x1b[{}m", parts.join(";"))
 }
 

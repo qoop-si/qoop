@@ -724,10 +724,7 @@ impl Interface {
         (first..=last)
             .filter(|&row| {
                 self.panel_line(row).is_some_and(|line| {
-                    let mut chars = line
-                        .strip_prefix(" \u{256d}\u{2500} ")
-                        .unwrap_or("")
-                        .chars();
+                    let mut chars = line.strip_prefix(" \u{256d}").unwrap_or("").chars();
                     matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
                         && chars.next() == Some(' ')
                 })
@@ -962,7 +959,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
     let list = agents_panel(&ui.screen);
     assert!(
         list.first()
-            .is_some_and(|row| row.starts_with(" \u{256d}\u{2500} \u{25be} default")),
+            .is_some_and(|row| row.starts_with(" \u{256d}\u{25be} default")),
         "the only space is not an open rule first: {list:?}"
     );
     assert!(

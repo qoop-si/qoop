@@ -711,7 +711,11 @@ mod tests {
     /// characters outside the sixel introducer pass through byte for byte.
     #[test]
     fn a_non_sixel_dcs_passes_through() {
-        for seq in [&b"\x1bPXhello\x1b\\"[..], b"\x1bP1$r0 q\x1b\\", b"\x1bP*q\x1b\\"] {
+        for seq in [
+            &b"\x1bPXhello\x1b\\"[..],
+            b"\x1bP1$r0 q\x1b\\",
+            b"\x1bP*q\x1b\\",
+        ] {
             let (clean, images) = run(&[seq]);
             assert!(images.is_empty(), "{seq:?} was captured");
             assert_eq!(clean, seq, "{seq:?} left the stream");

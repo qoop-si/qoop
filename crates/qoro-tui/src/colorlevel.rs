@@ -103,7 +103,7 @@ pub fn current_env() -> Env {
         colorterm: var("COLORTERM"),
         term_program: var("TERM_PROGRAM"),
         wt_session: std::env::var_os("WT_SESSION").is_some(),
-        windows: std::env::var("OS").map_or(false, |os| os == "Windows_NT"),
+        windows: std::env::var("OS").is_ok_and(|os| os == "Windows_NT"),
         no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
         tmux: std::env::var_os("TMUX").is_some(),
     }
