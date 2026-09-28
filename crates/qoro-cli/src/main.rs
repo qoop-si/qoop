@@ -125,7 +125,7 @@ fn run() -> std::io::Result<()> {
         Some("context") => run_context(&args),
         Some("agents") => run_agents(&args),
         Some("focus") => run_focus(&args),
-        Some("notch") => notch::run(&args, session_given.then_some(session.as_str())),
+        Some("notch") => notch::run(&args),
         Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
         Some("new") => supervise::run_new(&args),
         Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),
@@ -2143,13 +2143,14 @@ fn render_context_text(
 fn run_agents(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
-    let help = "usage: qoro agents [--json]\n       qoro agents --watch [--json]\n       qoro agents explain <target> [--json]";
+    let help = "usage: qoro agents [--json]\n       qoro agents --watch [--all] [--json]\n       qoro agents explain <target> [--json]";
     enum Mode<'a> {
         List { json: bool },
         Explain { target: &'a str, json: bool },
     }
     let mut mode = Mode::List { json: false };
     let mut watch = false;
+    let mut all = false;
     let mut rest = args.iter().skip(2);
     if rest.clone().next().is_some_and(|a| a == "explain") {
         rest.next();
@@ -2171,22 +2172,24 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
                 mode = Mode::List { json: true };
             } else if arg == "--watch" {
                 watch = true;
+            } else if arg == "--all" {
+                all = true;
             } else {
                 return Err(usage(format!("unknown flag {arg}; {help}")));
             }
         }
     }
+    if all && !watch {
+        return Err(usage(format!("--all goes with --watch; {help}")));
+    }
     if watch {
         let json = matches!(mode, Mode::List { json: true });
-        return supervise::run_watch(|agents| {
-            if json {
-                serde_json::to_string(agents).map_err(std::io::Error::other)
-            } else {
-                // A blank line between listings, so a person reading along sees where
-                // one ends.
-                Ok(agents.iter().map(agent_line).collect::<Vec<_>>().join("\n") + "\n")
-            }
-        });
+        let line = move |sessions: &supervise::Sessions| watch_listing(sessions, json, all);
+        return if all {
+            supervise::run_watch_all(line)
+        } else {
+            supervise::run_watch(line)
+        };
     }
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -2263,6 +2266,35 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
 ///
 /// `key=value` rather than columns, because a chosen name can hold a space
 /// and columns would then stop lining up exactly when they are needed.
+/// One listing of a watch. With `all`, every row names its session: as a `session` field
+/// in JSON, as a first word in text.
+fn watch_listing(sessions: &supervise::Sessions, json: bool, all: bool) -> std::io::Result<String> {
+    let rows = sessions
+        .iter()
+        .flat_map(|(name, rows)| rows.iter().map(move |row| (name, row)));
+    if json {
+        let rows = rows
+            .map(|(name, row)| {
+                let mut value = serde_json::to_value(row)?;
+                if all && let Some(fields) = value.as_object_mut() {
+                    fields.insert("session".to_string(), name.as_str().into());
+                }
+                Ok(value)
+            })
+            .collect::<serde_json::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)?;
+        return serde_json::to_string(&rows).map_err(std::io::Error::other);
+    }
+    // A blank line between listings, so a person reading along sees where one ends.
+    let lines: Vec<String> = rows
+        .map(|(name, row)| match all {
+            true => format!("session={name} {}", agent_line(row)),
+            false => agent_line(row),
+        })
+        .collect();
+    Ok(lines.join("\n") + "\n")
+}
+
 fn agent_line(row: &qoro_runtime::control::AgentRow) -> String {
     let program = row.program.as_deref().unwrap_or("-");
     let name = row.name.as_deref().unwrap_or("-");
@@ -2360,6 +2392,10 @@ fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
     while at < args.len() {
         // No short `-s`: the flag is taken from anywhere in argv, text words of `send`
         // and `prompt` included, and `du -s` or `ls -s` there is text, not a session.
+        // Past a `--` every word is text, so `send 3 -- --session x` types it.
+        if args[at] == "--" {
+            break;
+        }
         let taken = if args[at] == "--session" {
             // The value that follows, if there is one. A trailing `--session` with nothing
             // after it is a mistake worth naming rather than a request for the default:
@@ -2638,6 +2674,12 @@ mod tests {
             .unwrap(),
             "play"
         );
+        // Past `--` it is text to send, not a flag.
+        let mut sent: Vec<String> = ["qoro", "send", "3", "--", "--session", "play"]
+            .map(String::from)
+            .into();
+        assert_eq!(take_session(&mut sent).unwrap(), "work");
+        assert_eq!(sent.len(), 6, "the text is left as it was: {sent:?}");
         // A stale file is the default, never an error.
         // SAFETY: same variables as the SAFETY above, same single test.
         unsafe { std::env::remove_var(paths::SESSION_ENV) };

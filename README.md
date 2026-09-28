@@ -40,8 +40,9 @@ percent of a core while they turn, nothing once the agent stops, and `QORO_MOTIO
 `NO_COLOR` keeps them still.
 
 On a Mac the same news sits in the notch, with no window open: your pet, an amber badge
-counting the agents that need you, and how many are working and idle. A click drops the
-list; a click on a row opens that agent's terminal right under it, live and in its own
+counting the agents that need you, and how many are working and idle, across every
+running session (a session started later shows up as it starts). A click drops the list,
+each row naming its session when there is more than one; a click on a row opens that agent's terminal right under it, live and in its own
 colours, the same grid the interface draws and never resized for it. Scrolling up goes
 back past the screen: into the terminal's history, or for an agent on the full screen,
 into its conversation. A click on it types into it: every key goes to that terminal as

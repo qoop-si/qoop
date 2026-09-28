@@ -9,7 +9,8 @@
 // Everything it knows comes from the `qoro` binary that started it, named as the
 // first argument by `qoro notch run`: `agents --watch` for the rows, `avatar show
 // --json` for the pet, `focus` for a click. It links no qoro code and reads no qoro
-// file, so the command line stays the one contract.
+// file, so the command line stays the one contract. It shows every running session:
+// each command about a row names that row's session.
 
 import AppKit
 import Combine
@@ -19,7 +20,17 @@ let qoro = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "qoro"
 
 // MARK: model
 
+/// A terminal of one session: numbers repeat across sessions, the pair does not.
+struct Tab: Hashable {
+    let session: String
+    let terminal: Int
+
+    /// A qoro command about this terminal, run in its session.
+    func qoro(_ rest: String...) -> [String] { ["--session", session] + rest }
+}
+
 struct Row: Decodable, Equatable, Identifiable {
+    let session: String
     let terminal: Int
     let name: String?
     /// Null while a terminal is still starting, which must not drop the whole line.
@@ -29,7 +40,8 @@ struct Row: Decodable, Equatable, Identifiable {
     let agent_title: String?
     let cwd: String?
 
-    var id: Int { terminal }
+    var tab: Tab { Tab(session: session, terminal: terminal) }
+    var id: Tab { tab }
 
     enum Kind { case waiting, working, idle }
 
@@ -103,13 +115,13 @@ final class Store: ObservableObject {
     /// without waiting for the mouse to move.
     var changed: (() -> Void)?
     /// The row whose terminal is open under it, and the live view of that terminal.
-    @Published var expanded: Int? {
+    @Published var expanded: Tab? {
         didSet {
             guard expanded != oldValue else { return }
             mirror?.stop()
             // The peek of the row that closed may have had the keyboard.
             release?()
-            mirror = expanded.map { Mirror(terminal: $0) }
+            mirror = expanded.map { Mirror(tab: $0) }
             mirror?.start()
             changed?()
         }
@@ -121,13 +133,13 @@ final class Store: ObservableObject {
     var takeKeyboard: (() -> Void)?
     /// The terminal a peek is being typed into, and each terminal's queue of keys: kept
     /// here rather than in the peek, which is built again whenever its row moves.
-    var typingTo: Int?
-    private var queues: [Int: Keys] = [:]
+    var typingTo: Tab?
+    private var queues: [Tab: Keys] = [:]
 
-    func keys(for terminal: Int) -> Keys {
-        if let k = queues[terminal] { return k }
-        let k = Keys(terminal: terminal, store: self)
-        queues[terminal] = k
+    func keys(for tab: Tab) -> Keys {
+        if let k = queues[tab] { return k }
+        let k = Keys(tab: tab, store: self)
+        queues[tab] = k
         return k
     }
     var release: (() -> Void)?
@@ -144,6 +156,8 @@ final class Store: ObservableObject {
     var needInk: Color { rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? failed : blocked }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
+    /// Whether the rows come from more than one session, so each says which.
+    var mixed: Bool { Set(rows.map(\.session)).count > 1 }
 
     /// The right ear in words, zeros left out: what is drawn, and what its width is measured by.
     var countsText: String {
@@ -152,15 +166,15 @@ final class Store: ObservableObject {
     }
 
     func take(_ next: [Row]) {
-        let before = Dictionary(rows.map { ($0.terminal, $0.kind) }, uniquingKeysWith: { a, _ in a })
-        let finished = next.contains { before[$0.terminal] == .working && $0.kind == .idle }
+        let before = Dictionary(rows.map { ($0.tab, $0.kind) }, uniquingKeysWith: { a, _ in a })
+        let finished = next.contains { before[$0.tab] == .working && $0.kind == .idle }
         // A slept terminal is a remembered row with no process behind it: nothing to
         // count, and nothing a click could show.
         let agents = next.filter { $0.agent && $0.state != "sleeping" }
         if agents != rows { rows = agents }
         if finished { cheers += 1 }
         if rows.isEmpty { open = false }
-        if let e = expanded, !rows.contains(where: { $0.terminal == e }) { expanded = nil }
+        if let e = expanded, !rows.contains(where: { $0.tab == e }) { expanded = nil }
         changed?()
     }
 }
@@ -248,9 +262,9 @@ func loadPet(into store: Store) {
     }
 }
 
-/// Follow `qoro agents --watch --json`: one JSON array per line, a line each time
-/// anything an agent row shows changes. When qoro is not running the command exits;
-/// it is started again a few seconds later, which is the only waiting this does.
+/// Follow `qoro agents --watch --all --json`: one JSON array per line of every running
+/// session's rows, a line each time anything a row shows changes. It hears sessions start
+/// and end itself; should it ever exit, it is started again a few seconds later.
 func watch(into store: Store) {
     Thread.detachNewThread {
         while true {
@@ -267,7 +281,7 @@ func watch(into store: Store) {
 func watchOnce(into store: Store) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: qoro)
-    p.arguments = ["agents", "--watch", "--json"]
+    p.arguments = ["agents", "--watch", "--all", "--json"]
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
@@ -294,7 +308,7 @@ struct PeekRow: Identifiable {
 /// which is the only record of what scrolled away.
 @MainActor
 final class Mirror: ObservableObject {
-    let terminal: Int
+    let tab: Tab
     @Published var screen: [PeekRow] = []
     @Published var older: [PeekRow] = []
     @Published var more = true
@@ -314,12 +328,12 @@ final class Mirror: ObservableObject {
     private var settle: DispatchWorkItem?
     private var process: Process?
 
-    init(terminal: Int) { self.terminal = terminal }
+    init(tab: Tab) { self.tab = tab }
 
     func start() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: qoro)
-        p.arguments = ["read", String(terminal), "--watch", "--json"]
+        p.arguments = tab.qoro("read", String(tab.terminal), "--watch", "--json")
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
@@ -388,7 +402,7 @@ final class Mirror: ObservableObject {
     func loadOlder() {
         guard let alt, more, !loading else { return }
         loading = true
-        let (t, have, total, end, era) = (terminal, messages, behind, oldest ?? behind, epoch)
+        let (t, have, total, end, era) = (tab, messages, behind, oldest ?? behind, epoch)
         DispatchQueue.global().async { [weak self] in
             var rows: [PeekRow] = []
             var count = have
@@ -400,7 +414,7 @@ final class Mirror: ObservableObject {
                 // The conversation is read newest first and cut; asking for more is asking
                 // for a longer tail, bounded so one agent cannot fill the notch's memory.
                 let want = min(have + 20, 200)
-                if let data = runQoro(["history", String(t), "--last", String(want), "--json"]),
+                if let data = runQoro(t.qoro("history", String(t.terminal), "--last", String(want), "--json")),
                    let tr = try? JSONDecoder().decode(Transcript.self, from: data) {
                     let lines = conversation(tr.messages)
                     rows = lines.enumerated().map { PeekRow(id: $0.offset - lines.count, runs: $0.element) }
@@ -455,7 +469,7 @@ final class Mirror: ObservableObject {
     /// Read what went behind the screen since `t` and put it under what was read.
     private func extend(from t: Int, tries: Int = 0, settling: Bool = false) {
         guard !extending else { return }
-        let (term, now, era) = (terminal, behind, epoch)
+        let (term, now, era) = (tab, behind, epoch)
         // Far behind is not worth reading row by row: start over from the newest page.
         if now - t > 1000 {
             restart()
@@ -506,9 +520,9 @@ final class Mirror: ObservableObject {
 }
 
 /// History rows from `qoro read --back`, or nil when it could not be read.
-func readBack(_ terminal: Int, up: Int, rows: Int) -> Back? {
+func readBack(_ tab: Tab, up: Int, rows: Int) -> Back? {
     guard rows > 0,
-          let data = runQoro(["read", String(terminal), "--back", String(up), "--lines", String(rows), "--json"]) else { return nil }
+          let data = runQoro(tab.qoro("read", String(tab.terminal), "--back", String(up), "--lines", String(rows), "--json")) else { return nil }
     return try? JSONDecoder().decode(Back.self, from: data)
 }
 
@@ -534,10 +548,10 @@ func conversation(_ messages: [Transcript.Message]) -> [[Run]] {
 
 /// Switch the interface to a terminal, then raise the app that interface runs in: the
 /// first process up its parent chain that is an app the window server knows.
-func jump(to terminal: Int, store: Store) {
+func jump(to tab: Tab, store: Store) {
     DispatchQueue.global().async {
         let pids: [Int]
-        switch runQoroFull(["focus", String(terminal), "--json"]) {
+        switch runQoroFull(tab.qoro("focus", String(tab.terminal), "--json")) {
         case .success(let data):
             let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             pids = reply?["clients"] as? [Int] ?? []
@@ -708,6 +722,8 @@ struct Counts: View {
 struct RowView: View {
     let row: Row
     let open: Bool
+    /// Name the row's session beside its number: set when more than one is shown.
+    let session: Bool
     @State private var over = false
 
     var body: some View {
@@ -724,8 +740,10 @@ struct RowView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 8)
-            Text("\(row.terminal)")
+            Text(session ? "\(row.session)  \(row.terminal)" : "\(row.terminal)")
                 .font(.system(size: 11, design: .monospaced))
+                .lineLimit(1)
+                .fixedSize()
                 .foregroundStyle(.white.opacity(0.4))
         }
         .font(.system(size: 13))
@@ -778,13 +796,13 @@ final class Keys {
         case key(String)
     }
 
-    let terminal: Int
+    let tab: Tab
     unowned let store: Store
     private var queue: [Op] = []
     private var sending = false
 
-    init(terminal: Int, store: Store) {
-        self.terminal = terminal
+    init(tab: Tab, store: Store) {
+        self.tab = tab
         self.store = store
     }
 
@@ -802,8 +820,8 @@ final class Keys {
         sending = true
         let args: [String]
         switch queue.removeFirst() {
-        case .text(let text): args = ["send", String(terminal), "--", text]
-        case .key(let name): args = ["send", String(terminal), "--key", name]
+        case .text(let text): args = tab.qoro("send", String(tab.terminal), "--", text)
+        case .key(let name): args = tab.qoro("send", String(tab.terminal), "--key", name)
         }
         let store = self.store
         DispatchQueue.global().async { [weak self] in
@@ -864,7 +882,7 @@ struct TermPeek: View {
     @ObservedObject var m: Mirror
     let row: Row
     @ObservedObject var store: Store
-    let open: (Int) -> Void
+    let open: (Tab) -> Void
     @FocusState private var typing: Bool
 
     var body: some View {
@@ -899,7 +917,7 @@ struct TermPeek: View {
             }
             .onKeyPress(phases: [.down, .repeat]) { press in
                 guard let op = keyOp(press) else { return .ignored }
-                store.keys(for: row.terminal).push(op)
+                store.keys(for: row.tab).push(op)
                 return .handled
             }
             HStack(spacing: 8) {
@@ -910,7 +928,7 @@ struct TermPeek: View {
                         .foregroundStyle(typing ? focus.opacity(0.9) : .white.opacity(0.4))
                 }
                 Spacer(minLength: 8)
-                Button { open(row.terminal) } label: {
+                Button { open(row.tab) } label: {
                     Label("open in qoro", systemImage: "arrow.up.right")
                         .labelStyle(.titleAndIcon)
                 }
@@ -922,17 +940,17 @@ struct TermPeek: View {
         }
         .onChange(of: typing) { _, now in
             if now {
-                store.typingTo = row.terminal
-            } else if store.typingTo == row.terminal {
+                store.typingTo = row.tab
+            } else if store.typingTo == row.tab {
                 store.typingTo = nil
                 store.release?()
             }
         }
         // A row moving between sections (answered, it goes from "needs you" to "working")
         // builds its peek again: typing carries on in the new one.
-        .onAppear { if store.typingTo == row.terminal { typing = true } }
+        .onAppear { if store.typingTo == row.tab { typing = true } }
         .onDisappear {
-            if store.expanded != row.terminal, store.typingTo == row.terminal {
+            if store.expanded != row.tab, store.typingTo == row.tab {
                 store.typingTo = nil
                 store.release?()
             }
@@ -942,7 +960,7 @@ struct TermPeek: View {
 
 struct Island: View {
     @ObservedObject var s: Store
-    let open: (Int) -> Void
+    let open: (Tab) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -993,14 +1011,14 @@ struct Island: View {
                 .foregroundStyle(.white.opacity(0.38))
                 .padding(.top, 8).padding(.bottom, 3)
             ForEach(rows) { row in
-                let isOpen = s.expanded == row.terminal
-                RowView(row: row, open: isOpen)
+                let isOpen = s.expanded == row.tab
+                RowView(row: row, open: isOpen, session: s.mixed)
                     .padding(.horizontal, -8)
-                    .onTapGesture { withAnimation(spring) { s.expanded = isOpen ? nil : row.terminal } }
+                    .onTapGesture { withAnimation(spring) { s.expanded = isOpen ? nil : row.tab } }
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isButton)
                     .accessibilityHint(isOpen ? "Hides terminal \(row.terminal)" : "Shows terminal \(row.terminal) here")
-                    .accessibilityAction { s.expanded = isOpen ? nil : row.terminal }
+                    .accessibilityAction { s.expanded = isOpen ? nil : row.tab }
                 if isOpen, let mirror = s.mirror {
                     TermPeek(m: mirror, row: row, store: s, open: open)
                         .padding(.top, 4).padding(.bottom, 8)
@@ -1049,7 +1067,7 @@ struct Geometry {
 struct NotchView: View {
     @ObservedObject var s: Store
     let g: Geometry
-    let open: (Int) -> Void
+    let open: (Tab) -> Void
 
     var body: some View {
         let size = g.size(s)
@@ -1212,8 +1230,8 @@ final class App: NSObject, NSApplicationDelegate {
         panel.orderFrontRegardless()
     }
 
-    func go(_ terminal: Int) {
-        jump(to: terminal, store: store)
+    func go(_ tab: Tab) {
+        jump(to: tab, store: store)
     }
 }
 

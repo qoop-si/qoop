@@ -10,15 +10,14 @@
 //! the hooks and skills shape: `status` says what is there, `uninstall` takes out
 //! exactly what was put in.
 
-/// `qoro notch ...`. `session` is the one named with `--session` or `QORO_SESSION`, which
-/// the notch keeps to; without one it follows whichever session was opened last.
-pub fn run(args: &[String], session: Option<&str>) -> std::io::Result<()> {
+/// `qoro notch ...`. The notch shows every running session, so it takes none.
+pub fn run(args: &[String]) -> std::io::Result<()> {
     let help = "usage: qoro notch install|uninstall|status\n       qoro notch run";
     #[cfg(target_os = "macos")]
     {
         match args.get(2).map(String::as_str) {
             Some("run") => mac::run_app(),
-            Some("install") => mac::install(session),
+            Some("install") => mac::install(),
             Some("uninstall") => mac::uninstall(),
             Some("status") | None => mac::status(),
             Some(other) => Err(std::io::Error::other(format!(
@@ -28,7 +27,7 @@ pub fn run(args: &[String], session: Option<&str>) -> std::io::Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (args, session);
+        let _ = args;
         Err(std::io::Error::other(format!(
             "the notch is a macOS feature; {help}"
         )))
@@ -153,11 +152,10 @@ mod mac {
             .ok()
     }
 
-    pub(super) fn plist(exe: &str, session: Option<&str>) -> String {
+    pub(super) fn plist(exe: &str) -> String {
         // The launchd environment has none of the shell's. What moves where the session
         // sockets live and where the pet was picked is carried over, or the notch would
-        // look somewhere the install did not; the session only when one was named.
-        let named = session.map(|s| ("QORO_SESSION", s.to_string()));
+        // look somewhere the install did not.
         let env: String = ["QORO_RUNTIME_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
             .iter()
             .filter_map(|k| {
@@ -166,7 +164,6 @@ mod mac {
                     .filter(|v| !v.is_empty())
                     .map(|v| (*k, v))
             })
-            .chain(named)
             .map(|(k, v)| format!("    <key>{k}</key><string>{}</string>\n", super::xml(&v)))
             .collect();
         let env = if env.is_empty() {
@@ -194,7 +191,7 @@ mod mac {
         )
     }
 
-    pub fn install(session: Option<&str>) -> std::io::Result<()> {
+    pub fn install() -> std::io::Result<()> {
         match macos_major() {
             Some(v) if v >= 14 => {}
             _ => {
@@ -208,8 +205,7 @@ mod mac {
         let dir = plist_path.parent().expect("a file under LaunchAgents");
         std::fs::create_dir_all(dir)?;
         let staged = plist_path.with_extension("plist.new");
-        std::fs::File::create(&staged)?
-            .write_all(plist(&exe.to_string_lossy(), session).as_bytes())?;
+        std::fs::File::create(&staged)?.write_all(plist(&exe.to_string_lossy()).as_bytes())?;
         std::fs::rename(&staged, &plist_path)?;
         // A notch already loaded is taken down first, so a second install picks up a
         // moved binary rather than failing on a label that is taken. `bootout` can return
@@ -307,18 +303,13 @@ mod tests {
         assert_ne!(fnv(b"notch 1"), fnv(b"notch 2"));
     }
 
-    /// The login item keeps to a session only when one was named, so a plain install
-    /// follows whichever session was opened last.
+    /// The login item runs this binary and keeps to no session: the notch shows them all.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_plist_names_a_session_only_when_asked() {
-        let named = mac::plist("/bin/qoro", Some("work"));
-        assert!(
-            named.contains("<key>QORO_SESSION</key><string>work</string>"),
-            "{named}"
-        );
-        assert!(named.contains("<string>/bin/qoro</string><string>notch</string>"));
-        assert!(!mac::plist("/bin/qoro", None).contains("QORO_SESSION"));
+    fn the_plist_runs_the_notch_in_no_session() {
+        let plist = mac::plist("/bin/qoro");
+        assert!(plist.contains("<string>/bin/qoro</string><string>notch</string>"));
+        assert!(!plist.contains("QORO_SESSION"), "{plist}");
     }
 
     #[test]

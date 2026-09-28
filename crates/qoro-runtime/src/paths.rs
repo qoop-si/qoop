@@ -158,6 +158,12 @@ pub fn bridge_socket(runtime: &Path) -> PathBuf {
     runtime.join("bridge.sock")
 }
 
+/// Where anyone else who wants to hear "a session just started" listens: a socket each,
+/// rung by a daemon exactly like the bridge's doorbell.
+pub fn bells_dir(runtime: &Path) -> PathBuf {
+    runtime.join("bells")
+}
+
 /// Where every session lives.
 pub fn sessions_dir(runtime: &Path) -> PathBuf {
     runtime.join("sessions")

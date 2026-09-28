@@ -47,7 +47,7 @@ a claim nobody has to keep.
 | `qoro history <target> [--last N] [--role user\|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user\|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
-| `qoro agents --watch [--json]` | the same list now and again each time it reads differently, woken by the daemon's own news on one connection, never by a timer; ends when the daemon does | no |
+| `qoro agents --watch [--all] [--json]` | the same list now and again each time it reads differently, woken by the daemon's own news on one connection, never by a timer; ends when the daemon does. `--all` follows every running session as one list, each row naming its session, hears a session start by a bell in the runtime's `bells` directory that each daemon rings, and runs until its reader goes | no |
 | `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest, and what its screen discarded when anything was | no |
 | `qoro focus <terminal> [--json]` | show that terminal in every attached interface, as a click on its row would; `--json` answers `{"clients":[pid,...]}`, the interface processes asked, so a launcher can raise the window one runs in | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
@@ -60,7 +60,7 @@ a claim nobody has to keep.
 | `qoro avatar` | show the picked avatar, or pick one when on a terminal | no |
 | `qoro avatar pick` | choose a terminal pet from a batch: a number keeps one, `r` deals again | no |
 | `qoro avatar show [--json]` | print the picked avatar; `--json` prints its pixels, each a `#rrggbb` or `null`, rows top first, or `null` with none picked | no |
-| `qoro notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoro notch run` at login: your agents in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
+| `qoro notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoro notch run` at login: the agents of every running session in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
 | `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
 | `qoro notch status` | whether the notch is installed and running | no |
 | `qoro notch run` | write this build's notch app out when missing and run it against this binary | no |

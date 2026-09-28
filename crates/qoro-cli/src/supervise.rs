@@ -70,9 +70,13 @@ struct Link {
 impl Link {
     async fn open(who: &str) -> std::io::Result<Self> {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-        let socket = paths::socket_path(&dir);
+        Self::open_at(&paths::socket_path(&dir), who).await
+    }
+
+    /// A link to the daemon at `socket`, whichever session that is.
+    async fn open_at(socket: &std::path::Path, who: &str) -> std::io::Result<Self> {
         // These verbs never start a daemon; `connect` says when there is none.
-        let (stream, inbuf) = client::connect(&socket, who).await?;
+        let (stream, inbuf) = client::connect(socket, who).await?;
         let (rd, wr) = stream.into_split();
         Ok(Self {
             rd,
@@ -268,6 +272,9 @@ fn stashed_touches(stashed: Vec<client::Incoming>, watched: &[u32]) -> bool {
     touches(&events, watched)
 }
 
+/// Each session's agent rows, by session name: what a watch prints from.
+pub(crate) type Sessions = BTreeMap<String, Vec<AgentRow>>;
+
 /// `qoro agents --watch`: the index now, then again each time it reads differently.
 ///
 /// Woken by the daemon's own news on this connection, never by a timer: a watcher over
@@ -275,61 +282,229 @@ fn stashed_touches(stashed: Vec<client::Incoming>, watched: &[u32]) -> bool {
 /// reader that missed a line would otherwise hold a row that is no longer true. Ends when
 /// the daemon does, so a caller that wants to outlive a session starts it again.
 pub(crate) fn run_watch(
-    line: impl Fn(&[AgentRow]) -> std::io::Result<String>,
+    line: impl Fn(&Sessions) -> std::io::Result<String>,
 ) -> std::io::Result<()> {
-    use std::io::Write;
-
+    let name = paths::session_name(None).map_err(std::io::Error::other)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let mut link = Link::open("qoro-watch").await?;
+        let link = Link::open("qoro-watch").await?;
         let mut last = String::new();
-        let mut unsubscribed = false;
+        follow(link, |agents| {
+            let text = line(&Sessions::from([(name.clone(), agents)]))?;
+            Ok(print_new(&text, &mut last))
+        })
+        .await
+    })
+}
+
+/// `qoro agents --watch --all`: the rows of every running session, as one list.
+///
+/// A session that starts later is heard, not looked for: this watch keeps a bell in the
+/// runtime's `bells` directory, which every daemon rings when it starts serving. A session
+/// that ends closes its connection, which takes its rows off.
+pub(crate) fn run_watch_all(
+    line: impl Fn(&Sessions) -> std::io::Result<String>,
+) -> std::io::Result<()> {
+    use tokio::sync::mpsc;
+
+    let runtime = paths::runtime_base().map_err(std::io::Error::other)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let (rings, mut rung) = mpsc::channel::<()>(1);
+        let _bell = Bell::hang(&runtime, rings)?;
+        let (news, mut heard) = mpsc::unbounded_channel::<(String, Option<Vec<AgentRow>>)>();
+        let mut seen = Sessions::new();
+        let mut watched = std::collections::HashSet::new();
+        // Nothing is printed until there is a row: an empty list first says nothing.
+        let mut last = line(&seen)?;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        watch_new(&runtime, &mut watched, &news).await;
         loop {
-            let (agents, mut stashed) = link.agents().await?;
-            // The daemon subscribes every new connection to its lowest terminal. A watcher
-            // draws no screen, so the renders go back before they start to cost anything.
-            // What arrived meanwhile is kept: a change during this round trip is news too.
-            if !unsubscribed {
-                unsubscribed = true;
-                let (_, meanwhile) = link
-                    .ask(&ControlRequest::Unsubscribe {
-                        id: super::request_id("watch"),
-                        terminals: agents.iter().map(|r| r.terminal).collect(),
-                    })
-                    .await?;
-                stashed.extend(meanwhile);
+            if !print_new(&line(&seen)?, &mut last) {
+                return Ok(());
             }
-            let text = line(&agents)?;
-            if text != last {
-                let mut out = std::io::stdout().lock();
-                // A reader that went away ends the watch, rather than a panic on write.
-                if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
-                    return Ok(());
-                }
-                last = text;
-            }
-            // A change that landed while asking is news already had: ask again at once.
-            if stashed.iter().any(|i| {
-                matches!(
-                    i,
-                    client::Incoming::Event(
-                        EventMessage::AgentChanged { .. } | EventMessage::Resync
-                    )
-                )
-            }) {
-                continue;
-            }
-            loop {
-                let events = link.next_events(None).await?.unwrap_or_default();
-                if events
-                    .iter()
-                    .any(|e| !matches!(e, EventMessage::Focus { .. }))
-                {
-                    break;
+            tokio::select! {
+                Some((name, rows)) = heard.recv() => match rows {
+                    Some(rows) => {
+                        seen.insert(name, rows);
+                    }
+                    None => {
+                        seen.remove(&name);
+                        watched.remove(&name);
+                        // Ended, or ended and started again before this was heard: a ring
+                        // that came in between found the name still followed.
+                        watch_new(&runtime, &mut watched, &news).await;
+                    }
+                },
+                Some(()) = rung.recv() => watch_new(&runtime, &mut watched, &news).await,
+                _ = tick.tick() => {
+                    // Adopted by launchd: whoever started this watch is gone, and with no
+                    // change to print no write would fail to say so.
+                    if std::os::unix::process::parent_id() == 1 {
+                        return Ok(());
+                    }
                 }
             }
         }
     })
+}
+
+/// Follow every running session not followed yet, each on its own task. A connection
+/// lost while the daemon runs on (it sheds its worst one at its limit) is made again, its
+/// rows off meanwhile since nothing vouches for them; the task ends, and says so with
+/// `None`, when the session does.
+async fn watch_new(
+    runtime: &std::path::Path,
+    watched: &mut std::collections::HashSet<String>,
+    news: &tokio::sync::mpsc::UnboundedSender<(String, Option<Vec<AgentRow>>)>,
+) {
+    // Off the runtime: a connect to a daemon whose backlog is full can block.
+    let base = runtime.to_path_buf();
+    let sessions = tokio::task::spawn_blocking(move || qoro_bridge::bridge::sessions(&base))
+        .await
+        .unwrap_or_default();
+    for session in sessions {
+        if !session.running || !watched.insert(session.name.clone()) {
+            continue;
+        }
+        let socket = paths::socket_path(&paths::session_dir(runtime, &session.name));
+        let (name, news) = (session.name, news.clone());
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                let mut heard = false;
+                // A daemon that takes the connection and never answers is not followed.
+                if let Ok(Ok(link)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    Link::open_at(&socket, "qoro-watch"),
+                )
+                .await
+                {
+                    let _ = follow(link, |rows| {
+                        heard = true;
+                        Ok(news.send((name.clone(), Some(rows))).is_ok())
+                    })
+                    .await;
+                }
+                let _ = news.send((name.clone(), Some(Vec::new())));
+                if tokio::net::UnixStream::connect(&socket).await.is_err() {
+                    break;
+                }
+                if heard {
+                    backoff = Duration::from_secs(1);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+            let _ = news.send((name, None));
+        });
+    }
+}
+
+/// Print a listing unless it is the one printed last. False when the reader went away,
+/// which ends the watch rather than a panic on write.
+fn print_new(text: &str, last: &mut String) -> bool {
+    use std::io::Write;
+
+    if text == last {
+        return true;
+    }
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
+        return false;
+    }
+    *last = text.to_string();
+    true
+}
+
+/// A socket in the runtime's `bells` directory that daemons ring when they start. Taken
+/// down with the watch.
+struct Bell(std::path::PathBuf);
+
+impl Bell {
+    fn hang(
+        runtime: &std::path::Path,
+        rings: tokio::sync::mpsc::Sender<()>,
+    ) -> std::io::Result<Self> {
+        let dir = paths::bells_dir(runtime);
+        paths::ensure_private_dir(&dir).map_err(std::io::Error::other)?;
+        // Bells of watches that died without taking theirs down: nobody answers there.
+        for old in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
+            if std::os::unix::net::UnixStream::connect(old.path()).is_err() {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
+        let path = dir.join(format!("watch-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    // Closed at once: the ringer waits for exactly that. A ring already
+                    // waiting to be heard covers this one too.
+                    Ok((ringer, _)) => {
+                        drop(ringer);
+                        let _ = rings.try_send(());
+                    }
+                    // Out of descriptors, or a ringer gone mid-accept: the bell stays up.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        });
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Bell {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One session's agent rows, handed to `rows` now and each time they change, until the
+/// daemon closes the connection or `rows` says to stop.
+async fn follow(
+    mut link: Link,
+    mut rows: impl FnMut(Vec<AgentRow>) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    let mut unsubscribed = false;
+    loop {
+        let (agents, mut stashed) = link.agents().await?;
+        // The daemon subscribes every new connection to its lowest terminal. A watcher
+        // draws no screen, so the renders go back before they start to cost anything.
+        // What arrived meanwhile is kept: a change during this round trip is news too.
+        if !unsubscribed {
+            unsubscribed = true;
+            let (_, meanwhile) = link
+                .ask(&ControlRequest::Unsubscribe {
+                    id: super::request_id("watch"),
+                    terminals: agents.iter().map(|r| r.terminal).collect(),
+                })
+                .await?;
+            stashed.extend(meanwhile);
+        }
+        if !rows(agents)? {
+            return Ok(());
+        }
+        // A change that landed while asking is news already had: ask again at once.
+        if stashed.iter().any(|i| {
+            matches!(
+                i,
+                client::Incoming::Event(EventMessage::AgentChanged { .. } | EventMessage::Resync)
+            )
+        }) {
+            continue;
+        }
+        loop {
+            let events = link.next_events(None).await?.unwrap_or_default();
+            if events
+                .iter()
+                .any(|e| !matches!(e, EventMessage::Focus { .. }))
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// The least time between two screens `read --watch` prints. An agent streaming output

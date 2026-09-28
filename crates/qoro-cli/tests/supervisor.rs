@@ -332,3 +332,80 @@ fn a_write_to_a_replaced_process_is_refused() {
     assert!(ok, "{stderr}");
     assert!(daemon.wait_for_screen("1", "GEN_5"));
 }
+
+/// `agents --watch --all` lists every running session as one list, hears one that starts
+/// later by its bell, and drops it when it ends.
+#[test]
+fn a_watch_of_all_sessions_hears_one_start_and_end() {
+    use std::io::BufRead;
+
+    /// Killed however the test ends, so a failed assert leaves no watch or daemon behind.
+    struct Killed(Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let daemon = Daemon::start();
+    let mut watch = Killed(
+        daemon
+            .command(&["agents", "--watch", "--all", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the watch"),
+    );
+    let (lines_tx, lines) = std::sync::mpsc::channel::<Vec<serde_json::Value>>();
+    let out = watch.0.stdout.take().expect("stdout");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let rows = serde_json::from_str(&line).expect("each line is a JSON array");
+            if lines_tx.send(rows).is_err() {
+                break;
+            }
+        }
+    });
+    let sessions = |rows: &[serde_json::Value]| {
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r["session"]
+                    .as_str()
+                    .expect("a session on every row")
+                    .to_string()
+            })
+            .collect();
+        names.dedup();
+        names
+    };
+    let until = |want: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match lines.recv_timeout(left) {
+                Ok(rows) if sessions(&rows) == want => return true,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        false
+    };
+    assert!(until(&["default"]), "the running session was never listed");
+
+    let second = Killed(
+        daemon
+            .command(&["--session", "second", "daemon"])
+            .env("SHELL", "/bin/sh")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the second daemon"),
+    );
+    assert!(
+        until(&["default", "second"]),
+        "a session started later was never heard"
+    );
+    drop(second);
+    assert!(until(&["default"]), "a session that ended stayed listed");
+}
