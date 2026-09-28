@@ -200,6 +200,14 @@ mod mac {
                 ));
             }
         }
+        // Installing is asking for the notch: one turned off in its settings comes back.
+        // A file that cannot be written is said, not a reason to install nothing.
+        let read = qoro_tui::config::read();
+        if !read.config.notch
+            && let Err(why) = qoro_tui::config::set(&read.path, "notch.enabled", "true")
+        {
+            eprintln!("qoro: notch.enabled stays false ({why}); fix it with qoro config");
+        }
         let exe = std::env::current_exe()?;
         let plist_path = plist_path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
         let dir = plist_path.parent().expect("a file under LaunchAgents");

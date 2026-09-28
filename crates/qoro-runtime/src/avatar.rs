@@ -39,6 +39,8 @@ pub const HAIR_INK_TITLES: [&str; 8] = [
 ];
 /// The eyes the setup screen offers, in picker order.
 pub const EYE_STYLES: [&str; 5] = ["small", "big", "bigsmall", "squint", "squintw"];
+/// Display names for the eyes, same order as above.
+pub const EYE_TITLES: [&str; 5] = ["Small", "Big", "Odd", "Squint", "Wide Squint"];
 
 /// The pixel grid every pet is drawn on, same as the design mock.
 pub const GRID_W: i32 = 16;

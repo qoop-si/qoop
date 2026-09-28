@@ -7,6 +7,8 @@
 //! [notify]
 //! desktop = true
 //! sound = false
+//! [notch]
+//! enabled = true      # macOS: the agents in the notch
 //! ```
 //!
 //! Read by the interface alone, at start and again whenever the settings box opens, so an
@@ -64,6 +66,8 @@ pub struct Config {
     pub desktop: bool,
     /// And play a sound when it does.
     pub sound: bool,
+    /// Show the agents in the macOS notch. Read by the notch app, through `qoro config`.
+    pub notch: bool,
 }
 
 impl Default for Config {
@@ -73,6 +77,7 @@ impl Default for Config {
             theme: Theme::Auto,
             desktop: true,
             sound: false,
+            notch: true,
         }
     }
 }
@@ -217,12 +222,14 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
     // so the same text is read once more for them, top level and `[notify]`.
     type Spans = BTreeMap<String, toml::Spanned<toml::Value>>;
     #[derive(Default, serde::Deserialize)]
-    struct NotifySpans {
+    struct NestedSpans {
         #[serde(default)]
         notify: Spans,
+        #[serde(default)]
+        notch: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
-    let nested: NotifySpans = toml::from_str(&text).unwrap_or_default();
+    let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
     let line_of = |spans: &Spans, key: &str| spans.get(key).map(|s| line_at(&text, s.span().start));
 
     let mut config = Config::default();
@@ -264,6 +271,19 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
                 line,
                 "notify is a table: [notify] then desktop = true".into(),
             ),
+            ("notch", toml::Value::Table(notch)) => {
+                for (key, value) in notch {
+                    let line = line_of(&nested.notch, key);
+                    match (key.as_str(), value) {
+                        ("enabled", toml::Value::Boolean(on)) => config.notch = *on,
+                        ("enabled", _) => {
+                            refuse(line, format!("enabled = {value} is not true or false"));
+                        }
+                        _ => refuse(line, format!("there is no setting notch.{key}")),
+                    }
+                }
+            }
+            ("notch", _) => refuse(line, "notch is a table: [notch] then enabled = true".into()),
             _ => refuse(line, format!("there is no setting {key}")),
         }
     }
@@ -309,12 +329,94 @@ fn unreadable(text: &str, line: Option<usize>, message: &str) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         });
     match bare {
-        Some((key, _)) if matches!(key.rsplit('.').next(), Some("desktop" | "sound")) => {
+        Some((key, _))
+            if matches!(
+                key.rsplit('.').next(),
+                Some("desktop" | "sound" | "enabled")
+            ) =>
+        {
             format!("{} is true or false", key.rsplit('.').next().unwrap_or(key))
         }
         Some((key, value)) => format!("needs quotes: {key} = \"{value}\""),
         None => format!("not TOML ({message})"),
     }
+}
+
+/// Every prefix the file may name, in the order a picker lists them.
+pub fn prefixes() -> Vec<String> {
+    PREFIX_LETTERS
+        .chars()
+        .map(|letter| format!("ctrl-{letter}"))
+        .collect()
+}
+
+/// The keys `set` writes, each as the file spells it.
+pub const KEYS: [&str; 5] = [
+    "prefix",
+    "theme",
+    "notify.desktop",
+    "notify.sound",
+    "notch.enabled",
+];
+
+/// Write one setting into the file at `path`, leaving every other line as it was:
+/// comments, order and keys this build does not know. The value is checked first, so
+/// the file never holds something the reader would refuse; a file that is not TOML is
+/// left alone and said, since writing over it would lose what a person was typing.
+pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let item = match key {
+        "prefix" if prefix_byte(value).is_some() => toml_edit::value(value),
+        "prefix" => return Err(format!("prefix is {PREFIX_SAID}")),
+        "theme" if matches!(value, "auto" | "dark" | "light") => toml_edit::value(value),
+        "theme" => return Err("theme is auto, dark or light".to_string()),
+        "notify.desktop" | "notify.sound" | "notch.enabled" => match value {
+            "true" => toml_edit::value(true),
+            "false" => toml_edit::value(false),
+            _ => return Err(format!("{key} is true or false")),
+        },
+        _ => {
+            return Err(format!(
+                "there is no setting {key}; the settings are {}",
+                KEYS.join(", ")
+            ));
+        }
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|_| {
+        format!(
+            "{} is not TOML; fix it first (qoro config says where)",
+            path.display()
+        )
+    })?;
+    match key.split_once('.') {
+        Some((table, leaf)) => {
+            if !doc.contains_key(table) {
+                doc.insert(table, toml_edit::Item::Table(toml_edit::Table::new()));
+            }
+            // A `[table]`, dotted keys or `{ inline }`: written the way the file has it.
+            let Some(table) = doc[table].as_table_like_mut() else {
+                return Err(format!("{table} is not a table in {}", path.display()));
+            };
+            table.insert(leaf, item);
+        }
+        None => doc[key] = item,
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Through a link to where the file really is (a dotfiles checkout stays linked), with
+    // its permissions; whole or not at all, so a reader never meets half a file.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let staged = target.with_extension(format!("toml.{}.new", std::process::id()));
+    std::fs::write(&staged, doc.to_string()).map_err(|e| e.to_string())?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&staged, meta.permissions());
+    }
+    std::fs::rename(&staged, &target).map_err(|e| e.to_string())
 }
 
 /// `ctrl-b` is `0x02`, for the letters a prefix may be.
@@ -381,6 +483,8 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
         " [notify]".to_string(),
         row(format!("desktop = {}", config.desktop), &notes),
         row(format!("sound = {}", config.sound), "true | false"),
+        " [notch]".to_string(),
+        row(format!("enabled = {}", config.notch), "true | false, macOS"),
     ];
     rows.extend(read.problems.iter().map(|p| format!(" ! {}", p.short())));
     rows
@@ -415,7 +519,7 @@ mod tests {
     #[test]
     fn every_key_is_read_in_every_toml_spelling() {
         let (config, problems) = parse(
-            "\u{feff}# mine\nprefix = \"ctrl-b\"\ntheme = 'light'  # bright room\n\n[notify]\ndesktop = false\nsound = true\n",
+            "\u{feff}# mine\nprefix = \"ctrl-b\"\ntheme = 'light'  # bright room\n\n[notify]\ndesktop = false\nsound = true\n[notch]\nenabled = false\n",
         );
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
@@ -425,6 +529,7 @@ mod tests {
                 theme: Theme::Light,
                 desktop: false,
                 sound: true,
+                notch: false,
             }
         );
         let dotted = parse("notify.desktop = false\n").0;
@@ -522,7 +627,9 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
-        assert_eq!(rows[6], " ! line 1: needs quotes: theme = \"blue\"");
+        assert_eq!(rows[6], " [notch]");
+        assert!(rows[7].starts_with(" enabled = true"), "{rows:?}");
+        assert_eq!(rows[8], " ! line 1: needs quotes: theme = \"blue\"");
     }
 
     /// Nothing from the file reaches the screen with a line break or a control character
@@ -571,5 +678,66 @@ mod tests {
             parse("prefix = \"ctrl-a\"\ntheme = \"blue\"\n[notify]\n\nsound = \"yes\"\n");
         let lines: Vec<Option<usize>> = problems.iter().map(|p| p.line).collect();
         assert_eq!(lines, vec![Some(2), Some(5)], "{problems:?}");
+    }
+
+    /// One setting is written and nothing else moves: comments, order and a key this
+    /// build does not know stay; a refused value leaves the file untouched.
+    #[test]
+    fn set_writes_one_key_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("config.toml");
+        // No file yet: made with just the key.
+        set(&file, "notch.enabled", "false").unwrap();
+        assert!(!read_from(&file).config.notch);
+        std::fs::write(
+            &file,
+            "# mine\ntheme = \"dark\"  # night\nlater = 1\n[notify]\nsound = true\n",
+        )
+        .unwrap();
+        set(&file, "notify.sound", "false").unwrap();
+        set(&file, "prefix", "ctrl-b").unwrap();
+        set(&file, "notch.enabled", "true").unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.starts_with("# mine\ntheme = \"dark\"  # night\nlater = 1\n"),
+            "{text}"
+        );
+        let (config, _) = parse(&text);
+        assert_eq!(
+            (config.prefix, config.sound, config.notch),
+            (0x02, false, true)
+        );
+        for (key, value) in [
+            ("prefix", "ctrl-c"),
+            ("theme", "blue"),
+            ("notify.sound", "yes"),
+            ("nope", "1"),
+        ] {
+            assert!(set(&file, key, value).is_err(), "{key} = {value}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            text,
+            "a refusal writes nothing"
+        );
+        // However the table is spelled, it stays spelled that way.
+        std::fs::write(&file, "notify = { sound = true }\nnotch.enabled = false\n").unwrap();
+        set(&file, "notify.desktop", "false").unwrap();
+        set(&file, "notch.enabled", "true").unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.starts_with("notify = {") && text.contains("desktop = false }"),
+            "{text}"
+        );
+        assert!(text.contains("notch.enabled = true"), "{text}");
+        let (config, problems) = parse(&text);
+        assert!(
+            problems.is_empty() && !config.desktop && config.sound && config.notch,
+            "{text}"
+        );
+        // A file that is not TOML is not written over.
+        std::fs::write(&file, "theme = dark\n").unwrap();
+        assert!(set(&file, "theme", "light").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theme = dark\n");
     }
 }

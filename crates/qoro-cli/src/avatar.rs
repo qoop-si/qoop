@@ -15,8 +15,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qoro_runtime::avatar::{
-    self, Avatar, BODY, BODY_INK, EYE_STYLES, GRID_H, GRID_W, HAIR_INKS, HAIR_STYLES, art_cells,
-    bg, fg, pixel,
+    self, Avatar, BODY, BODY_INK, EYE_STYLES, EYE_TITLES, GRID_H, GRID_W, HAIR_INK_TITLES,
+    HAIR_INKS, HAIR_STYLES, HAIR_TITLES, art_cells, bg, fg, pixel,
 };
 
 /// How many pets a batch holds.
@@ -34,16 +34,82 @@ const CURATED: [(&str, u8, &str); BATCH] = [
 
 /// `qoro avatar ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro avatar [pick|show [--json]|options --json|set [--hair H] [--hair-ink N] [--eyes E]]";
     match args.get(2).map(String::as_str) {
         Some("pick") => pick(),
         Some("show") if args.get(3).map(String::as_str) == Some("--json") => show_json(),
         Some("show") => show(),
+        Some("options") if args.get(3).map(String::as_str) == Some("--json") => options_json(),
+        Some("set") => {
+            set(&args[3..]).map_err(|why| std::io::Error::other(format!("{why}; {help}")))
+        }
         None if !std::io::stdin().is_terminal() => show(),
         None => pick(),
         Some(other) => Err(std::io::Error::other(format!(
-            "unknown command {other}; usage: qoro avatar [pick|show [--json]]"
+            "unknown command {other}; {help}"
         ))),
     }
+}
+
+/// Every part a pet may have, for a picker that is not this terminal one: each hair and
+/// eye style by id and title, each hair colour by its ink, title and `#rrggbb`.
+fn options_json() -> std::io::Result<()> {
+    let named = |ids: &[&str], titles: &[&str]| -> Vec<serde_json::Value> {
+        ids.iter()
+            .zip(titles)
+            .map(|(id, title)| serde_json::json!({ "id": id, "title": title }))
+            .collect()
+    };
+    let inks: Vec<serde_json::Value> = HAIR_INKS
+        .iter()
+        .zip(HAIR_INK_TITLES)
+        .map(|(ink, title)| serde_json::json!({ "ink": ink, "title": title, "hex": avatar::ink_hex(*ink) }))
+        .collect();
+    let value = serde_json::json!({
+        "hair": named(&HAIR_STYLES, &HAIR_TITLES),
+        "hair_ink": inks,
+        "eyes": named(&EYE_STYLES, &EYE_TITLES),
+    });
+    println!("{value}");
+    Ok(())
+}
+
+/// Change some parts of the pet and keep the rest; with none picked yet, the parts start
+/// from the first curated one. Only parts the picker itself offers are taken.
+fn set(args: &[String]) -> Result<(), String> {
+    let (hair, ink, eyes) = CURATED[0];
+    let mut pet = avatar::load().unwrap_or(Avatar {
+        body: BODY.to_string(),
+        hair: hair.to_string(),
+        eyes: eyes.to_string(),
+        hair_ink: ink,
+        body_ink: BODY_INK,
+    });
+    if args.is_empty() {
+        return Err("name at least one part".to_string());
+    }
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let value = rest.next().ok_or(format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--hair" => pet.hair = value.clone(),
+            "--eyes" => pet.eyes = value.clone(),
+            "--hair-ink" => {
+                pet.hair_ink = value
+                    .parse()
+                    .map_err(|_| format!("--hair-ink {value} is not a number"))?
+            }
+            _ => return Err(format!("unknown flag {flag}")),
+        }
+    }
+    if !pet.valid() {
+        return Err(
+            "that is not a part the picker offers (qoro avatar options --json)".to_string(),
+        );
+    }
+    avatar::save(&pet).map_err(|e| e.to_string())?;
+    println!("{}", pet.name());
+    Ok(())
 }
 
 /// Print the current avatar, or that there is none yet.
@@ -73,7 +139,13 @@ fn show_json() -> std::io::Result<()> {
                     .collect()
             })
             .collect();
-        serde_json::json!({ "name": pet.name(), "pixels": pixels })
+        serde_json::json!({
+            "name": pet.name(),
+            "hair": pet.hair,
+            "hair_ink": pet.hair_ink,
+            "eyes": pet.eyes,
+            "pixels": pixels,
+        })
     });
     println!("{}", value.unwrap_or(serde_json::Value::Null));
     Ok(())

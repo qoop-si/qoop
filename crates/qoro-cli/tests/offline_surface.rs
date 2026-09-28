@@ -75,13 +75,21 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
     out
 }
 
-fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
+fn scratch() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(
         dir.path(),
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )
     .expect("chmod");
+    dir
+}
+
+/// Each run in a fresh directory of its own, so a run never sees what another left behind.
+/// A row that names where its files are (`qoro config`) names that directory, which is the
+/// one difference allowed: it is read back as `<scratch>`.
+fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
+    let dir = scratch();
     let mut command = Command::new(qoro());
     // Run from the scratch directory too, so a row that reads where it runs (`worktree
     // ls` lists the repository it is in) answers the same thing on every machine rather
@@ -102,8 +110,9 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
             .env("RES_OPTIONS", "timeout:1 attempts:1");
     }
     let out = command.output().expect("run qoro");
+    let here = dir.path().display().to_string();
     (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stdout).replace(&here, "<scratch>"),
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code(),
     )

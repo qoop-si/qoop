@@ -961,6 +961,7 @@ struct TermPeek: View {
 struct Island: View {
     @ObservedObject var s: Store
     let open: (Tab) -> Void
+    let settings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -975,6 +976,16 @@ struct Island: View {
                     Text("\(s.idle) idle").foregroundStyle(.white.opacity(0.45))
                 }
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
+                Button(action: settings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.5))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Settings")
+                .accessibilityLabel("Settings")
             }
             .padding(.vertical, 8)
             Divider().overlay(.white.opacity(0.08)).padding(.bottom, 2)
@@ -1029,6 +1040,247 @@ struct Island: View {
     }
 }
 
+// MARK: settings
+
+/// `qoro config --json`: every setting in effect, keyed as `qoro config set` takes them.
+struct ConfigRead: Decodable {
+    struct Values: Decodable {
+        var prefix: String
+        var theme: String
+        var desktop: Bool
+        var sound: Bool
+        var notch: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case prefix, theme
+            case desktop = "notify.desktop", sound = "notify.sound", notch = "notch.enabled"
+        }
+    }
+    struct Choices: Decodable {
+        let prefix: [String]
+        let theme: [String]
+    }
+    let path: String
+    let exists: Bool
+    var settings: Values
+    let choices: Choices
+    let problems: [String]
+}
+
+/// `qoro avatar options --json`: every part a pet may have.
+struct PetOptions: Decodable {
+    struct Named: Decodable {
+        let id: String
+        let title: String
+    }
+    struct Ink: Decodable {
+        let ink: Int
+        let title: String
+    }
+    let hair: [Named]
+    let hair_ink: [Ink]
+    let eyes: [Named]
+}
+
+/// The parts of the pet now, from `qoro avatar show --json`.
+struct PetParts: Decodable {
+    var hair: String
+    var hair_ink: Int
+    var eyes: String
+}
+
+func readConfig() -> ConfigRead? {
+    runQoro(["config", "--json"]).flatMap { try? JSONDecoder().decode(ConfigRead.self, from: $0) }
+}
+
+/// What the settings window shows, read from qoro and written back through it one
+/// setting at a time, in the order they were changed.
+@MainActor
+final class Settings: ObservableObject {
+    @Published var config: ConfigRead?
+    @Published var options: PetOptions?
+    @Published var parts: PetParts?
+    @Published var error: String?
+    unowned let store: Store
+    /// Told when the notch is turned on or off here, so it shows or hides at once.
+    var notch: ((Bool) -> Void)?
+    /// One write at a time: two quick changes must not read the file before the other wrote.
+    private let writes = DispatchQueue(label: "qoro.settings")
+
+    init(store: Store) { self.store = store }
+
+    /// Read on the write queue, so a read never lands before a write made ahead of it.
+    func load() {
+        writes.async { [weak self] in
+            let config = readConfig()
+            let options = runQoro(["avatar", "options", "--json"]).flatMap { try? JSONDecoder().decode(PetOptions.self, from: $0) }
+            let parts = runQoro(["avatar", "show", "--json"]).flatMap { try? JSONDecoder().decode(PetParts.self, from: $0) }
+            DispatchQueue.main.async {
+                self?.config = config
+                self?.options = options
+                self?.parts = parts
+            }
+        }
+    }
+
+    func set(_ key: String, _ value: String) {
+        write(["config", "set", key, value]) { [weak self] written in
+            // Only once it is on disk: a write refused leaves the notch as it was.
+            if written, key == "notch.enabled" { self?.notch?(value == "true") }
+        }
+    }
+
+    func pet(_ flag: String, _ value: String) {
+        write(["avatar", "set", flag, value]) { [weak self] _ in
+            if let store = self?.store { loadPet(into: store) }
+        }
+    }
+
+    /// Wait for every write already asked for.
+    func settle() { writes.sync {} }
+
+    private func write(_ args: [String], then: ((Bool) -> Void)? = nil) {
+        writes.async { [weak self] in
+            let why = runQoroChecked(args)
+            DispatchQueue.main.async {
+                self?.error = why
+                then?(why == nil)
+                self?.load()
+            }
+        }
+    }
+}
+
+/// The settings window: the system's own grouped form, nothing drawn by hand.
+struct SettingsView: View {
+    @ObservedObject var m: Settings
+    @ObservedObject var store: Store
+
+    var body: some View {
+        Form {
+            if let c = m.config {
+                content(c)
+            } else {
+                ProgressView().frame(maxWidth: .infinity)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 460, height: 640)
+    }
+
+    @ViewBuilder
+    private func content(_ c: ConfigRead) -> some View {
+        Section("Notch") {
+            Toggle("Show agents in the notch", isOn: flag("notch.enabled", \.notch))
+        }
+        Section {
+            Toggle("Desktop notification", isOn: flag("notify.desktop", \.desktop))
+            Toggle("Sound", isOn: flag("notify.sound", \.sound))
+        } header: {
+            Text("When an agent needs you")
+        }
+        Section("Appearance") {
+            Picker("Theme", selection: choice("theme", \.theme)) {
+                ForEach(c.choices.theme, id: \.self) { Text($0.capitalized).tag($0) }
+            }
+            .pickerStyle(.segmented)
+        }
+        Section {
+            Picker("Prefix key", selection: choice("prefix", \.prefix)) {
+                ForEach(c.choices.prefix, id: \.self) { Text($0).tag($0) }
+            }
+        } header: {
+            Text("Keyboard")
+        } footer: {
+            Text("The key that starts every qoro command.")
+        }
+        if let o = m.options {
+            Section("Pet") {
+                HStack {
+                    Spacer()
+                    PetView(pixels: store.pixels, px: 5)
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                Picker("Hair", selection: part(\.hair, "--hair", "block")) {
+                    ForEach(o.hair, id: \.id) { Text($0.title).tag($0.id) }
+                }
+                Picker("Colour", selection: inkPart()) {
+                    ForEach(o.hair_ink, id: \.ink) { Text($0.title).tag($0.ink) }
+                }
+                Picker("Eyes", selection: part(\.eyes, "--eyes", "big")) {
+                    ForEach(o.eyes, id: \.id) { Text($0.title).tag($0.id) }
+                }
+            }
+        }
+        if !c.problems.isEmpty || m.error != nil {
+            Section("Could not be used") {
+                ForEach(c.problems + [m.error].compactMap { $0 }, id: \.self) {
+                    Text($0).foregroundStyle(.red)
+                }
+            }
+        }
+        Section {
+            LabeledContent("File") {
+                Text(c.exists ? c.path : "no file yet: every setting is its default")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            HStack {
+                Spacer()
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: c.path)])
+                }
+                .disabled(!c.exists)
+                Button("Open config.toml") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: c.path))
+                }
+                .disabled(!c.exists)
+            }
+        }
+    }
+
+    /// A switch shown as changed at once, then written.
+    private func flag(_ key: String, _ path: WritableKeyPath<ConfigRead.Values, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { m.config?.settings[keyPath: path] ?? false },
+            set: {
+                m.config?.settings[keyPath: path] = $0
+                m.set(key, $0 ? "true" : "false")
+            })
+    }
+
+    private func choice(_ key: String, _ path: WritableKeyPath<ConfigRead.Values, String>) -> Binding<String> {
+        Binding(
+            get: { m.config?.settings[keyPath: path] ?? "" },
+            set: {
+                m.config?.settings[keyPath: path] = $0
+                m.set(key, $0)
+            })
+    }
+
+    /// A part of the pet; with none picked yet, the picker starts where `qoro avatar set` does.
+    private func part(_ path: WritableKeyPath<PetParts, String>, _ flag: String, _ none: String) -> Binding<String> {
+        Binding(
+            get: { m.parts?[keyPath: path] ?? none },
+            set: {
+                m.parts?[keyPath: path] = $0
+                m.pet(flag, $0)
+            })
+    }
+
+    private func inkPart() -> Binding<Int> {
+        Binding(
+            get: { m.parts?.hair_ink ?? 212 },
+            set: {
+                m.parts?.hair_ink = $0
+                m.pet("--hair-ink", String($0))
+            })
+    }
+}
+
 /// Sizes the panel reads to know where clicks belong to the notch.
 @MainActor
 struct Geometry {
@@ -1068,6 +1320,7 @@ struct NotchView: View {
     @ObservedObject var s: Store
     let g: Geometry
     let open: (Tab) -> Void
+    let settings: () -> Void
 
     var body: some View {
         let size = g.size(s)
@@ -1089,7 +1342,7 @@ struct NotchView: View {
                 .frame(height: g.notch.height)
                 .opacity(shown ? 1 : 0)
                 if s.open {
-                    Island(s: s, open: open)
+                    Island(s: s, open: open, settings: settings)
                         .transition(.opacity.combined(with: .offset(y: -10)))
                 }
             }
@@ -1115,8 +1368,10 @@ final class NotchPanel: NSPanel {
 }
 
 @MainActor
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = Store()
+    lazy var settings = Settings(store: store)
+    var settingsWindow: NSWindow?
     var panel: NotchPanel!
     var geometry = Geometry(notch: CGSize(width: 185, height: 32))
     var monitors: [Any] = []
@@ -1124,6 +1379,10 @@ final class App: NSObject, NSApplicationDelegate {
     var folded: AnyCancellable?
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // Turned off in its settings: nothing to draw, and an exit that launchd leaves down
+        // until `qoro notch install` or the setting turns it back on.
+        if readConfig()?.settings.notch == false { exit(0) }
+        settings.notch = { [weak self] on in self?.show(on) }
         panel = NotchPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -1179,7 +1438,10 @@ final class App: NSObject, NSApplicationDelegate {
         } else {
             geometry.notch = CGSize(width: 185, height: max(24, f.maxY - screen.visibleFrame.maxY))
         }
-        let host = NSHostingView(rootView: NotchView(s: store, g: geometry) { [weak self] t in self?.go(t) })
+        let host = NSHostingView(rootView: NotchView(
+            s: store, g: geometry,
+            open: { [weak self] t in self?.go(t) },
+            settings: { [weak self] in self?.openSettings() }))
         // The panel keeps the size given here. By default a hosting view resizes its window
         // to fit what it draws, which moved the notch off the camera as the ears grew.
         host.sizingOptions = []
@@ -1232,6 +1494,47 @@ final class App: NSObject, NSApplicationDelegate {
 
     func go(_ tab: Tab) {
         jump(to: tab, store: store)
+    }
+
+    /// The settings window: a plain titled window in front, opened from the island's gear.
+    func openSettings() {
+        store.open = false
+        if settingsWindow == nil {
+            let window = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(m: settings, store: store)))
+            window.title = "qoro Settings"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            settingsWindow = window
+            // No menu bar in an app like this one, so cmd-W is heard here.
+            monitors.append(NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+                guard e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "w",
+                      e.window === window else { return e }
+                window.performClose(nil)
+                return nil
+            } as Any)
+        }
+        settings.load()
+        settingsWindow?.center()
+        NSApp.activate()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Shows or hides the notch at once, when it is turned on or off in the settings.
+    func show(_ on: Bool) {
+        if on {
+            panel.orderFrontRegardless()
+        } else {
+            store.open = false
+            panel.orderOut(nil)
+        }
+    }
+
+    /// Closing the settings with the notch off leaves nothing to show: the app ends. Decided
+    /// by the file once every write has landed, not by what the window last showed.
+    func windowWillClose(_ notification: Notification) {
+        settings.settle()
+        if readConfig()?.settings.notch == false { NSApp.terminate(nil) }
     }
 }
 

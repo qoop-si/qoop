@@ -49,8 +49,10 @@ into its conversation. A click on it types into it: every key goes to that termi
 pressed, so arrows move through an agent's menu, Enter picks, Esc cancels, and a click
 outside stops. "open in qoro" switches the interface there and brings its app forward
 (inside tmux the switch happens and nothing is raised, since the tmux server has no app to
-find). The installer turns it on; `qoro notch uninstall` turns it off, and `qoro notch
-install` back on. It is built into the macOS binary, so it needs no download or signature
+find). The gear in the list opens a settings window: the notch on or off, notifications,
+theme, prefix key and pet, all written to `~/.config/qoro/config.toml`, which `qoro
+config` prints and `qoro config set` changes. The installer turns the notch on; `qoro notch
+uninstall` turns it off, and `qoro notch install` back on. It is built into the macOS binary, so it needs no download or signature
 of its own.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and

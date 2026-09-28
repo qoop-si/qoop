@@ -60,6 +60,10 @@ a claim nobody has to keep.
 | `qoro avatar` | show the picked avatar, or pick one when on a terminal | no |
 | `qoro avatar pick` | choose a terminal pet from a batch: a number keeps one, `r` deals again | no |
 | `qoro avatar show [--json]` | print the picked avatar; `--json` prints its pixels, each a `#rrggbb` or `null`, rows top first, or `null` with none picked | no |
+| `qoro avatar options --json` | every part a pet may have: hair and eyes by id and title, hair colours by ink, title and `#rrggbb` | no |
+| `qoro avatar set [--hair H] [--hair-ink N] [--eyes E]` | change those parts of the pet and keep the rest; only parts the picker offers are taken | no |
+| `qoro config [--json]` | the settings in `config.toml` (prefix, theme, notifications, the notch), each from the file or its default, where the file is, and what in it could not be used | no |
+| `qoro config set <key> <value>` | write one setting, checked first, keeping every other line of the file; `notch.enabled` is read by the notch when it starts or from its settings window | no |
 | `qoro notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoro notch run` at login: the agents of every running session in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
 | `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
 | `qoro notch status` | whether the notch is installed and running | no |

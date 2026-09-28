@@ -16,6 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod avatar;
+mod config;
 mod hooks;
 mod mirror;
 mod mobile;
@@ -135,6 +136,7 @@ fn run() -> std::io::Result<()> {
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
+        Some("config") => config::run(&args),
         Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
@@ -207,6 +209,9 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro ls         list the sessions and say which are running\n\
                   \x20 qoro avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoro avatar show [--json]  print the picked pet\n\
+                  \x20 qoro avatar options|set ...  the parts a pet may have, or set some\n\
+                  \x20 qoro config [--json]  the settings in config.toml and where it is\n\
+                  \x20 qoro config set <key> <value>  change one, keeping the rest of the file\n\
                   \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
                  \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
