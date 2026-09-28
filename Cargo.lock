@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-attention"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "serde",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "libc",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-bridge"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "libc",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-collab"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "serde",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-detect"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "regex",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-domain"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-events"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "rusqlite",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-history"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-detect",
  "rusqlite",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-hub"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "a2",
  "base64 0.22.1",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-move"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-plugin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "serde",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-pty"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "libc",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-remote"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-proto",
  "serde",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-setup"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "serde",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "rusqlite",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-support"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qoro-events",
  "serde",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-terminal"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "bytes",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-testkit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "libc",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "qoro-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "qoro-attention",
