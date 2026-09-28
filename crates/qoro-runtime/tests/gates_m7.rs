@@ -141,6 +141,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x23".into(),
             terminal,
         },
+        // Says which rows are news for the person: read by the index, never typed.
+        ControlRequest::News {
+            id: "x24".into(),
+            terminals: vec![terminal],
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -150,6 +155,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
             | ControlRequest::Focus { .. }
+            | ControlRequest::News { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }

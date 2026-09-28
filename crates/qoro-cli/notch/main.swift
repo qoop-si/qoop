@@ -43,13 +43,17 @@ struct Row: Decodable, Equatable, Identifiable {
     var tab: Tab { Tab(session: session, terminal: terminal) }
     var id: Tab { tab }
 
-    enum Kind { case waiting, working, idle }
+    /// Set when the qoro interface shows this row as done: it finished while the person
+    /// was on another tab. Absent from a qoro that predates it.
+    let news: Bool?
+
+    enum Kind { case waiting, done, working, idle }
 
     var kind: Kind {
         switch state {
         case "blocked", "failed": return .waiting
         case "working": return .working
-        default: return .idle
+        default: return news == true ? .done : .idle
         }
     }
 
@@ -60,7 +64,7 @@ struct Row: Decodable, Equatable, Identifiable {
         return agent_title ?? (kind == .waiting ? "needs you" : "")
     }
     /// Blocked or Failed for a row that needs you, nothing for the rest.
-    var ink: Color? { state == "failed" ? failed : kind == .waiting ? blocked : nil }
+    var ink: Color? { state == "failed" ? failed : kind == .waiting ? blocked : kind == .done ? done : nil }
 }
 
 struct Pet: Decodable {
@@ -156,18 +160,20 @@ final class Store: ObservableObject {
     var needInk: Color { rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? failed : blocked }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
+    /// Finished while the person was elsewhere, as the qoro interface shows it.
+    var finished: Int { rows.filter { $0.kind == .done }.count }
     /// Whether the rows come from more than one session, so each says which.
     var mixed: Bool { Set(rows.map(\.session)).count > 1 }
 
     /// The right ear in words, zeros left out: what is drawn, and what its width is measured by.
     var countsText: String {
-        [working > 0 ? "\(working) working" : nil, idle > 0 ? "\(idle) idle" : nil]
+        [finished > 0 ? "\(finished) done" : nil, working > 0 ? "\(working) working" : nil, idle > 0 ? "\(idle) idle" : nil]
             .compactMap { $0 }.joined(separator: " \u{00b7} ")
     }
 
     func take(_ next: [Row]) {
         let before = Dictionary(rows.map { ($0.tab, $0.kind) }, uniquingKeysWith: { a, _ in a })
-        let finished = next.contains { before[$0.tab] == .working && $0.kind == .idle }
+        let finished = next.contains { before[$0.tab] == .working && ($0.kind == .idle || $0.kind == .done) }
         // A slept terminal is a remembered row with no process behind it: nothing to
         // count, and nothing a click could show.
         let agents = next.filter { $0.agent && $0.state != "sleeping" }
@@ -604,6 +610,7 @@ func hostApp(of pid: pid_t) -> NSRunningApplication? {
 // the same ink here as in the sidebar and on the phone.
 let blocked = hex("#ff8700")!
 let failed = hex("#ff00ff")!
+let done = hex("#00af5f")!
 let focus = hex("#ff87d7")!
 let spring = Animation.spring(response: 0.42, dampingFraction: 0.74)
 
@@ -705,6 +712,10 @@ struct Counts: View {
     @ObservedObject var s: Store
     var body: some View {
         HStack(spacing: 4) {
+            if s.finished > 0 {
+                Text("\(s.finished) done").foregroundStyle(done).contentTransition(.numericText())
+            }
+            if s.finished > 0, s.working + s.idle > 0 { Text("\u{00b7}").foregroundStyle(.white.opacity(0.35)) }
             if s.working > 0 {
                 Text("\(s.working) working").foregroundStyle(.white).contentTransition(.numericText())
             }
@@ -982,6 +993,7 @@ struct Island: View {
                 Spacer()
                 HStack(spacing: 12) {
                     Text("\(s.waiting) waiting").foregroundStyle(s.needInk)
+                    if s.finished > 0 { Text("\(s.finished) done").foregroundStyle(done) }
                     Text("\(s.working) working").foregroundStyle(.white)
                     Text("\(s.idle) idle").foregroundStyle(.white.opacity(0.45))
                 }
@@ -1010,6 +1022,7 @@ struct Island: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
                     section("needs you", .waiting)
+                    section("done", .done)
                     section("working", .working)
                     section("idle", .idle)
                 }
@@ -1312,7 +1325,7 @@ struct Geometry {
     }
 
     func openHeight(_ s: Store) -> CGFloat {
-        let sections = [Row.Kind.waiting, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
+        let sections = [Row.Kind.waiting, .done, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
         let peek: CGFloat = s.expanded == nil ? 0 : TermPeek.height + 6 + 18 + 12
         let note: CGFloat = s.note == nil || s.expanded != nil ? 0 : 26
         let full = notch.height + 40 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + 4 + peek + note

@@ -2440,6 +2440,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace,
@@ -2465,6 +2466,7 @@ mod tests {
 
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace,
@@ -3059,6 +3061,7 @@ mod tests {
 
     fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: Some(name.to_string()),
             workspace,
@@ -3306,6 +3309,7 @@ mod tests {
     #[test]
     fn a_wrapper_is_shown_as_standing_in_the_way_and_never_as_the_program() {
         let agents = vec![AgentRow {
+            news: false,
             terminal: 5,
             name: None,
             workspace: 1,
@@ -3341,6 +3345,7 @@ mod tests {
     #[test]
     fn an_unknown_state_is_drawn_as_nothing_and_leaves_the_name_the_whole_row() {
         let agents = vec![AgentRow {
+            news: false,
             terminal: 5,
             name: None,
             workspace: 1,

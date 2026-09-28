@@ -22,6 +22,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
 
 fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
     AgentRow {
+        news: false,
         terminal,
         name: None,
         workspace,

@@ -1538,6 +1538,7 @@ mod tests {
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             workspace: 1,
             name: name.map(str::to_string),

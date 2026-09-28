@@ -216,6 +216,8 @@ pub struct Connection {
     /// Whether the peer introduced itself as an interface, the one kind of client that
     /// shows a terminal to a person and so the one `qoro focus` is for.
     interface: std::sync::atomic::AtomicBool,
+    /// The terminals this connection last said are news for its person (`News`).
+    news: std::sync::Mutex<BTreeSet<u32>>,
 }
 
 impl ConnectionRegistry {
@@ -268,8 +270,39 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    fn remove(&self, client: &ClientId) {
-        self.inner.lock().unwrap().retain(|c| &c.client != client);
+    /// Take a connection out, and say which terminals it held as news: their rows change.
+    fn remove(&self, client: &ClientId) -> Vec<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        let news = inner
+            .iter()
+            .filter(|c| &c.client == client)
+            .flat_map(|c| c.news.lock().unwrap().clone())
+            .collect();
+        inner.retain(|c| &c.client != client);
+        news
+    }
+
+    /// Replace what one connection counts as news, and say which terminals moved.
+    fn set_news(&self, client: &ClientId, terminals: Vec<u32>) -> Vec<u32> {
+        let wanted: BTreeSet<u32> = terminals.into_iter().collect();
+        let inner = self.inner.lock().unwrap();
+        let Some(connection) = inner.iter().find(|c| &c.client == client) else {
+            return Vec::new();
+        };
+        let mut held = connection.news.lock().unwrap();
+        let moved = held.symmetric_difference(&wanted).copied().collect();
+        *held = wanted;
+        moved
+    }
+
+    /// Every terminal some connection counts as news.
+    pub fn news(&self) -> BTreeSet<u32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.news.lock().unwrap().clone())
+            .collect()
     }
 
     fn contains(&self, client: &ClientId) -> bool {
@@ -1026,7 +1059,9 @@ impl Daemon {
                 admitted: std::time::Instant::now(),
                 pid: peer_pid(&stream),
                 interface: std::sync::atomic::AtomicBool::new(false),
+                news: std::sync::Mutex::default(),
             });
+            let announce = self.agents.clone();
             tokio::spawn(async move {
                 // Milestone 1 has one attach mode and it is writable. Read-only observers
                 // are a milestone 2 surface; the arbitration below already refuses them.
@@ -1056,7 +1091,10 @@ impl Daemon {
                 if let Err(e) = result {
                     eprintln!("qorod: client ended: {e}");
                 }
-                registry.remove(&registered);
+                // What it held as news is news no more: every index looks again.
+                for terminal in registry.remove(&registered) {
+                    announce.announce(terminal);
+                }
             });
         }
     }
@@ -2341,6 +2379,7 @@ fn verify_waiter(
 /// separately); every belief field absent rather than wrong.
 fn tomb_row(tomb: &crate::agents::Tombstone) -> crate::control::AgentRow {
     crate::control::AgentRow {
+        news: false,
         terminal: tomb.stream,
         name: tomb.name.clone(),
         workspace: tomb.workspace,
@@ -2874,6 +2913,8 @@ async fn handle_control(
             }
         }
         ControlRequest::ListAgents { .. } => {
+            // What the attached interfaces count as news, read once for every row.
+            let news = connections.news();
             // Titles come out of the agents' own storage: a directory walk, a megabyte of
             // transcript per Claude tab, a database for opencode, on a disk the user
             // chose. All of them at once on the probe pool with a deadline (ADR-011),
@@ -2972,6 +3013,7 @@ async fn handle_control(
                     )
                     .to_string();
                     crate::control::AgentRow {
+                        news: news.contains(&terminal),
                         terminal,
                         name: terminals.name_of(terminal),
                         workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
@@ -3071,6 +3113,14 @@ async fn handle_control(
                 reason: format!("no terminal {terminal}"),
             },
         },
+        ControlRequest::News {
+            terminals: news, ..
+        } => {
+            for terminal in connections.set_news(client, news) {
+                agents.announce(terminal);
+            }
+            ControlResponse::NewsNoted { id }
+        }
         ControlRequest::Subscribe {
             terminals: wanted, ..
         } => {

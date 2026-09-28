@@ -290,6 +290,7 @@ mod tests {
 
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace: 1,
@@ -315,6 +316,7 @@ mod tests {
 
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace: 1,

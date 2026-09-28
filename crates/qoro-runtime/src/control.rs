@@ -138,6 +138,12 @@ pub enum ControlRequest {
         id: String,
         terminal: TerminalStream,
     },
+    /// The terminals this interface counts as news right now, replacing what it said
+    /// before. Held for the connection's life; see `AgentRow::news`.
+    News {
+        id: String,
+        terminals: Vec<TerminalStream>,
+    },
     /// Receive renders for these terminals. Subscribing to a terminal twice is not an
     /// error and does not double the traffic: the set is a set.
     Subscribe {
@@ -304,6 +310,7 @@ impl ControlRequest {
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
             | Self::Focus { id, .. }
+            | Self::News { id, .. }
             | Self::ListWorkspaces { id }
             | Self::CreateWorkspace { id, .. }
             | Self::CloseWorkspace { id, .. }
@@ -478,6 +485,10 @@ pub enum ControlResponse {
     },
     /// `HostColors` was taken: programs asking from now on get these.
     HostColorsNoted {
+        id: String,
+    },
+    /// `News` was taken: the rows say it from now on.
+    NewsNoted {
         id: String,
     },
 }
@@ -753,6 +764,13 @@ pub struct AgentRow {
     /// leave the discard silent. Absent on rows from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discards: Option<Discards>,
+    /// Whether an interface counts this terminal as news for the person: an agent that
+    /// finished while they were on another tab, or a `done` they have not read. The
+    /// interface decides, since it is what showed the person the terminal; it says so with
+    /// `News`, and this is true while any attached interface holds it. What the notch
+    /// shows as done. Written only when true, and false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub news: bool,
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -814,6 +832,7 @@ impl ControlResponse {
             | Self::RemoteMissing { id, .. }
             | Self::RemoteInstalled { id, .. }
             | Self::HostColorsNoted { id }
+            | Self::NewsNoted { id }
             | Self::SplitSaved { id }
             | Self::Failed { id, .. } => id,
         }
@@ -1090,6 +1109,7 @@ mod tests {
         assert_eq!(new.slept_at_unix, Some(1_750_000_000));
         // Skipped on the wire when absent: live rows say nothing new.
         let live = AgentRow {
+            news: false,
             terminal: 3,
             workspace: 1,
             name: None,

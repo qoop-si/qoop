@@ -2055,6 +2055,7 @@ mod tests {
 
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace: 1,
@@ -3900,6 +3901,7 @@ mod tests {
 
     fn blocked_row(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace: 1,
@@ -4472,6 +4474,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, state)| AgentRow {
+                news: false,
                 terminal: i as u32 + 1,
                 name: None,
                 workspace: 1,

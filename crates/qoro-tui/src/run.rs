@@ -631,6 +631,10 @@ struct State {
     host_sent: Option<([u8; 3], [u8; 3])>,
     /// The daemon predates `HostColors` and said so: not asked again this session.
     host_refused: bool,
+    /// The rows last told to the daemon as news, so the same set is not sent again.
+    news_sent: Option<Vec<u32>>,
+    /// The daemon predates `News` and said so: not told again this session.
+    news_refused: bool,
     /// State changes waiting out `notify::DELAY` before they are said, and when the first
     /// of them is due. Empty on a quiet screen, so nothing is armed (ADR-009).
     notes: Vec<crate::notify::Note>,
@@ -2948,6 +2952,8 @@ where
         host_light: None,
         host_sent: None,
         host_refused: false,
+        news_sent: None,
+        news_refused: false,
         notes: Vec::new(),
         notes_due: None,
         route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
@@ -3141,6 +3147,10 @@ where
             {
                 wr.write_all(&sync).await?;
                 dirty = true;
+            }
+            if let Some(tell) = news_request(&mut state, &mut request) {
+                wr.write_all(&client::encode_control_seq(&tell, &mut control_seq)?)
+                    .await?;
             }
             // At most one frame per `FRAME`. The first render after a quiet spell goes out
             // at once, so a keystroke echoes with no added wait; renders arriving closer
@@ -5160,6 +5170,32 @@ fn host_colors_request(state: &mut State, request: &mut u64) -> Option<ControlRe
     })
 }
 
+/// The rows this interface shows as news (finished while the keyboard was elsewhere, or a
+/// `done` not read), when they are not what the daemon was last told. Told so that every
+/// other index, the notch among them, says the same "done" this one does. Only this
+/// machine's rows: the numbers of another machine's are not this daemon's.
+fn news_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> {
+    if state.news_refused {
+        return None;
+    }
+    let news: Vec<u32> = state
+        .rows
+        .iter()
+        .filter(|r| !crate::mux::is_remote_workspace(r.workspace))
+        .filter(|r| sidebar::is_new(r, state.focused, &state.seen_done, &state.unseen_finished))
+        .map(|r| r.terminal)
+        .collect();
+    if state.news_sent.as_ref() == Some(&news) {
+        return None;
+    }
+    state.news_sent = Some(news.clone());
+    *request += 1;
+    Some(ControlRequest::News {
+        id: format!("news-{request}"),
+        terminals: news,
+    })
+}
+
 /// Hold a desktop note for a row that has just started needing a person who is not
 /// looking at it: another tab has the keyboard, or the whole window lost the focus.
 ///
@@ -6723,6 +6759,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 state.host_refused = true;
                 return;
             }
+            // The same for the news this interface tells: an older daemon has no rows to
+            // put it on.
+            if id.is_empty() && reason.contains("`News`") {
+                state.news_refused = true;
+                return;
+            }
             // A split whose spawn failed rolls its tree entry back where it
             // was asked for: one failure must not clear another space's
             // split still on its way, and a rollback on screen only would
@@ -6961,6 +7003,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            news: false,
             terminal,
             name: None,
             workspace,
@@ -7163,6 +7206,8 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            news_sent: None,
+            news_refused: false,
             notes: Vec::new(),
             notes_due: None,
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
@@ -7384,6 +7429,57 @@ mod tests {
             other => panic!("a detach closed nothing: {other:?}"),
         }
         assert_eq!(state.palette, None);
+    }
+
+    /// The rows shown as news go to the daemon when the set moves, never twice the same,
+    /// never another machine's, and an older daemon's refusal ends the telling.
+    #[test]
+    fn news_is_told_when_it_moves_and_only_this_machines() {
+        let mut state = state();
+        let mut request = 0;
+        let remote = 1i64 << 40;
+        state.rows = vec![
+            agent(2, 1, "claude", "idle"),
+            agent(3, 1, "claude", "idle"),
+            agent(9, remote, "claude", "idle"),
+        ];
+        state.focused = 3;
+        let told = |r: Option<ControlRequest>| match r {
+            Some(ControlRequest::News { terminals, .. }) => terminals,
+            other => panic!("nothing told: {other:?}"),
+        };
+        assert_eq!(
+            told(news_request(&mut state, &mut request)),
+            Vec::<u32>::new()
+        );
+        assert!(
+            news_request(&mut state, &mut request).is_none(),
+            "the same set twice"
+        );
+        // Finished while the keyboard was elsewhere, here and on another machine.
+        for t in [2, 9] {
+            state.unseen_finished.insert((t, 0));
+        }
+        assert_eq!(told(news_request(&mut state, &mut request)), vec![2]);
+        // Looked at: news no more.
+        state.focused = 2;
+        assert_eq!(
+            told(news_request(&mut state, &mut request)),
+            Vec::<u32>::new()
+        );
+        state.focused = 3;
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: String::new(),
+                reason: "unknown variant `News`".into(),
+            },
+            &mut false,
+        );
+        assert!(
+            news_request(&mut state, &mut request).is_none(),
+            "an old daemon is not asked again"
+        );
     }
 
     /// The colours go to the daemon once both are known and again only when they change;
@@ -7708,6 +7804,8 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            news_sent: None,
+            news_refused: false,
             notes: Vec::new(),
             notes_due: None,
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
@@ -7816,6 +7914,8 @@ mod tests {
             host_light: None,
             host_sent: None,
             host_refused: false,
+            news_sent: None,
+            news_refused: false,
             notes: Vec::new(),
             notes_due: None,
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
