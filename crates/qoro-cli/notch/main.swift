@@ -850,7 +850,7 @@ func keyOp(_ press: KeyPress) -> Keys.Op? {
         return .text(text.contains("\n") ? "\u{1b}[200~" + text + "\u{1b}[201~" : text)
     }
     let named: [KeyEquivalent: String] = [
-        .return: "enter", .escape: "esc", .delete: "backspace", .upArrow: "up", .downArrow: "down",
+        .return: "enter", .escape: "esc", .upArrow: "up", .downArrow: "down",
         .leftArrow: "left", .rightArrow: "right", .home: "home", .end: "end", .pageUp: "pageup",
         .pageDown: "pagedown",
     ]
@@ -860,6 +860,11 @@ func keyOp(_ press: KeyPress) -> Keys.Op? {
     }
     // A new line rather than a send, the way agents take Esc then Enter.
     if press.key == .return, !press.modifiers.isDisjoint(with: [.shift, .option]) { return .text("\u{1b}\r") }
+    // Backspace is DEL (U+007F) from a Mac keyboard; SwiftUI's `.delete` is U+0008. Either
+    // one rubs out a character, and with Option a word, as a terminal's meta key does.
+    if press.key == .delete || press.key.character == "\u{7f}" {
+        return press.modifiers.contains(.option) ? .text("\u{1b}\u{7f}") : .key("backspace")
+    }
     if let name = named[press.key] { return .key(name) }
     if press.modifiers.contains(.control) {
         let c = press.key.character.lowercased()
@@ -916,7 +921,12 @@ struct TermPeek: View {
                 typing = true
             }
             .onKeyPress(phases: [.down, .repeat]) { press in
-                guard let op = keyOp(press) else { return .ignored }
+                // A key the terminal has no use for is still taken while typing here, rather
+                // than passed up to the system, which answers it with the error beep. Command
+                // keys go on, so the system's own shortcuts keep working.
+                guard let op = keyOp(press) else {
+                    return press.modifiers.contains(.command) ? .ignored : .handled
+                }
                 store.keys(for: row.tab).push(op)
                 return .handled
             }
