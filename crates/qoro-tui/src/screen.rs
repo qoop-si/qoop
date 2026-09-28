@@ -4429,7 +4429,7 @@ mod tests {
         assert_eq!(
             texts
                 .iter()
-                .skip_while(|t| !t.starts_with(" spaces"))
+                .skip_while(|t| !t.starts_with("   spaces"))
                 .filter(|t| {
                     t.starts_with(" \u{2502} \u{25cf} claude")
                         || t.starts_with(" \u{2502} \u{25c6} claude")
@@ -4442,7 +4442,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with(" spaces") && t.ends_with("tree +")),
+                .any(|t| t.starts_with("   spaces") && t.ends_with("tree +")),
             "{texts:?}"
         );
     }

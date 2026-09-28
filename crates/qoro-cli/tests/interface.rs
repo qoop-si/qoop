@@ -276,7 +276,7 @@ fn agents_title_row(screen: &Screen) -> Option<usize> {
                 .take(index_width())
                 .collect::<String>()
                 .trim_end()
-                .starts_with(" spaces")
+                .starts_with("   spaces")
         })
     })
 }
@@ -917,7 +917,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         .unwrap_or_default();
     // One title over the whole column: the order word, then the corner that makes a space.
     assert!(
-        title.starts_with(" spaces") && title.ends_with("tree +"),
+        title.starts_with("   spaces") && title.ends_with("tree +"),
         "the title lost its order word or its new-space corner: {title:?}"
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel

@@ -113,7 +113,7 @@ const BOX_LEAD: usize = 3;
 
 /// The columns of a space's top edge a click folds with: the corner, the arrow and the
 /// space after it. Anywhere else on the edge moves to the space.
-pub const FOLD_CELLS: usize = 6;
+pub const FOLD_CELLS: usize = 4;
 
 /// The state dot at the start of an agent's first row: one leading space,
 /// then the dot. The dot says the state in the state's own colour, so no
@@ -672,7 +672,7 @@ fn wait_word(agent: &AgentRow) -> (&'static str, crate::theme::Role) {
     }
 }
 
-/// The pin's title: ` needs you`, then how many want what, each count in its colour, in
+/// The pin's title: `   needs you`, then how many want what, each count in its colour, in
 /// the pin's own order: `▲1 wants  ✗1 failed  ✓2 done`. The words go first when the
 /// column is narrow, then the kinds, leaving the plain total.
 fn pin_title(c: &Column, needing: &[&AgentRow]) -> Line {
@@ -689,7 +689,7 @@ fn pin_title(c: &Column, needing: &[&AgentRow]) -> Line {
         (n > 0).then(|| (format!("{mark}{n}"), word, ink))
     })
     .collect();
-    let head = format!(" {PIN_TITLE}");
+    let head = format!("   {PIN_TITLE}");
     let room = c.width.saturating_sub(crate::width::width(&head) + 2);
     let spoken = |words: bool| -> Vec<(String, Role)> {
         kinds
@@ -930,6 +930,10 @@ fn pin_box(c: &Column, word: &str, kind: &[&AgentRow], inside: usize) -> Vec<Row
 }
 
 /// The title: `spaces` on the left, the order word and the `+` on the right.
+///
+/// A title is chrome, not content, but it starts in the same column as the agents'
+/// dots below it rather than two columns left of them at the box edge, so the one
+/// word a person reads first does not stick out past everything it names.
 fn title_line(c: &Column) -> Line {
     // The whole fleet's cost before the order word, when costs are shown at all.
     let total = c
@@ -942,12 +946,12 @@ fn title_line(c: &Column) -> Line {
         })
         .unwrap_or_default();
     let mode = format!("{} +", title_mode(c.view));
-    // The total only when ` spaces` still fits in front of it: the title names the list
+    // The total only when `   spaces` still fits in front of it: the title names the list
     // first, and a number in its place would name nothing.
     let right = if c
         .width
         .saturating_sub(crate::width::width(&total) + crate::width::width(&mode))
-        >= SPACES_TITLE.len() + 2
+        >= SPACES_TITLE.len() + 4
     {
         format!("{total}{mode}")
     } else {
@@ -957,7 +961,7 @@ fn title_line(c: &Column) -> Line {
         text: format!(
             "{}{right}",
             fit_to(
-                &format!(" {SPACES_TITLE}"),
+                &format!("   {SPACES_TITLE}"),
                 c.width.saturating_sub(crate::width::width(&right))
             )
         ),
@@ -1081,8 +1085,12 @@ fn content(c: &Column) -> Vec<Row> {
 /// arrow, the name, and how many tabs it holds, framed in the space's own colour.
 ///
 /// ```text
-///  ╭─ ▾ default ──────── 3 ─╮
+///  ╭▾ default ──────── 3 ─╮
 /// ```
+///
+/// The arrow sits where the pin's edge keeps its dash, so the name starts in the same
+/// column as the pin's own labels and one column right of the dots below it, instead of
+/// two further right behind a dash and a space.
 ///
 /// Folded, the arrow and the count take the colour of the most urgent agent under them
 /// when that agent wants a person, so a fold never hides a blocked agent silently. Open,
@@ -1108,7 +1116,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         kids.len().to_string()
     };
     let count_w = crate::width::width(&count);
-    // ` ╭─ ▾ ` then the name, a space, the dashes, ` 3 ─` when it holds tabs, and the
+    // ` ╭▾ ` then the name, a space, the dashes, ` 3 ─` when it holds tabs, and the
     // corner, one column in from the right as the pin's boxes are. The name gives way
     // before the count and the arrow do.
     let end_w = if count.is_empty() { 0 } else { count_w + 3 };
@@ -1117,7 +1125,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let name_w = crate::width::width(&name);
     let fill = width.saturating_sub(FOLD_CELLS + name_w + 1 + end_w + 2);
     let dashes_at = FOLD_CELLS + name_w + 1;
-    let mut runs = vec![(1, 2, ink), (dashes_at, fill, ink)];
+    let mut runs = vec![(1, 1, ink), (dashes_at, fill, ink)];
     let end = if count.is_empty() {
         runs.push((dashes_at + fill, 1, ink));
         String::new()
@@ -1128,7 +1136,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         format!(" {count} \u{2500}")
     };
     let text = format!(
-        " \u{256d}\u{2500} {arrow} {name} {}{end}\u{256e}",
+        " \u{256d}{arrow} {name} {}{end}\u{256e}",
         "\u{2500}".repeat(fill)
     );
     Line {
@@ -2672,7 +2680,7 @@ mod tests {
             );
             let title = &lines[0];
             assert!(
-                title.text.starts_with(&format!(" {SPACES_TITLE} ")),
+                title.text.starts_with(&format!("   {SPACES_TITLE} ")),
                 "{:?}",
                 title.text
             );
@@ -2724,14 +2732,14 @@ mod tests {
             .position(|t| t == "   \u{25cf} claude")
             .unwrap_or_else(|| panic!("{texts:?}"));
         assert!(
-            texts[head - 1].starts_with(" \u{256d}\u{2500} \u{25be} app "),
+            texts[head - 1].starts_with(" \u{256d}\u{25be} app "),
             "{texts:?}"
         );
         assert_eq!(texts[head + 1], "     \u{2514} claude", "{texts:?}");
         assert_eq!(texts[head + 2], "   \u{b7} sh", "{texts:?}");
         assert!(texts[head + 3].starts_with(" \u{2570}"), "{texts:?}");
         assert!(
-            texts[head + 4].starts_with(" \u{256d}\u{2500} \u{25be} personal "),
+            texts[head + 4].starts_with(" \u{256d}\u{25be} personal "),
             "{texts:?}"
         );
         // No state word on the right: the dot says the state in its colour, three
@@ -2764,7 +2772,7 @@ mod tests {
         assert_eq!(shell[0].indicator, None, "a shell has no state to colour");
         let app = lines
             .iter()
-            .find(|l| l.text.starts_with(" \u{256d}\u{2500} \u{25be} app "))
+            .find(|l| l.text.starts_with(" \u{256d}\u{25be} app "))
             .expect("the app rule");
         assert!(app.text.ends_with(" 2 \u{2500}\u{256e} "), "{:?}", app.text);
     }
@@ -2815,16 +2823,16 @@ mod tests {
         assert_eq!(
             app.text,
             format!(
-                " \u{256d}\u{2500} \u{25be} app {} 2 \u{2500}\u{256e} ",
-                "\u{2500}".repeat(14)
+                " \u{256d}\u{25be} app {} 2 \u{2500}\u{256e} ",
+                "\u{2500}".repeat(16)
             )
         );
         let ink = crate::theme::space_of(1);
         assert_eq!(
             app.runs,
             vec![
-                (1, 2, ink),
-                (10, 14, ink),
+                (1, 1, ink),
+                (8, 16, ink),
                 (25, 1, crate::theme::Role::Faint),
                 (27, 2, ink),
             ]
@@ -2834,10 +2842,7 @@ mod tests {
         let dub = rule_row(&rows, 3);
         assert_eq!(
             dub.text,
-            format!(
-                " \u{256d}\u{2500} \u{b7} dub {}\u{256e} ",
-                "\u{2500}".repeat(18)
-            )
+            format!(" \u{256d}\u{b7} dub {}\u{256e} ", "\u{2500}".repeat(20))
         );
         // Folded, the arrow points right and the count stays.
         let shut = Shut::from([1]);
@@ -2845,7 +2850,7 @@ mod tests {
         assert!(
             rule_row(&rows, 1)
                 .text
-                .starts_with(" \u{256d}\u{2500} \u{25b8} app "),
+                .starts_with(" \u{256d}\u{25b8} app "),
             "{:?}",
             rule_row(&rows, 1).text
         );
@@ -2914,7 +2919,7 @@ mod tests {
                     // Under the title a box is a space's; above it, a box is the pin's.
                     let in_tree = lines[..row]
                         .iter()
-                        .any(|l| l.text.starts_with(&format!(" {SPACES_TITLE}")));
+                        .any(|l| l.text.starts_with(&format!("   {SPACES_TITLE}")));
                     // A second row reaches the terminal named just above it. Only the
                     // focused terminal's, 3, may open a window with its name cut off,
                     // when that row is all the window has room for.
@@ -2924,8 +2929,13 @@ mod tests {
                     };
                     let want = if text.trim_start().starts_with('\u{2514}') {
                         second
-                    } else if in_tree && text.starts_with(" \u{256d}\u{2500} ") {
-                        // A space's top edge moves to the space it names.
+                    } else if in_tree
+                        && text.starts_with(" \u{256d}")
+                        && !text.starts_with(" \u{256d}\u{2500} ")
+                    {
+                        // A space's top edge moves to the space it names. Its arrow
+                        // sits where the pin's edge keeps a dash, so the dash tells
+                        // the pin's boxes apart from the spaces'.
                         spaces
                             .iter()
                             .find(|s| text.contains(&format!(" {} ", s.name)))
@@ -2976,12 +2986,13 @@ mod tests {
                         }
                     } else if text.is_empty()
                         || text.chars().all(|c| c == '\u{2500}')
-                        || text.starts_with(&format!(" {PIN_TITLE}"))
+                        || text.starts_with(&format!("   {PIN_TITLE}"))
                     {
                         // Blank rows, the rule under the pin and the pin's own title
                         // do nothing when clicked.
                         None
-                    } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
+                    } else if text.starts_with(&format!("   {SPACES_TITLE}")) && text.ends_with('+')
+                    {
                         Some(Hit::Title)
                     } else if text.contains(BRAND) && text.ends_with('\u{ab}') {
                         Some(Hit::Foot)
@@ -3374,7 +3385,7 @@ mod tests {
         let rule = rule_row(&rows, 1);
         assert!(
             rule.text
-                .starts_with(" \u{256d}\u{2500} \u{25be} \u{4e2d}\u{6587} \u{2500}"),
+                .starts_with(" \u{256d}\u{25be} \u{4e2d}\u{6587} \u{2500}"),
             "{:?}",
             rule.text
         );
@@ -3488,7 +3499,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with(&format!(" {SPACES_TITLE}")) && t.ends_with("tree +")),
+                .any(|t| t.starts_with(&format!("   {SPACES_TITLE}")) && t.ends_with("tree +")),
             "{texts:?}"
         );
         for line in &lines {
@@ -4119,7 +4130,7 @@ mod tests {
         assert_eq!(
             texts[..13],
             [
-                " needs you  \u{25b2}1 wants  \u{2713}2 done".to_string(),
+                "   needs you            \u{25b2}1 \u{2713}2".to_string(),
                 format!(" \u{256d}\u{2500} wants {}\u{256e}", edge(18)),
                 " \u{2502} \u{25cf} Claude Code TUI t\u{2026} 12s \u{2502}".to_string(),
                 " \u{2502}   \u{2514} Wait 8 seconds, the\u{2026} \u{2502}".to_string(),
@@ -4187,7 +4198,7 @@ mod tests {
             rows[7].0.text
         );
         assert_eq!(role_at(2, 25), Some(Role::Faint));
-        assert_eq!(role_at(0, 12), Some(Role::Blocked));
+        assert_eq!(role_at(0, 24), Some(Role::Blocked));
         // Too narrow for a box: one row per agent, as before.
         let narrow = column(
             &spaces,
@@ -4261,7 +4272,7 @@ mod tests {
         assert!(
             fresh_lines
                 .iter()
-                .skip_while(|l| !l.text.starts_with(&format!(" {SPACES_TITLE}")))
+                .skip_while(|l| !l.text.starts_with(&format!("   {SPACES_TITLE}")))
                 .any(|l| l.text.starts_with(" \u{2502} \u{25c6} ")),
             "unseen failed lost its diamond: {:?}",
             texts(&fresh_lines)
@@ -4540,7 +4551,7 @@ mod tests {
         // The fold cells are exactly the top edge's corner, arrow and the space after it.
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let head: String = rule_row(&rows, 1).text.chars().take(FOLD_CELLS).collect();
-        assert_eq!(head, " \u{256d}\u{2500} \u{25be} ");
+        assert_eq!(head, " \u{256d}\u{25be} ");
     }
 
     /// No breath between the title and the tree any more: the first rule is itself a
@@ -4565,7 +4576,10 @@ mod tests {
         let rows = tree_rows(&spaces, &agents, 9, 10, &Seen::new(), &Shut::new());
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = texts(&lines);
-        assert!(texts[0].starts_with(&format!(" {PIN_TITLE}")), "{texts:?}");
+        assert!(
+            texts[0].starts_with(&format!("   {PIN_TITLE}")),
+            "{texts:?}"
+        );
         assert!(texts[0].ends_with("\u{25b2}1 wants"), "{texts:?}");
         assert_eq!(lines[0].colour, Some(crate::theme::Role::Title));
         assert_eq!(rows[0].1, None);
@@ -5035,7 +5049,7 @@ mod tests {
                 c.usage = Some(&usage);
                 let title = title_line(&c);
                 assert!(
-                    title.text.starts_with(" spaces "),
+                    title.text.starts_with("   spaces "),
                     "{width}: {:?}",
                     title.text
                 );
@@ -5201,7 +5215,7 @@ mod tests {
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
         assert!(
-            app.text.starts_with(" \u{256d}\u{2500} \u{25b8} app "),
+            app.text.starts_with(" \u{256d}\u{25b8} app "),
             "{:?}",
             app.text
         );
@@ -5216,7 +5230,7 @@ mod tests {
         assert!(
             rule_row(&rows, 2)
                 .text
-                .starts_with(" \u{256d}\u{2500} \u{25be} dub "),
+                .starts_with(" \u{256d}\u{25be} dub "),
             "{:?}",
             rule_row(&rows, 2).text
         );
@@ -6002,7 +6016,7 @@ mod tests {
                         width,
                     );
                     assert_eq!(
-                        lines[0].text.starts_with(&format!(" {PIN_TITLE}")),
+                        lines[0].text.starts_with(&format!("   {PIN_TITLE}")),
                         pinned_fleet && view == View::Tree,
                         "width {width}: {:?}",
                         lines[0].text
