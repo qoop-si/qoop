@@ -628,6 +628,15 @@ pub struct WorkspaceRow {
     /// The tabs a wake brings back, when `asleep`.
     #[serde(default)]
     pub sleeping: Vec<SleepingTab>,
+    /// Whether this daemon will close this space when asked. False for the session's
+    /// default, which is where a client that names no workspace lands and which cannot be
+    /// dropped without every later default creation becoming a foreign-key refusal.
+    ///
+    /// Defaulted false, not true: an older daemon omits the field, and a client reading
+    /// that as "yes" offers a close that is always refused. Missing means "no", and the
+    /// cost of missing is one control that is not drawn.
+    #[serde(default)]
+    pub closable: bool,
 }
 
 /// A tab of a sleeping workspace, as its row in the store keeps it.

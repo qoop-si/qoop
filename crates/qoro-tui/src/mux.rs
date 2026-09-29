@@ -259,6 +259,10 @@ impl Link {
                     terminals: 0,
                     asleep: row.asleep,
                     sleeping: row.sleeping.clone(),
+                    // A link that is not answering cannot be asked to close anything, and
+                    // what the far daemon would say about it is as stale as the rest of this
+                    // row. No close, and no dead control drawn for one.
+                    closable: false,
                 })
                 .collect();
         }
@@ -268,6 +272,7 @@ impl Link {
             terminals: 0,
             asleep: false,
             sleeping: Vec::new(),
+            closable: false,
         }]
     }
 }
@@ -1065,6 +1070,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                                     Some(tab)
                                 })
                                 .collect(),
+                            // The far daemon's own answer, carried across: a remote space
+                            // carries its rules with it, and `CloseWorkspace` is routed
+                            // back to the link that owns it.
+                            closable: row.closable,
                         })
                     })
                     .collect();

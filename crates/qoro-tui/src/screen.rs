@@ -40,6 +40,8 @@ pub struct Frame<'a> {
     pub snapshot: Option<&'a SnapshotWire>,
     pub cols: u16,
     pub lines: u16,
+    /// The space whose rule is asking whether it should close, or `None` while no rule is.
+    pub armed: Option<i64>,
     /// Shown instead of the key list, when there is something to say.
     pub message: Option<&'a str>,
     /// Something worth saying while nothing else is happening, said until the person does
@@ -152,6 +154,7 @@ impl Frame<'_> {
             } else {
                 self.chrome.dim
             },
+            armed: self.armed,
             tick: self.tick,
             view: self.view,
             seen: self.seen,
@@ -2219,6 +2222,7 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }]
     }
 
@@ -2521,6 +2525,7 @@ mod tests {
         let cols = 100u16;
         let lines = 24u16;
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2574,6 +2579,7 @@ mod tests {
     fn the_keybinds_overlay_paints_on_an_80_by_24_window() {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2621,6 +2627,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2674,6 +2681,7 @@ mod tests {
         let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes,
@@ -2728,6 +2736,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle"), row(3, "sh", "idle")];
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2784,6 +2793,7 @@ mod tests {
         let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: panes.clone(),
@@ -2831,6 +2841,7 @@ mod tests {
     fn the_menu_teaches_the_key_each_row_replaces() {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2924,6 +2935,7 @@ mod tests {
         let long = "x".repeat(500);
         let snapshot = snapshot(&[&long]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -2969,6 +2981,7 @@ mod tests {
     fn a_frame_with_no_snapshot_yet_still_paints() {
         let rows = [row(1, "zsh", "starting")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3020,6 +3033,7 @@ mod tests {
         }]];
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3073,6 +3087,7 @@ mod tests {
         let snapshot = snapshot(&["plain"]);
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3138,6 +3153,7 @@ mod tests {
         }]];
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3202,6 +3218,7 @@ mod tests {
         snapshot.cursor = (0, 2);
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3254,6 +3271,7 @@ mod tests {
         snapshot.modes.cursor_visible = false;
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3304,6 +3322,7 @@ mod tests {
         let snapshot = snapshot(&["x".repeat(200).as_str()]);
         for cols in [1u16, 5, 10, 20, 23, 24, 25, 40] {
             let painted = paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -3355,6 +3374,7 @@ mod tests {
     fn the_cursor_comes_back_on_even_before_the_first_snapshot() {
         let rows = [row(1, "sh", "starting")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3404,6 +3424,7 @@ mod tests {
         let panes = std::collections::BTreeSet::new();
         let spaces = spaces();
         let frame = Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes,
@@ -3521,6 +3542,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         for cols in [40u16, 60, 80, 100, 200] {
             let painted = paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -3708,6 +3730,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         for (cols, lines) in [(80u16, 24u16), (120, 40), (160, 50)] {
             let painted = paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -3754,6 +3777,7 @@ mod tests {
         let snapshot = snapshot(&["PANE_CONTENT"]);
         for lines in [3u16, 4, 5] {
             let painted = paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -3820,6 +3844,7 @@ mod tests {
     fn a_space_wears_its_colour_on_its_rule_and_the_agent_its_state() {
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -3878,6 +3903,7 @@ mod tests {
         let rows = [row(1, "claude", "working")];
         let paint_at = |tick: u64| {
             paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -3952,9 +3978,11 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }];
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &wide,
             panes: std::collections::BTreeSet::new(),
@@ -4043,6 +4071,7 @@ mod tests {
         let snapshot = snapshot(&["şğüöçİĞÜÖÇşğüöçİĞÜÖÇşğüöçİĞÜÖÇ"]);
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4130,6 +4159,7 @@ mod tests {
         let rows = [blocked_row(1, "codex")];
         let snapshot = snapshot(&["waiting"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4177,6 +4207,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         let snapshot = snapshot(&["quiet"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4221,6 +4252,7 @@ mod tests {
         let rows = [blocked_row(1, "codex")];
         let snapshot = snapshot(&["waiting"]);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4270,9 +4302,11 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }];
         let palette = Palette::open();
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &wide,
             panes: std::collections::BTreeSet::new(),
@@ -4319,6 +4353,7 @@ mod tests {
         let snapshot = snapshot(&["terminal output"]);
         let palette = Palette::open();
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4402,6 +4437,7 @@ mod tests {
         }]];
         let palette = Palette::open();
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4481,6 +4517,7 @@ mod tests {
         let behind = crate::run::Behind::default();
         for cols in 10..=13u16 {
             let painted = paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -4557,6 +4594,7 @@ mod tests {
             rows: 8,
         };
         let frame_of = |tiles: Vec<Tile<'static>>| Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeSet::new(),
@@ -4621,6 +4659,7 @@ mod tests {
             palette.push(c);
         }
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4669,6 +4708,7 @@ mod tests {
             terminals: 9,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }];
         let states = [
             "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",
@@ -4706,6 +4746,7 @@ mod tests {
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
         let lines = sidebar::render_folded(
             &sidebar::Column {
+                armed: None,
                 spaces: &spaces,
                 agents: &rows,
                 focused_space: 1,
@@ -4765,6 +4806,7 @@ mod tests {
         let mut selection = crate::selection::Selection::start(0, 4);
         selection.extend(0, 8);
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4828,6 +4870,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let build = |selection| {
             paint(&Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -4880,6 +4923,7 @@ mod tests {
             total: 100,
         };
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -4941,6 +4985,7 @@ mod tests {
             total: 1,
         };
         let painted = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
@@ -5092,6 +5137,7 @@ mod tests {
             })
             .collect();
         paint(&Frame {
+            armed: None,
             rows,
             spaces,
             panes: std::collections::BTreeSet::new(),
@@ -5132,6 +5178,7 @@ mod tests {
         let behind = crate::run::Behind::default();
         let (pane_cols, pane_rows) = pane_size(80, 24);
         let legacy = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeSet::new(),
@@ -5163,6 +5210,7 @@ mod tests {
             chrome: Default::default(),
         });
         let tiled = paint(&Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeSet::new(),
@@ -5219,6 +5267,7 @@ mod tests {
         let seen = sidebar::Seen::new();
         let unseen = sidebar::Unseen::new();
         let frame_of = |notice: Option<&'static str>| Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes: panes.clone(),
@@ -5464,6 +5513,7 @@ mod tests {
         let mut out = String::new();
         paint_reading(
             &Frame {
+                armed: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeSet::new(),
@@ -5520,6 +5570,7 @@ mod tests {
             total: 0,
         };
         let frame = |focused| Frame {
+            armed: None,
             rows: &rows,
             spaces: &spaces,
             panes: panes.clone(),

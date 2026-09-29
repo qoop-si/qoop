@@ -310,6 +310,7 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }
     }
 

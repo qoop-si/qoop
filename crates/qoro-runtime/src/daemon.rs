@@ -3000,6 +3000,10 @@ async fn handle_control(
                         .count(),
                     asleep,
                     sleeping,
+                    // The default is where a client that names no workspace lands, and
+                    // `CloseWorkspace` refuses it (below), so a client that is told so
+                    // does not draw a close for a space that cannot be closed.
+                    closable: row.id != workspace,
                 });
             }
             ControlResponse::Workspaces { id, workspaces }

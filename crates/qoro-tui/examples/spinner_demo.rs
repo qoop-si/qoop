@@ -19,6 +19,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
         terminals: 4,
         asleep: false,
         sleeping: Vec::new(),
+        closable: true,
     }
 }
 
@@ -67,6 +68,7 @@ fn main() {
         space: Some(1),
         panes: std::collections::BTreeSet::new(),
         focused: 1,
+        armed: None,
         snapshot: None,
         cols: 60,
         lines: 16,

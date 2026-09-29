@@ -146,6 +146,14 @@ const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// How long an index request may stay unanswered before the next change asks again.
 const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a space close waits before it gives up and says what is still in the way.
+///
+/// Not a refusal and not a hang: the daemon's own teardown ends a process tree in two
+/// seconds (`qoro_pty::teardown::TEARDOWN_DEADLINE`), so a close that has not finished by
+/// then is not going to, and a person is better told the count than left watching a row
+/// that never changes.
+const CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How often the column's spinner and sweep step while an agent works: twelve frames a
 /// second, enough for a sweep across thirty columns to read as motion rather than jumps.
 const MOTION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
@@ -535,6 +543,21 @@ struct State {
     /// `None` while the mouse does anything else. The width at the press is
     /// what tells a motionless press from a pull on release.
     sidebar_drag: Option<usize>,
+    /// A space being closed, and the tabs still on their way out.
+    ///
+    /// `sent` is how many of `asked` have been asked, because each one is asked when the
+    /// last one answered. The state is kept until the space itself closes or the daemon
+    /// refuses, so a refusal says what is still in the way instead of the client having
+    /// forgotten it was in the middle of something.
+    closing: Option<Closing>,
+    /// The space whose rule is asking whether it should close, once the close has been
+    /// asked for and not yet answered.
+    ///
+    /// The question is on the rule itself rather than on the notice row, because the
+    /// person who clicked `x` is looking at the rule and the answer is a second click on
+    /// the same two columns. `None` is the ordinary case, and a row that is mid question
+    /// answers nothing else: it does not fold, does not navigate and does not sleep.
+    armed: Option<i64>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -612,6 +635,16 @@ struct State {
 /// and the tile-local cell. Divider cells answer `None`.
 type TileHit = (u32, (usize, usize), (usize, usize));
 
+/// A space being closed, and the tabs still on their way out of it.
+#[derive(Clone)]
+struct Closing {
+    space: i64,
+    /// Every tab that has to go, the live ones and a sleeping space's own, in the order
+    /// they are asked for.
+    asked: Vec<u32>,
+    sent: usize,
+}
+
 /// The modes that own the keyboard for a while, and what they leave for the loop.
 ///
 /// Together because they are one idea: a key means something else until the mode is left,
@@ -686,6 +719,7 @@ impl State {
             space: self.space,
             panes: self.panes(),
             focused: self.focused,
+            armed: self.armed,
             snapshot: self.snapshot.as_ref(),
             cols: self.cols,
             lines: self.lines,
@@ -1054,6 +1088,10 @@ impl State {
         match sidebar::act(hit, col as usize, &column, self.collapsed)? {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
+            sidebar::Act::Sleep(space) => Some(Clicked::Sleep(space)),
+            sidebar::Act::Close(space) => Some(Clicked::Close(space)),
+            sidebar::Act::ConfirmClose(space) => Some(Clicked::ConfirmClose(space)),
+            sidebar::Act::CancelClose => Some(Clicked::CancelClose),
             sidebar::Act::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
             sidebar::Act::NewSpace => Some(Clicked::NewSpace),
             sidebar::Act::Menu => Some(Clicked::Menu),
@@ -1080,6 +1118,7 @@ impl State {
             now_unix,
             width: self.sidebar_width,
             shut: &self.shut,
+            armed: self.armed,
             usage: Some(&self.usage),
         }
     }
@@ -2070,7 +2109,9 @@ fn mode_key(bytes: &[u8], at: usize) -> (ModeKey, usize) {
 fn mode_input(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> ModeOutcome {
     let mut input = std::mem::take(&mut state.modes.pending);
     input.extend_from_slice(bytes);
-    let outcome = if state.modes.confirm_close.is_some() {
+    let outcome = if let Some(space) = state.armed {
+        armed_key(state, space, &input, request)
+    } else if state.modes.confirm_close.is_some() {
         confirm_key(state, &input, request)
     } else if state.modes.resizing {
         resize_key(state, &input)
@@ -2134,6 +2175,12 @@ fn sleep_toggle(state: &mut State, request: &mut u64) {
         state.message = Some("no space to put to sleep".to_string());
         return;
     };
+    sleep_space(state, space, request);
+}
+
+/// The same toggle, for a named space rather than the one on screen, which is what the
+/// rule's own `z` is: a person clicking a row means that row, not where they are.
+fn sleep_space(state: &mut State, space: i64, request: &mut u64) {
     if state.asleep(space) {
         let to = state.dim_tab();
         wake(state, space, to, request);
@@ -2158,7 +2205,12 @@ fn wake(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
             .and_then(|w| w.sleeping.first())
             .map(|t| t.terminal)
     });
-    state.waking = to.map(|to| (space, to));
+    // Only a wake of the space on screen moves the screen: a background space's tabs come
+    // back where they were left, which is the whole point of waking one you are not in.
+    state.waking = (state.space == Some(space))
+        .then_some(to)
+        .flatten()
+        .map(|to| (space, to));
     state.message = Some(format!("waking {}", space_name(state, space)));
     state.modes.outbox.push(ControlRequest::WakeWorkspace {
         id: format!("wake-{request}"),
@@ -2200,6 +2252,180 @@ fn nothing_awake(state: &State) -> bool {
             .spaces
             .iter()
             .any(|w| !w.asleep && crate::mux::is_remote_workspace(w.id))
+}
+
+/// The answer to a space rule's own question: `y` closes it, `n` or anything else keeps it.
+///
+/// Lowercase, unlike the tab close's capital `Y`. That one is about a stray `y` typed into
+/// a pane waiting for an answer of its own, and this one is about a key pressed while a
+/// rule on screen is asking, where the person has read the question and is answering it.
+/// The bytes are not typed anywhere: the question owns them.
+fn armed_key(state: &mut State, space: i64, bytes: &[u8], request: &mut u64) -> ModeOutcome {
+    state.armed = None;
+    if bytes.first() == Some(&b'y') {
+        start_close(state, space, request);
+    } else {
+        state.message = Some(format!("kept {}", space_name(state, space)));
+    }
+    ModeOutcome::Stay
+}
+
+/// Put a space's rule into the state where it asks whether it should close.
+///
+/// Nothing is sent. The question is on the rule itself, one click from where the close was,
+/// and the answer is a second click on the same row: the rule repaints with `y` and `n` in
+/// the two columns its controls occupied.
+///
+/// The notice row carries what the rule has no room for, which is the part a person reads
+/// before answering: how many tabs go, and which of them is working.
+fn arm_close(state: &mut State, space: i64) {
+    let held: Vec<&AgentRow> = state.rows.iter().filter(|r| r.workspace == space).collect();
+    let sleeping = state
+        .spaces
+        .iter()
+        .find(|w| w.id == space)
+        .filter(|w| w.asleep)
+        .map_or(0, |w| w.sleeping.len());
+    // The count is the store's, not the index's: a sleeping space has no rows in the index
+    // and every tab in the store, and a question that says zero would be a lie.
+    let count = held.len() + sleeping;
+    let busy: Vec<String> = held
+        .iter()
+        .filter(|r| r.agent && matches!(r.state.as_str(), "working" | "blocked" | "starting"))
+        .map(|r| {
+            format!(
+                "{} in tab {} is {}",
+                r.program.as_deref().unwrap_or("an agent"),
+                r.terminal,
+                r.state
+            )
+        })
+        .collect();
+    state.armed = Some(space);
+    state.message = Some(if busy.is_empty() {
+        format!(
+            "close {}? {count} tab{}",
+            space_name(state, space),
+            if count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "close {}? {count} tab{}, {}",
+            space_name(state, space),
+            if count == 1 { "" } else { "s" },
+            busy.join(", ")
+        )
+    });
+}
+
+/// Begin the close a person answered `y` to: the space is marked, and its tabs go one per
+/// answer rather than as a burst.
+///
+/// The burst is the obvious implementation and it is wrong twice over. `CloseTerminal`
+/// answers `TerminalClosed` when the terminal's command channel accepts the close, which is
+/// before the store row is closed, so the daemon still counts the tab; and `dispatch` sends
+/// a request off the connection's read loop when the space lock is not free right now, so a
+/// burst can execute out of order and the close of the space can land before a single tab
+/// does. One at a time, each pushed when the previous one answers, is the only ordering this
+/// protocol can give.
+fn start_close(state: &mut State, space: i64, request: &mut u64) {
+    let mut asked: Vec<u32> = state
+        .rows
+        .iter()
+        .filter(|r| r.workspace == space)
+        .map(|r| r.terminal)
+        .collect();
+    asked.extend(
+        state
+            .spaces
+            .iter()
+            .find(|w| w.id == space && w.asleep)
+            .map(|w| w.sleeping.iter().map(|t| t.terminal).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let left = asked.len();
+    state.closing = Some(Closing {
+        space,
+        asked,
+        sent: 0,
+    });
+    if left == 0 {
+        // Nothing in it and nothing running: this is the case `CloseWorkspace` was built
+        // for, and there is nothing to wait for.
+        close_the_space(state, request);
+        return;
+    }
+    state.message = Some(format!(
+        "closing {left} {} of {}",
+        plural(left),
+        space_name(state, space)
+    ));
+    close_one(state, request);
+}
+
+/// Send the next tab's close, if there is one.
+fn close_one(state: &mut State, request: &mut u64) {
+    let Some(closing) = state.closing.as_mut() else {
+        return;
+    };
+    let Some(terminal) = closing.asked.get(closing.sent).copied() else {
+        return;
+    };
+    closing.sent += 1;
+    *request += 1;
+    state.modes.outbox.push(ControlRequest::CloseTerminal {
+        id: format!("close-{request}"),
+        terminal,
+    });
+}
+
+/// Ask the daemon to close the space itself, which it will only do once nothing in it is
+/// left. The answer is not waited for here: the client finds out from the index and from the
+/// response, and a refusal names what is still in the way.
+fn close_the_space(state: &mut State, request: &mut u64) {
+    let Some(closing) = state.closing.as_ref() else {
+        return;
+    };
+    let space = closing.space;
+    *request += 1;
+    state.modes.outbox.push(ControlRequest::CloseWorkspace {
+        id: format!("close-space-{request}"),
+        workspace: space,
+    });
+}
+
+/// Whether the daemon's count of a space is zero, as far as this client can tell.
+///
+/// The index reads the live registry and `CloseWorkspace` counts store rows, and the two
+/// agree only while every row is live. A sleeping space is the case they part company on:
+/// its exit hook keeps the row open so a wake can bring it back, so the index shows the
+/// space empty while the store still holds every tab. The gate is therefore on the tabs
+/// being gone rather than on the space waking, because the asleep flag is cleared by a wake
+/// or by the close itself and neither is coming on its own.
+fn space_is_empty(state: &State, space: i64) -> bool {
+    !state.rows.iter().any(|r| r.workspace == space)
+        && state
+            .spaces
+            .iter()
+            .find(|w| w.id == space)
+            .is_none_or(|w| !w.asleep || w.sleeping.is_empty())
+}
+
+/// How many tabs a space still holds, counting the store's view and not the index's, so a
+/// sleeping space is counted rather than reported as empty.
+fn tabs_left(state: &State, space: i64) -> usize {
+    let live = state.rows.iter().filter(|r| r.workspace == space).count();
+    let sleeping = state
+        .spaces
+        .iter()
+        .find(|w| w.id == space)
+        .filter(|w| w.asleep)
+        .map_or(0, |w| w.sleeping.len());
+    live + sleeping
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "tab" } else { "tabs" }
 }
 
 /// The answer to "close it?": `Y` closes, anything else is a no and is not typed.
@@ -2822,6 +3048,15 @@ enum Clicked {
     View,
     Collapse,
     Space(i64),
+    /// The rule's sleep toggle, on the space that rule is for rather than the one on
+    /// screen: a person clicking a row means that row.
+    Sleep(i64),
+    /// The rule's close, which only arms the question.
+    Close(i64),
+    /// `y` on an armed rule: the space and everything in it goes.
+    ConfirmClose(i64),
+    /// The question is off. Nothing was sent.
+    CancelClose,
     Terminal(u32),
     NewTerminal,
     NewSpace,
@@ -2950,6 +3185,8 @@ where
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (cols, lines) = client::outer_size();
     let mut state = State {
+        armed: None,
+        closing: None,
         rows: Vec::new(),
         focused: 0,
         snapshot: None,
@@ -3171,6 +3408,9 @@ where
     // costs one round trip at a time rather than one request per announce, and the last
     // change is never lost. A request unanswered for [`INDEX_PATIENCE`] is taken as lost.
     let mut index_asked: Option<tokio::time::Instant> = None;
+    // When the close in progress started, so the loop can give up on it rather than
+    // leaving a person watching a row that never changes.
+    let mut closing_since: Option<tokio::time::Instant> = None;
     // The id of that request, so only its own answer clears it: behind the mux one request
     // can be answered once per machine, and a late answer must not open the gate early.
     let mut index_id = String::new();
@@ -3771,9 +4011,11 @@ where
                             }
                             PromptOutcome::Passthrough(rest) => feed = Some(rest),
                         }
-                    } else if state.modes.open() {
+                    } else if state.armed.is_some() || state.modes.open() {
                         // A mode owns the keyboard the way the overlays do, and hands the
-                        // rest back when it is left.
+                        // rest back when it is left. An armed rule owns it too, without
+                        // being a mode: its question is on a row rather than an overlay,
+                        // but the bytes belong to the question the same way.
                         let outcome = mode_input(&mut state, &bytes, keys.prefix(), &mut request);
                         dirty = true;
                         if let ModeOutcome::Passthrough(rest) = outcome {
@@ -4051,6 +4293,37 @@ where
                                     Some(Clicked::Fold(space)) => {
                                         if !state.shut.remove(&space) {
                                             state.shut.insert(space);
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Sleep(space)) => {
+                                        sleep_space(&mut state, space, &mut request);
+                                        dirty = true;
+                                    }
+                                    // The close is a two step, and the first step is this
+                                    // one: the rule repaints itself as a question and
+                                    // nothing is asked of the daemon yet.
+                                    Some(Clicked::Close(space)) => {
+                                        arm_close(&mut state, space);
+                                        dirty = true;
+                                    }
+                                    // `y`: the tabs go, one per answer, and the space with
+                                    // them once the daemon's own count says there is
+                                    // nothing left in it.
+                                    Some(Clicked::ConfirmClose(space)) => {
+                                        state.armed = None;
+                                        start_close(&mut state, space, &mut request);
+                                        closing_since = Some(tokio::time::Instant::now());
+                                        dirty = true;
+                                    }
+                                    // Anything else on the row, or anywhere else while a
+                                    // rule is armed, takes the question down.
+                                    Some(Clicked::CancelClose) => {
+                                        if let Some(space) = state.armed.take() {
+                                            state.message = Some(format!(
+                                                "kept {}",
+                                                space_name(&state, space)
+                                            ));
                                         }
                                         dirty = true;
                                     }
@@ -4964,7 +5237,17 @@ where
                                     index_asked = None;
                                     refresh |= std::mem::take(&mut index_owed);
                                 }
-                                apply(&mut state, response, &mut dirty);
+                                apply(&mut state, response, &mut request, &mut dirty);
+                                // The give-up timer follows the close rather than being
+                                // set in two places: it starts when a close starts and is
+                                // cleared when there is not one any more.
+                                match (state.closing.is_some(), closing_since.is_some()) {
+                                    (true, false) => {
+                                        closing_since = Some(tokio::time::Instant::now());
+                                    }
+                                    (false, true) => closing_since = None,
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -5068,6 +5351,30 @@ where
                     }
                 } => {
                     fire_notes(&mut state, &mut out)?;
+                }
+                // A close that has not finished in [`CLOSE_PATIENCE`] is not going to.
+                // Said once, with the count, rather than left as a row that never changes.
+                _ = async {
+                    match closing_since {
+                        Some(at) => tokio::time::sleep_until(at + CLOSE_PATIENCE).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(space) = state.closing.as_ref().map(|c| c.space) {
+                        let left = tabs_left(&state, space);
+                        state.message = Some(format!(
+                            "close of {} gave up, {} still there",
+                            space_name(&state, space),
+                            if left == 0 {
+                                "a tab nobody answered for".to_string()
+                            } else {
+                                format!("{left} {}", plural(left))
+                            }
+                        ));
+                        state.closing = None;
+                    }
+                    closing_since = None;
+                    dirty = true;
                 }
                 // Last, so it never goes ahead of input: it only wakes the loop to send
                 // the frame that the renders above held back.
@@ -6334,7 +6641,7 @@ fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
 }
 
 /// Fold one answer into what is on screen.
-fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
+fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty: &mut bool) {
     if response.request_id() == "behind" {
         state.modes.refetching = false;
     }
@@ -6540,6 +6847,36 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
         }
         // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
         // on the hint row until the person does something, rather than one frame.
+        // A space close the daemon refused: something is still in the space, so the
+        // space stays and the person is told what. The state is kept rather than
+        // forgotten, because the tabs are still on their way out and the next index
+        // will ask again.
+        ControlResponse::Failed { id, reason } if id.starts_with("close-space-") => {
+            if let Some(closing) = state.closing.clone() {
+                let left = tabs_left(state, closing.space);
+                state.hint = Some(if left == 0 {
+                    reason
+                } else {
+                    format!("{reason}; {left} {} still there", plural(left))
+                });
+            }
+            *dirty = true;
+        }
+        // A tab close refused: its command channel was full, which is the one refusal a
+        // close can make. The space is not closed over a tab that is still there.
+        ControlResponse::Failed { id, reason } if id.starts_with("close-") => {
+            state.hint = Some(reason.clone());
+            if let Some(closing) = state.closing.clone() {
+                let left = closing.asked.len().saturating_sub(closing.sent)
+                    + tabs_left(state, closing.space);
+                state.message = Some(format!(
+                    "left {} in {}: {reason}",
+                    plural(left),
+                    space_name(state, closing.space)
+                ));
+            }
+            *dirty = true;
+        }
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -6570,6 +6907,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::WorkspaceClosed { workspace, .. } => {
+            // The close this client asked for, answered. The armed question and the tabs
+            // in flight both go with it: there is nothing left to answer either.
+            state.closing = None;
+            state.armed = None;
             // Its tree goes with it: a layout for a space that no longer exists would
             // reseed nothing and leak the entry. The space itself moves to whatever the
             // next list answers: `None` reads as "pick the first" on that path.
@@ -6780,6 +7121,16 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // A space being closed waits for this: the daemon counts store rows and the
+            // index reads the live registry, so the index showing a space empty is the
+            // earliest the space can be asked to close, and asking earlier is a refusal
+            // that names tabs which are on their way out anyway.
+            if let Some(closing) = state.closing.clone()
+                && closing.sent >= closing.asked.len()
+                && space_is_empty(state, closing.space)
+            {
+                close_the_space(state, request);
+            }
             // Nothing left anywhere. The interface is a way into terminals, so with none of
             // them it is a screen a person has to know a key to escape from. Ending is what
             // every multiplexer does when its last window closes, and the daemon stays: it
@@ -6916,6 +7267,14 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
+            // One answer, one next ask: a space being closed sends its tabs one at a
+            // time, so the close of the space cannot be reordered ahead of them.
+            if let Some(closing) = state.closing.clone()
+                && closing.sent > 0
+                && closing.asked.get(closing.sent - 1) == Some(&terminal)
+            {
+                close_one(state, request);
+            }
             // Out of every tree, so no space keeps a pane nobody can focus.
             // Trees left with no leaves and no pending split go away, and the
             // unsubscription of a tile nobody watches piggybacks on the next
@@ -7200,6 +7559,7 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }
     }
 
@@ -7334,6 +7694,172 @@ mod tests {
         );
     }
 
+    /// A space close sends its tabs one at a time, and only asks the daemon to close the
+    /// space once there is nothing left in it.
+    ///
+    /// The burst is what the shape suggests and it is wrong twice over: a close is answered
+    /// before the store row closes, so the daemon still counts the tab, and a request whose
+    /// space lock is busy runs off the connection's read loop, so a burst can arrive out of
+    /// order. This is the property that keeps the space from being asked to close over tabs
+    /// that are on their way out.
+    #[test]
+    fn a_space_close_asks_for_one_tab_at_a_time_and_waits_for_the_index() {
+        let mut s = state();
+        s.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+        ];
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        s.armed = Some(1);
+        armed_key(&mut s, 1, b"y", &mut request);
+        assert_eq!(s.armed, None, "the question is answered");
+        // One tab, not two, and no space yet.
+        assert_eq!(s.closing.as_ref().map(|c| c.sent), Some(1));
+        assert_eq!(s.modes.outbox.len(), 1);
+        assert!(matches!(
+            s.modes.outbox[0],
+            ControlRequest::CloseTerminal { terminal: 1, .. }
+        ));
+
+        // The first tab answers: the second is asked, and the space is not.
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::TerminalClosed {
+                id: "close-1".into(),
+                terminal: 1,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.closing.as_ref().map(|c| c.sent), Some(2));
+        assert_eq!(s.modes.outbox.len(), 2);
+        assert!(matches!(
+            s.modes.outbox[1],
+            ControlRequest::CloseTerminal { terminal: 2, .. }
+        ));
+
+        // The second answers and the index has not caught up: still no space request.
+        apply(
+            &mut s,
+            ControlResponse::TerminalClosed {
+                id: "close-2".into(),
+                terminal: 2,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(
+            s.modes.outbox.len(),
+            2,
+            "asked the space before the index agreed"
+        );
+        assert!(!space_is_empty(&s, 1), "the index still lists a tab");
+
+        // The index agrees, and only then does the space go.
+        s.rows.clear();
+        assert!(space_is_empty(&s, 1), "the index says the space is empty");
+        apply(
+            &mut s,
+            ControlResponse::Agents {
+                id: "index".into(),
+                agents: Vec::new(),
+                splits: Vec::new(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(
+            s.modes
+                .outbox
+                .iter()
+                .any(|r| matches!(r, ControlRequest::CloseWorkspace { workspace: 1, .. })),
+            "{:?}",
+            s.modes.outbox
+        );
+    }
+
+    /// A space with nothing in it is asked to close at once: there is nothing to wait for.
+    #[test]
+    fn an_empty_space_closes_in_one_step() {
+        let mut s = state();
+        s.rows.clear();
+        s.spaces = vec![space(1, "dub")];
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        assert_eq!(s.modes.outbox.len(), 1);
+        assert!(
+            matches!(
+                s.modes.outbox[0],
+                ControlRequest::CloseWorkspace { workspace: 1, .. }
+            ),
+            "{:?}",
+            s.modes.outbox
+        );
+    }
+
+    /// A sleeping space's tabs are the store's, not the index's, so both the question and
+    /// the gate count them. A close that reported zero would be closing over tabs nobody
+    /// had closed.
+    #[test]
+    fn a_sleeping_space_is_counted_by_its_store_rows_and_not_by_the_index() {
+        let mut s = state();
+        s.rows.clear();
+        s.spaces = vec![asleep(1, "qoro", &[4, 5, 6])];
+        assert!(!space_is_empty(&s, 1), "a sleeping space is not empty");
+        assert_eq!(tabs_left(&s, 1), 3, "the index has none of them");
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        // Its sleeping tabs are asked for by number, and the space waits for them.
+        assert_eq!(
+            s.closing.as_ref().map(|c| c.asked.as_slice()),
+            Some([4, 5, 6].as_slice())
+        );
+        assert!(matches!(
+            s.modes.outbox[0],
+            ControlRequest::CloseTerminal { terminal: 4, .. }
+        ));
+        assert!(
+            !s.modes
+                .outbox
+                .iter()
+                .any(|r| matches!(r, ControlRequest::CloseWorkspace { .. })),
+            "the space was asked to close over three tabs"
+        );
+    }
+
+    /// The question names what will refuse, because the daemon's own close checks nothing
+    /// and a count alone would not say which tab is still working.
+    #[test]
+    fn the_close_question_names_the_tabs_that_are_working() {
+        let mut s = state();
+        s.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+        ];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        assert_eq!(s.armed, Some(1));
+        let asked = s.message.clone().unwrap_or_default();
+        assert!(asked.contains("close qoro?"), "{asked:?}");
+        assert!(asked.contains("2 tabs"), "{asked:?}");
+        assert!(asked.contains("claude in tab 1 is working"), "{asked:?}");
+    }
+
+    /// Any other key takes the question down rather than being typed at whatever is behind.
+    #[test]
+    fn any_key_answers_a_space_question() {
+        let mut s = state();
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        s.armed = Some(1);
+        armed_key(&mut s, 1, b"n", &mut request);
+        assert_eq!(s.armed, None);
+        assert_eq!(s.message.as_deref(), Some("kept qoro"));
+        assert!(s.closing.is_none(), "nothing was sent");
+    }
+
     fn state() -> State {
         State {
             rows: vec![
@@ -7429,6 +7955,8 @@ mod tests {
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
+            closing: None,
+            armed: None,
         }
     }
 
@@ -7675,6 +8203,7 @@ mod tests {
                 id: String::new(),
                 reason: "unknown variant `News`".into(),
             },
+            &mut 0,
             &mut false,
         );
         assert!(
@@ -7727,6 +8256,7 @@ mod tests {
                 id: String::new(),
                 reason: old_daemon_refusal(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.message, None, "the refusal is not news to a person");
@@ -8011,6 +8541,8 @@ mod tests {
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
             config: crate::config::Config::default(),
+            closing: None,
+            armed: None,
         }
     }
 
@@ -8030,6 +8562,8 @@ mod tests {
     fn tiled_state() -> State {
         // Space 1 with two terminals side by side, 1 focused, both watched.
         let mut state = State {
+            armed: None,
+            closing: None,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
             focused: 1,
             snapshot: Some(snapshot_with_behind(0)),
@@ -8208,6 +8742,7 @@ mod tests {
                 id: "x".to_string(),
                 terminal: 1,
             },
+            &mut 0,
             &mut dirty,
         );
         state.rows.retain(|r| r.terminal != 1);
@@ -8239,6 +8774,7 @@ mod tests {
                 id: "split-4".to_string(),
                 terminal: 4,
             },
+            &mut 0,
             &mut dirty,
         );
         let parked: Vec<Vec<u32>> = state.parked[&1].iter().map(|l| l.leaves()).collect();
@@ -8288,6 +8824,7 @@ mod tests {
                 id: "split-4".to_string(),
                 terminal: 4,
             },
+            &mut 0,
             &mut dirty,
         );
         apply(
@@ -8296,6 +8833,7 @@ mod tests {
                 id: "split-5".to_string(),
                 terminal: 5,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.layouts[&1].leaves(), vec![3, 5]);
@@ -8310,7 +8848,12 @@ mod tests {
         state.subs.clear();
         state.space = None;
         let mut dirty = false;
-        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        apply(
+            &mut state,
+            index_with(vec![three_panes()]),
+            &mut 0,
+            &mut dirty,
+        );
         assert!(state.layouts.is_empty(), "no space yet, no tree on screen");
         apply(
             &mut state,
@@ -8318,6 +8861,7 @@ mod tests {
                 id: "spaces".to_string(),
                 workspaces: vec![space(1, "app")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(
@@ -8344,6 +8888,7 @@ mod tests {
                 id: "split-5".to_string(),
                 terminal: 5,
             },
+            &mut 0,
             &mut dirty,
         );
         let written: Vec<Vec<u32>> = state.split_writes.iter().map(|t| t.leaves()).collect();
@@ -8392,7 +8937,12 @@ mod tests {
     fn a_split_in_the_index_comes_back_as_one_tab() {
         let mut state = fresh_client_with_one_pane_on_screen();
         let mut dirty = false;
-        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        apply(
+            &mut state,
+            index_with(vec![three_panes()]),
+            &mut 0,
+            &mut dirty,
+        );
         assert_eq!(
             state.layouts.get(&1).map(|l| l.leaves()),
             Some(vec![1, 2, 3])
@@ -8423,7 +8973,7 @@ mod tests {
         if let ControlResponse::Agents { agents, .. } = &mut index {
             agents.push(agent(9, 1, "sh", "idle"));
         }
-        apply(&mut state, index, &mut dirty);
+        apply(&mut state, index, &mut 0, &mut dirty);
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![9]));
         let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
         assert_eq!(tabs, vec![1, 9]);
@@ -8434,7 +8984,12 @@ mod tests {
         let mut state = tiled_state();
         state.rows.push(agent(3, 1, "sh", "idle"));
         let mut dirty = false;
-        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        apply(
+            &mut state,
+            index_with(vec![three_panes()]),
+            &mut 0,
+            &mut dirty,
+        );
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1, 2]));
         assert!(!state.is_pane(3), "the local tree wins; 3 stays a tab");
     }
@@ -8444,13 +8999,19 @@ mod tests {
         let mut state = fresh_client_with_one_pane_on_screen();
         state.split_saving = 1;
         let mut dirty = false;
-        apply(&mut state, index_with(vec![three_panes()]), &mut dirty);
+        apply(
+            &mut state,
+            index_with(vec![three_panes()]),
+            &mut 0,
+            &mut dirty,
+        );
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1]));
         apply(
             &mut state,
             ControlResponse::SplitSaved {
                 id: "tree-1".to_string(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.split_saving, 0);
@@ -8470,6 +9031,7 @@ mod tests {
                 id: "x".to_string(),
                 terminal: 1,
             },
+            &mut 0,
             &mut dirty,
         );
         state.rows.retain(|r| r.terminal != 1);
@@ -8488,6 +9050,7 @@ mod tests {
                 id: "x".to_string(),
                 terminal: 2,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1]));
@@ -8515,6 +9078,7 @@ mod tests {
                 id: "split-9".to_string(),
                 reason: "no".to_string(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!state.layouts.get(&1).unwrap().has_pending());
@@ -8595,6 +9159,7 @@ mod tests {
                 id: "w".to_string(),
                 workspace: 2,
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!state.layouts.contains_key(&2));
@@ -8630,6 +9195,7 @@ mod tests {
                 id: "split-1".to_string(),
                 terminal: 3,
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
@@ -8657,6 +9223,7 @@ mod tests {
                 id: "new-1".to_string(),
                 terminal: 3,
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!state.layouts.get(&1).unwrap().contains(3));
@@ -8686,6 +9253,7 @@ mod tests {
                 id: "split-9".to_string(),
                 terminal: 3,
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(state.layouts.get(&1).unwrap().contains(3));
@@ -8716,6 +9284,7 @@ mod tests {
                 id: "split-9".to_string(),
                 reason: "no".to_string(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!state.layouts.get(&1).unwrap().has_pending());
@@ -8732,6 +9301,7 @@ mod tests {
         state.cols = 100;
         state.lines = 30;
         state.spaces = vec![qoro_runtime::control::WorkspaceRow {
+            closable: true,
             id: 1,
             name: "default".to_string(),
             terminals: 0,
@@ -8963,6 +9533,7 @@ mod tests {
                 agents,
                 splits: Vec::new(),
             },
+            &mut 0,
             &mut dirty,
         );
     }
@@ -9192,6 +9763,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: vec![agent(7, 5, "zsh", "working")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.focused, 7);
@@ -9212,6 +9784,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: rows,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(
@@ -9247,7 +9820,8 @@ mod tests {
         state.adopted = false;
         state.last = LastFocus::read(Some(file.clone()));
         let mut dirty = false;
-        apply(&mut state, index(rows()), &mut dirty);
+        let mut request = 0u64;
+        apply(&mut state, index(rows()), &mut request, &mut dirty);
         assert_eq!(state.space, Some(2), "the space it was in");
         assert_eq!(state.pending_focus, Some(9), "the terminal it was on");
         assert_eq!(state.last.resume, None, "once");
@@ -9257,7 +9831,7 @@ mod tests {
         state.focused = 0;
         state.adopted = false;
         state.last = LastFocus::read(Some(file.clone()));
-        apply(&mut state, index(rows()), &mut dirty);
+        apply(&mut state, index(rows()), &mut request, &mut dirty);
         assert_eq!(state.focused, 1, "gone: the first tab, as before");
         assert_eq!(state.pending_focus, None);
 
@@ -9287,6 +9861,7 @@ mod tests {
         apply(
             &mut state,
             index(vec![agent(1, 1, "zsh", "working")]),
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.pending_focus, None);
@@ -9297,6 +9872,7 @@ mod tests {
                 agent(1, 1, "zsh", "working"),
                 agent(9, 1, "claude", "idle"),
             ]),
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.pending_focus, Some(9));
@@ -9317,6 +9893,7 @@ mod tests {
                 agent(1, 1, "zsh", "working"),
                 agent(9, 1, "claude", "idle"),
             ]),
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.pending_focus, None);
@@ -9350,6 +9927,7 @@ mod tests {
                     splits: Vec::new(),
                     agents: vec![agent(1, 1, "zsh", state_word)],
                 },
+                &mut 0,
                 &mut dirty,
             );
             assert_eq!(state.message.is_none(), cleared, "{state_word}");
@@ -9373,6 +9951,7 @@ mod tests {
                 id: "ws".to_string(),
                 workspaces: vec![space(1, "default"), space(2, "other")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.space, Some(1));
@@ -9401,6 +9980,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: vec![agent(1, 1, "claude", "working")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(state.focus_fetch, "the list refetches on the index");
@@ -9532,6 +10112,7 @@ mod tests {
                 terminal: 1,
                 events: vec![tool_event("Read foo.rs")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(dirty);
@@ -9545,6 +10126,7 @@ mod tests {
                 terminal: 9,
                 events: vec![tool_event("Read bar.rs")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!dirty);
@@ -9559,6 +10141,7 @@ mod tests {
                 terminal: 1,
                 events: vec![],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!dirty);
@@ -9575,6 +10158,7 @@ mod tests {
                 id: "focus-1".to_string(),
                 reason: "no terminal 1".to_string(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(
@@ -9600,6 +10184,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: vec![],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(!state.done, "an offline remote ended the interface");
@@ -9611,6 +10196,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: vec![],
             },
+            &mut 0,
             &mut dirty,
         );
         assert!(
@@ -9639,6 +10225,7 @@ mod tests {
                     agent(remote, R1 | 1, "claude", "idle"),
                 ],
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.pending_focus, Some(remote));
@@ -9655,6 +10242,7 @@ mod tests {
                 splits: Vec::new(),
                 agents: vec![agent(remote, R1 | 1, "claude", "sleeping")],
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.pending_focus, None);
@@ -9690,6 +10278,7 @@ mod tests {
                 id: "space-4".into(),
                 reason: "devbox is offline".into(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.creating, 0);
@@ -9737,13 +10326,13 @@ mod tests {
             root: false,
         };
         state.probing = Some("probe-2".into());
-        apply(&mut state, answer("probe-1"), &mut dirty);
+        apply(&mut state, answer("probe-1"), &mut 0, &mut dirty);
         assert_eq!(state.menu, None, "a stale answer opened the list");
         state.prompt = Some(Prompt {
             what: Naming::Space,
             text: String::new(),
         });
-        apply(&mut state, answer("probe-2"), &mut dirty);
+        apply(&mut state, answer("probe-2"), &mut 0, &mut dirty);
         assert_eq!(state.menu, None, "the list opened over a box");
         assert!(state.message.is_some());
     }
@@ -9760,6 +10349,7 @@ mod tests {
                 id: "connect-1".into(),
                 name: "devbox".into(),
             },
+            &mut 0,
             &mut dirty,
         );
         let there = (1i64 << 40) | 1;
@@ -9772,6 +10362,7 @@ mod tests {
                 agents: vec![agent(1, 1, "zsh", "idle"), agent(tab, there, "zsh", "idle")],
                 splits: Vec::new(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.space, Some(there));
@@ -10174,6 +10765,7 @@ mod tests {
                 total: 1_003,
                 lines: (996..1_003).map(|at| format!("row {at}")).collect(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(copy_row(&state, 1_000).as_deref(), Some("row 1000"));
@@ -10237,6 +10829,7 @@ mod tests {
                 col: 0,
                 resume: Some(400),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(
@@ -10259,6 +10852,7 @@ mod tests {
                 col: 7,
                 resume: None,
             },
+            &mut 0,
             &mut dirty,
         );
         let copy = state.modes.copy.as_ref().unwrap();
@@ -10275,6 +10869,7 @@ mod tests {
                 col: 0,
                 resume: None,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.modes.copy.as_ref().unwrap().cursor, (123, 7));
@@ -10294,6 +10889,7 @@ mod tests {
                 id: String::new(),
                 reason: "this daemon is older (unknown variant `SearchScrollback`)".to_string(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(
@@ -10339,6 +10935,7 @@ mod tests {
                         .map(|at| format!("row {at}"))
                         .collect(),
                 },
+                &mut 0,
                 &mut dirty,
             );
         }
@@ -10368,6 +10965,7 @@ mod tests {
                 platform: "linux x86_64".into(),
                 root: true,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.menu, Some(0));
@@ -10415,7 +11013,7 @@ mod tests {
             version: "0.2.0".into(),
         };
         state.installing = Some("install-2".into());
-        apply(&mut state, done("install-1"), &mut dirty);
+        apply(&mut state, done("install-1"), &mut 0, &mut dirty);
         assert!(
             state
                 .message
@@ -10423,7 +11021,7 @@ mod tests {
                 .is_some_and(|m| m.contains("installed"))
         );
         assert_eq!(state.reprobe, None, "a stale install asked again");
-        apply(&mut state, done("install-2"), &mut dirty);
+        apply(&mut state, done("install-2"), &mut 0, &mut dirty);
         assert_eq!(state.reprobe.as_deref(), Some("h"));
         assert_eq!(state.installing, None);
     }
@@ -10453,6 +11051,7 @@ mod tests {
                 id: "spaces".into(),
                 workspaces,
             },
+            &mut 0,
             &mut dirty,
         );
     }
@@ -10495,6 +11094,7 @@ mod tests {
                 terminals: 2,
                 resumed: 2,
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(state.waking, None);
@@ -10506,6 +11106,7 @@ mod tests {
                 id: "sleep-3".into(),
                 reason: "tab 2 (ssh) holds a connection".into(),
             },
+            &mut 0,
             &mut dirty,
         );
         assert_eq!(

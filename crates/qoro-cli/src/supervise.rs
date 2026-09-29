@@ -1815,6 +1815,7 @@ mod tests {
                 terminals: 1,
                 asleep: false,
                 sleeping: Vec::new(),
+                closable: true,
             },
             WorkspaceRow {
                 id: 2,
@@ -1822,6 +1823,7 @@ mod tests {
                 terminals: 0,
                 asleep: false,
                 sleeping: Vec::new(),
+                closable: true,
             },
         ];
         assert_eq!(pick_space(&spaces, "2").unwrap(), Some(2));
@@ -1834,6 +1836,7 @@ mod tests {
             terminals: 0,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }];
         assert_eq!(
             pick_space(&named, "2024").unwrap(),

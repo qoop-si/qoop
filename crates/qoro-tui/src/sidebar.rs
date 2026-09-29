@@ -244,6 +244,17 @@ pub enum Act {
     Space(i64),
     /// Fold a space's agents away under its rule, or open them again.
     Fold(i64),
+    /// Put a space to sleep, or wake it: the toggle on its rule, which reads the space
+    /// from the row it was on rather than from whatever is on screen.
+    Sleep(i64),
+    /// The close on a space's rule. Only ever arms: the row asks, and the answer is a
+    /// second click on the same row.
+    Close(i64),
+    /// `y` on an armed rule: the space, and every tab in it, goes.
+    ConfirmClose(i64),
+    /// Anything else on an armed rule, or on any other row while one is armed: the
+    /// question goes and nothing is sent.
+    CancelClose,
     Terminal(u32),
     /// The `+` of the title: a space, named first.
     NewSpace,
@@ -489,6 +500,10 @@ pub struct Column<'a> {
     /// The live column width, at or above [`SIDEBAR_MIN`] on the live path.
     pub width: usize,
     pub shut: &'a Shut,
+    /// The space whose rule is asking whether it should close, or `None` while no rule is.
+    /// The rule paints the question and answers only the question; every other click falls
+    /// through to what the row does ordinarily.
+    pub armed: Option<i64>,
     /// What each local agent costs, when the person asked to see it.
     pub usage: Option<&'a Usage>,
 }
@@ -956,30 +971,35 @@ fn content(c: &Column) -> Vec<Row> {
     out
 }
 
-/// A space as the top edge of its box: the fold
-/// arrow, the name, and how many tabs it holds, framed in the space's own colour.
+/// A space as the top edge of its box: the fold arrow, the name, what it holds beside
+/// the name, and the two controls in fixed columns at the right, framed in the space's
+/// own colour.
 ///
 /// ```text
-///  ╭▾ default ──────── 3 ─╮
+///  ╭▾ qoro (4)─────────────z x╮
+///  ╭▾ qoro sleeping───────z x╮
 /// ```
 ///
 /// The arrow sits right after the corner, so the name starts one column right of the
 /// dots below it, instead of two further right behind a dash and a space.
 ///
-/// Folded, the arrow and the count take the colour of the most urgent agent under them
-/// when that agent wants a person, so a fold never hides a blocked agent silently. Open,
-/// they stay grey: the agents are right there, wearing their own dots. Only agents
-/// colour it: a shell never wants a person.
+/// The name and the count beside it share one slot: the count while the space is awake,
+/// the word `sleeping` while it is not, and the word gives way before the name does,
+/// because a name is identity and a state is not. A sleeping space wears `Role::Sleeping`
+/// on its name and its rule, so the state is in the colour as well as the word.
 ///
-/// A sleeping space carries a `z` after its name, and counts the tabs a wake brings back:
-///
-/// ```text
-///  ╭─ ▸ default z ────── 3 ─╮
-/// ```
+/// The two controls are [`Block`], in fixed columns at the right. Folded, the arrow and the
+/// name take the colour of the most urgent agent under them when that agent wants a person,
+/// so a fold never hides a blocked agent silently. Open, they stay grey: the agents are
+/// right there, wearing their own dots. Only agents colour it: a shell never wants a person.
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
     use crate::theme::Role;
     let width = c.width;
-    let ink = crate::theme::space_of(space.id);
+    let ink = if space.asleep {
+        Role::Sleeping
+    } else {
+        crate::theme::space_of(space.id)
+    };
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
     let mark = hot.unwrap_or(Role::Faint);
@@ -995,45 +1015,181 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     } else {
         '\u{25b8}'
     };
-    let count = if held == 0 {
+    // A sleeping space draws the toggle whenever it has tabs to wake, because nothing of
+    // it is running and `z` is then the only way back with a mouse. An awake space draws
+    // it when it holds anything at all, which is the daemon's own test: `kids` is the
+    // live registry filtered by workspace, so an empty `kids` is a space nothing runs in
+    // and `SleepWorkspace` would refuse it.
+    let block = if c.armed == Some(space.id) {
+        // Armed: the row is a question, so the two controls become the two answers in the
+        // same columns. A question is asked in the place it was asked from, and answered
+        // by a second click on the same cells.
+        Block::armed(width)
+    } else {
+        block(width, space.closable, space.asleep || !kids.is_empty())
+    };
+    // One slot after the name, and only one: the count while awake, the word while asleep,
+    // because they are the same fact and never both true. The slot carries its own leading
+    // space, so the name and the slot never touch, and the word goes first of the two: a
+    // space that would starve to a single column keeps its name and says its state in
+    // colour instead.
+    let slot = if c.armed == Some(space.id) {
+        // The question, in the slot the count and the word would have used, and held to
+        // the same floor: a rule that is asking is the rule a person is looking at, so
+        // the name is not what gives way.
+        if room_for(width, QUESTION) >= MIN_NAME_COLS {
+            QUESTION.to_string()
+        } else {
+            QUESTION_SHORT.to_string()
+        }
+    } else if space.asleep && room_for(width, SLEEPING) >= MIN_NAME_COLS {
+        SLEEPING.to_string()
+    } else if held == 0 {
         String::new()
     } else {
-        held.to_string()
+        format!(" ({held})")
     };
-    let count_w = crate::width::width(&count);
-    let asleep = if space.asleep { " z" } else { "" };
-    let asleep_w = asleep.len();
-    // ` ╭▾ ` then the name, the sleep mark when asleep, a space, the dashes, ` 3 ─`
-    // when it holds tabs, and the corner, one column in from the right. The name gives way
-    // before the count, the mark and the arrow do.
-    let end_w = if count.is_empty() { 0 } else { count_w + 3 };
-    let room = width.saturating_sub(FOLD_CELLS + asleep_w + 1 + 1 + end_w + 2);
+    let slot_w = crate::width::width(&slot);
+    let room = width.saturating_sub(BLOCK_TAIL).saturating_sub(slot_w);
     let name = shorten_middle(&space.name, room);
     let name_w = crate::width::width(&name);
-    let fill = width.saturating_sub(FOLD_CELLS + name_w + asleep_w + 1 + end_w + 2);
-    let dashes_at = FOLD_CELLS + name_w + asleep_w + 1;
-    let mut runs = vec![(1, 1, ink), (dashes_at, fill, ink)];
-    if space.asleep {
-        runs.push((FOLD_CELLS + name_w + 1, 1, Role::Sleeping));
+    // ` <arrow> ` then the name, the slot (which carries the space before it when it has
+    // one), the fill between them, and the three block columns. The block therefore
+    // starts at `width - 4` whatever the name and the slot are, and the last column is
+    // left blank, as every row of this column already is.
+    let fill_at = FOLD_CELLS + name_w + slot_w;
+    let fill = width.saturating_sub(1).saturating_sub(fill_at).saturating_sub(BLOCK_W);
+    let mut runs = vec![(1, 1, ink), (fill_at, fill, ink)];
+    if !slot.is_empty() {
+        runs.push((
+            FOLD_CELLS + name_w,
+            slot_w,
+            if space.asleep { Role::Sleeping } else { mark },
+        ));
     }
-    let end = if count.is_empty() {
-        runs.push((dashes_at + fill, 1, ink));
-        String::new()
-    } else {
-        let count_at = dashes_at + fill + 1;
-        runs.push((count_at, count_w, mark));
-        runs.push((count_at + count_w + 1, 2, ink));
-        format!(" {count}  ")
-    };
-    // No line round a space: its name in its own colour and its agents under it group
-    // it, and the box's cells stay as space so every row keeps its place.
-    let text = format!(" {arrow} {name}{asleep} {}{end} ", " ".repeat(fill));
+    // The two block cells, coloured by what they say rather than by which field holds
+    // them. The sleeping ink means a space is asleep, so it cannot also be the affirmative
+    // of a question that destroys one, and the two answers are deliberately not the same
+    // weight: `y` is a word, `n` is quieter.
+    for cell in [block.sleep, block.close] {
+        let Some((at, w)) = cell else { continue };
+        let role = match block.answer {
+            // The affirmative is a word and the other is quieter, so a question cannot be
+            // answered by a glance at two equal marks.
+            Some(Answer::Yes) if at == width - 4 => Role::Text,
+            Some(_) => Role::Faint,
+            None if Some((at, w)) == block.sleep && space.asleep => Role::Sleeping,
+            None => mark,
+        };
+        runs.push((at, w, role));
+    }
+    let text = format!(
+        " {arrow} {name}{slot}{}{}",
+        " ".repeat(fill),
+        block.text()
+    );
     Line {
         text: fit(&text, width),
         colour: None,
         accent: Some((FOLD_CELLS, name_w, ink)),
         indicator: Some((FOLD_CELLS - 2, 1, mark)),
         runs,
+    }
+}
+
+/// The word a sleeping space wears beside its name, when the column has room for it.
+const SLEEPING: &str = " sleeping";
+
+/// What an armed rule says instead of its name's count: the question, and nothing else.
+/// The space it is about is on the row, and the notice row carries the count and the
+/// reason, so the rule itself only has to ask.
+const QUESTION: &str = " close?";
+
+/// The same question for a column with no room for it, which is still a question: the
+/// answers are in the block and the row is the only place they can be drawn.
+const QUESTION_SHORT: &str = " ?";
+
+/// What a name must keep to stay a name. A space whose row cannot hold this many columns
+/// for the name is a row that has said its name is not the most important thing on it.
+const MIN_NAME_COLS: usize = 3;
+
+/// The columns the block takes.
+const BLOCK_W: usize = 3;
+
+/// Everything on the row that is neither the name, the slot nor the fill: the fold
+/// cells, the block, and the blank last column the block leaves. A name gets what is
+/// left of the width once these are paid for.
+const BLOCK_TAIL: usize = FOLD_CELLS + BLOCK_W + 1;
+
+/// The columns a name has once the slot beside it is paid for, which is what decides
+/// whether the word `sleeping` fits or the count stays.
+fn room_for(width: usize, slot: &str) -> usize {
+    width
+        .saturating_sub(FOLD_CELLS)
+        .saturating_sub(crate::width::width(slot))
+        .saturating_sub(BLOCK_TAIL)
+}
+
+/// The control block at the right of a space rule: the sleep toggle and the close, in three
+/// columns that never change shape, laid out from the right edge inward.
+///
+/// `z` at `width - 4` and `x` at `width - 2`, whenever drawn. The block being fixed is the
+/// whole point: the slot beside the name grows a column at 10 tabs, and a control that
+/// moved with it would be a control nobody could learn.
+///
+/// A space with nothing running in it gets no `z`, because the daemon refuses to sleep an
+/// empty space and a control that cannot work is worse than no control. A space that is
+/// asleep always gets one, because `z` is then the only way back with a mouse: a sleeping
+/// space has no tab rows to press, so there is nothing else to click.
+struct Block {
+    /// (zero-based column, width) of the sleep toggle, if it is drawn.
+    sleep: Option<(usize, usize)>,
+    /// The same for the close.
+    close: Option<(usize, usize)>,
+    /// Which answer the block is drawing, while the row is armed.
+    answer: Option<Answer>,
+}
+
+impl Block {
+    /// The three columns, in the order they are drawn. A control that is not drawn is a
+    /// blank, so the block keeps its shape and the other control keeps its column.
+    fn text(&self) -> String {
+        // Armed, the two cells are the two answers; otherwise they are the two controls.
+        // Either way the block is three columns and neither cell ever moves.
+        let [left, right] = match self.answer {
+            Some(Answer::Yes) => ["y", "n"],
+            Some(Answer::No) => ["n", "y"],
+            None => [
+                if self.sleep.is_some() { "z" } else { " " },
+                if self.close.is_some() { "x" } else { " " },
+            ],
+        };
+        format!("{left} {right}")
+    }
+
+    /// The two answers in the two columns the controls used, so a person who aimed at `x`
+    /// finds `y` and `n` under the pointer rather than somewhere else on the row.
+    fn armed(width: usize) -> Block {
+        Block {
+            sleep: Some((width.saturating_sub(4), 1)),
+            close: Some((width.saturating_sub(2), 1)),
+            answer: Some(Answer::Yes),
+        }
+    }
+}
+
+/// What the rule is asking, when it is asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+}
+
+fn block(width: usize, closable: bool, can_sleep: bool) -> Block {
+    Block {
+        sleep: can_sleep.then_some((width.saturating_sub(4), 1)),
+        close: closable.then_some((width.saturating_sub(2), 1)),
+        answer: None,
     }
 }
 
@@ -1504,6 +1660,46 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
         Hit::Terminal(terminal) | Hit::Next(Some(terminal)) => Some(Act::Terminal(terminal)),
         Hit::Next(None) => None,
         Hit::Space(id) => {
+            let space = c.spaces.iter().find(|s| s.id == id);
+            if let Some(space) = space {
+                let kids: Vec<&AgentRow> = c.agents.iter().filter(|a| a.workspace == id).collect();
+                let drawn = if c.armed == Some(id) {
+                    Block::armed(c.width)
+                } else {
+                    block(c.width, space.closable, space.asleep || !kids.is_empty())
+                };
+                if col > 0 {
+                    match (drawn.answer, drawn.sleep, drawn.close) {
+                        // An armed rule answers `y` and `n`, and nothing else: a row
+                        // that is mid question does not fold, does not navigate and does
+                        // not sleep, because a person aiming at one of those would be
+                        // answering a question they did not read.
+                        (Some(answer), Some((yes, _)), _) if col - 1 == yes => {
+                            return Some(if answer == Answer::Yes {
+                                Act::ConfirmClose(id)
+                            } else {
+                                Act::CancelClose
+                            });
+                        }
+                        (_, _, Some((no, _))) if col - 1 == no && c.armed == Some(id) => {
+                            return Some(Act::CancelClose);
+                        }
+                        // Not armed: the controls do what they say.
+                        (None, Some((at, _)), _) if col - 1 == at => {
+                            return Some(Act::Sleep(id));
+                        }
+                        (None, _, Some((at, _))) if col - 1 == at => {
+                            return Some(Act::Close(id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // A rule mid question folds nothing and moves nowhere: a person aiming at the
+            // arrow is aiming at a question, and the only answers are the two cells.
+            if c.armed == Some(id) {
+                return Some(Act::CancelClose);
+            }
             // The arrow folds; a rule with nothing under it has nothing to fold, so
             // every cell of it moves to the space.
             let folds = !collapsed
@@ -2054,6 +2250,7 @@ mod tests {
         shut: &'a Shut,
     ) -> Column<'a> {
         Column {
+            armed: None,
             spaces,
             agents,
             focused_space,
@@ -2264,6 +2461,7 @@ mod tests {
             terminals: 1,
             asleep: false,
             sleeping: Vec::new(),
+            closable: true,
         }
     }
 
@@ -2607,7 +2805,8 @@ mod tests {
             .find(|l| l.text.starts_with(" \u{25be} app "))
             .expect("the app rule");
         // The count is agents only: the shell in the same space does not add to it.
-        assert!(app.text.ends_with(" 1    "), "{:?}", app.text);
+        assert!(app.text.contains("app (1)"), "{:?}", app.text);
+
     }
 
     #[test]
@@ -2645,36 +2844,47 @@ mod tests {
         );
     }
 
-    /// Every space is one box, its top edge carrying its name: the arrow says open,
-    /// folded or empty, the name and the frame wear the space's colour, and the count
-    /// says how many tabs live there, quiet grey while the space is open.
+    /// Every space is one box: its top edge carries the fold arrow, the name, what it
+    /// holds beside the name, and the two controls in fixed columns at the right.
     #[test]
-    fn every_space_draws_one_rule_with_its_arrow_and_count() {
+    fn every_space_draws_one_rule_with_its_arrow_count_and_block() {
         let (spaces, agents) = sample();
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let app = rule_row(&rows, 1);
-        // The space's one agent counts; its plain shell tab does not, since the tree
-        // lists agents only.
-        assert_eq!(app.text, format!(" \u{25be} app {} 1    ", " ".repeat(17)));
+        assert_eq!(app.text, format!(" \u{25be} app (1){}z x ", " ".repeat(16)));
+        assert_eq!(crate::width::width(&app.text), WIDTH);
+
         let ink = crate::theme::space_of(1);
+        // The corner, the dashes, the count, the corner of the dashes at the block, and
+        // the two controls. Every run inside the row, none of them overlapping.
         assert_eq!(
             app.runs,
             vec![
                 (1, 1, ink),
-                (7, 17, ink),
-                (25, 1, crate::theme::Role::Faint),
-                (27, 2, ink),
+                (10, 16, ink),
+                (6, 4, crate::theme::Role::Faint),
+                (WIDTH - 4, 1, crate::theme::Role::Faint),
+                (WIDTH - 2, 1, crate::theme::Role::Faint),
+
             ]
         );
-        // An empty space has nothing to fold and nothing to count: a dot for the arrow,
-        // and the dashes run to the corner.
+        // An empty space has nothing to fold, nothing to count and nothing running, so it
+        // draws a dot for the arrow, no slot, and a close with nothing beside it.
         let dub = rule_row(&rows, 3);
-        assert_eq!(dub.text, format!(" \u{b7} dub {}", " ".repeat(23)));
+        assert_eq!(
+            dub.text,
+            format!(" \u{b7} dub{}  x ", " ".repeat(20))
+        );
+        assert_eq!(crate::width::width(&dub.text), WIDTH);
+
         // Folded, the arrow points right and the count stays.
         let shut = Shut::from([1]);
         let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &shut);
         assert!(
-            rule_row(&rows, 1).text.starts_with(" \u{25b8} app "),
+            rule_row(&rows, 1)
+                .text
+                .starts_with(" \u{25b8} app (1)"),
+
             "{:?}",
             rule_row(&rows, 1).text
         );
@@ -2773,9 +2983,19 @@ mod tests {
                         // boundary (a space, or the row's own end) after it.
                         spaces
                             .iter()
+                            // The name as the rule draws it, then whatever follows: the
+                            // slot beside it, a dash, or the block. A space with nothing
+                            // in it has no slot, so requiring a trailing space would lose
+                            // it exactly when the row is at its emptiest.
                             .find(|s| {
-                                rest.strip_prefix(s.name.as_str())
-                                    .is_some_and(|after| after.is_empty() || after.starts_with(' '))
+                                text.find(&s.name).is_some_and(|at| {
+                                    at > 0
+                                        && text[..at]
+                                            .chars()
+                                            .next_back()
+                                            .is_some_and(|c| !c.is_alphanumeric())
+                                })
+
                             })
                             .map(|s| Hit::Space(s.id))
                     } else if text.is_empty() {
@@ -3219,7 +3439,9 @@ mod tests {
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
         assert!(
-            rule.text.starts_with(" \u{25be} \u{4e2d}\u{6587} "),
+            rule.text
+                .starts_with(" \u{25be} \u{4e2d}\u{6587} (1)"),
+
             "{:?}",
             rule.text
         );
@@ -4398,15 +4620,27 @@ mod tests {
                 }
 
                 // A top edge folds at its corner and arrow, in the tree only, and only when
-                // there is something under it to fold.
+                // there is something under it to fold. Its two controls answer in their own
+                // columns, which are the same whatever the name and the count are.
                 for col in 1..=width {
                     let want = if view == View::Tree && col <= FOLD_CELLS {
                         Act::Fold(1)
+                    } else if col == width - 4 + 1 {
+                        Act::Sleep(1)
+                    } else if col == width - 2 + 1 {
+                        Act::Close(1)
                     } else {
                         Act::Space(1)
                     };
-                    assert_eq!(act(Hit::Space(1), col, &c, false), Some(want));
-                    assert_eq!(act(Hit::Space(3), col, &c, false), Some(Act::Space(3)));
+                    assert_eq!(act(Hit::Space(1), col, &c, false), Some(want), "space 1");
+                    // The empty space draws no sleep toggle, so every column but the close
+                    // is the space itself.
+                    let want = if col == width - 2 + 1 {
+                        Act::Close(3)
+                    } else {
+                        Act::Space(3)
+                    };
+                    assert_eq!(act(Hit::Space(3), col, &c, false), Some(want), "space 3");
                 }
                 assert_eq!(act(Hit::Space(1), 1, &c, true), Some(Act::Space(1)));
                 assert_eq!(act(Hit::Foot, 1, &c, true), Some(Act::Collapse));
@@ -4981,8 +5215,16 @@ mod tests {
         let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
-        assert!(app.text.starts_with(" \u{25b8} app "), "{:?}", app.text);
-        assert!(app.text.ends_with(" 3    "), "the count keeps every agent");
+        assert!(
+            app.text.starts_with(" \u{25b8} app (3)"),
+            "{:?}",
+            app.text
+        );
+        // The count sits beside the name it counts, and the block keeps its columns.
+        assert!(app.text.contains("(3)"), "the count keeps every agent");
+        assert_eq!(column_of(&app.text, 'z'), Some(WIDTH - 4), "{:?}", app.text);
+        assert_eq!(column_of(&app.text, 'x'), Some(WIDTH - 2), "{:?}", app.text);
+
         // Off the space, the fold hides all three.
         let rows = tree_rows(&spaces, &agents, 4, 14, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![4]);
@@ -5014,13 +5256,14 @@ mod tests {
         // The colour of the arrow and of the count, read off the painted runs.
         let marks = |rule: &Line| -> (Role, Role) {
             let arrow = rule.indicator.expect("an arrow").2;
+            // The slot is the count in parens now, so the run is the parens and the digits
+            // rather than the digits alone.
             let (_, _, count) = rule
                 .runs
                 .iter()
                 .find(|(at, len, _)| {
-                    run_text(rule, *at, *len)
-                        .chars()
-                        .all(|c| c.is_ascii_digit())
+                    let text = run_text(rule, *at, *len);
+                    text.contains('(') && text.chars().any(|c| c.is_ascii_digit())
                 })
                 .copied()
                 .expect("a count run");
@@ -5638,8 +5881,22 @@ mod tests {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{:?}", line.text);
         }
         let rule = rule_row(&rows, 1);
-        assert!(rule.text.ends_with(" 1    "), "{:?}", rule.text);
+        assert!(rule.text.contains("(1)"), "{:?}", rule.text);
         assert!(rule.text.contains('…'), "{:?}", rule.text);
+        // The name gave way, not the block: the two controls keep their columns.
+        assert_eq!(
+            column_of(&rule.text, 'z'),
+            Some(WIDTH - 4),
+            "{:?}",
+            rule.text
+        );
+        assert_eq!(
+            column_of(&rule.text, 'x'),
+            Some(WIDTH - 2),
+            "{:?}",
+            rule.text
+        );
+
         let (at, len, _) = rule.accent.expect("the name is accented");
         assert!(at + len <= WIDTH);
     }
@@ -5913,14 +6170,25 @@ mod tests {
         let agents = vec![agent(1, 1, "claude", "idle")];
         let folded = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::from([2]));
         let head = rule_row(&folded, 2);
-        assert!(head.text.contains("\u{25b8} api z "), "{:?}", head.text);
-        // Sleeping counts agents only: terminal 8 is a plain shell tab and never adds
-        // to it, so the wake brings back just the one agent tab.
-        assert!(head.text.contains(" 1   "), "{:?}", head.text);
+        // Folded, asleep, and saying so in the slot rather than in a mark after the name.
+        assert!(
+            head.text.contains("\u{25b8} api sleeping"),
+            "{:?}",
+            head.text
+        );
+        assert!(!head.text.contains("api z"), "{:?}", head.text);
+
         assert_eq!(crate::width::width(&head.text), WIDTH);
+        // The name and the rule wear the sleeping colour, and the toggle keeps its column.
+        assert_eq!(
+            head.accent.expect("the name's run").2,
+            crate::theme::Role::Sleeping,
+            "{:?}",
+            head.runs
+        );
         assert!(
             head.runs
-                .contains(&(FOLD_CELLS + 4, 1, crate::theme::Role::Sleeping)),
+                .contains(&(WIDTH - 4, 1, crate::theme::Role::Sleeping)),
             "{:?}",
             head.runs
         );
@@ -5964,5 +6232,312 @@ mod tests {
             Some(Act::Fold(2))
         );
         assert_eq!(act(Hit::Terminal(7), 9, &c, false), Some(Act::Terminal(7)));
+    }
+
+    /// The rule as the column paints it, at a width, for a space in a known state.
+    fn rule_at(width: usize, name: &str, held: usize, asleep: bool, closable: bool) -> String {
+        let space = WorkspaceRow {
+            id: 1,
+            name: name.to_string(),
+            terminals: held,
+            asleep,
+            sleeping: if asleep {
+                (0..held as u32)
+                    .map(|terminal| SleepingTab {
+                        terminal,
+                        title: None,
+                        agent: Some("claude".into()),
+                        cwd: "/tmp".into(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            closable,
+        };
+        let spaces = vec![space];
+        let agents: Vec<AgentRow> = (1..=held as u32)
+            .map(|n| agent(n, 1, "claude", "idle"))
+            .collect();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            width,
+            &shut,
+        );
+        // A height no list of test-sized tabs can overflow, so the rule is on screen
+        // rather than scrolled: this is about how a rule is drawn, not about the window.
+        rows_folded(&c, 4096, current_avatar().as_ref())
+            .into_iter()
+            .find(|(l, _)| {
+                l.text.starts_with(" \u{25be} ")
+                    || l.text.starts_with(" \u{25b8} ")
+                    || l.text.starts_with(" \u{b7} ")
+            })
+            .map(|(l, _)| l.text)
+            .unwrap_or_default()
+    }
+
+    /// The column of a character in a row, counting columns and not bytes, or `None` when
+    /// the row does not carry it.
+    fn column_of(text: &str, at: char) -> Option<usize> {
+        let mut col = 0;
+        for c in text.chars() {
+            if c == at {
+                return Some(col);
+            }
+            col += crate::width::columns(c);
+        }
+        None
+    }
+
+    /// Every rule this column can draw, at every width it can be drawn at, with a name
+    /// and a count that stress the arithmetic: the block keeps its columns, the row is
+    /// exactly the column, and the name gives way before the controls do.
+    ///
+    /// The sweep is the test. Three widths would only prove three of them.
+    #[test]
+    fn the_rule_holds_its_columns_at_every_width_and_count() {
+        let names = [
+            "q",
+            "qoro",
+            "dub",
+            "shop-api",
+            "shop-core",
+            "shop-core-and-then-some-more-yes",
+            // A name this column counts in columns and not characters, which is the
+            // case a byte offset would get wrong.
+            "\u{4e2d}\u{6587}",
+            "\u{4e2d}\u{6587}\u{5b57}",
+        ];
+        let counts = [0usize, 1, 9, 10, 99, 1234];
+        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+            for name in names {
+                for held in counts {
+                    for asleep in [false, true] {
+                        for closable in [false, true] {
+                            let row = rule_at(width, name, held, asleep, closable);
+                            let label = format!("{width} {name} {held} {asleep} {closable}");
+                            assert_eq!(
+                                crate::width::width(&row),
+                                width,
+                                "not the column's width: {label} {row:?}"
+                            );
+                            // The sleep toggle, when the space can take one.
+                            let sleep = if asleep || held > 0 {
+                                Some(width - 4)
+                            } else {
+                                None
+                            };
+                            assert_eq!(
+                                column_of(&row, 'z'),
+                                sleep,
+                                "the toggle moved: {label} {row:?}"
+                            );
+                            assert_eq!(
+                                column_of(&row, 'x'),
+                                closable.then_some(width - 2),
+                                "the close moved: {label} {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The count sits beside the name it counts, in the space's own colour, and a sleeping
+    /// space says so in words rather than in a mark after the name.
+    #[test]
+    fn a_rule_says_what_it_holds_beside_its_name() {
+        let row = rule_at(WIDTH, "qoro", 4, false, true);
+        assert!(row.contains("qoro (4)"), "{row:?}");
+        // Asleep, the word replaces the count: they are the same fact, and the count of a
+        // sleeping space is in the notice row anyway.
+        let row = rule_at(WIDTH, "qoro", 3, true, true);
+        assert!(row.contains("qoro sleeping"), "{row:?}");
+        assert!(!row.contains("(3)"), "{row:?}");
+        // At the narrowest column the word does not fit and the count stays, so the name
+        // never starves for a state.
+        let row = rule_at(SIDEBAR_MIN, "qoro", 3, true, true);
+        assert!(row.contains("qoro (3)"), "{row:?}");
+    }
+
+    /// The session's own default carries no close, because the daemon refuses to close it
+    /// and a control that cannot work is worse than no control.
+    #[test]
+    fn a_space_that_cannot_be_closed_says_so_by_drawing_no_close() {
+        let row = rule_at(WIDTH, "default", 2, false, false);
+        assert!(!row.contains('x'), "{row:?}");
+        let row = rule_at(WIDTH, "dub", 0, false, true);
+        assert!(row.contains('x'), "{row:?}");
+    }
+
+    /// The two controls answer in the columns the rule painted them in, at every width,
+    /// which is what stops a click landing beside a control that moved.
+    #[test]
+    fn a_rule_answers_its_controls_where_it_painted_them() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+            let c = clicks(&spaces, &agents, View::Tree, width, &none);
+            let row = rows_folded(&c, 20, None)
+                .into_iter()
+                .find(|(_, h)| *h == Some(Hit::Space(1)))
+                .map(|(l, _)| l.text)
+                .expect("the rule");
+            // Read the columns off the painted text rather than off the geometry, so this
+            // fails if the paint and the hit test ever disagree.
+            assert_eq!(
+                column_of(&row, 'z'),
+                Some(width - 4),
+                "width {width}: {row:?}"
+            );
+            assert_eq!(
+                column_of(&row, 'x'),
+                Some(width - 2),
+                "width {width}: {row:?}"
+            );
+            assert_eq!(
+                act(Hit::Space(1), width - 4 + 1, &c, false),
+                Some(Act::Sleep(1)),
+                "width {width}"
+            );
+            assert_eq!(
+                act(Hit::Space(1), width - 2 + 1, &c, false),
+                Some(Act::Close(1)),
+                "width {width}"
+            );
+            // One column either side of a control is the space, never the control.
+            for at in [width - 5, width - 3, width - 1] {
+                if (1..=width).contains(&(at + 1)) && at > FOLD_CELLS {
+                    assert_eq!(
+                        act(Hit::Space(1), at + 1, &c, false),
+                        Some(Act::Space(1)),
+                        "column {at} of {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A space with nothing running in it draws no toggle, so there is no column that
+    /// answers with a sleep the daemon would refuse.
+    #[test]
+    fn a_space_that_cannot_sleep_does_not_answer_with_a_sleep() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        for col in 1..=WIDTH {
+            assert_ne!(
+                act(Hit::Space(3), col, &c, false),
+                Some(Act::Sleep(3)),
+                "the empty space offered a sleep at column {col}"
+            );
+        }
+    }
+
+    /// An armed rule asks its question in the two columns its controls were, and answers
+    /// nothing else: a row mid question does not fold, navigate or sleep.
+    #[test]
+    fn an_armed_rule_answers_yes_and_no_and_nothing_else() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        c.armed = Some(1);
+        let row = rows_folded(&c, 20, None)
+            .into_iter()
+            .find(|(_, h)| *h == Some(Hit::Space(1)))
+            .map(|(l, _)| l.text)
+            .expect("the armed rule");
+        assert!(row.contains("close?"), "{row:?}");
+        assert_eq!(column_of(&row, 'y'), Some(WIDTH - 4), "{row:?}");
+        assert_eq!(column_of(&row, 'n'), Some(WIDTH - 2), "{row:?}");
+        assert_eq!(
+            act(Hit::Space(1), WIDTH - 4 + 1, &c, false),
+            Some(Act::ConfirmClose(1))
+        );
+        assert_eq!(
+            act(Hit::Space(1), WIDTH - 2 + 1, &c, false),
+            Some(Act::CancelClose)
+        );
+        // The fold arrow and the body of the row are not answers, they take the question
+        // down: a row mid question neither folds nor navigates nor sleeps.
+        assert_eq!(act(Hit::Space(1), 1, &c, false), Some(Act::CancelClose));
+        assert_eq!(
+            act(Hit::Space(1), FOLD_CELLS, &c, false),
+            Some(Act::CancelClose)
+        );
+        assert_eq!(act(Hit::Space(1), 8, &c, false), Some(Act::CancelClose));
+        // A rule that is not armed is untouched by another one being armed.
+        assert_eq!(
+            act(Hit::Space(3), WIDTH - 2 + 1, &c, false),
+            Some(Act::Close(3))
+        );
+    }
+
+    /// The sleeping state is a colour as well as a word, so a narrow column that drops the
+    /// word still says it.
+    #[test]
+    fn a_sleeping_space_keeps_the_only_way_back() {
+        let row = rule_at(WIDTH, "qoro", 3, true, true);
+        assert!(row.contains('z'), "{row:?}");
+        // An awake space with nothing in it draws none, and the daemon would refuse.
+        let row = rule_at(WIDTH, "dub", 0, false, true);
+        assert!(!row.contains('z'), "{row:?}");
+    }
+
+    /// The sleeping state is a colour as well as a word, so a narrow column that drops the
+    /// word still says it.
+    #[test]
+    fn a_sleeping_rule_wears_the_sleeping_colour() {
+        let spaces = vec![WorkspaceRow {
+            id: 1,
+            name: "qoro".into(),
+            terminals: 3,
+            asleep: true,
+            sleeping: (0..3)
+                .map(|terminal| SleepingTab {
+                    terminal,
+                    title: None,
+                    agent: Some("claude".into()),
+                    cwd: "/tmp".into(),
+                })
+                .collect(),
+            closable: true,
+        }];
+        let agents: Vec<AgentRow> = (1..=3).map(|n| agent(n, 1, "claude", "idle")).collect();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let rule = rows_folded(&c, 40, current_avatar().as_ref())
+            .into_iter()
+            .find(|(l, _)| {
+                l.text.starts_with(" \u{25be} ")
+                    || l.text.starts_with(" \u{25b8} ")
+                    || l.text.starts_with(" \u{b7} ")
+            })
+            .expect("the rule");
+        let accent = rule.1.and(rule.0.accent).expect("the name's run");
+        assert_eq!(accent.2, crate::theme::Role::Sleeping, "{:?}", rule.0);
     }
 }
