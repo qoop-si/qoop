@@ -1550,13 +1550,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
 /// other dot, since nothing runs in it. What a person called it, else the agent that
 /// comes back in it, else a shell (a sleep refuses any other program), and where.
 fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
-    let name = tab
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .or(tab.agent.as_deref())
-        .map_or_else(|| "shell".to_string(), str::to_string);
+    let name = tab.label().to_string();
     let text = match cwd_basename(Some(&tab.cwd)).filter(|b| !b.eq_ignore_ascii_case(&space.name)) {
         Some(place) => format!("{name} \u{b7} {place}"),
         None => name,
@@ -6174,12 +6168,14 @@ mod tests {
         asleep.sleeping = vec![
             SleepingTab {
                 terminal: 7,
+                session: None,
                 title: None,
                 agent: Some("claude".into()),
                 cwd: "/src/api".into(),
             },
             SleepingTab {
                 terminal: 8,
+                session: None,
                 title: Some("logs".into()),
                 agent: None,
                 cwd: "/src/wt".into(),
@@ -6253,6 +6249,35 @@ mod tests {
         assert_eq!(act(Hit::Terminal(7), 9, &c, false), Some(Act::Terminal(7)));
     }
 
+    /// A sleeping agent tab keeps the name its conversation had: a person's title wins,
+    /// then the agent's own session name, and only then the bare agent.
+    #[test]
+    fn a_sleeping_tab_keeps_its_session_name() {
+        let named = |title: Option<&str>, session: Option<&str>| {
+            let mut asleep = space(2, "api");
+            asleep.asleep = true;
+            asleep.sleeping = vec![SleepingTab {
+                terminal: 7,
+                title: title.map(Into::into),
+                session: session.map(Into::into),
+                agent: Some("claude".into()),
+                cwd: "/src/api".into(),
+            }];
+            let spaces = vec![space(1, "app"), asleep];
+            let rows = tree_rows(&spaces, &[], 1, 20, &Seen::new(), &Shut::new());
+            let line = rows
+                .iter()
+                .find(|(_, h)| *h == Some(Hit::Terminal(7)))
+                .expect("the tab draws")
+                .0
+                .clone();
+            unbox(&line.text)
+        };
+        assert!(named(None, Some("fix login")).contains("fix login"));
+        assert!(named(Some("mine"), Some("fix login")).contains("mine"));
+        assert!(named(None, None).contains("claude"));
+    }
+
     /// The rule as the column paints it, at a width, for a space in a known state.
     fn rule_at(width: usize, name: &str, held: usize, asleep: bool, closable: bool) -> String {
         rule_asked_at(width, name, held, asleep, closable, false)
@@ -6275,6 +6300,7 @@ mod tests {
                 (0..held as u32)
                     .map(|terminal| SleepingTab {
                         terminal,
+                        session: None,
                         title: None,
                         agent: Some("claude".into()),
                         cwd: "/tmp".into(),
@@ -6585,6 +6611,7 @@ mod tests {
             sleeping: (0..3)
                 .map(|terminal| SleepingTab {
                     terminal,
+                    session: None,
                     title: None,
                     agent: Some("claude".into()),
                     cwd: "/tmp".into(),

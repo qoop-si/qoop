@@ -148,15 +148,11 @@ impl Palette {
         }) {
             out.push(terminal_entry(agent, spaces, "idle"));
         }
-        // The tabs of sleeping spaces, below everything that runs: picking one wakes its
-        // space and goes to it.
+        // The tabs of sleeping spaces, below everything that runs: picking one shows what
+        // it last drew, and waking it is a separate key.
         for space in spaces.iter().filter(|s| s.asleep) {
             for tab in &space.sleeping {
-                let name = tab
-                    .title
-                    .clone()
-                    .or_else(|| tab.agent.clone())
-                    .unwrap_or_else(|| "shell".to_string());
+                let name = tab.label();
                 out.push(Entry {
                     item: Item::Terminal(tab.terminal),
                     section: "sleeping",
@@ -621,6 +617,7 @@ mod tests {
         asleep.asleep = true;
         asleep.sleeping = vec![qoro_runtime::control::SleepingTab {
             terminal: 7,
+            session: None,
             title: None,
             agent: Some("claude".into()),
             cwd: "/tmp".into(),

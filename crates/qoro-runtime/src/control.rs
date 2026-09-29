@@ -648,8 +648,28 @@ pub struct SleepingTab {
     pub title: Option<String>,
     /// The agent that was in it, resumed into its own conversation on wake.
     pub agent: Option<String>,
+    /// What that agent called the conversation, read from its own storage when listed:
+    /// the name an awake row shows, so a sleep does not turn it back into a bare agent.
+    #[serde(default)]
+    pub session: Option<String>,
     /// Where it was, and where it starts again.
     pub cwd: String,
+}
+
+impl SleepingTab {
+    /// What a list calls this tab: what a person called it, else the agent's own name for
+    /// the conversation, else the agent, else a shell.
+    pub fn label(&self) -> &str {
+        [
+            self.title.as_deref().map(str::trim),
+            self.session.as_deref(),
+            self.agent.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty())
+        .unwrap_or("shell")
+    }
 }
 
 /// What a terminal threw away rather than drew, as an index row carries it.

@@ -123,6 +123,11 @@ private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKE
 A space you are not using can sleep: every tab in it ends, nothing of it takes CPU or
 memory, and waking it brings back the same tabs, numbers, names, splits, directories and
 scrollback, the last screen included, with each agent resumed into its own conversation.
+A sleeping tab keeps the name its conversation had, and reaching for it (a click, the
+palette) shows the last screen it drew, dimmed, without waking anything: Enter or `ctrl-a Z`
+wakes it once you have seen where it was. A program on the alternate screen leaves no last
+screen behind, and its tab says so.
+
 A space sleeps whole or not at all: a command still running, an agent that is working or
 has not told its conversation yet, or a job left in the background keeps it awake, and the
 refusal says which tab and why. When nothing is awake and no interface is attached, the

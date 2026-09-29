@@ -695,6 +695,11 @@ struct Modes {
     refetching: bool,
     /// The start of a key sequence the last read ended inside, held for the next one.
     pending: Vec<u8>,
+    /// The last screen of the sleeping tab the keyboard rests on, once the daemon has
+    /// sent it, drawn dim in the pane so a person sees where it was before waking it.
+    peek: Option<(u32, SnapshotWire)>,
+    /// The sleeping tab whose screen has been asked for, so it is asked for once.
+    peek_asked: Option<(u32, u16)>,
 }
 
 impl Modes {
@@ -745,7 +750,7 @@ impl State {
             panes: self.panes(),
             focused: self.focused,
             armed: self.armed,
-            snapshot: self.snapshot.as_ref(),
+            snapshot: self.peek_view().or(self.snapshot.as_ref()),
             cols: self.cols,
             lines: self.lines,
             // A mode speaks for itself on the notice row: its keys, or its question.
@@ -1191,6 +1196,16 @@ impl State {
             .map(|next| &self.spaces[next])
             .find(|w| !w.asleep)
             .map(|w| w.id)
+    }
+
+    /// The screen of the sleeping tab the keyboard rests on, when it has arrived.
+    fn peek_view(&self) -> Option<&SnapshotWire> {
+        let tab = self.dim_tab()?;
+        self.modes
+            .peek
+            .as_ref()
+            .filter(|(shown, _)| *shown == tab)
+            .map(|(_, snapshot)| snapshot)
     }
 
     /// Whether this space is listed asleep.
@@ -3202,6 +3217,74 @@ fn start_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
     true
 }
 
+/// The pane's size in cells, which is what a sleeping tab's screen is cut to.
+fn pane_cells(state: &State) -> (u16, u16) {
+    screen::pane_size_for(
+        state.cols,
+        state.lines,
+        state.collapsed,
+        0,
+        state.sidebar_width,
+    )
+}
+
+/// Ask for the last screen of the sleeping tab the keyboard rests on, once per tab and
+/// pane size, and let go of it when no sleeping tab is on screen any more, so a later
+/// sleep asks afresh.
+fn ask_peek(state: &mut State) {
+    let Some(tab) = state.dim_tab() else {
+        state.modes.peek = None;
+        state.modes.peek_asked = None;
+        return;
+    };
+    let (_, rows) = pane_cells(state);
+    if state.modes.peek_asked == Some((tab, rows)) {
+        return;
+    }
+    state.modes.peek_asked = Some((tab, rows));
+    state.modes.outbox.push(ControlRequest::Scrollback {
+        id: format!("peek-{tab}"),
+        terminal: tab,
+        up: rows as usize,
+        rows: rows as usize,
+    });
+}
+
+/// A sleeping tab's rows as a screen: plain text, every row dim, no cursor, so the pane
+/// draws it like a live one and nobody mistakes it for something that is running.
+fn peek_screen(mut lines: Vec<String>, cols: usize, rows: usize) -> SnapshotWire {
+    if lines.is_empty() {
+        lines.push("nothing of this tab's screen was kept".to_string());
+    }
+    lines.drain(..lines.len().saturating_sub(rows));
+    let styles = lines
+        .iter()
+        .map(|line| {
+            vec![qoro_runtime::daemon::SpanWire {
+                at: 0,
+                len: line.chars().count(),
+                fg: None,
+                bg: None,
+                attrs: qoro_runtime::daemon::attrs::DIM,
+                link: None,
+            }]
+        })
+        .collect();
+    SnapshotWire {
+        cols,
+        rows,
+        cursor: (0, 0),
+        lines,
+        styles,
+        links: Vec::new(),
+        modes: qoro_runtime::daemon::ModesWire {
+            cursor_visible: false,
+            ..Default::default()
+        },
+        behind: 0,
+    }
+}
+
 /// Send what the modes asked for, and copy a finished yank. Runs wherever the loop has a
 /// write in hand.
 async fn drain_modes(
@@ -3210,6 +3293,7 @@ async fn drain_modes(
     wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     dirty: &mut bool,
 ) -> io::Result<()> {
+    ask_peek(state);
     for ask in std::mem::take(&mut state.modes.outbox) {
         wr.write_all(&client::encode_control_seq(&ask, control_seq)?)
             .await?;
@@ -3980,11 +4064,15 @@ where
                             }
                             PaletteOutcome::Confirm(item) => {
                                 match item {
-                                    // A jump to a sleeping tab, or a sleeping space, wakes it.
+                                    // A jump to a sleeping tab shows it; a sleeping space wakes.
                                     palette::Item::Terminal(picked)
                                         if let Some(space) = state.sleeping_space_of(picked) =>
                                     {
-                                        wake(&mut state, space, Some(picked), &mut request);
+                                        if let Some(out) = peek(
+                                            &mut state, space, picked, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&out).await?;
+                                        }
                                     }
                                     palette::Item::Space(space) if state.asleep(space) => {
                                         wake(&mut state, space, None, &mut request);
@@ -4503,12 +4591,16 @@ where
                                 // armed row's own columns through `act`, and taking the
                                 // flag first would answer `y` as the sleep toggle.
                                 match clicked {
-                                    // A sleeping tab: its space wakes, and the screen goes
-                                    // to the tab once it is live again.
+                                    // A sleeping tab: looked at, not woken. Enter or
+                                    // ctrl-a Z wakes it once the person has seen it.
                                     Some(Clicked::Terminal(picked))
                                         if let Some(space) = state.sleeping_space_of(picked) =>
                                     {
-                                        wake(&mut state, space, Some(picked), &mut request);
+                                        if let Some(bytes) = peek(
+                                            &mut state, space, picked, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                        }
                                         dirty = true;
                                     }
                                     Some(Clicked::Terminal(picked)) => {
@@ -6849,6 +6941,19 @@ fn enter_space(
     }
 }
 
+/// Put the keyboard on one tab of a sleeping space without waking it: its space comes on
+/// screen with that tab picked, and the wake stays a key away.
+fn peek(
+    state: &mut State,
+    space: i64,
+    tab: u32,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    state.dim = tab;
+    enter_space(state, space, control_seq, seqs)
+}
+
 /// Take the keyboard out of every terminal, because this space has none to put it in.
 ///
 /// The unsubscribe is the point. Leaving the old terminal focused kept every keystroke
@@ -6994,6 +7099,36 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 copy.status = reason;
             }
             *dirty = true;
+        }
+        ControlResponse::Scrollback {
+            id,
+            terminal,
+            lines,
+            ..
+        } if id.starts_with("peek-") => {
+            // Only the tab still being looked at: an answer that outlived a wake, or a
+            // move to another tab, is for a screen nobody is showing.
+            if state
+                .modes
+                .peek_asked
+                .is_some_and(|(tab, _)| tab == terminal)
+            {
+                let (cols, rows) = pane_cells(state);
+                state.modes.peek =
+                    Some((terminal, peek_screen(lines, cols as usize, rows as usize)));
+                *dirty = true;
+            }
+        }
+        // A sleeping tab whose screen cannot be read is shown as an empty one, not as an
+        // error on the notice row over a tab nobody asked to open.
+        ControlResponse::Failed { id, .. } if id.starts_with("peek-") => {
+            let tab = id["peek-".len()..].parse::<u32>().ok();
+            if tab.is_some() && state.modes.peek_asked.map(|(t, _)| t) == tab {
+                let (cols, rows) = pane_cells(state);
+                state.modes.peek =
+                    tab.map(|tab| (tab, peek_screen(Vec::new(), cols as usize, rows as usize)));
+                *dirty = true;
+            }
         }
         ControlResponse::Scrollback {
             terminal,
@@ -12103,6 +12238,7 @@ mod tests {
                 .iter()
                 .map(|&terminal| qoro_runtime::control::SleepingTab {
                     terminal,
+                    session: None,
                     title: None,
                     agent: Some("claude".into()),
                     cwd: "/tmp".into(),
@@ -12122,6 +12258,127 @@ mod tests {
             },
             &mut 0,
             &mut dirty,
+        );
+    }
+
+    /// Reaching for a sleeping tab (a click, a palette jump) only puts the keyboard on it:
+    /// its space comes on screen with that tab picked and nothing is asked of the daemon.
+    #[test]
+    fn reaching_for_a_sleeping_tab_shows_it_and_wakes_nothing() {
+        let mut state = state();
+        state.spaces[0] = asleep(1, "app", &[7, 8]);
+        state.rows.clear();
+        let (mut control_seq, mut seqs) = (0, Default::default());
+        peek(&mut state, 1, 8, &mut control_seq, &mut seqs).expect("peek");
+        assert_eq!(state.space, Some(1));
+        assert_eq!(state.focused, 0);
+        assert_eq!(state.dim_tab(), Some(8));
+        assert_eq!(state.waking, None);
+        assert!(state.modes.outbox.is_empty(), "{:?}", state.modes.outbox);
+    }
+
+    /// The screen of a sleeping tab is asked for once when the keyboard rests on it, drawn
+    /// dim in its pane when it arrives, and let go of when no sleeping tab is on screen.
+    #[test]
+    fn a_sleeping_tabs_last_screen_is_asked_for_once_and_drawn_dim() {
+        let mut state = state();
+        state.spaces[0] = asleep(1, "app", &[7, 8]);
+        state.rows.clear();
+        state.space = Some(1);
+        state.focused = 0;
+        state.dim = 8;
+        ask_peek(&mut state);
+        ask_peek(&mut state);
+        assert!(
+            matches!(
+                state.modes.outbox.as_slice(),
+                [ControlRequest::Scrollback { id, terminal: 8, .. }] if id == "peek-8"
+            ),
+            "asked once, for the tab the keyboard rests on: {:?}",
+            state.modes.outbox
+        );
+        assert!(
+            state.peek_view().is_none(),
+            "nothing to draw before it arrives"
+        );
+
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Scrollback {
+                id: "peek-8".into(),
+                terminal: 8,
+                from: 0,
+                total: 2,
+                lines: vec!["$ cargo test".into(), "ok".into()],
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        let shown = state.peek_view().expect("the screen is drawn");
+        assert_eq!(shown.lines, vec!["$ cargo test", "ok"]);
+        assert!(
+            shown
+                .styles
+                .iter()
+                .all(|row| row[0].attrs == qoro_runtime::daemon::attrs::DIM)
+        );
+        assert!(!shown.modes.cursor_visible);
+        assert!(state.frame().snapshot.is_some());
+
+        // Another tab picked: its own screen is drawn, never the last one's.
+        state.dim = 7;
+        assert!(state.peek_view().is_none());
+
+        // Leaving the sleeping space lets go of it, so a later sleep asks afresh.
+        state.focused = 1;
+        ask_peek(&mut state);
+        assert!(state.modes.peek.is_none() && state.modes.peek_asked.is_none());
+    }
+
+    /// An answer for a tab no longer being looked at is dropped, and a resized pane asks
+    /// again so the screen is cut to the new size.
+    #[test]
+    fn a_stale_peek_answer_is_dropped_and_a_resize_asks_again() {
+        let mut state = state();
+        state.spaces[0] = asleep(1, "app", &[7, 8]);
+        state.rows.clear();
+        state.space = Some(1);
+        state.focused = 0;
+        state.dim = 8;
+        ask_peek(&mut state);
+        state.modes.outbox.clear();
+        let mut dirty = false;
+        let answer = |terminal| ControlResponse::Scrollback {
+            id: format!("peek-{terminal}"),
+            terminal,
+            from: 0,
+            total: 1,
+            lines: vec!["old".into()],
+        };
+        apply(&mut state, answer(7), &mut 0, &mut dirty);
+        assert!(
+            state.modes.peek.is_none(),
+            "an answer for another tab was kept"
+        );
+
+        state.lines += 4;
+        ask_peek(&mut state);
+        assert_eq!(
+            state.modes.outbox.len(),
+            1,
+            "a resized pane did not ask again"
+        );
+    }
+
+    /// Only the tail that fits the pane is kept, and a tab with nothing kept says so.
+    #[test]
+    fn a_peek_keeps_the_tail_that_fits_and_names_an_empty_one() {
+        let lines = (0..10).map(|n| n.to_string()).collect();
+        assert_eq!(peek_screen(lines, 20, 3).lines, vec!["7", "8", "9"]);
+        assert_eq!(
+            peek_screen(Vec::new(), 20, 3).lines,
+            vec!["nothing of this tab's screen was kept"]
         );
     }
 

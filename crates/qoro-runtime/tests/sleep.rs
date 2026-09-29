@@ -122,6 +122,40 @@ async fn a_space_sleeps_and_wakes_with_the_same_tab_and_its_last_screen() {
         "the list does not name the sleeping tab"
     );
 
+    // Asleep, its screen can still be read, so a client can show it before waking it.
+    let peeked = ask(
+        &mut c,
+        ControlRequest::Scrollback {
+            id: "peek".into(),
+            terminal: tab,
+            up: 50,
+            rows: 50,
+        },
+    )
+    .await;
+    let ControlResponse::Scrollback { lines, .. } = peeked else {
+        panic!("a sleeping tab's screen was not readable: {peeked:?}");
+    };
+    assert!(
+        lines.iter().any(|l| l.trim() == "SLEEPMARK-42"),
+        "the sleeping tab's last screen is not readable: {lines:?}"
+    );
+    // A number no sleeping space holds is still refused, and leaves no directory behind.
+    let stranger = ask(
+        &mut c,
+        ControlRequest::Scrollback {
+            id: "stranger".into(),
+            terminal: tab + 500,
+            up: 50,
+            rows: 50,
+        },
+    )
+    .await;
+    assert!(
+        matches!(stranger, ControlResponse::Failed { .. }),
+        "{stranger:?}"
+    );
+
     let woke = wake(&mut c, space).await;
     assert!(
         matches!(woke, ControlResponse::WorkspaceAwake { terminals: 1, .. }),

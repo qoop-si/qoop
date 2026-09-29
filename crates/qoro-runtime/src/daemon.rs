@@ -2861,7 +2861,14 @@ async fn handle_control(
         } => {
             let dir = match history_of(terminals, history_dir.as_ref(), terminal) {
                 Ok(dir) => dir,
-                Err(reason) => return ControlResponse::Failed { id, reason },
+                // A tab of a sleeping space has no terminal but keeps its history, which
+                // is what a client shows of it before deciding to wake it.
+                Err(reason) => {
+                    match sleeping_history_of(books, history_dir.as_ref(), terminal).await {
+                        Some(dir) => dir,
+                        None => return ControlResponse::Failed { id, reason },
+                    }
+                }
             };
             // Capped, because the count comes from a client and a client that asks for a
             // hundred million rows would be asking the daemon to allocate them.
@@ -2984,6 +2991,7 @@ async fn handle_control(
                         .map(|tab| crate::control::SleepingTab {
                             terminal: tab.id as u32,
                             title: tab.title,
+                            session: agent_title(tab.agent_session.as_deref()),
                             agent: tab.agent,
                             cwd: tab.cwd,
                         })
@@ -5333,6 +5341,27 @@ async fn is_dir_probed(path: &Path) -> Result<bool, crate::blocking::BlockingErr
         owned.is_dir()
     })
     .await
+}
+
+/// Where the history of a tab of a sleeping space lives, when this is one. Only a tab a
+/// sleeping space holds: opening a history creates its directory, so any other id would
+/// leave an empty one behind.
+async fn sleeping_history_of(
+    books: &Bookkeeping,
+    history_dir: Option<&PathBuf>,
+    terminal: u32,
+) -> Option<PathBuf> {
+    let dir = history_dir?.join(terminal.to_string());
+    let asleep: Vec<i64> = books.asleep.lock().unwrap().iter().copied().collect();
+    for workspace in asleep {
+        let Ok(rows) = books.store.open_terminals(workspace).await else {
+            continue;
+        };
+        if rows.iter().any(|row| row.id == terminal as i64) {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// Where a terminal's history lives, or why it cannot be read.
