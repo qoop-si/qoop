@@ -9,24 +9,31 @@ qoro
 
 That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
 no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you are back in
-the same one.
+the same one, on the terminal you left: the same space, the same tab, the same pane of a split.
 
 ```
- ▲ claude                 12s │ 1 zsh  2 claude  +
-   spaces               tree +│~/my-project $ cargo test
-─▾ my-project ──────────── 1 ─│
-   ● claude                   │
-─· notes ─────────────────────│
+ ⠯⠇claude                 12s │ 1 zsh  2 claude  +
+ agents                 tree +│~/my-project $ cargo test
+ ▾ my-project           1     │
+ ⠯⠇claude                     │
+ ▸ notes                      │
 terminal 2 is blocked
 ```
 
-The index says which space each agent is in and what it is doing: every space is a rule
-with its agents under it, and `ctrl-a f` folds one away. An agent waiting for an answer is
-named in the one row at the top, with a mark for each one waiting after it, and `ctrl-a tab`
+The index says which space each agent is in and what it is doing: every space is its name
+with its agents under it (only agents: every tab is on the bar above the terminal), and
+`ctrl-a f` folds one away. An agent waiting for an answer is named in the one row at the top, with a mark for each one waiting after it, and `ctrl-a tab`
 goes to it: wants first, then failed, then finished. It also lights its row and rings the
 bell, so you find out without looking, even when its space is folded. The name is the one
 you would say, not the runtime underneath it: an agent installed as a node package reads as
 itself, not as `node`.
+
+Each agent wears a small square of nine dots in its state's colour. While it works the dots
+fill the ring and empty it again; when it stops they settle into a picture: an empty ring
+when it wants you, an X when it failed, the full square when it finished, one dot in the
+middle when it is idle. The shape says it as well as the colour, so it reads without colour
+too. A split tab draws a frame round its panes, with each pane's name on its top edge, and
+the pane the keyboard is in is drawn in its space's colour.
 
 `ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches. The
 bottom row names the keys that work where you are, and every command while `ctrl-a` waits
@@ -35,7 +42,7 @@ sidebar.rs`, `cargo test`), from the agent's own hook. `ctrl-a M` opens the focu
 last answer as a page, and `QORO_USAGE=1` shows what each agent costs in CPU and memory.
 Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a
 minute, and the state is read off a terminal's screen only once it stops changing. The one
-motion is the spinner and sweep beside an agent that is working and on screen: about 0.3
+motion is the filling ring and sweep beside an agent that is working and on screen: about 0.3
 percent of a core while they turn, nothing once the agent stops, and `QORO_MOTION=0` or
 `NO_COLOR` keeps them still.
 

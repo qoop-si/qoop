@@ -235,6 +235,14 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .collect()
 }
 
+/// Whether `line` is a space's rule: no line is drawn round a space any more, so a rule
+/// reads by its own leading shape alone, a fold arrow (or the dot of an empty space) one
+/// column in, then a space before the name.
+fn is_rule_line(line: &str) -> bool {
+    let mut chars = line.strip_prefix(' ').unwrap_or("").chars();
+    matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}')) && chars.next() == Some(' ')
+}
+
 /// A row inside a space's box with the box's sides blanked, column for column, so what it
 /// holds reads at the columns it is drawn at: ` │ ● claude  │` is `   ● claude   `. The
 /// edges of the box, and every other row, as they are.
@@ -261,7 +269,7 @@ fn first_agent_row_of(screen: &Screen) -> usize {
         .unwrap_or_else(|| panic!("the column title is not on screen:\n{screen}"))
 }
 
-/// Where the column's ` spaces` title is, if a whole frame of it has arrived.
+/// Where the column's ` agents` title is, if a whole frame of it has arrived.
 ///
 /// An answer rather than a panic, because the caller is usually waiting rather than
 /// asserting: what has been read so far can be half a frame, with the title in the part
@@ -274,7 +282,7 @@ fn agents_title_row(screen: &Screen) -> Option<usize> {
                 .take(index_width())
                 .collect::<String>()
                 .trim_end()
-                .starts_with("   spaces")
+                .starts_with(" agents")
         })
     })
 }
@@ -713,20 +721,13 @@ impl Interface {
 
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
-    /// Found by its shape rather than by arithmetic: a space's box opens with its corner,
-    /// then its fold arrow and a space, and agents move the boxes down as they come and
-    /// go.
+    /// Found by its shape rather than by arithmetic: a rule opens with its fold arrow (or
+    /// the dot of an empty space), and agents move the rules down as they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
         (first..=last)
-            .filter(|&row| {
-                self.panel_line(row).is_some_and(|line| {
-                    let mut chars = line.strip_prefix(" \u{256d}").unwrap_or("").chars();
-                    matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}'))
-                        && chars.next() == Some(' ')
-                })
-            })
+            .filter(|&row| self.panel_line(row).is_some_and(|line| is_rule_line(&line)))
             .nth(nth - 1)
     }
 
@@ -743,15 +744,16 @@ impl Interface {
     }
 
     /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
-    /// box carries the raised background. The rule itself never does, since the tab bar
-    /// already names the focused space by colour.
+    /// box carries the raised background, or, when the keyboard is on a tab with no agent
+    /// and so no row of its own, the rule itself does.
     fn space_selected(&self, rule: usize) -> bool {
-        (rule + 1..ROWS as usize)
-            .take_while(|&row| {
-                self.panel_line(row)
-                    .is_some_and(|line| !line.trim_start().starts_with('\u{256d}'))
-            })
-            .any(|row| self.panel_selected(row))
+        self.panel_selected(rule)
+            || (rule + 1..ROWS as usize)
+                .take_while(|&row| {
+                    self.panel_line(row)
+                        .is_some_and(|line| !is_rule_line(&line))
+                })
+                .any(|row| self.panel_selected(row))
     }
 
     /// Read until the space whose rule is drawn on `rule` carries the keyboard.
@@ -924,7 +926,7 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         .unwrap_or_default();
     // One title over the whole column: the order word, then the corner that makes a space.
     assert!(
-        title.starts_with("   spaces") && title.ends_with("tree +"),
+        title.starts_with(" agents") && title.ends_with("tree +"),
         "the title lost its order word or its new-space corner: {title:?}"
     );
     // The shell is a tab and not an agent. The bar answers "what did I open" and the panel
@@ -959,27 +961,24 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         "the tab names no program: {:?}",
         ui.tab_bar()
     );
-    // The space's rule holds its one tab: a plain shell is a tab, listed as one faint
-    // row with a middle dot where an agent wears its state.
+    // The panel lists agents only: a plain shell is a tab, not an agent, so it never
+    // gets a row there, and the space's rule holds nothing to fold, its middle dot
+    // saying so.
     assert!(
-        ui.wait_for_agents(|row| row.starts_with("   \u{b7} "), Duration::from_secs(10)),
-        "the shell's tab is not under its space: {:?}",
+        ui.wait_for_agents(
+            |row| row.starts_with(" \u{b7} default"),
+            Duration::from_secs(10)
+        ),
+        "the empty space is not an open rule first: {:?}",
         agents_panel(&ui.screen)
     );
     let list = agents_panel(&ui.screen);
     assert!(
-        list.first()
-            .is_some_and(|row| row.starts_with(" \u{256d}\u{25be} default")),
-        "the only space is not an open rule first: {list:?}"
-    );
-    assert!(
-        // An agent row has its mark three columns in: a dot, the failed diamond, or a
-        // spinner frame. None of them may be there.
-        !list.iter().any(|row| row.starts_with("   ")
-            && row
-                .chars()
-                .nth(3)
-                .is_some_and(|c| c != ' ' && c != '\u{b7}')),
+        // No row drew for the shell, or for anything else: the space holds nothing
+        // an agents-only panel lists, so every row under the rule is blank.
+        !list
+            .iter()
+            .any(|row| row.starts_with("   ") && !row.trim().is_empty()),
         "a plain shell is listed as an agent: {list:?}"
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
@@ -1938,7 +1937,7 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     // found, the tab reads as the wrapper, as it does in the tab bar.
     assert!(
         ui.wait_for_agents(
-            |line| line.contains("codex") && !line.starts_with("   \u{b7} "),
+            |line| line.contains("codex") && !line.starts_with(" \u{b7} "),
             Duration::from_secs(20)
         ),
         "the agent behind the wrapper is not on the panel: {:?}\n{}",
@@ -2145,9 +2144,23 @@ fn radar_tree_order_holds_creation_order() {
         .expect("chmod");
     }
 
+    // A state row opens with its two-cell braille mark straight into the program
+    // name, with no space between them; a place row (`└ claude · ...`) never does,
+    // so this pins the match to the state row alone.
+    fn is_state_row(line: &str, program: &str) -> bool {
+        line.strip_prefix(' ').is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                && rest
+                    .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+                    .starts_with(program)
+        })
+    }
+
     ui.type_in(format!("{}\n", dir.join("claude").display()).as_bytes());
     assert!(
-        ui.wait_for_agents(|line| line.contains("● claude"), Duration::from_secs(15)),
+        ui.wait_for_agents(|line| is_state_row(line, "claude"), Duration::from_secs(15)),
         "the agents panel does not name the agent: {:?}",
         agents_panel(&ui.screen)
     );
@@ -2160,22 +2173,22 @@ fn radar_tree_order_holds_creation_order() {
     );
     ui.type_in(format!("{}\n", dir.join("codex").display()).as_bytes());
     assert!(
-        ui.wait_for_agents(|line| line.contains("● codex"), Duration::from_secs(15)),
+        ui.wait_for_agents(|line| is_state_row(line, "codex"), Duration::from_secs(15)),
         "the agents panel does not name the agent: {:?}",
         agents_panel(&ui.screen)
     );
 
     // Grouped is daemon order: the first created agent draws first, whatever
-    // the two have done since. The dot pins the match to first rows, so a
+    // the two have done since. The mark pins the match to first rows, so a
     // place row naming the program cannot satisfy it.
     let panel = agents_panel(&ui.screen);
     let claude = panel
         .iter()
-        .position(|line| line.contains("● claude"))
+        .position(|line| is_state_row(line, "claude"))
         .unwrap_or_else(|| panic!("claude left the panel: {panel:?}"));
     let codex = panel
         .iter()
-        .position(|line| line.contains("● codex"))
+        .position(|line| is_state_row(line, "codex"))
         .unwrap_or_else(|| panic!("codex left the panel: {panel:?}"));
     assert!(claude < codex, "tree order moved a row: {panel:?}");
 }

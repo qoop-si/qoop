@@ -163,8 +163,11 @@ impl Layout {
         if self.zoomed.is_some() {
             return false;
         }
-        let Some(rect) = self
-            .tile_rects(area)
+        // Measured inside the frame the split is about to bring, so a pane that fits now
+        // still fits once the frame takes its cell from every side.
+        let mut rects = Vec::new();
+        layout_node(&self.root, framed(area), &mut rects);
+        let Some(rect) = rects
             .into_iter()
             .find(|(t, _)| *t == target)
             .map(|(_, r)| r)
@@ -294,8 +297,20 @@ impl Layout {
             return vec![(z, area)];
         }
         let mut out = Vec::new();
-        layout_node(&self.root, area, &mut out);
+        layout_node(&self.root, self.inner(area), &mut out);
         out
+    }
+
+    /// The part of `area` the panes share once a frame is drawn around them: one cell in
+    /// from every side while a split is on screen, all of it for one pane or a zoom.
+    ///
+    /// The one place the frame is taken off, so sizing, painting, clicks and drags all
+    /// measure the same tiles.
+    pub fn inner(&self, area: Rect) -> Rect {
+        if self.zoomed.is_some() || !matches!(self.root, Node::Split { .. }) {
+            return area;
+        }
+        framed(area)
     }
 
     /// Move the divider nearest the focused pane on the move's axis, by `step` of its
@@ -309,6 +324,7 @@ impl Layout {
         if self.zoomed.is_some() {
             return false;
         }
+        let area = self.inner(area);
         // Left and right move a side by side divider, up and down a stacked one, each the
         // way the key points (tmux's rule): which side of it the pane is on does not matter.
         let (dir, sign) = match mv {
@@ -344,7 +360,7 @@ impl Layout {
             return None;
         }
         let mut path = Vec::new();
-        divider_in(&self.root, area, col, row, &mut path).then_some(path)
+        divider_in(&self.root, self.inner(area), col, row, &mut path).then_some(path)
     }
 
     /// Put the divider of the split at `path` under a pane-local cell. Answers whether it
@@ -355,6 +371,7 @@ impl Layout {
     /// cell, so a drag toward the limit has already put the divider on the last allowed cell
     /// by the time the pointer passes it.
     pub fn drag(&mut self, area: Rect, path: &[bool], col: usize, row: usize) -> bool {
+        let area = self.inner(area);
         let Some((dir, _, rect)) = split_at(&self.root, path, area) else {
             return false;
         };
@@ -619,6 +636,20 @@ fn layout_node(node: &Node, area: Rect, out: &mut Vec<(u32, Rect)>) {
                 layout_node(second, b, out);
             }
         }
+    }
+}
+
+/// `area` one cell in from every side, for the frame around split panes. An area too small
+/// to give up the cells is left whole.
+fn framed(area: Rect) -> Rect {
+    if area.cols < 3 || area.rows < 3 {
+        return area;
+    }
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        cols: area.cols - 2,
+        rows: area.rows - 2,
     }
 }
 
@@ -891,9 +922,10 @@ mod tests {
         assert!(layout.bind_placeholder(2));
         let rects = layout.tile_rects(area(80, 24));
         assert_eq!(rects.len(), 2);
-        let total: usize = rects.iter().map(|(_, r)| r.cols).sum::<usize>() + 1;
+        // Two panes, one divider, and the frame's column on each side.
+        let total: usize = rects.iter().map(|(_, r)| r.cols).sum::<usize>() + 1 + 2;
         assert_eq!(total, 80);
-        assert!(rects.iter().all(|(_, r)| r.rows == 24));
+        assert!(rects.iter().all(|(_, r)| r.rows == 22));
     }
 
     #[test]
@@ -903,9 +935,28 @@ mod tests {
         assert!(layout.bind_placeholder(2));
         let rects = layout.tile_rects(area(80, 24));
         assert_eq!(rects.len(), 2);
-        let total: usize = rects.iter().map(|(_, r)| r.rows).sum::<usize>() + 1;
+        let total: usize = rects.iter().map(|(_, r)| r.rows).sum::<usize>() + 1 + 2;
         assert_eq!(total, 24);
-        assert!(rects.iter().all(|(_, r)| r.cols == 80));
+        assert!(rects.iter().all(|(_, r)| r.cols == 78));
+    }
+
+    /// The frame is there only while panes share the area: one pane and a zoom fill it.
+    #[test]
+    fn a_frame_surrounds_split_panes_and_nothing_else() {
+        let mut layout = Layout::single(1);
+        assert_eq!(layout.inner(area(80, 24)), area(80, 24));
+        assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
+        assert!(layout.bind_placeholder(2));
+        let inner = layout.inner(area(80, 24));
+        assert_eq!((inner.x, inner.y, inner.cols, inner.rows), (1, 1, 78, 22));
+        assert!(
+            layout
+                .tile_rects(area(80, 24))
+                .iter()
+                .all(|(_, r)| r.x >= 1 && r.y == 1)
+        );
+        layout.toggle_zoom();
+        assert_eq!(layout.tile_rects(area(80, 24)), vec![(2, area(80, 24))]);
     }
 
     #[test]
@@ -1042,9 +1093,10 @@ mod tests {
         assert!(layout.bind_placeholder(2));
         let rects = layout.tile_rects(area(80, 24));
         let left = rects.iter().find(|(t, _)| *t == 1).unwrap().1;
-        // The column right after the left pane is the divider.
-        assert_eq!(layout.hit(area(80, 24), left.cols, 0), None);
-        assert_eq!(layout.hit(area(80, 24), 0, 0), Some(1));
+        // The column right after the left pane is the divider, and the outer edge is frame.
+        assert_eq!(layout.hit(area(80, 24), left.x + left.cols, 1), None);
+        assert_eq!(layout.hit(area(80, 24), 0, 0), None);
+        assert_eq!(layout.hit(area(80, 24), 1, 1), Some(1));
     }
 
     /// `[A | (B over C)]`: 1 on the left, 2 above 3 on the right, 3 focused.
@@ -1118,7 +1170,7 @@ mod tests {
         assert!(layout.nudge(a, Move::Right, 0.2));
         assert!(layout.equalize());
         let widths: Vec<usize> = layout.tile_rects(a).iter().map(|(_, r)| r.cols).collect();
-        assert_eq!(widths, vec![40, 40, 40], "the stack is one column");
+        assert_eq!(widths, vec![39, 39, 39], "the stack is one column");
         assert!(!layout.equalize(), "already even");
 
         let mut row = Layout::single(1);
@@ -1128,7 +1180,7 @@ mod tests {
         assert!(row.bind_placeholder(3));
         row.equalize();
         let widths: Vec<usize> = row
-            .tile_rects(area(92, 24))
+            .tile_rects(area(94, 24))
             .iter()
             .map(|(_, r)| r.cols)
             .collect();
@@ -1157,15 +1209,15 @@ mod tests {
         let a = area(80, 24);
         let left = rect_of(&layout, 1);
         let right = rect_of(&layout, 2);
-        assert_eq!(layout.divider_at(a, left.cols, 5), Some(vec![]));
+        assert_eq!(layout.divider_at(a, left.x + left.cols, 5), Some(vec![]));
         assert_eq!(
-            layout.divider_at(a, right.x + 3, right.rows),
+            layout.divider_at(a, right.x + 3, right.y + right.rows),
             Some(vec![true])
         );
         assert_eq!(layout.divider_at(a, 2, 2), None, "inside a pane");
-        // Dragged to column 30: the left pane is thirty columns wide.
+        // Dragged to column 30: the left pane runs from the frame to it, 29 columns.
         assert!(layout.drag(a, &[], 30, 5));
-        assert_eq!(rect_of(&layout, 1).cols, 30);
+        assert_eq!(rect_of(&layout, 1).cols, 29);
         assert!(
             !layout.drag(a, &[], 30, 9),
             "the same column again is no move"
@@ -1175,10 +1227,10 @@ mod tests {
         assert!(rect_of(&layout, 2).cols >= MIN_COLS);
         // The stacked divider follows rows.
         assert!(layout.drag(a, &[true], 60, 6));
-        assert_eq!(rect_of(&layout, 2).rows, 6);
+        assert_eq!(rect_of(&layout, 2).rows, 5);
         layout.toggle_zoom();
         assert_eq!(
-            layout.divider_at(a, left.cols, 5),
+            layout.divider_at(a, left.x + left.cols, 5),
             None,
             "no divider while zoomed"
         );

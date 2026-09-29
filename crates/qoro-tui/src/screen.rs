@@ -579,6 +579,23 @@ pub fn paint(frame: &Frame) -> String {
     } else {
         Vec::new()
     };
+    // The lines around split panes, worked out once for the whole frame.
+    let edges = if frame.tiles.len() < 2 {
+        Vec::new()
+    } else {
+        pane_edges(
+            &frame.tiles,
+            frame.rows,
+            pane_cols as usize,
+            pane_rows as usize,
+        )
+    };
+    // The space of the focused tab when that tab runs no agent, and so draws no row.
+    let shell_space = frame
+        .rows
+        .iter()
+        .find(|r| r.terminal == column.focused_terminal && !r.agent)
+        .map(|r| r.workspace);
     for row in 0..column_rows {
         out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -594,7 +611,9 @@ pub fn paint(frame: &Frame) -> String {
         // edge.
         if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
-                Some(sidebar::Hit::Space(_)) => false,
+                // A tab with no agent has no row in the column, so the keyboard on one is
+                // shown on its space's rule instead: the column always says where it is.
+                Some(sidebar::Hit::Space(space)) => shell_space == Some(*space),
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == column.focused_terminal,
                 Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Next(_)) | None => {
                     false
@@ -714,7 +733,7 @@ pub fn paint(frame: &Frame) -> String {
                 selected,
             ));
         } else {
-            paint_tiled_row(frame, pane_row, pane_cols as usize, left, &mut out);
+            paint_tiled_row(frame, &edges, pane_row, pane_cols as usize, left, &mut out);
         }
     }
 
@@ -1685,14 +1704,150 @@ fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
     })
 }
 
-/// One pane row with several tiles in it, plus the dividers between them.
+/// How a cell of the lines around split panes is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeInk {
+    /// A line no focused pane touches: the rule grey.
+    Rule,
+    /// A line of the focused pane's box, in its space's colour.
+    Lit,
+    /// A pane's name on its top edge.
+    Title,
+    /// The focused pane's name.
+    TitleLit,
+}
+
+/// The lines around split panes, as a grid over the pane area.
+///
+/// Each tile gets a box one cell out from it, and boxes that meet share the cells between
+/// them, so two panes side by side have one line between them and a frame round both.
+/// Where lines meet the cell joins them (`┬ ┴ ├ ┤ ┼`), the outer corners round the way every
+/// other box on this screen does, and the focused pane's box is drawn in its space's colour
+/// with its name on the top edge: the keyboard's pane is findable without reading.
+fn pane_edges(
+    tiles: &[Tile],
+    agents: &[AgentRow],
+    cols: usize,
+    rows: usize,
+) -> Vec<Vec<Option<(char, EdgeInk)>>> {
+    // Which ways a line leaves each cell: up, down, left, right.
+    let mut ways = vec![vec![[false; 4]; cols]; rows];
+    let mut lit = vec![vec![false; cols]; rows];
+    for tile in tiles {
+        let r = tile.rect;
+        // The box around the tile. A tile against the area's edge (an area too small for
+        // the frame) has no line on that side.
+        let (Some(left), Some(top)) = (r.x.checked_sub(1), r.y.checked_sub(1)) else {
+            continue;
+        };
+        let (right, bottom) = (r.x + r.cols, r.y + r.rows);
+        if right >= cols || bottom >= rows {
+            continue;
+        }
+        for x in left..=right {
+            for y in [top, bottom] {
+                ways[y][x][2] |= x > left;
+                ways[y][x][3] |= x < right;
+                lit[y][x] |= tile.focused;
+            }
+        }
+        for y in top..=bottom {
+            for x in [left, right] {
+                ways[y][x][0] |= y > top;
+                ways[y][x][1] |= y < bottom;
+                lit[y][x] |= tile.focused;
+            }
+        }
+    }
+    let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = ways
+        .iter()
+        .zip(&lit)
+        .map(|(row, lit)| {
+            row.iter()
+                .zip(lit)
+                .map(|(way, lit)| {
+                    edge_char(*way).map(|c| (c, if *lit { EdgeInk::Lit } else { EdgeInk::Rule }))
+                })
+                .collect()
+        })
+        .collect();
+    // Each pane's name on its top edge, two cells in from its corner.
+    for tile in tiles {
+        let r = tile.rect;
+        let Some(top) = r.y.checked_sub(1) else {
+            continue;
+        };
+        let Some(row) = agents.iter().find(|a| a.terminal == tile.terminal) else {
+            continue;
+        };
+        let room = r.cols.saturating_sub(2);
+        if room < 3 {
+            continue;
+        }
+        let name = crate::sidebar::label(row);
+        let name = width::fit(&name, width::width(&name).min(room - 2));
+        let ink = if tile.focused {
+            EdgeInk::TitleLit
+        } else {
+            EdgeInk::Title
+        };
+        let mut x = r.x + 1;
+        for c in format!(" {} ", name.trim_end()).chars() {
+            let wide = width::columns(c) == 2;
+            if let Some(cell) = grid[top].get_mut(x) {
+                *cell = Some((c, ink));
+            }
+            // The cell a wide character spills into paints nothing of its own.
+            if wide && let Some(cell) = grid[top].get_mut(x + 1) {
+                *cell = Some(('\0', ink));
+            }
+            x += if wide { 2 } else { 1 };
+        }
+    }
+    grid
+}
+
+/// The line-drawing character for a cell the lines leave by `[up, down, left, right]`.
+fn edge_char(way: [bool; 4]) -> Option<char> {
+    Some(match way {
+        [true, true, true, true] => '\u{253c}',
+        [true, true, true, false] => '\u{2524}',
+        [true, true, false, true] => '\u{251c}',
+        [true, false, true, true] => '\u{2534}',
+        [false, true, true, true] => '\u{252c}',
+        [false, true, false, true] => '\u{256d}',
+        [false, true, true, false] => '\u{256e}',
+        [true, false, false, true] => '\u{2570}',
+        [true, false, true, false] => '\u{256f}',
+        [true, _, false, false] | [_, true, false, false] => '\u{2502}',
+        [false, false, true, _] | [false, false, _, true] => '\u{2500}',
+        [false, false, false, false] => return None,
+    })
+}
+
+/// The escape for one kind of edge cell. The focused pane's name is bold in the space's
+/// colour; its box is the space's colour, and bold only without colour, which is how every
+/// other focus on this screen reads in monochrome.
+fn edge_style(ink: EdgeInk, space: theme::Role) -> String {
+    let mono = crate::colorlevel::level() == crate::colorlevel::Level::Mono;
+    match ink {
+        EdgeInk::Rule => theme::fg(theme::Role::Rule),
+        EdgeInk::Title => theme::fg(theme::Role::Detail),
+        EdgeInk::Lit if !mono => theme::fg(space),
+        EdgeInk::Lit | EdgeInk::TitleLit => format!("{}\x1b[1m", theme::fg(space)),
+    }
+}
+
+/// One pane row with several tiles in it, and the lines around them.
 ///
 /// Each tile shows the leftmost columns of its own snapshot. Every tile is
 /// sized to its rectangle, so nothing is hidden, unless another client owns
 /// that terminal's size and it is cropped. Scrollback, selection and the
-/// cursor belong to the focused tile alone. Cells no tile covers are dividers.
+/// cursor belong to the focused tile alone. Cells no tile covers are the
+/// frame and the lines between the tiles, from [`pane_edges`].
 fn paint_tiled_row(
     frame: &Frame,
+    edges: &[Vec<Option<(char, EdgeInk)>>],
     pane_row: usize,
     pane_cols: usize,
     pane_left: usize,
@@ -1740,26 +1895,28 @@ fn paint_tiled_row(
         });
         out.push_str(&paint_row(line, spans, links, tile.rect.cols, selected));
     }
+    let space = theme::space_of(frame.space.unwrap_or_default());
+    let row = edges.get(pane_row);
     let mut x = 0;
     while x < pane_cols {
         if covers(frame, x, pane_row) {
             x += 1;
             continue;
         }
-        let start = x;
-        while x < pane_cols && !covers(frame, x, pane_row) {
+        // A run of uncovered cells in one ink, written with one escape.
+        let cell = |x: usize| row.and_then(|r| r.get(x).copied().flatten());
+        let ink = cell(x).map(|(_, ink)| ink);
+        out.push_str(&at(screen_row, pane_left + 1 + x));
+        out.push_str(&ink.map_or_else(
+            || theme::fg(theme::Role::Rule),
+            |ink| edge_style(ink, space),
+        ));
+        while x < pane_cols && !covers(frame, x, pane_row) && cell(x).map(|(_, ink)| ink) == ink {
+            match cell(x).map_or(' ', |(c, _)| c) {
+                '\0' => {}
+                c => out.push(c),
+            }
             x += 1;
-        }
-        // A gap with tiles on both sides on this row is a vertical divider,
-        // anything else is a horizontal one.
-        let vertical = start > 0
-            && x < pane_cols
-            && covers(frame, start - 1, pane_row)
-            && covers(frame, x, pane_row);
-        out.push_str(&theme::fg(theme::Role::Rule));
-        out.push_str(&at(screen_row, pane_left + 1 + start));
-        for _ in start..x {
-            out.push(if vertical { '\u{2502}' } else { '\u{2500}' });
         }
         out.push_str(theme::RESET);
     }
@@ -2504,7 +2661,7 @@ mod tests {
         // space and the panel says what it is doing.
         assert!(painted.matches("claude").count() >= 2, "{painted:?}");
         assert!(strip(&painted).contains("d\u{2192}detach"));
-        assert!(painted.contains("spaces"), "no spaces panel: {painted:?}");
+        assert!(painted.contains("agents"), "no agents panel: {painted:?}");
         assert!(
             painted.contains("app"),
             "the space is not named: {painted:?}"
@@ -3757,16 +3914,23 @@ mod tests {
                 chrome: Default::default(),
             })
         };
+        // The still, two-cell mark a working row wears at frame zero, and the frame it
+        // turns to at tick one: `cell_mark(Role::Working, true, tick)` in sidebar.rs is
+        // the source of truth these are copied from.
+        let still = "\u{2809}\u{2803}";
+        let frame_one = "\u{2809}\u{2800}";
         let first = paint_at(0);
-        for glyph in ['\u{280b}', '\u{2819}', '\u{2839}'] {
-            assert!(
-                !strip(&first).contains(glyph),
-                "frame zero moved: {first:?}"
-            );
-        }
+        assert!(
+            strip(&first).contains(still),
+            "frame zero is not the still mark: {first:?}"
+        );
+        assert!(
+            !strip(&first).contains(frame_one),
+            "frame zero moved: {first:?}"
+        );
         let second = paint_at(1);
         assert!(
-            strip(&second).contains('\u{2819}'),
+            strip(&second).contains(frame_one),
             "the working row did not turn the spinner: {second:?}"
         );
         // The status sentence keeps the word on purpose: it says what the focused
@@ -4561,14 +4725,24 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // Under the title: the next row above it names one of the same agents.
+        // Under the title: the next row above it names one of the same agents. Each
+        // agent's row opens with its two-cell state mark (braille U+2800..=U+28FF),
+        // whatever state it is in, straight into the name with no space.
         assert_eq!(
             texts
                 .iter()
-                .skip_while(|t| !t.starts_with("   spaces"))
+                .skip_while(|t| !t.starts_with(" agents"))
                 .filter(|t| {
-                    t.starts_with(" \u{2502} \u{25cf} claude")
-                        || t.starts_with(" \u{2502} \u{25c6} claude")
+                    t.strip_prefix(" ").is_some_and(|rest| {
+                        rest.chars()
+                            .next()
+                            .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                            && rest
+                                .trim_start_matches(|c: char| {
+                                    ('\u{2800}'..='\u{28ff}').contains(&c)
+                                })
+                                .starts_with("claude")
+                    })
                 })
                 .count(),
             9,
@@ -4578,7 +4752,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|t| t.starts_with("   spaces") && t.ends_with("tree +")),
+                .any(|t| t.starts_with(" agents") && t.ends_with("tree +")),
             "{texts:?}"
         );
     }
@@ -5092,6 +5266,64 @@ mod tests {
         );
     }
 
+    /// A split tab is framed the way the column's boxes are: rounded outer corners, one
+    /// shared line between the panes joined into the frame, and the focused pane's box and
+    /// name lit while the other's stay grey.
+    #[test]
+    fn split_panes_are_framed_and_the_focused_one_is_lit() {
+        let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+        let area = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 10,
+        };
+        let mut layout = crate::layout::Layout::single(1);
+        assert!(layout.split_placeholder(1, crate::layout::Dir::V, area));
+        assert!(layout.bind_placeholder(2));
+        let tiles: Vec<Tile> = layout
+            .tile_rects(area)
+            .into_iter()
+            .map(|(terminal, rect)| Tile {
+                terminal,
+                rect,
+                snapshot: None,
+                focused: terminal == 2,
+            })
+            .collect();
+        let grid = pane_edges(&tiles, &rows, 40, 10);
+        let text =
+            |y: usize| -> String { grid[y].iter().map(|c| c.map_or(' ', |(c, _)| c)).collect() };
+        let left = tiles[0].rect;
+        let divider = left.x + left.cols;
+        assert!(text(0).starts_with('\u{256d}'), "{:?}", text(0));
+        assert!(text(0).ends_with('\u{256e}'), "{:?}", text(0));
+        assert_eq!(grid[0][divider].map(|(c, _)| c), Some('\u{252c}'));
+        assert_eq!(grid[9][divider].map(|(c, _)| c), Some('\u{2534}'));
+        assert!(text(9).starts_with('\u{2570}') && text(9).ends_with('\u{256f}'));
+        assert_eq!(grid[4][divider].map(|(c, _)| c), Some('\u{2502}'));
+        // Each pane's name on its top edge, the focused one lit.
+        assert!(
+            text(0).contains(" zsh ") && text(0).contains(" claude "),
+            "{:?}",
+            text(0)
+        );
+        let top = text(0);
+        let at = top[..top.find(" claude ").expect("its name")]
+            .chars()
+            .count();
+        assert_eq!(grid[0][at + 1].map(|(_, ink)| ink), Some(EdgeInk::TitleLit));
+        let top = text(0);
+        let at = top[..top.find(" zsh ").expect("its name")].chars().count();
+        assert_eq!(grid[0][at + 1].map(|(_, ink)| ink), Some(EdgeInk::Title));
+        // The shared line is the focused pane's edge too; the far side is not.
+        assert_eq!(grid[4][divider].map(|(_, ink)| ink), Some(EdgeInk::Lit));
+        assert_eq!(grid[4][39].map(|(_, ink)| ink), Some(EdgeInk::Lit));
+        assert_eq!(grid[4][0].map(|(_, ink)| ink), Some(EdgeInk::Rule));
+        // Nothing drawn inside a pane.
+        assert!(grid[4][left.x + 2].is_none());
+    }
+
     #[test]
     fn two_side_by_side_panes_both_paint_and_share_the_width() {
         let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
@@ -5177,37 +5409,36 @@ mod tests {
         let top = snapshot(&["top row"]);
         let bottom = snapshot(&["bottom row"]);
         let (pane_cols, pane_rows) = pane_size(80, 24);
-        let half = (pane_rows as usize - 1) / 2;
+        let area = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            cols: pane_cols as usize,
+            rows: pane_rows as usize,
+        };
+        // Real tiles, split the way the tree splits them: the frame around each and
+        // the shared line between them is `Layout::inner`'s and `pane_edges`' job, not
+        // something a test builds by hand.
+        let mut layout = crate::layout::Layout::single(1);
+        assert!(layout.split_placeholder(1, crate::layout::Dir::H, area));
+        assert!(layout.bind_placeholder(2));
         let painted = paint_two_panes(
             &rows,
             &spaces,
             Some(&top),
             Some(&bottom),
             1,
-            vec![
-                (
-                    1,
-                    crate::layout::Rect {
-                        x: 0,
-                        y: 0,
-                        cols: pane_cols as usize,
-                        rows: half,
-                    },
-                ),
-                (
-                    2,
-                    crate::layout::Rect {
-                        x: 0,
-                        y: half + 1,
-                        cols: pane_cols as usize,
-                        rows: pane_rows as usize - half - 1,
-                    },
-                ),
-            ],
+            layout.tile_rects(area),
         );
         assert!(painted.contains("top row"), "{painted:?}");
         assert!(painted.contains("bottom row"), "{painted:?}");
-        assert!(painted.contains('\u{2500}'), "no divider: {painted:?}");
+        // The join between the two frames, or a plain rule inside the pane area: either
+        // is the horizontal line the shared border draws.
+        assert!(
+            painted.contains('\u{251c}')
+                || painted.contains('\u{2524}')
+                || painted.contains('\u{2500}'),
+            "no divider: {painted:?}"
+        );
     }
     #[test]
     fn the_pane_shrinks_from_the_right_exactly_as_it_shrinks_from_the_left() {

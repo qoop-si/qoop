@@ -1595,7 +1595,13 @@ pub async fn run(
     // reads as fast as it paints.
     let (tui_side, mux_side) = tokio::io::duplex(1 << 20);
     tokio::spawn(serve(mux_side, local, remotes));
-    crate::run::run_stream(tui_side, BytesMut::new(), notice).await
+    crate::run::run_stream(
+        tui_side,
+        BytesMut::new(),
+        notice,
+        socket.map(crate::run::last_focus_path),
+    )
+    .await
 }
 
 #[cfg(test)]

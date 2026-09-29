@@ -401,6 +401,8 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
+    /// The terminal this client showed last time, and where that is kept.
+    last: LastFocus,
     /// A terminal `qoro focus` named before this interface listed it: a launcher that
     /// opens one and shows it at once gets there first. Shown once an index has it; a
     /// few seconds on, a terminal that never came is forgotten rather than jumped to.
@@ -2852,12 +2854,72 @@ pub async fn run(socket: &Path) -> io::Result<()> {
 /// hook is still read from its screen.
 pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Result<()> {
     let (stream, leftover) = client::connect(socket, "qoro-tui").await?;
-    run_stream(stream, leftover, notice).await
+    run_stream(stream, leftover, notice, Some(last_focus_path(socket))).await
+}
+
+/// Where an interface on this socket keeps the terminal it showed last: beside the
+/// daemon's socket. Shared by every interface on that daemon on purpose, the last focus
+/// written wins: coming back means coming back to where the person last was, in whichever
+/// window that was, and `focus` brings that terminal's space along with it.
+pub fn last_focus_path(socket: &Path) -> std::path::PathBuf {
+    socket.with_file_name("interface-focus")
+}
+
+/// The terminal a person left, so coming back lands there rather than on the first tab.
+///
+/// Read once at start and handed to the first index; written whenever the keyboard
+/// moves to another local terminal. Best effort both ways: no file, a stale id or a
+/// write that fails is today's first tab, never an error.
+#[derive(Default)]
+struct LastFocus {
+    file: Option<std::path::PathBuf>,
+    /// Read from the file, waiting for the first index to name it.
+    resume: Option<u32>,
+    /// What the file holds now, so an unchanged focus writes nothing.
+    written: u32,
+}
+
+impl LastFocus {
+    fn read(file: Option<std::path::PathBuf>) -> LastFocus {
+        let resume = file
+            .as_deref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .filter(|t| *t != 0);
+        LastFocus {
+            file,
+            resume,
+            written: resume.unwrap_or(0),
+        }
+    }
+
+    /// Keep `focused` when it is a local terminal the file does not already hold. A
+    /// remote terminal's number is this interface's, not the daemon's, and means
+    /// nothing to the next one.
+    fn keep(&mut self, focused: u32) {
+        if focused == 0 || focused == self.written || crate::mux::is_remote_terminal(focused) {
+            return;
+        }
+        self.written = focused;
+        if let Some(file) = &self.file {
+            // Written aside and renamed over, so another interface reading it never sees
+            // half a number.
+            let temp = file.with_extension(format!("{}", std::process::id()));
+            if std::fs::write(&temp, format!("{focused}\n")).is_ok() {
+                let _ = std::fs::rename(&temp, file);
+            }
+        }
+    }
 }
 
 /// The interface over a connection that has already done its handshake: a local socket,
 /// an `ssh` running `qoro relay`, or the mux that puts several daemons behind one stream.
-pub async fn run_stream<S>(stream: S, leftover: BytesMut, notice: Option<String>) -> io::Result<()>
+pub async fn run_stream<S>(
+    stream: S,
+    leftover: BytesMut,
+    notice: Option<String>,
+    last_focus: Option<std::path::PathBuf>,
+) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -2870,13 +2932,18 @@ where
         previous_hook(info);
     }));
 
-    let outcome = drive(stream, leftover, notice).await;
+    let outcome = drive(stream, leftover, notice, last_focus).await;
 
     drop(guard);
     outcome
 }
 
-async fn drive<S>(stream: S, leftover: BytesMut, notice: Option<String>) -> io::Result<()>
+async fn drive<S>(
+    stream: S,
+    leftover: BytesMut,
+    notice: Option<String>,
+    last_focus: Option<std::path::PathBuf>,
+) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -2911,6 +2978,7 @@ where
         message: Some(CONNECTING.to_string()),
         hint: notice,
         pending_focus: None,
+        last: LastFocus::read(last_focus),
         show_when_listed: None,
         waking: None,
         dim: 0,
@@ -3181,6 +3249,7 @@ where
                 state.prefix_pending = keys.prefix_pending();
                 dirty = true;
             }
+            state.last.keep(state.focused);
             if dirty && presented.elapsed() >= FRAME {
                 // An open answer lays out for the pane before the frame borrows the state:
                 // once per width, so a long answer is not wrapped again every frame.
@@ -6515,6 +6584,18 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
         ControlResponse::Agents { agents, splits, .. } => {
             // First, so the bootstrap below already knows which rows are panes.
             adopt_splits(state, &agents, splits);
+            // Back where the person left: the first index names what is still there, and
+            // `focus` brings its space and, for a pane, its tab. The bootstrap below
+            // adopts in that space, so the first frame is already the right one.
+            if let Some(row) = state
+                .last
+                .resume
+                .take()
+                .and_then(|t| agents.iter().find(|r| r.terminal == t))
+            {
+                state.space = Some(row.workspace);
+                state.pending_focus = Some(row.terminal);
+            }
             if state.focused == 0 && !state.adopted {
                 // Only before this client has ever had a terminal. The daemon subscribes a
                 // fresh client to what is already open, so this is the bootstrap and no
@@ -6658,9 +6739,9 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 // A screen agent that worked and now sits idle while the
                 // keyboard is elsewhere finished without ever reporting done.
                 // Same news as a daemon done, same bell, same `new` row.
-                let was_working = before
-                    .as_deref()
-                    .is_some_and(|b| matches!(b, "working" | "starting"));
+                // Working only: `starting` is a session opening (a new tab, a
+                // restore, `/clear`), and one that settles to idle did nothing.
+                let was_working = before.as_deref() == Some("working");
                 if was_working
                     && matches!(row.state.as_str(), "idle" | "done")
                     && row.terminal != state.focused
@@ -7266,6 +7347,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            last: LastFocus::default(),
             show_when_listed: None,
             waking: None,
             dim: 0,
@@ -7862,6 +7944,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            last: LastFocus::default(),
             show_when_listed: None,
             waking: None,
             dim: 0,
@@ -7970,6 +8053,7 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            last: LastFocus::default(),
             show_when_listed: None,
             waking: None,
             dim: 0,
@@ -8442,20 +8526,25 @@ mod tests {
         let state = tiled_state();
         let left = screen::left_for(80, false, sidebar::WIDTH);
         let first_col = left + 1;
-        // Top-left cell of the pane is terminal 1's tile.
-        let hit = state.tile_at_screen((screen::TABS + 1) as u16, first_col as u16);
+        // The pane's corner is the frame around the split, and belongs to no pane.
+        assert_eq!(
+            state.tile_at_screen((screen::TABS + 1) as u16, first_col as u16),
+            None
+        );
+        // One cell in from it is terminal 1's top-left cell.
+        let hit = state.tile_at_screen((screen::TABS + 2) as u16, (first_col + 1) as u16);
         assert_eq!(hit.map(|h| h.0), Some(1));
         // The divider column between the two tiles belongs to no pane.
         let rects = state.layouts.get(&1).unwrap().tile_rects(pane_area(&state));
         let left_rect = rects.iter().find(|(t, _)| *t == 1).unwrap().1;
-        let divider_col = (first_col + left_rect.cols) as u16;
+        let divider_col = (first_col + left_rect.x + left_rect.cols) as u16;
         assert_eq!(
-            state.tile_at_screen((screen::TABS + 1) as u16, divider_col),
+            state.tile_at_screen((screen::TABS + 2) as u16, divider_col),
             None
         );
         // And the focused tile answers tile-local coordinates.
         assert_eq!(
-            state.in_pane((screen::TABS + 1) as u16, first_col as u16),
+            state.in_pane((screen::TABS + 2) as u16, (first_col + 1) as u16),
             Some((0, 0))
         );
     }
@@ -9004,6 +9093,47 @@ mod tests {
         assert_eq!(state.notes.len(), 1);
     }
 
+    /// A session that opens and settles (a new tab, a restore, `/clear`) did no turn: no
+    /// note, no bell, no `done` row. A real turn settling still is all three.
+    #[test]
+    fn an_agent_that_only_started_is_not_news() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "idle")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "starting")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "idle")],
+        );
+        assert!(
+            state.notes.is_empty(),
+            "a start was said: {:?}",
+            state.notes.len()
+        );
+        assert!(!state.ring);
+        assert!(state.unseen_finished.is_empty(), "a start reads as done");
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "working")],
+        );
+        index(
+            &mut state,
+            vec![agent(1, 1, "a", "idle"), agent(2, 1, "b", "idle")],
+        );
+        assert_eq!(state.notes.len(), 1, "a finished turn is news");
+        assert!(!state.unseen_finished.is_empty());
+    }
+
     /// With nowhere to send a note the bell rings exactly as before, and the hint says why
     /// once.
     #[test]
@@ -9090,6 +9220,51 @@ mod tests {
             "the keyboard comes back to its space: {:?}",
             state.pending_focus
         );
+    }
+
+    /// Coming back lands on the terminal the person left, in its space, once the first
+    /// index names it; one that is gone falls back to the first tab, and the file then
+    /// keeps whatever the keyboard moves to, never a remote number.
+    #[test]
+    fn a_new_interface_comes_back_to_the_terminal_left() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("interface-focus");
+        let index = |agents| ControlResponse::Agents {
+            id: "index".to_string(),
+            splits: Vec::new(),
+            agents,
+        };
+        let rows = || {
+            vec![
+                agent(1, 1, "zsh", "idle"),
+                agent(4, 2, "claude", "idle"),
+                agent(9, 2, "zsh", "idle"),
+            ]
+        };
+        std::fs::write(&file, "9\n").expect("write");
+        let mut state = bare_state();
+        state.focused = 0;
+        state.adopted = false;
+        state.last = LastFocus::read(Some(file.clone()));
+        let mut dirty = false;
+        apply(&mut state, index(rows()), &mut dirty);
+        assert_eq!(state.space, Some(2), "the space it was in");
+        assert_eq!(state.pending_focus, Some(9), "the terminal it was on");
+        assert_eq!(state.last.resume, None, "once");
+
+        std::fs::write(&file, "77\n").expect("write");
+        let mut state = bare_state();
+        state.focused = 0;
+        state.adopted = false;
+        state.last = LastFocus::read(Some(file.clone()));
+        apply(&mut state, index(rows()), &mut dirty);
+        assert_eq!(state.focused, 1, "gone: the first tab, as before");
+        assert_eq!(state.pending_focus, None);
+
+        state.last.keep(4);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "4\n");
+        state.last.keep(crate::mux::REMOTE_TERMINAL | 3);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "4\n");
     }
 
     /// `qoro focus` for a terminal not listed yet: waited for, shown once an index names
@@ -9653,7 +9828,7 @@ mod tests {
         let mut state = tiled_state();
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-        let divider_col = (left + 1 + rect.cols) as u16;
+        let divider_col = (left + 1 + rect.x + rect.cols) as u16;
         let row = (screen::TABS + 3) as u16;
         assert!(state.split_press(divider_col, row));
         assert!(!state.divider_press(divider_col, row), "not the sidebar's");
@@ -9879,10 +10054,10 @@ mod tests {
         zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-        let divider_col = (left + 1 + rect.cols) as u16;
+        let divider_col = (left + 1 + rect.x + rect.cols) as u16;
         assert!(!state.split_press(divider_col, state.lines - 1));
         assert!(!state.split_press(divider_col, state.lines));
-        assert!(state.split_press(divider_col, (screen::TABS + 1) as u16));
+        assert!(state.split_press(divider_col, (screen::TABS + 2) as u16));
     }
 
     #[test]

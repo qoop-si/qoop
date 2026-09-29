@@ -75,6 +75,21 @@ fn set(level: Level) {
 /// startup, before the first frame is painted.
 pub fn apply() {
     set(detect());
+    BRAILLE.store(braille_from(&current_env()), Ordering::Relaxed);
+}
+
+static BRAILLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the outer terminal draws braille, which the state marks are made of. Every
+/// terminal emulator does, drawing it itself (Ghostty, kitty, WezTerm) or from a system
+/// font (Apple Braille on macOS, Cascadia on Windows); the kernel console and a dumb
+/// terminal do not, and get plain characters instead.
+pub fn braille() -> bool {
+    BRAILLE.load(Ordering::Relaxed)
+}
+
+fn braille_from(env: &Env) -> bool {
+    !matches!(env.term.as_deref(), Some("dumb") | Some("linux"))
 }
 
 /// The environment that matters, as plain values so tests never touch the
@@ -236,6 +251,20 @@ mod tests {
             term: Some("xterm-256color".to_string()),
             ..Env::default()
         }
+    }
+
+    /// The kernel console and a dumb terminal cannot draw braille; every emulator can.
+    #[test]
+    fn braille_is_off_only_where_nothing_draws_it() {
+        let env = |term: &str| Env {
+            term: Some(term.to_string()),
+            ..Env::default()
+        };
+        assert!(!braille_from(&env("linux")));
+        assert!(!braille_from(&env("dumb")));
+        assert!(braille_from(&env("xterm-256color")));
+        assert!(braille_from(&env("xterm-ghostty")));
+        assert!(braille_from(&Env::default()));
     }
 
     #[test]
