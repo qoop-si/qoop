@@ -1116,38 +1116,16 @@ struct TermPeek: View {
     }
 }
 
+/// The person's first name, lower case, as the island's header greets them.
+let personName = NSFullUserName().split(separator: " ").first.map(String.init)?.lowercased() ?? NSUserName()
+
 struct Island: View {
     @ObservedObject var s: Store
     let open: (Tab) -> Void
-    let settings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                PetView(pixels: s.pixels, px: 2)
-                Text(NSFullUserName().split(separator: " ").first.map(String.init)?.lowercased() ?? NSUserName())
-                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                Spacer()
-                HStack(spacing: 12) {
-                    Text("\(s.waiting) waiting").foregroundStyle(s.needInk)
-                    if s.finished > 0 { Text("\(s.finished) done").foregroundStyle(done) }
-                    Text("\(s.working) working").foregroundStyle(.white)
-                    Text("\(s.idle) idle").foregroundStyle(.white.opacity(0.45))
-                }
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                Button(action: settings) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.5))
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Settings")
-                .accessibilityLabel("Settings")
-            }
-            .padding(.vertical, 8)
-            Divider().overlay(.white.opacity(0.08)).padding(.bottom, 2)
+            Divider().overlay(.white.opacity(0.08)).padding(.top, 4).padding(.bottom, 2)
             if let note = s.note, s.expanded == nil {
                 Text(note)
                     .font(.system(size: 12))
@@ -1454,6 +1432,8 @@ struct Geometry {
     static let openMaxHeight: CGFloat = 640
     /// The left ear holds the pet and the badge beside it, whatever the right one says.
     static let petEar: CGFloat = 62
+    /// The gear beside the counts once open, with its gap.
+    static let gear: CGFloat = 28
 
     func closedWidth(_ s: Store) -> CGFloat {
         guard !s.rows.isEmpty else { return notch.width }
@@ -1468,13 +1448,13 @@ struct Geometry {
         let sections = [Row.Kind.waiting, .done, .working, .idle].filter { k in s.rows.contains { $0.kind == k } }.count
         let peek: CGFloat = s.expanded == nil ? 0 : TermPeek.height + 6 + 18 + 12
         let note: CGFloat = s.note == nil || s.expanded != nil ? 0 : 26
-        let full = notch.height + 40 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + 4 + peek + note
+        let full = notch.height + 20 + CGFloat(sections) * 25 + CGFloat(s.rows.count) * Geometry.rowHeight + 4 + peek + note
         return min(full, Geometry.openMaxHeight)
     }
 
     func size(_ s: Store) -> CGSize {
         s.open
-            ? CGSize(width: Geometry.openWidth, height: openHeight(s))
+            ? CGSize(width: max(Geometry.openWidth, closedWidth(s) + 2 * Geometry.gear), height: openHeight(s))
             : CGSize(width: closedWidth(s) + (s.hover && !s.rows.isEmpty ? 8 : 0), height: notch.height + (s.hover && !s.rows.isEmpty ? 3 : 0))
     }
 }
@@ -1499,13 +1479,36 @@ struct NotchView: View {
                         Badge(n: s.waiting, ink: s.needInk).offset(x: 14, y: -5)
                     }
                     .padding(.leading, 20)
+                    // Open, the ears grow into the island's header: who, then the gear.
+                    if s.open {
+                        Text(personName)
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .lineLimit(1)
+                            .padding(.leading, 12)
+                            .transition(.opacity)
+                    }
                     Spacer(minLength: g.notch.width)
-                    Counts(s: s).padding(.trailing, 20)
+                    Counts(s: s)
+                    if s.open {
+                        Button(action: settings) {
+                            Image(systemName: "gearshape")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.5))
+                                .frame(width: 22, height: 22)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Settings")
+                        .accessibilityLabel("Settings")
+                        .padding(.leading, 6)
+                        .transition(.opacity)
+                    }
                 }
+                .padding(.trailing, s.open ? 14 : 20)
                 .frame(height: g.notch.height)
                 .opacity(shown ? 1 : 0)
                 if s.open {
-                    Island(s: s, open: open, settings: settings)
+                    Island(s: s, open: open)
                         .transition(.opacity.combined(with: .offset(y: -10)))
                 }
             }
@@ -1609,7 +1612,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // to fit what it draws, which moved the notch off the camera as the ears grew.
         host.sizingOptions = []
         panel.contentView = host
-        let w = Geometry.openWidth + 40, h: CGFloat = 700
+        // As wide as the menu bar: the island grows with its counts, and the panel takes the
+        // mouse only over the black, so the rest of the width costs nothing.
+        let w = f.width, h: CGFloat = 700
         panel.setFrame(NSRect(x: f.midX - w / 2, y: f.maxY - h, width: w, height: h), display: true)
     }
 
