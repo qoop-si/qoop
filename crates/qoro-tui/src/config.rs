@@ -13,11 +13,15 @@
 //! idle_minutes = 0
 //! [daemon]
 //! exit_when_asleep = true
+//! [agents]            # a name for a new agent, and the line typed to start it
+//! claudec = "claude --dangerously-skip-permissions"
+//! lm = "opencode"
 //! ```
 //!
 //! Read by the interface at start and again whenever the settings box opens, so an edit
-//! takes effect without a restart and without a watcher. `[sleep]` and `[daemon]` are the
-//! daemon's: it reads them itself when it decides, and their rules live beside it in
+//! takes effect without a restart and without a watcher; `qoro bridge` reads `[agents]` the
+//! same way whenever a phone asks for the list. `[sleep]` and `[daemon]` are the daemon's:
+//! it reads them itself when it decides, and their rules live beside it in
 //! `qoro_runtime::config`, which this file asks rather than repeating them.
 //!
 //! Read as TOML by the `toml` crate, so dotted keys (`notify.desktop = false`), inline
@@ -118,6 +122,8 @@ impl Problem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Read {
     pub config: Config,
+    /// `[agents]`, in the order the file lists them.
+    pub agents: Vec<Launcher>,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
@@ -150,32 +156,78 @@ pub fn read() -> Read {
     read_from(&path())
 }
 
+/// The agents the file names, read now: what a palette or a phone offers as a new agent.
+pub fn agents() -> Vec<Launcher> {
+    read().agents
+}
+
 /// Read a file by its path, so a test never touches a home directory.
 pub fn read_from(path: &Path) -> Read {
-    let (config, problems, exists) = match std::fs::read_to_string(path) {
+    let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, problems) = parse(&text);
-            (config, problems, true)
+            let (config, agents, problems) = parse_all(&text);
+            (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (Config::default(), Vec::new(), false)
+            (Config::default(), Vec::new(), Vec::new(), false)
         }
         Err(error) => (
             Config::default(),
+            Vec::new(),
             vec![Problem::new(None, &format!("could not be read ({error})"))],
             true,
         ),
     };
     Read {
         config,
+        agents,
         problems,
         path: path.to_path_buf(),
         exists,
     }
 }
 
+/// A named line from `[agents]`: the name a palette and a phone show, and the command
+/// typed into a new terminal's shell to start that agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launcher {
+    pub name: String,
+    pub command: String,
+}
+
+/// One `[agents]` entry, or why it cannot be one. The command is typed into a shell, so
+/// it must be one line: a newline or a tab in it would be typed as that key, and a second
+/// line would run on its own.
+fn launcher(name: &str, value: &toml::Value) -> Result<Launcher, String> {
+    let toml::Value::String(command) = value else {
+        return Err(format!(
+            "agents.{name} = {value} is not a command line in quotes"
+        ));
+    };
+    let (name, command) = (name.trim(), command.trim());
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err("an agent needs a name of plain characters".to_string());
+    }
+    if command.is_empty() {
+        return Err(format!("agents.{name} has no command"));
+    }
+    if command.chars().any(char::is_control) {
+        return Err(format!("agents.{name} is one line, with no newline or tab"));
+    }
+    Ok(Launcher {
+        name: name.to_string(),
+        command: command.to_string(),
+    })
+}
+
 /// The settings, and everything that could not be used.
 pub fn parse(text: &str) -> (Config, Vec<Problem>) {
+    let (config, _, problems) = parse_all(text);
+    (config, problems)
+}
+
+/// The settings, the agents, and everything that could not be used.
+fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
     let mut problems: Vec<Problem> = Vec::new();
     let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
     // The problem for a construct left open to the end of the file, while it is walked back.
@@ -238,6 +290,8 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
         sleep: Spans,
         #[serde(default)]
         daemon: Spans,
+        #[serde(default)]
+        agents: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
@@ -260,6 +314,7 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
         };
         problems.push(Problem::new(line, &what));
     }
+    let mut agents: Vec<(Option<usize>, Launcher)> = Vec::new();
     let mut refuse = |line: Option<usize>, what: String| problems.push(Problem::new(line, &what));
     for (key, value) in &table {
         let line = line_of(&top, key);
@@ -312,12 +367,30 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
             }
             ("notch", _) => refuse(line, "notch is a table: [notch] then enabled = true".into()),
             ("sleep" | "daemon", _) => {}
+            ("agents", toml::Value::Table(table)) => {
+                for (name, value) in table {
+                    let line = line_of(&nested.agents, name);
+                    match launcher(name, value) {
+                        Ok(agent) => agents.push((line, agent)),
+                        Err(why) => refuse(line, why),
+                    }
+                }
+            }
+            ("agents", _) => refuse(
+                line,
+                "agents is a table: [agents] then lm = \"opencode\"".into(),
+            ),
             _ => refuse(line, format!("there is no setting {key}")),
         }
     }
     // In the order a person reads the file, not the order the table holds its keys.
     problems.sort_by_key(|p| p.line.unwrap_or(usize::MAX));
-    (config, problems)
+    agents.sort_by_key(|(line, _)| line.unwrap_or(usize::MAX));
+    (
+        config,
+        agents.into_iter().map(|(_, a)| a).collect(),
+        problems,
+    )
 }
 
 /// The line a byte offset is on, counted from one.
@@ -524,6 +597,15 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
             "leave when nothing is awake",
         ),
     ];
+    if !read.agents.is_empty() {
+        rows.push(" [agents]".to_string());
+        rows.extend(read.agents.iter().map(|a| {
+            row(
+                format!("{} = \"{}\"", plain(&a.name), plain(&a.command)),
+                "a new agent",
+            )
+        }));
+    }
     rows.extend(read.problems.iter().map(|p| format!(" ! {}", p.short())));
     rows
 }
@@ -531,6 +613,49 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agents come in the order the file lists them, not sorted by name, and each is
+    /// the command a person wrote, trimmed.
+    #[test]
+    fn agents_read_in_file_order() {
+        let (_, agents, problems) = parse_all(
+            "[agents]\nzed = \"claude --dangerously-skip-permissions\"\nlm = \" opencode \"\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let got: Vec<(&str, &str)> = agents
+            .iter()
+            .map(|a| (a.name.as_str(), a.command.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("zed", "claude --dangerously-skip-permissions"),
+                ("lm", "opencode")
+            ]
+        );
+    }
+
+    /// An entry that is not one line of text is said with its line and left out, and the
+    /// rest still start: a newline would be typed as Enter and run a second command.
+    #[test]
+    fn an_agent_that_is_not_one_line_is_refused() {
+        let (_, agents, problems) = parse_all(
+            "[agents]\nok = \"codex\"\ntwo = \"\"\"\nclaude\nrm -rf x\"\"\"\nnum = 3\nblank = \"  \"\n",
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "ok");
+        let lines: Vec<Option<usize>> = problems.iter().map(|p| p.line).collect();
+        assert_eq!(lines, [Some(3), Some(6), Some(7)], "{problems:?}");
+        assert!(problems[0].what.contains("one line"), "{problems:?}");
+    }
+
+    #[test]
+    fn agents_that_are_not_a_table_are_said() {
+        let (_, agents, problems) = parse_all("agents = \"claude\"\n");
+        assert!(agents.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].what.contains("[agents]"), "{problems:?}");
+    }
 
     #[test]
     fn no_file_is_every_default_and_nothing_to_say() {
@@ -656,6 +781,7 @@ mod tests {
             problems,
             path: PathBuf::from("/c/config.toml"),
             exists: true,
+            ..Read::default()
         };
         let rows = describe(&read, true, "terminal-notifier");
         assert_eq!(rows[0], " /c/config.toml");

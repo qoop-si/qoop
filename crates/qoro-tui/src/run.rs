@@ -4509,7 +4509,7 @@ where
                                 dirty = true;
                             }
                             Action::Palette => {
-                                state.palette = Some(Palette::open());
+                                state.palette = Some(Palette::with_agents(crate::config::agents()));
                                 dirty = true;
                             }
                             Action::ToggleView => {

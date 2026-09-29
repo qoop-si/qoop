@@ -53,6 +53,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.sound": c.sound,
                 "notch.enabled": c.notch,
             },
+            "agents": read.agents.iter().map(|a| serde_json::json!({ "name": a.name, "command": a.command })).collect::<Vec<_>>(),
             "choices": {
                 "prefix": config::prefixes(),
                 "theme": ["auto", "dark", "light"],
@@ -76,6 +77,9 @@ fn show(json: bool) -> std::io::Result<()> {
     println!("notify.desktop = {}", c.desktop);
     println!("notify.sound = {}", c.sound);
     println!("notch.enabled = {}", c.notch);
+    for a in &read.agents {
+        println!("agents.{} = {:?}", a.name, a.command);
+    }
     for problem in &read.problems {
         println!("! {}", problem.short());
     }

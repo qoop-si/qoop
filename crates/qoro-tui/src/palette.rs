@@ -52,15 +52,23 @@ pub struct Entry {
 pub struct Palette {
     pub query: String,
     pub selected: usize,
+    /// The config's `[agents]`, read when the palette opened, so an edit shows the next
+    /// time without the file being read per frame.
+    pub agents: Vec<crate::config::Launcher>,
 }
 
 impl Palette {
     /// An opened palette: empty query, first row selected, which is the most
     /// urgent thing on the daemon.
     pub fn open() -> Self {
+        Palette::default()
+    }
+
+    /// An opened palette that also offers the person's own agents.
+    pub fn with_agents(agents: Vec<crate::config::Launcher>) -> Self {
         Palette {
-            query: String::new(),
-            selected: 0,
+            agents,
+            ..Palette::default()
         }
     }
 
@@ -201,6 +209,21 @@ impl Palette {
         // short with the single agent row above, and typing a name finds its own.
         if !self.query.is_empty() {
             let needle = self.query.to_lowercase();
+            // The person's own first: picking one types its command, not its name.
+            for agent in &self.agents {
+                let text = format!("new {} terminal", agent.name);
+                if text.to_lowercase().contains(&needle) {
+                    out.push(Entry {
+                        item: Item::NewAgent(agent.command.clone()),
+                        section: "agents",
+                        text,
+                        sub: agent.command.clone(),
+                        space: None,
+                        space_len: 0,
+                        state: None,
+                    });
+                }
+            }
             for name in qoro_domain::program::agent_names() {
                 let text = format!("new {name} terminal");
                 if text.contains(&needle) {
@@ -517,6 +540,32 @@ mod tests {
                 &crate::sidebar::Unseen::new()
             ),
             Some(Item::NewSpace)
+        );
+    }
+
+    /// A `[agents]` entry is found by its name and starts its command, ahead of the
+    /// known agents.
+    #[test]
+    fn a_configured_agent_is_found_by_name_and_types_its_command() {
+        let (rows, spaces) = sample();
+        let mut palette = Palette::with_agents(vec![crate::config::Launcher {
+            name: "claudec".to_string(),
+            command: "claude --dangerously-skip-permissions".to_string(),
+        }]);
+        for c in "claudec".chars() {
+            palette.push(c);
+        }
+        assert_eq!(
+            palette.picked(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new()
+            ),
+            Some(Item::NewAgent(
+                "claude --dangerously-skip-permissions".to_string()
+            ))
         );
     }
 
