@@ -22,11 +22,18 @@ terminal 2 is blocked
 
 The index says which space each agent is in and what it is doing: every space is its name
 with its agents under it (only agents: every tab is on the bar above the terminal), and
-`ctrl-a f` folds one away. An agent waiting for an answer is named in the one row at the top, with a mark for each one waiting after it, and `ctrl-a tab`
+`ctrl-a f` folds one away. An agent waiting for an answer is named in the one row at the
+top, with a mark for each one waiting after it, and `ctrl-a tab`
 goes to it: wants first, then failed, then finished. It also lights its row and rings the
 bell, so you find out without looking, even when its space is folded. The name is the one
 you would say, not the runtime underneath it: an agent installed as a node package reads as
 itself, not as `node`.
+
+A space's own line ends in two controls, in the same three columns on every line whatever
+the name is: `z` sleeps the space or wakes it, and `x` asks whether to close it. The
+question is drawn on the line itself, as `y` and `n` under the pointer that asked, and a `y`
+closes the space's tabs and then the space. Neither control has a key of its own: `ctrl-a Z`
+sleeps the space you are in and `ctrl-a x` closes the tab you are on.
 
 Each agent wears a small square of nine dots in its state's colour. While it works the dots
 fill the ring and empty it again; when it stops they settle into a picture: an empty ring
