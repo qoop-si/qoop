@@ -1058,7 +1058,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     // starts at `width - 4` whatever the name and the slot are, and the last column is
     // left blank, as every row of this column already is.
     let fill_at = FOLD_CELLS + name_w + slot_w;
-    let fill = width.saturating_sub(1).saturating_sub(fill_at).saturating_sub(BLOCK_W);
+    let fill = width
+        .saturating_sub(1)
+        .saturating_sub(fill_at)
+        .saturating_sub(BLOCK_W);
     let mut runs = vec![(1, 1, ink), (fill_at, fill, ink)];
     if !slot.is_empty() {
         runs.push((
@@ -1083,11 +1086,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         };
         runs.push((at, w, role));
     }
-    let text = format!(
-        " {arrow} {name}{slot}{}{}",
-        " ".repeat(fill),
-        block.text()
-    );
+    let text = format!(" {arrow} {name}{slot}{}{}", " ".repeat(fill), block.text());
     Line {
         text: fit(&text, width),
         colour: None,
@@ -1173,7 +1172,6 @@ impl Block {
         };
         format!("{left} {right}")
     }
-
 }
 
 /// The two answers in the two columns the controls were, so a person who aimed at `x` finds
@@ -2847,7 +2845,6 @@ mod tests {
             .expect("the app rule");
         // The count is agents only: the shell in the same space does not add to it.
         assert!(app.text.contains("app (1)"), "{:?}", app.text);
-
     }
 
     #[test]
@@ -2906,26 +2903,19 @@ mod tests {
                 (6, 4, crate::theme::Role::Faint),
                 (WIDTH - 4, 1, crate::theme::Role::Faint),
                 (WIDTH - 2, 1, crate::theme::Role::Faint),
-
             ]
         );
         // An empty space has nothing to fold, nothing to count and nothing running, so it
         // draws a dot for the arrow, no slot, and a close with nothing beside it.
         let dub = rule_row(&rows, 3);
-        assert_eq!(
-            dub.text,
-            format!(" \u{b7} dub{}  x ", " ".repeat(20))
-        );
+        assert_eq!(dub.text, format!(" \u{b7} dub{}  x ", " ".repeat(20)));
         assert_eq!(crate::width::width(&dub.text), WIDTH);
 
         // Folded, the arrow points right and the count stays.
         let shut = Shut::from([1]);
         let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &shut);
         assert!(
-            rule_row(&rows, 1)
-                .text
-                .starts_with(" \u{25b8} app (1)"),
-
+            rule_row(&rows, 1).text.starts_with(" \u{25b8} app (1)"),
             "{:?}",
             rule_row(&rows, 1).text
         );
@@ -3036,7 +3026,6 @@ mod tests {
                                             .next_back()
                                             .is_some_and(|c| !c.is_alphanumeric())
                                 })
-
                             })
                             .map(|s| Hit::Space(s.id))
                     } else if text.is_empty() {
@@ -3480,9 +3469,7 @@ mod tests {
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
         assert!(
-            rule.text
-                .starts_with(" \u{25be} \u{4e2d}\u{6587} (1)"),
-
+            rule.text.starts_with(" \u{25be} \u{4e2d}\u{6587} (1)"),
             "{:?}",
             rule.text
         );
@@ -5256,11 +5243,7 @@ mod tests {
         let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
-        assert!(
-            app.text.starts_with(" \u{25b8} app (3)"),
-            "{:?}",
-            app.text
-        );
+        assert!(app.text.starts_with(" \u{25b8} app (3)"), "{:?}", app.text);
         // The count sits beside the name it counts, and the block keeps its columns.
         assert!(app.text.contains("(3)"), "the count keeps every agent");
         assert_eq!(column_of(&app.text, 'z'), Some(WIDTH - 4), "{:?}", app.text);
@@ -6341,6 +6324,7 @@ mod tests {
 
     /// `cols` columns of `text` from the zero-based column `at`, counting columns and not
     /// characters, so a full width name cannot shift what is read.
+    #[allow(dead_code)]
     fn columns_from(text: &str, at: usize, cols: usize) -> String {
         let mut col = 0;
         let mut out = String::new();

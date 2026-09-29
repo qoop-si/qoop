@@ -2320,19 +2320,66 @@ fn is_mouse(bytes: &[u8]) -> bool {
     true
 }
 
+/// Every tab a close of this space asks the daemon about, in the order they are asked.
+///
+/// The index and the store, because a sleeping space has no rows in the index and every
+/// tab in the store, and a question that says zero would be a lie. Deduped, because a tab
+/// can be in both lists when the space fell asleep between this client's last index and the
+/// click that armed the question, and [`arm_close`] counts this list rather than counting
+/// the two sources itself: the count a person was told and the count the daemon is asked
+/// are the same number or one of them is a lie.
+fn tabs_to_close(state: &State, space: i64) -> Vec<u32> {
+    let mut asked: Vec<u32> = state
+        .rows
+        .iter()
+        .filter(|r| r.workspace == space)
+        .map(|r| r.terminal)
+        .collect();
+    asked.extend(
+        state
+            .spaces
+            .iter()
+            .find(|w| w.id == space && w.asleep)
+            .map(|w| w.sleeping.iter().map(|t| t.terminal).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    asked.sort_unstable();
+    asked.dedup();
+    asked
+}
+
 /// The answer to a space rule's own question: `y` closes it, `n` or anything else keeps it.
 ///
-/// Take a rule's question down and say that its space was kept.
-///
-/// A click puts the question down whatever it lands on, so a rule cannot sit on screen
-/// asking while the keyboard is dead and its row has scrolled out of view. The arm that
-/// matches a click has taken it already; this is for the three that answer a click on the
-/// divider, on a tile or inside a running pane and return before the space arm.
+/// Take a rule's question down and say that its space was kept, for a click or a wheel that
+/// is not the run loop's `Click` arm and so does not go through [`put_question_down`].
 fn take_question(state: &mut State) -> Option<String> {
     state
         .armed
         .take()
         .map(|space| format!("kept {}", space_name(state, space)))
+}
+
+/// Put a rule's question down, unless the click is about the question.
+///
+/// A click puts the question down whatever it lands on, so a rule cannot sit on screen
+/// asking while the keyboard is dead and its row has scrolled out of view. The three
+/// clicks that are about it keep it: the arm that asked, and the two answers. Everything
+/// else puts it down here rather than in an arm, because an arm can only run after every
+/// other arm has declined to match, and the arms that change the view are exactly the ones
+/// a question must not survive: a question with no rule on screen to ask on still holds the
+/// keyboard, and `y` would then close a space over a row nobody can see.
+fn put_question_down(state: &mut State, clicked: Option<Clicked>) -> Option<i64> {
+    let asked = state.armed.take();
+    let about_the_question = matches!(
+        clicked,
+        Some(Clicked::Close(_)) | Some(Clicked::ConfirmClose(_)) | Some(Clicked::CancelClose)
+    );
+    if let Some(space) = asked
+        && !about_the_question
+    {
+        state.message = Some(format!("kept {}", space_name(state, space)));
+    }
+    asked
 }
 
 /// Lowercase, unlike the tab close's capital `Y`. That one is about a stray `y` typed into
@@ -2361,15 +2408,10 @@ fn armed_key(state: &mut State, space: i64, bytes: &[u8], request: &mut u64) -> 
 /// before answering: how many tabs go, and which of them is working.
 fn arm_close(state: &mut State, space: i64) {
     let held: Vec<&AgentRow> = state.rows.iter().filter(|r| r.workspace == space).collect();
-    let sleeping = state
-        .spaces
-        .iter()
-        .find(|w| w.id == space)
-        .filter(|w| w.asleep)
-        .map_or(0, |w| w.sleeping.len());
-    // The count is the store's, not the index's: a sleeping space has no rows in the index
-    // and every tab in the store, and a question that says zero would be a lie.
-    let count = held.len() + sleeping;
+    // The same list the close asks the daemon about, deduped, so the count a person reads
+    // on the question and the number of `CloseTerminal` requests that follow are one
+    // number. A tab in both the index and the store is one tab, not two.
+    let count = tabs_to_close(state, space).len();
     let busy: Vec<String> = held
         .iter()
         .filter(|r| r.agent && matches!(r.state.as_str(), "working" | "blocked" | "starting"))
@@ -2429,24 +2471,7 @@ fn start_close(state: &mut State, space: i64, request: &mut u64) -> bool {
         });
         return false;
     }
-    let mut asked: Vec<u32> = state
-        .rows
-        .iter()
-        .filter(|r| r.workspace == space)
-        .map(|r| r.terminal)
-        .collect();
-    asked.extend(
-        state
-            .spaces
-            .iter()
-            .find(|w| w.id == space && w.asleep)
-            .map(|w| w.sleeping.iter().map(|t| t.terminal).collect::<Vec<_>>())
-            .unwrap_or_default(),
-    );
-    // A tab that is in both lists, because the space fell asleep between this client's last
-    // index and this click, is asked once and not twice.
-    asked.sort_unstable();
-    asked.dedup();
+    let asked = tabs_to_close(state, space);
     let left = asked.len();
     state.closing = Some(Closing {
         space,
@@ -2513,8 +2538,9 @@ fn close_one(state: &mut State, request: &mut u64) {
 
 /// The next tab on the list, skipping one that has given up, and counting it as asked.
 ///
-/// `skip` is the tab the chain gave up on, which stays in `asked` (the count a person was
-/// told includes it) but is not asked again and does not hold up the tabs behind it.
+/// The next tab to ask, and the only place `sent` moves. A tab the chain gave up on stays
+/// in `asked` (the count a person was told includes it) but is never handed out again, and
+/// it does not hold up the tabs behind it.
 fn next_tab(closing: &mut Closing) -> Option<u32> {
     let terminal = closing.asked.get(closing.sent).copied()?;
     closing.sent += 1;
@@ -3215,6 +3241,7 @@ fn copy_cursor(state: &State) -> Option<(usize, usize)> {
 }
 
 /// What the interface drew where a person clicked.
+#[derive(Clone, Copy, Debug)]
 enum Clicked {
     Menu,
     Fold(i64),
@@ -4382,10 +4409,6 @@ where
                                     if state.selection.take().is_some() {
                                         dirty = true;
                                     }
-                                    if let Some(said) = take_question(&mut state) {
-                                        state.message = Some(said);
-                                        dirty = true;
-                                    }
                                     continue;
                                 }
                                 // A tiled pane first. A click on an unfocused tile only
@@ -4407,10 +4430,6 @@ where
                                             wr.write_all(&bytes).await?;
                                             dirty = true;
                                         }
-                                    if let Some(said) = take_question(&mut state) {
-                                        state.message = Some(said);
-                                        dirty = true;
-                                    }
                                         continue;
                                     }
                                     // In the focused pane, and the program in it has not
@@ -4439,10 +4458,6 @@ where
                                             ));
                                         dirty = true;
                                     }
-                                    if let Some(said) = take_question(&mut state) {
-                                        state.message = Some(said);
-                                        dirty = true;
-                                    }
                                     continue;
                                 }
                                 // A press anywhere else puts down whatever was selected:
@@ -4461,7 +4476,7 @@ where
                                 // armed row's own columns through `act`, and taking the
                                 // flag first would answer `y` as the sleep toggle.
                                 let clicked = state.clicked(row, col);
-                                let asked_about = state.armed.take();
+                                let asked_about = put_question_down(&mut state, clicked);
                                 match clicked {
                                     // A sleeping tab: its space wakes, and the screen goes
                                     // to the tab once it is live again.
@@ -4568,19 +4583,6 @@ where
                                         {
                                             wr.write_all(&resize).await?;
                                         }
-                                        dirty = true;
-                                    }
-                                    // Every click that is not one of the two answers, and
-                                    // not one of the controls, takes the question down and
-                                    // says so: a question that silently stayed up would hold
-                                    // the keyboard from a person who never saw it. Last in
-                                    // the match on purpose, because above the real arms it
-                                    // would answer `y` with "kept".
-                                    _ if asked_about.is_some() => {
-                                        state.message = Some(format!(
-                                            "kept {}",
-                                            space_name(&state, asked_about.expect("asked"))
-                                        ));
                                         dirty = true;
                                     }
                                     None => {}
@@ -4739,6 +4741,12 @@ where
                             }
                             Action::Wheel { row, col, up, shift } => {
                                 let Some((pane_row, pane_col)) = state.in_pane(row, col) else {
+                                    // Over the column, which is where a question is drawn
+                                    // and where scrolling moves it out of view.
+                                    if let Some(said) = take_question(&mut state) {
+                                        state.message = Some(said);
+                                        dirty = true;
+                                    }
                                     continue;
                                 };
                                 if state.focus {
@@ -5598,16 +5606,19 @@ where
                     if let Some(space) = state.closing.as_ref().map(|c| c.space) {
                         let left = tabs_left(&state, space);
                         let stuck = state.closing.as_ref().and_then(|c| c.stuck);
-                        state.message = Some(match (left, stuck) {
-                            (0, Some(terminal)) => format!(
+                        // On the tab first, not on the count. A tab the daemon would not
+                        // take is still listed by the index, because it never tore down,
+                        // so a match that asked the count first would never name it.
+                        state.message = Some(match (stuck, left) {
+                            (Some(terminal), _) => format!(
                                 "tab {terminal} would not close, {} kept",
                                 space_name(&state, space)
                             ),
-                            (0, None) => format!(
+                            (None, 0) => format!(
                                 "close of {} gave up, a tab nobody answered for",
                                 space_name(&state, space)
                             ),
-                            (left, _) => format!(
+                            (None, left) => format!(
                                 "close of {} gave up, {left} {} still there",
                                 space_name(&state, space),
                                 plural(left)
@@ -7118,7 +7129,13 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                         format!("{reason}; {left} {} still there", plural(left))
                     });
                 }
-                None => state.message = Some(reason),
+                None => {
+                    // Both rows, like the tab refusal below: a running agent's render
+                    // wipes the notice row without asking, and a refusal that needs
+                    // reading is the one message that must not vanish on contact.
+                    state.hint = Some(reason.clone());
+                    state.message = Some(reason);
+                }
             }
             *dirty = true;
         }
@@ -8336,7 +8353,9 @@ mod tests {
                 &mut dirty,
             );
             assert_eq!(s.message.as_deref(), Some(name), "{name}");
-            assert!(s.hint.is_none(), "{name}: {:?}", s.hint);
+            // On both rows: the notice row is what it has always been, and the hint row
+            // is where it survives a pane's own render.
+            assert_eq!(s.hint.as_deref(), Some(name), "{name}");
             assert!(s.closing.is_none(), "{name}");
         }
     }
@@ -8588,6 +8607,166 @@ mod tests {
 
     /// The question names what will refuse, because the daemon's own close checks nothing
     /// and a count alone would not say which tab is still working.
+    /// The count on the question and the number of requests that follow it are one number.
+    /// A tab the index and the store both know is one tab: counted twice on the question
+    /// and once to the daemon, the person reads "4 tabs" and watches three close.
+    #[test]
+    fn the_question_counts_the_tabs_the_close_will_ask_for() {
+        let mut s = state();
+        s.rows = vec![agent(4, 1, "claude", "idle")];
+        // A space that fell asleep between this client's last index and the click: the
+        // store still lists tab 4 and the index still lists it too.
+        s.spaces = vec![asleep(1, "qoro", &[4, 5])];
+        arm_close(&mut s, 1);
+        let asked = s.message.clone().unwrap_or_default();
+        assert!(asked.contains("2 tabs"), "{asked:?}");
+        let mut request = 0u64;
+        assert!(
+            start_close(&mut s, 1, &mut request),
+            "the close did not begin"
+        );
+        assert_eq!(
+            s.closing.as_ref().map(|c| c.asked.as_slice()),
+            Some([4, 5].as_slice()),
+            "the daemon is asked for a different number than the question named"
+        );
+    }
+
+    /// A question is drawn on a rule, and a rule exists only in the tree. Everything that
+    /// takes the tree away leaves a question nothing can see and nothing can answer, with
+    /// the keyboard still held: pressing `y` then closes a space over a row that is not on
+    /// screen any more. So every click that changes the view puts the question down.
+    #[test]
+    fn a_click_that_changes_the_view_puts_the_question_down() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        assert_eq!(s.armed, Some(1), "the question never went up");
+        // The row and the columns the paint actually drew, read out of the column the
+        // click maps onto, so a control that moves moves the test with it.
+        let column = s.column(s.paint_now, 0);
+        let rows = sidebar::rows_folded(
+            &column,
+            (s.lines as usize).saturating_sub(screen::STATUS),
+            sidebar::current_avatar().as_ref(),
+        );
+        let title = rows
+            .iter()
+            .position(|(_, hit)| *hit == Some(sidebar::Hit::Title))
+            .expect("the title row")
+            + screen::SIDEBAR_TOP;
+        let on = |what| {
+            (1..=crate::sidebar::WIDTH)
+                .find(|c| {
+                    sidebar::act(sidebar::Hit::Title, *c, &column, false).is_some_and(|a| {
+                        matches!(
+                            (what, a),
+                            ("view", sidebar::Act::View) | ("new", sidebar::Act::NewSpace)
+                        )
+                    })
+                })
+                .unwrap_or_else(|| panic!("no column on the title row is {what}"))
+        };
+        let (title, view_col, new_col) = (title as u16, on("view") as u16, on("new") as u16);
+        for (what, row, col) in [
+            ("the order word", title, view_col),
+            ("the plus", title, new_col),
+            ("a rule's own row", title + 1, 3),
+        ] {
+            let hit = s.clicked(row, col);
+            assert!(
+                hit.is_some(),
+                "{what}: the click at {row},{col} hit nothing, so the test proves nothing"
+            );
+            let about = format!("{hit:?}", hit = hit);
+            s.armed = Some(1);
+            let asked = put_question_down(&mut s, hit);
+            assert_eq!(asked, Some(1), "{what}: there was no question to put down");
+            assert_eq!(s.armed, None, "{what}: {about} left the question asking");
+            assert_eq!(s.message.as_deref(), Some("kept qoro"), "{what}: {about}");
+        }
+        // And the three clicks that are about the question keep it, because the arm
+        // behind them is what puts it back up.
+        for keep in [
+            Some(Clicked::Close(1)),
+            Some(Clicked::ConfirmClose(1)),
+            Some(Clicked::CancelClose),
+        ] {
+            let about = format!("{keep:?}", keep = keep);
+            s.armed = Some(1);
+            s.message = None;
+            assert_eq!(put_question_down(&mut s, keep), Some(1));
+            assert!(
+                s.message.is_none(),
+                "{about} is about the question and must not say a space was kept"
+            );
+        }
+    }
+
+    /// The give-up timer is armed where the close is created, by a click and by a key, and
+    /// never on a later answer: a daemon that takes the request and says nothing is exactly
+    /// the case the timer exists for, and it would never answer. `start_close` refuses a
+    /// second close, so a close whose flag the next close wipes would wait out the timer
+    /// with nobody watching.
+    #[test]
+    fn a_close_arms_the_give_up_timer_where_it_is_created() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        let mut request = 0u64;
+        let prefix = s.config.prefix;
+        let outcome = mode_input(&mut s, b"y", prefix, &mut request);
+        assert!(matches!(outcome, ModeOutcome::Stay));
+        assert!(
+            s.close_begun,
+            "the key path armed no timer, and a close nobody answers never ends"
+        );
+        // The click path needs no flag: it is in scope where the close begins.
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        let mut request = 0u64;
+        assert!(
+            start_close(&mut s, 1, &mut request),
+            "the close did not begin"
+        );
+        assert!(s.closing.is_some());
+    }
+
+    /// The affirmative cell, from the key and from the pointer, is the only thing standing
+    /// between a question and a dead end: `start_close` refuses a second close, so a close
+    /// begun with a flag the next close wipes would wait for the give-up timer with nobody
+    /// watching. Both paths arm it, and the flag is read on the very next line of the
+    /// keyboard arm, not on the next answer.
+    #[test]
+    fn a_close_from_the_key_arms_the_give_up_timer() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        let mut request = 0u64;
+        let prefix = s.config.prefix;
+        let outcome = mode_input(&mut s, b"y", prefix, &mut request);
+        assert!(matches!(outcome, ModeOutcome::Stay));
+        assert!(
+            s.close_begun,
+            "the key path armed no timer, and a close nobody answers never ends"
+        );
+        // And the click path does it without the flag at all, because it is in scope.
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        let mut request = 0u64;
+        assert!(
+            start_close(&mut s, 1, &mut request),
+            "the close did not begin"
+        );
+    }
+
     #[test]
     fn the_close_question_names_the_tabs_that_are_working() {
         let mut s = state();
