@@ -1860,6 +1860,12 @@ fn shorten_middle(middle: &str, room: usize) -> String {
     if crate::width::width(middle) <= room {
         return middle.to_string();
     }
+    // Nothing to shorten into. The ellipsis is a column of its own and would be one too
+    // many, which shifts every control after the name a column right of where `act` looks
+    // for it, so a rule with no room for its name draws no name at all.
+    if room == 0 {
+        return String::new();
+    }
     let mut out = String::new();
     let mut used = 0;
     for c in middle.chars() {
@@ -2253,8 +2259,39 @@ mod tests {
         width: usize,
         shut: &'a Shut,
     ) -> Column<'a> {
+        column_armed(
+            spaces,
+            agents,
+            focused_space,
+            focused_terminal,
+            tick,
+            view,
+            seen,
+            unseen,
+            now_unix,
+            width,
+            shut,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn column_armed<'a>(
+        spaces: &'a [WorkspaceRow],
+        agents: &'a [AgentRow],
+        focused_space: i64,
+        focused_terminal: u32,
+        tick: u64,
+        view: View,
+        seen: &'a Seen,
+        unseen: &'a Unseen,
+        now_unix: i64,
+        width: usize,
+        shut: &'a Shut,
+        armed: Option<i64>,
+    ) -> Column<'a> {
         Column {
-            armed: None,
+            armed,
             spaces,
             agents,
             focused_space,
@@ -6240,6 +6277,17 @@ mod tests {
 
     /// The rule as the column paints it, at a width, for a space in a known state.
     fn rule_at(width: usize, name: &str, held: usize, asleep: bool, closable: bool) -> String {
+        rule_asked_at(width, name, held, asleep, closable, false)
+    }
+
+    fn rule_asked_at(
+        width: usize,
+        name: &str,
+        held: usize,
+        asleep: bool,
+        closable: bool,
+        asking: bool,
+    ) -> String {
         let space = WorkspaceRow {
             id: 1,
             name: name.to_string(),
@@ -6264,7 +6312,7 @@ mod tests {
             .map(|n| agent(n, 1, "claude", "idle"))
             .collect();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
-        let c = column(
+        let c = column_armed(
             &spaces,
             &agents,
             1,
@@ -6276,6 +6324,7 @@ mod tests {
             NOW,
             width,
             &shut,
+            asking.then_some(1),
         );
         // A height no list of test-sized tabs can overflow, so the rule is on screen
         // rather than scrolled: this is about how a rule is drawn, not about the window.
@@ -6316,6 +6365,32 @@ mod tests {
             col += crate::width::columns(c);
         }
         None
+    }
+
+    /// Every rule this column can draw, at every width it can be drawn at, with a name
+    /// and a count that stress the arithmetic: the block keeps its columns, the row is
+    /// exactly the column, and the name gives way before the controls do.
+    ///
+    /// No room for the name is a column with no name in it, not a name that runs one
+    /// column over. A narrow rule whose count has taken the whole budget would otherwise
+    /// draw the ellipsis past it and push every control a column right of where `act`
+    /// looks for it, so the painted `z` would be one column from the click that means it.
+    #[test]
+    fn a_name_with_no_room_is_left_out_rather_than_over_running() {
+        assert_eq!(
+            shorten_middle("qoro", 0),
+            "",
+            "an ellipsis is a column of its own"
+        );
+        assert_eq!(crate::width::width(&shorten_middle("qoro", 0)), 0);
+        assert_eq!(shorten_middle("qoro", 1), "\u{2026}");
+        assert_eq!(shorten_middle("qoro", 4), "qoro");
+        assert_eq!(shorten_middle("qoro", 3), "qo\u{2026}");
+        // The width a rule can be drawn at, and the widest count that leaves nothing for
+        // the name at all, agree on the budget: the fold cells, the block and the blank
+        // last column are what a name never gets.
+        assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 11);
+        assert_eq!(crate::width::width(&format!(" ({})", 999_999_usize)), 9);
     }
 
     /// Every rule this column can draw, at every width it can be drawn at, with a name
@@ -6515,8 +6590,8 @@ mod tests {
         assert!(!row.contains('z'), "{row:?}");
     }
 
-    /// The sleeping state is a colour as well as a word, so a narrow column that drops the
-    /// word still says it.
+    /// The sleeping state is a colour as well as a word, so the rule says it twice and a
+    /// narrow column that has to drop one of them still says it.
     #[test]
     fn a_sleeping_rule_wears_the_sleeping_colour() {
         let spaces = vec![WorkspaceRow {

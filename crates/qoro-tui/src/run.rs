@@ -154,8 +154,8 @@ const INDEX_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 /// that never changes.
 const CLOSE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How many times one tab is asked to close before the chain gives up on it and moves to
-/// the next. The daemon's only refusal is a command channel that was full at that instant,
+/// How many times a refused tab is asked again before the chain gives up on it and moves
+/// to the next, so the tab is asked one time plus this many. The daemon's only refusal is a command channel that was full at that instant,
 /// which a retry fixes; three is enough to tell a full channel from a tab that will not go.
 const STUCK_TRIES: usize = 3;
 
@@ -652,10 +652,12 @@ struct Closing {
     /// they are asked for.
     asked: Vec<u32>,
     sent: usize,
-    /// Whether the space itself has been asked. The gate that sends it runs on every
-    /// index, and a second `CloseWorkspace` for a space the first one deleted is answered
-    /// with a refusal that would be reported against a close that worked.
+    /// Whether the space itself has been asked, and the id it went out under. The gate that
+    /// sends it runs on every index, and a second `CloseWorkspace` for a space the first one
+    /// deleted is answered with a refusal that would be reported against a close that
+    /// worked; the id is what tells our refusal from `ctrl-a W`'s, which is the same prefix.
     space_asked: bool,
+    space_asked_id: Option<String>,
     /// A tab that would not take the close, and how many times it has been asked for it.
     /// The daemon's only refusal here is a full command channel, which is exactly the kind
     /// that succeeds the second time, so the tab is asked again before the chain gives up
@@ -2320,6 +2322,19 @@ fn is_mouse(bytes: &[u8]) -> bool {
 
 /// The answer to a space rule's own question: `y` closes it, `n` or anything else keeps it.
 ///
+/// Take a rule's question down and say that its space was kept.
+///
+/// A click puts the question down whatever it lands on, so a rule cannot sit on screen
+/// asking while the keyboard is dead and its row has scrolled out of view. The arm that
+/// matches a click has taken it already; this is for the three that answer a click on the
+/// divider, on a tile or inside a running pane and return before the space arm.
+fn take_question(state: &mut State) -> Option<String> {
+    state
+        .armed
+        .take()
+        .map(|space| format!("kept {}", space_name(state, space)))
+}
+
 /// Lowercase, unlike the tab close's capital `Y`. That one is about a stray `y` typed into
 /// a pane waiting for an answer of its own, and this one is about a key pressed while a
 /// rule on screen is asking, where the person has read the question and is answering it.
@@ -2438,6 +2453,7 @@ fn start_close(state: &mut State, space: i64, request: &mut u64) -> bool {
         asked,
         sent: 0,
         space_asked: false,
+        space_asked_id: None,
         stuck: None,
         stuck_tries: 0,
         pending: Vec::new(),
@@ -2471,15 +2487,15 @@ fn close_one(state: &mut State, request: &mut u64) {
         // Asked enough times. The chain leaves this tab behind rather than stalling, and
         // the space is left open: the daemon would refuse a close over a tab that is still
         // there, and the person is told which one now rather than after the wait.
-        Some(stuck) => {
-            closing.stuck = None;
-            closing.stuck_tries = 0;
-            match next_tab(closing, Some(stuck)) {
+        Some(_) => {
+            // `stuck` stays and the counter stays spent, so the give-up can name the tab
+            // that would not close: it is the one thing a person can do something about.
+            match next_tab(closing) {
                 Some(terminal) => terminal,
                 None => return,
             }
         }
-        None => match next_tab(closing, None) {
+        None => match next_tab(closing) {
             Some(terminal) => terminal,
             None => return,
         },
@@ -2499,15 +2515,10 @@ fn close_one(state: &mut State, request: &mut u64) {
 ///
 /// `skip` is the tab the chain gave up on, which stays in `asked` (the count a person was
 /// told includes it) but is not asked again and does not hold up the tabs behind it.
-fn next_tab(closing: &mut Closing, skip: Option<u32>) -> Option<u32> {
-    while let Some(terminal) = closing.asked.get(closing.sent).copied() {
-        closing.sent += 1;
-        if Some(terminal) == skip {
-            continue;
-        }
-        return Some(terminal);
-    }
-    None
+fn next_tab(closing: &mut Closing) -> Option<u32> {
+    let terminal = closing.asked.get(closing.sent).copied()?;
+    closing.sent += 1;
+    Some(terminal)
 }
 
 /// Ask the daemon to close the space itself, which it will only do once nothing in it is
@@ -2526,10 +2537,34 @@ fn close_the_space(state: &mut State, request: &mut u64) {
     }
     closing.space_asked = true;
     *request += 1;
+    let id = format!("close-space-{request}");
+    if let Some(closing) = state.closing.as_mut() {
+        closing.space_asked_id = Some(id.clone());
+    }
     state.modes.outbox.push(ControlRequest::CloseWorkspace {
-        id: format!("close-space-{request}"),
+        id,
         workspace: space,
     });
+}
+
+/// Ask the daemon to close the space, once every tab is gone and the daemon's own count is
+/// zero.
+///
+/// Called on the index and on the space list, and both are needed. A waking space empties
+/// in the index, because its tabs are live rows. A sleeping space empties in the space
+/// list, because its tabs are `sleeping` entries and the index never lists them: the two
+/// answers arrive in the order the loop asks for them, the index first, against the list
+/// that still says the space holds what it held a moment ago, and nothing asks again after
+/// that. With the gate on the index alone a sleeping space waits for the give-up timer and
+/// blames a tab that never refused anything.
+fn close_gate(state: &mut State, request: &mut u64) {
+    if let Some(closing) = state.closing.clone()
+        && !closing.space_asked
+        && closing.sent >= closing.asked.len()
+        && space_is_empty(state, closing.space)
+    {
+        close_the_space(state, request);
+    }
 }
 
 /// Whether the daemon's count of a space is zero, as far as this client can tell.
@@ -4159,6 +4194,14 @@ where
                         // arm is reached before the mouse one, so taking the pointer here
                         // would leave a rule asking a question nothing could ever answer.
                         let outcome = mode_input(&mut state, &bytes, keys.prefix(), &mut request);
+                        // The give-up timer is armed where the close is created, and a key is
+                        // as much a place as a click. Armed here rather than on the next
+                        // answer, because a daemon that takes the request and says nothing
+                        // is exactly the case the timer exists for, and it never would.
+                        if state.close_begun {
+                            state.close_begun = false;
+                            closing_since = Some(tokio::time::Instant::now());
+                        }
                         dirty = true;
                         if let ModeOutcome::Passthrough(rest) = outcome {
                             feed = Some(rest);
@@ -4339,6 +4382,10 @@ where
                                     if state.selection.take().is_some() {
                                         dirty = true;
                                     }
+                                    if let Some(said) = take_question(&mut state) {
+                                        state.message = Some(said);
+                                        dirty = true;
+                                    }
                                     continue;
                                 }
                                 // A tiled pane first. A click on an unfocused tile only
@@ -4360,6 +4407,10 @@ where
                                             wr.write_all(&bytes).await?;
                                             dirty = true;
                                         }
+                                    if let Some(said) = take_question(&mut state) {
+                                        state.message = Some(said);
+                                        dirty = true;
+                                    }
                                         continue;
                                     }
                                     // In the focused pane, and the program in it has not
@@ -4386,6 +4437,10 @@ where
                                             Some(crate::selection::Selection::start(
                                                 tile_row, tile_col,
                                             ));
+                                        dirty = true;
+                                    }
+                                    if let Some(said) = take_question(&mut state) {
+                                        state.message = Some(said);
                                         dirty = true;
                                     }
                                     continue;
@@ -4486,13 +4541,12 @@ where
                                         if start_close(&mut state, space, &mut request) {
                                             closing_since = Some(tokio::time::Instant::now());
                                         }
-                                        state.close_begun = false;
                                         dirty = true;
                                     }
                                     // Anything else on the row, or anywhere else while a
                                     // rule is armed, takes the question down.
                                     Some(Clicked::CancelClose) => {
-                                        if let Some(space) = state.armed.take() {
+                                        if let Some(space) = asked_about {
                                             state.message = Some(format!(
                                                 "kept {}",
                                                 space_name(&state, space)
@@ -4525,7 +4579,7 @@ where
                                     _ if asked_about.is_some() => {
                                         state.message = Some(format!(
                                             "kept {}",
-                                            space_name(&state, asked_about.unwrap_or_default())
+                                            space_name(&state, asked_about.expect("asked"))
                                         ));
                                         dirty = true;
                                     }
@@ -5424,15 +5478,6 @@ where
                                     refresh |= std::mem::take(&mut index_owed);
                                 }
                                 apply(&mut state, response, &mut request, &mut dirty);
-                                // The give-up timer is armed where the close is created,
-                                // by a click or by the key, and only cleared here, so a
-                                // close begun against a daemon that accepts the connection
-                                // and never answers is still reported rather than holding
-                                // the column for ever.
-                                if state.close_begun {
-                                    state.close_begun = false;
-                                    closing_since = Some(tokio::time::Instant::now());
-                                }
                                 if state.closing.is_none() {
                                     closing_since = None;
                                 }
@@ -7009,6 +7054,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // no row known yet, and an interface that just opened must not leave for that.
             state.done =
                 nothing_awake(state) && state.spaces.iter().all(|w| w.asleep || w.terminals == 0);
+            // A sleeping space's emptiness is this answer's news and not the index's, so a
+            // close waiting on one is asked here as well.
+            close_gate(state, request);
             *dirty = true;
         }
         ControlResponse::WorkspaceAsleep {
@@ -7042,24 +7090,35 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             }
             *dirty = true;
         }
-        // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
-        // on the hint row until the person does something, rather than one frame.
-        // A space close the daemon refused: something is still in the space, so the space
-        // stays and the person is told what. The gate re-arms, because the tabs that caused
-        // the refusal are on their way out and the next index will find the space empty.
+        // A space close the daemon refused. `ctrl-a W` asks for one directly and never sets
+        // `closing`, and its refusal is the notice row it has always been: a new client and
+        // an old daemon, a sleeping space whose tabs the client's own count cannot see, and
+        // the session's default are all refusals a person has to read.
+        //
+        // A refusal for the close this client is running re-arms the gate, because the tabs
+        // that caused it are on their way out and the next index will find the space empty.
         // A refusal with nothing left to wait for is the one that repeats, and the give-up
         // timer is what ends that rather than a loop.
         ControlResponse::Failed { id, reason } if id.starts_with("close-space-") => {
-            if let Some(space) = state.closing.as_ref().map(|c| c.space) {
-                let left = tabs_left(state, space);
-                if let Some(closing) = state.closing.as_mut() {
-                    closing.space_asked = false;
+            let ours = state
+                .closing
+                .as_ref()
+                .filter(|c| c.space_asked_id.as_deref() == Some(id.as_str()))
+                .map(|c| c.space);
+            match ours {
+                Some(space) => {
+                    let left = tabs_left(state, space);
+                    if let Some(closing) = state.closing.as_mut() {
+                        closing.space_asked = false;
+                        closing.space_asked_id = None;
+                    }
+                    state.hint = Some(if left == 0 {
+                        reason
+                    } else {
+                        format!("{reason}; {left} {} still there", plural(left))
+                    });
                 }
-                state.hint = Some(if left == 0 {
-                    reason
-                } else {
-                    format!("{reason}; {left} {} still there", plural(left))
-                });
+                None => state.message = Some(reason),
             }
             *dirty = true;
         }
@@ -7068,10 +7127,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // not closed over a tab that is still there, and the refusal is asked again rather
         // than ending the chain on the first one.
         //
-        // Only a close of a space takes the hint row. A refused `ctrl-a x` on a single tab
-        // is the ordinary notice row it has always been, and a hint is wiped by the next
-        // keystroke, which would make a refusal that needs a person to read it the one
-        // message that disappears when they reach for the keyboard.
+        // Both rows, ours and anybody else's. The notice row is the one a single tab's
+        // refusal has always had, and the hint row is where it survives: a pane with a
+        // running agent renders over the notice row without asking, so a refusal that
+        // needs reading would vanish at the moment the person reached for the keyboard.
         ControlResponse::Failed { id, reason } if id.starts_with("close-") => {
             // Which tab this refusal is about, and whether it is ours at all: a refused
             // `ctrl-a x` on a single tab is somebody else's close, and it keeps the notice
@@ -7083,9 +7142,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 c.stuck = Some(terminal);
                 Some(terminal)
             });
-            // Ours says what is left in the space as well; somebody else's is the ordinary
-            // refusal of one tab, which has always been on the notice row, and the hint
-            // carries it too so a full pane's own render cannot wipe the reason.
+            // Ours says what is left in the space as well, and somebody else's stays the
+            // ordinary refusal of one tab. The hint is written either way, so neither
+            // reason can be wiped by a pane's own render.
             state.hint = Some(reason.clone());
             if ours.is_some() {
                 close_one(state, request);
@@ -7094,6 +7153,8 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             }
             *dirty = true;
         }
+        // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
+        // on the hint row until the person does something, rather than one frame.
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -7348,13 +7409,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // index reads the live registry, so the index showing a space empty is the
             // earliest the space can be asked to close, and asking earlier is a refusal
             // that names tabs which are on their way out anyway.
-            if let Some(closing) = state.closing.clone()
-                && !closing.space_asked
-                && closing.sent >= closing.asked.len()
-                && space_is_empty(state, closing.space)
-            {
-                close_the_space(state, request);
-            }
+            close_gate(state, request);
             // Nothing left anywhere. The interface is a way into terminals, so with none of
             // them it is a screen a person has to know a key to escape from. Ending is what
             // every multiplexer does when its last window closes, and the daemon stays: it
@@ -8186,6 +8241,184 @@ mod tests {
             "{:?}",
             s.modes.outbox
         );
+    }
+
+    /// The space list is what empties a sleeping space, so the gate runs there too. On the
+    /// index alone the two answers arrive in the order the loop asks for them, the index
+    /// first, and nothing asks again: the space waits for the give-up timer and the timer
+    /// blames a tab that never refused anything.
+    #[test]
+    fn a_sleeping_space_is_asked_to_close_when_its_tabs_are_gone() {
+        let mut s = state();
+        s.rows.clear();
+        s.spaces = vec![asleep(1, "qoro", &[4, 5, 6])];
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        let mut dirty = false;
+        let mut sent = 0u64;
+        for terminal in [4u32, 5, 6] {
+            sent += 1;
+            apply(
+                &mut s,
+                ControlResponse::TerminalClosed {
+                    id: format!("close-{sent}"),
+                    terminal,
+                },
+                &mut request,
+                &mut dirty,
+            );
+        }
+        // The index cannot see a sleeping space's tabs, so it says nothing and no space
+        // close goes out on it.
+        apply(
+            &mut s,
+            ControlResponse::Agents {
+                id: "index".into(),
+                agents: Vec::new(),
+                splits: Vec::new(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(
+            !s.modes
+                .outbox
+                .iter()
+                .any(|r| matches!(r, ControlRequest::CloseWorkspace { .. })),
+            "the index has no news about a sleeping space: {:?}",
+            s.modes.outbox
+        );
+        // The space list is the news.
+        apply(
+            &mut s,
+            ControlResponse::Workspaces {
+                id: "spaces".into(),
+                workspaces: vec![asleep(1, "qoro", &[])],
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(
+            s.modes
+                .outbox
+                .iter()
+                .any(|r| matches!(r, ControlRequest::CloseWorkspace { workspace: 1, .. })),
+            "the space list emptied it and nothing asked: {:?}",
+            s.modes.outbox
+        );
+        assert_eq!(
+            s.closing.as_ref().and_then(|c| c.space_asked_id.clone()),
+            s.modes.outbox.iter().find_map(|r| match r {
+                ControlRequest::CloseWorkspace { id, .. } => Some(id.clone()),
+                _ => None,
+            }),
+            "the id it went out under is kept, to tell our refusal from ctrl-a W's"
+        );
+    }
+
+    /// `ctrl-a W` asks for a space close directly and its refusal is a notice row, the way
+    /// it has always been. It never sets `closing`, so an arm that assumed it did would
+    /// swallow every refusal the daemon has ever given: the default space, and a sleeping
+    /// one whose tabs the client's own count cannot see.
+    #[test]
+    fn a_refused_ctrl_a_w_is_the_notice_row_it_has_always_been() {
+        for name in ["the default space", "a space with three tabs in it"] {
+            let mut s = state();
+            let mut dirty = false;
+            let mut request = 0u64;
+            apply(
+                &mut s,
+                ControlResponse::Failed {
+                    id: "close-space-9".into(),
+                    reason: name.into(),
+                },
+                &mut request,
+                &mut dirty,
+            );
+            assert_eq!(s.message.as_deref(), Some(name), "{name}");
+            assert!(s.hint.is_none(), "{name}: {:?}", s.hint);
+            assert!(s.closing.is_none(), "{name}");
+        }
+    }
+
+    /// `ctrl-a W` and this client's space close share an id prefix, so a refusal is told
+    /// apart by the id it went out under. Somebody else's refusal is a notice row and does
+    /// not re-arm our gate, which would send ours a second time and have its refusal
+    /// reported against a close that already worked.
+    #[test]
+    fn a_refused_ctrl_a_w_does_not_re_ask_our_space() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "working")];
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        apply(
+            &mut s,
+            ControlResponse::TerminalClosed {
+                id: "close-1".into(),
+                terminal: 1,
+            },
+            &mut request,
+            &mut false,
+        );
+        s.rows.clear();
+        apply(
+            &mut s,
+            ControlResponse::Agents {
+                id: "index".into(),
+                agents: Vec::new(),
+                splits: Vec::new(),
+            },
+            &mut request,
+            &mut false,
+        );
+        let ours = s
+            .modes
+            .outbox
+            .iter()
+            .find_map(|r| match r {
+                ControlRequest::CloseWorkspace { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("the space close went out");
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: "close-space-77".into(),
+                reason: "workspace 2 is this session's default".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(
+            s.message.as_deref(),
+            Some("workspace 2 is this session's default"),
+            "a refusal that is not ours is the notice row"
+        );
+        assert!(
+            s.closing
+                .as_ref()
+                .is_some_and(|c| c.space_asked_id.as_deref() == Some(ours.as_str())),
+            "our gate was re-armed by somebody else's refusal: {:?}",
+            s.closing.as_ref().map(|c| &c.space_asked_id)
+        );
+        // And ours still re-arms, because the tabs that caused the refusal are on their
+        // way out and the next index will find the space empty.
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: ours.clone(),
+                reason: "workspace 1 still holds 1 tab".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.closing.as_ref().is_some_and(|c| !c.space_asked));
+        // Nothing of ours is left to wait for, so the daemon's own words are the whole
+        // message rather than our count appended to them.
+        assert_eq!(s.hint.as_deref(), Some("workspace 1 still holds 1 tab"));
     }
 
     /// A sleeping space's tabs are the store's, not the index's, so both the question and
