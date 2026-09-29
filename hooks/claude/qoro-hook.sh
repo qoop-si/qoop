@@ -39,7 +39,7 @@
 # state alone.
 #
 # Event map:
-#   SessionStart -> working, no event
+#   SessionStart -> starting (working when `source` is `compact`), no event
 #   anything a subagent fired (the payload carries `agent_id`, SubagentStop
 #     always does) -> nothing: it describes the subagent, not this terminal
 #   UserPromptSubmit -> working + `--event user` (prompt head, best-effort)
@@ -107,7 +107,13 @@ name = payload.get("hook_event_name") or ""
 if payload.get("agent_id"):
     raise SystemExit(0)
 if name == "SessionStart":
-    state, flags, event, label = "working", "--visible-working", "", ""
+    # A session opening, resuming or clearing is not a turn: `starting`, so an
+    # agent the screen then reads as idle is not news that it finished. A
+    # compaction runs inside a turn and stays working.
+    if payload.get("source") == "compact":
+        state, flags, event, label = "working", "--visible-working", "", ""
+    else:
+        state, flags, event, label = "starting", "", "", ""
 elif name == "UserPromptSubmit":
     state, flags, event = "working", "--visible-working", "user"
     label = one_line(payload.get("prompt") or "")
@@ -148,7 +154,9 @@ session = str(payload.get("session_id") or "")
 if session and (len(session) > 128 or not all(c.isalnum() or c in "-_." for c in session)):
     session = ""
 
-args = ["qoro", "hook-report", "--state", state, flags]
+args = ["qoro", "hook-report", "--state", state]
+if flags:
+    args.append(flags)
 if event:
     args += ["--event", event]
 if label:

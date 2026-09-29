@@ -8,7 +8,7 @@
 # `~/.cursor/hooks.json` (user) or `.cursor/hooks.json` (project):
 #
 #   { "version": 1, "hooks": {
-#       "sessionStart": [{ "command": "qoro-hook.sh working" }],
+#       "sessionStart": [{ "command": "qoro-hook.sh starting" }],
 #       "postToolUse": [{ "command": "qoro-hook.sh working" }],
 #       "stop": [{ "command": "qoro-hook.sh idle" }]
 #   } }

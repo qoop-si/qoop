@@ -91,13 +91,19 @@ def first_fileish(tool_input):
     return ""
 
 
-args = ["qoro", "hook-report", "--state", os.environ["QORO_HOOK_STATE"]]
-if os.environ.get("QORO_HOOK_FLAGS"):
-    args.append(os.environ["QORO_HOOK_FLAGS"])
+name = payload.get("hook_event_name") or ""
+state = os.environ["QORO_HOOK_STATE"]
+flags = os.environ.get("QORO_HOOK_FLAGS") or ""
+# A session starting is not a turn. Said here and not only by the argument,
+# because an entry installed earlier still passes `working` for it.
+if name == "SessionStart":
+    state, flags = "starting", ""
+args = ["qoro", "hook-report", "--state", state]
+if flags:
+    args.append(flags)
 session = str(payload.get("session_id") or "")
 if session and len(session) <= 128 and all(c.isalnum() or c in "-_." for c in session):
     args += ["--session-id", session]
-name = payload.get("hook_event_name") or ""
 if name in ("PreToolUse", "PermissionRequest"):
     tool = str(payload.get("tool_name") or "").strip()
     arg = first_fileish(payload.get("tool_input"))

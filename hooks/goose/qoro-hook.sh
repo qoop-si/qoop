@@ -45,7 +45,10 @@ try:
 except Exception:
     raise SystemExit(1)
 name = payload.get("event") or ""
-if name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"):
+# A session starting is not a turn, so an idle screen after it is not news.
+if name == "SessionStart":
+    state = "starting"
+elif name in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
     state = "working --visible-working"
 elif name in ("Stop", "SessionEnd"):
     state = "idle --visible-idle"

@@ -120,7 +120,7 @@ fn targets() -> Vec<Target> {
                 // argument here; the script reads the event name only to label the
                 // focus event.
                 events: &[
-                    Event("SessionStart", Some("working")),
+                    Event("SessionStart", Some("starting")),
                     Event("UserPromptSubmit", Some("working")),
                     Event("PreToolUse", Some("working")),
                     Event("PostToolUse", Some("working")),
@@ -139,7 +139,7 @@ fn targets() -> Vec<Target> {
             home_env: None,
             shape: Shape::Nested {
                 events: &[
-                    Event("SessionStart", Some("working")),
+                    Event("SessionStart", Some("starting")),
                     Event("BeforeAgent", Some("working")),
                     Event("BeforeTool", Some("working")),
                     Event("AfterAgent", Some("idle")),
@@ -157,7 +157,7 @@ fn targets() -> Vec<Target> {
             home_env: None,
             shape: Shape::Flat {
                 events: &[
-                    Event("sessionStart", Some("working")),
+                    Event("sessionStart", Some("starting")),
                     Event("postToolUse", Some("working")),
                     Event("stop", Some("idle")),
                 ],
@@ -1179,7 +1179,7 @@ mod tests {
             entry["command"]
                 .as_str()
                 .expect("a command")
-                .ends_with(" working"),
+                .ends_with(" starting"),
             "the state has to be on the command line: {entry}"
         );
 
@@ -1289,6 +1289,76 @@ mod tests {
                 r#"{{"hook_event_name":"Notification","notification_type":"{kind}"}}"#
             ));
             assert!(said.is_empty(), "{kind} reported {said:?}");
+        }
+    }
+
+    /// A session opening is `starting`, never `working`: an agent that opens and sits
+    /// idle did no turn, and a turn settling is what says "finished". Codex and gemini
+    /// installed earlier still pass `working` for it, and still report `starting`.
+    #[test]
+    fn a_session_start_reports_starting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let log = dir.path().join("reports");
+        let fake = dir.path().join("qoro");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let report = |agent: &str, arg: &str, payload: &str| -> String {
+            let _ = std::fs::remove_file(&log);
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .arg(arg)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QORO_TERMINAL", "1")
+                .env("QORO_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        for source in ["startup", "resume", "clear"] {
+            let said = report(
+                "claude",
+                "",
+                &format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#),
+            );
+            assert_eq!(said.trim(), "hook-report --state starting", "{source}");
+        }
+        let said = report(
+            "claude",
+            "",
+            r#"{"hook_event_name":"SessionStart","source":"compact"}"#,
+        );
+        assert!(
+            said.contains("--state working"),
+            "compact is mid turn: {said:?}"
+        );
+        for agent in ["codex", "gemini"] {
+            let said = report(agent, "working", r#"{"hook_event_name":"SessionStart"}"#);
+            assert_eq!(said.trim(), "hook-report --state starting", "{agent}");
+            let said = report(
+                agent,
+                "working",
+                r#"{"hook_event_name":"UserPromptSubmit"}"#,
+            );
+            assert!(
+                said.contains("--state working --visible-working"),
+                "{agent}: {said:?}"
+            );
         }
     }
 
