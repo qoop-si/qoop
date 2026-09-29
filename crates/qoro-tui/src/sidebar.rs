@@ -1024,7 +1024,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         // Armed: the row is a question, so the two controls become the two answers in the
         // same columns. A question is asked in the place it was asked from, and answered
         // by a second click on the same cells.
-        Block::armed(width)
+        armed_block(width)
     } else {
         block(width, space.closable, space.asleep || !kids.is_empty())
     };
@@ -1076,7 +1076,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         let role = match block.answer {
             // The affirmative is a word and the other is quieter, so a question cannot be
             // answered by a glance at two equal marks.
-            Some(Answer::Yes) if at == width - 4 => Role::Text,
+            Some(yes) if Some((at, w)) == Some(yes) => Role::Text,
             Some(_) => Role::Faint,
             None if Some((at, w)) == block.sleep && space.asleep => Role::Sleeping,
             None => mark,
@@ -1123,11 +1123,13 @@ const BLOCK_TAIL: usize = FOLD_CELLS + BLOCK_W + 1;
 
 /// The columns a name has once the slot beside it is paid for, which is what decides
 /// whether the word `sleeping` fits or the count stays.
+///
+/// The same subtraction `rule` makes for the name's own room, so the two cannot disagree
+/// about what fits.
 fn room_for(width: usize, slot: &str) -> usize {
     width
-        .saturating_sub(FOLD_CELLS)
-        .saturating_sub(crate::width::width(slot))
         .saturating_sub(BLOCK_TAIL)
+        .saturating_sub(crate::width::width(slot))
 }
 
 /// The control block at the right of a space rule: the sleep toggle and the close, in three
@@ -1146,8 +1148,9 @@ struct Block {
     sleep: Option<(usize, usize)>,
     /// The same for the close.
     close: Option<(usize, usize)>,
-    /// Which answer the block is drawing, while the row is armed.
-    answer: Option<Answer>,
+    /// The column the affirmative is in, while the row is armed, and the other cell is
+    /// then the negative. Both sit where the controls were.
+    answer: Option<(usize, usize)>,
 }
 
 impl Block {
@@ -1157,8 +1160,12 @@ impl Block {
         // Armed, the two cells are the two answers; otherwise they are the two controls.
         // Either way the block is three columns and neither cell ever moves.
         let [left, right] = match self.answer {
-            Some(Answer::Yes) => ["y", "n"],
-            Some(Answer::No) => ["n", "y"],
+            // `answer` is the cell the affirmative is drawn in, and the affirmative is
+            // always the left one: a question puts `y` under the pointer that armed it.
+            Some(yes) => [
+                if self.sleep == Some(yes) { "y" } else { "n" },
+                if self.close == Some(yes) { "y" } else { "n" },
+            ],
             None => [
                 if self.sleep.is_some() { "z" } else { " " },
                 if self.close.is_some() { "x" } else { " " },
@@ -1167,22 +1174,16 @@ impl Block {
         format!("{left} {right}")
     }
 
-    /// The two answers in the two columns the controls used, so a person who aimed at `x`
-    /// finds `y` and `n` under the pointer rather than somewhere else on the row.
-    fn armed(width: usize) -> Block {
-        Block {
-            sleep: Some((width.saturating_sub(4), 1)),
-            close: Some((width.saturating_sub(2), 1)),
-            answer: Some(Answer::Yes),
-        }
-    }
 }
 
-/// What the rule is asking, when it is asking.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Answer {
-    Yes,
-    No,
+/// The two answers in the two columns the controls were, so a person who aimed at `x` finds
+/// `y` and `n` under the pointer rather than somewhere else on the row.
+fn armed_block(width: usize) -> Block {
+    Block {
+        sleep: Some((width.saturating_sub(4), 1)),
+        close: Some((width.saturating_sub(2), 1)),
+        answer: Some((width.saturating_sub(4), 1)),
+    }
 }
 
 fn block(width: usize, closable: bool, can_sleep: bool) -> Block {
@@ -1660,39 +1661,42 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
         Hit::Terminal(terminal) | Hit::Next(Some(terminal)) => Some(Act::Terminal(terminal)),
         Hit::Next(None) => None,
         Hit::Space(id) => {
-            let space = c.spaces.iter().find(|s| s.id == id);
+            // The folded strip is four columns and carries no controls, so a click there
+            // cannot reach one however the columns would fall.
+            let space = (!collapsed)
+                .then(|| c.spaces.iter().find(|s| s.id == id))
+                .flatten();
             if let Some(space) = space {
                 let kids: Vec<&AgentRow> = c.agents.iter().filter(|a| a.workspace == id).collect();
                 let drawn = if c.armed == Some(id) {
-                    Block::armed(c.width)
+                    armed_block(c.width)
                 } else {
                     block(c.width, space.closable, space.asleep || !kids.is_empty())
                 };
-                if col > 0 {
-                    match (drawn.answer, drawn.sleep, drawn.close) {
-                        // An armed rule answers `y` and `n`, and nothing else: a row
-                        // that is mid question does not fold, does not navigate and does
-                        // not sleep, because a person aiming at one of those would be
-                        // answering a question they did not read.
-                        (Some(answer), Some((yes, _)), _) if col - 1 == yes => {
-                            return Some(if answer == Answer::Yes {
-                                Act::ConfirmClose(id)
-                            } else {
-                                Act::CancelClose
-                            });
-                        }
-                        (_, _, Some((no, _))) if col - 1 == no && c.armed == Some(id) => {
-                            return Some(Act::CancelClose);
-                        }
-                        // Not armed: the controls do what they say.
-                        (None, Some((at, _)), _) if col - 1 == at => {
-                            return Some(Act::Sleep(id));
-                        }
-                        (None, _, Some((at, _))) if col - 1 == at => {
-                            return Some(Act::Close(id));
-                        }
-                        _ => {}
-                    }
+                let at = col.saturating_sub(1);
+                if let Some(yes) = drawn.answer {
+                    // An armed rule answers `y` and `n`, and nothing else: a row that is
+                    // mid question does not fold, does not navigate and does not sleep,
+                    // because a person aiming at one of those would be answering a
+                    // question they did not read.
+                    return Some(if at == yes.0 {
+                        Act::ConfirmClose(id)
+                    } else {
+                        Act::CancelClose
+                    });
+                }
+                // Not armed: the controls do what they say.
+                if drawn
+                    .sleep
+                    .is_some_and(|(at, _)| col.saturating_sub(1) == at)
+                {
+                    return Some(Act::Sleep(id));
+                }
+                if drawn
+                    .close
+                    .is_some_and(|(at, _)| col.saturating_sub(1) == at)
+                {
+                    return Some(Act::Close(id));
                 }
             }
             // A rule mid question folds nothing and moves nowhere: a person aiming at the
@@ -2974,9 +2978,9 @@ mod tests {
                     } else if text.trim_start().starts_with('\u{2514}') {
                         second
                     } else if in_tree
-                        && let Some(rest) = [" \u{25be} ", " \u{25b8} ", " \u{b7} "]
+                        && [" \u{25be} ", " \u{25b8} ", " \u{b7} "]
                             .iter()
-                            .find_map(|p| text.strip_prefix(p))
+                            .any(|p| text.starts_with(p))
                     {
                         // A space's top edge moves to the space it names: the name
                         // sits right after the arrow, with nothing but a word
@@ -6284,6 +6288,21 @@ mod tests {
             })
             .map(|(l, _)| l.text)
             .unwrap_or_default()
+    }
+
+    /// `cols` columns of `text` from the zero-based column `at`, counting columns and not
+    /// characters, so a full width name cannot shift what is read.
+    fn columns_from(text: &str, at: usize, cols: usize) -> String {
+        let mut col = 0;
+        let mut out = String::new();
+        for c in text.chars() {
+            let w = crate::width::columns(c);
+            if col >= at && col < at + cols {
+                out.push(c);
+            }
+            col += w;
+        }
+        out
     }
 
     /// The column of a character in a row, counting columns and not bytes, or `None` when
