@@ -47,9 +47,9 @@ colours, the same grid the interface draws and never resized for it. Scrolling u
 back past the screen: into the terminal's history, or for an agent on the full screen,
 into its conversation. A click on it types into it: every key goes to that terminal as
 pressed, so arrows move through an agent's menu, Enter picks, Esc cancels, and a click
-outside stops. When qoro cannot read a terminal, the box says what qoro said about it,
-or that it could not read it, instead of sitting empty. "open in qoro" switches the
-interface there and brings its app forward
+outside stops. When qoro cannot read a terminal, the box says what qoro said about it, or
+that it could not read it, instead of sitting empty. "open in qoro" switches the interface
+there and brings its app forward
 (inside tmux the switch happens and nothing is raised, since the tmux server has no app to
 find). The gear in the list opens a settings window: the notch on or off, notifications,
 theme, prefix key and pet, all written to `~/.config/qoro/config.toml`, which `qoro
