@@ -197,7 +197,7 @@ func runQoroFull(_ args: [String], _ what: String) -> Result<Data, QoroFailed> {
     let out = Pipe(), err = Pipe()
     p.standardOutput = out
     p.standardError = err
-    do { try p.run() } catch { return .failure(QoroFailed(why: "cannot run qoro")) }
+    do { try p.run() } catch { return .failure(QoroFailed(why: Refusal.noQoro)) }
     // Stderr on its own thread, so neither pipe can fill while the other is read.
     var said = Data()
     let drained = DispatchSemaphore(value: 0)
@@ -223,6 +223,16 @@ func qoroSaid(_ raw: Data) -> String {
 
 struct QoroFailed: Error {
     let why: String
+}
+
+/// The sentences the notch writes itself, for what qoro left unsaid. A line the notch
+/// cannot read is one qoro answered and this build could not: the qoro behind the notch
+/// is newer than the notch, which is what a notch left running across an update is, and
+/// `qoro update` brings the notch up with it.
+enum Refusal {
+    static let noQoro = "cannot run qoro"
+    static let screen = "not a screen this notch can read: qoro update brings the notch up with it"
+    static let page = "not a page this notch can read: qoro update brings the notch up with it"
 }
 
 /// Run qoro once for its effect: nil when it worked, else what it said went wrong.
@@ -361,50 +371,49 @@ final class Mirror: ObservableObject {
         p.standardOutput = out
         p.standardError = err
         guard (try? p.run()) != nil else {
-            screenRefusal = "cannot run qoro"
+            screenRefusal = Refusal.noQoro
             return
         }
         process = p
         // Stderr on its own thread, as in runQoroFull, so a qoro that refuses with a long
-        // sentence and a screen that never comes cannot fill one pipe while the other is read.
+        // sentence and a screen that never comes cannot fill one pipe while the other is
+        // read. A thread of its own, not the shared queue: a peek can stay open for hours,
+        // and the queue it would sit on is where loadPet and a click to focus also wait.
         var said = Data()
         let drained = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             said = err.fileHandleForReading.readDataToEndOfFile()
             drained.signal()
         }
         Thread.detachNewThread { [weak self] in
-            // A line this build cannot read is worth saying once: an old notch against a
-            // newer qoro draws nothing at all, and the way out is one command.
-            var drew = false
             autoreleasepool {
                 readLines(out.fileHandleForReading) { line in
-                    // A blank line is not a screen this build cannot read.
-                    guard !line.isEmpty else { return }
+                    // A line with nothing on it is not a screen this build cannot read.
+                    guard !line.allSatisfy({ $0 == 0x20 || $0 == 0x09 || $0 == 0x0d }) else { return }
                     guard let screen = try? JSONDecoder().decode(Screen.self, from: line) else {
                         DispatchQueue.main.async { self?.refuse(Refusal.screen) }
                         return
                     }
-                    drew = true
                     DispatchQueue.main.async { self?.show(screen) }
                 }
             }
             drained.wait()
             p.waitUntilExit()
             let why = qoroSaid(said)
-            // Both hops from this one thread, so the last screen is drawn before the
-            // refusal that says nothing was. A qoro that refused outranks a line that
-            // could not be read: it is about the whole watch, not one line of it. A child
-            // that ended having drawn nothing and said nothing is a terminal that is gone,
-            // and its row goes with it, so there is nothing left to explain.
+            // Only a qoro that failed and said why is worth a sentence, and it is worth it
+            // whether or not screens came first: a watch that dies on a dropped link leaves
+            // the last screen on the box for as long as the row is listed. A child that
+            // ended quietly has nothing to explain, its terminal is what ended, and the row
+            // goes with it. The hop is from this one thread, so the last screen lands first.
+            guard p.terminationStatus != 0, !why.isEmpty else { return }
             DispatchQueue.main.async {
-                guard let self, !self.stopped, !drew else { return }
-                self.screenRefusal = why.isEmpty ? Refusal.screen : why
+                guard let self, !self.stopped else { return }
+                self.screenRefusal = why
             }
         }
     }
 
-    /// Say a screen qoro would not read, once, and stop saying it while screens come.
+    /// Say a screen this build could not read, once, and stop saying it while screens come.
     private func refuse(_ why: String) {
         if screenRefusal == nil { screenRefusal = why }
     }
@@ -417,6 +426,9 @@ final class Mirror: ObservableObject {
     }
 
     private func show(_ s: Screen) {
+        // A screen already on its way when the row closed would otherwise ask for a page
+        // of history this app no longer draws.
+        guard !stopped else { return }
         generation += 1
         var rows = s.rows
         // A screen's blank bottom is room the program has not used, not something to read.
@@ -424,7 +436,7 @@ final class Mirror: ObservableObject {
             rows.removeLast()
         }
         screen = rows.enumerated().map { PeekRow(id: 1 << 40 + $0.offset, runs: $0.element) }
-        screenRefusal = nil
+        if screenRefusal != nil { screenRefusal = nil }
         behind = s.behind
         if alt != s.alt {
             // The first screen, or the program went to or from the full screen: the past
@@ -501,7 +513,7 @@ final class Mirror: ObservableObject {
                 }
             } else if end > 0 {
                 let start = max(0, end - 200)
-                switch readBack(t, up: total - start, rows: end - start, "qoro read") {
+                switch readBack(t, up: total - start, rows: end - start) {
                 case .success(let back):
                     // Cut on the rows' own places: history written since `total` was read
                     // moves the page newer, and a trimmed history pins it to the oldest row.
@@ -534,7 +546,7 @@ final class Mirror: ObservableObject {
                     self.more = more
                     return
                 }
-                self.pageRefusal = nil
+                if self.pageRefusal != nil { self.pageRefusal = nil }
                 if alt {
                     self.older = rows
                 } else {
@@ -566,12 +578,12 @@ final class Mirror: ObservableObject {
         DispatchQueue.global().async { [weak self] in
             // Ahead of the screen's count, or level with it when settling: the newest rows
             // are asked for, and only those past `t` are kept.
-            var back = now > t ? readBack(term, up: now - t, rows: now - t, "qoro read")
-                               : readBack(term, up: 500, rows: 500, "qoro read")
+            var back = now > t ? readBack(term, up: now - t, rows: now - t)
+                               : readBack(term, up: 500, rows: 500)
             // The history is written a beat after the screen says rows went behind it, so
             // it may count fewer: asked again against its own count.
             if case .success(let b) = back, b.from + b.rows.count <= t, b.total > t {
-                back = readBack(term, up: b.total - t, rows: min(b.total - t, 1000), "qoro read")
+                back = readBack(term, up: b.total - t, rows: min(b.total - t, 1000))
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -583,7 +595,7 @@ final class Mirror: ObservableObject {
                     if case .failure(let f) = back { self.pageRefusal = f.why }
                     return
                 }
-                self.pageRefusal = nil
+                if self.pageRefusal != nil { self.pageRefusal = nil }
                 let rows = back.rows.enumerated()
                     .filter { back.from + $0.offset >= t }
                     .map { PeekRow(id: back.from + $0.offset, runs: $0.element) }
@@ -614,19 +626,10 @@ final class Mirror: ObservableObject {
     }
 }
 
-/// The sentences the notch writes itself, for the reads qoro answered but this build
-/// cannot read: the shape of an old notch against a newer qoro, and one command is out.
-enum Refusal {
-    static let screen = "not a screen this notch can read: qoro update brings the notch up with it"
-    static let page = "not a page this notch can read: qoro update brings the notch up with it"
-}
-
 /// History rows from `qoro read --back`, or what it said would not come.
-func readBack(_ tab: Tab, up: Int, rows: Int, _ what: String) -> Result<Back, QoroFailed> {
-    guard rows > 0 else { return .failure(QoroFailed(why: "nothing to read")) }
-    switch runQoroFull(
-        tab.qoro("read", String(tab.terminal), "--back", String(up), "--lines", String(rows), "--json"), what)
-    {
+func readBack(_ tab: Tab, up: Int, rows: Int) -> Result<Back, QoroFailed> {
+    let args = tab.qoro("read", String(tab.terminal), "--back", String(up), "--lines", String(rows), "--json")
+    switch runQoroFull(args, "qoro read") {
     case .failure(let f): return .failure(f)
     case .success(let data):
         guard let back = try? JSONDecoder().decode(Back.self, from: data) else {
@@ -1030,10 +1033,10 @@ struct TermPeek: View {
                             .foregroundStyle(.white.opacity(0.3))
                             .onAppear { m.loadOlder() }
                     }
-                    // What qoro would not read stands where those rows would be, and only
-                    // while they are not there: a read that answers puts them back in the
-                    // same place, so the sentence is never a second thing on the box.
-                    if m.older.isEmpty, let why = m.pageRefusal {
+                    // What qoro would not read stands where the past is. A read that
+                    // answers takes its place: the sentence and the rows are never both on
+                    // the box, and one that cannot be read leaves the rows already read.
+                    if let why = m.pageRefusal {
                         RefusalLine(why: why)
                     }
                     ForEach(m.older) { TermLine(runs: $0.runs) }
