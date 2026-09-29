@@ -202,11 +202,11 @@ impl Drop for Interface {
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// The screen row the column's title is drawn on while nobody needs a person, so no pin
-/// sits over it. Taken from the interface rather than written as `1`, so this test cannot
-/// disagree with the layout the next time the layout changes. The tab bar is over the
-/// pane, not over this column, so the column starts at the very top.
-const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP;
+/// The screen row the column's title is drawn on: under the one next row, which is there
+/// whether or not anybody waits. Taken from the interface rather than written as `2`, so this
+/// test cannot disagree with the layout the next time the layout changes. The tab bar is over
+/// the pane, not over this column, so the column starts at the very top.
+const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + 1;
 
 /// The screen row the first space's rule is drawn on, directly under that title. The next
 /// space's rule follows it directly while the first space holds no agent.
@@ -215,11 +215,9 @@ const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
 /// Every row of the list under the column's title, from its first row down to the bottom
 /// of the column: the space rules and the agents under them.
 ///
-/// Read off the screen rather than worked out from the layout. The pin over the title
-/// comes and goes with whoever needs a person, so where the list starts depends on what is
-/// running: a row number computed in a test would be a second copy of that arithmetic, and
-/// a wrong one the first time either changed. It also has to be read again on every poll,
-/// because the pin moves the title as agents arrive.
+/// Read off the screen rather than worked out from the layout: a row number computed in a
+/// test would be a second copy of that arithmetic, and a wrong one the first time either
+/// changed.
 fn agents_panel(screen: &Screen) -> Vec<String> {
     let Some(first) = agents_title_row(screen).map(|row| row + 1) else {
         return Vec::new();
@@ -696,7 +694,7 @@ impl Interface {
 
     /// Read until the nth space, counted down the spaces panel from one, is the focused one.
     ///
-    /// The background behind the row is the whole marker: no glyph says where
+    /// The background behind a row of its box is the whole marker: no glyph says where
     /// the keyboard is, so this reads the raw bytes (escapes intact) rather
     /// than the stripped text `panel_line` returns.
     fn wait_for_space(&mut self, nth: usize, within: Duration) -> bool {
@@ -704,7 +702,7 @@ impl Interface {
         while start.elapsed() < within {
             if self
                 .space_row(nth)
-                .is_some_and(|row| self.panel_selected(row))
+                .is_some_and(|row| self.space_selected(row))
             {
                 return true;
             }
@@ -716,8 +714,8 @@ impl Interface {
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
     /// Found by its shape rather than by arithmetic: a space's box opens with its corner,
-    /// then its fold arrow and a space, and agents and the pin move the boxes down as
-    /// they come and go.
+    /// then its fold arrow and a space, and agents move the boxes down as they come and
+    /// go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
@@ -744,11 +742,23 @@ impl Interface {
             .is_some_and(|(_, style)| style.contains("48;5;236"))
     }
 
-    /// Read until one index row carries the keyboard.
-    fn wait_for_selected(&mut self, row: usize, within: Duration) -> Option<Duration> {
+    /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
+    /// box carries the raised background. The rule itself never does, since the tab bar
+    /// already names the focused space by colour.
+    fn space_selected(&self, rule: usize) -> bool {
+        (rule + 1..ROWS as usize)
+            .take_while(|&row| {
+                self.panel_line(row)
+                    .is_some_and(|line| !line.trim_start().starts_with('\u{256d}'))
+            })
+            .any(|row| self.panel_selected(row))
+    }
+
+    /// Read until the space whose rule is drawn on `rule` carries the keyboard.
+    fn wait_for_space_at(&mut self, rule: usize, within: Duration) -> Option<Duration> {
         let start = Instant::now();
         while start.elapsed() < within {
-            if self.panel_selected(row) {
+            if self.space_selected(rule) {
                 return Some(start.elapsed());
             }
             let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
@@ -1395,7 +1405,7 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // The keyboard reaches the other space too, so the pointer is not the only way in.
     ui.command(b's');
     assert!(
-        ui.wait_for_selected(second, Duration::from_secs(15))
+        ui.wait_for_space_at(second, Duration::from_secs(15))
             .is_some(),
         "ctrl-a s did not move to the next space: {:?}",
         ui.panel_line(second)
@@ -1413,7 +1423,7 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     // Backwards again, which wraps the other way, off the front of the list.
     ui.command(b'S');
     assert!(
-        ui.wait_for_selected(second, Duration::from_secs(15))
+        ui.wait_for_space_at(second, Duration::from_secs(15))
             .is_some(),
         "ctrl-a S from the first space did not wrap to the last: {:?}",
         ui.panel_line(second)

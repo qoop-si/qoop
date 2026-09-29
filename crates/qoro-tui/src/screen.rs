@@ -119,8 +119,6 @@ pub struct Chrome<'a> {
     pub usage: &'a sidebar::Usage,
     /// An agent's last answer is open over the pane, and the key row says how to read it.
     pub answer: bool,
-    /// The first line of each finished agent's last answer, for its row in the pin.
-    pub heads: &'a sidebar::Heads,
     /// The sleeping tab the keyboard rests on while the space on screen is asleep, zero
     /// otherwise. The column raises it the way it raises the focused terminal.
     pub dim: u32,
@@ -129,7 +127,6 @@ pub struct Chrome<'a> {
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
 static NO_SHUT: sidebar::Shut = sidebar::Shut::new();
 static NO_USAGE: sidebar::Usage = sidebar::Usage::new();
-static NO_HEADS: sidebar::Heads = sidebar::Heads::new();
 
 impl Default for Chrome<'_> {
     fn default() -> Self {
@@ -138,7 +135,6 @@ impl Default for Chrome<'_> {
             keys: KeyContext::default(),
             usage: &NO_USAGE,
             answer: false,
-            heads: &NO_HEADS,
             dim: 0,
         }
     }
@@ -164,7 +160,6 @@ impl Frame<'_> {
             width: self.sidebar_width,
             shut: self.chrome.shut,
             usage: Some(self.chrome.usage),
-            heads: Some(self.chrome.heads),
         }
     }
 }
@@ -601,15 +596,20 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 Some(sidebar::Hit::Space(_)) => false,
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == column.focused_terminal,
-                Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Pinned(_)) | None => {
+                Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Next(_)) | None => {
                     false
                 }
             };
-            let base = match (selected, line.colour) {
-                (true, Some(role)) => theme::selected_in(role),
-                (true, None) => theme::selected(),
-                (false, Some(role)) => theme::fg(role),
-                (false, None) => theme::fg(theme::Role::Text),
+            // The next row sits on the status bar's band: the one container on the column,
+            // so it reads as the place to look, not as another row of the list.
+            let band = matches!(hit, Some(sidebar::Hit::Next(_)));
+            let base = match (selected, band, line.colour) {
+                (true, _, Some(role)) => theme::selected_in(role),
+                (true, _, None) => theme::selected(),
+                (false, true, Some(role)) => theme::status_in(role),
+                (false, true, None) => theme::status(),
+                (false, false, Some(role)) => theme::fg(role),
+                (false, false, None) => theme::fg(theme::Role::Text),
             };
             out.push_str(&base);
             // The coloured runs inside the row: the space's name, the opening sign, and
@@ -645,6 +645,8 @@ pub fn paint(frame: &Frame) -> String {
                 let escape = |role: theme::Role| {
                     if selected {
                         theme::selected_in(role)
+                    } else if band {
+                        theme::status_in(role)
                     } else {
                         theme::fg(role)
                     }
@@ -915,11 +917,13 @@ pub fn paint(frame: &Frame) -> String {
     out
 }
 
-/// The single next thing to do, when something is waiting.
+/// The single next thing to do, when something is waiting: the first of the next row's
+/// queue, so the status line, the next row and `ctrl-a tab` name the same agent.
 ///
 /// Blocked first, then failed, then finished-while-away: the first of each in
-/// daemon order. `None` when nothing waits, and then the status line carries
-/// the key list instead, which is how a person finds out they are done.
+/// daemon order, never the focused one. `None` when nothing waits, and then the
+/// status line carries the key list instead, which is how a person finds out they
+/// are done.
 fn triage(
     rows: &[AgentRow],
     spaces: &[WorkspaceRow],
@@ -927,7 +931,7 @@ fn triage(
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
 ) -> Option<String> {
-    let row = sidebar::most_urgent(rows, focused, seen, unseen)?;
+    let row = *sidebar::queue(rows, focused, seen, unseen).first()?;
     let space = spaces
         .iter()
         .find(|s| s.id == row.workspace)
@@ -941,7 +945,7 @@ fn triage(
         row.state.as_str()
     };
     Some(crate::keys::named(&format!(
-        "next: {space}/{} is {word}  ctrl-a space",
+        "next: {space}/{} is {word}  ctrl-a tab",
         palette_label(row),
     )))
 }
@@ -976,14 +980,15 @@ fn here(frame: &Frame) -> String {
 
 /// The state of the thing the status line is about to name, when something waits.
 ///
-/// The same order [`triage`] picks in, so the colour and the words are about one terminal.
+/// The same queue [`triage`] reads, so the colour and the words are about one terminal.
 fn waiting(
     rows: &[AgentRow],
     focused: u32,
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
 ) -> Option<theme::Role> {
-    sidebar::urgency_ink(rows, focused, seen, unseen)
+    let queue = sidebar::queue(rows, focused, seen, unseen);
+    sidebar::urgency_ink(queue, focused, seen, unseen)
 }
 
 /// What a terminal is called outside the tab bar: its program's last segment, the
@@ -1507,6 +1512,7 @@ pub(crate) fn keybind_lines() -> Vec<String> {
         cmd("Z", "sleep or wake space"),
         cmd("R", "rename space"),
         cmd("space", "find anything"),
+        cmd("tab", "what needs you next"),
         cmd("g", "spaces: tree or rank"),
         cmd("f", "fold this space"),
         cmd("M", "last answer, as a page"),
@@ -1527,8 +1533,7 @@ pub(crate) fn keybind_lines() -> Vec<String> {
         key("  v V y", "select, copy"),
         key("  / ? n N", "search history"),
         key("  q esc", "leave"),
-        cmd("d", "detach"),
-        key("ctrl-q", "detach"),
+        cmd("d", "detach, also ctrl-q"),
         cmd("U", "update waiting?"),
         cmd("l", "repaint"),
         // The mouse is not a key, and it is the part of this a person is least likely to
@@ -3402,7 +3407,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 37;
+    const COMMANDS: usize = 38;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -3458,6 +3463,7 @@ mod tests {
             Action::FoldSpace => (const { place(34) }, Some("ctrl-a f")),
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
+            Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
         }
     }
 
@@ -3519,6 +3525,7 @@ mod tests {
             Action::FoldSpace,
             Action::Answer,
             Action::Sleep,
+            Action::UpNext,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -3936,7 +3943,24 @@ mod tests {
         }
     }
 
-    /// Triage: one line saying what to do next, while something waits.
+    /// The status line's words and colour read one queue, so they name one agent: with
+    /// the keyboard on a blocked agent and another failed, both say failed.
+    #[test]
+    fn the_status_line_words_and_colour_name_the_same_agent() {
+        let mut failed = blocked_row(2, "claude");
+        failed.state = "failed".to_string();
+        let rows = [blocked_row(1, "codex"), failed];
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let words = triage(&rows, &spaces(), 1, &seen, &unseen).expect("one waits");
+        assert!(words.contains("claude is failed"), "{words}");
+        assert_eq!(waiting(&rows, 1, &seen, &unseen), Some(theme::Role::Failed));
+        // Nothing but the focused agent waits: nothing is next.
+        assert_eq!(triage(&rows[..1], &spaces(), 1, &seen, &unseen), None);
+        assert_eq!(waiting(&rows[..1], 1, &seen, &unseen), None);
+    }
+
+    /// Triage: one line saying what to do next, while something waits and the keyboard
+    /// is elsewhere: the agent it is on is already in front of the person.
     #[test]
     fn a_blocked_agent_puts_the_next_action_on_the_status_line() {
         let rows = [blocked_row(1, "codex")];
@@ -3946,7 +3970,7 @@ mod tests {
             spaces: &spaces(),
             panes: std::collections::BTreeSet::new(),
             space: Some(1),
-            focused: 1,
+            focused: 2,
             snapshot: Some(&snapshot),
             cols: 80,
             lines: 24,
@@ -3981,7 +4005,7 @@ mod tests {
             painted.contains("next: app/codex is blocked"),
             "{painted:?}"
         );
-        assert!(painted.contains("ctrl-a space"), "{painted:?}");
+        assert!(painted.contains("ctrl-a tab"), "{painted:?}");
     }
 
     #[test]
@@ -4530,7 +4554,6 @@ mod tests {
                 width: sidebar::WIDTH,
                 shut: &shut,
                 usage: None,
-                heads: None,
             },
             44,
         );
@@ -4538,7 +4561,7 @@ mod tests {
             .iter()
             .map(|l| l.text.trim_end().to_string())
             .collect();
-        // Under the title: the pin's boxes above it hold the same rows.
+        // Under the title: the next row above it names one of the same agents.
         assert_eq!(
             texts
                 .iter()

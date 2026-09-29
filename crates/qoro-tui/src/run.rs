@@ -170,8 +170,6 @@ enum Blocked {
     },
     /// An agent's last answer read from its transcript, or why it could not be.
     Answer(u32, Result<crate::answer::Answer, String>),
-    /// The first line of a finished agent's last answer, for the finish it was read for.
-    Head(u32, Option<i64>, Option<String>),
 }
 
 /// The newest assistant message of an agent's transcript, as a page, or why there is none.
@@ -208,58 +206,6 @@ fn last_answer(program: &str, session: Option<&str>) -> Result<String, String> {
         .map(|m| m.text.clone())
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| "no answer from this agent yet".to_string())
-}
-
-/// The first line of an agent's last answer with its markdown marks taken off, for the
-/// row that says it finished: `**Tests pass**: 1618 ok` reads `Tests pass: 1618 ok`.
-fn answer_head(text: &str) -> Option<String> {
-    text.lines()
-        .map(|line| {
-            line.trim()
-                .trim_start_matches(['#', '>', '-', '*', '+'])
-                .replace("**", "")
-                .replace('`', "")
-                .trim()
-                .to_string()
-        })
-        .find(|line| !line.is_empty())
-        .map(|line| line.chars().take(200).collect())
-}
-
-/// The finished agents in the pin whose last answer has not been asked for yet, marked
-/// asked, as (terminal, finish time, program, session).
-///
-/// ponytail: `heads_asked` keeps every finish it has seen; a client lives for hours, not
-/// for millions of finishes.
-fn heads_wanted(state: &mut State) -> Vec<(u32, Option<i64>, String, Option<String>)> {
-    let wanted: Vec<_> = state
-        .rows
-        .iter()
-        // Another machine's transcripts are not on this disk: reading "the newest claude
-        // answer" here would put this machine's answer on that machine's card.
-        .filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))
-        .filter(|r| !matches!(r.state.as_str(), "blocked" | "failed"))
-        .filter(|r| {
-            sidebar::needs_person(r, state.focused, &state.seen_done, &state.unseen_finished)
-        })
-        .filter(|r| {
-            !state
-                .heads_asked
-                .contains(&(r.terminal, r.last_active_at_unix))
-        })
-        .map(|r| {
-            (
-                r.terminal,
-                r.last_active_at_unix,
-                r.program.clone().unwrap_or_default(),
-                r.agent_session.clone(),
-            )
-        })
-        .collect();
-    for (terminal, stamp, _, _) in &wanted {
-        state.heads_asked.insert((*terminal, *stamp));
-    }
-    wanted
 }
 
 /// The local agents whose cost can be sampled, as (terminal, foreground group).
@@ -548,11 +494,6 @@ struct State {
     answer: Option<crate::answer::Answer>,
     /// What each local agent costs, as last sampled. Empty unless `QORO_USAGE=1`.
     usage: sidebar::Usage,
-    /// The first line of each finished agent's last answer, for its row in the pin.
-    heads: sidebar::Heads,
-    /// The (terminal, finish time) pairs whose answer has been asked for, so each finish
-    /// is read once however many frames it stays pinned.
-    heads_asked: std::collections::BTreeSet<(u32, Option<i64>)>,
     /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
     /// then, for the next sample's percent.
     usage_seen: std::collections::BTreeMap<
@@ -775,7 +716,6 @@ impl State {
             chrome: screen::Chrome {
                 shut: &self.shut,
                 usage: &self.usage,
-                heads: &self.heads,
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
                 keys: if self.prefix_pending {
@@ -1139,7 +1079,6 @@ impl State {
             width: self.sidebar_width,
             shut: &self.shut,
             usage: Some(&self.usage),
-            heads: Some(&self.heads),
         }
     }
 
@@ -3005,10 +2944,6 @@ where
 
         usage: sidebar::Usage::new(),
 
-        heads: sidebar::Heads::new(),
-
-        heads_asked: std::collections::BTreeSet::new(),
-
         usage_seen: std::collections::BTreeMap::new(),
         seen_done: sidebar::Seen::new(),
         unseen_finished: sidebar::Unseen::new(),
@@ -3245,25 +3180,6 @@ where
             if keys.prefix_pending() != state.prefix_pending {
                 state.prefix_pending = keys.prefix_pending();
                 dirty = true;
-            }
-            // A finished agent in the pin says the first line of its answer, read off the
-            // loop's thread once per finish.
-            for (terminal, stamp, program, session) in heads_wanted(&mut state) {
-                let tx = blocking_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let read = || {
-                        last_answer(&program, session.as_deref())
-                            .ok()
-                            .and_then(|text| answer_head(&text))
-                    };
-                    // The finish can reach the daemon a moment before the transcript's
-                    // last write reaches the disk: one more look before giving up.
-                    let head = read().or_else(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                        read()
-                    });
-                    let _ = tx.send(Blocked::Head(terminal, stamp, head));
-                });
             }
             if dirty && presented.elapsed() >= FRAME {
                 // An open answer lays out for the pane before the frame borrows the state:
@@ -4512,6 +4428,32 @@ where
                                 state.palette = Some(Palette::with_agents(crate::config::agents()));
                                 dirty = true;
                             }
+                            // The first of the next row's queue, the way a click on that row
+                            // goes there. Standing on a finished agent reads it, so the next
+                            // press finds the one after: wants, then failed, then done.
+                            Action::UpNext => {
+                                let next = sidebar::queue(
+                                    &state.rows,
+                                    state.focused,
+                                    &state.seen_done,
+                                    &state.unseen_finished,
+                                )
+                                .first()
+                                .map(|row| row.terminal);
+                                match next {
+                                    Some(picked) => {
+                                        if let Some(bytes) = focus(
+                                            &mut state, picked, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                        }
+                                    }
+                                    None => {
+                                        state.message = Some("nothing needs you".to_string());
+                                    }
+                                }
+                                dirty = true;
+                            }
                             Action::ToggleView => {
                                 state.view = state.view.toggle();
                                 dirty = true;
@@ -5150,11 +5092,6 @@ where
                         state.message = Some(why);
                         dirty = true;
                     }
-                    Blocked::Head(terminal, stamp, Some(head)) => {
-                        state.heads.insert(terminal, (stamp, head));
-                        dirty = true;
-                    }
-                    Blocked::Head(_, _, None) => {}
                 },
                 // A change owed to an index request that never answered: after
                 // `INDEX_PATIENCE` it is taken as lost and the owed change asks on its
@@ -7146,20 +7083,6 @@ mod tests {
 
     /// A finished row says the first line of the answer as a person reads it: the heading
     /// and emphasis marks are the page's, not the words.
-    #[test]
-    fn an_answer_head_is_its_first_line_without_markdown() {
-        assert_eq!(
-            answer_head("\n## **Done**: `1618` ok\nmore"),
-            Some("Done: 1618 ok".to_string())
-        );
-        assert_eq!(
-            answer_head("- **Sebep:** a rule"),
-            Some("Sebep: a rule".to_string())
-        );
-        assert_eq!(answer_head("  \n \n"), None);
-        assert_eq!(answer_head(&"x".repeat(500)).map(|h| h.len()), Some(200));
-    }
-
     /// A drag or release past the tile's edge reaches the program at that edge.
     #[test]
     fn a_pointer_outside_the_focused_tile_is_pulled_back_to_its_edge() {
@@ -7375,10 +7298,6 @@ mod tests {
             answer: None,
 
             usage: sidebar::Usage::new(),
-
-            heads: sidebar::Heads::new(),
-
-            heads_asked: std::collections::BTreeSet::new(),
 
             usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
@@ -7976,10 +7895,6 @@ mod tests {
 
             usage: sidebar::Usage::new(),
 
-            heads: sidebar::Heads::new(),
-
-            heads_asked: std::collections::BTreeSet::new(),
-
             usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
             unseen_finished: sidebar::Unseen::new(),
@@ -8087,10 +8002,6 @@ mod tests {
             answer: None,
 
             usage: sidebar::Usage::new(),
-
-            heads: sidebar::Heads::new(),
-
-            heads_asked: std::collections::BTreeSet::new(),
 
             usage_seen: std::collections::BTreeMap::new(),
             seen_done: sidebar::Seen::new(),
@@ -8725,7 +8636,7 @@ mod tests {
 
     /// Only the `+` corner of the spaces title makes a space: the word
     /// itself is a no-op, so a click aimed at the title never makes a space
-    /// nobody asked for.
+    /// nobody asked for. The title sits under the next row.
     #[test]
     fn only_the_plus_corner_of_the_spaces_title_makes_a_space() {
         let mut state = bare_state();
@@ -8741,14 +8652,14 @@ mod tests {
         state.space = Some(1);
         assert!(matches!(
             state.clicked(
-                crate::screen::SIDEBAR_TOP as u16,
+                (crate::screen::SIDEBAR_TOP + 1) as u16,
                 crate::sidebar::WIDTH as u16
             ),
             Some(Clicked::NewSpace)
         ));
         assert!(
             state
-                .clicked(crate::screen::SIDEBAR_TOP as u16, 5)
+                .clicked((crate::screen::SIDEBAR_TOP + 1) as u16, 5)
                 .is_none()
         );
     }

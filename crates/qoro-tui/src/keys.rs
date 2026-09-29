@@ -162,6 +162,8 @@ pub enum Action {
     FoldSpace,
     /// ctrl-a M: the focused agent's last answer, read from its transcript, as a page.
     Answer,
+    /// ctrl-a tab: the agent that needs the person next, the first of the next row's queue.
+    UpNext,
     /// ctrl-a F: the focus view over the focused terminal: the user's last
     /// prompt, the agent's last turns, and one row per tool call.
     ///
@@ -400,6 +402,7 @@ impl Keys {
                     b'g' => Action::ToggleView,
                     b'f' => Action::FoldSpace,
                     b'M' => Action::Answer,
+                    b'\t' => Action::UpNext,
                     b'F' => Action::Focus,
                     b'v' => Action::SplitV,
                     b'-' => Action::SplitH,
@@ -667,6 +670,7 @@ mod tests {
     fn space_opens_the_palette_and_g_toggles_the_agents_view() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01 "), vec![Action::Palette]);
+        assert_eq!(keys.feed(b"\x01\t"), vec![Action::UpNext]);
         assert_eq!(keys.feed(b"\x01g"), vec![Action::ToggleView]);
     }
 
