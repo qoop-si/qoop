@@ -24,7 +24,7 @@ use qoro_proto::{Channel, Frame, Reassembler};
 use qoro_remote::Remote;
 use qoro_runtime::client::{self, Connection, Incoming};
 use qoro_runtime::control::{
-    AgentRow, ControlRequest, ControlResponse, EventMessage, Pane, RemoteSession, WorkspaceRow,
+    AgentRow, ControlRequest, ControlResponse, EventMessage, Pane, WorkspaceRow,
 };
 use qoro_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -118,21 +118,36 @@ enum FromLink {
         conn: u64,
         reason: String,
     },
-    /// An answer a task of the mux's own worked out: the sessions on a machine, that it
-    /// has no qoro, that qoro is now there, or why not.
+    /// An answer a task of the mux's own worked out: that a machine has no qoro, that qoro
+    /// is now there, or why not.
     Reply(ControlResponse),
+    /// A machine asked to be connected answered with a qoro this build can talk to: add it.
+    Probed { id: String, target: String },
+    /// The time a remote with nothing awake is given before its link is let go.
+    ParkCheck { link: usize, conn: u64 },
 }
+
+/// How long a remote with nothing awake keeps its link before the link is let go, so its
+/// daemon, held by nothing else, can leave the way this machine's does.
+const PARK_AFTER: Duration = Duration::from_secs(10);
 
 /// One daemon as the mux keeps it.
 struct Link {
     /// Empty for the local daemon.
     name: String,
-    /// Where it is and which session, for a remote; `None` for the local daemon.
+    /// Where it is, for a remote; `None` for the local daemon.
     remote: Option<Remote>,
     /// Rung when something is asked of this link while it is down, so the next attempt
     /// to reach it happens now rather than at the end of its backoff: a person clicking
     /// on an offline machine is the best sign there is that its network is back.
     wake: Arc<Notify>,
+    /// Let go on purpose, because nothing over there was awake: the supervisor closes the
+    /// connection and waits for this to turn false before it tries again, with no backoff
+    /// and no stale permit from an earlier offline spell to start it early.
+    parked: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Requests for a parked link, sent once it is up again: the ask that wakes a machine
+    /// is the one it should answer.
+    pending: Vec<ControlRequest>,
     /// The connection now up, if any, and its number, so a message from a connection that
     /// has since been replaced is recognised and dropped.
     conn: Option<(u64, mpsc::UnboundedSender<BytesMut>)>,
@@ -173,6 +188,8 @@ impl Link {
             name,
             remote,
             wake: Arc::new(Notify::new()),
+            parked: Arc::new(tokio::sync::watch::channel(false).0),
+            pending: Vec::new(),
             conn: None,
             control_seq: 0,
             seqs: BTreeMap::new(),
@@ -216,7 +233,20 @@ impl Link {
         if self.name.is_empty() && !self.listed {
             return Vec::new();
         }
-        if self.conn.is_some() && self.listed {
+        // A machine let go runs nothing: its spaces read as asleep, so an interface with
+        // nothing else awake detaches rather than staying up, and this machine's daemon with
+        // it, for a remote space that has no tab. Asking for one wakes the machine.
+        if self.listed && *self.parked.borrow() {
+            return self
+                .spaces
+                .iter()
+                .map(|row| WorkspaceRow {
+                    asleep: true,
+                    ..row.clone()
+                })
+                .collect();
+        }
+        if self.listed && self.conn.is_some() {
             return self.spaces.clone();
         }
         if self.listed {
@@ -227,6 +257,8 @@ impl Link {
                     id: row.id,
                     name: format!("{} ({})", row.name, self.reason),
                     terminals: 0,
+                    asleep: row.asleep,
+                    sleeping: row.sleeping.clone(),
                 })
                 .collect();
         }
@@ -234,6 +266,8 @@ impl Link {
             id: (link as i64) << WORKSPACE_SHIFT,
             name: format!("{} ({})", self.name, self.reason),
             terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
         }]
     }
 }
@@ -368,6 +402,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             remote,
             self.events.clone(),
             entry.wake.clone(),
+            entry.parked.clone(),
         ));
         self.links.push(Some(entry));
         Some(link)
@@ -383,28 +418,52 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     }
 
     /// Add the machine at `target` from the interface, keep it in the list of remotes,
-    /// and say under what name it will appear.
-    async fn connect_remote(
-        &mut self,
-        id: String,
-        target: String,
-        session: String,
-    ) -> io::Result<()> {
-        let session = if session.trim().is_empty() {
-            "default".to_string()
-        } else {
-            session.trim().to_string()
-        };
+    /// and say under what name it will appear. A machine already kept is taken there; a
+    /// new one is asked first whether it has a qoro, in a task, since ssh can take seconds.
+    async fn connect_remote(&mut self, id: String, target: String) -> io::Result<()> {
         if !qoro_remote::saved::valid_target(&target) {
             return self
                 .failed(id, format!("{target:?} is not an ssh address"))
                 .await;
         }
-        if !qoro_runtime::paths::valid_session_name(&session) {
+        let same = |r: &Remote| r.target == target;
+        let linked = self
+            .links
+            .iter()
+            .position(|l| l.as_ref().and_then(|l| l.remote.as_ref()).is_some_and(same));
+        // Already kept: connecting it means "take me there". A link already running is
+        // woken, which after an install is exactly what brings it up.
+        if let Some(link) = linked {
+            let name = self.link(link).map(|l| l.name.clone()).unwrap_or_default();
+            self.wake(link);
             return self
-                .failed(id, format!("{session:?} cannot be a session name"))
+                .respond(&ControlResponse::RemoteAdded { id, name })
                 .await;
         }
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let message = match crate::link::probe(&target).await {
+                Ok(crate::link::Probe::Ready) => FromLink::Probed { id, target },
+                Ok(crate::link::Probe::Missing(platform)) => {
+                    FromLink::Reply(ControlResponse::RemoteMissing {
+                        id,
+                        target,
+                        platform: platform.describe(),
+                        root: platform.root,
+                    })
+                }
+                Err(e) => FromLink::Reply(ControlResponse::Failed {
+                    id,
+                    reason: e.to_string(),
+                }),
+            };
+            let _ = events.send(message).await;
+        });
+        Ok(())
+    }
+
+    /// Keep a machine that answered with a qoro, and start its link.
+    async fn add_new_remote(&mut self, id: String, target: String) -> io::Result<()> {
         // Before anything is kept: a machine saved that this interface cannot show would
         // appear only on the next start, as if added then.
         if self.links.len() > MAX_REMOTES {
@@ -425,22 +484,8 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             .filter_map(|l| l.remote.clone())
             .chain(saved.iter().cloned())
             .collect();
-        // Already kept: connecting it means "take me there". A link already running is woken,
-        // which after an install is exactly what brings it up; one only in the file (added
-        // from a shell while this interface ran) is started.
-        let same = |r: &Remote| r.target == target && r.session == session;
-        let linked = self
-            .links
-            .iter()
-            .position(|l| l.as_ref().and_then(|l| l.remote.as_ref()).is_some_and(same));
-        if let Some(link) = linked {
-            let name = self.link(link).map(|l| l.name.clone()).unwrap_or_default();
-            self.wake(link);
-            return self
-                .respond(&ControlResponse::RemoteAdded { id, name })
-                .await;
-        }
-        if let Some(kept) = saved.iter().find(|r| same(r)).cloned() {
+        // One only in the file (added from a shell while this interface ran) is started.
+        if let Some(kept) = saved.iter().find(|r| r.target == target).cloned() {
             let name = kept.name.clone();
             self.add_remote(kept);
             self.push_lists("mux").await?;
@@ -452,7 +497,6 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         let remote = Remote {
             name: qoro_remote::saved::name_for(&target, &taken),
             target,
-            session,
         };
         saved.push(remote.clone());
         if let Err(e) = qoro_remote::saved::save_to(&file, &saved) {
@@ -468,6 +512,19 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     /// Send a request that names one daemon, or answer for a daemon that is not there.
     async fn send_one(&mut self, link: usize, request: ControlRequest) -> io::Result<()> {
         let id = request.request_id().to_string();
+        // A machine let go because nothing there was awake: this ask is what brings it back,
+        // and it is answered once the link is up rather than failed as offline. A connection
+        // still closing keeps the ask too, and its `Down` starts the next one.
+        if let Some(l) = self.link(link)
+            && *l.parked.borrow()
+        {
+            l.pending.push(request);
+            if l.conn.is_none() {
+                l.reason = "connecting".to_string();
+                l.parked.send_replace(false);
+            }
+            return Ok(());
+        }
         let sent = self.link(link).is_some_and(|l| {
             let sent = l.send(&request);
             if sent {
@@ -625,6 +682,27 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(link, R::CloseWorkspace { id, workspace })
                     .await
             }
+            // To the machine the space is on, in its own numbering; a machine let go because
+            // everything there slept is brought back by the wake itself.
+            R::SleepWorkspace { id, workspace } => {
+                let (link, workspace) = workspace_in(workspace);
+                self.send_one(link, R::SleepWorkspace { id, workspace })
+                    .await
+            }
+            R::WakeWorkspace {
+                id,
+                workspace: Some(workspace),
+            } => {
+                let (link, workspace) = workspace_in(workspace);
+                self.send_one(
+                    link,
+                    R::WakeWorkspace {
+                        id,
+                        workspace: Some(workspace),
+                    },
+                )
+                .await
+            }
             R::RenameTerminal { id, terminal, name } => {
                 let (link, terminal) = terminal_in(terminal);
                 self.send_one(link, R::RenameTerminal { id, terminal, name })
@@ -699,55 +777,13 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
-            R::ListRemoteSessions { id, target } => {
-                if !qoro_remote::saved::valid_target(&target) {
-                    return self
-                        .failed(id, format!("{target:?} is not an ssh address"))
-                        .await;
-                }
-                // ssh can take seconds, and the mux has renders to pass meanwhile: asked in a
-                // task of its own, answered when it reports back.
-                let events = self.events.clone();
-                tokio::spawn(async move {
-                    let reply = match crate::link::list_sessions(&target).await {
-                        Ok(crate::link::Probe::Sessions(listed)) => {
-                            ControlResponse::RemoteSessions {
-                                id,
-                                target,
-                                sessions: listed
-                                    .into_iter()
-                                    .map(|s| RemoteSession {
-                                        name: s.name,
-                                        running: s.running,
-                                        tabs: s.tabs,
-                                    })
-                                    .collect(),
-                            }
-                        }
-                        Ok(crate::link::Probe::Missing(platform)) => {
-                            ControlResponse::RemoteMissing {
-                                id,
-                                target,
-                                platform: platform.describe(),
-                                root: platform.root,
-                            }
-                        }
-                        Err(e) => ControlResponse::Failed {
-                            id,
-                            reason: e.to_string(),
-                        },
-                    };
-                    let _ = events.send(FromLink::Reply(reply)).await;
-                });
-                Ok(())
-            }
             R::InstallRemote { id, target } => {
                 if !qoro_remote::saved::valid_target(&target) {
                     return self
                         .failed(id, format!("{target:?} is not an ssh address"))
                         .await;
                 }
-                // A copy of several megabytes over ssh: in a task, like the session list.
+                // A copy of several megabytes over ssh: in a task, like the probe.
                 let events = self.events.clone();
                 tokio::spawn(async move {
                     let reply = match crate::link::install(&target).await {
@@ -765,11 +801,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 });
                 Ok(())
             }
-            R::ConnectRemote {
-                id,
-                target,
-                session,
-            } => self.connect_remote(id, target, session).await,
+            R::ConnectRemote { id, target } => self.connect_remote(id, target).await,
             // Everything else the interface sends names no terminal: it is about the daemon
             // this machine runs, or the one remote when there is no local one.
             other => self.send_one(self.home, other).await,
@@ -787,6 +819,12 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.seqs.clear();
                 l.hidden.clear();
                 l.reason = "connecting".to_string();
+                for request in std::mem::take(&mut l.pending) {
+                    let id = request.request_id().to_string();
+                    if l.send(&request) {
+                        l.inflight.insert(id);
+                    }
+                }
                 l.send(&ControlRequest::ListWorkspaces {
                     id: "mux-spaces".into(),
                 });
@@ -804,9 +842,20 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     // Said again only when it says something new: a host that keeps failing
                     // the same way is not news every thirty seconds.
                     let reason = format!("offline: {reason}");
+                    // What asked for it is answered now, not held while the tries go on.
+                    let waiting = if l.conn.is_none() {
+                        std::mem::take(&mut l.pending)
+                    } else {
+                        Vec::new()
+                    };
+                    let said = reason.clone();
                     if l.conn.is_none() && reason.len() > "offline: ".len() && l.reason != reason {
                         l.reason = reason;
                         self.push_lists("mux").await?;
+                    }
+                    for request in waiting {
+                        self.failed(request.request_id().to_string(), said.clone())
+                            .await?;
                     }
                     return Ok(());
                 }
@@ -816,7 +865,15 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.agents.clear();
                 l.splits.clear();
                 l.desired.clear();
-                l.reason = if reason.is_empty() {
+                // Asked for while it closed: up again at once for what is waiting.
+                if !l.pending.is_empty() {
+                    l.parked.send_replace(false);
+                }
+                l.reason = if !l.pending.is_empty() {
+                    "connecting".to_string()
+                } else if *l.parked.borrow() {
+                    "asleep".to_string()
+                } else if reason.is_empty() {
                     "offline".to_string()
                 } else {
                     format!("offline: {reason}")
@@ -827,6 +884,19 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     self.failed(id, format!("{name} went offline")).await?;
                 }
                 self.push_lists("mux").await
+            }
+            FromLink::Probed { id, target } => self.add_new_remote(id, target).await,
+            FromLink::ParkCheck { link, conn } => {
+                let Some(l) = self.link(link) else {
+                    return Ok(());
+                };
+                // Still the same connection, still nothing awake over there, and nothing
+                // asked of it meanwhile: let it go.
+                let same = l.conn.as_ref().is_some_and(|(c, _)| *c == conn);
+                if same && l.inflight.is_empty() && !l.stale_spaces && quiet(&l.spaces) {
+                    l.parked.send_replace(true);
+                }
+                Ok(())
             }
             FromLink::Reply(reply) => {
                 // A machine that just got its qoro: any link already kept for it tries now
@@ -933,6 +1003,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     async fn answer(&mut self, link: usize, response: ControlResponse) -> io::Result<()> {
         use ControlResponse as C;
         let id = response.request_id().to_string();
+        let events = self.events.clone();
         let Some(l) = self.link(link) else {
             return Ok(());
         };
@@ -964,6 +1035,18 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             C::Workspaces { workspaces, .. } => {
                 l.listed = true;
                 l.stale_spaces = false;
+                // A remote with nothing awake is given a moment, then let go: held open, its
+                // daemon would never leave. Checked again when the moment is up.
+                if l.remote.is_some()
+                    && quiet(&workspaces)
+                    && let Some((conn, _)) = &l.conn
+                {
+                    let conn = *conn;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(PARK_AFTER).await;
+                        let _ = events.send(FromLink::ParkCheck { link, conn }).await;
+                    });
+                }
                 l.spaces = workspaces
                     .into_iter()
                     .filter_map(|row| {
@@ -971,6 +1054,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                             id: workspace_out(link, row.id)?,
                             name: space_name(&name, &row.name),
                             terminals: row.terminals,
+                            asleep: row.asleep,
+                            // The tabs of a sleeping space carry the machine's numbers,
+                            // moved into this link's range like every other terminal.
+                            sleeping: row
+                                .sleeping
+                                .into_iter()
+                                .filter_map(|mut tab| {
+                                    tab.terminal = terminal_out(link, tab.terminal)?;
+                                    Some(tab)
+                                })
+                                .collect(),
                         })
                     })
                     .collect();
@@ -1024,6 +1118,54 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Some(workspace) => {
                     self.touched(link);
                     self.respond(&C::WorkspaceClosed { id, workspace }).await
+                }
+                None => Ok(()),
+            },
+            // A machine running a qoro from before an ask existed says so in its own words,
+            // which name a fix for itself; over ssh the fix is on that machine.
+            C::Failed { id, reason }
+                if !name.is_empty() && reason.contains("older than the client") =>
+            {
+                self.failed(
+                    id,
+                    format!(
+                        "{name} runs an older qoro: detach, then on {name} run `qoro stop` and \
+                         `qoro update`"
+                    ),
+                )
+                .await
+            }
+            C::WorkspaceAsleep {
+                id,
+                workspace,
+                terminals,
+            } => match workspace_out(link, workspace) {
+                Some(workspace) => {
+                    self.touched(link);
+                    self.respond(&C::WorkspaceAsleep {
+                        id,
+                        workspace,
+                        terminals,
+                    })
+                    .await
+                }
+                None => Ok(()),
+            },
+            C::WorkspaceAwake {
+                id,
+                workspace,
+                terminals,
+                resumed,
+            } => match workspace_out(link, workspace) {
+                Some(workspace) => {
+                    self.touched(link);
+                    self.respond(&C::WorkspaceAwake {
+                        id,
+                        workspace,
+                        terminals,
+                        resumed,
+                    })
+                    .await
                 }
                 None => Ok(()),
             },
@@ -1256,11 +1398,27 @@ async fn pump<S>(
     writer.abort();
 }
 
-/// Keep one remote connected for as long as the mux runs.
-async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>, wake: Arc<Notify>) {
+/// Whether nothing in a machine's spaces is running.
+fn quiet(spaces: &[WorkspaceRow]) -> bool {
+    spaces.iter().all(|space| space.terminals == 0)
+}
+
+/// Keep one remote connected for as long as the mux runs, except while it is parked.
+async fn supervise(
+    link: usize,
+    remote: Remote,
+    events: mpsc::Sender<FromLink>,
+    wake: Arc<Notify>,
+    parked: Arc<tokio::sync::watch::Sender<bool>>,
+) {
     let mut backoff = Duration::from_secs(1);
     let mut conn = 0u64;
+    let mut unparked = parked.subscribe();
     loop {
+        // Parked: nothing is tried until something is asked of this machine.
+        if unparked.wait_for(|parked| !*parked).await.is_err() {
+            return;
+        }
         conn += 1;
         let attempted = Instant::now();
         match crate::link::open(&remote, true).await {
@@ -1272,7 +1430,13 @@ async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>, 
                     said,
                 } = opened;
                 let started = Instant::now();
-                pump(link, conn, stream, leftover, &events).await;
+                // Pumped until the connection ends or the mux lets it go; the child is
+                // dropped either way, and with it the ssh.
+                let mut parking = parked.subscribe();
+                tokio::select! {
+                    _ = pump(link, conn, stream, leftover, &events) => {}
+                    _ = parking.wait_for(|parked| *parked) => {}
+                }
                 drop(child);
                 if started.elapsed() > BACKOFF_CAP {
                     backoff = Duration::from_secs(1);
@@ -1303,6 +1467,11 @@ async fn supervise(link: usize, remote: Remote, events: mpsc::Sender<FromLink>, 
         // Until the backoff runs out, or until somebody asks for this machine: then at once,
         // and from the shortest wait again, since a person reaching for it now is a good
         // sign the network is back.
+        // A link let go on purpose starts again only when asked, from the top of the loop.
+        if *parked.borrow() {
+            backoff = Duration::from_secs(1);
+            continue;
+        }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => backoff = (backoff * 2).min(BACKOFF_CAP),
             _ = wake.notified() => {

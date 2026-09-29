@@ -9,12 +9,16 @@
 //! sound = false
 //! [notch]
 //! enabled = true      # macOS: the agents in the notch
+//! [sleep]
+//! idle_minutes = 0
+//! [daemon]
+//! exit_when_asleep = true
 //! ```
 //!
-//! Read by the interface alone, at start and again whenever the settings box opens, so an
-//! edit takes effect without a restart and without a watcher. The daemon never reads it:
-//! how long an idle terminal lives stays `QORO_IDLE_TIMEOUT_MINUTES`, because that is the
-//! daemon's decision and a client's file would be one more place to look for it.
+//! Read by the interface at start and again whenever the settings box opens, so an edit
+//! takes effect without a restart and without a watcher. `[sleep]` and `[daemon]` are the
+//! daemon's: it reads them itself when it decides, and their rules live beside it in
+//! `qoro_runtime::config`, which this file asks rather than repeating them.
 //!
 //! Read as TOML by the `toml` crate, so dotted keys (`notify.desktop = false`), inline
 //! tables and quoting behave the way the format says. Nothing here is ever fatal: a value
@@ -68,6 +72,8 @@ pub struct Config {
     pub sound: bool,
     /// Show the agents in the macOS notch. Read by the notch app, through `qoro config`.
     pub notch: bool,
+    /// The daemon's settings, shown here and read by the daemon itself.
+    pub lifecycle: qoro_runtime::config::Lifecycle,
 }
 
 impl Default for Config {
@@ -78,6 +84,7 @@ impl Default for Config {
             desktop: true,
             sound: false,
             notch: true,
+            lifecycle: qoro_runtime::config::Lifecycle::default(),
         }
     }
 }
@@ -227,12 +234,32 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
         notify: Spans,
         #[serde(default)]
         notch: Spans,
+        #[serde(default)]
+        sleep: Spans,
+        #[serde(default)]
+        daemon: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
     let line_of = |spans: &Spans, key: &str| spans.get(key).map(|s| line_at(&text, s.span().start));
 
     let mut config = Config::default();
+    // The daemon's sections, judged by the daemon's own rules.
+    let (lifecycle, refused) = qoro_runtime::config::lifecycle_from(&table);
+    config.lifecycle = lifecycle;
+    for (key, what) in refused {
+        let (section, name) = key.split_once('.').unwrap_or((key.as_str(), ""));
+        let spans = match section {
+            "sleep" => &nested.sleep,
+            _ => &nested.daemon,
+        };
+        let line = if name.is_empty() {
+            line_of(&top, section)
+        } else {
+            line_of(spans, name)
+        };
+        problems.push(Problem::new(line, &what));
+    }
     let mut refuse = |line: Option<usize>, what: String| problems.push(Problem::new(line, &what));
     for (key, value) in &table {
         let line = line_of(&top, key);
@@ -284,6 +311,7 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
                 }
             }
             ("notch", _) => refuse(line, "notch is a table: [notch] then enabled = true".into()),
+            ("sleep" | "daemon", _) => {}
             _ => refuse(line, format!("there is no setting {key}")),
         }
     }
@@ -485,6 +513,16 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
         row(format!("sound = {}", config.sound), "true | false"),
         " [notch]".to_string(),
         row(format!("enabled = {}", config.notch), "true | false, macOS"),
+        " [sleep]".to_string(),
+        row(
+            format!("idle_minutes = {}", config.lifecycle.idle_minutes),
+            "0 = never, else a space idle this long sleeps",
+        ),
+        " [daemon]".to_string(),
+        row(
+            format!("exit_when_asleep = {}", config.lifecycle.exit_when_asleep),
+            "leave when nothing is awake",
+        ),
     ];
     rows.extend(read.problems.iter().map(|p| format!(" ! {}", p.short())));
     rows
@@ -530,6 +568,7 @@ mod tests {
                 desktop: false,
                 sound: true,
                 notch: false,
+                lifecycle: qoro_runtime::config::Lifecycle::default(),
             }
         );
         let dotted = parse("notify.desktop = false\n").0;
@@ -629,7 +668,11 @@ mod tests {
         assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
         assert_eq!(rows[6], " [notch]");
         assert!(rows[7].starts_with(" enabled = true"), "{rows:?}");
-        assert_eq!(rows[8], " ! line 1: needs quotes: theme = \"blue\"");
+        assert_eq!(rows[8], " [sleep]");
+        assert!(rows[9].starts_with(" idle_minutes = 0"), "{rows:?}");
+        assert_eq!(rows[10], " [daemon]");
+        assert!(rows[11].starts_with(" exit_when_asleep = true"), "{rows:?}");
+        assert_eq!(rows[12], " ! line 1: needs quotes: theme = \"blue\"");
     }
 
     /// Nothing from the file reaches the screen with a line break or a control character
@@ -739,5 +782,18 @@ mod tests {
         std::fs::write(&file, "theme = dark\n").unwrap();
         assert!(set(&file, "theme", "light").is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "theme = dark\n");
+    }
+
+    #[test]
+    fn the_daemon_sections_are_read_and_their_mistakes_named_by_line() {
+        let (config, problems) =
+            parse("[sleep]\nidle_minutes = 20\n[daemon]\nexit_when_asleep = maybe\n");
+        assert_eq!(config.lifecycle.idle_minutes, 20);
+        assert!(
+            config.lifecycle.exit_when_asleep,
+            "a bad value kept its default"
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].line, Some(4), "{problems:?}");
     }
 }

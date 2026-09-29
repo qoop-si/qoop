@@ -100,6 +100,8 @@ fn start_daemon_with(trace: bool) -> Daemon {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(socket.exists(), "the daemon never bound its socket");
+    // Terminal 1, which `fill` and every gate count on and a bind no longer opens.
+    qoro_testkit::open_first_terminal(&socket);
     Daemon { child, dir, socket }
 }
 

@@ -22,6 +22,8 @@ qoro-pty = { path = "../qoro-pty" }
 qoro-terminal = { path = "../qoro-terminal" }
 qoro-detect = { path = "../qoro-detect" }
 rusqlite = { workspace = true }
+# config.toml, the same file and crate the interface reads it with.
+toml = { workspace = true }
 unicode-width = "0.2"
 tempfile = { workspace = true }
 

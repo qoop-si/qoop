@@ -122,36 +122,6 @@ impl TerminalAgent {
     }
 }
 
-/// Why a terminal ended, decided once at teardown by `take_ending`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalEnding {
-    /// A person closed it: forget, even if the reaper marked first.
-    ExplicitClose,
-    /// The reaper asked: entomb, so the slept tab stays visible.
-    Reaped,
-    /// An `exit`, a shutdown, anything else: forget, as before.
-    Other,
-}
-
-/// What a reap leaves behind so a slept tab stays visible: display fields
-/// only, no process, no clocks that tick. Memory-only and never restored.
-#[derive(Clone, Debug)]
-pub struct Tombstone {
-    pub stream: u32,
-    pub program: Option<String>,
-    pub name: Option<String>,
-    pub workspace: i64,
-    /// When the reaper took it, daemon unix seconds.
-    pub slept_at_unix: i64,
-    /// How long it had been idle then, seconds.
-    pub idle_secs: i64,
-}
-
-/// The most tombstones one daemon keeps. Past it the oldest goes, announced
-/// like any other tomb change: an unbounded per-daemon log in memory grows
-/// with how long the session has been open. Same bound as the focus log.
-pub const MAX_TOMBS: usize = 50;
-
 /// How long a waiter→target edge may live, seconds. A delegation silent
 /// for a full day is over by every definition that matters; the bound keeps
 /// the map from holding a wait forever. Swept lazily on every reap pass.
@@ -206,25 +176,14 @@ pub struct AgentRegistry {
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
-    /// Streams the idle reaper asked to close and that have not torn down
-    /// yet, mapped to the foreground program at mark time. What lets the
-    /// teardown callback tell a reap (entomb: keep a visible marker) from
-    /// any other ending (forget: leave nothing). The program rides the
-    /// mark because the exit settling during teardown wipes the live
-    /// identity before the callback reads it; without this every tomb
-    /// would be nameless. Entries die with the teardown they mark.
-    reaped: Mutex<BTreeMap<u32, Option<String>>>,
+    /// Each terminal's leader pid and its terminal, keyed like the process table, so a
+    /// sleep can walk what the leader started.
+    leaders: Mutex<HashMap<u32, (i32, u64)>>,
     /// Streams an explicit `CloseTerminal` asked to close and that have not
-    /// torn down yet. Wins over a reaper mark in both directions: the reaper
-    /// never re-asks them, and their teardown forgets even if the reaper
-    /// marked first. A user-closed tab is never entombed. Entries die with
-    /// the teardown they mark.
+    /// torn down yet. Their rows close even if their space is going to sleep,
+    /// and idle sleep leaves them alone. Entries die with the teardown they
+    /// mark.
     closed: Mutex<BTreeSet<u32>>,
-    /// Slept tabs, by stream. Kept out of `terminals` (and therefore out of
-    /// `streams()`) so the reaper, the containment scan and the probe
-    /// schedule never see them; served only to `ListAgents` as
-    /// `state: "sleeping"` rows.
-    tombs: Mutex<BTreeMap<u32, Tombstone>>,
     /// Who waits on whom: waiter stream → (target stream, edge since, unix
     /// seconds). Set when a verified `qoro send/prompt` arrives from one
     /// terminal to another. The waiter is vetoed while its target is busy;
@@ -232,8 +191,8 @@ pub struct AgentRegistry {
     expectations: Mutex<BTreeMap<u32, (u32, i64)>>,
     /// Recent proof of life beyond the two activity clocks: admitted hook
     /// focus events. Vetoes while
-    /// fresher than the reap timeout. Bounded by live-terminal count,
-    /// cleared on forget and entomb.
+    /// fresher than the idle timeout. Bounded by live-terminal count,
+    /// cleared on forget.
     shield_at_unix: Mutex<BTreeMap<u32, i64>>,
 }
 
@@ -347,9 +306,8 @@ impl AgentRegistry {
             terminals: Mutex::new(BTreeMap::new()),
             focus: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
-            reaped: Mutex::new(BTreeMap::new()),
+            leaders: Mutex::new(HashMap::new()),
             closed: Mutex::new(BTreeSet::new()),
-            tombs: Mutex::new(BTreeMap::new()),
             expectations: Mutex::new(BTreeMap::new()),
             shield_at_unix: Mutex::new(BTreeMap::new()),
             changes: tokio::sync::broadcast::channel(64).0,
@@ -372,6 +330,17 @@ impl AgentRegistry {
     /// through the stale entry read that other terminal's group and recorded its leader here.
     pub fn detach_master(&self, stream: u32) {
         self.masters.lock().unwrap().remove(&stream);
+        self.leaders.lock().unwrap().remove(&stream);
+    }
+
+    /// Remember a terminal's leader and its terminal device, for the sleep walk.
+    pub fn attach_leader(&self, stream: u32, pid: i32, tty: u64) {
+        self.leaders.lock().unwrap().insert(stream, (pid, tty));
+    }
+
+    /// A terminal's leader pid and terminal device, while it runs.
+    pub fn leader_of(&self, stream: u32) -> Option<(i32, u64)> {
+        self.leaders.lock().unwrap().get(&stream).copied()
     }
 
     /// Re-read a terminal's foreground group and apply any change.
@@ -504,57 +473,24 @@ impl AgentRegistry {
         self.masters.lock().unwrap().get(&stream).copied()
     }
 
-    /// Mark a stream the idle reaper asked to close, carrying the
-    /// foreground program at mark time for the tombstone. The teardown
-    /// callback prefers the live snapshot when it still names one; the
-    /// mark's copy is what survives the exit settling that wipes the live
-    /// identity before the callback reads it.
-    pub fn mark_reaped(&self, stream: u32, program: Option<String>) {
-        self.reaped.lock().unwrap().insert(stream, program);
-    }
-
-    /// Whether the reaper asked about this stream and teardown has not run yet.
-    pub fn is_reaped(&self, stream: u32) -> bool {
-        self.reaped.lock().unwrap().contains_key(&stream)
-    }
-
-    /// Mark a stream an explicit close asked about. Wins over a reaper mark:
-    /// call before asking, so a user-closed tab forgets even if the reaper
-    /// marked first, and the reaper never re-asks it while it tears down.
-    /// True when this call set the mark, false when an earlier close already
-    /// had: only the caller that set it may take it back.
+    /// Mark a stream an explicit close asked about. Call before asking, so a
+    /// teardown that runs first still reads it, and idle sleep leaves the tab
+    /// alone while it tears down. True when this call set the mark, false
+    /// when an earlier close already had: only the caller that set it may
+    /// take it back.
     pub fn mark_closed(&self, stream: u32) -> bool {
         self.closed.lock().unwrap().insert(stream)
     }
 
     /// Take back an explicit-close mark and say whether one was there: the
-    /// close was refused, so the tab lives on and a reap may still entomb it.
+    /// close was refused, and the tab lives on; or the teardown reads it.
     pub fn take_closed(&self, stream: u32) -> bool {
         self.closed.lock().unwrap().remove(&stream)
     }
 
-    /// Why a terminal ended, decided once at teardown. An explicit close
-    /// wins over a reaper mark: a user-closed tab forgets even if the
-    /// reaper marked first. Both marks die with the decision, so a late
-    /// mark from either side lands on nothing and is cleared by the
-    /// `entomb`/`forget` that follows. Returns the decision with the
-    /// foreground program the reaper saw at mark time, if any.
-    pub fn take_ending(&self, stream: u32) -> (TerminalEnding, Option<String>) {
-        let explicit = self.closed.lock().unwrap().remove(&stream);
-        let reaped = self.reaped.lock().unwrap().remove(&stream);
-        if explicit {
-            (TerminalEnding::ExplicitClose, None)
-        } else if let Some(program) = reaped {
-            (TerminalEnding::Reaped, program)
-        } else {
-            (TerminalEnding::Other, None)
-        }
-    }
-
     /// Whether an explicit close is asking or was accepted for this stream
-    /// and teardown has not run yet. The reaper skips these: asking again
-    /// would re-mark a user-closed tab and entomb it. A refused close takes
-    /// its mark back, so at worst the reaper waits one pass.
+    /// and teardown has not run yet. Idle sleep skips these. A refused close
+    /// takes its mark back, so at worst idle sleep waits one pass.
     pub fn is_closed(&self, stream: u32) -> bool {
         self.closed.lock().unwrap().contains(&stream)
     }
@@ -569,70 +505,6 @@ impl AgentRegistry {
             .unwrap()
             .get(&stream)
             .map(|a| a.capability.token.clone())
-    }
-
-    /// Turn a reaped terminal into a visible sleeping marker: drop the live
-    /// record, keep display fields as a tomb, clear every reap-time state
-    /// for the stream. Evicts the oldest tomb past [`MAX_TOMBS`], announced
-    /// like any other tomb change so cached lists converge.
-    pub fn entomb(&self, stream: u32, tomb: Tombstone) {
-        self.remove_live(stream);
-        self.reaped.lock().unwrap().remove(&stream);
-        self.closed.lock().unwrap().remove(&stream);
-        self.shield_at_unix.lock().unwrap().remove(&stream);
-        self.drop_expectations_touching(stream);
-        let mut tombs = self.tombs.lock().unwrap();
-        tombs.insert(stream, tomb);
-        let mut evicted = Vec::new();
-        while tombs.len() > MAX_TOMBS {
-            // Oldest slept first, smallest stream breaks ties: eviction is
-            // deterministic, never "whichever the map feels like".
-            let oldest = tombs
-                .iter()
-                .min_by_key(|(s, t)| (t.slept_at_unix, **s))
-                .map(|(s, _)| *s);
-            match oldest {
-                Some(victim) => {
-                    tombs.remove(&victim);
-                    evicted.push(victim);
-                }
-                None => break,
-            }
-        }
-        drop(tombs);
-        self.announce(stream);
-        for victim in evicted {
-            self.announce(victim);
-        }
-    }
-
-    /// Dismiss a sleeping marker. True when one was there: double-dismiss
-    /// answers the same as the first, never an error.
-    pub fn dismiss_tomb(&self, stream: u32) -> bool {
-        let removed = self.tombs.lock().unwrap().remove(&stream).is_some();
-        if removed {
-            self.announce(stream);
-        }
-        removed
-    }
-
-    /// Every sleeping marker, oldest first.
-    pub fn tombs(&self) -> Vec<Tombstone> {
-        let tombs = self.tombs.lock().unwrap();
-        let mut out: Vec<Tombstone> = tombs.values().cloned().collect();
-        out.sort_by_key(|t| (t.slept_at_unix, t.stream));
-        out
-    }
-
-    /// Drop all reap-time state: tombs, marks, expectations, shields. The
-    /// daemon calls this on shutdown; tombs are memory-only and never
-    /// restored, so dying with them is correct.
-    pub fn clear_sleep_state(&self) {
-        self.tombs.lock().unwrap().clear();
-        self.reaped.lock().unwrap().clear();
-        self.closed.lock().unwrap().clear();
-        self.expectations.lock().unwrap().clear();
-        self.shield_at_unix.lock().unwrap().clear();
     }
 
     /// Record that waiter asked target, now. One edge per waiter: asking
@@ -723,7 +595,6 @@ impl AgentRegistry {
 
     pub fn forget(&self, stream: u32) {
         self.remove_live(stream);
-        self.reaped.lock().unwrap().remove(&stream);
         self.closed.lock().unwrap().remove(&stream);
         self.shield_at_unix.lock().unwrap().remove(&stream);
         self.drop_expectations_touching(stream);
@@ -735,8 +606,7 @@ impl AgentRegistry {
         self.announce(stream);
     }
 
-    /// Drop the live record without touching tombs, shields or edges.
-    /// Shared by `forget` and `entomb`, which differ only in what they keep.
+    /// Drop the live record without touching shields or edges.
     fn remove_live(&self, stream: u32) {
         self.masters.lock().unwrap().remove(&stream);
         self.focus.lock().unwrap().remove(&stream);
@@ -2095,49 +1965,10 @@ mod tests {
         assert!(r.master_of(1).is_none(), "no master attached in tests");
     }
 
-    fn tomb(stream: u32, slept_at: i64) -> Tombstone {
-        Tombstone {
-            stream,
-            program: Some("claude".into()),
-            name: None,
-            workspace: 1,
-            slept_at_unix: slept_at,
-            idle_secs: 1800,
-        }
-    }
-
-    /// Entomb keeps display fields and drops everything live; dismiss
-    /// removes; the cap evicts oldest-first, deterministically.
+    /// Forget clears every idle-time trace of the stream: shields, and edges
+    /// on either end, and leaves the other terminals' alone.
     #[test]
-    fn entomb_dismiss_and_cap_behave() {
-        let r = registry();
-        r.register(1, TerminalId::new("1"), mint_token(1));
-        assert!(r.agent(1).is_some());
-        r.entomb(1, tomb(1, NOW));
-        assert!(r.agent(1).is_none(), "no live record survives");
-        assert!(r.streams().is_empty(), "tombs never list as streams");
-        let tombs = r.tombs();
-        assert_eq!(tombs.len(), 1);
-        assert_eq!(tombs[0].program.as_deref(), Some("claude"));
-        assert_eq!(tombs[0].slept_at_unix, NOW);
-        assert!(r.dismiss_tomb(1));
-        assert!(r.tombs().is_empty());
-        assert!(!r.dismiss_tomb(1), "double-dismiss is quiet, not an error");
-
-        // Past the cap the oldest goes, ties broken by stream number.
-        for stream in 10..10 + MAX_TOMBS as u32 + 3 {
-            r.entomb(stream, tomb(stream, NOW + stream as i64));
-        }
-        let kept: Vec<u32> = r.tombs().iter().map(|t| t.stream).collect();
-        assert_eq!(kept.len(), MAX_TOMBS);
-        assert!(!kept.contains(&10), "oldest evicted");
-        assert!(kept.contains(&(10 + MAX_TOMBS as u32 + 2)), "newest kept");
-    }
-
-    /// Forget and entomb clear every reap-time trace of the stream:
-    /// reaped marks, shields, and edges on either end.
-    #[test]
-    fn forget_and_entomb_clear_reap_time_state() {
+    fn forget_clears_idle_time_state() {
         let r = registry();
         for stream in [1, 2] {
             r.register(
@@ -2146,32 +1977,17 @@ mod tests {
                 mint_token(stream),
             );
         }
-        r.mark_reaped(1, Some("zsh".into()));
         r.note_shield(1, NOW);
         r.note_shield(2, NOW);
         r.note_expectation(1, 2, NOW);
-        assert!(r.is_reaped(1));
         assert!(r.shield_fresh(1, NOW + 10, 1800));
         assert_eq!(r.expectation_of(1), Some((2, NOW)));
 
         r.forget(1);
-        assert!(!r.is_reaped(1));
         assert!(!r.shield_fresh(1, NOW + 10, 1800));
         assert_eq!(r.expectation_of(1), None);
         // Terminal 2's shield survives: only the gone stream is cleared.
         assert!(r.shield_fresh(2, NOW + 10, 1800));
-
-        r.note_expectation(2, 1, NOW);
-        r.entomb(2, tomb(2, NOW));
-        assert_eq!(r.expectation_of(2), None);
-        assert!(!r.shield_fresh(2, NOW + 10, 1800));
-
-        r.note_expectation(2, 1, NOW);
-        r.mark_reaped(2, None);
-        r.clear_sleep_state();
-        assert!(r.tombs().is_empty());
-        assert!(!r.is_reaped(2));
-        assert_eq!(r.expectation_of(2), None);
     }
 
     /// Edges live a day and not a second longer, swept lazily.
@@ -2213,33 +2029,16 @@ mod tests {
         assert!(!r.shield_fresh(2, NOW + 10, 1800), "never cross-terminal");
     }
 
-    /// The teardown decision, taken once: an explicit close wins over a
-    /// reaper mark in both orders, both marks die with the decision, and
-    /// the reap path carries the program the reaper saw at mark time.
+    /// An explicit close is marked once and taken once: a repeat close does not
+    /// own the mark, and the teardown's take leaves nothing behind.
     #[test]
-    fn an_explicit_close_wins_over_a_reaper_mark_both_ways() {
-        use TerminalEnding::{ExplicitClose, Other, Reaped};
+    fn an_explicit_close_is_marked_once_and_taken_once() {
         let r = registry();
-        // Reap mark, then explicit close: the person wins.
-        r.mark_reaped(1, Some("zsh".into()));
-        r.mark_closed(1);
-        assert_eq!(r.take_ending(1), (ExplicitClose, None));
-        // Explicit close, then reap mark: still the person.
-        r.mark_closed(2);
-        r.mark_reaped(2, Some("sh".into()));
-        assert_eq!(r.take_ending(2), (ExplicitClose, None));
-        // Reap mark alone: entomb path, with the marked program.
-        r.mark_reaped(3, Some("claude".into()));
-        assert_eq!(r.take_ending(3), (Reaped, Some("claude".into())));
-        // Nothing: plain forgetting.
-        assert_eq!(r.take_ending(4), (Other, None));
-        // A second close on a stream already marked does not own the mark:
-        // refusing it must not take back the first close's decision.
         assert!(r.mark_closed(5), "first close sets the mark");
         assert!(!r.mark_closed(5), "a repeat close finds it set");
-        // Decided once: a second take finds nothing.
-        assert_eq!(r.take_ending(1), (Other, None));
-        assert!(!r.is_reaped(1));
-        assert!(!r.is_closed(2));
+        assert!(r.is_closed(5));
+        assert!(r.take_closed(5));
+        assert!(!r.take_closed(5), "taken once");
+        assert!(!r.is_closed(5));
     }
 }

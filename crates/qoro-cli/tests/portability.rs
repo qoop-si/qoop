@@ -219,29 +219,3 @@ fn the_binary_answers_a_bootstrap_with_its_codec_generation() {
     assert!(hello["version"].is_string());
     assert!(hello["platform"].is_string());
 }
-
-/// Trust is per machine (ADR-015), so a Setup confirmed in one session is confirmed in
-/// every other session on the same machine.
-#[test]
-fn a_setup_trusted_in_one_session_is_trusted_in_another() {
-    let b = tempfile::tempdir().expect("tempdir");
-    std::fs::set_permissions(
-        b.path(),
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-    )
-    .expect("chmod");
-    let work = b.path().join("code");
-    std::fs::create_dir(&work).expect("mkdir");
-    let artifact = b.path().join("payments.toml");
-    std::fs::write(&artifact, captured_on_a(&work).to_toml().expect("encode")).expect("write");
-    let artifact = artifact.display().to_string();
-
-    let trust = ["--session", "a", "setup", "trust", &artifact];
-    let (_, _, ok) = answering(b.path(), &trust, "y\n");
-    assert!(ok, "trusting the Setup failed");
-    let (_, stderr, ok) = run(b.path(), &["--session", "b", "setup", "check", &artifact]);
-    assert!(
-        ok,
-        "a Setup trusted in session a was untrusted in b: {stderr}"
-    );
-}

@@ -11,6 +11,7 @@
 //! the shell running.
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -74,30 +75,12 @@ fn is_usage(e: &std::io::Error) -> bool {
 
 fn run() -> std::io::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
-    // Asked before the session is taken out of the arguments: a remote opened with no
-    // `--session` opens that machine's default session, not whichever one was last opened
-    // here.
-    let session_given = args
-        .iter()
-        .any(|a| a == "--session" || a.starts_with("--session="))
-        || std::env::var(paths::SESSION_ENV).is_ok_and(|s| !s.is_empty());
-    // Taken out of the arguments before anything reads them, and put into the environment,
-    // because the session decides which directory every path in this process resolves
-    // against. Held in one place rather than passed down twelve call sites, and inherited
-    // by anything this process starts, which is what makes a shell inside a session able
-    // to say `qoro send` and reach its own daemon rather than the default one.
-    // The session this process was started in, before `--session` replaces it: what
-    // tells "my own terminal" apart from the same number in another session.
-    let home_session = std::env::var(paths::SESSION_ENV).ok();
-    let session = match take_session(&mut args) {
-        Ok(name) => name,
-        Err(e) => {
-            eprintln!("qoro: {e}");
-            std::process::exit(2);
-        }
-    };
-    // SAFETY: single threaded, before anything else runs.
-    unsafe { std::env::set_var(paths::SESSION_ENV, &session) };
+    // `--session` is taken out of the arguments wherever it was written, so every command's
+    // own parsing sees what it expects: one daemon now, and only `default` names it.
+    if let Err(e) = take_session(&mut args) {
+        eprintln!("qoro: {e}");
+        std::process::exit(2);
+    }
     match args.get(1).map(String::as_str) {
         Some("daemon") => run_daemon(),
         Some("--hello") => {
@@ -117,8 +100,11 @@ fn run() -> std::io::Result<()> {
         }
         Some("attach") => run_attach(),
         Some("relay") => run_relay(),
-        Some("remote") => remote::run(&args, session_given.then_some(session.as_str())),
-        Some("--remote") => run_remote(&args, session_given.then_some(session.as_str())),
+        // What `qoro <remote>` asks of the machine before its interface opens: the space
+        // that slept last back, or a first tab, as a bare `qoro` does here.
+        Some("ensure-awake") => supervise::ensure_awake(),
+        Some("remote") => remote::run(&args),
+        Some("--remote") => run_remote(&args),
         Some("send") => run_send(&args),
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
@@ -127,9 +113,11 @@ fn run() -> std::io::Result<()> {
         Some("agents") => run_agents(&args),
         Some("focus") => run_focus(&args),
         Some("notch") => notch::run(&args),
-        Some("wait") => supervise::run_wait(&args, home_session.as_deref(), &session),
+        Some("wait") => supervise::run_wait(&args),
         Some("new") => supervise::run_new(&args),
-        Some("close") => supervise::run_close(&args, home_session.as_deref(), &session),
+        Some("sleep") => supervise::run_sleep(&args),
+        Some("wake") => supervise::run_wake(&args),
+        Some("close") => supervise::run_close(&args),
         Some("worktree") => worktree::run(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
@@ -142,8 +130,8 @@ fn run() -> std::io::Result<()> {
         Some("pair") => mobile::run_pair(&args),
         Some("devices") => mobile::run_devices(&args),
         Some("bridge") => mobile::run_bridge(),
-        Some("ls") => run_list_sessions(),
-        Some("stop") => run_stop(&args, &session),
+        Some("ls") => run_list_spaces(&args),
+        Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
             println!("qoro {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -158,8 +146,9 @@ fn run() -> std::io::Result<()> {
                  \x20 qoro daemon     run the daemon in the foreground\n\
                  \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
+                 \x20 qoro ensure-awake  wake the space that slept last, or open a first tab\n\
                  \x20 qoro --remote <name|ssh-target>  the interface for another machine's qoro\n\
-                 \x20 qoro remote add <name> <ssh-target> [--session S]  show that\n\
+                 \x20 qoro remote add <name> <ssh-target>  show that\n\
                  \x20                 machine's spaces in `qoro`, beside this one's\n\
                  \x20 qoro remote rm <name>  stop showing them\n\
                  \x20 qoro remote ls  the remotes added\n\
@@ -180,6 +169,8 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
                   \x20                 block until a terminal reaches a state, or TEXT is on\n\
                   \x20                 its live screen; exits 124 on timeout\n\
+                  \x20 qoro sleep <space>  end a space's tabs and keep them: nothing of it runs until it wakes\n\
+                  \x20 qoro wake [space]   bring a sleeping space back, or the one that slept last\n\
                   \x20 qoro new [--name N] [--cwd DIR] [--space ID|NAME] [-- command...]  open a\n\
                   \x20                 terminal, print its number, type the command into it\n\
                   \x20 qoro worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
@@ -206,7 +197,7 @@ fn run() -> std::io::Result<()> {
                   \x20                 doing and which conversation it is having\n\
                   \x20 qoro skills ...  teach an agent what qoro is for, so it looks\n\
                   \x20                 before it writes\n\
-                  \x20 qoro ls         list the sessions and say which are running\n\
+                  \x20 qoro ls [--json]  list the spaces and say which are asleep\n\
                   \x20 qoro avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoro avatar show [--json]  print the picked pet\n\
                   \x20 qoro avatar options|set ...  the parts a pet may have, or set some\n\
@@ -214,7 +205,7 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro config set <key> <value>  change one, keeping the rest of the file\n\
                   \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
-                 \x20 qoro stop [name]  end a session: its daemon and everything in it\n\
+                 \x20 qoro stop       end the daemon and every tab; `qoro` brings them back\n\
                  \x20 qoro pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
                  \x20 qoro devices ls  the phones paired with this machine\n\
                  \x20 qoro devices rm <name>  unpair one; its open streams close at once\n\
@@ -224,14 +215,8 @@ fn run() -> std::io::Result<()> {
                  \x20                 nothing is live\n\
                  \x20 qoro --version\n\
                  \n\
-                 options:\n\
-                 \x20 --session <name>  which session to work in (or QORO_SESSION).\n\
-                 \x20                   sessions do not see each other. the flag wins over\n\
-                 \x20                   the environment, which wins over the session last\n\
-                 \x20                   opened, which wins over the default.\n\
-                 \n\
                  detach with ctrl-q. the shell keeps running.\n\
-                 stop ends the processes; opening the session again brings the tabs back.\n"
+                 a space with nothing awake costs nothing: `qoro sleep` it, and `qoro wake` brings it back.\n"
             );
             Ok(())
         }
@@ -248,12 +233,13 @@ fn run() -> std::io::Result<()> {
         None => run_client(),
         // A typo is named, not answered with a daemon and the full-screen interface.
         Some(other) => Err(usage(format!(
-            "unknown command {other}; usage: qoro [command] [--session <name>], see qoro --help"
+            "unknown command {other}; usage: qoro [command], see qoro --help"
         ))),
     }
 }
 
 fn run_daemon() -> std::io::Result<()> {
+    qoro_runtime::daemon::close_inherited_fds();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     // Held across the whole sequence: stale-socket check, unlink, bind, listen, initialise.
     // Two daemons started at once therefore serialise here rather than both concluding the
@@ -262,7 +248,7 @@ fn run_daemon() -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let daemon = match Daemon::bind(&dir, &shell()).await {
-            Ok(d) => d,
+            Ok(d) => d.leaving_when_idle(),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Another daemon won the race and is already serving. This is the expected
                 // outcome for the loser, not a failure.
@@ -293,12 +279,8 @@ fn run_client() -> std::io::Result<()> {
     // lock across its whole bind sequence, so the loser finds the socket already listening
     // and exits without touching it.
     ensure_daemon(&socket)?;
+    supervise::ensure_awake()?;
 
-    // The open that bare `qoro` will come back to. Written after the daemon is
-    // up and before the interface starts, so a failed start records nothing
-    // and a good one is what the next bare open finds. Best effort: the attach
-    // matters, this file does not.
-    record_last_session();
     let rt = tokio::runtime::Runtime::new()?;
     // The interface, not the bare attach. `qoro attach` is still there for the one terminal
     // case and for anything driving this program from a script, because a full screen
@@ -333,29 +315,22 @@ fn run_client() -> std::io::Result<()> {
 
 /// `qoro --remote <name|target>`: the interface for another machine's qoro alone.
 ///
-/// A name added with `qoro remote add` brings its own target and session; anything else is
-/// an ssh target, opened in the session given with `--session`, else that machine's
-/// default. It goes through the same connection the interface keeps for added remotes, so
-/// a dropped connection comes back on its own rather than ending the interface.
-fn run_remote(args: &[String], session: Option<&str>) -> std::io::Result<()> {
+/// A name added with `qoro remote add` brings its own target; anything else is an ssh
+/// target. It goes through the same connection the interface keeps for added remotes, so a
+/// dropped connection comes back on its own rather than ending the interface.
+fn run_remote(args: &[String]) -> std::io::Result<()> {
     let Some(what) = args.get(2) else {
-        eprintln!("usage: qoro --remote <name|ssh-target> [--session S]");
+        eprintln!("usage: qoro --remote <name|ssh-target>");
         std::process::exit(2);
     };
     let added = qoro_remote::saved::load()?
         .into_iter()
         .find(|r| &r.name == what);
     let remote = match added {
-        Some(mut remote) => {
-            if let Some(session) = session {
-                remote.session = session.to_string();
-            }
-            remote
-        }
+        Some(remote) => remote,
         None if qoro_remote::saved::valid_target(what) => qoro_remote::Remote {
             name: what.clone(),
             target: what.clone(),
-            session: session.unwrap_or("default").to_string(),
         },
         None => {
             eprintln!("qoro: {what:?} is neither an added remote nor an ssh target");
@@ -368,6 +343,7 @@ fn run_remote(args: &[String], session: Option<&str>) -> std::io::Result<()> {
         eprintln!("qoro: {e}");
         std::process::exit(1);
     }
+    remote::wake(&remote);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(qoro_tui::mux::run(None, vec![remote], None))
 }
@@ -377,22 +353,9 @@ fn run_attach() -> std::io::Result<()> {
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
     ensure_daemon(&socket)?;
-    record_last_session();
+    supervise::ensure_awake()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(attach(&socket))
-}
-
-/// Remember the session that was just opened, so the next bare `qoro` comes
-/// back to it. Best effort by design: a file that cannot be written is a file
-/// that is read as absent, and the open still succeeds.
-fn record_last_session() {
-    let Ok(session) = std::env::var(paths::SESSION_ENV) else {
-        return;
-    };
-    let Ok(base) = paths::runtime_base() else {
-        return;
-    };
-    paths::write_last_session(&base, &session);
 }
 
 async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
@@ -2190,18 +2153,33 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
     if watch {
         let json = matches!(mode, Mode::List { json: true });
         let line = move |sessions: &supervise::Sessions| watch_listing(sessions, json, all);
-        return if all {
-            supervise::run_watch_all(line)
-        } else {
-            supervise::run_watch(line)
-        };
+        // One daemon, so `--all` is the same watch with each row naming its session, which
+        // is what a notch built for many sessions reads.
+        return supervise::run_watch(line);
     }
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-agents").await?;
+        let (stream, mut inbuf) = match client::connect(&socket, "qoro-agents").await {
+            Ok(connected) => connected,
+            // No daemon is nothing awake, which is an answer: an empty list. An
+            // explanation of one agent still needs that agent, and says so.
+            Err(e)
+                if matches!(mode, Mode::List { .. })
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                if matches!(mode, Mode::List { json: true }) {
+                    println!("[]");
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let (mut rd, mut wr) = stream.into_split();
         let mut connection = client::Connection::new();
         let mut seq = 0u32;
@@ -2362,8 +2340,11 @@ fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
+    // Its own process group, so the hangup a closing window or a dropped ssh connection
+    // sends the starter's job does not take the daemon, and every tab, with it.
     Command::new(exe)
         .arg("daemon")
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2384,15 +2365,10 @@ fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
 /// Pull `--session <name>` out of the arguments, wherever it was written.
 ///
 /// Removed rather than left in place, so every command's own argument parsing sees the
-/// arguments it expects: `qoro send --session work 2 "text"` has to mean the same as
-/// `qoro --session work send 2 "text"`, and neither may leave `send` counting the flag as
-/// its terminal number.
-///
-/// What was asked wins over the environment, which wins over the last session that was
-/// opened, which wins over the default. The file is read only when neither the flag nor
-/// the environment names one, and a stale or invalid file is the default, never an error.
-fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
-    let mut asked = None;
+/// arguments it expects. Accepted only as `default`: that is what an older qoro on the
+/// other end of ssh sends, and any other name belonged to a session that is a space now,
+/// refused with where its files went.
+fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
     let mut at = 1;
     while at < args.len() {
         // No short `-s`: the flag is taken from anywhere in argv, text words of `send`
@@ -2402,9 +2378,6 @@ fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
             break;
         }
         let taken = if args[at] == "--session" {
-            // The value that follows, if there is one. A trailing `--session` with nothing
-            // after it is a mistake worth naming rather than a request for the default:
-            // `session_name` refuses the empty value.
             let value = args.get(at + 1).cloned().unwrap_or_default();
             args.drain(at..(at + 2).min(args.len()));
             Some(value)
@@ -2416,79 +2389,106 @@ fn take_session(args: &mut Vec<String>) -> Result<String, paths::PathError> {
             at += 1;
             None
         };
-        if let Some(value) = taken {
-            asked = Some(value);
+        if let Some(value) = taken
+            && value != paths::DEFAULT_SESSION
+        {
+            // An empty value is a flag with nothing after it, a mistake, not the default.
+            let base = paths::runtime_base()?;
+            if value.is_empty() {
+                return paths::only_default("--session", &base);
+            }
+            return paths::only_default(&value, &base);
         }
-    }
-    if asked.is_some() {
-        return paths::session_name(asked.as_deref());
-    }
-    if std::env::var(paths::SESSION_ENV)
-        .ok()
-        .is_some_and(|n| !n.is_empty())
-    {
-        return paths::session_name(None);
-    }
-    if let Some(last) = paths::read_last_session(&paths::raw_runtime_base())
-        && paths::valid_session_name(&last)
-    {
-        return paths::session_name(Some(&last));
-    }
-    paths::session_name(None)
-}
-
-/// `qoro ls`: what sessions exist, and which of them are running.
-///
-/// Read off the disk rather than from a daemon, because the question is usually asked when
-/// none of them are running. What is running is answered by connecting: a socket file
-/// proves a daemon started once, not that one is there now.
-fn run_list_sessions() -> std::io::Result<()> {
-    let base = paths::runtime_base().map_err(std::io::Error::other)?;
-    let names = paths::sessions(&base);
-    if names.is_empty() {
-        println!("no sessions yet. `qoro` starts the default one.");
-        return Ok(());
-    }
-    let here = std::env::var(paths::SESSION_ENV).unwrap_or_default();
-    for name in names {
-        let dir = paths::session_dir(&base, &name);
-        let running = std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok();
-        // What it is holding, read from its own database. A session that is not running
-        // still has tabs: they are what the next start brings back.
-        let waiting = qoro_store::Store::open(&dir.join("qoro.db"))
-            .and_then(|s: qoro_store::Store| s.open_terminal_count())
-            .unwrap_or(0);
-        let tabs = match waiting {
-            1 => "1 tab".to_string(),
-            n => format!("{n} tabs"),
-        };
-        println!(
-            "{}{name:<20} {:<8} {tabs}",
-            if name == here { "* " } else { "  " },
-            if running { "running" } else { "stopped" },
-        );
     }
     Ok(())
 }
 
-/// `qoro stop [name]`: end a session's daemon, and with it everything it was running.
+/// `qoro ls`: this machine's spaces, and which of them are asleep.
+///
+/// Read off the store rather than from a daemon when none is running, which is when the
+/// question is most often asked: a daemon that left because nothing was awake still has
+/// every space and tab written down.
+fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let running = std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok();
+    let store = qoro_store::Store::open(&dir.join("qoro.db")).map_err(std::io::Error::other)?;
+    let asleep: Vec<i64> = store
+        .asleep()
+        .map_err(std::io::Error::other)?
+        .into_iter()
+        .map(|(space, _)| space)
+        .collect();
+    let mut rows = Vec::new();
+    for space in store.workspaces().map_err(std::io::Error::other)? {
+        let tabs = store
+            .open_terminals(space.id)
+            .map_err(std::io::Error::other)?
+            .len();
+        // With no daemon nothing runs: a space not marked asleep comes back awake on the
+        // next start, and is said as stopped until then.
+        let state = if asleep.contains(&space.id) {
+            "asleep"
+        } else if running {
+            "awake"
+        } else {
+            "stopped"
+        };
+        rows.push((space.id, space.name, state, tabs));
+    }
+    if json {
+        let list: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, name, state, tabs)| {
+                serde_json::json!({ "id": id, "name": name, "state": state, "tabs": tabs })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(list));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no spaces yet. `qoro` starts one.");
+    }
+    for (id, name, state, tabs) in rows {
+        let tabs = match tabs {
+            1 => "1 tab".to_string(),
+            n => format!("{n} tabs"),
+        };
+        println!("{id:>3}  {name:<20} {state:<8} {tabs}");
+    }
+    Ok(())
+}
+
+/// `qoro stop`: end the daemon, and with it everything it was running.
 ///
 /// The tabs are not lost by this and are not meant to be: what was open stays recorded, so
-/// opening the session again brings back the same spaces, the same tabs, the same
-/// directories, and carries on the conversation of any agent that was in one. What does
-/// not survive is the processes, and that is not a choice: a terminal is a pty this daemon
-/// owns, and its children get a hangup when it goes.
-fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
-    // `qoro stop work` names a session positionally, which is how a person will write it.
-    let name = match args.get(2) {
-        Some(named) => paths::session_name(Some(named)).map_err(std::io::Error::other)?,
-        None => current.to_string(),
+/// the next `qoro` brings back the same spaces, the same tabs, the same directories, and
+/// carries on the conversation of any agent that was in one, and a space that was asleep
+/// stays asleep. What does not survive is the processes, and that is not a choice: a
+/// terminal is a pty this daemon owns, and its children get a hangup when it goes.
+fn run_stop(args: &[String]) -> std::io::Result<()> {
+    // `qoro stop work` named a session once; there is one daemon now, so a name other than
+    // the default is pointed at where that session's files are. A daemon of that name still
+    // running from before is stopped by it, since nothing else reaches it now.
+    let dir = match args.get(2) {
+        Some(named) => {
+            let base = paths::runtime_base().map_err(std::io::Error::other)?;
+            match paths::only_default(named, &base) {
+                Ok(()) => paths::runtime_dir().map_err(std::io::Error::other)?,
+                Err(paths::PathError::NamedSession { dir, .. })
+                    if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir))
+                        .is_ok() =>
+                {
+                    dir
+                }
+                Err(e) => return Err(std::io::Error::other(e)),
+            }
+        }
+        None => paths::runtime_dir().map_err(std::io::Error::other)?,
     };
-    let base = paths::runtime_base().map_err(std::io::Error::other)?;
-    let dir = paths::session_dir(&base, &name);
     let socket = paths::socket_path(&dir);
     if std::os::unix::net::UnixStream::connect(&socket).is_err() {
-        println!("session {name} is not running");
+        println!("qoro is not running");
         return Ok(());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2519,21 +2519,12 @@ fn run_stop(args: &[String], current: &str) -> std::io::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 println!(
-                    "session {name} stopped, {terminals} {} ended. `qoro{}` brings the tabs \
-                     back.",
+                    "qoro stopped, {terminals} {} ended. `qoro` brings the tabs back.",
                     if terminals == 1 {
                         "terminal"
                     } else {
                         "terminals"
                     },
-                    // Bare `qoro` reopens the session last opened, which is this one
-                    // when it is stopped from inside itself. A session stopped from
-                    // elsewhere still needs its name spelled out.
-                    if name == current {
-                        String::new()
-                    } else {
-                        format!(" --session {name}")
-                    }
                 );
                 Ok(())
             }
@@ -2652,50 +2643,48 @@ mod tests {
     }
 
     #[test]
-    fn session_selection_is_flag_then_env_then_last_opened_then_default() {
+    fn only_the_default_session_is_taken_and_any_other_is_pointed_at() {
         let base = tempfile::tempdir().expect("a directory");
-        // SAFETY: no other test in this binary touches these variables, and the
-        // override keeps every read and write inside the tempdir.
-        unsafe {
-            std::env::set_var(paths::RUNTIME_DIR_ENV, base.path());
-            std::env::remove_var(paths::SESSION_ENV);
-        }
-        let bare = || take_session(&mut vec!["qoro".to_string()]).unwrap();
-        assert_eq!(bare(), paths::DEFAULT_SESSION);
-        // A recorded session with a directory is what a bare open reopens.
-        std::fs::create_dir_all(base.path().join("sessions").join("hobby")).unwrap();
-        paths::write_last_session(base.path(), "hobby");
-        assert_eq!(bare(), "hobby");
-        // The environment wins over the file.
-        // SAFETY: same variables as the SAFETY above, same single test.
-        unsafe { std::env::set_var(paths::SESSION_ENV, "work") };
-        assert_eq!(bare(), "work");
-        // The flag wins over both.
-        assert_eq!(
-            take_session(&mut vec![
-                "qoro".to_string(),
-                "--session".to_string(),
-                "play".to_string(),
-            ])
-            .unwrap(),
-            "play"
+        std::fs::set_permissions(
+            base.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("chmod");
+        // SAFETY: no other test in this binary touches this variable, and the override
+        // keeps every read inside the tempdir.
+        unsafe { std::env::set_var(paths::RUNTIME_DIR_ENV, base.path()) };
+        // What an older qoro across ssh sends: taken out, and the command still reads.
+        let mut args: Vec<String> = ["qoro", "--session", "default", "relay"]
+            .map(String::from)
+            .to_vec();
+        take_session(&mut args).expect("the default is accepted");
+        assert_eq!(args, vec!["qoro".to_string(), "relay".to_string()]);
+        let mut args: Vec<String> = ["qoro", "send", "--session=default", "2", "x"]
+            .map(String::from)
+            .to_vec();
+        take_session(&mut args).expect("the default is accepted");
+        assert_eq!(args, ["qoro", "send", "2", "x"].map(String::from).to_vec());
+        // A session of its own was a space's worth of tabs: refused, with where it went.
+        let refused = take_session(
+            &mut ["qoro", "--session", "work", "ls"]
+                .map(String::from)
+                .to_vec(),
+        )
+        .expect_err("a named session");
+        assert!(
+            refused.to_string().contains("replaced by spaces"),
+            "{refused}"
         );
+        // A flag with nothing after it is a mistake, not the default.
+        assert!(take_session(&mut ["qoro", "--session"].map(String::from).to_vec()).is_err());
         // Past `--` it is text to send, not a flag.
         let mut sent: Vec<String> = ["qoro", "send", "3", "--", "--session", "play"]
             .map(String::from)
             .into();
-        assert_eq!(take_session(&mut sent).unwrap(), "work");
+        take_session(&mut sent).expect("text past `--` is not a session");
         assert_eq!(sent.len(), 6, "the text is left as it was: {sent:?}");
-        // A stale file is the default, never an error.
-        // SAFETY: same variables as the SAFETY above, same single test.
-        unsafe { std::env::remove_var(paths::SESSION_ENV) };
-        std::fs::write(paths::last_session_path(base.path()), "gone\n").unwrap();
-        assert_eq!(bare(), paths::DEFAULT_SESSION);
-        // SAFETY: same variables as the SAFETY above, same single test.
-        unsafe {
-            std::env::remove_var(paths::RUNTIME_DIR_ENV);
-            std::env::remove_var(paths::SESSION_ENV);
-        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(paths::RUNTIME_DIR_ENV) };
     }
 
     #[test]

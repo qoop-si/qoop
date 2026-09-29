@@ -41,6 +41,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(socket.exists(), "the daemon never bound its socket");
+        qoro_testkit::open_first_terminal(&socket);
         Self { child, dir }
     }
 
@@ -200,10 +201,11 @@ fn wait_match_sees_text_already_on_the_screen() {
 }
 
 #[test]
-fn verbs_refuse_without_a_session_and_start_none() {
+fn verbs_refuse_without_a_daemon_and_start_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    for args in [&["new", "--", "true"][..], &["read", "1"], &["agents"]] {
+    // `agents` is not here: with nothing awake it answers an empty list.
+    for args in [&["new", "--", "true"][..], &["read", "1"]] {
         let out = Command::new(env!("CARGO_BIN_EXE_qoro"))
             .args(args)
             .env("QORO_RUNTIME_DIR", dir.path())
@@ -213,7 +215,7 @@ fn verbs_refuse_without_a_session_and_start_none() {
         // One line, the same shape for every command, never Rust's debug form.
         assert_eq!(
             text(&out.stderr),
-            "qoro: no session running: `qoro` starts one\n",
+            "qoro: nothing is awake: `qoro` or `qoro wake` starts it\n",
             "{args:?}"
         );
     }
@@ -485,12 +487,12 @@ fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
     let (checkout, terminal) = new_worktree(&daemon, &repo, "feat/home");
     daemon.close(&terminal);
 
-    // A second session's daemon started from inside: every terminal it opens without a
-    // directory starts there, so it is not a client to ignore.
+    // Another daemon (another runtime directory) started from inside: every terminal it
+    // opens without a directory starts there, so it is not a client to ignore.
     let other = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
     let mut inside = Command::new(env!("CARGO_BIN_EXE_qoro"))
-        .args(["--session", "homed", "daemon"])
+        .args(["daemon"])
         .current_dir(&checkout)
         .env("QORO_RUNTIME_DIR", other.path())
         .env("SHELL", "/bin/sh")
@@ -498,8 +500,7 @@ fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn a daemon inside");
-    let socket =
-        qoro_runtime::paths::socket_path(&qoro_runtime::paths::session_dir(other.path(), "homed"));
+    let socket = qoro_testkit::socket_in(other.path());
     let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline && !socket.exists() {
         std::thread::sleep(Duration::from_millis(50));
@@ -510,7 +511,7 @@ fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
     assert_eq!(refused.status.code(), Some(1));
     assert!(
         text(&refused.stderr).contains(&format!(
-            "the qoro daemon for session homed (pid {}) runs from inside",
+            "a qoro daemon (pid {}) runs from inside",
             inside.id()
         )),
         "{}",

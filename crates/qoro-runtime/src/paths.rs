@@ -8,22 +8,18 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Overrides the runtime directory: the place every session of this user lives under. It
-/// exists so integration tests, which run in parallel, each get their own daemon and
-/// socket, and so a contributor running the suite does not attach to their own working
-/// daemon.
+/// Overrides the runtime directory: where this user's daemon lives. It exists so
+/// integration tests, which run in parallel, each get their own daemon and socket, and so a
+/// contributor running the suite does not attach to their own working daemon.
 pub const RUNTIME_DIR_ENV: &str = "QORO_RUNTIME_DIR";
 
-/// Names the session to attach to, for a person who would rather set it once than pass
-/// `--session` to everything. The flag wins when both are given.
+/// What named a session, when there were several. Still read, so a shell or a login item
+/// left from then is told where its session went instead of reaching the wrong daemon.
 pub const SESSION_ENV: &str = "QORO_SESSION";
 
-/// The session a person gets when they do not ask for one.
+/// The one daemon's directory under `sessions/`, the name the default session had, so the
+/// state of everyone who used it is where it always was.
 pub const DEFAULT_SESSION: &str = "default";
-
-/// The longest a session name may be. Long enough for a project name, short enough that
-/// the directory it makes is readable in a listing.
-const NAME_LIMIT: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
@@ -32,11 +28,17 @@ pub enum PathError {
     #[error("{0} is not a directory")]
     NotADirectory(PathBuf),
     #[error(
-        "{0:?} cannot be a session name: it becomes a directory, so it needs one that has \
-         no slash, no colon, no spaces, does not start with a dot and is at most \
-         {NAME_LIMIT} characters"
+        "named sessions were replaced by spaces, so {name:?} is not opened any more; its \
+         files are at {dir}, and to use them instead of the default, stop qoro and swap \
+         that directory with {default}",
+        dir = .dir.display(),
+        default = .default.display()
     )]
-    BadSessionName(String),
+    NamedSession {
+        name: String,
+        dir: PathBuf,
+        default: PathBuf,
+    },
     #[error("{0} is a symlink, which is refused because its target can change under us")]
     IsSymlink(PathBuf),
     #[error("{path} is owned by uid {owner}, not by us ({us})")]
@@ -54,15 +56,18 @@ pub enum PathError {
 /// with a world-writable socket.
 pub fn runtime_dir() -> Result<PathBuf, PathError> {
     let base = runtime_base()?;
-    let dir = session_dir(&base, &session_name(None)?);
+    if let Ok(name) = std::env::var(SESSION_ENV) {
+        only_default(&name, &base)?;
+    }
+    let dir = session_dir(&base, DEFAULT_SESSION);
     ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
-/// The directory every session of this user lives under.
+/// The directory above the daemon's.
 ///
-/// Verified the same way a session directory is, because it is the parent of all of them
-/// and a world writable parent is a parent somebody else can put a session into.
+/// Verified the same way the daemon's directory is, because a world writable parent is a
+/// parent somebody else can put a directory into.
 pub fn runtime_base() -> Result<PathBuf, PathError> {
     let dir = if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
         PathBuf::from(explicit)
@@ -158,12 +163,6 @@ pub fn bridge_socket(runtime: &Path) -> PathBuf {
     runtime.join("bridge.sock")
 }
 
-/// Where anyone else who wants to hear "a session just started" listens: a socket each,
-/// rung by a daemon exactly like the bridge's doorbell.
-pub fn bells_dir(runtime: &Path) -> PathBuf {
-    runtime.join("bells")
-}
-
 /// Where every session lives.
 pub fn sessions_dir(runtime: &Path) -> PathBuf {
     runtime.join("sessions")
@@ -179,110 +178,22 @@ pub fn session_dir(runtime: &Path, name: &str) -> PathBuf {
     sessions_dir(runtime).join(name)
 }
 
-/// Whether a name can be a session.
-///
-/// It becomes a directory name, so the rules are the ones a directory name needs: no
-/// separator, no walking upwards, nothing invisible, and a length a listing can show.
-/// Refused rather than sanitised: a person who typed `../../etc` meant something, and
-/// quietly turning it into `etc` is worse than saying no.
-pub fn valid_session_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= NAME_LIMIT
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| !c.is_control() && !c.is_whitespace() && c != ':')
-}
-
-/// The session a command is about: what was asked for, else the environment, else the
-/// default.
-///
-/// An empty name asked for is refused like any other bad name: a trailing `--session`
-/// or `qoro stop ""` is a mistake, and quietly working on `default` instead is the
-/// wrong session. An empty `QORO_SESSION` is different: it means unset.
-pub fn session_name(asked: Option<&str>) -> Result<String, PathError> {
-    let name = match asked {
-        Some(name) => name.to_string(),
-        None => std::env::var(SESSION_ENV)
-            .ok()
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| DEFAULT_SESSION.to_string()),
-    };
-    if !valid_session_name(&name) {
-        return Err(PathError::BadSessionName(name));
+/// Accept a session name only if it is the default one, or empty. Any other name belonged
+/// to a session of its own, which is now a space: refused with where its files are, rather
+/// than quietly reaching the default daemon and a different tab under the same number.
+pub fn only_default(name: &str, base: &Path) -> Result<(), PathError> {
+    if name.is_empty() || name == DEFAULT_SESSION {
+        return Ok(());
     }
-    Ok(name)
-}
-
-/// Every session that exists on disk, named, in order.
-///
-/// Read from the directory rather than from a daemon: a person asking what sessions they
-/// have is usually asking because none of them are running.
-pub fn sessions(runtime: &Path) -> Vec<String> {
-    let mut names: Vec<String> = match std::fs::read_dir(sessions_dir(runtime)) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| valid_session_name(n))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    names.sort();
-    names
+    Err(PathError::NamedSession {
+        name: name.to_string(),
+        dir: session_dir(base, name),
+        default: session_dir(base, DEFAULT_SESSION),
+    })
 }
 
 pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join("qorod.lock")
-}
-
-/// The runtime base without creating or verifying anything, so reading the
-/// last-used session never creates state: `--help` must not make directories.
-pub fn raw_runtime_base() -> PathBuf {
-    if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
-        PathBuf::from(explicit)
-    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        Path::new(&xdg).join("qoro")
-    } else {
-        std::env::temp_dir().join(format!("qoro-{}", current_uid()))
-    }
-}
-
-/// The one file under the runtime base holding the last opened session.
-///
-/// A plain name, so a bare `qoro` can reopen what was there. Read only when no
-/// flag and no env name a session; written on every successful attach.
-pub fn last_session_path(base: &Path) -> PathBuf {
-    base.join("last-session")
-}
-
-/// The last opened session, if the file holds a name a session could have.
-///
-/// Anything else is no answer, not an error: a stale, edited or truncated file
-/// falls back to the default rather than failing the open. Stale means the
-/// session directory is gone, so a bare open never resurrects a name from a
-/// file alone without the directory that makes it a session.
-pub fn read_last_session(base: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(last_session_path(base)).ok()?;
-    let name = text.trim().to_string();
-    if !valid_session_name(&name) {
-        return None;
-    }
-    session_dir(base, &name).is_dir().then_some(name)
-}
-
-/// Remember the session that was just opened. Best effort: an attach that
-/// cannot write this still attaches, and the next bare open falls back as
-/// before. An invalid name is never written.
-pub fn write_last_session(base: &Path, name: &str) {
-    if !valid_session_name(name) {
-        return;
-    }
-    let _ = std::fs::write(last_session_path(base), format!("{name}\n"));
 }
 
 /// Where `qoro update --check` leaves the newest version it saw on GitHub Releases.
@@ -385,6 +296,86 @@ pub fn verify_private_dir(dir: &Path) -> Result<(), PathError> {
         });
     }
     Ok(())
+}
+
+/// Block on a kqueue watch of `dir` until `socket` answers. Registered before the socket
+/// is looked at, so a daemon binding in between is an event rather than a missed moment.
+///
+/// Also ends, with `BrokenPipe`, when the process that started this one exits: a watcher
+/// waiting for a daemon writes nothing, so it would not otherwise learn that its reader
+/// (the notch, restarted) is gone, and would wait on as an orphan.
+#[cfg(target_os = "macos")]
+pub fn wait_for_socket(dir: &std::path::Path, socket: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: a NUL-terminated path, opened for events only.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: no arguments; the result is checked.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: fd was opened above and is closed once.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: a zeroed kevent is a valid value to fill in.
+    let mut changes: [libc::kevent; 2] = unsafe { std::mem::zeroed() };
+    changes[0].ident = fd as libc::uintptr_t;
+    changes[0].filter = libc::EVFILT_VNODE;
+    changes[0].flags = libc::EV_ADD | libc::EV_CLEAR;
+    changes[0].fflags = libc::NOTE_WRITE;
+    // SAFETY: no arguments.
+    let parent = unsafe { libc::getppid() };
+    changes[1].ident = parent as libc::uintptr_t;
+    changes[1].filter = libc::EVFILT_PROC;
+    changes[1].flags = libc::EV_ADD;
+    changes[1].fflags = libc::NOTE_EXIT;
+    // Started by launchd, or already orphaned: there is no reader's exit to wait for.
+    let watched = if parent > 1 { 2 } else { 1 };
+    // SAFETY: `watched` changes, no events asked for, on the kqueue made above.
+    let rc = unsafe {
+        libc::kevent(
+            kq,
+            changes.as_ptr(),
+            watched,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    let result = if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        loop {
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+                break Ok(());
+            }
+            // SAFETY: a zeroed kevent is a valid out-param; one event, no timeout.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let n =
+                unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    break Err(e);
+                }
+            } else if n > 0 && event.filter == libc::EVFILT_PROC {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the process reading this went away",
+                ));
+            }
+        }
+    };
+    // SAFETY: both descriptors were opened above and are closed once.
+    unsafe {
+        libc::close(kq);
+        libc::close(fd);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -526,87 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn a_session_name_that_would_escape_its_directory_is_refused_rather_than_cleaned() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        for bad in [
-            "..",
-            ".",
-            "../etc",
-            "a/b",
-            "a\\b",
-            ".hidden",
-            "two words",
-            "a:b",
-            "with\ttab",
-        ] {
-            assert!(
-                !valid_session_name(bad),
-                "{bad:?} would become a directory somewhere else"
-            );
-            // SAFETY: single-threaded test setup.
-            unsafe { std::env::remove_var(SESSION_ENV) };
-            assert!(
-                session_name(Some(bad)).is_err(),
-                "{bad:?} has to be refused by name, not quietly turned into something else"
-            );
-        }
-        for good in ["app", "work-1", "webshop_2", "a", &"x".repeat(NAME_LIMIT)] {
-            assert!(valid_session_name(good), "{good:?} is a reasonable name");
-        }
-        assert!(
-            !valid_session_name(&"x".repeat(NAME_LIMIT + 1)),
-            "a name past the limit is refused"
-        );
-        // An empty name asked for is a mistake worth naming, a trailing `--session` or
-        // `qoro stop ""`, and never quietly the default session.
-        assert!(!valid_session_name(""));
-        assert!(session_name(Some("")).is_err());
-    }
-
-    #[test]
-    fn a_session_comes_from_the_flag_then_the_environment_then_the_default() {
-        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: single-threaded test setup.
-        unsafe { std::env::remove_var(SESSION_ENV) };
-        assert_eq!(session_name(None).unwrap(), DEFAULT_SESSION);
-        // SAFETY: as above.
-        unsafe { std::env::set_var(SESSION_ENV, "from-env") };
-        assert_eq!(session_name(None).unwrap(), "from-env");
-        assert_eq!(
-            session_name(Some("from-flag")).unwrap(),
-            "from-flag",
-            "the flag wins, or passing it would do nothing in a shell that exports the name"
-        );
-        // An empty variable is not a session, it is an unset one.
-        // SAFETY: as above.
-        unsafe { std::env::set_var(SESSION_ENV, "") };
-        assert_eq!(session_name(None).unwrap(), DEFAULT_SESSION);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(SESSION_ENV) };
-    }
-
-    #[test]
-    fn two_sessions_are_two_directories_and_a_listing_reads_them_off_the_disk() {
-        let base = tempfile::tempdir().unwrap();
-        assert_eq!(sessions(base.path()), Vec::<String>::new());
-
-        for name in ["work", "play"] {
-            ensure_private_dir(&session_dir(base.path(), name)).expect("a session directory");
-        }
-        assert_eq!(sessions(base.path()), vec!["play", "work"]);
-        assert_ne!(
-            socket_path(&session_dir(base.path(), "work")),
-            socket_path(&session_dir(base.path(), "play")),
-            "two sessions sharing a socket are one session"
-        );
-
-        // A file, and a name no session could have, are not sessions.
-        std::fs::write(sessions_dir(base.path()).join("notes.txt"), b"").unwrap();
-        std::fs::create_dir(sessions_dir(base.path()).join(".git")).unwrap();
-        assert_eq!(sessions(base.path()), vec!["play", "work"]);
-    }
-
-    #[test]
     fn dotted_versions_parse_and_compare() {
         assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("v0.4.0"), Some((0, 4, 0)));
@@ -621,25 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn the_last_session_round_trips_and_garbage_is_no_answer() {
+    fn only_the_default_session_is_accepted_and_the_others_are_pointed_at() {
         let base = tempfile::tempdir().unwrap();
-        assert_eq!(read_last_session(base.path()), None);
-        write_last_session(base.path(), "hobby");
-        // A name in the file alone never opens a session: without the session
-        // directory it is stale, and stale is no answer.
-        assert_eq!(read_last_session(base.path()), None);
-        std::fs::create_dir_all(session_dir(base.path(), "hobby")).unwrap();
-        assert_eq!(read_last_session(base.path()).as_deref(), Some("hobby"));
-        // An invalid name is never written, so the previous answer stands.
-        write_last_session(base.path(), "../etc");
-        assert_eq!(read_last_session(base.path()).as_deref(), Some("hobby"));
-        // A session that went away is stale: no answer, not an error, and the
-        // open falls back to the default rather than failing.
-        std::fs::remove_dir(session_dir(base.path(), "hobby")).unwrap();
-        assert_eq!(read_last_session(base.path()), None);
-        std::fs::write(last_session_path(base.path()), "../etc\n").unwrap();
-        assert_eq!(read_last_session(base.path()), None);
-        std::fs::write(last_session_path(base.path()), "\n").unwrap();
-        assert_eq!(read_last_session(base.path()), None);
+        assert!(only_default("", base.path()).is_ok());
+        assert!(only_default(DEFAULT_SESSION, base.path()).is_ok());
+        let refused = only_default("work", base.path()).expect_err("a named session");
+        let said = refused.to_string();
+        assert!(said.contains("replaced by spaces"), "{said}");
+        assert!(
+            said.contains(&session_dir(base.path(), "work").display().to_string()),
+            "{said}"
+        );
     }
 }

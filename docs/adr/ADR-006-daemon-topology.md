@@ -73,6 +73,47 @@ The consequences below are narrowed accordingly: a daemon crash affects every wo
 its session rather than every workspace on the machine, which is strictly better, and one
 process registry, one event stream and one listener are now per session.
 
+## Amendment, 2026-09-28: one daemon again, spaces that sleep
+
+The first amendment's reason was a real requirement: stop one project, get the machine
+back, open it again later as it was. What it chose to answer it with, a daemon per named
+session, answered it at the wrong grain. A person's projects are spaces, not sessions, and
+in practice a machine ended up with one session a person used and a dozen made by test
+runs; a second level of grouping above spaces was one more thing to name and pick for no
+use anyone had.
+
+So the original decision stands again: one daemon per machine per user. The runtime
+directory is the one the default session had, so nothing moves. `--session default` is
+still accepted, because an older qoro on the far side of ssh sends it; any other name, as
+the flag or as `QORO_SESSION`, is refused with where that session's files are. They are
+left on disk, never deleted and never imported.
+
+The requirement is met per space instead. A space sleeps: every tab in it ends, its rows
+stay open, and waking it reopens the same rows under the same numbers, with each agent
+resumed into its own conversation. And the daemon leaves by itself once nothing is awake
+and nobody is attached, so a machine with everything asleep runs nothing at all.
+
+The first amendment's argument against doing this inside one daemon was that stopping a
+subset of terminals is "a new class of half-stopped state". It is answered, not waved away:
+
+- Asleep is durable and read before anything else: a table in the store, written in the
+  same transaction as each sleeping tab's agent and conversation id, and mirrored in memory
+  for the one decision that cannot wait on the store, whether a terminal ending now keeps
+  its row.
+- Half asleep does not exist. A space sleeps whole or not at all: every tab is vetted, a
+  tab that could not come back as it is refuses the whole space, and a tab made in a
+  sleeping space wakes it first, at the one place every tab is made.
+- Every change of state is serialized by the space's lock: sleep, wake, a tab made or
+  closed in it, the space closing. The connection's read loop never waits on that lock.
+- Crash ordering is consistent both ways: a crash after the mark is written and before the
+  tabs end leaves a space asleep with its rows open, which the next start does not open and
+  a wake does; a crash in a wake leaves the mark, and the rows, as they were.
+- Writes that outlive their caller are fenced where they run: the store refuses to change a
+  sleeping tab's agent columns, however late the write arrives.
+
+What is given up: a daemon crash affects every space on the machine again, not every space
+of one session. Crash containment and durable state stay milestone gates for that reason.
+
 ## Rollback
 Splitting into multiple daemons later requires a registry and a router. The ownership
 boundaries chosen now are exactly what would make that possible.

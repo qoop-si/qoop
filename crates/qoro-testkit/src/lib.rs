@@ -55,6 +55,55 @@ pub fn socket_in(dir: &Path) -> std::path::PathBuf {
     paths::socket_path(&paths::session_dir(dir, paths::DEFAULT_SESSION))
 }
 
+/// Open terminal 1 in a daemon started as `qoro daemon`, which binds with none.
+///
+/// Blocking, for the harnesses that start the real binary from synchronous code. The
+/// shell starts where the test runs, which is what the daemon's own first tab did.
+pub fn open_first_terminal(socket: &Path) {
+    if let Err(e) = try_open_first_terminal(socket) {
+        panic!("{e}");
+    }
+}
+
+/// The same, answering instead of panicking, for a harness that reports a failed
+/// scenario rather than aborting the run. On a thread of its own, so it works from
+/// inside a runtime as well as outside one.
+pub fn try_open_first_terminal(socket: &Path) -> Result<(), String> {
+    let socket = socket.to_path_buf();
+    std::thread::spawn(move || open_first_terminal_now(&socket))
+        .join()
+        .map_err(|_| "the first terminal's thread panicked".to_string())?
+}
+
+fn open_first_terminal_now(socket: &Path) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let (stream, inbuf) = client::connect(socket, "test-first")
+            .await
+            .map_err(|e| format!("connect for the first terminal: {e}"))?;
+        let mut c = TestClient::from_parts(stream, inbuf, 1);
+        let here = std::env::current_dir().map_err(|e| e.to_string())?;
+        let created = c
+            .control(
+                &qoro_runtime::control::ControlRequest::CreateTerminal {
+                    id: "first".into(),
+                    cwd: Some(here.display().to_string()),
+                    workspace: None,
+                    name: None,
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+        match created {
+            Some(qoro_runtime::control::ControlResponse::TerminalCreated { .. }) => Ok(()),
+            other => Err(format!("the first terminal was not created: {other:?}")),
+        }
+    })
+}
+
 pub struct TestDaemon {
     store: qoro_runtime::store::StoreHandle,
     workspace: i64,
@@ -97,7 +146,11 @@ impl TestDaemon {
 
         let daemon = {
             let _binding = BINDING.lock().await;
-            Daemon::bind(dir.path(), shell).await.expect("bind")
+            let daemon = Daemon::bind(dir.path(), shell).await.expect("bind");
+            // A bind opens nothing by itself now; the tests were written against a daemon
+            // that always had terminal 1, and that is still the daemon they start.
+            daemon.open_first_terminal().await.expect("first terminal");
+            daemon
         };
         let socket = daemon.socket().to_path_buf();
         // Taken before `serve` consumes the daemon, so a gate can look at the same state

@@ -6,6 +6,7 @@ pub mod agents;
 pub mod avatar;
 pub mod blocking;
 pub mod client;
+pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod eventlog;

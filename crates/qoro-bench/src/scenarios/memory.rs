@@ -1,7 +1,7 @@
 //! Scenario 5: resident memory per terminal.
 //!
-//! Milestone 1 spawns exactly one terminal per daemon: `Daemon::bind` always starts one
-//! shell, unconditionally. That means there is no way to build a daemon with zero terminals
+//! The harness opens exactly one terminal per daemon, the way `qoro` does against a fresh
+//! one. Measured with that one open, there is no reading of a daemon with zero terminals
 //! to subtract from, and no way to build the many-terminal daemon section 7's 100-terminal
 //! budget is ultimately about.
 //!

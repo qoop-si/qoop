@@ -459,6 +459,12 @@ struct State {
     /// opens one and shows it at once gets there first. Shown once an index has it; a
     /// few seconds on, a terminal that never came is forgotten rather than jumped to.
     show_when_listed: Option<(u32, std::time::Instant)>,
+    /// A wake asked for from here, as the space and the tab to show once it is back: the
+    /// clicked one, or the space's first. Handed to `show_when_listed` by the answer.
+    waking: Option<(i64, u32)>,
+    /// Which sleeping tab the keyboard rests on while the space on screen is asleep, as
+    /// `ctrl-a n/p` picked it. Read through `dim_tab`, which falls back to the first.
+    dim: u32,
     /// The workspaces this daemon holds, and which one is on screen.
     spaces: Vec<qoro_runtime::control::WorkspaceRow>,
     space: Option<i64>,
@@ -771,6 +777,7 @@ impl State {
                 usage: &self.usage,
                 heads: &self.heads,
                 answer: self.answer.is_some(),
+                dim: self.dim_tab().unwrap_or(0),
                 keys: if self.prefix_pending {
                     screen::KeyContext::Prefix
                 } else if self.in_column
@@ -1119,7 +1126,11 @@ impl State {
             spaces: &self.spaces,
             agents: &self.rows,
             focused_space: self.space.unwrap_or_default(),
-            focused_terminal: self.focused,
+            focused_terminal: if self.focused != 0 {
+                self.focused
+            } else {
+                self.dim_tab().unwrap_or(0)
+            },
             tick,
             view: self.view,
             seen: &self.seen_done,
@@ -1155,23 +1166,60 @@ impl State {
         Some(tabs[next].terminal)
     }
 
-    /// The space after the focused one, wrapping.
+    /// The awake space after the focused one, wrapping. A sleeping space is passed over:
+    /// going there wakes nothing, so it is only reached on purpose.
     fn next_space(&self, forward: bool) -> Option<i64> {
-        if self.spaces.is_empty() {
-            return None;
-        }
         let at = self
             .spaces
             .iter()
             .position(|w| Some(w.id) == self.space)
             .unwrap_or(0);
         let n = self.spaces.len();
-        let next = if forward {
-            (at + 1) % n
-        } else {
-            (at + n - 1) % n
-        };
-        Some(self.spaces[next].id)
+        (1..=n)
+            .map(|step| {
+                if forward {
+                    (at + step) % n
+                } else {
+                    (at + n - step) % n
+                }
+            })
+            .map(|next| &self.spaces[next])
+            .find(|w| !w.asleep)
+            .map(|w| w.id)
+    }
+
+    /// Whether this space is listed asleep.
+    fn asleep(&self, space: i64) -> bool {
+        self.spaces.iter().any(|w| w.id == space && w.asleep)
+    }
+
+    /// The tabs a wake of the space on screen brings back, when it is asleep.
+    fn dim_tabs(&self) -> &[qoro_runtime::control::SleepingTab] {
+        self.spaces
+            .iter()
+            .find(|w| Some(w.id) == self.space && w.asleep)
+            .map_or(&[], |w| &w.sleeping)
+    }
+
+    /// The sleeping tab the keyboard rests on: the one `ctrl-a n/p` picked, else the first.
+    /// Only while no live terminal has the keyboard.
+    fn dim_tab(&self) -> Option<u32> {
+        if self.focused != 0 {
+            return None;
+        }
+        let tabs = self.dim_tabs();
+        tabs.iter()
+            .find(|t| t.terminal == self.dim)
+            .or(tabs.first())
+            .map(|t| t.terminal)
+    }
+
+    /// The sleeping space a tab belongs to, when it is one of a sleeping space's tabs.
+    fn sleeping_space_of(&self, terminal: u32) -> Option<i64> {
+        self.spaces
+            .iter()
+            .find(|w| w.asleep && w.sleeping.iter().any(|t| t.terminal == terminal))
+            .map(|w| w.id)
     }
 }
 
@@ -1303,11 +1351,6 @@ pub enum MenuKind {
     Main,
     /// What the `+` beside "spaces" offers.
     Plus,
-    /// The sessions on a machine about to be connected, then a row to start a new one.
-    Sessions {
-        target: String,
-        sessions: Vec<qoro_runtime::control::RemoteSession>,
-    },
     /// A machine being connected has no qoro: put this version there, or not.
     Install {
         target: String,
@@ -1335,26 +1378,6 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             ("new space".to_string(), crate::keys::named("ctrl-a w")),
             ("connect a machine (ssh)".to_string(), String::new()),
         ],
-        MenuKind::Sessions { sessions, .. } => {
-            let mut rows: Vec<(String, String)> = sessions
-                .iter()
-                .map(|s| {
-                    let tabs = match s.tabs {
-                        1 => "1 tab".to_string(),
-                        n => format!("{n} tabs"),
-                    };
-                    let state = if s.running { "running" } else { "stopped" };
-                    (s.name.clone(), format!("{state}  {tabs}"))
-                })
-                .collect();
-            // Nothing there yet: the session it would open anyway, named, so the first
-            // choice is not a blank.
-            if rows.is_empty() {
-                rows.push(("default".to_string(), "new".to_string()));
-            }
-            rows.push(("new session".to_string(), "name it".to_string()));
-            rows
-        }
         MenuKind::Install { platform, .. } => vec![
             (
                 format!("install qoro {} there", env!("CARGO_PKG_VERSION")),
@@ -1370,7 +1393,6 @@ pub fn menu_title(kind: &MenuKind) -> String {
     match kind {
         MenuKind::Main => " menu".to_string(),
         MenuKind::Plus => " spaces".to_string(),
-        MenuKind::Sessions { target, .. } => format!(" sessions on {target}"),
         // As root said out loud: every agent started there will run as root.
         MenuKind::Install { target, root, .. } => {
             let who = if *root { " as root" } else { "" };
@@ -1516,26 +1538,6 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             state.installing = Some(id.clone());
             state.message = Some(format!("installing qoro on {target}"));
             return MenuSend::Control(ControlRequest::InstallRemote { id, target });
-        }
-        MenuKind::Sessions { target, sessions } => {
-            // The last row names a new session; every row before it is one to open, or
-            // the default when the machine had none (see `menu_rows`).
-            let picked = if item >= sessions.len().max(1) {
-                state.connecting = Some(target);
-                state.prompt = ask(Naming::RemoteSession);
-                return MenuSend::Nothing;
-            } else {
-                sessions
-                    .get(item)
-                    .map_or_else(|| "default".to_string(), |s| s.name.clone())
-            };
-            *request += 1;
-            state.message = Some(format!("connecting to {target}"));
-            return MenuSend::Control(ControlRequest::ConnectRemote {
-                id: format!("connect-{request}"),
-                target,
-                session: picked,
-            });
         }
     }
     match MENU[item].0 {
@@ -1749,8 +1751,6 @@ pub enum Naming {
     RenameTerminal(u32),
     /// The ssh address of a machine to connect, from the `+` beside the spaces.
     Remote,
-    /// A new session on the machine being connected.
-    RemoteSession,
 }
 
 impl Naming {
@@ -1763,7 +1763,6 @@ impl Naming {
             Naming::RenameSpace(_) => "rename this space",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::Remote => "ssh address of the machine",
-            Naming::RemoteSession => "name the new session",
         }
     }
 
@@ -1790,8 +1789,7 @@ impl Naming {
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
             Naming::RenameSpace(_) => "enter to rename, esc to stop",
-            Naming::Remote => "like admin@10.0.0.5; enter lists its sessions, esc to stop",
-            Naming::RemoteSession => "enter to connect, esc to stop, empty for default",
+            Naming::Remote => "like admin@10.0.0.5; enter connects it, esc to stop",
         }
     }
 }
@@ -2162,8 +2160,18 @@ fn close_question(state: &State) -> Option<String> {
 }
 
 /// Close the focused terminal, or ask first when an agent in it is busy.
+///
+/// With the keyboard on a sleeping tab instead, that tab is discarded: the daemon closes it
+/// for good without waking its space, so there is nothing running to ask about.
 fn close_focused(state: &mut State, request: &mut u64) {
     if state.focused == 0 {
+        if let Some(terminal) = state.dim_tab() {
+            *request += 1;
+            state.modes.outbox.push(ControlRequest::CloseTerminal {
+                id: format!("close-{request}"),
+                terminal,
+            });
+        }
         return;
     }
     match close_question(state) {
@@ -2176,6 +2184,81 @@ fn close_focused(state: &mut State, request: &mut u64) {
             });
         }
     }
+}
+
+/// `ctrl-a Z`: put the space on screen to sleep, or wake it when it is asleep. Sent through
+/// the outbox like a close; a refusal comes back on the hint row with the daemon's reason.
+fn sleep_toggle(state: &mut State, request: &mut u64) {
+    let Some(space) = state.space else {
+        state.message = Some("no space to put to sleep".to_string());
+        return;
+    };
+    if state.asleep(space) {
+        let to = state.dim_tab();
+        wake(state, space, to, request);
+        return;
+    }
+    *request += 1;
+    state.message = Some(format!("putting {} to sleep", space_name(state, space)));
+    state.modes.outbox.push(ControlRequest::SleepWorkspace {
+        id: format!("sleep-{request}"),
+        workspace: space,
+    });
+}
+
+/// Wake a sleeping space, and show `to` (else its first tab) once the index lists it.
+fn wake(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
+    *request += 1;
+    let to = to.or_else(|| {
+        state
+            .spaces
+            .iter()
+            .find(|w| w.id == space)
+            .and_then(|w| w.sleeping.first())
+            .map(|t| t.terminal)
+    });
+    state.waking = to.map(|to| (space, to));
+    state.message = Some(format!("waking {}", space_name(state, space)));
+    state.modes.outbox.push(ControlRequest::WakeWorkspace {
+        id: format!("wake-{request}"),
+        workspace: Some(space),
+    });
+}
+
+/// Whether an index says a space was put to sleep or woken somewhere else (`qoro sleep`,
+/// another client): nothing announces it but its tabs leaving or coming back, so an awake
+/// space that held tabs and now lists none, or a sleeping one with tabs listed, asks for
+/// the space list again.
+fn slept_or_woken(spaces: &[qoro_runtime::control::WorkspaceRow], agents: &[AgentRow]) -> bool {
+    spaces.iter().any(|space| {
+        let held = agents.iter().any(|r| r.workspace == space.id);
+        if space.asleep {
+            held
+        } else {
+            !held && space.terminals > 0
+        }
+    })
+}
+
+/// A space as the column names it, for a sentence on the notice row.
+fn space_name(state: &State, space: i64) -> String {
+    state
+        .spaces
+        .iter()
+        .find(|w| w.id == space)
+        .map_or_else(|| "this space".to_string(), |w| w.name.clone())
+}
+
+/// Whether there is nothing awake left to be an interface to: no terminal anywhere, and no
+/// awake remote space that comes back on its own when its machine answers. Sleeping spaces
+/// do not count, whoever put them to sleep: the interface detaches, as `ctrl-q` does.
+fn nothing_awake(state: &State) -> bool {
+    state.adopted
+        && state.rows.is_empty()
+        && !state
+            .spaces
+            .iter()
+            .any(|w| !w.asleep && crate::mux::is_remote_workspace(w.id))
 }
 
 /// The answer to "close it?": `Y` closes, anything else is a no and is not typed.
@@ -2890,6 +2973,8 @@ where
         hint: notice,
         pending_focus: None,
         show_when_listed: None,
+        waking: None,
+        dim: 0,
         spaces: Vec::new(),
         space: None,
         was: std::collections::BTreeMap::new(),
@@ -3461,6 +3546,18 @@ where
                             }
                             PaletteOutcome::Confirm(item) => {
                                 match item {
+                                    // A jump to a sleeping tab, or a sleeping space, wakes it.
+                                    palette::Item::Terminal(picked)
+                                        if let Some(space) = state.sleeping_space_of(picked) =>
+                                    {
+                                        wake(&mut state, space, Some(picked), &mut request);
+                                    }
+                                    palette::Item::Space(space) if state.asleep(space) => {
+                                        wake(&mut state, space, None, &mut request);
+                                    }
+                                    palette::Item::Sleep => {
+                                        sleep_toggle(&mut state, &mut request);
+                                    }
                                     palette::Item::Terminal(picked) => {
                                         if let Some(out) = focus(
                                             &mut state, picked, &mut control_seq, &mut seqs,
@@ -3649,23 +3746,15 @@ where
                                         name: name.unwrap_or_else(|| next_space_name(&state)),
                                     }),
                                     // An address is what the box is for: empty is a
-                                    // cancel, as with a space's name.
+                                    // cancel, as with a space's name. Asked of the machine
+                                    // first, by the mux: one with no qoro answers with an
+                                    // offer to put it there.
                                     Naming::Remote => name.map(|target| {
                                         let id = format!("probe-{request}");
                                         state.probing = Some(id.clone());
                                         state.connecting = Some(target.clone());
-                                        ControlRequest::ListRemoteSessions { id, target }
+                                        ControlRequest::ConnectRemote { id, target }
                                     }),
-                                    Naming::RemoteSession => {
-                                        state.connecting.clone().map(|target| {
-                                            ControlRequest::ConnectRemote {
-                                                id: format!("connect-{request}"),
-                                                target,
-                                                session: name
-                                                    .unwrap_or_else(|| "default".into()),
-                                            }
-                                        })
-                                    }
                                 };
                                 if let Some(ask) = ask {
                                     if matches!(what, Naming::Space) {
@@ -3688,10 +3777,6 @@ where
                                             "renamed".to_string()
                                         }
                                         Naming::Remote => format!(
-                                            "looking at {}",
-                                            state.connecting.as_deref().unwrap_or_default()
-                                        ),
-                                        Naming::RemoteSession => format!(
                                             "connecting to {}",
                                             state.connecting.as_deref().unwrap_or_default()
                                         ),
@@ -3801,6 +3886,16 @@ where
                                     dirty = true;
                                 }
                                 let focused = state.focused;
+                                // Enter on a sleeping tab wakes its space, the one key that
+                                // means "go" when there is nothing to type into.
+                                if focused == 0
+                                    && bytes.contains(&b'\r')
+                                    && let Some(to) = state.dim_tab()
+                                    && let Some(space) = state.space
+                                {
+                                    wake(&mut state, space, Some(to), &mut request);
+                                    dirty = true;
+                                }
                                 if focused != 0 {
                                     // Large pastes travel as several small messages
                                     // rather than one huge one: one message
@@ -3924,6 +4019,14 @@ where
                                     dirty = true;
                                 }
                                 match state.clicked(row, col) {
+                                    // A sleeping tab: its space wakes, and the screen goes
+                                    // to the tab once it is live again.
+                                    Some(Clicked::Terminal(picked))
+                                        if let Some(space) = state.sleeping_space_of(picked) =>
+                                    {
+                                        wake(&mut state, space, Some(picked), &mut request);
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Terminal(picked)) => {
                                         if let Some(bytes) = focus(
                                             &mut state, picked, &mut control_seq, &mut seqs,
@@ -4228,6 +4331,25 @@ where
                                 state.shown_images.clear();
                                 dirty = true;
                             }
+                            // On a sleeping space the keys move between its tabs without
+                            // waking anything, so a tab can be picked to wake or discard.
+                            Action::Next | Action::Previous
+                                if state.dim_tab().is_some() =>
+                            {
+                                let tabs: Vec<u32> =
+                                    state.dim_tabs().iter().map(|t| t.terminal).collect();
+                                let at = tabs
+                                    .iter()
+                                    .position(|t| Some(*t) == state.dim_tab())
+                                    .unwrap_or(0);
+                                let n = tabs.len();
+                                state.dim = if matches!(action, Action::Next) {
+                                    tabs[(at + 1) % n]
+                                } else {
+                                    tabs[(at + n - 1) % n]
+                                };
+                                dirty = true;
+                            }
                             Action::Next | Action::Previous => {
                                 let forward = matches!(action, Action::Next);
                                 if let Some(next) = state.neighbour(forward)
@@ -4364,11 +4486,14 @@ where
                                 }
                             }
 
-                            Action::Close if state.focused == 0 => {}
                             // A busy agent is asked about first: one stray `x` after the
                             // prefix must not end an hour of its work.
                             Action::Close => {
                                 close_focused(&mut state, &mut request);
+                                dirty = true;
+                            }
+                            Action::Sleep => {
+                                sleep_toggle(&mut state, &mut request);
                                 dirty = true;
                             }
                             Action::Resize => {
@@ -4782,6 +4907,8 @@ where
                                         // The mux holds merged lists back until the
                                         // link answers again; this is that question.
                                         | ControlResponse::SplitSaved { .. }
+                                        | ControlResponse::WorkspaceAsleep { .. }
+                                        | ControlResponse::WorkspaceAwake { .. }
                                 );
                                 refresh_spaces |= matches!(
                                     response,
@@ -4792,6 +4919,8 @@ where
                                         // A renamed space is a changed space list, and
                                         // nothing else will say so.
                                         | ControlResponse::Renamed { .. }
+                                        | ControlResponse::WorkspaceAsleep { .. }
+                                        | ControlResponse::WorkspaceAwake { .. }
                                 );
                                 // A row in a space this client does not list: another
                                 // client (`qoro new --space`) made it, and no answer
@@ -4805,6 +4934,11 @@ where
                                             && r.workspace != 0
                                             && !state.spaces.iter().any(|s| s.id == r.workspace)
                                     })
+                                {
+                                    refresh_spaces = true;
+                                }
+                                if let ControlResponse::Agents { agents, .. } = &response
+                                    && slept_or_woken(&state.spaces, agents)
                                 {
                                     refresh_spaces = true;
                                 }
@@ -4844,15 +4978,15 @@ where
                             &mut control_seq,
                         )?).await?;
                     }
-                    // qoro was just put on a machine the person is connecting: ask it about its
-                    // sessions again, and the list follows as if it had been there all along.
+                    // qoro was just put on a machine the person is connecting: connect it now,
+                    // as if it had been there all along.
                     if let Some(target) = state.reprobe.take() {
                         request += 1;
                         let id = format!("probe-{request}");
                         state.probing = Some(id.clone());
                         state.connecting = Some(target.clone());
                         wr.write_all(&client::encode_control_seq(
-                            &ControlRequest::ListRemoteSessions { id, target },
+                            &ControlRequest::ConnectRemote { id, target },
                             &mut control_seq,
                         )?).await?;
                     }
@@ -6105,6 +6239,14 @@ fn enter_space(
             Ok(Some(out))
         }
         Some(first) => focus(state, first, control_seq, seqs),
+        // Asleep: the keyboard rests on its tabs, and waking is a key away.
+        None if state.asleep(space) => unfocus(
+            state,
+            &crate::keys::named(
+                "asleep: enter or ctrl-a Z wakes it, ctrl-a n/p picks a tab, ctrl-a x discards it",
+            ),
+            control_seq,
+        ),
         None => unfocus(
             state,
             &format!(
@@ -6157,7 +6299,7 @@ fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
     }
     state.probing = None;
     let target = match &kind {
-        MenuKind::Sessions { target, .. } | MenuKind::Install { target, .. } => target.clone(),
+        MenuKind::Install { target, .. } => target.clone(),
         MenuKind::Main | MenuKind::Plus => String::new(),
     };
     let fits = crate::screen::menu_rect(
@@ -6318,11 +6460,88 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     state.adopted_resize = true;
                 }
             }
+            // A space that falls asleep is folded, and opens again when it wakes: its tabs
+            // are only what a wake would bring back, and the fold keeps them out of the way
+            // until somebody asks. A person can still unfold it by its arrow.
+            let was = |id: i64| state.spaces.iter().find(|w| w.id == id).map(|w| w.asleep);
+            let mut slept_here = false;
+            let mut folds = Vec::new();
+            for space in &workspaces {
+                match (was(space.id), space.asleep) {
+                    (Some(true), false) => folds.push((space.id, false)),
+                    (before, true) if before != Some(true) => {
+                        folds.push((space.id, true));
+                        slept_here |= before == Some(false) && state.space == Some(space.id);
+                    }
+                    _ => {}
+                }
+            }
+            for (id, shut) in folds {
+                if shut {
+                    state.shut.insert(id);
+                } else {
+                    state.shut.remove(&id);
+                }
+            }
             state.spaces = workspaces;
             // A fold outlives nothing it folded: a space that went away takes its fold
             // with it, so a later space reusing the id does not start folded.
             let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
             state.shut.retain(|id| live.contains(id));
+            // The space on screen went to sleep: the screen moves on to the next awake
+            // space and the keyboard to its first tab. With none awake anywhere there is
+            // nothing to move to, and the interface detaches instead.
+            if slept_here && let Some(next) = state.next_space(true) {
+                state.space = Some(next);
+                state.pending_focus = state.tabs().first().map(|r| r.terminal);
+            }
+            // The list's own counts too: this answer can land before the first index, with
+            // no row known yet, and an interface that just opened must not leave for that.
+            state.done =
+                nothing_awake(state) && state.spaces.iter().all(|w| w.asleep || w.terminals == 0);
+            *dirty = true;
+        }
+        ControlResponse::WorkspaceAsleep {
+            workspace,
+            terminals,
+            ..
+        } => {
+            let tabs = if terminals == 1 { "tab" } else { "tabs" };
+            state.message = Some(format!(
+                "{} is asleep, {terminals} {tabs} to wake",
+                space_name(state, workspace)
+            ));
+            *dirty = true;
+        }
+        ControlResponse::WorkspaceAwake {
+            workspace,
+            terminals,
+            resumed,
+            ..
+        } => {
+            state.message = Some(format!(
+                "{} is awake: {terminals} tabs back, {resumed} agents resumed",
+                space_name(state, workspace)
+            ));
+            // The tab asked for goes on screen once the index lists it again.
+            if let Some((space, to)) = state.waking
+                && space == workspace
+            {
+                state.waking = None;
+                state.show_when_listed = Some((to, std::time::Instant::now()));
+            }
+            *dirty = true;
+        }
+        // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
+        // on the hint row until the person does something, rather than one frame.
+        ControlResponse::Failed { id, reason }
+            if id.starts_with("sleep-") || id.starts_with("wake-") =>
+        {
+            if id.starts_with("wake-") {
+                state.waking = None;
+            }
+            state.message = None;
+            state.hint = Some(reason);
             *dirty = true;
         }
         ControlResponse::WorkspaceCreated { workspace, .. } => {
@@ -6442,10 +6661,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     ));
                 }
             }
-            // Nothing left anywhere. The interface is a way into terminals, so with none of
-            // them it is a screen a person has to know a key to escape from. Ending is what
-            // every multiplexer does when its last window closes, and the daemon stays: it
-            // is the client that goes.
             // A machine just connected from here has its first tab listed: the screen goes
             // there, which is what the person connected it for.
             if let Some(name) = state.joining.clone() {
@@ -6482,14 +6697,6 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                     })
                     .map(|r| r.terminal);
             }
-            // A remote that is connecting or offline is still somewhere to be: its space is
-            // listed, and it comes back on its own.
-            state.done = state.adopted
-                && agents.is_empty()
-                && !state
-                    .spaces
-                    .iter()
-                    .any(|w| crate::mux::is_remote_workspace(w.id));
 
             // A terminal that has just started needing a person. The bell is the local
             // notification: it is what the person's own terminal emulator turns into a
@@ -6555,6 +6762,12 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            // Nothing left anywhere. The interface is a way into terminals, so with none of
+            // them it is a screen a person has to know a key to escape from. Ending is what
+            // every multiplexer does when its last window closes, and the daemon stays: it
+            // is the client that goes. A remote that is connecting or offline is still
+            // somewhere to be: its space is listed, and it comes back on its own.
+            state.done = nothing_awake(state);
             if let Some((terminal, asked)) = state.show_when_listed.take()
                 && asked.elapsed() < std::time::Duration::from_secs(5)
             {
@@ -6806,27 +7019,10 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             state.split_saving = state.split_saving.saturating_sub(1);
         }
 
-        // The sessions on the machine being connected. Opened only as the answer to the
-        // question still standing, and only over nothing else: an answer can take seconds,
-        // and a list that opened over a box the person has moved on to would take their
-        // keys.
-        ControlResponse::RemoteSessions {
-            id,
-            target,
-            mut sessions,
-        } => {
-            // What is running first, then what holds the most, then by name.
-            sessions.sort_by(|a, b| {
-                b.running
-                    .cmp(&a.running)
-                    .then(b.tabs.cmp(&a.tabs))
-                    .then(a.name.cmp(&b.name))
-            });
-            open_answer_list(state, &id, MenuKind::Sessions { target, sessions });
-            *dirty = true;
-        }
-        // No qoro on the machine being connected: the same kind of list, offering to put it
-        // there, under the same rules.
+        // No qoro on the machine being connected: a list offering to put it there. Opened only
+        // as the answer to the question still standing, and only over nothing else: an answer
+        // can take seconds, and a list that opened over a box the person has moved on to
+        // would take their keys.
         ControlResponse::RemoteMissing {
             id,
             target,
@@ -6844,8 +7040,8 @@ fn apply(state: &mut State, response: ControlResponse, dirty: &mut bool) {
             );
             *dirty = true;
         }
-        // Said whatever the person is doing now, because it happened; the list of its
-        // sessions follows only while they are still waiting for it.
+        // Said whatever the person is doing now, because it happened; the connection follows
+        // only while they are still waiting for it.
         ControlResponse::RemoteInstalled {
             id,
             target,
@@ -6998,6 +7194,8 @@ mod tests {
             id,
             name: name.to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }
     }
 
@@ -7146,6 +7344,8 @@ mod tests {
             hint: None,
             pending_focus: None,
             show_when_listed: None,
+            waking: None,
+            dim: 0,
             spaces: vec![space(1, "app"), space(2, "webshop")],
             space: Some(2),
             was: std::collections::BTreeMap::new(),
@@ -7744,6 +7944,8 @@ mod tests {
             hint: None,
             pending_focus: None,
             show_when_listed: None,
+            waking: None,
+            dim: 0,
             spaces: Vec::new(),
             space: None,
             was: Default::default(),
@@ -7854,6 +8056,8 @@ mod tests {
             hint: None,
             pending_focus: None,
             show_when_listed: None,
+            waking: None,
+            dim: 0,
             spaces: vec![space(1, "app")],
             space: Some(1),
             was: Default::default(),
@@ -8531,6 +8735,8 @@ mod tests {
             id: 1,
             name: "default".to_string(),
             terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
         }];
         state.space = Some(1);
         assert!(matches!(
@@ -9432,81 +9638,17 @@ mod tests {
         assert_eq!(state.menu_kind, MenuKind::Main);
     }
 
-    fn remote(name: &str, running: bool, tabs: usize) -> qoro_runtime::control::RemoteSession {
-        qoro_runtime::control::RemoteSession {
-            name: name.to_string(),
-            running,
-            tabs,
-        }
-    }
-
-    /// The sessions come back sorted into a list to pick from; a pick connects to it, and
-    /// the last row asks for a new session's name instead.
-    #[test]
-    fn a_session_is_picked_from_the_machine_or_named_new() {
-        let mut state = bare_state();
-        state.probing = Some("probe-1".into());
-        let mut dirty = false;
-        apply(
-            &mut state,
-            ControlResponse::RemoteSessions {
-                id: "probe-1".into(),
-                target: "admin@10.0.0.5".into(),
-                sessions: vec![remote("old", false, 5), remote("work", true, 2)],
-            },
-            &mut dirty,
-        );
-        assert_eq!(state.menu, Some(0));
-        let rows = menu_rows(&state.menu_kind);
-        assert_eq!(rows[0].0, "work", "running sorts first: {rows:?}");
-        assert_eq!(rows[1].0, "old");
-        assert_eq!(rows[2].0, "new session");
-        let mut request = 0;
-        match apply_menu_choice(&mut state, 0, &mut request) {
-            MenuSend::Control(ControlRequest::ConnectRemote {
-                target, session, ..
-            }) => {
-                assert_eq!(target, "admin@10.0.0.5");
-                assert_eq!(session, "work");
-            }
-            _ => panic!("picking a session does not connect to it"),
-        }
-
-        state.menu_kind = MenuKind::Sessions {
-            target: "admin@10.0.0.5".into(),
-            sessions: vec![],
-        };
-        assert_eq!(menu_rows(&state.menu_kind)[0].0, "default");
-        match apply_menu_choice(&mut state, 0, &mut request) {
-            MenuSend::Control(ControlRequest::ConnectRemote { session, .. }) => {
-                assert_eq!(session, "default")
-            }
-            _ => panic!("a machine with no sessions does not offer the default"),
-        }
-        state.menu_kind = MenuKind::Sessions {
-            target: "admin@10.0.0.5".into(),
-            sessions: vec![],
-        };
-        apply_menu_choice(&mut state, 1, &mut request);
-        assert!(
-            state
-                .prompt
-                .as_ref()
-                .is_some_and(|p| p.what == Naming::RemoteSession)
-        );
-        assert_eq!(state.connecting.as_deref(), Some("admin@10.0.0.5"));
-    }
-
     /// An answer to a question no longer standing, or one that lands on an open box, never
     /// opens a list over what the person is doing.
     #[test]
     fn a_late_session_list_does_not_take_the_keys() {
         let mut state = bare_state();
         let mut dirty = false;
-        let answer = |id: &str| ControlResponse::RemoteSessions {
+        let answer = |id: &str| ControlResponse::RemoteMissing {
             id: id.into(),
             target: "h".into(),
-            sessions: vec![remote("default", true, 1)],
+            platform: "linux x86_64".into(),
+            root: false,
         };
         state.probing = Some("probe-2".into());
         apply(&mut state, answer("probe-1"), &mut dirty);
@@ -10198,5 +10340,189 @@ mod tests {
         apply(&mut state, done("install-2"), &mut dirty);
         assert_eq!(state.reprobe.as_deref(), Some("h"));
         assert_eq!(state.installing, None);
+    }
+
+    /// A space as a wake would bring it back: asleep, holding these tabs.
+    fn asleep(id: i64, name: &str, tabs: &[u32]) -> WorkspaceRow {
+        WorkspaceRow {
+            asleep: true,
+            sleeping: tabs
+                .iter()
+                .map(|&terminal| qoro_runtime::control::SleepingTab {
+                    terminal,
+                    title: None,
+                    agent: Some("claude".into()),
+                    cwd: "/tmp".into(),
+                })
+                .collect(),
+            ..space(id, name)
+        }
+    }
+
+    fn spaces(state: &mut State, workspaces: Vec<WorkspaceRow>) {
+        let mut dirty = false;
+        apply(
+            state,
+            ControlResponse::Workspaces {
+                id: "spaces".into(),
+                workspaces,
+            },
+            &mut dirty,
+        );
+    }
+
+    /// `ctrl-a Z` sleeps the awake space on screen, and on a sleeping one wakes it and
+    /// shows the tab the keyboard rested on once it is back. A refusal stays on the hint
+    /// row with the daemon's reason.
+    #[test]
+    fn ctrl_a_z_sleeps_an_awake_space_and_wakes_a_sleeping_one() {
+        let mut state = state();
+        let mut request = 0;
+        sleep_toggle(&mut state, &mut request);
+        assert_eq!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SleepWorkspace {
+                id: "sleep-1".into(),
+                workspace: 2,
+            })
+        );
+
+        state.spaces[0] = asleep(1, "app", &[7, 8]);
+        state.space = Some(1);
+        state.focused = 0;
+        state.dim = 8;
+        sleep_toggle(&mut state, &mut request);
+        assert_eq!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::WakeWorkspace {
+                id: "wake-2".into(),
+                workspace: Some(1),
+            })
+        );
+        assert_eq!(state.waking, Some((1, 8)));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::WorkspaceAwake {
+                id: "wake-2".into(),
+                workspace: 1,
+                terminals: 2,
+                resumed: 2,
+            },
+            &mut dirty,
+        );
+        assert_eq!(state.waking, None);
+        assert_eq!(state.show_when_listed.map(|(t, _)| t), Some(8));
+
+        apply(
+            &mut state,
+            ControlResponse::Failed {
+                id: "sleep-3".into(),
+                reason: "tab 2 (ssh) holds a connection".into(),
+            },
+            &mut dirty,
+        );
+        assert_eq!(
+            state.hint.as_deref(),
+            Some("tab 2 (ssh) holds a connection")
+        );
+    }
+
+    /// The keyboard on a sleeping tab: `ctrl-a x` discards that tab, not the space.
+    #[test]
+    fn closing_on_a_sleeping_space_discards_the_tab_the_keyboard_rests_on() {
+        let mut state = state();
+        state.spaces[0] = asleep(1, "app", &[7, 8]);
+        state.space = Some(1);
+        state.focused = 0;
+        let mut request = 0;
+        close_focused(&mut state, &mut request);
+        assert_eq!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::CloseTerminal {
+                id: "close-1".into(),
+                terminal: 7,
+            })
+        );
+    }
+
+    /// `ctrl-a s/S` pass a sleeping space by, and with every other space asleep stay put.
+    #[test]
+    fn space_navigation_skips_a_sleeping_space() {
+        let mut state = state();
+        state.spaces = vec![space(1, "app"), asleep(2, "api", &[7]), space(3, "dub")];
+        state.space = Some(1);
+        assert_eq!(state.next_space(true), Some(3));
+        state.space = Some(3);
+        assert_eq!(state.next_space(false), Some(1));
+        state.spaces[2] = asleep(3, "dub", &[9]);
+        state.space = Some(1);
+        assert_eq!(state.next_space(true), Some(1));
+        assert_eq!(
+            state.dim_tab(),
+            None,
+            "an awake space rests on no sleeping tab"
+        );
+    }
+
+    /// The space on screen falls asleep: the screen moves to an awake space. Once every
+    /// space is asleep, whoever slept them, nothing is left and the interface detaches.
+    #[test]
+    fn the_last_awake_space_falling_asleep_detaches() {
+        let mut state = state();
+        spaces(
+            &mut state,
+            vec![space(1, "app"), asleep(2, "webshop", &[2])],
+        );
+        assert_eq!(state.space, Some(1));
+        assert_eq!(state.pending_focus, Some(1));
+        assert!(state.shut.contains(&2), "a sleeping space is drawn folded");
+        assert!(!state.done);
+
+        // `qoro sleep app` from a shell: the index loses its tabs first, the space list
+        // follows. A sleeping remote space keeps nothing open either.
+        state.pending_focus = None;
+        index(&mut state, vec![]);
+        assert!(
+            state.done,
+            "nothing awake anywhere, and the interface stayed"
+        );
+        state.done = false;
+        spaces(
+            &mut state,
+            vec![
+                asleep(1, "app", &[1]),
+                asleep(2, "webshop", &[2]),
+                asleep(R1 | 1, "devbox:work", &[]),
+            ],
+        );
+        assert!(
+            state.done,
+            "a sleeping remote space kept the interface open"
+        );
+    }
+
+    /// An index is the only word of a sleep or wake made elsewhere: an awake space whose
+    /// tabs all left, or a sleeping one whose tabs came back, asks for the space list.
+    #[test]
+    fn tabs_leaving_or_returning_ask_for_the_space_list() {
+        let rows = [agent(1, 1, "claude", "idle")];
+        assert!(!slept_or_woken(&[space(1, "app")], &rows));
+        assert!(slept_or_woken(&[space(1, "app"), space(2, "api")], &rows));
+        assert!(slept_or_woken(&[asleep(1, "app", &[1])], &rows));
+        assert!(!slept_or_woken(&[asleep(2, "api", &[5])], &rows));
+    }
+
+    /// Adopted from a first render, the space list lands before the first index: its
+    /// space has a tab, so the interface that just opened stays.
+    #[test]
+    fn a_space_list_before_the_first_index_does_not_detach() {
+        let mut state = state();
+        state.rows.clear();
+        spaces(&mut state, vec![space(1, "app")]);
+        assert!(
+            !state.done,
+            "the interface left while its space still had a tab"
+        );
     }
 }

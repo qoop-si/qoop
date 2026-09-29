@@ -57,6 +57,15 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x10b".into(),
             workspace: 999,
         },
+        // A space that does not exist: nothing sleeps or wakes, nothing is typed.
+        ControlRequest::SleepWorkspace {
+            id: "x10c".into(),
+            workspace: 999,
+        },
+        ControlRequest::WakeWorkspace {
+            id: "x10d".into(),
+            workspace: Some(999),
+        },
         // A forged token: refused, but answered. The report carries a state for
         // the index, never bytes for the child.
         ControlRequest::ReportAgentState {
@@ -103,15 +112,9 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal,
             last_n: 10,
         },
-        // The interface's own requests: a daemon refuses them, and refusing writes nothing.
-        ControlRequest::ListRemoteSessions {
-            id: "x18".into(),
-            target: "me@devbox".into(),
-        },
         ControlRequest::ConnectRemote {
             id: "x19".into(),
             target: "me@devbox".into(),
-            session: "default".into(),
         },
         ControlRequest::InstallRemote {
             id: "x20".into(),
@@ -159,6 +162,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }
+            | ControlRequest::SleepWorkspace { .. }
+            | ControlRequest::WakeWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
@@ -167,7 +172,6 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ListFocusEvents { .. }
-            | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }

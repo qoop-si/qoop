@@ -189,6 +189,12 @@ pub struct ConnectionRegistry {
     /// `qoro focus`, fanned out to every connection's event task. Bounded and lossy on
     /// purpose: a focus nobody drained in time is a click the person has moved past.
     focus: tokio::sync::broadcast::Sender<u32>,
+    /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
+    /// on, rather than a timer.
+    changed: tokio::sync::Notify,
+    /// Set, under `inner`'s lock, once the daemon has decided to go: nothing registers
+    /// after it, so no connection is let in and then left behind by the exit.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ConnectionRegistry {
@@ -196,6 +202,8 @@ impl Default for ConnectionRegistry {
         Self {
             inner: std::sync::Mutex::default(),
             focus: tokio::sync::broadcast::channel(16).0,
+            changed: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -218,6 +226,10 @@ pub struct Connection {
     interface: std::sync::atomic::AtomicBool,
     /// The terminals this connection last said are news for its person (`News`).
     news: std::sync::Mutex<BTreeSet<u32>>,
+    /// Whether its hello was answered with a welcome. Until then it is nobody yet.
+    welcomed: std::sync::atomic::AtomicBool,
+    /// Whether it said it only watches: a daemon with nothing awake leaves with it open.
+    observer: std::sync::atomic::AtomicBool,
 }
 
 impl ConnectionRegistry {
@@ -245,8 +257,61 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    fn register(&self, connection: Connection) {
-        self.inner.lock().unwrap().push(connection);
+    /// Whether it was let in: not once the daemon is leaving.
+    fn register(&self, connection: Connection) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        inner.push(connection);
+        drop(inner);
+        self.changed.notify_one();
+        true
+    }
+
+    /// Close to newcomers if nobody is here but watchers, in one step with `register`, so
+    /// a connection is either counted here or refused there.
+    fn close_if_unheld(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let unheld = inner
+            .iter()
+            .all(|c| c.welcomed.load(Ordering::Relaxed) && c.observer.load(Ordering::Relaxed));
+        if unheld {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        unheld
+    }
+
+    /// A welcomed peer, and whether it only watches.
+    fn mark_welcomed(&self, client: &ClientId, observer: bool) {
+        for c in self.inner.lock().unwrap().iter() {
+            if &c.client == client {
+                c.observer.store(observer, Ordering::Relaxed);
+                c.welcomed.store(true, Ordering::Relaxed);
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    /// Connections that keep a daemon with nothing awake from leaving: welcomed, and not
+    /// only watching. An older client never says it only watches, so it counts.
+    pub fn holders(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.welcomed.load(Ordering::Relaxed) && !c.observer.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// Connections accepted whose hello has not been answered yet.
+    pub fn pending(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| !c.welcomed.load(Ordering::Relaxed))
+            .count()
     }
 
     fn mark_interface(&self, client: &ClientId) {
@@ -279,6 +344,8 @@ impl ConnectionRegistry {
             .flat_map(|c| c.news.lock().unwrap().clone())
             .collect();
         inner.retain(|c| &c.client != client);
+        drop(inner);
+        self.changed.notify_one();
         news
     }
 
@@ -403,6 +470,10 @@ pub struct TerminalHandle {
     /// Memory only, like the name: the store keeps a copy for resume, but
     /// the index reads this so every poll stays off the disk.
     pub session: Option<String>,
+    /// The agent generation whose own hook reported `session`. `None` when the id came
+    /// from the store on a restore: carried over, not yet said by the agent running now,
+    /// which may be a different one.
+    pub session_generation: Option<u64>,
     /// Where this terminal is, last known. Written by the terminal's own
     /// task whenever its throttled read sees a change, read by the index,
     /// so a repaint never waits on the store and never syscalls. Lags the
@@ -437,7 +508,20 @@ pub struct TerminalHandle {
     /// (which carries no grid), the end still carries a blank screen of the
     /// right geometry rather than a guessed one.
     pub last_dims: Arc<std::sync::atomic::AtomicU64>,
+    /// Which life of this terminal number this is. A number comes back when a tab is
+    /// restored in the same daemon (a woken space), and a subscription made for the
+    /// earlier life must not be taken for one to the new.
+    pub incarnation: u64,
 }
+
+/// A fresh [`TerminalHandle::incarnation`], never repeated within a daemon.
+fn next_incarnation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A connection's render subscriptions: the terminal life each was made for, and its task.
+type Subscriptions = Arc<std::sync::Mutex<BTreeMap<u32, (u64, tokio::task::AbortHandle)>>>;
 
 /// The daemon's terminals, addressed by the number that travels in a frame's `stream`
 /// field. Stream 0 is reserved and is never a terminal, so a decoder that defaults a
@@ -491,11 +575,13 @@ impl TerminalRegistry {
         }
     }
 
-    /// Remember a reported conversation id. False when there is no such terminal.
-    fn set_session(&self, stream: u32, session: Option<String>) -> bool {
+    /// Remember a conversation id, and the agent generation that reported it (`None`
+    /// for one read back from the store). False when there is no such terminal.
+    fn set_session(&self, stream: u32, session: Option<String>, generation: Option<u64>) -> bool {
         match self.inner.lock().unwrap().get_mut(&stream) {
             Some(handle) => {
                 handle.session = session;
+                handle.session_generation = generation;
                 true
             }
             None => false,
@@ -616,18 +702,23 @@ pub struct Daemon {
     /// switching is a client surface and a later milestone, but the row has to exist from
     /// the first terminal or the metadata has nowhere to hang.
     workspace: i64,
-    /// Set by a shutdown, read by every terminal that ends after one.
-    stopping: Arc<std::sync::atomic::AtomicBool>,
     /// Which terminals live connections currently watch. The idle reaper
     /// never closes a watched tab.
     watched: crate::idle::WatchCounts,
+    /// What a terminal ending writes down, and which spaces are asleep, shared with every
+    /// terminal and connection.
+    books: Bookkeeping,
+    /// Whether this daemon leaves when nothing is awake and nobody is attached. Set by the
+    /// binary that runs one on its own (`qoro daemon`); a daemon embedded in something
+    /// else, a test, stays until it is dropped.
+    leaves: bool,
     /// What the last restart brought back, counted by kind. Kept so a gate, a
     /// client, or a startup line can read what survived without reopening tabs.
     restore_report: RestoreReport,
 }
 
 impl Daemon {
-    /// Bind, spawn the terminal, and start serving. The caller must already hold the
+    /// Bind and restore what was awake. The caller must already hold the
     /// startup lock (ADR-012), which is what makes the stale-socket removal below safe.
     pub async fn bind(dir: &Path, shell: &Path) -> io::Result<Self> {
         let socket = paths::socket_path(dir);
@@ -651,8 +742,6 @@ impl Daemon {
         };
 
         let terminals = Arc::new(TerminalRegistry::default());
-        // One terminal at bind, which is the whole of milestone 1's surface and the default
-        // a client with no arguments attaches to.
         // Whether this is a restart is decided before the file is opened, because opening
         // it creates it: a first start would otherwise record a gap for an interval that
         // never existed.
@@ -682,10 +771,29 @@ impl Daemon {
         // a set to absorb rather than an empty map.
         scanner.refresh().await;
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let books = Bookkeeping {
-            store: store.clone(),
-            stopping: stopping.clone(),
-        };
+        let books = Bookkeeping::new(store.clone(), stopping.clone());
+        // Which spaces are asleep, read before anything is restored: their tabs stay down,
+        // and their rows must keep their place from the first teardown on.
+        match store.asleep().await {
+            Ok(rows) => books
+                .asleep
+                .lock()
+                .unwrap()
+                .extend(rows.into_iter().map(|(workspace, _)| workspace)),
+            // Not known, so every space is taken as asleep: nothing is restored, nothing is
+            // lost, and a wake brings each back. Restoring them all instead would bring back
+            // a sleeping space under its mark, where no agent write lands.
+            Err(e) => {
+                eprintln!("qorod: which spaces are asleep could not be read: {e}");
+                if let Ok(spaces) = store.workspaces().await {
+                    books
+                        .asleep
+                        .lock()
+                        .unwrap()
+                        .extend(spaces.into_iter().map(|space| space.id));
+                }
+            }
+        }
         // Who is in each terminal, written down as it changes.
         //
         // Hung off the registry's own announcements rather than off the terminal's output,
@@ -714,38 +822,7 @@ impl Daemon {
             events: events.clone(),
         })
         .await;
-        restore_splits(&terminals, &store).await;
-        if report.brought_back == 0 {
-            // Nothing to bring back, so the one terminal a first start has always had.
-            let stream = terminals.mint();
-            if let Err(e) = store
-                .create_terminal(
-                    stream as i64,
-                    workspace,
-                    here().display().to_string(),
-                    shell.display().to_string(),
-                )
-                .await
-            {
-                return Err(io::Error::other(e));
-            }
-            open_terminal(
-                &terminals,
-                stream,
-                workspace,
-                // The terminal the daemon opens for itself, which nobody was asked about.
-                None,
-                shell,
-                None,
-                warnings.clone(),
-                Some(dir.join("history")),
-                scanner.clone(),
-                agents.clone(),
-                events.clone(),
-                Some(books.clone()),
-            )?;
-        }
-
+        restore_splits(&terminals, &books).await;
         Ok(Self {
             listener,
             socket,
@@ -760,7 +837,8 @@ impl Daemon {
             scanner,
             agents,
             events,
-            stopping,
+            books,
+            leaves: false,
             watched: crate::idle::WatchCounts::default(),
             restore_report: report,
         })
@@ -782,6 +860,47 @@ impl Daemon {
     /// The workspace new terminals are recorded in.
     pub fn workspace(&self) -> i64 {
         self.workspace
+    }
+
+    /// Leave when nothing is awake and nobody is attached, as `qoro daemon` does (see
+    /// `leave_when_idle`). Off unless asked for, because leaving is `process::exit`.
+    pub fn leaving_when_idle(mut self) -> Self {
+        self.leaves = true;
+        self
+    }
+
+    /// Open one terminal in the default workspace, where the daemon is, before serving.
+    ///
+    /// A bind no longer opens one by itself: a daemon with nothing awake is one that is
+    /// about to leave, and the client that started it says what it wants (`qoro` asks
+    /// for a shell where the person is). This is for an embedder with no client, which
+    /// is the tests.
+    pub async fn open_first_terminal(&self) -> io::Result<u32> {
+        let stream = self.terminals.mint();
+        self.store
+            .create_terminal(
+                stream as i64,
+                self.workspace,
+                here().display().to_string(),
+                self.shell.display().to_string(),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        open_terminal(
+            &self.terminals,
+            stream,
+            self.workspace,
+            None,
+            &self.shell,
+            None,
+            self.warnings.clone(),
+            self.history_dir.clone(),
+            self.scanner.clone(),
+            self.agents.clone(),
+            self.events.clone(),
+            Some(self.books.clone()),
+        )?;
+        Ok(stream)
     }
 
     /// The terminal registry. Taken before `serve` consumes the daemon.
@@ -820,6 +939,15 @@ impl Daemon {
     }
 
     pub async fn serve(self) -> io::Result<()> {
+        if self.leaves {
+            tokio::spawn(leave_when_idle(Leaving {
+                terminals: self.terminals.clone(),
+                connections: self.connections.clone(),
+                agents: self.agents.clone(),
+                books: self.books.clone(),
+                socket: self.socket.clone(),
+            }));
+        }
         // The wedged-reader sweep. It runs whatever the connection count is, because a peer
         // that stopped reading is a problem at one connection as much as at sixty four, and
         // eviction only ever ran at the limit.
@@ -888,39 +1016,36 @@ impl Daemon {
             }
         });
 
-        // The idle reaper. Spawned only when armed: disabled (the default)
-        // means no task and zero wakeups, which is what keeps ADR-009's
-        // macOS literal-zero-idle claim intact. Armed, it parks while the
-        // terminal set is empty and while stopping, and otherwise wakes on
-        // an adaptive tick to close what has been idle past the timeout.
-        let idle_raw = std::env::var(crate::idle::IDLE_TIMEOUT_ENV).ok();
-        match crate::idle::parse_idle_timeout(idle_raw.as_deref()) {
-            None => {
-                // Unset, empty and all-zeros disable quietly; anything else
-                // that fails to parse names itself, so a typo does not
-                // silently mean disabled.
-                let raw = idle_raw.as_deref().unwrap_or("");
-                let quiet = raw.trim().is_empty() || raw.trim().bytes().all(|b| b == b'0');
-                if quiet {
-                    eprintln!("qorod: idle reap: disabled");
-                } else {
-                    eprintln!(
-                        "qorod: idle reap: disabled (ignoring invalid {}={raw:?})",
-                        crate::idle::IDLE_TIMEOUT_ENV,
-                    );
-                }
-            }
-            Some(timeout) => {
-                eprintln!("qorod: idle reap: armed: {}m", timeout.as_secs() / 60);
-                tokio::spawn(idle_reap_loop(
-                    self.terminals.clone(),
-                    self.agents.clone(),
-                    self.events.clone(),
-                    self.stopping.clone(),
-                    self.watched.clone(),
-                    timeout,
-                ));
-            }
+        // Spaces that sleep by themselves. Spawned only when `[sleep] idle_minutes` is set:
+        // off (the default) means no task and zero wakeups, which is what keeps ADR-009's
+        // macOS literal-zero-idle claim intact. On, it parks while nothing is awake and
+        // otherwise wakes on an adaptive tick to put to sleep a space idle past the time.
+        if std::env::var_os(crate::idle::IDLE_TIMEOUT_ENV).is_some() {
+            eprintln!(
+                "qorod: {} is no longer read: idle spaces sleep after `[sleep] idle_minutes` in \
+                 config.toml",
+                crate::idle::IDLE_TIMEOUT_ENV
+            );
+        }
+        let minutes = crate::config::read().idle_minutes;
+        if minutes == 0 {
+            eprintln!("qorod: idle sleep: off");
+        } else {
+            eprintln!("qorod: idle sleep: after {minutes}m");
+            tokio::spawn(idle_sleep_loop(
+                Restore {
+                    terminals: self.terminals.clone(),
+                    books: self.books.clone(),
+                    shell: self.shell.clone(),
+                    warnings: self.warnings.clone(),
+                    history_dir: self.history_dir.clone(),
+                    scanner: self.scanner.clone(),
+                    agents: self.agents.clone(),
+                    events: self.events.clone(),
+                },
+                self.watched.clone(),
+                std::time::Duration::from_secs(minutes.saturating_mul(60)),
+            ));
         }
 
         // Process changes. On macOS the kqueue descriptor is itself pollable, so this is a
@@ -959,8 +1084,8 @@ impl Daemon {
             }
         });
 
-        // Ring the bridge's doorbell, if there is a bridge, and every other bell: "a session
-        // just started, look again". A connect and a close, nothing written, errors ignored,
+        // Ring the bridge's doorbell, if there is a bridge: "a session just started, look
+        // again". A connect and a close, nothing written, errors ignored,
         // each on its own task so a wedged listener can never hold up the accept loop. Rung
         // here and not at bind, because bind is still restoring terminals and a watcher that
         // arrived then would wait in the backlog.
@@ -970,24 +1095,18 @@ impl Daemon {
             .and_then(Path::parent)
             .and_then(Path::parent)
         {
-            // The bells of other watchers too (the notch's), rung the same way.
-            let bells = std::fs::read_dir(paths::bells_dir(runtime))
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|e| e.path());
-            for bell in std::iter::once(paths::bridge_socket(runtime)).chain(bells) {
-                tokio::spawn(async move {
-                    // Held open until the listener closes it, so it can read our uid (macOS
-                    // cannot once the peer is gone). Nothing is written.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                        if let Ok(mut s) = tokio::net::UnixStream::connect(bell).await {
-                            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut [0u8; 1]).await;
-                        }
-                    })
-                    .await;
-                });
-            }
+            // The notch's watch needs no ring: it waits on the runtime directory itself.
+            let bell = paths::bridge_socket(runtime);
+            tokio::spawn(async move {
+                // Held open until the listener closes it, so it can read our uid (macOS
+                // cannot once the peer is gone). Nothing is written.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    if let Ok(mut s) = tokio::net::UnixStream::connect(bell).await {
+                        let _ = tokio::io::AsyncReadExt::read(&mut s, &mut [0u8; 1]).await;
+                    }
+                })
+                .await;
+            });
         }
 
         let mut next_client = 0u64;
@@ -1041,18 +1160,18 @@ impl Daemon {
             let shutdown = Arc::new(tokio::sync::Notify::new());
             let served_shutdown = shutdown.clone();
             let served_outbound = self.outbound.clone();
-            let served_store = self.store.clone();
-            let served_stopping = self.stopping.clone();
             let workspace = self.workspace;
             let served_history = self.history_dir.clone();
             let served_scanner = self.scanner.clone();
             let served_agents = self.agents.clone();
             let served_events = self.events.clone();
             let served_watched = self.watched.clone();
+            let served_books = self.books.clone();
             // Registered before the task exists, so the task's own `remove` on exit always
             // finds it: registering after the spawn let a connection that closed at once
             // remove nothing and then stay listed, counted against the budget forever.
-            self.connections.register(Connection {
+            // Refused once this daemon has decided to go: its client starts the next one.
+            let admitted = self.connections.register(Connection {
                 client,
                 progress,
                 shutdown,
@@ -1060,8 +1179,14 @@ impl Daemon {
                 pid: peer_pid(&stream),
                 interface: std::sync::atomic::AtomicBool::new(false),
                 news: std::sync::Mutex::default(),
+                welcomed: std::sync::atomic::AtomicBool::new(false),
+                observer: std::sync::atomic::AtomicBool::new(false),
             });
             let announce = self.agents.clone();
+            if !admitted {
+                drop(stream);
+                continue;
+            }
             tokio::spawn(async move {
                 // Milestone 1 has one attach mode and it is writable. Read-only observers
                 // are a milestone 2 surface; the arbitration below already refuses them.
@@ -1076,8 +1201,6 @@ impl Daemon {
                         progress: served_progress,
                         shutdown: served_shutdown,
                         outbound: served_outbound,
-                        store: served_store,
-                        stopping: served_stopping,
                         workspace,
                         history_dir: served_history,
                         scanner: served_scanner,
@@ -1085,6 +1208,7 @@ impl Daemon {
                         events: served_events,
                         watched: served_watched,
                         connections: registry.clone(),
+                        books: served_books,
                     },
                 )
                 .await;
@@ -1417,9 +1541,6 @@ pub struct ServeContext {
     pub progress: Arc<Progress>,
     pub shutdown: Arc<tokio::sync::Notify>,
     pub outbound: Arc<std::sync::atomic::AtomicUsize>,
-    pub store: crate::store::StoreHandle,
-    /// Set by a shutdown, read by every terminal that ends after one.
-    pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub workspace: i64,
     pub history_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
@@ -1430,6 +1551,8 @@ pub struct ServeContext {
     pub watched: crate::idle::WatchCounts,
     /// Every live connection, so a stop can wait for the one that asked to hang up.
     pub connections: Arc<ConnectionRegistry>,
+    /// What a terminal ending writes down, and which spaces are asleep.
+    pub books: Bookkeeping,
 }
 
 async fn serve_client(
@@ -1445,8 +1568,6 @@ async fn serve_client(
         progress,
         shutdown,
         outbound,
-        store,
-        stopping,
         workspace,
         history_dir,
         scanner,
@@ -1454,6 +1575,7 @@ async fn serve_client(
         events,
         watched,
         connections,
+        books,
     } = context;
     // Filesystem permissions are the first gate, not the only one. A peer from another uid
     // is closed with no protocol response at all.
@@ -1522,6 +1644,11 @@ async fn serve_client(
     {
         connections.mark_interface(&client);
     }
+    if matches!(outcome, qoro_proto::HandshakeOutcome::Welcome(_)) {
+        let observer =
+            hello.extra.get(crate::client::OBSERVER) == Some(&serde_json::Value::Bool(true));
+        connections.mark_welcomed(&client, observer);
+    }
     stream.write_all(&out).await?;
     if matches!(outcome, qoro_proto::HandshakeOutcome::Refuse(_)) {
         return Ok(());
@@ -1538,8 +1665,7 @@ async fn serve_client(
     let searching = Arc::new(AtomicU64::new(0));
     // Subscription tasks, one per terminal this connection is watching. Kept so that
     // unsubscribing, and ending the connection, actually stop them.
-    let subscriptions: Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>> =
-        Arc::default();
+    let subscriptions: Subscriptions = Arc::default();
 
     // A connection attaches to the lowest numbered terminal by default, which is the whole
     // of what a client with no arguments wants and is what milestone 1 shipped. Everything
@@ -1761,27 +1887,80 @@ async fn serve_client(
                             });
                             continue;
                         }
-                        Ok(request) => {
-                            handle_control(
-                                request,
-                                &terminals,
-                                &subscriptions,
-                                &renders,
-                                &shell,
-                                &warnings,
-                                &store,
-                                &stopping,
-                                workspace,
-                                history_dir.clone(),
-                                &client,
-                                &scanner,
-                                &agents,
-                                &events,
-                                &watched,
-                                &connections,
-                            )
-                            .await
-                        }
+                        // A sleep, a wake, or anything waiting on a space that is changing
+                        // takes seconds: answered from a task of its own, like a search
+                        // step, so typing into every other tab on this connection goes on.
+                        Ok(request) => match dispatch(&request, &books, &terminals, workspace) {
+                            Dispatch::Apart => {
+                                let tx = control_tx.clone();
+                                let terminals = terminals.clone();
+                                let subscriptions = subscriptions.clone();
+                                let renders = renders.clone();
+                                let shell = shell.clone();
+                                let warnings = warnings.clone();
+                                let history_dir = history_dir.clone();
+                                let client = client.clone();
+                                let scanner = scanner.clone();
+                                let agents = agents.clone();
+                                let events = events.clone();
+                                let watched = watched.clone();
+                                let connections = connections.clone();
+                                let books = books.clone();
+                                tokio::spawn(async move {
+                                    let response = handle_control(
+                                        request,
+                                        &terminals,
+                                        &subscriptions,
+                                        &renders,
+                                        &shell,
+                                        &warnings,
+                                        workspace,
+                                        history_dir,
+                                        &client,
+                                        &scanner,
+                                        &agents,
+                                        &events,
+                                        &watched,
+                                        &connections,
+                                        &books,
+                                        None,
+                                    )
+                                    .await;
+                                    let Ok(body) = serde_json::to_vec(&response) else {
+                                        return;
+                                    };
+                                    let mut out = BytesMut::new();
+                                    if Frame::new(Channel::Control, 0, Bytes::from(body))
+                                        .encode(&mut out)
+                                        .is_ok()
+                                    {
+                                        let _ = tx.send(out).await;
+                                    }
+                                });
+                                continue;
+                            }
+                            Dispatch::Inline(held) => {
+                                handle_control(
+                                    request,
+                                    &terminals,
+                                    &subscriptions,
+                                    &renders,
+                                    &shell,
+                                    &warnings,
+                                    workspace,
+                                    history_dir.clone(),
+                                    &client,
+                                    &scanner,
+                                    &agents,
+                                    &events,
+                                    &watched,
+                                    &connections,
+                                    &books,
+                                    held,
+                                )
+                                .await
+                            }
+                        },
                         Err(e) => ControlResponse::Failed {
                             // The typed request did not parse, but its JSON may still name
                             // an id: an op from a newer client is the usual case, and a
@@ -1874,7 +2053,7 @@ async fn serve_client(
     // daemon-wide watch counts the idle reaper reads, and stop the tasks.
     let held = std::mem::take(&mut *subscriptions.lock().unwrap());
     watched.unwatch_all(&held.keys().copied().collect());
-    for (_, task) in held {
+    for (_, (_, task)) in held {
         task.abort();
     }
     writer.abort();
@@ -1906,24 +2085,38 @@ async fn serve_client(
 /// terminal birth, until something else happens to print.
 fn subscribe(
     terminals: &Arc<TerminalRegistry>,
-    subscriptions: &Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>>,
+    subscriptions: &Subscriptions,
     renders: &Arc<RenderQueue>,
     watched: &crate::idle::WatchCounts,
     stream: u32,
 ) -> bool {
-    if subscriptions.lock().unwrap().contains_key(&stream) {
-        // Subscribing twice is not an error and must not double the traffic: no second
-        // task. It still asks for the live screen, once, because a client that subscribes
-        // wants one, and one that had dropped its copy would otherwise wait on a quiet
-        // terminal for a screen that never comes.
-        if let Some(handle) = terminals.get(stream) {
-            let _ = handle.commands.try_send(ClientCommand::Refresh);
-        }
-        return true;
-    }
     let Some(handle) = terminals.get(stream) else {
         return false;
     };
+    {
+        let mut held = subscriptions.lock().unwrap();
+        match held.get(&stream) {
+            Some((life, task)) if *life == handle.incarnation && !task.is_finished() => {
+                // Subscribing twice is not an error and must not double the traffic: no
+                // second task. It still asks for the live screen, once, because a client
+                // that subscribes wants one, and one that had dropped its copy would
+                // otherwise wait on a quiet terminal for a screen that never comes.
+                drop(held);
+                let _ = handle.commands.try_send(ClientCommand::Refresh);
+                return true;
+            }
+            Some(_) => {
+                // Made for an earlier life of this number, or already over: kept, it would
+                // answer for the new terminal with a task nobody feeds, and the pane would
+                // stay blank. Dropped, and its watch count with it.
+                if let Some((_, task)) = held.remove(&stream) {
+                    task.abort();
+                    watched.unwatch(stream);
+                }
+            }
+            None => {}
+        }
+    }
     let mut updates = handle.updates.subscribe();
     let queue = renders.clone();
     // A picture published while nobody watched lives on in the handle, so a late
@@ -1968,10 +2161,16 @@ fn subscribe(
             }
         }
     });
-    subscriptions
+    if let Some((_, older)) = subscriptions
         .lock()
         .unwrap()
-        .insert(stream, task.abort_handle());
+        .insert(stream, (handle.incarnation, task.abort_handle()))
+    {
+        // Another subscribe landed between the check above and here: one task per
+        // terminal, and the count it added goes with it.
+        older.abort();
+        watched.unwatch(stream);
+    }
     // A new watcher for the daemon-wide counts the idle reaper reads: a
     // watched tab is never reaped while somebody looks at it.
     watched.watch(stream);
@@ -2167,22 +2366,15 @@ fn state_name(state: qoro_domain::AgentRuntimeState) -> &'static str {
 /// the terminal set is empty (zero wakeups: creation announces, which ends
 /// the wait) and while stopping, and otherwise wakes on an adaptive tick.
 /// Each pass snapshots eligibility for every terminal, applies waiter-edge
-/// vetoes against that snapshot (never pass order), then asks the victims
-/// to close the same way `Shutdown` does (`try_send`, never blocking). A
-/// full command queue or a failed journal write means skip this round and
-/// retry the next. Asked terminals entomb on teardown instead of being
-/// forgotten, so a slept tab stays visible as a sleeping row.
-async fn idle_reap_loop(
-    terminals: Arc<TerminalRegistry>,
-    agents: Arc<crate::agents::AgentRegistry>,
-    events: crate::eventlog::EventLog,
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+/// vetoes against that snapshot (never pass order), then puts to sleep each
+/// space all of whose tabs are ready, the way a person would ask for it.
+async fn idle_sleep_loop(
+    into: Restore,
     watched: crate::idle::WatchCounts,
     timeout: std::time::Duration,
 ) {
     // One startup delay under 30 seconds, from the wall clock rather than a
-    // new dependency, so a fleet armed together does not reap in one herd.
-    // Reaps already spread by differing idle stamps after this.
+    // new dependency, so a fleet armed together does not sleep in one herd.
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() % 30)
@@ -2190,21 +2382,19 @@ async fn idle_reap_loop(
     tokio::time::sleep(std::time::Duration::from_secs(jitter as u64)).await;
     let tick = crate::idle::reap_tick(timeout);
     let timeout_secs = timeout.as_secs().min(i64::MAX as u64) as i64;
-    let mut changes = agents.subscribe();
-    let mut in_flight: BTreeSet<u32> = BTreeSet::new();
+    let mut changes = into.agents.subscribe();
     loop {
-        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        if into
+            .books
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             break;
         }
-        if agents.streams().is_empty() {
-            // Parked: creation registers and announces, which ends this
-            // wait. Clears the in-flight set: a vanished stream stays gone,
-            // and a stream number is never reused within a run.
-            in_flight.clear();
-            // A lagged wait is a nudge like any other: the set is re-read
-            // below either way. A closed channel cannot happen while this
-            // task holds the registry, but break rather than spin if it
-            // ever does.
+        if into.agents.streams().is_empty() {
+            // Parked: creation registers and announces, which ends this wait. A lagged
+            // wait is a nudge like any other; a closed channel cannot happen while this
+            // task holds the registry, but break rather than spin if it ever does.
             match changes.recv().await {
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2212,46 +2402,54 @@ async fn idle_reap_loop(
             }
         }
         tokio::time::sleep(tick).await;
-        if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        if into
+            .books
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             break;
         }
-        reap_pass(
-            &terminals,
-            &agents,
-            &events,
-            &watched,
-            timeout_secs,
-            &mut in_flight,
-        )
-        .await;
+        idle_sleep_pass(&into, &watched, timeout_secs).await;
     }
 }
 
-/// One reap pass over every tracked terminal. See `idle_reap_loop`.
-async fn reap_pass(
-    terminals: &Arc<TerminalRegistry>,
-    agents: &Arc<crate::agents::AgentRegistry>,
-    events: &crate::eventlog::EventLog,
-    watched: &crate::idle::WatchCounts,
-    timeout_secs: i64,
-    in_flight: &mut BTreeSet<u32>,
-) {
-    let now = crate::agents::now_unix();
+/// One pass: every space whose tabs have all been idle and unwatched past the timeout goes
+/// to sleep, through the same sleep a person asks for, which vets each tab again in full.
+async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, timeout_secs: i64) {
     // Edges older than a day are over by definition; swept over all edges,
     // every pass, before anything evaluates.
-    agents.sweep_expectations(now);
+    into.agents.sweep_expectations(crate::agents::now_unix());
+    for (space, all) in idle_spaces(into, watched, timeout_secs) {
+        // Asked again for this space alone, just before it sleeps: the spaces before it took
+        // seconds each, and in them a person may have come back to this one.
+        if !all || idle_spaces(into, watched, timeout_secs).get(&space) != Some(&true) {
+            continue;
+        }
+        match sleep_space(into, space).await {
+            Ok(ended) => eprintln!("qorod: idle sleep: space {space} asleep, {ended} tabs ended"),
+            // Said once per pass and tried again on the next: a refusal here is a tab that
+            // is not what it looked like from its screen alone.
+            Err(why) => eprintln!("qorod: idle sleep: {why}"),
+        }
+    }
+}
+
+/// Every space with a live tab, and whether all of its tabs are idle past the timeout,
+/// unwatched and not held by a wait.
+fn idle_spaces(
+    into: &Restore,
+    watched: &crate::idle::WatchCounts,
+    timeout_secs: i64,
+) -> BTreeMap<i64, bool> {
+    let agents = &into.agents;
+    let now = crate::agents::now_unix();
     let streams = agents.streams();
-    in_flight.retain(|s| streams.contains(s));
     // Snapshot eligibility for every live terminal at pass start. Edge
     // vetoes evaluate against this map, so the outcome never depends on
     // the order the pass happens to visit terminals in.
     let mut eligible: BTreeMap<u32, bool> = BTreeMap::new();
-    let mut snaps: BTreeMap<u32, crate::agents::ReapSnapshot> = BTreeMap::new();
     for stream in &streams {
-        // Asked before and still tearing down (ADR-014 escalation takes up
-        // to seconds), or an explicit close already accepted: never ask
-        // twice, never log twice, and never re-mark a user-closed tab.
-        if in_flight.contains(stream) || agents.is_closed(*stream) {
+        if agents.is_closed(*stream) {
             eligible.insert(*stream, false);
             continue;
         }
@@ -2275,83 +2473,26 @@ async fn reap_pass(
             watched.watched(*stream),
             idle_secs,
             timeout_secs,
-        ) && !agents.shield_fresh(*stream, now, timeout_secs)
-            // A task under a shell leader that the snapshot program alone
-            // reports as the shell. Checked here, before edges, so a waiter
-            // on such a tab sees it busy. No master known means
-            // just-created or a race: fail closed and retry next pass.
-            && agents
-                .master_of(*stream)
-                .is_some_and(|master| !crate::idle::group_holds_task(master));
+        ) && !agents.shield_fresh(*stream, now, timeout_secs);
         eligible.insert(*stream, verdict);
-        if verdict {
-            snaps.insert(*stream, snap);
-        }
     }
-    let victims = {
-        // Edges at targets already going away, reaped or closed by hand,
-        // end with them: a wait on a terminal tearing down is not a wait on
-        // anything alive. Filtered before evaluation so a waiter is never
-        // vetoed an extra pass.
-        let edges: Vec<(u32, u32)> = agents
-            .expectation_edges()
-            .into_iter()
-            .filter(|(_, target)| !in_flight.contains(target) && !agents.is_closed(*target))
-            .collect();
-        crate::idle::apply_edge_vetoes(&eligible, &edges)
-    };
+    let edges: Vec<(u32, u32)> = agents
+        .expectation_edges()
+        .into_iter()
+        .filter(|(_, target)| !agents.is_closed(*target))
+        .collect();
+    let ready = crate::idle::apply_edge_vetoes(&eligible, &edges);
+    // A space sleeps whole or not at all: every one of its tabs has to be ready.
+    let mut spaces: BTreeMap<i64, bool> = BTreeMap::new();
     for stream in &streams {
-        if !victims.get(stream).copied().unwrap_or(false) {
+        let Some(space) = into.terminals.workspace_of(*stream) else {
             continue;
-        }
-        let snap = snaps.get(stream).expect("victims come from snapshots");
-        let idle_secs = now.saturating_sub(snap.idle_since.expect("snapshots carry clocks"));
-        // Journal first, in the same shape as a manual close, so post-hoc
-        // forensics can tell a reap from a crash or a kill. A journal that
-        // will not write vetoes the reap: retry next pass.
-        let key = format!("idle-reap-{stream}-{now}");
-        if events
-            .append_durable(vec![
-                (
-                    qoro_events::Stream::Command(key.clone()),
-                    qoro_events::Body::Command {
-                        idempotency_key: key.clone(),
-                        operation: "IdleReap".into(),
-                        detail: serde_json::json!({ "terminal": stream }),
-                    },
-                ),
-                (
-                    qoro_events::Stream::Command(key.clone()),
-                    qoro_events::Body::Outcome {
-                        idempotency_key: key.clone(),
-                        ok: true,
-                        detail: serde_json::json!({ "terminal": stream }),
-                    },
-                ),
-            ])
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        if let Some(handle) = terminals.get(*stream)
-            && handle.commands.try_send(ClientCommand::Close).is_ok()
-        {
-            // Logged only on accepted send: `try_send` succeeding while the
-            // tab lingers through teardown is normal. A full queue is one
-            // being pasted into: skip this round, retry the next. The mark
-            // is what turns this teardown into a tombstone instead of a
-            // forgetting: shared state, read by the terminal's own ending,
-            // carrying the foreground program at mark time for the tomb.
-            agents.mark_reaped(*stream, snap.program.clone());
-            in_flight.insert(*stream);
-            eprintln!(
-                "qorod: idle reap: closed terminal {stream} after {}m idle ({})",
-                idle_secs / 60,
-                state_name(snap.state),
-            );
-        }
+        };
+        let this = ready.get(stream).copied().unwrap_or(false);
+        let all = spaces.entry(space).or_insert(true);
+        *all = *all && this;
     }
+    spaces
 }
 
 /// Whether a `from_terminal` claim on an incoming Input binds to its
@@ -2373,51 +2514,84 @@ fn verify_waiter(
         && agents.token_of(waiter).is_some_and(|t| t.as_str() == token)
 }
 
-/// One sleeping row for `ListAgents`: same shape as a live row, the
-/// process gone, `slept_at_unix` saying when. `agent: true` so panels
-/// list it (live-agent *counts* exclude `state == "sleeping"`
-/// separately); every belief field absent rather than wrong.
-fn tomb_row(tomb: &crate::agents::Tombstone) -> crate::control::AgentRow {
-    crate::control::AgentRow {
-        news: false,
-        terminal: tomb.stream,
-        name: tomb.name.clone(),
-        workspace: tomb.workspace,
-        agent: true,
-        program: tomb.program.clone(),
-        behind: None,
-        state: "sleeping".to_string(),
-        generation: None,
-        readiness: "unknown".to_string(),
-        source: None,
-        rule: None,
-        manifest: None,
-        agent_session: None,
-        agent_title: None,
-        last_active_at_unix: None,
-        cwd: None,
-        slept_at_unix: Some(tomb.slept_at_unix),
-        activity: None,
-        pgid: None,
-        discards: None,
+/// Write down a close the way every close is written down: the command and its outcome,
+/// so a retry of the same request finds it applied rather than closing twice or failing.
+async fn record_close(events: &crate::eventlog::EventLog, id: &str, terminal: u32) {
+    let _ = events
+        .append_durable(vec![
+            (
+                qoro_events::Stream::Command(id.to_string()),
+                qoro_events::Body::Command {
+                    idempotency_key: id.to_string(),
+                    operation: "CloseTerminal".into(),
+                    detail: serde_json::json!({ "terminal": terminal }),
+                },
+            ),
+            (
+                qoro_events::Stream::Command(id.to_string()),
+                qoro_events::Body::Outcome {
+                    idempotency_key: id.to_string(),
+                    ok: true,
+                    detail: serde_json::json!({ "terminal": terminal }),
+                },
+            ),
+        ])
+        .await;
+}
+
+/// Where a request is answered: on the connection's read loop, holding already the lock of
+/// the space it changes when it changes one; or in a task of its own.
+enum Dispatch {
+    Inline(Option<tokio::sync::OwnedMutexGuard<()>>),
+    Apart,
+}
+
+/// A sleep or a wake always goes apart. A tab made or closed, or a space closed, stays on
+/// the read loop only when its space is awake and its lock is free this instant, and then
+/// the lock is taken here and handed over: the read loop never waits on a space lock,
+/// because typing into every other tab on the connection waits with it.
+fn dispatch(
+    request: &ControlRequest,
+    books: &Bookkeeping,
+    terminals: &TerminalRegistry,
+    default: i64,
+) -> Dispatch {
+    let take = |workspace: i64| {
+        if books.is_asleep(workspace) {
+            return Dispatch::Apart;
+        }
+        match books.lock_of(workspace).try_lock_owned() {
+            Ok(guard) => Dispatch::Inline(Some(guard)),
+            Err(_) => Dispatch::Apart,
+        }
+    };
+    match request {
+        ControlRequest::SleepWorkspace { .. } | ControlRequest::WakeWorkspace { .. } => {
+            Dispatch::Apart
+        }
+        ControlRequest::CreateTerminal { workspace, .. } => take(workspace.unwrap_or(default)),
+        ControlRequest::CloseTerminal { terminal, .. } => match terminals.workspace_of(*terminal) {
+            Some(workspace) => take(workspace),
+            None => Dispatch::Apart,
+        },
+        ControlRequest::CloseWorkspace { workspace, .. } => take(*workspace),
+        _ => Dispatch::Inline(None),
     }
 }
 
 /// Answer one control request.
 ///
-/// Synchronous on purpose: every operation here is a registry edit or a spawn, and none of
-/// them waits on a peer. An operation that later needs to wait for durability gets its own
-/// path rather than making this one async and inviting a lock across an await.
+/// `held` is the lock of the space the request changes, when `dispatch` already took it;
+/// an arm that needs one and was handed none takes it itself, which only happens off the
+/// read loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
     request: ControlRequest,
     terminals: &Arc<TerminalRegistry>,
-    subscriptions: &Arc<std::sync::Mutex<BTreeMap<u32, tokio::task::AbortHandle>>>,
+    subscriptions: &Subscriptions,
     renders: &Arc<RenderQueue>,
     shell: &Path,
     warnings: &Arc<std::sync::Mutex<Vec<Warning>>>,
-    store: &crate::store::StoreHandle,
-    stopping: &Arc<std::sync::atomic::AtomicBool>,
     workspace: i64,
     history_dir: Option<PathBuf>,
     client: &ClientId,
@@ -2426,8 +2600,23 @@ async fn handle_control(
     events: &crate::eventlog::EventLog,
     watched: &crate::idle::WatchCounts,
     connections: &Arc<ConnectionRegistry>,
+    books: &Bookkeeping,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> ControlResponse {
     let id = request.request_id().to_string();
+    let store = &books.store;
+    let stopping = &books.stopping;
+    // What a sleep, a wake and a tab made in a sleeping space need, in one value.
+    let restore = || Restore {
+        terminals: terminals.clone(),
+        books: books.clone(),
+        shell: shell.to_path_buf(),
+        warnings: warnings.clone(),
+        history_dir: history_dir.clone(),
+        scanner: scanner.clone(),
+        agents: agents.clone(),
+        events: events.clone(),
+    };
 
     // A command that has already been applied returns its original answer rather than
     // being done again. ADR-017: the ledger is what makes a retry after an ambiguous
@@ -2450,6 +2639,18 @@ async fn handle_control(
             // that does not know about workspaces sends nothing and lands in the default,
             // which is what it already believed was happening.
             let workspace = wanted.unwrap_or(workspace);
+            // Held for the whole create, so a sleep of this space waits for the new tab
+            // and then vets it, rather than missing it. A space asleep wakes first: a tab
+            // made in it must not leave it half awake.
+            let _held = match held {
+                Some(guard) => guard,
+                None => books.lock_of(workspace).lock_owned().await,
+            };
+            if books.is_asleep(workspace)
+                && let Err(reason) = wake_locked(&restore(), workspace).await
+            {
+                return ControlResponse::Failed { id, reason };
+            }
             // A requested working directory is validated here rather than trusted. It has
             // to be absolute, because a relative path would resolve against whatever
             // directory the daemon happens to be in, and it has to exist, because a shell
@@ -2550,10 +2751,7 @@ async fn handle_control(
                 scanner.clone(),
                 agents.clone(),
                 events.clone(),
-                Some(Bookkeeping {
-                    store: store.clone(),
-                    stopping: stopping.clone(),
-                }),
+                Some(books.clone()),
             ) {
                 Ok(_) => {
                     // Subscribed on creation. A client that asked for a terminal wants to
@@ -2594,94 +2792,70 @@ async fn handle_control(
                 }
             }
         }
-        ControlRequest::CloseTerminal { terminal, .. } => match terminals.get(terminal) {
-            Some(handle) => {
-                // Closing is a request to the terminal, not a registry edit: the terminal
-                // owns its teardown, which has to contain what it started (ADR-014).
-                //
-                // An explicit close wins over a reaper mark in both
-                // directions (`take_ending` prefers it), and keeps the
-                // reaper from re-asking while the tab tears down. Marked
-                // before asking, so a teardown that runs before this
-                // handler's next line still reads it; taken back if the
-                // ask is refused, so a refused close leaves the reaper's
-                // own mark, and its tomb, alone. Only a mark this request
-                // set is taken back: a repeat close refused while an
-                // accepted one tears down must not undo that one. A
-                // user-closed tab forgets, never entombs.
-                let marked = agents.mark_closed(terminal);
-                // The result is not discarded. A terminal whose command channel is full,
-                // because another connection is pasting into it, would otherwise be
-                // reported closed to a client that then stops subscribing while the shell
-                // keeps running, with no way for that client to find out.
-                match handle.commands.try_send(ClientCommand::Close) {
-                    Ok(()) => {
-                        let _ = events
-                            .append_durable(vec![
-                                (
-                                    qoro_events::Stream::Command(id.clone()),
-                                    qoro_events::Body::Command {
-                                        idempotency_key: id.clone(),
-                                        operation: "CloseTerminal".into(),
-                                        detail: serde_json::json!({ "terminal": terminal }),
-                                    },
-                                ),
-                                (
-                                    qoro_events::Stream::Command(id.clone()),
-                                    qoro_events::Body::Outcome {
-                                        idempotency_key: id.clone(),
-                                        ok: true,
-                                        detail: serde_json::json!({ "terminal": terminal }),
-                                    },
-                                ),
-                            ])
-                            .await;
-                        ControlResponse::TerminalClosed { id, terminal }
-                    }
-                    Err(e) => {
-                        if marked {
-                            agents.take_closed(terminal);
+        ControlRequest::CloseTerminal { terminal, .. } => {
+            // Under its space's lock, taken before anything is read, so a sleep deciding
+            // which rows to keep never sees this tab half closed, and this close never acts
+            // on what it saw before a sleep or a wake moved the tab.
+            let mut held = held;
+            if let Some(space) = terminals.workspace_of(terminal) {
+                let guard = match held.take() {
+                    Some(guard) => guard,
+                    None => books.lock_of(space).lock_owned().await,
+                };
+                if let Some(handle) = terminals.get(terminal) {
+                    // Closing is a request to the terminal, not a registry edit: the
+                    // terminal owns its teardown, which has to contain what it started
+                    // (ADR-014).
+                    //
+                    // An explicit close wins over a space going to sleep: its row
+                    // closes rather than being kept, and idle sleep leaves the tab
+                    // alone while it tears down. Marked before asking, so a teardown
+                    // that runs before this handler's next line still reads it; taken
+                    // back if the ask is refused. Only a mark this request set is taken
+                    // back: a repeat close refused while an accepted one tears down must
+                    // not undo that one.
+                    let marked = agents.mark_closed(terminal);
+                    // The result is not discarded. A terminal whose command channel is
+                    // full, because another connection is pasting into it, would otherwise
+                    // be reported closed to a client that then stops subscribing while the
+                    // shell keeps running, with no way for that client to find out.
+                    return match handle.commands.try_send(ClientCommand::Close) {
+                        Ok(()) => {
+                            record_close(events, &id, terminal).await;
+                            ControlResponse::TerminalClosed { id, terminal }
                         }
-                        ControlResponse::Failed {
-                            id,
-                            reason: format!("terminal {terminal} did not accept the close: {e}"),
+                        Err(e) => {
+                            if marked {
+                                agents.take_closed(terminal);
+                            }
+                            ControlResponse::Failed {
+                                id,
+                                reason: format!(
+                                    "terminal {terminal} did not accept the close: {e}"
+                                ),
+                            }
                         }
-                    }
-                }
-            }
-            // No live terminal: this may be a sleeping marker, dismissed
-            // rather than torn down. Dismissing twice answers the same as
-            // dismissing once, never an error; anything else is refused.
-            None => {
-                if !agents.dismiss_tomb(terminal) {
-                    return ControlResponse::Failed {
-                        id,
-                        reason: format!("no terminal {terminal}"),
                     };
                 }
-                let _ = events
-                    .append_durable(vec![
-                        (
-                            qoro_events::Stream::Command(id.clone()),
-                            qoro_events::Body::Command {
-                                idempotency_key: id.clone(),
-                                operation: "CloseTerminal".into(),
-                                detail: serde_json::json!({ "terminal": terminal }),
-                            },
-                        ),
-                        (
-                            qoro_events::Stream::Command(id.clone()),
-                            qoro_events::Body::Outcome {
-                                idempotency_key: id.clone(),
-                                ok: true,
-                                detail: serde_json::json!({ "terminal": terminal }),
-                            },
-                        ),
-                    ])
-                    .await;
-                ControlResponse::TerminalClosed { id, terminal }
+                // Gone while the lock was waited for: asleep now, or closed. Let go, so
+                // the sleeping close below can take the lock of the space it is in.
+                drop(guard);
             }
-        },
+            // No live terminal: a tab of a sleeping space, closed for good without waking
+            // it. Anything else is refused.
+            match close_sleeping_tab(books, history_dir.as_deref(), terminal).await {
+                Ok(true) => {
+                    record_close(events, &id, terminal).await;
+                    return ControlResponse::TerminalClosed { id, terminal };
+                }
+                Ok(false) => {}
+                Err(reason) => return ControlResponse::Failed { id, reason },
+            }
+            ControlResponse::Failed {
+                id,
+                reason: format!("no terminal {terminal}"),
+            }
+        }
         ControlRequest::Scrollback {
             terminal, up, rows, ..
         } => {
@@ -2743,9 +2917,6 @@ async fn handle_control(
             // terminal ending after this is the daemon going rather than a person closing
             // a tab: recorded as closed, none of them would come back.
             stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-            // Sleep state is memory-only and never restored: dying with it
-            // is correct, and no teardown after this may entomb.
-            agents.clear_sleep_state();
             let live = terminals.streams();
             for stream in &live {
                 if let Some(handle) = terminals.get(*stream) {
@@ -2774,6 +2945,7 @@ async fn handle_control(
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
+                crate::store::settle_owed(deadline).await;
                 std::process::exit(0);
             });
             ControlResponse::Stopping {
@@ -2790,26 +2962,47 @@ async fn handle_control(
             // store knows which terminals were ever created in a workspace, and a client
             // drawing a list wants to know which ones are alive.
             let live = terminals.streams();
-            match store.workspaces().await {
-                Ok(rows) => ControlResponse::Workspaces {
-                    id,
-                    workspaces: rows
+            let rows = match store.workspaces().await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("the workspaces could not be read: {e}"),
+                    };
+                }
+            };
+            let mut workspaces = Vec::with_capacity(rows.len());
+            for row in rows {
+                let asleep = books.is_asleep(row.id);
+                // A sleeping space's tabs come from its rows: nothing of it is running.
+                let sleeping = if asleep {
+                    store
+                        .open_terminals(row.id)
+                        .await
+                        .unwrap_or_default()
                         .into_iter()
-                        .map(|row| crate::control::WorkspaceRow {
-                            id: row.id,
-                            name: row.name,
-                            terminals: live
-                                .iter()
-                                .filter(|s| terminals.workspace_of(**s) == Some(row.id))
-                                .count(),
+                        .map(|tab| crate::control::SleepingTab {
+                            terminal: tab.id as u32,
+                            title: tab.title,
+                            agent: tab.agent,
+                            cwd: tab.cwd,
                         })
-                        .collect(),
-                },
-                Err(e) => ControlResponse::Failed {
-                    id,
-                    reason: format!("the workspaces could not be read: {e}"),
-                },
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                workspaces.push(crate::control::WorkspaceRow {
+                    id: row.id,
+                    name: row.name,
+                    terminals: live
+                        .iter()
+                        .filter(|s| terminals.workspace_of(**s) == Some(row.id))
+                        .count(),
+                    asleep,
+                    sleeping,
+                });
             }
+            ControlResponse::Workspaces { id, workspaces }
         }
         ControlRequest::RenameTerminal { terminal, name, .. } => {
             // A name is trimmed here rather than at the client, because every client would
@@ -2883,16 +3076,33 @@ async fn handle_control(
                     ),
                 };
             }
-            let live = terminals
-                .streams()
-                .into_iter()
-                .filter(|s| terminals.workspace_of(*s) == Some(target))
-                .count();
+            // Counted from the store, not the live registry: a row that is open but not
+            // running (a stopped or sleeping tab) is still a tab, and the delete below
+            // cascades to it. An unreadable count refuses rather than guessing zero.
+            let _held = match held {
+                Some(guard) => guard,
+                None => books.lock_of(target).lock_owned().await,
+            };
+            let closing = books.closing.lock().unwrap().clone();
+            let live = match store.open_terminals(target).await {
+                // A tab whose close is on its way to the store is gone already.
+                Ok(rows) => rows
+                    .iter()
+                    .filter(|row| !closing.contains(&(row.id as u32)))
+                    .count(),
+                Err(e) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("the workspace could not be checked: {e}"),
+                    };
+                }
+            };
             if live > 0 {
                 return ControlResponse::Failed {
                     id,
                     reason: format!(
-                        "workspace {target} still holds {live} terminal{}, close them first",
+                        "workspace {target} still holds {live} tab{}, running or not \
+                         (stopped, asleep or not restored): close them first",
                         if live == 1 { "" } else { "s" }
                     ),
                 };
@@ -2902,16 +3112,41 @@ async fn handle_control(
                     id,
                     reason: format!("there is no workspace {target}"),
                 },
-                Ok(_) => ControlResponse::WorkspaceClosed {
-                    id,
-                    workspace: target,
-                },
+                Ok(_) => {
+                    // Its sleep mark went with the row; the mirror follows.
+                    books.asleep.lock().unwrap().remove(&target);
+                    ControlResponse::WorkspaceClosed {
+                        id,
+                        workspace: target,
+                    }
+                }
                 Err(e) => ControlResponse::Failed {
                     id,
                     reason: format!("the workspace could not be closed: {e}"),
                 },
             }
         }
+        ControlRequest::SleepWorkspace {
+            workspace: target, ..
+        } => match sleep_space(&restore(), target).await {
+            Ok(ended) => ControlResponse::WorkspaceAsleep {
+                id,
+                workspace: target,
+                terminals: ended,
+            },
+            Err(reason) => ControlResponse::Failed { id, reason },
+        },
+        ControlRequest::WakeWorkspace {
+            workspace: target, ..
+        } => match wake_space(&restore(), target).await {
+            Ok((woken, report)) => ControlResponse::WorkspaceAwake {
+                id,
+                workspace: woken,
+                terminals: report.brought_back,
+                resumed: report.agents_resumed,
+            },
+            Err(reason) => ControlResponse::Failed { id, reason },
+        },
         ControlRequest::ListAgents { .. } => {
             // What the attached interfaces count as news, read once for every row.
             let news = connections.news();
@@ -2942,7 +3177,7 @@ async fn handle_control(
             // One read of the registry for the rows and the splits both, so a terminal
             // that closes in between cannot be in one and not the other.
             let live = terminals.streams();
-            let mut rows: Vec<crate::control::AgentRow> = live
+            let rows: Vec<crate::control::AgentRow> = live
                 .iter()
                 .copied()
                 .map(|terminal| {
@@ -3068,17 +3303,21 @@ async fn handle_control(
                     }
                 })
                 .collect();
-            // Slept tabs stay visible as sleeping rows: same shape, the
-            // process gone, `slept_at_unix` saying when. `agent: true` so
-            // panels list them (live-agent *counts* exclude sleeping
-            // separately); every belief field absent rather than wrong.
-            for tomb in agents.tombs() {
-                rows.push(tomb_row(&tomb));
-            }
+            // A space still waking has only some of its tabs back: a tree cut to those would
+            // be taken as the whole split. Its trees come with the index after the wake.
+            let settled: Vec<u32> = live
+                .iter()
+                .copied()
+                .filter(|t| {
+                    !terminals
+                        .workspace_of(*t)
+                        .is_some_and(|w| books.is_asleep(w))
+                })
+                .collect();
             ControlResponse::Agents {
                 id,
                 agents: rows,
-                splits: terminals.live_splits(&live),
+                splits: terminals.live_splits(&settled),
             }
         }
         // A tree naming one terminal twice would come back on every index as a tab
@@ -3241,7 +3480,8 @@ async fn handle_control(
                     // spawned: a stop that lands between the answer and a background
                     // write would lose the conversation the tab was having.
                     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
-                        terminals.set_session(terminal, Some(session.clone()));
+                        let generation = agents.agent(terminal).map(|a| a.belief.generation.0);
+                        terminals.set_session(terminal, Some(session.clone()), generation);
                         let _ = store.set_agent_session(terminal as i64, session).await;
                     }
                     if changed {
@@ -3300,7 +3540,7 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 };
             }
-            terminals.set_session(terminal, Some(session.clone()));
+            terminals.set_session(terminal, Some(session.clone()), Some(generation.0));
             let _ = store.set_agent_session(terminal as i64, session).await;
             ControlResponse::AgentStateReported { id, terminal }
         }
@@ -3328,12 +3568,13 @@ async fn handle_control(
         }
         // Another machine is the interface's business, not this daemon's. Reaching here
         // means a client sent it straight to a daemon, and that is said rather than ignored.
-        ControlRequest::ListRemoteSessions { .. }
-        | ControlRequest::ConnectRemote { .. }
-        | ControlRequest::InstallRemote { .. } => ControlResponse::Failed {
-            id,
-            reason: "remote machines are reached by the interface, not by the daemon".to_string(),
-        },
+        ControlRequest::ConnectRemote { .. } | ControlRequest::InstallRemote { .. } => {
+            ControlResponse::Failed {
+                id,
+                reason: "remote machines are reached by the interface, not by the daemon"
+                    .to_string(),
+            }
+        }
         ControlRequest::ReloadAgentManifests { .. } => {
             // Answered live from the files, never journalled: a replayed answer
             // would lie about what the directory says now. Good files replace
@@ -3356,7 +3597,7 @@ async fn handle_control(
             let mut held = subscriptions.lock().unwrap();
             let dropped: Vec<u32> = wanted
                 .into_iter()
-                .filter_map(|s| held.remove(&s).map(|t| (s, t)))
+                .filter_map(|s| held.remove(&s).map(|(_, t)| (s, t)))
                 .map(|(s, task)| {
                     task.abort();
                     watched.unwatch(s);
@@ -3832,6 +4073,7 @@ pub fn open_terminal(
     let handle = TerminalHandle {
         name,
         session: None,
+        session_generation: None,
         // Seeded with where the shell starts: what was asked for, or the
         // daemon's own directory. The task writes the registry only when its
         // throttled read sees a change from there, so an unseeded tab that
@@ -3851,13 +4093,24 @@ pub fn open_terminal(
         image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         discards: Arc::default(),
         last_dims: Arc::new(std::sync::atomic::AtomicU64::new((80u64 << 32) | 24u64)),
+        incarnation: next_incarnation(),
     };
     terminals.insert(stream, handle.clone());
     let registry = terminals.clone();
     let spill = crate::spill::SpillRing::new();
     let history = history_dir.map(|dir| dir.join(stream.to_string()));
     if let Some(dir) = &history {
-        spawn_history_writer(dir.clone(), spill.clone(), behind.clone());
+        let (done, finished) = watch::channel(());
+        if let Some(books) = &books {
+            books.writers.lock().unwrap().insert(stream, finished);
+        }
+        spawn_history_writer(
+            dir.clone(),
+            spill.clone(),
+            behind.clone(),
+            handle.commands.downgrade(),
+            done,
+        );
     }
     let forgetting = agents.clone();
     let unregister = agents.clone();
@@ -3878,54 +4131,37 @@ pub fn open_terminal(
         spill,
         scanner,
         move || {
-            // Why this terminal ended decides what remains, decided once
-            // here: an explicit close forgets even if the reaper marked
-            // first, a reaper mark entombs so the slept tab stays visible
-            // as a sleeping row, anything else forgets as before. The
-            // snapshot is read while the live record still exists.
-            let (ending, marked_program) = forgetting.take_ending(stream);
-            let tomb = matches!(ending, crate::agents::TerminalEnding::Reaped).then(|| {
-                let snap = forgetting.reap_snapshot(stream);
-                let now = crate::agents::now_unix();
-                // The live snapshot first: a rename or program change after
-                // the mark still describes the tab better. The mark's copy
-                // is the fallback for what the exit settling already wiped.
-                let live_program = snap.as_ref().and_then(|s| s.program.clone());
-                crate::agents::Tombstone {
-                    stream,
-                    program: live_program.or(marked_program),
-                    name: registry.name_of(stream),
-                    workspace: registry.workspace_of(stream).unwrap_or(0),
-                    slept_at_unix: now,
-                    idle_secs: snap
-                        .as_ref()
-                        .and_then(|s| s.idle_since)
-                        .map(|since| now.saturating_sub(since))
-                        .unwrap_or(0),
-                }
-            });
-            registry.remove(stream);
-            // A slept tab keeps its history like it keeps its row in the index, for the rest
-            // of this daemon's life; the next start, which has no tombs, removes it.
-            let for_good = tomb.is_none();
-            match tomb {
-                Some(tomb) => forgetting.entomb(stream, tomb),
-                None => forgetting.forget(stream),
+            // An explicit close is read once here: it wins over a space going to sleep.
+            let closed = forgetting.take_closed(stream);
+            // Decided here, before the tab leaves the registry and while its workspace can
+            // still be read: a daemon going, or a space going to sleep, keeps the row open
+            // so the tab comes back. Anything else is a close, marked as under way until
+            // the store has it, so a wake in between does not reopen it.
+            let keeps = !closed
+                && books
+                    .as_ref()
+                    .is_some_and(|b| b.keeps_row(registry.workspace_of(stream)));
+            if !keeps && let Some(books) = &books {
+                books.closing.lock().unwrap().insert(stream);
             }
+            registry.remove(stream);
+            forgetting.forget(stream);
             // A tab whose process ended is a tab the person is done with, so it stops
             // coming back. A daemon going down is the other case and writes nothing, which
             // is exactly why the next start finds its terminals still open.
             if let Some(books) = books
-                && !books.stopping.load(std::sync::atomic::Ordering::SeqCst)
+                && !keeps
             {
+                let owed = crate::store::Owed::new();
                 tokio::spawn(async move {
+                    let _owed = owed;
                     let closed = books.store.close_terminal(stream as i64).await;
+                    books.closing.lock().unwrap().remove(&stream);
                     // History lives as long as the tab can come back, and a closed row
                     // never does. Only after the close landed: a row still open is
                     // restored with its history. The writer may still be on its last
                     // flush; it writes to unlinked files, which is harmless.
                     if closed.is_ok()
-                        && for_good
                         && let Some(dir) = history
                     {
                         let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
@@ -3964,14 +4200,14 @@ fn spawn_agent_recorder(
         loop {
             match changes.recv().await {
                 Ok(stream) => {
-                    record_stream(&agents, &books, &mut written, stream).await;
+                    record_stream(&agents, &terminals, &books, &mut written, stream).await;
                 }
                 // Announcements are news, not a ledger, but a reader that fell behind
                 // cannot know which terminals changed: re-read every open one rather
                 // than waiting for the next announcement, which may never come.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for stream in terminals.streams() {
-                        record_stream(&agents, &books, &mut written, stream).await;
+                        record_stream(&agents, &terminals, &books, &mut written, stream).await;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -3989,11 +4225,22 @@ fn spawn_agent_recorder(
 /// between the stop and the exit.
 async fn record_stream(
     agents: &Arc<crate::agents::AgentRegistry>,
+    terminals: &TerminalRegistry,
     books: &Bookkeeping,
     written: &mut BTreeMap<u32, Option<String>>,
     stream: u32,
 ) {
     if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    // A tab that has already left says nothing worth writing: closed, its row is closed
+    // anyway; asleep, the row must keep the agent it had. Nor does one whose space is
+    // going to sleep, for the same reason.
+    let Some(workspace) = terminals.workspace_of(stream) else {
+        written.remove(&stream);
+        return;
+    };
+    if books.is_asleep(workspace) {
         return;
     }
     let now = agent_program(agents, stream);
@@ -4123,13 +4370,16 @@ fn note_cwd(
     }
 }
 
-/// Bring back the split trees, cut down to the terminals that came back.
+/// Bring back the split trees, cut down to the terminals that came back or are asleep.
 ///
 /// Written back at once, because a dead leaf must not outlive a restart: ids can repeat
 /// after one (a deleted workspace takes its rows, highest ids included, with it), and a
-/// stale leaf would pull an unrelated new terminal into somebody's tab. While the daemon
-/// runs ids only grow, so the listing's own cut is enough from here on.
-async fn restore_splits(terminals: &TerminalRegistry, store: &crate::store::StoreHandle) {
+/// stale leaf would pull an unrelated new terminal into somebody's tab. A sleeping tab is
+/// not a dead leaf: its row is open and its number is kept, and its space's splits have to
+/// be there when it wakes. While the daemon runs ids only grow past every open row, so the
+/// listing's own cut is enough from here on.
+async fn restore_splits(terminals: &TerminalRegistry, books: &Bookkeeping) {
+    let store = &books.store;
     let stored: Vec<crate::control::Pane> = store
         .splits()
         .await
@@ -4138,7 +4388,20 @@ async fn restore_splits(terminals: &TerminalRegistry, store: &crate::store::Stor
         .filter_map(|json| serde_json::from_str(json).ok())
         .collect();
     terminals.load_splits(stored.clone());
-    let kept = terminals.live_splits(&terminals.streams());
+    // Every open row, not only the ones that came back: a tab that failed to reopen this
+    // start is still a tab, and its split is still its own.
+    let Ok(spaces) = store.workspaces().await else {
+        return;
+    };
+    let mut keep = terminals.streams();
+    for space in spaces {
+        match store.open_terminals(space.id).await {
+            Ok(rows) => keep.extend(rows.iter().map(|row| row.id as u32)),
+            // Not read, so not known to be dead: nothing is cut this start.
+            Err(_) => return,
+        }
+    }
+    let kept = terminals.live_splits(&keep);
     terminals.load_splits(kept.clone());
     if kept != stored {
         let _ = store.set_splits(splits_json(&kept)).await;
@@ -4161,6 +4424,69 @@ pub struct Bookkeeping {
     /// Set when the daemon is on its way out. A terminal that ends after this is not a tab
     /// a person closed: recording it as closed is exactly what would stop it coming back.
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// The workspaces asleep, as the store's `asleep` table says, held here because a
+    /// terminal's teardown decides whether its row stays open synchronously and cannot
+    /// wait on the store. Changed only under that workspace's lock, with the table.
+    pub asleep: Arc<std::sync::Mutex<BTreeSet<i64>>>,
+    /// Tabs closed for good whose close has not reached the store yet. A wake must not
+    /// bring one back in the moment between the tab going and its row saying so.
+    pub closing: Arc<std::sync::Mutex<BTreeSet<u32>>>,
+    /// Each terminal's history writer, which lets go of its end when it has written its
+    /// last row. A tab reopened on the same number waits for it: two writers on one
+    /// directory would number their rows over each other.
+    pub writers: Arc<std::sync::Mutex<std::collections::HashMap<u32, watch::Receiver<()>>>>,
+    /// One lock per workspace, held by whatever changes whether it is asleep: a sleep, a
+    /// wake, a tab made or closed in it, the workspace closing. It and `writers` keep an
+    /// entry for every id they were asked about: a few bytes each, for the daemon's life.
+    locks: Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Bookkeeping {
+    pub fn new(
+        store: crate::store::StoreHandle,
+        stopping: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            store,
+            stopping,
+            asleep: Arc::default(),
+            closing: Arc::default(),
+            writers: Arc::default(),
+            locks: Arc::default(),
+        }
+    }
+
+    /// Whether a terminal ending now keeps its row open: the daemon is going, or its
+    /// workspace is going to sleep.
+    fn keeps_row(&self, workspace: Option<i64>) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+            || workspace.is_some_and(|w| self.is_asleep(w))
+    }
+
+    pub fn is_asleep(&self, workspace: i64) -> bool {
+        self.asleep.lock().unwrap().contains(&workspace)
+    }
+
+    /// The lock of one workspace.
+    pub fn lock_of(&self, workspace: i64) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry(workspace)
+            .or_default()
+            .clone()
+    }
+
+    /// Wait until the history writer of a terminal number has finished, or `within` runs
+    /// out. True when it has (or there never was one).
+    async fn writer_done(&self, stream: u32, within: std::time::Duration) -> bool {
+        let Some(mut done) = self.writers.lock().unwrap().get(&stream).cloned() else {
+            return true;
+        };
+        tokio::time::timeout(within, async move { while done.changed().await.is_ok() {} })
+            .await
+            .is_ok()
+    }
 }
 
 pub struct Restore {
@@ -4247,7 +4573,8 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
     };
     report.spaces = spaces.len();
     // Every open row, for the history sweep below, and whether every list was read: a
-    // failed read must never make an open row look like it has no history to keep.
+    // failed read must never make an open row look like it has no history to keep. A
+    // sleeping space's rows are open rows: its history is kept like any other's.
     let mut open = std::collections::BTreeSet::new();
     let mut read_all = true;
     let mut listed = Vec::new();
@@ -4256,7 +4583,16 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
             read_all = false;
             continue;
         };
-        listed.push((space, rows));
+        for row in &rows {
+            let stream = row.id as u32;
+            open.insert(stream);
+            // The registry has to keep minting above what came back, or the next new
+            // terminal takes the number of one already on screen, or of one asleep.
+            into.terminals.mint_above(stream);
+        }
+        if !into.books.is_asleep(space.id) {
+            listed.push((space.id, rows));
+        }
     }
     // A directory that is gone is not a reason to lose the tab. The shell starts where the
     // daemon is instead, which is visible and recoverable, unlike a tab that silently did
@@ -4269,83 +4605,7 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
     )
     .await;
     for (space, rows) in listed {
-        for row in rows {
-            report.terminals += 1;
-            let stream = row.id as u32;
-            open.insert(stream);
-            // The registry has to keep minting above what came back, or the next new
-            // terminal takes the number of one already on screen.
-            into.terminals.mint_above(stream);
-            // The row keeps its directory either way.
-            let cwd = PathBuf::from(&row.cwd);
-            let cwd = dirs.contains(&cwd).then_some(cwd);
-            let opened = open_terminal(
-                &into.terminals,
-                stream,
-                space.id,
-                row.title.clone(),
-                &into.shell,
-                cwd.as_deref(),
-                into.warnings.clone(),
-                into.history_dir.clone(),
-                into.scanner.clone(),
-                into.agents.clone(),
-                into.events.clone(),
-                Some(into.books.clone()),
-            );
-            let Ok(handle) = opened else {
-                continue;
-            };
-            report.brought_back += 1;
-            // The DB row kept the conversation id (COALESCE preserves it),
-            // but `open_terminal` starts memory at `None`. Repopulate it so
-            // `agents --json` and `history` work right after a restart, before
-            // the next hook report. Fresh registry, no token to admit with,
-            // so this is a restore not a claim; first hook corrects staleness.
-            if let Some(session) = row.agent_session.as_deref()
-                && !session.trim().is_empty()
-            {
-                into.terminals
-                    .set_session(stream, Some(session.to_string()));
-            }
-            let resume = row
-                .agent
-                .as_deref()
-                .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()));
-            // The resume command is typed into the shell, and the send is what does
-            // it: a tab whose send failed holds a shell, not a resumed agent, and the
-            // report says so rather than counting an intent as a recovery.
-            let mut sent = false;
-            if let Some(argv) = resume {
-                let mut line = shell_line(&argv);
-                line.push('\r');
-                sent = handle
-                    .commands
-                    .send(ClientCommand::Input {
-                        from: ClientId::new("qoro-restore"),
-                        bytes: Bytes::from(line),
-                    })
-                    .await
-                    .is_ok();
-            }
-            match (&row.agent, sent) {
-                (Some(_), true) => {
-                    report.agents_resumed += 1;
-                }
-                (Some(_), false) => {
-                    report.agents_shell_fallback += 1;
-                }
-                (None, _) => {
-                    report.plain_shells += 1;
-                }
-            }
-            // A row whose directory is gone started where the daemon is instead. Counted
-            // here, after the open succeeded, so a tab that never opened is missing from
-            // both halves of the summary rather than half reported as moved.
-            if cwd.is_none() {
-                report.cwd_fallback += 1;
-            }
-        }
+        restore_rows(into, space, rows, &dirs, &mut report).await;
     }
     // History no open row owns: tabs closed before history was deleted with them, tabs
     // slept in the last run, crash leftovers. Before any new id is minted, so a new tab
@@ -4354,6 +4614,582 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
         let _ = crate::blocking::run(move || sweep_history(&dir, &open)).await;
     }
     report
+}
+
+/// Reopen one workspace's rows: the same numbers, names and directories, and each agent's
+/// own resume command typed into its shell. Shared by a restart and by a wake.
+async fn restore_rows(
+    into: &Restore,
+    space: i64,
+    rows: Vec<qoro_store::TerminalRow>,
+    dirs: &std::collections::BTreeSet<PathBuf>,
+    report: &mut RestoreReport,
+) {
+    for row in rows {
+        // A stop that came in meanwhile has already asked every open tab to close, and a
+        // tab opened after that would be one it never asks.
+        if into
+            .books
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+        report.terminals += 1;
+        let stream = row.id as u32;
+        // The row keeps its directory either way.
+        let cwd = PathBuf::from(&row.cwd);
+        let cwd = dirs.contains(&cwd).then_some(cwd);
+        let opened = open_terminal(
+            &into.terminals,
+            stream,
+            space,
+            row.title.clone(),
+            &into.shell,
+            cwd.as_deref(),
+            into.warnings.clone(),
+            into.history_dir.clone(),
+            into.scanner.clone(),
+            into.agents.clone(),
+            into.events.clone(),
+            Some(into.books.clone()),
+        );
+        let Ok(handle) = opened else {
+            continue;
+        };
+        report.brought_back += 1;
+        // The DB row kept the conversation id (COALESCE preserves it),
+        // but `open_terminal` starts memory at `None`. Repopulate it so
+        // `agents --json` and `history` work right after a restart, before
+        // the next hook report. Fresh registry, no token to admit with,
+        // so this is a restore not a claim; first hook corrects staleness.
+        if let Some(session) = row.agent_session.as_deref()
+            && !session.trim().is_empty()
+        {
+            into.terminals
+                .set_session(stream, Some(session.to_string()), None);
+        }
+        let resume = row
+            .agent
+            .as_deref()
+            .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()));
+        // The resume command is typed into the shell, and the send is what does
+        // it: a tab whose send failed holds a shell, not a resumed agent, and the
+        // report says so rather than counting an intent as a recovery.
+        let mut sent = false;
+        if let Some(argv) = resume {
+            let mut line = shell_line(&argv);
+            line.push('\r');
+            sent = handle
+                .commands
+                .send(ClientCommand::Input {
+                    from: ClientId::new("qoro-restore"),
+                    bytes: Bytes::from(line),
+                })
+                .await
+                .is_ok();
+        }
+        match (&row.agent, sent) {
+            (Some(_), true) => {
+                report.agents_resumed += 1;
+            }
+            (Some(_), false) => {
+                report.agents_shell_fallback += 1;
+            }
+            (None, _) => {
+                report.plain_shells += 1;
+            }
+        }
+        // A row whose directory is gone started where the daemon is instead. Counted
+        // here, after the open succeeded, so a tab that never opened is missing from
+        // both halves of the summary rather than half reported as moved.
+        if cwd.is_none() {
+            report.cwd_fallback += 1;
+        }
+    }
+}
+
+/// Why one terminal cannot go to sleep, or what its row has to say when it does.
+///
+/// A tab can sleep only if it can come back as it is: a shell at its prompt, or a known
+/// agent that is idle or done, has told us its conversation in this run of it, and can be
+/// resumed into that conversation by id. Anything still running in it, in front or in the
+/// background, would be lost, or would outlive the sleep; either is a refusal.
+fn vet_for_sleep(
+    into: &Restore,
+    stream: u32,
+    table: &[qoro_pty::sys::ProcRow],
+) -> Result<qoro_store::Checkpoint, String> {
+    use crate::idle::ForegroundKind as K;
+    use qoro_domain::AgentRuntimeState as S;
+    let snap = into
+        .agents
+        .reap_snapshot(stream)
+        .ok_or("it has not been read yet")?;
+    if snap.boundary {
+        return Err("qoro cannot see what runs in it".into());
+    }
+    if snap.setup_gate {
+        return Err("it is waiting on its setup".into());
+    }
+    let state = format!("{:?}", snap.state).to_lowercase();
+    let master = into.agents.master_of(stream);
+    let (agent, agent_session) =
+        match crate::idle::classify_program(snap.program.as_deref(), snap.agent) {
+            K::Absent | K::Shell => {
+                if matches!(snap.state, S::Starting | S::Working | S::Blocked) {
+                    return Err(format!("it is {state}"));
+                }
+                if master.is_some_and(crate::idle::group_holds_task) {
+                    return Err("a command is running in it".into());
+                }
+                (None, None)
+            }
+            K::Agent => {
+                let name = agent_program(&into.agents, stream)
+                    .or(snap.program.clone())
+                    .unwrap_or_default();
+                if !matches!(snap.state, S::Idle | S::Done) {
+                    return Err(format!("{name} is {state}"));
+                }
+                let handle = into.terminals.get(stream).ok_or("it has gone")?;
+                let session = handle
+                    .session
+                    .clone()
+                    .filter(|_| handle.session_generation == Some(snap.generation.0))
+                    .ok_or(format!(
+                        "{name} has not said which conversation it is in (`qoro hooks install`)"
+                    ))?;
+                if !qoro_detect::resumes_by_id(&name) {
+                    return Err(format!(
+                        "{name} cannot be resumed into a given conversation"
+                    ));
+                }
+                (Some(name), Some(session))
+            }
+            K::Other => {
+                return Err(format!(
+                    "{} is running in it",
+                    snap.program.as_deref().unwrap_or("a command")
+                ));
+            }
+        };
+    let (leader, tty) = into
+        .agents
+        .leader_of(stream)
+        .ok_or("its process is not known")?;
+    let foreground = master
+        .and_then(qoro_pty::sys::foreground_pgrp)
+        .map(|group| group.0);
+    let blockers = crate::idle::sleep_blockers(table, leader, foreground, tty);
+    if !blockers.is_empty() {
+        return Err(format!("{} running in the background", blockers.join(", ")));
+    }
+    Ok(qoro_store::Checkpoint {
+        terminal: stream as i64,
+        agent,
+        agent_session,
+    })
+}
+
+/// Put one workspace to sleep. Answers how many tabs ended. See
+/// `ControlRequest::SleepWorkspace`.
+async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
+    let lock = into.books.lock_of(workspace);
+    let _held = lock.lock().await;
+    if into
+        .books
+        .stopping
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("qoro is stopping".into());
+    }
+    let live = |into: &Restore| -> Vec<u32> {
+        into.terminals
+            .streams()
+            .into_iter()
+            .filter(|s| into.terminals.workspace_of(*s) == Some(workspace))
+            .collect()
+    };
+    // Asleep already: nothing to vet, and whatever of it is still running is a sleep that
+    // did not finish, ended now.
+    if into.books.is_asleep(workspace) {
+        let streams = live(into);
+        return end_tabs(into, &streams).await.map(|()| 0);
+    }
+    let known = into
+        .books
+        .store
+        .workspaces()
+        .await
+        .map_err(|e| format!("the spaces could not be read: {e}"))?;
+    if !known.iter().any(|space| space.id == workspace) {
+        return Err(format!("there is no space {workspace}"));
+    }
+    let streams = live(into);
+    if streams.is_empty() {
+        return Err(format!("nothing in space {workspace} is running"));
+    }
+    // A tab waiting on another, or waited on by one, is part of a conversation between
+    // agents that a sleep would cut in half, and the wait itself is not written anywhere.
+    let edges: Vec<(u32, u32)> = into
+        .agents
+        .expectation_edges()
+        .into_iter()
+        .filter(|(_, target)| !into.agents.is_closed(*target))
+        .collect();
+    if let Some((waiter, target)) = edges
+        .iter()
+        .find(|(waiter, target)| streams.contains(waiter) || streams.contains(target))
+    {
+        return Err(format!(
+            "space {workspace} stays awake: tab {waiter} is waiting on tab {target}"
+        ));
+    }
+    // Read now, not from the last scan: a job started a moment ago is exactly the one a
+    // sleep must not miss.
+    let table =
+        crate::blocking::run_within(crate::store::STORE_DEADLINE, qoro_pty::sys::process_table)
+            .await
+            .map_err(|_| "the process table could not be read".to_string())?;
+    let vet = |into: &Restore| -> Result<Vec<qoro_store::Checkpoint>, String> {
+        let mut checkpoints = Vec::new();
+        let mut refused = Vec::new();
+        for stream in &streams {
+            match vet_for_sleep(into, *stream, &table) {
+                Ok(checkpoint) => checkpoints.push(checkpoint),
+                Err(why) => refused.push(format!("tab {stream}: {why}")),
+            }
+        }
+        if refused.is_empty() {
+            Ok(checkpoints)
+        } else {
+            Err(format!(
+                "space {workspace} stays awake: {}",
+                refused.join("; ")
+            ))
+        }
+    };
+    let checkpoints = vet(into)?;
+    let written = into
+        .books
+        .store
+        .sleep_workspace(workspace, checkpoints.clone())
+        .await;
+    // Looked at again after the write, the whole vet: a command typed, an agent that
+    // started working, a new conversation in a tab, in the moment the write took, would be
+    // put down mid-thought or brought back into the wrong conversation.
+    let still = vet(into);
+    if written.is_err() || still.as_ref() != Ok(&checkpoints) {
+        // A write that timed out still lands later; taking the mark off after it is what
+        // keeps the table and this daemon from disagreeing about an awake space.
+        let _ = into.books.store.wake_workspace(workspace).await;
+        return Err(match (written, still) {
+            (Err(e), _) => format!("the sleep could not be written down: {e}"),
+            (_, Err(why)) => why,
+            _ => format!("space {workspace} stays awake: a tab changed while it was written down"),
+        });
+    }
+    into.books.asleep.lock().unwrap().insert(workspace);
+    end_tabs(into, &streams).await?;
+    Ok(streams.len())
+}
+
+/// Ask each tab to end, and wait for it and its history to be gone, under one deadline for
+/// them all. A tab still running at the end is said by number; the space stays marked
+/// asleep, so asking again finishes it.
+async fn end_tabs(into: &Restore, streams: &[u32]) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
+    for stream in streams {
+        if let Some(handle) = into.terminals.get(*stream) {
+            let _ =
+                tokio::time::timeout_at(deadline, handle.commands.send(ClientCommand::Close)).await;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
+    while streams.iter().any(|s| into.terminals.get(*s).is_some())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if let Some(stuck) = streams.iter().find(|s| into.terminals.get(**s).is_some()) {
+        return Err(format!(
+            "tab {stuck} did not end in time; asking again finishes it"
+        ));
+    }
+    for stream in streams {
+        if !into.books.writer_done(*stream, SHUTDOWN_PATIENCE).await {
+            eprintln!("qorod: the history of tab {stream} was still being written at its sleep");
+        }
+    }
+    Ok(())
+}
+
+/// Close a tab of a sleeping space for good: its row closed and its history removed, and
+/// the space left asleep. False when no sleeping space holds the tab.
+async fn close_sleeping_tab(
+    books: &Bookkeeping,
+    history_dir: Option<&Path>,
+    terminal: u32,
+) -> Result<bool, String> {
+    let asleep: Vec<i64> = books.asleep.lock().unwrap().iter().copied().collect();
+    for workspace in asleep {
+        let lock = books.lock_of(workspace);
+        let _held = lock.lock().await;
+        // Read under the lock: a wake that got there first has taken the tab back.
+        if !books.is_asleep(workspace) {
+            continue;
+        }
+        let rows = books
+            .store
+            .open_terminals(workspace)
+            .await
+            .map_err(|e| format!("the sleeping tabs could not be read: {e}"))?;
+        if !rows.iter().any(|row| row.id == terminal as i64) {
+            continue;
+        }
+        books
+            .store
+            .close_terminal(terminal as i64)
+            .await
+            .map_err(|e| format!("tab {terminal} could not be closed: {e}"))?;
+        if let Some(dir) = history_dir.map(|dir| dir.join(terminal.to_string())) {
+            let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Wake one workspace, or the one that went to sleep last. Answers which, and what came
+/// back. See `ControlRequest::WakeWorkspace`.
+async fn wake_space(
+    into: &Restore,
+    workspace: Option<i64>,
+) -> Result<(i64, RestoreReport), String> {
+    let workspace = match workspace {
+        Some(workspace) => workspace,
+        None => into
+            .books
+            .store
+            .asleep()
+            .await
+            .map_err(|e| format!("the sleeping spaces could not be read: {e}"))?
+            .first()
+            .map(|(workspace, _)| *workspace)
+            .ok_or("nothing is asleep")?,
+    };
+    let lock = into.books.lock_of(workspace);
+    let _held = lock.lock().await;
+    wake_locked(into, workspace)
+        .await
+        .map(|report| (workspace, report))
+}
+
+/// The wake itself, with the workspace's lock already held.
+async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, String> {
+    if into
+        .books
+        .stopping
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("qoro is stopping".into());
+    }
+    if !into.books.is_asleep(workspace) {
+        // Awake here; the table is told so as well, which is what brings the two back
+        // together after a sleep whose write timed out and landed late.
+        let _ = into.books.store.wake_workspace(workspace).await;
+        return Ok(RestoreReport::default());
+    }
+    // A tab of a sleep that has not finished is still ending: waited out, because reopening
+    // its row now would race its teardown into closing it for good.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
+    let ending = || {
+        into.terminals
+            .streams()
+            .into_iter()
+            .find(|s| into.terminals.workspace_of(*s) == Some(workspace))
+    };
+    while ending().is_some() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if let Some(stuck) = ending() {
+        return Err(format!(
+            "tab {stuck} is still going to sleep; try again in a moment"
+        ));
+    }
+    let rows = into
+        .books
+        .store
+        .open_terminals(workspace)
+        .await
+        .map_err(|e| format!("the space's tabs could not be read: {e}"))?;
+    // Read after the store answered: a close that landed meanwhile is already in the set.
+    let closing = into.books.closing.lock().unwrap().clone();
+    let rows: Vec<qoro_store::TerminalRow> = rows
+        .into_iter()
+        .filter(|row| {
+            let stream = row.id as u32;
+            into.terminals.get(stream).is_none() && !closing.contains(&stream)
+        })
+        .collect();
+    for row in &rows {
+        if !into
+            .books
+            .writer_done(row.id as u32, std::time::Duration::from_secs(30))
+            .await
+        {
+            return Err(format!(
+                "tab {} is still writing down its history; try again in a moment",
+                row.id
+            ));
+        }
+    }
+    let dirs = existing_dirs(rows.iter().map(|row| PathBuf::from(&row.cwd))).await;
+    let mut report = RestoreReport::default();
+    let first = rows.first().map(|row| row.id as u32);
+    restore_rows(into, workspace, rows, &dirs, &mut report).await;
+    // The mark comes off last: until then a late write about the tabs that slept still
+    // meets it, and the rows read above are what came back.
+    let unmarked = into.books.store.wake_workspace(workspace).await;
+    into.books.asleep.lock().unwrap().remove(&workspace);
+    // The index its splits were held out of is asked for again, now whole.
+    if let Some(first) = first {
+        into.agents.announce(first);
+    }
+    unmarked
+        .map_err(|e| format!("the space is up, but its sleep mark could not be taken off: {e}"))?;
+    Ok(report)
+}
+
+/// Close every descriptor the daemon was started with past stdin, stdout and stderr.
+///
+/// The daemon outlives whoever started it, and every tab's shell inherits what it holds, so
+/// a pipe that leaked into the starter (a `$(qoro ...)` in a script, or another thread's
+/// pipe caught mid-spawn) would otherwise never see its end and its reader waits forever.
+/// Call it first thing, before anything of the daemon's own is open.
+pub fn close_inherited_fds() {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<i32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter(|&fd| fd > 2)
+        .collect();
+    // The listing's own descriptor is among them and is already closed: EBADF, harmless,
+    // since nothing else opens anything in between.
+    for fd in fds {
+        // SAFETY: nothing in this process owns a descriptor above 2 yet.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// How long nothing has to be awake, with nobody attached, before the daemon leaves.
+const LEAVE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the leaving watch reads.
+struct Leaving {
+    terminals: Arc<TerminalRegistry>,
+    connections: Arc<ConnectionRegistry>,
+    agents: Arc<crate::agents::AgentRegistry>,
+    books: Bookkeeping,
+    socket: PathBuf,
+}
+
+impl Leaving {
+    /// Nothing awake, nobody attached, and not already on the way out.
+    fn quiet(&self) -> bool {
+        self.terminals.is_empty()
+            && self.connections.holders() == 0
+            && !self
+                .books
+                .stopping
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Leave once nothing has been awake and nobody attached for `LEAVE_AFTER`, so a machine
+/// whose spaces are all asleep costs nothing at all.
+///
+/// Woken by what changes the answer, never by a timer while something is awake: a tab
+/// coming or going, a connection coming, being welcomed or going. The countdown starts when
+/// the daemon falls quiet and is not restarted by a watcher reconnecting, which would
+/// otherwise keep a daemon up by watching it. `daemon.exit_when_asleep = false` in the
+/// config keeps it up.
+async fn leave_when_idle(watch: Leaving) {
+    let mut changes = watch.agents.subscribe();
+    loop {
+        while !watch.quiet() {
+            tokio::select! {
+                _ = watch.connections.changed.notified() => {}
+                changed = changes.recv() => {
+                    if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        return;
+                    }
+                }
+            }
+        }
+        if !crate::config::read().exit_when_asleep {
+            watch.connections.changed.notified().await;
+            continue;
+        }
+        let deadline = tokio::time::Instant::now() + LEAVE_AFTER;
+        let lasted = loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break true,
+                _ = watch.connections.changed.notified() => {}
+                changed = changes.recv() => {
+                    if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        return;
+                    }
+                }
+            }
+            if !watch.quiet() {
+                break false;
+            }
+        };
+        if lasted && leave(&watch).await {
+            return;
+        }
+    }
+}
+
+/// Go, unless something came in the meantime; false then, and the daemon carries on.
+///
+/// Under the startup lock, so a daemon started meanwhile waits for this one to be gone
+/// rather than binding beside it; checked again under it, after every connection already
+/// accepted has been welcomed or has gone. Then new connections are closed as they come and
+/// the socket goes, so the next client starts the next daemon, which the lock holds until
+/// this process has exited.
+async fn leave(watch: &Leaving) -> bool {
+    let Some(dir) = watch.socket.parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    let lock = tokio::task::spawn_blocking(move || {
+        crate::lock::StartupLock::acquire(&crate::paths::lock_path(&dir))
+    })
+    .await;
+    let Ok(Ok(lock)) = lock else {
+        return false;
+    };
+    let deadline = tokio::time::Instant::now() + qoro_proto::reassembly::SEQUENCE_DEADLINE;
+    while watch.connections.pending() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if !watch.quiet() || !watch.connections.close_if_unheld() {
+        drop(lock);
+        return false;
+    }
+    let _ = std::fs::remove_file(&watch.socket);
+    watch
+        .books
+        .stopping
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
+    eprintln!("qorod: nothing is awake and nobody is attached; leaving");
+    // The lock goes with the process, and with it the next daemon may bind.
+    std::process::exit(0);
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.
@@ -4410,8 +5246,8 @@ pub(crate) fn unparsable(error: &str) -> String {
     if error.contains("unknown variant") {
         return format!(
             "this daemon is older than the client that called it: it does not know the \
-             method that was asked for ({error}). stop the session and open it again to \
-             pick up the new daemon; what is open comes back."
+             method that was asked for ({error}). `qoro stop`, then `qoro`, picks up the new \
+             daemon; what is open comes back."
         );
     }
     format!("malformed control request: {error}")
@@ -4728,8 +5564,14 @@ fn spawn_history_writer(
     dir: PathBuf,
     spill: crate::spill::SpillRing,
     rows_behind: Arc<std::sync::atomic::AtomicU64>,
+    commands: mpsc::WeakSender<ClientCommand>,
+    done: watch::Sender<()>,
 ) {
+    let owed = crate::store::Owed::new();
     tokio::spawn(async move {
+        let _owed = owed;
+        // Dropped with the task, however it ends: that is the signal a reopen waits for.
+        let _done = done;
         // The open is a blocking call too, and a hundred of them at once is a hundred
         // threads.
         let mut history = match crate::blocking::run({
@@ -4744,6 +5586,18 @@ fn spawn_history_writer(
                 return;
             }
         };
+        // What a restored tab already has on disk is behind its screen from the first
+        // snapshot: published only after the next append, a tab that came back quiet
+        // could not be scrolled into at all.
+        rows_behind.store(history.len(), std::sync::atomic::Ordering::Relaxed);
+        // The screen that went out before this count was known said nothing is behind it,
+        // and a quiet tab would not send another: ask for one that says what is.
+        if !history.is_empty()
+            && let Some(commands) = commands.upgrade()
+        {
+            let _ = commands.try_send(ClientCommand::Refresh);
+        }
+        drop(commands);
         let mut unflushed = false;
         loop {
             // A timeout only while there is something to flush.
@@ -4850,7 +5704,12 @@ fn spawn_history_writer(
                 }
                 Ok((h, Err(e))) => {
                     history = h;
-                    eprintln!("qorod: history write failed: {e}");
+                    // The last rows of a tab closed for good race the removal of its
+                    // directory, and losing them there is the point, not a failure.
+                    let gone = finished && !dir.exists();
+                    if !gone {
+                        eprintln!("qorod: history write failed: {e}");
+                    }
                 }
                 Err(_) => return,
             }
@@ -4969,6 +5828,7 @@ fn spawn_terminal(
     // through the terminal's own task: that task is parked waiting for output that a
     // `sleep` will never produce.
     register_master.attach_master(stream, master_fd.as_raw_fd());
+    register_master.attach_leader(stream, child.id() as i32, sys::scan_key(tty_dev));
 
     // What the supervisor needs if the task below panics: the nested task dies
     // with the child handle, so the ordered teardown never runs. The tty
@@ -6115,6 +6975,19 @@ async fn terminal_task(
         &scanner,
     )
     .await;
+    // The history gets the rest of the tab: what scrolled off while it was being torn down,
+    // then the screen it was showing. Only rows that scrolled off were ever written, so a
+    // tab that stopped or slept came back without the output of its last command. The
+    // alternate screen is a program's own canvas, not output, and stays out. A tab that
+    // was closed for good has its history removed afterwards, so this costs it nothing.
+    spill.push(engine.take_scrolled_off());
+    if !engine.modes().alt_screen {
+        let mut screen = engine.visible_text();
+        while screen.last().is_some_and(|row| row.trim().is_empty()) {
+            screen.pop();
+        }
+        spill.push(screen);
+    }
     // While `afd` still holds the descriptor: returning closes it, and the number must not
     // be readable through the registry once another terminal can be handed it.
     agents.detach_master(stream);
@@ -6788,333 +7661,6 @@ mod restore_report_tests {
         .await
         .expect("an empty tree kills nothing and waits for nothing");
         assert_eq!(seen, 0, "nothing was tracked on an empty tty");
-    }
-}
-
-#[cfg(test)]
-mod idle_reap_tests {
-    //! The reaper harness: `reap_pass` against a registry with scripted
-    //! terminals, asserting what gets a `Close` and what does not. Narrow on
-    //! purpose (no full daemon boot): the eligibility table itself is pinned
-    //! in `idle.rs`, and this pins the wiring around it.
-    use super::*;
-    use crate::agents::{AgentRegistry, mint_token, now_unix};
-
-    /// One scripted terminal: registered, spawn-seeded, given a foreground
-    /// identity and a bogus master (no group to protect), and inserted with
-    /// a command channel the test reads. Returns the channel, the token,
-    /// and a spare sender for filling the queue.
-    fn add_terminal(
-        terminals: &Arc<TerminalRegistry>,
-        agents: &Arc<AgentRegistry>,
-        stream: u32,
-    ) -> (
-        mpsc::Receiver<ClientCommand>,
-        qoro_domain::CapabilityToken,
-        mpsc::Sender<ClientCommand>,
-    ) {
-        let token = mint_token(stream);
-        let terminal_id = TerminalId::new(stream.to_string());
-        agents.register(stream, terminal_id.clone(), token.clone());
-        let (tx, rx) = mpsc::channel(8);
-        let engine = AlacrittyEngine::new(80, 24);
-        let (updates, _) = watch::channel(TerminalUpdate::Full(engine.snapshot()));
-        terminals.insert(
-            stream,
-            TerminalHandle {
-                workspace: 1,
-                name: None,
-                session: None,
-                cwd: None,
-                id: terminal_id,
-                history: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                token: token.clone(),
-                commands: tx.clone(),
-                updates,
-                last_image: Arc::new(std::sync::Mutex::new(None)),
-                image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                discards: Arc::default(),
-                last_dims: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            },
-        );
-        (rx, token, tx)
-    }
-
-    fn harness() -> (
-        Arc<TerminalRegistry>,
-        Arc<AgentRegistry>,
-        crate::eventlog::EventLog,
-        crate::idle::WatchCounts,
-    ) {
-        (
-            Arc::new(TerminalRegistry::default()),
-            Arc::new(AgentRegistry::new().expect("registry")),
-            crate::eventlog::EventLog::new(qoro_events::EventStore::in_memory().expect("open")),
-            crate::idle::WatchCounts::default(),
-        )
-    }
-
-    /// An idle shell is asked to close exactly once; a second pass while it
-    /// lingers finds the in-flight set, not the channel.
-    #[tokio::test]
-    async fn an_idle_shell_is_closed_once_and_never_twice() {
-        let (terminals, agents, events, watched) = harness();
-        let (mut rx, _token, _tx) = add_terminal(&terminals, &agents, 1);
-        let ancient = now_unix() - 7200;
-        agents.note_spawn(1, ancient);
-        agents.test_set_foreground(1, Some("zsh"), false);
-        agents.attach_master(1, -1);
-        let mut in_flight = BTreeSet::new();
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(
-            matches!(rx.try_recv(), Ok(ClientCommand::Close)),
-            "an idle shell gets one Close"
-        );
-        assert!(in_flight.contains(&1));
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "the in-flight set suppresses the second ask"
-        );
-    }
-
-    /// Everything that must survive a pass: a working agent, a blocked one,
-    /// a tab with fresh output, a watched tab, a boundary tab, and a task in
-    /// the foreground. None gets a `Close`.
-    #[tokio::test]
-    async fn busy_watched_and_unreadable_tabs_survive_a_pass() {
-        let (terminals, agents, events, watched) = harness();
-        let now = now_unix();
-        let ancient = now - 7200;
-        // Working agent, idle for two hours: the state vetoes.
-        let (mut working_rx, working_token, _tx1) = add_terminal(&terminals, &agents, 1);
-        agents.note_spawn(1, ancient);
-        agents.test_set_foreground(1, Some("claude"), false);
-        agents
-            .observe_hook(
-                1,
-                &TerminalId::new("1"),
-                &working_token,
-                qoro_domain::AgentRuntimeState::Working,
-                false,
-                false,
-                ancient,
-            )
-            .expect("applies");
-        agents.attach_master(1, -1);
-        // Blocked agent: the state vetoes, whatever the screen says.
-        let (mut blocked_rx, blocked_token, _tx2) = add_terminal(&terminals, &agents, 2);
-        agents.note_spawn(2, ancient);
-        agents.test_set_foreground(2, Some("codex"), false);
-        agents
-            .observe_hook(
-                2,
-                &TerminalId::new("2"),
-                &blocked_token,
-                qoro_domain::AgentRuntimeState::Blocked,
-                true,
-                false,
-                ancient,
-            )
-            .expect("applies");
-        agents.attach_master(2, -1);
-        // Idle shell with fresh output: the IO clock vetoes.
-        let (mut fresh_rx, _fresh_token, _tx3) = add_terminal(&terminals, &agents, 3);
-        agents.note_spawn(3, ancient);
-        agents.test_set_foreground(3, Some("bash"), false);
-        agents.note_io(3, now);
-        agents.attach_master(3, -1);
-        // Idle shell somebody watches: the watcher vetoes.
-        let (mut watched_rx, _watched_token, _tx4) = add_terminal(&terminals, &agents, 4);
-        agents.note_spawn(4, ancient);
-        agents.test_set_foreground(4, Some("sh"), false);
-        agents.attach_master(4, -1);
-        watched.watch(4);
-        // Idle behind a wrapper the daemon cannot see through: vetoes.
-        let (mut boundary_rx, _boundary_token, _tx5) = add_terminal(&terminals, &agents, 5);
-        agents.note_spawn(5, ancient);
-        agents.test_set_foreground(5, None, true);
-        agents.attach_master(5, -1);
-        // Idle belief with a task in the foreground: vetoes.
-        let (mut task_rx, task_token, _tx6) = add_terminal(&terminals, &agents, 6);
-        agents.note_spawn(6, ancient);
-        agents.test_set_foreground(6, Some("cargo"), false);
-        agents
-            .observe_hook(
-                6,
-                &TerminalId::new("6"),
-                &task_token,
-                qoro_domain::AgentRuntimeState::Idle,
-                false,
-                false,
-                ancient,
-            )
-            .expect("applies");
-        agents.attach_master(6, -1);
-
-        let mut in_flight = BTreeSet::new();
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        for (name, rx) in [
-            ("working", &mut working_rx),
-            ("blocked", &mut blocked_rx),
-            ("fresh output", &mut fresh_rx),
-            ("watched", &mut watched_rx),
-            ("boundary", &mut boundary_rx),
-            ("task foreground", &mut task_rx),
-        ] {
-            assert!(rx.try_recv().is_err(), "{name} survives the pass");
-        }
-        assert!(in_flight.is_empty(), "nothing was asked");
-    }
-
-    /// A full command queue is one being pasted into: the pass skips the
-    /// terminal this round, sends nothing, and retries the next.
-    #[tokio::test]
-    async fn a_full_command_queue_defers_the_reap() {
-        let (terminals, agents, events, watched) = harness();
-        let (mut rx, _token, tx) = add_terminal(&terminals, &agents, 1);
-        agents.note_spawn(1, now_unix() - 7200);
-        agents.test_set_foreground(1, Some("zsh"), false);
-        agents.attach_master(1, -1);
-        for _ in 0..8 {
-            tx.try_send(ClientCommand::Close)
-                .expect("filling the queue");
-        }
-        let mut in_flight = BTreeSet::new();
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(in_flight.is_empty(), "a full queue is asked nothing");
-        let mut buffered = 0;
-        while rx.try_recv().is_ok() {
-            buffered += 1;
-        }
-        assert_eq!(buffered, 8, "only what the test filled is there");
-    }
-
-    /// A sender claim binds by token: the right token for a live terminal
-    /// records the wait; a forged token, an unknown terminal, or a claim
-    /// about the target itself is ignored.
-    #[test]
-    fn waiter_claims_bind_by_token_or_not_at_all() {
-        let (terminals, agents, _events, _watched) = harness();
-        let (_rx, token, _tx) = add_terminal(&terminals, &agents, 1);
-        let (_rx2, _token2, _tx2) = add_terminal(&terminals, &agents, 2);
-        let good = token.as_str();
-        assert!(verify_waiter(&agents, &terminals, 1, good, 2));
-        assert!(!verify_waiter(&agents, &terminals, 1, "forged", 2));
-        assert!(
-            !verify_waiter(&agents, &terminals, 9, good, 2),
-            "unknown waiter"
-        );
-        assert!(
-            !verify_waiter(&agents, &terminals, 1, good, 1),
-            "self is not a wait"
-        );
-        assert!(
-            !verify_waiter(&agents, &terminals, 2, good, 1),
-            "terminal 1's token proves nothing about terminal 2"
-        );
-    }
-
-    /// End to end through the pass: a waiter survives while its target is
-    /// busy, and both sleep together when both are idle.
-    #[tokio::test]
-    async fn a_waiter_survives_while_its_target_is_busy() {
-        let (terminals, agents, events, watched) = harness();
-        let ancient = now_unix() - 7200;
-        let (mut x_rx, _x_token, _x_tx) = add_terminal(&terminals, &agents, 1);
-        let (mut y_rx, y_token, _y_tx) = add_terminal(&terminals, &agents, 2);
-        for stream in [1, 2] {
-            agents.note_spawn(stream, ancient);
-            agents.attach_master(stream, -1);
-        }
-        agents.test_set_foreground(1, Some("zsh"), false);
-        agents.test_set_foreground(2, Some("claude"), false);
-        agents
-            .observe_hook(
-                2,
-                &TerminalId::new("2"),
-                &y_token,
-                qoro_domain::AgentRuntimeState::Working,
-                false,
-                false,
-                ancient,
-            )
-            .expect("applies");
-        // Terminal 1 asks terminal 2, with its own token: the wait is real.
-        agents.note_expectation(1, 2, ancient);
-        // Then prints, the way an agent renders its tool result and ends its
-        // turn after `qoro prompt` returns. Output after asking must not end
-        // the wait: the waiter is still waiting on a busy target.
-        agents.note_io(1, ancient + 3);
-
-        let mut in_flight = BTreeSet::new();
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(x_rx.try_recv().is_err(), "waiter survives a busy target");
-        assert!(y_rx.try_recv().is_err(), "working target survives");
-
-        // The target finishes and goes quiet: both sleep together, same pass.
-        agents
-            .observe_hook(
-                2,
-                &TerminalId::new("2"),
-                &y_token,
-                qoro_domain::AgentRuntimeState::Idle,
-                false,
-                false,
-                ancient,
-            )
-            .expect("applies");
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(
-            matches!(x_rx.try_recv(), Ok(ClientCommand::Close)),
-            "waiter sleeps with its idle target"
-        );
-        assert!(
-            matches!(y_rx.try_recv(), Ok(ClientCommand::Close)),
-            "idle target sleeps too"
-        );
-    }
-
-    /// The tomb row lists the sleeper: agent true so panels show it,
-    /// sleeping state, when it slept, and nothing believed.
-    #[test]
-    fn a_tomb_row_lists_the_sleeper_and_believes_nothing() {
-        let tomb = crate::agents::Tombstone {
-            stream: 7,
-            program: Some("claude".into()),
-            name: Some("release".into()),
-            workspace: 2,
-            slept_at_unix: 1_750_000_000,
-            idle_secs: 1800,
-        };
-        let row = tomb_row(&tomb);
-        assert_eq!(row.terminal, 7);
-        assert_eq!(row.state, "sleeping");
-        assert!(row.agent, "panels filter on agent first");
-        assert_eq!(row.program.as_deref(), Some("claude"));
-        assert_eq!(row.name.as_deref(), Some("release"));
-        assert_eq!(row.workspace, 2);
-        assert_eq!(row.slept_at_unix, Some(1_750_000_000));
-        assert_eq!(row.last_active_at_unix, None);
-        assert_eq!(row.source, None);
-        assert_eq!(row.generation, None);
-    }
-
-    /// An explicit close accepted while the tab tears down keeps the
-    /// reaper from re-asking: the pass sends nothing and marks nothing.
-    #[tokio::test]
-    async fn an_explicitly_closed_tab_is_never_re_marked() {
-        let (terminals, agents, events, watched) = harness();
-        let (mut rx, _token, _tx) = add_terminal(&terminals, &agents, 1);
-        agents.note_spawn(1, now_unix() - 7200);
-        agents.test_set_foreground(1, Some("zsh"), false);
-        agents.attach_master(1, -1);
-        agents.mark_closed(1);
-        let mut in_flight = BTreeSet::new();
-        reap_pass(&terminals, &agents, &events, &watched, 1800, &mut in_flight).await;
-        assert!(rx.try_recv().is_err(), "asked nothing");
-        assert!(!agents.is_reaped(1), "marked nothing");
-        assert!(in_flight.is_empty());
     }
 }
 

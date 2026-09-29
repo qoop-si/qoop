@@ -38,6 +38,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(socket.exists(), "the daemon never bound its socket");
+        qoro_testkit::open_first_terminal(&socket);
         Self { child, dir, config }
     }
 

@@ -154,7 +154,14 @@ impl Store {
              -- created unconditionally rather than a column behind a version bump: a
              -- bump makes every older binary refuse this file, and an older binary that
              -- ignores the table loses nothing but the splits.
-             CREATE TABLE IF NOT EXISTS split_tree (tree TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS split_tree (tree TEXT NOT NULL);
+             -- The workspaces that are asleep: their rows are open and nothing runs. The
+             -- same reasoning as split_tree: an older binary ignores the table and brings
+             -- a sleeping space back awake, which loses nothing.
+             CREATE TABLE IF NOT EXISTS asleep (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+                 since INTEGER NOT NULL
+             );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
@@ -375,8 +382,13 @@ impl Store {
     /// table; the id can only come from the agent itself, through its own hook, and an id
     /// arriving must not overwrite a name the other writer knows better.
     pub fn set_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
+        // Never into a sleeping space: its rows say what to bring back, and a late write
+        // from the teardown that put it to sleep would say something else. Checked here,
+        // when the write runs, not when it was asked for, because a write whose caller
+        // gave up waiting still runs.
         self.conn.execute(
-            "UPDATE terminal SET agent_session = ?2 WHERE id = ?1",
+            "UPDATE terminal SET agent_session = ?2 WHERE id = ?1 \
+             AND workspace NOT IN (SELECT workspace FROM asleep)",
             params![id, session],
         )?;
         Ok(())
@@ -398,12 +410,70 @@ impl Store {
         agent: Option<&str>,
         agent_session: Option<&str>,
     ) -> Result<(), StoreError> {
+        // Not into a sleeping space, for the reason `set_agent_session` gives: an agent
+        // ending under the sleep is announced as gone, and writing that down would bring
+        // the tab back as a bare shell.
         self.conn.execute(
             "UPDATE terminal SET agent = ?2, agent_session = COALESCE(?3, agent_session) \
-             WHERE id = ?1",
+             WHERE id = ?1 AND workspace NOT IN (SELECT workspace FROM asleep)",
             params![id, agent, agent_session],
         )?;
         Ok(())
+    }
+}
+
+/// What a sleeping terminal's row has to say when its space goes to sleep: which agent
+/// was in it and that agent's own id for the conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub terminal: i64,
+    pub agent: Option<String>,
+    pub agent_session: Option<String>,
+}
+
+impl Store {
+    /// Every workspace that is asleep, and since when, the latest first.
+    pub fn asleep(&self) -> Result<Vec<(i64, i64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT workspace, since FROM asleep ORDER BY since DESC, workspace DESC")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Put a workspace to sleep: its terminals' agents written down, then the mark, in one
+    /// transaction. A failure leaves neither, so a space is never marked asleep with rows
+    /// that do not say what to bring back.
+    pub fn sleep_workspace(
+        &mut self,
+        workspace: i64,
+        since: i64,
+        checkpoints: &[Checkpoint],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        for c in checkpoints {
+            tx.execute(
+                "UPDATE terminal SET agent = ?2, agent_session = COALESCE(?3, agent_session) \
+                 WHERE id = ?1",
+                params![c.terminal, c.agent, c.agent_session],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO asleep (workspace, since) VALUES (?1, ?2)",
+            params![workspace, since],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Take the sleep mark off a workspace. Answers whether it had one.
+    pub fn wake_workspace(&self, workspace: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM asleep WHERE workspace = ?1",
+            params![workspace],
+        )? == 1)
     }
 }
 
@@ -698,5 +768,57 @@ mod tests {
             Some("abc-123"),
             "the conversation it had is still the one to carry on if it comes back"
         );
+    }
+
+    #[test]
+    fn a_workspace_sleeps_with_its_agents_written_down_and_wakes() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.set_agent(7, Some("claude"), Some("abc")).expect("agent");
+        s.sleep_workspace(
+            ws,
+            10,
+            &[Checkpoint {
+                terminal: 7,
+                agent: Some("claude".into()),
+                agent_session: None,
+            }],
+        )
+        .expect("sleep");
+        assert_eq!(s.asleep().expect("asleep"), vec![(ws, 10)]);
+        let row = &s.open_terminals(ws).expect("rows")[0];
+        assert_eq!(row.agent.as_deref(), Some("claude"));
+        // A checkpoint with no id keeps the one the hook reported.
+        assert_eq!(row.agent_session.as_deref(), Some("abc"));
+        assert!(s.wake_workspace(ws).expect("wake"));
+        assert!(!s.wake_workspace(ws).expect("wake again"));
+        assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    #[test]
+    fn deleting_a_workspace_takes_its_sleep_mark_with_it() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.sleep_workspace(ws, 5, &[]).expect("sleep");
+        s.delete_workspace(ws).expect("delete");
+        assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    #[test]
+    fn a_sleeping_space_refuses_late_agent_writes() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.set_agent(3, Some("claude"), Some("abc")).expect("agent");
+        s.sleep_workspace(ws, 2, &[]).expect("sleep");
+        s.set_agent(3, None, None).expect("a late write runs");
+        s.set_agent_session(3, "other").expect("a late id runs");
+        let row = &s.open_terminals(ws).expect("rows")[0];
+        assert_eq!(row.agent.as_deref(), Some("claude"));
+        assert_eq!(row.agent_session.as_deref(), Some("abc"));
+        s.wake_workspace(ws).expect("wake");
+        s.set_agent(3, None, None).expect("an awake write");
+        assert_eq!(s.open_terminals(ws).expect("rows")[0].agent, None);
     }
 }

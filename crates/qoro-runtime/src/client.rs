@@ -101,7 +101,15 @@ pub fn outer_size() -> (u16, u16) {
     }
 }
 
-fn hello(client_id: &str) -> ClientHello {
+/// The hello key a client sets to say it only watches: a daemon with nothing awake does
+/// not stay up for it. An older client never says it, so it counts as somebody there.
+pub const OBSERVER: &str = "observer";
+
+fn hello(client_id: &str, observer: bool) -> ClientHello {
+    let mut extra = serde_json::Map::new();
+    if observer {
+        extra.insert(OBSERVER.into(), serde_json::Value::Bool(true));
+    }
     ClientHello {
         codec_generation_min: qoro_proto::CODEC_GENERATION,
         codec_generation_max: qoro_proto::CODEC_GENERATION,
@@ -114,7 +122,7 @@ fn hello(client_id: &str) -> ClientHello {
             terminal: vec!["terminal.frame.v1".into()],
             blob: vec!["blob.raw.v1".into()],
         },
-        extra: Default::default(),
+        extra,
     }
 }
 
@@ -126,12 +134,29 @@ fn hello(client_id: &str) -> ClientHello {
 /// blank screen until something else happened to change. It passed every unit test and
 /// failed the first time a person ran it.
 pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, BytesMut)> {
+    connect_as(socket, client_id, false).await
+}
+
+/// Connect as one that only watches (`agents --watch`, a phone bridge's watcher): the same
+/// connection, but it does not keep a daemon with nothing awake from leaving.
+pub async fn connect_observer(
+    socket: &Path,
+    client_id: &str,
+) -> io::Result<(UnixStream, BytesMut)> {
+    connect_as(socket, client_id, true).await
+}
+
+async fn connect_as(
+    socket: &Path,
+    client_id: &str,
+    observer: bool,
+) -> io::Result<(UnixStream, BytesMut)> {
     // Bounded: a daemon that accepts and never answers (wedged, or a stale socket held by
     // something else) otherwise hangs every caller, a hook inside an agent's turn included.
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
         let stream = UnixStream::connect(socket).await.map_err(not_running)?;
-        handshake(stream, client_id).await
+        handshake_as(stream, client_id, observer).await
     })
     .await
     .map_err(|_| {
@@ -142,13 +167,14 @@ pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, 
     })?
 }
 
-/// A missing or dead socket is a session nobody started, said as such: "No such file or
+/// A missing or dead socket is a daemon that is not running, said as such: "No such file or
 /// directory" names no fix. The kind is kept for callers that start a daemon on it.
 fn not_running(e: io::Error) -> io::Error {
     match e.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
-            io::Error::new(e.kind(), "no session running: `qoro` starts one")
-        }
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => io::Error::new(
+            e.kind(),
+            "nothing is awake: `qoro` or `qoro wake` starts it",
+        ),
         _ => e,
     }
 }
@@ -156,11 +182,22 @@ fn not_running(e: io::Error) -> io::Error {
 /// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`
 /// running `qoro relay` on another machine. The relay does not change the protocol, so
 /// nothing after this point needs to know which one it is.
-pub async fn handshake<S>(mut stream: S, client_id: &str) -> io::Result<(S, BytesMut)>
+pub async fn handshake<S>(stream: S, client_id: &str) -> io::Result<(S, BytesMut)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let body = serde_json::to_vec(&hello(client_id))
+    handshake_as(stream, client_id, false).await
+}
+
+async fn handshake_as<S>(
+    mut stream: S,
+    client_id: &str,
+    observer: bool,
+) -> io::Result<(S, BytesMut)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let body = serde_json::to_vec(&hello(client_id, observer))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = BytesMut::new();
     Frame::new(Channel::Handshake, 0, Bytes::from(body))

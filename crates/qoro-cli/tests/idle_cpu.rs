@@ -148,6 +148,7 @@ fn start_daemon() -> Daemon {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(socket.exists(), "the daemon never bound its socket");
+    qoro_testkit::open_first_terminal(&socket);
     Daemon {
         child,
         runtime: dir.path().to_path_buf(),

@@ -124,6 +124,24 @@ pub enum ControlRequest {
         id: String,
         workspace: i64,
     },
+    /// Put a workspace to sleep: every tab in it ends, its rows stay, and nothing of it
+    /// runs until it wakes.
+    ///
+    /// All or nothing. A tab that could not come back as it is (a command running, an
+    /// agent busy or not yet telling its conversation, a job in the background) refuses
+    /// the whole space, and the answer says which and why.
+    SleepWorkspace {
+        id: String,
+        workspace: i64,
+    },
+    /// Bring a sleeping workspace back: the same tabs, numbers, names and directories,
+    /// and each agent resumed into its own conversation. `None` wakes the one that went
+    /// to sleep last.
+    WakeWorkspace {
+        id: String,
+        #[serde(default)]
+        workspace: Option<i64>,
+    },
     /// The index a client draws: one row per terminal, with who is in it.
     ///
     /// Separate from `ListTerminals` rather than an extra field on it, because the two
@@ -251,23 +269,18 @@ pub enum ControlRequest {
         terminal: TerminalStream,
         last_n: usize,
     },
-    /// The sessions on another machine, reached over ssh. Answered by the interface's own
-    /// connection to its daemons, never by a daemon: a daemon has no business opening ssh
-    /// connections on a client's behalf.
-    ListRemoteSessions {
-        id: String,
-        target: String,
-    },
     /// Add a machine to the interface, and keep it: its spaces are listed from now on.
-    /// Answered by the interface's connection, like `ListRemoteSessions`.
+    ///
+    /// Answered by the interface's own connection to its daemons, never by a daemon: a
+    /// daemon has no business opening ssh connections on a client's behalf. A machine with
+    /// no qoro is answered `RemoteMissing` rather than added.
     ConnectRemote {
         id: String,
         target: String,
-        session: String,
     },
     /// Put this version of qoro on a machine that has none, into `~/.local/bin` over ssh.
-    /// Answered by the interface's connection, like `ListRemoteSessions`; it never replaces
-    /// a qoro that is already there.
+    /// Answered by the interface's connection, like `ConnectRemote`; it never replaces a
+    /// qoro that is already there.
     InstallRemote {
         id: String,
         target: String,
@@ -314,6 +327,8 @@ impl ControlRequest {
             | Self::ListWorkspaces { id }
             | Self::CreateWorkspace { id, .. }
             | Self::CloseWorkspace { id, .. }
+            | Self::SleepWorkspace { id, .. }
+            | Self::WakeWorkspace { id, .. }
             | Self::Subscribe { id, .. }
             | Self::Unsubscribe { id, .. }
             | Self::RequestOwnership { id, .. }
@@ -323,7 +338,6 @@ impl ControlRequest {
             | Self::HostColors { id, .. }
             | Self::SetSplit { id, .. }
             | Self::ReloadAgentManifests { id }
-            | Self::ListRemoteSessions { id, .. }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
             | Self::GrantOwnership { id, .. } => id,
@@ -373,6 +387,20 @@ pub enum ControlResponse {
     WorkspaceClosed {
         id: String,
         workspace: i64,
+    },
+    /// A workspace is asleep: `terminals` tabs ended with their rows kept.
+    WorkspaceAsleep {
+        id: String,
+        workspace: i64,
+        terminals: usize,
+    },
+    /// A workspace is awake again: `terminals` tabs reopened, `resumed` of them agents
+    /// typed back into their own conversations.
+    WorkspaceAwake {
+        id: String,
+        workspace: i64,
+        terminals: usize,
+        resumed: usize,
     },
     /// A terminal or a workspace now carries a different name.
     /// Rows of scrollback, and how many there are in total.
@@ -459,11 +487,6 @@ pub enum ControlResponse {
         terminal: TerminalStream,
         events: Vec<FocusEvent>,
     },
-    RemoteSessions {
-        id: String,
-        target: String,
-        sessions: Vec<RemoteSession>,
-    },
     /// The machine is added under `name`, and its spaces are on their way.
     RemoteAdded {
         id: String,
@@ -491,14 +514,6 @@ pub enum ControlResponse {
     NewsNoted {
         id: String,
     },
-}
-
-/// One session on another machine, as `qoro ls` there describes it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RemoteSession {
-    pub name: String,
-    pub running: bool,
-    pub tabs: usize,
 }
 
 /// One hook event, as the focus view draws it.
@@ -606,6 +621,26 @@ pub struct WorkspaceRow {
     /// How many terminals are open in it, so a client can show a workspace as busy or
     /// empty without asking about every terminal in it.
     pub terminals: usize,
+    /// Asleep: nothing in it runs, and `sleeping` is what waking it brings back. Defaulted
+    /// so an older daemon's answer reads as awake.
+    #[serde(default)]
+    pub asleep: bool,
+    /// The tabs a wake brings back, when `asleep`.
+    #[serde(default)]
+    pub sleeping: Vec<SleepingTab>,
+}
+
+/// A tab of a sleeping workspace, as its row in the store keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SleepingTab {
+    /// The number it comes back under.
+    pub terminal: u32,
+    /// What a person called it, if anyone did.
+    pub title: Option<String>,
+    /// The agent that was in it, resumed into its own conversation on wake.
+    pub agent: Option<String>,
+    /// Where it was, and where it starts again.
+    pub cwd: String,
 }
 
 /// What a terminal threw away rather than drew, as an index row carries it.
@@ -817,6 +852,8 @@ impl ControlResponse {
             | Self::Workspaces { id, .. }
             | Self::WorkspaceCreated { id, .. }
             | Self::WorkspaceClosed { id, .. }
+            | Self::WorkspaceAsleep { id, .. }
+            | Self::WorkspaceAwake { id, .. }
             | Self::Renamed { id, .. }
             | Self::Stopping { id, .. }
             | Self::Scrollback { id, .. }
@@ -827,7 +864,6 @@ impl ControlResponse {
             | Self::AgentStateReported { id, .. }
             | Self::ManifestsReloaded { id, .. }
             | Self::FocusEvents { id, .. }
-            | Self::RemoteSessions { id, .. }
             | Self::RemoteAdded { id, .. }
             | Self::RemoteMissing { id, .. }
             | Self::RemoteInstalled { id, .. }
@@ -1402,7 +1438,7 @@ mod version_message_tests {
         );
         assert!(said.contains("older"), "{said}");
         assert!(
-            said.contains("stop the session"),
+            said.contains("`qoro stop`"),
             "the fix has to be in the message: {said}"
         );
         assert!(

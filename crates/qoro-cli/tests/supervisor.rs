@@ -38,6 +38,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(socket.exists(), "the daemon never bound its socket");
+        qoro_testkit::open_first_terminal(&socket);
         let daemon = Self { child, dir };
         assert!(
             daemon.wait_for_screen("1", "$"),
@@ -333,10 +334,10 @@ fn a_write_to_a_replaced_process_is_refused() {
     assert!(daemon.wait_for_screen("1", "GEN_5"));
 }
 
-/// `agents --watch --all` lists every running session as one list, hears one that starts
-/// later by its bell, and drops it when it ends.
+/// `agents --watch --all`, as the notch runs it: the one daemon's rows, each naming the
+/// session a command about it may pass.
 #[test]
-fn a_watch_of_all_sessions_hears_one_start_and_end() {
+fn a_watch_of_all_sessions_names_the_session_on_every_row() {
     use std::io::BufRead;
 
     /// Killed however the test ends, so a failed assert leaves no watch or daemon behind.
@@ -392,20 +393,4 @@ fn a_watch_of_all_sessions_hears_one_start_and_end() {
         false
     };
     assert!(until(&["default"]), "the running session was never listed");
-
-    let second = Killed(
-        daemon
-            .command(&["--session", "second", "daemon"])
-            .env("SHELL", "/bin/sh")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the second daemon"),
-    );
-    assert!(
-        until(&["default", "second"]),
-        "a session started later was never heard"
-    );
-    drop(second);
-    assert!(until(&["default"]), "a session that ended stayed listed");
 }

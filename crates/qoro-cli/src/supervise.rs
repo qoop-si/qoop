@@ -69,14 +69,24 @@ struct Link {
 
 impl Link {
     async fn open(who: &str) -> std::io::Result<Self> {
-        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-        Self::open_at(&paths::socket_path(&dir), who).await
+        Self::open_as(who, false).await
     }
 
-    /// A link to the daemon at `socket`, whichever session that is.
-    async fn open_at(socket: &std::path::Path, who: &str) -> std::io::Result<Self> {
+    /// The same, as a connection that only watches: a daemon with nothing awake leaves
+    /// with this one still open, which is what lets a notch watch without keeping it up.
+    async fn open_observer(who: &str) -> std::io::Result<Self> {
+        Self::open_as(who, true).await
+    }
+
+    async fn open_as(who: &str, observer: bool) -> std::io::Result<Self> {
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let socket = paths::socket_path(&dir);
         // These verbs never start a daemon; `connect` says when there is none.
-        let (stream, inbuf) = client::connect(socket, who).await?;
+        let (stream, inbuf) = if observer {
+            client::connect_observer(&socket, who).await?
+        } else {
+            client::connect(&socket, who).await?
+        };
         let (rd, wr) = stream.into_split();
         Ok(Self {
             rd,
@@ -88,6 +98,22 @@ impl Link {
             screen_text: None,
             on_screen: false,
         })
+    }
+
+    /// Every space, as the daemon lists them.
+    async fn spaces(&mut self) -> std::io::Result<Vec<WorkspaceRow>> {
+        match self
+            .ask(&ControlRequest::ListWorkspaces {
+                id: super::request_id("spaces"),
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Workspaces { workspaces, .. } => Ok(workspaces),
+            _ => Err(std::io::Error::other(
+                "unexpected answer to the space listing",
+            )),
+        }
     }
 
     /// A space by id or name, made when the name is new.
@@ -231,7 +257,10 @@ impl Link {
                 Ok(n) => n?,
             };
             if n == 0 {
-                return Err(std::io::Error::other("the daemon closed the connection"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the daemon closed the connection",
+                ));
             }
             self.inbuf.extend_from_slice(&read[..n]);
             let mut events = Vec::new();
@@ -272,7 +301,8 @@ fn stashed_touches(stashed: Vec<client::Incoming>, watched: &[u32]) -> bool {
     touches(&events, watched)
 }
 
-/// Each session's agent rows, by session name: what a watch prints from.
+/// Each session's agent rows, by session name: what a watch prints from. One daemon, so
+/// one entry, `default`, kept so a reader of `--all` still finds its rows under a name.
 pub(crate) type Sessions = BTreeMap<String, Vec<AgentRow>>;
 
 /// `qoro agents --watch`: the index now, then again each time it reads differently.
@@ -284,188 +314,68 @@ pub(crate) type Sessions = BTreeMap<String, Vec<AgentRow>>;
 pub(crate) fn run_watch(
     line: impl Fn(&Sessions) -> std::io::Result<String>,
 ) -> std::io::Result<()> {
-    let name = paths::session_name(None).map_err(std::io::Error::other)?;
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let link = Link::open("qoro-watch").await?;
-        let mut last = String::new();
-        follow(link, |agents| {
-            let text = line(&Sessions::from([(name.clone(), agents)]))?;
-            Ok(print_new(&text, &mut last))
-        })
-        .await
-    })
-}
-
-/// `qoro agents --watch --all`: the rows of every running session, as one list.
-///
-/// A session that starts later is heard, not looked for: this watch keeps a bell in the
-/// runtime's `bells` directory, which every daemon rings when it starts serving. A session
-/// that ends closes its connection, which takes its rows off.
-pub(crate) fn run_watch_all(
-    line: impl Fn(&Sessions) -> std::io::Result<String>,
-) -> std::io::Result<()> {
-    use tokio::sync::mpsc;
-
-    let runtime = paths::runtime_base().map_err(std::io::Error::other)?;
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let (rings, mut rung) = mpsc::channel::<()>(1);
-        let _bell = Bell::hang(&runtime, rings)?;
-        let (news, mut heard) = mpsc::unbounded_channel::<(String, Option<Vec<AgentRow>>)>();
-        let mut seen = Sessions::new();
-        let mut watched = std::collections::HashSet::new();
-        // Nothing is printed until there is a row: an empty list first says nothing.
-        let mut last = line(&seen)?;
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        watch_new(&runtime, &mut watched, &news).await;
-        loop {
-            if !print_new(&line(&seen)?, &mut last) {
-                return Ok(());
-            }
-            tokio::select! {
-                Some((name, rows)) = heard.recv() => match rows {
-                    Some(rows) => {
-                        seen.insert(name, rows);
-                    }
-                    None => {
-                        seen.remove(&name);
-                        watched.remove(&name);
-                        // Ended, or ended and started again before this was heard: a ring
-                        // that came in between found the name still followed.
-                        watch_new(&runtime, &mut watched, &news).await;
-                    }
-                },
-                Some(()) = rung.recv() => watch_new(&runtime, &mut watched, &news).await,
-                _ = tick.tick() => {
-                    // Adopted by launchd: whoever started this watch is gone, and with no
-                    // change to print no write would fail to say so.
-                    if std::os::unix::process::parent_id() == 1 {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Follow every running session not followed yet, each on its own task. A connection
-/// lost while the daemon runs on (it sheds its worst one at its limit) is made again, its
-/// rows off meanwhile since nothing vouches for them; the task ends, and says so with
-/// `None`, when the session does.
-async fn watch_new(
-    runtime: &std::path::Path,
-    watched: &mut std::collections::HashSet<String>,
-    news: &tokio::sync::mpsc::UnboundedSender<(String, Option<Vec<AgentRow>>)>,
-) {
-    // Off the runtime: a connect to a daemon whose backlog is full can block.
-    let base = runtime.to_path_buf();
-    let sessions = tokio::task::spawn_blocking(move || qoro_bridge::bridge::sessions(&base))
-        .await
-        .unwrap_or_default();
-    for session in sessions {
-        if !session.running || !watched.insert(session.name.clone()) {
-            continue;
-        }
-        let socket = paths::socket_path(&paths::session_dir(runtime, &session.name));
-        let (name, news) = (session.name, news.clone());
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                let mut heard = false;
-                // A daemon that takes the connection and never answers is not followed.
-                if let Ok(Ok(link)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    Link::open_at(&socket, "qoro-watch"),
-                )
-                .await
-                {
-                    let _ = follow(link, |rows| {
-                        heard = true;
-                        Ok(news.send((name.clone(), Some(rows))).is_ok())
-                    })
-                    .await;
-                }
-                let _ = news.send((name.clone(), Some(Vec::new())));
-                if tokio::net::UnixStream::connect(&socket).await.is_err() {
-                    break;
-                }
-                if heard {
-                    backoff = Duration::from_secs(1);
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
-            let _ = news.send((name, None));
-        });
-    }
-}
-
-/// Print a listing unless it is the one printed last. False when the reader went away,
-/// which ends the watch rather than a panic on write.
-fn print_new(text: &str, last: &mut String) -> bool {
     use std::io::Write;
 
-    if text == last {
-        return true;
-    }
-    let mut out = std::io::stdout().lock();
-    if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
-        return false;
-    }
-    *last = text.to_string();
-    true
-}
-
-/// A socket in the runtime's `bells` directory that daemons ring when they start. Taken
-/// down with the watch.
-struct Bell(std::path::PathBuf);
-
-impl Bell {
-    fn hang(
-        runtime: &std::path::Path,
-        rings: tokio::sync::mpsc::Sender<()>,
-    ) -> std::io::Result<Self> {
-        let dir = paths::bells_dir(runtime);
-        paths::ensure_private_dir(&dir).map_err(std::io::Error::other)?;
-        // Bells of watches that died without taking theirs down: nobody answers there.
-        for old in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
-            if std::os::unix::net::UnixStream::connect(old.path()).is_err() {
-                let _ = std::fs::remove_file(old.path());
+    let line = |rows: &[AgentRow]| {
+        line(&Sessions::from([(
+            paths::DEFAULT_SESSION.to_string(),
+            rows.to_vec(),
+        )]))
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut last = String::new();
+        // Printed only when it changes, so a watcher that reconnects says nothing new.
+        let mut say = |text: String| -> std::io::Result<bool> {
+            if text == last {
+                return Ok(true);
+            }
+            let mut out = std::io::stdout().lock();
+            // A reader that went away ends the watch, rather than a panic on write.
+            if writeln!(out, "{text}").and_then(|()| out.flush()).is_err() {
+                return Ok(false);
+            }
+            last = text;
+            Ok(true)
+        };
+        loop {
+            let ended = match Link::open_observer("qoro-watch").await {
+                Ok(mut link) => match follow(&mut link, &line, &mut say).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
+            if !daemon_gone(&ended) {
+                return Err(ended);
+            }
+            // Nothing is awake, so nothing is listed: said, then waited out without a
+            // process started or a timer run, until a daemon binds its socket again.
+            if !say(line(&[])?)? {
+                return Ok(());
+            }
+            if !wait_for_daemon().await? {
+                return Err(ended);
             }
         }
-        let path = dir.join(format!("watch-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    // Closed at once: the ringer waits for exactly that. A ring already
-                    // waiting to be heard covers this one too.
-                    Ok((ringer, _)) => {
-                        drop(ringer);
-                        let _ = rings.try_send(());
-                    }
-                    // Out of descriptors, or a ringer gone mid-accept: the bell stays up.
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                }
-            }
-        });
-        Ok(Self(path))
-    }
+    })
 }
 
-impl Drop for Bell {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// Whether an error means there is no daemon now (never started, or it left), rather than
+/// a daemon that refused or misbehaved.
+fn daemon_gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(
+        e.kind(),
+        K::NotFound | K::ConnectionRefused | K::UnexpectedEof | K::ConnectionReset | K::BrokenPipe
+    )
 }
 
-/// One session's agent rows, handed to `rows` now and each time they change, until the
-/// daemon closes the connection or `rows` says to stop.
+/// Follow one daemon's agents until it goes, printing each change through `say`.
 async fn follow(
-    mut link: Link,
-    mut rows: impl FnMut(Vec<AgentRow>) -> std::io::Result<bool>,
+    link: &mut Link,
+    line: &impl Fn(&[AgentRow]) -> std::io::Result<String>,
+    say: &mut impl FnMut(String) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
     let mut unsubscribed = false;
     loop {
@@ -483,7 +393,7 @@ async fn follow(
                 .await?;
             stashed.extend(meanwhile);
         }
-        if !rows(agents)? {
+        if !say(line(&agents)?)? {
             return Ok(());
         }
         // A change that landed while asking is news already had: ask again at once.
@@ -507,6 +417,24 @@ async fn follow(
     }
 }
 
+/// Wait, without a timer, until a daemon's socket appears in the runtime directory, and
+/// answer true then. False where there is no way to wait (anything but macOS), and the
+/// watch ends as it did before: the one watcher that stays up, the notch, is macOS only.
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon() -> std::io::Result<bool> {
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    tokio::task::spawn_blocking(move || paths::wait_for_socket(&dir, &socket))
+        .await
+        .map_err(std::io::Error::other)??;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn wait_for_daemon() -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// The least time between two screens `read --watch` prints. An agent streaming output
 /// renders far faster than anyone reads; a viewer gets the newest screen at this pace.
 const WATCH_GAP: Duration = Duration::from_millis(150);
@@ -524,7 +452,7 @@ pub(crate) fn run_read_watch(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let mut link = Link::open("qoro-read").await?;
+        let mut link = Link::open_observer("qoro-read").await?;
         let (agents, _) = link.agents().await?;
         // The daemon subscribes a new connection to its lowest terminal; any other one
         // goes back before its renders cost anything.
@@ -767,9 +695,9 @@ pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Res
 /// Both halves, because terminal numbers repeat across sessions: tab 2 of
 /// another session is not this tab. `home` is the session this process was
 /// started in, read before `--session` replaced it.
-fn own_terminal(home: Option<&str>, session: &str) -> Option<u32> {
-    let terminal = std::env::var("QORO_TERMINAL").ok()?.parse().ok()?;
-    (home == Some(session)).then_some(terminal)
+/// The terminal this command runs in, when it runs in one of this machine's.
+fn own_terminal() -> Option<u32> {
+    std::env::var("QORO_TERMINAL").ok()?.parse().ok()
 }
 
 /// `qoro wait`: block until a terminal reaches a state.
@@ -777,7 +705,7 @@ fn own_terminal(home: Option<&str>, session: &str) -> Option<u32> {
 /// Level triggered: a
 /// target already there returns at once. Exits 124 on timeout, 1 when a
 /// target closes or nothing can be waited on.
-pub(crate) fn run_wait(args: &[String], home: Option<&str>, session: &str) -> std::io::Result<()> {
+pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
     let help = "usage: qoro wait [target...] [--until STATE[,STATE...]] [--match TEXT] [--timeout SECS] [--json]";
     let mut targets = Vec::new();
     let mut text: Option<String> = None;
@@ -828,7 +756,7 @@ pub(crate) fn run_wait(args: &[String], home: Option<&str>, session: &str) -> st
         until = DEFAULT_UNTIL.iter().map(|s| s.to_string()).collect();
     }
     let deadline = timeout.map(|t| Instant::now() + t);
-    let own = own_terminal(home, session);
+    let own = own_terminal();
 
     let rt = tokio::runtime::Runtime::new()?;
     let matched = rt.block_on(async {
@@ -1108,6 +1036,147 @@ pub(crate) fn parse_new_args(args: &[String]) -> Result<NewOpts, String> {
     Ok(opts)
 }
 
+/// A space by id, or by a name only one space has. Never made: `sleep` and `wake` act on
+/// what exists, and a name two spaces share is refused rather than guessed.
+fn resolve_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Result<i64> {
+    if let Some(space) = wanted
+        .parse::<i64>()
+        .ok()
+        .and_then(|id| spaces.iter().find(|s| s.id == id))
+    {
+        return Ok(space.id);
+    }
+    let named: Vec<&WorkspaceRow> = spaces.iter().filter(|s| s.name == wanted).collect();
+    match named.as_slice() {
+        [one] => Ok(one.id),
+        [] => Err(std::io::Error::other(format!(
+            "no space with id or name {wanted}"
+        ))),
+        many => Err(std::io::Error::other(format!(
+            "{} spaces are called {wanted}; use an id: {}",
+            many.len(),
+            many.iter()
+                .map(|s| s.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// `qoro sleep <space>`: end every tab in a space and keep them, so it costs nothing until
+/// it wakes. Refused, with each reason, when a tab could not come back as it is.
+pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro sleep <space> [--json]";
+    let json = args.iter().any(|a| a == "--json");
+    let wanted: Vec<&String> = args.iter().skip(2).filter(|a| *a != "--json").collect();
+    let [wanted] = wanted.as_slice() else {
+        return Err(super::usage(help));
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // No daemon is nothing awake: there is nothing to put to sleep, and starting one to
+        // find that out would wake every space that was left awake.
+        let mut link = match Link::open("qoro-sleep").await {
+            Ok(link) => link,
+            Err(e) if daemon_gone(&e) => {
+                println!("nothing is awake");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let spaces = link.spaces().await?;
+        let space = resolve_space(&spaces, wanted)?;
+        match link
+            .ask(&ControlRequest::SleepWorkspace {
+                id: super::request_id("sleep"),
+                workspace: space,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::WorkspaceAsleep { terminals, .. } => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "space": space, "asleep": true, "ended": terminals })
+                    );
+                } else {
+                    println!("space {wanted} is asleep: {terminals} tabs ended");
+                }
+                Ok(())
+            }
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a sleep")),
+        }
+    })
+}
+
+/// `qoro wake [space]`: bring a sleeping space back, or the one that went to sleep last.
+/// Starts the daemon when none is running, since waking is asking for one.
+pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro wake [space] [--json]";
+    let json = args.iter().any(|a| a == "--json");
+    let wanted: Vec<&String> = args.iter().skip(2).filter(|a| *a != "--json").collect();
+    if wanted.len() > 1 {
+        return Err(super::usage(help));
+    }
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    super::ensure_daemon(&paths::socket_path(&dir))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut link = Link::open("qoro-wake").await?;
+        let workspace = match wanted.first() {
+            Some(wanted) => Some(resolve_space(&link.spaces().await?, wanted)?),
+            None => None,
+        };
+        match link
+            .ask(&ControlRequest::WakeWorkspace {
+                id: super::request_id("wake"),
+                workspace,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::WorkspaceAwake {
+                workspace,
+                terminals,
+                resumed,
+                ..
+            } => {
+                if json {
+                    println!("{}", serde_json::json!({ "space": workspace, "asleep": false, "tabs": terminals, "resumed": resumed }));
+                } else {
+                    println!("space {workspace} is awake: {terminals} tabs, {resumed} agents resumed");
+                }
+                Ok(())
+            }
+            // Nothing named and nothing asleep, but tabs up: a daemon this wake started
+            // brought back what a `qoro stop` ended, which is what was asked for.
+            ControlResponse::Failed { reason, .. } if workspace.is_none() => {
+                match link
+                    .ask(&ControlRequest::ListTerminals {
+                        id: super::request_id("wake"),
+                    })
+                    .await?
+                    .0
+                {
+                    ControlResponse::Terminals { terminals, .. } if !terminals.is_empty() => {
+                        if json {
+                            println!("{}", serde_json::json!({ "asleep": false, "tabs": terminals.len() }));
+                        } else {
+                            println!("nothing was asleep; {} tabs are awake", terminals.len());
+                        }
+                        Ok(())
+                    }
+                    _ => Err(std::io::Error::other(reason)),
+                }
+            }
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a wake")),
+        }
+    })
+}
+
 /// `qoro new`: open a terminal, optionally typing a command into its shell.
 ///
 /// Prints only the terminal number, so `t=$(qoro new ...)` works. The
@@ -1117,6 +1186,86 @@ pub(crate) fn parse_new_args(args: &[String]) -> Result<NewOpts, String> {
 pub(crate) fn run_new(args: &[String]) -> std::io::Result<()> {
     let opts = parse_new_args(args).map_err(super::usage)?;
     open_terminal(&opts, |terminal| println!("{terminal}"))
+}
+
+/// Leave the daemon with something to attach to: a shell where the person is, when
+/// nothing is open.
+///
+/// A daemon opens no terminal by itself, so a first start, one after every tab was closed,
+/// or one after every space went to sleep would otherwise hand the interface nothing. Under a lock in the runtime
+/// directory, so two clients starting at once open one shell. A directory that is gone or
+/// that the daemon cannot use costs the shell its place, never the start.
+pub(crate) fn ensure_awake() -> std::io::Result<()> {
+    let here = std::env::current_dir().ok();
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    let _held = qoro_runtime::lock::StartupLock::acquire(&dir.join("awake.lock"))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // A daemon that was leaving as this connected closes it: started again, once.
+        let mut link = match Link::open("qoro-start").await {
+            Ok(link) => link,
+            Err(e) if daemon_gone(&e) => {
+                super::ensure_daemon(&socket)?;
+                Link::open("qoro-start").await?
+            }
+            Err(e) => return Err(e),
+        };
+        if let ControlResponse::Terminals { terminals, .. } = link
+            .ask(&ControlRequest::ListTerminals {
+                id: super::request_id("start"),
+            })
+            .await?
+            .0
+            && !terminals.is_empty()
+        {
+            return Ok(());
+        }
+        // Nothing awake: the space that went to sleep last is the one that was left, so it
+        // is the one woken. Only with nothing asleep either is there a shell to open, or in
+        // a woken space that brought no tab back.
+        let woken = match link
+            .ask(&ControlRequest::WakeWorkspace {
+                id: super::request_id("start"),
+                workspace: None,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::WorkspaceAwake { terminals, .. } if terminals > 0 => return Ok(()),
+            ControlResponse::WorkspaceAwake { workspace, .. } => Some(workspace),
+            // Refused while a space is still asleep: said, rather than a shell opened beside
+            // a space that did not come back.
+            ControlResponse::Failed { reason, .. } => {
+                if link.spaces().await?.iter().any(|space| space.asleep) {
+                    return Err(std::io::Error::other(reason));
+                }
+                None
+            }
+            _ => None,
+        };
+        let mut reason = String::new();
+        for cwd in [here.map(|h| h.display().to_string()), None] {
+            match link
+                .ask(&ControlRequest::CreateTerminal {
+                    id: super::request_id("start"),
+                    cwd: cwd.clone(),
+                    workspace: woken,
+                    name: None,
+                })
+                .await?
+                .0
+            {
+                ControlResponse::TerminalCreated { .. } => return Ok(()),
+                ControlResponse::Failed { reason: why, .. } => reason = why,
+                _ => reason = "unexpected answer to a create".into(),
+            }
+            if cwd.is_none() {
+                break;
+            }
+        }
+        Err(std::io::Error::other(reason))
+    })
 }
 
 /// Open one terminal as `opts` says, tell `announce` its number, then type its command.
@@ -1200,7 +1349,7 @@ pub(crate) fn pick_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Resu
 /// A number and never a name: a destructive verb does not guess. The
 /// terminal this runs in is refused, because a supervisor that closes
 /// itself has lost the loop it was running.
-pub(crate) fn run_close(args: &[String], home: Option<&str>, session: &str) -> std::io::Result<()> {
+pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
     let help = "usage: qoro close <terminal> [--generation G]";
     let mut args = args.to_vec();
     let generation = take_generation(&mut args);
@@ -1208,7 +1357,7 @@ pub(crate) fn run_close(args: &[String], home: Option<&str>, session: &str) -> s
         Some([n]) => n.parse().map_err(|_| super::usage(help))?,
         _ => return Err(super::usage(help)),
     };
-    if own_terminal(home, session) == Some(terminal) {
+    if own_terminal() == Some(terminal) {
         return Err(std::io::Error::other(
             "refusing to close the terminal this command runs in",
         ));
@@ -1664,11 +1813,15 @@ mod tests {
                 id: 1,
                 name: "default".into(),
                 terminals: 1,
+                asleep: false,
+                sleeping: Vec::new(),
             },
             WorkspaceRow {
                 id: 2,
                 name: "work".into(),
                 terminals: 0,
+                asleep: false,
+                sleeping: Vec::new(),
             },
         ];
         assert_eq!(pick_space(&spaces, "2").unwrap(), Some(2));
@@ -1679,6 +1832,8 @@ mod tests {
             id: 3,
             name: "2024".into(),
             terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
         }];
         assert_eq!(
             pick_space(&named, "2024").unwrap(),

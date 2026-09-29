@@ -121,6 +121,9 @@ pub struct Chrome<'a> {
     pub answer: bool,
     /// The first line of each finished agent's last answer, for its row in the pin.
     pub heads: &'a sidebar::Heads,
+    /// The sleeping tab the keyboard rests on while the space on screen is asleep, zero
+    /// otherwise. The column raises it the way it raises the focused terminal.
+    pub dim: u32,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
@@ -136,6 +139,7 @@ impl Default for Chrome<'_> {
             usage: &NO_USAGE,
             answer: false,
             heads: &NO_HEADS,
+            dim: 0,
         }
     }
 }
@@ -147,7 +151,11 @@ impl Frame<'_> {
             spaces: self.spaces,
             agents: self.rows,
             focused_space: self.space.unwrap_or_default(),
-            focused_terminal: self.focused,
+            focused_terminal: if self.focused != 0 {
+                self.focused
+            } else {
+                self.chrome.dim
+            },
             tick: self.tick,
             view: self.view,
             seen: self.seen,
@@ -222,6 +230,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("w", Some("new space"), 5),
             ("R", Some("rename space"), 6),
             ("W", Some("close space"), 7),
+            ("Z", Some("sleep"), 7),
             ("space", Some("find"), 1),
             ("f", Some("fold"), 5),
             ("F", Some("focus"), 5),
@@ -588,7 +597,7 @@ pub fn paint(frame: &Frame) -> String {
         if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
                 Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
-                Some(sidebar::Hit::Terminal(terminal)) => *terminal == frame.focused,
+                Some(sidebar::Hit::Terminal(terminal)) => *terminal == column.focused_terminal,
                 Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Pinned(_)) | None => {
                     false
                 }
@@ -1492,6 +1501,7 @@ pub(crate) fn keybind_lines() -> Vec<String> {
         cmd("s/S", "next, previous space"),
         cmd("w", "new space"),
         cmd("W", "close an empty space"),
+        cmd("Z", "sleep or wake space"),
         cmd("R", "rename space"),
         cmd("space", "find anything"),
         cmd("g", "spaces: tree or rank"),
@@ -2042,6 +2052,8 @@ mod tests {
             id: 1,
             name: "app".to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }]
     }
 
@@ -3387,7 +3399,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 36;
+    const COMMANDS: usize = 37;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -3442,6 +3454,7 @@ mod tests {
             Action::CopyMode => (const { place(33) }, Some("ctrl-a [")),
             Action::FoldSpace => (const { place(34) }, Some("ctrl-a f")),
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
+            Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
         }
     }
 
@@ -3502,6 +3515,7 @@ mod tests {
             Action::CopyMode,
             Action::FoldSpace,
             Action::Answer,
+            Action::Sleep,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -3762,6 +3776,8 @@ mod tests {
             id: 1,
             name: "\u{4e2d}\u{6587}".to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }];
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
@@ -4061,6 +4077,8 @@ mod tests {
             id: 1,
             name: "中文ab".to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }];
         let palette = Palette::open();
         let painted = paint(&Frame {
@@ -4458,6 +4476,8 @@ mod tests {
             id: 1,
             name: "app".to_string(),
             terminals: 9,
+            asleep: false,
+            sleeping: Vec::new(),
         }];
         let states = [
             "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",

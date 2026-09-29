@@ -85,6 +85,9 @@ impl DaemonProcess {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                // A daemon binds with no terminal; the scenarios measure the one a client
+                // opens, as `qoro` does.
+                qoro_testkit::try_open_first_terminal(&socket).map_err(io::Error::other)?;
                 return Ok(Self { child, dir, socket });
             }
             std::thread::sleep(Duration::from_millis(10));

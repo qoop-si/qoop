@@ -1,52 +1,22 @@
-//! Idle auto-sleep: close terminals idle past a configurable timeout.
+//! Idle sleep: a space whose tabs have all been idle past a time goes to sleep by itself.
 //!
-//! Disabled by default and armed by one environment variable,
-//! `QORO_IDLE_TIMEOUT_MINUTES`. `0`, unset, empty or invalid means the reaper
-//! task is never spawned: an idle daemon then pays zero wakeups for this
-//! feature, which is what keeps ADR-009's macOS literal-zero-idle claim and
-//! the latency gate intact. `30` is the documented recommended opt-in value.
+//! Off by default, and turned on by `[sleep] idle_minutes` in `config.toml`. Off means the
+//! task is never spawned: an idle daemon then pays zero wakeups for this feature, which is
+//! what keeps ADR-009's macOS literal-zero-idle claim and the latency gate intact.
 //!
-//! Eligibility is fail closed throughout: an unknown program, a boundary
-//! identity, a setup gate, a watched terminal, or a full command queue all
-//! veto. A reaped tab closes through the existing `CloseTerminal` path, so
-//! the agent's own conversation survives in the agent's own store and the
-//! scrollback files stay on disk, but the durable qoro row (including the
-//! recorded `agent_session`) is removed exactly like a manual close, and a
-//! later restore does not bring the tab back.
+//! Eligibility is fail closed throughout: an unknown program, a boundary identity, a setup
+//! gate, a watched terminal, or a wait between tabs all veto, and a space sleeps only when
+//! every one of its tabs is ready. The sleep itself is the one a person asks for, which
+//! vets each tab again, process tree included, and keeps every row so the space comes
+//! back as it was.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The environment variable that arms the reaper, in whole minutes.
+/// What armed the old idle reaper. No longer read; a daemon that finds it set says where
+/// the setting moved.
 pub const IDLE_TIMEOUT_ENV: &str = "QORO_IDLE_TIMEOUT_MINUTES";
 
-/// The recommended opt-in value, in minutes. Not a default: the default is
-/// disabled. Thirty minutes is what the feature was asked for.
-pub const RECOMMENDED_IDLE_TIMEOUT_MINUTES: u64 = 30;
-
-/// Parse the timeout from an environment value.
-///
-/// `None` (unset) and `"0"` mean disabled. Anything that is not a plain
-/// non-negative integer (floats, suffixes like `30m`, signs, whitespace
-/// around digits is trimmed then must be all digits, overflow) is disabled
-/// too: a misconfigured reaper must never close tabs, and the caller logs
-/// the raw value once. Minutes convert to seconds saturating, never wrapping.
-pub fn parse_idle_timeout(env: Option<&str>) -> Option<std::time::Duration> {
-    let raw = env?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let minutes: u64 = trimmed.parse().ok()?;
-    if minutes == 0 {
-        return None;
-    }
-    Some(std::time::Duration::from_secs(minutes.saturating_mul(60)))
-}
-
-/// How often the reaper wakes while armed: a quarter of the timeout,
+/// How often idle sleep looks while on: a quarter of the timeout,
 /// floored at a minute and capped at five, so a 30 minute timeout wakes
 /// every 5 minutes and a 1 minute trial timeout every minute.
 pub fn reap_tick(timeout: std::time::Duration) -> std::time::Duration {
@@ -179,6 +149,53 @@ pub fn group_holds_task(master: std::os::fd::RawFd) -> bool {
     false
 }
 
+/// What in a terminal's process tree would outlive, or be lost to, putting it to sleep.
+///
+/// Walked from the terminal's leader by parent. Two kinds block, named by program:
+/// a descendant that is no longer on the terminal (`setsid`, the way Claude Code starts a
+/// background shell), which teardown cannot reach, so the space would be called asleep
+/// while it still ran; and a group the shell started that is neither its own nor the
+/// foreground's (`postgres &`), a job that would end without coming back. Everything under
+/// the foreground that is still on the terminal is the program's own, MCP servers in groups
+/// of their own included (measured under codex): teardown ends them and the program starts
+/// them again when it resumes. Pure, so the measured trees are its tests.
+pub fn sleep_blockers(
+    table: &[qoro_pty::sys::ProcRow],
+    leader: i32,
+    foreground: Option<i32>,
+    tty: u64,
+) -> Vec<String> {
+    let mut children: BTreeMap<i32, Vec<&qoro_pty::sys::ProcRow>> = BTreeMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+    let shell_group = table
+        .iter()
+        .find(|r| r.pid == leader)
+        .map_or(leader, |r| r.pgid);
+    let mut blockers = Vec::new();
+    // (pid, whether it is under the foreground program)
+    let mut stack = vec![(leader, false)];
+    while let Some((pid, under_foreground)) = stack.pop() {
+        for child in children.get(&pid).map(Vec::as_slice).unwrap_or_default() {
+            if child.tty != Some(tty) {
+                blockers.push(child.name.clone());
+                continue;
+            }
+            let foreground_here =
+                under_foreground || (Some(child.pgid) == foreground && child.pgid != shell_group);
+            if !foreground_here && child.pgid != shell_group {
+                blockers.push(child.name.clone());
+                continue;
+            }
+            stack.push((child.pid, foreground_here));
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
 /// Whether input from this sender counts as live traffic.
 ///
 /// Restore replay arrives as `Input` from `qoro-restore`: transcript bytes
@@ -241,9 +258,10 @@ pub fn apply_edge_vetoes(
 /// because two connections may watch the same tab.
 ///
 /// Entries for closed terminals are removed on unsubscribe and disconnect,
-/// which always follow a close for a watched tab. A lingering entry is
-/// harmless in any case: stream numbers are never reused within a run, so
-/// it can never match a later terminal.
+/// which always follow a close for a watched tab. A number does come back
+/// within a run (a woken space keeps its tabs' numbers), so a subscription
+/// made for an earlier life is dropped, count and all, when the same
+/// connection subscribes to the new one.
 #[derive(Clone, Default, Debug)]
 pub struct WatchCounts {
     inner: std::sync::Arc<std::sync::Mutex<BTreeMap<u32, usize>>>,
@@ -289,33 +307,6 @@ impl WatchCounts {
 mod tests {
     use super::*;
     use qoro_domain::AgentRuntimeState as S;
-
-    #[test]
-    fn the_timeout_parses_plain_minutes_and_nothing_else() {
-        assert_eq!(parse_idle_timeout(None), None, "unset is disabled");
-        assert_eq!(parse_idle_timeout(Some("0")), None);
-        assert_eq!(parse_idle_timeout(Some("")), None);
-        assert_eq!(parse_idle_timeout(Some("   ")), None);
-        assert_eq!(
-            parse_idle_timeout(Some("30")),
-            Some(std::time::Duration::from_secs(1800))
-        );
-        assert_eq!(
-            parse_idle_timeout(Some("  30  ")),
-            Some(std::time::Duration::from_secs(1800)),
-            "surrounding whitespace is trimmed"
-        );
-        // Everything else is disabled, never a panic and never seconds.
-        for bad in ["-1", "30m", "30.5", "+30", "3 0", "abc", "0x1e"] {
-            assert_eq!(parse_idle_timeout(Some(bad)), None, "{bad}");
-        }
-        // Overflow saturates instead of wrapping: parses as minutes but
-        // exceeds seconds range once multiplied.
-        let huge = parse_idle_timeout(Some("307445734561825861")).expect("saturates");
-        assert_eq!(huge, std::time::Duration::from_secs(u64::MAX));
-        // Beyond u64 entirely: disabled, never a panic.
-        assert_eq!(parse_idle_timeout(Some("99999999999999999999")), None);
-    }
 
     #[test]
     fn the_tick_is_a_quarter_of_the_timeout_within_a_minute_and_five() {
@@ -531,5 +522,84 @@ mod tests {
         counts.watch(2);
         counts.unwatch_all(&BTreeSet::from([1, 2]));
         assert!(!counts.watched(2));
+    }
+
+    fn row(pid: i32, ppid: i32, pgid: i32, tty: Option<u64>, name: &str) -> qoro_pty::sys::ProcRow {
+        qoro_pty::sys::ProcRow {
+            pid,
+            ppid,
+            pgid,
+            tty,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_shell_at_its_prompt_has_nothing_in_the_way() {
+        let t = [row(10, 1, 10, Some(5), "zsh")];
+        assert!(sleep_blockers(&t, 10, Some(10), 5).is_empty());
+    }
+
+    #[test]
+    fn claude_idle_with_its_caffeinate_may_sleep() {
+        // Measured: Claude Code 2.1.280, idle, one `caffeinate` in its own group.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "claude"),
+            row(21, 20, 20, Some(5), "caffeinate"),
+        ];
+        assert!(sleep_blockers(&t, 10, Some(20), 5).is_empty());
+    }
+
+    #[test]
+    fn claudes_background_shell_left_the_terminal_and_blocks() {
+        // Measured: `run_in_background` starts a setsid shell, tty `??`.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "claude"),
+            row(30, 20, 30, None, "zsh"),
+            row(31, 30, 30, None, "sleep"),
+        ];
+        assert_eq!(sleep_blockers(&t, 10, Some(20), 5), vec!["zsh".to_string()]);
+    }
+
+    #[test]
+    fn codex_mcp_servers_in_their_own_groups_are_its_own() {
+        // Measured: codex 0.154, every MCP server in a group of its own, all on the tty.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "codex"),
+            row(21, 20, 21, Some(5), "npm"),
+            row(22, 21, 21, Some(5), "node"),
+            row(23, 20, 23, Some(5), "app-mcp"),
+            row(24, 23, 24, Some(5), "Google Chrome"),
+        ];
+        assert!(sleep_blockers(&t, 10, Some(20), 5).is_empty());
+    }
+
+    #[test]
+    fn a_job_the_shell_put_in_the_background_blocks() {
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(40, 10, 40, Some(5), "postgres"),
+        ];
+        assert_eq!(
+            sleep_blockers(&t, 10, Some(10), 5),
+            vec!["postgres".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_nested_multiplexer_server_blocks() {
+        // A nested multiplexer's server, started from a shell, leaves the terminal.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "muxd"),
+            row(21, 20, 21, None, "muxd"),
+        ];
+        assert_eq!(
+            sleep_blockers(&t, 10, Some(20), 5),
+            vec!["muxd".to_string()]
+        );
     }
 }

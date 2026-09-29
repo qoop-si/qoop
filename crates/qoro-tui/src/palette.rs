@@ -27,6 +27,8 @@ pub enum Item {
     CopyMode,
     Resize,
     Equalize,
+    /// Put the space on screen to sleep, as `ctrl-a Z` does.
+    Sleep,
 }
 
 /// One filtered row: what it does, which section it is under, and what to draw.
@@ -130,19 +132,33 @@ impl Palette {
         {
             out.push(terminal_entry(agent, spaces, "finished"));
         }
-        // Slept tabs get their own calm bucket, named, between finished and
-        // idle: folding them into "idle" would lie about whether anything
-        // runs there, and the catch-all below must not list them twice.
-        for agent in listed.iter().filter(|a| a.state == "sleeping") {
-            out.push(terminal_entry(agent, spaces, "sleeping"));
-        }
         for agent in listed.iter().filter(|a| {
             !matches!(
                 a.state.as_str(),
-                "blocked" | "failed" | "working" | "starting" | "done" | "sleeping"
+                "blocked" | "failed" | "working" | "starting" | "done"
             ) && !crate::sidebar::is_new(a, focused, seen, unseen)
         }) {
             out.push(terminal_entry(agent, spaces, "idle"));
+        }
+        // The tabs of sleeping spaces, below everything that runs: picking one wakes its
+        // space and goes to it.
+        for space in spaces.iter().filter(|s| s.asleep) {
+            for tab in &space.sleeping {
+                let name = tab
+                    .title
+                    .clone()
+                    .or_else(|| tab.agent.clone())
+                    .unwrap_or_else(|| "shell".to_string());
+                out.push(Entry {
+                    item: Item::Terminal(tab.terminal),
+                    section: "sleeping",
+                    text: format!("{} {name}", space.name),
+                    sub: "asleep".to_string(),
+                    space: Some(space.id),
+                    space_len: crate::width::width(&space.name),
+                    state: None,
+                });
+            }
         }
         for space in spaces {
             out.push(Entry {
@@ -164,6 +180,7 @@ impl Palette {
             (Item::Equalize, "equalize panes", "="),
             (Item::NewTerminal, "new terminal here", "c"),
             (Item::NewAgentAsk, "new agent terminal...", ""),
+            (Item::Sleep, "sleep this space", "Z"),
             (Item::NewSpace, "new space", "w"),
         ] {
             out.push(Entry {
@@ -268,6 +285,8 @@ mod tests {
             id,
             name: name.to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }
     }
 
@@ -544,14 +563,21 @@ mod tests {
         assert!(entries[0].text.contains("77"), "{entries:?}");
     }
 
-    /// A slept tab gets its own calm bucket, named, exactly once: the idle
-    /// catch-all must not list it a second time.
+    /// A sleeping space's tabs are listed once each, under their own name, so a jump can
+    /// wake them; the space's `sleep this space` row is there for the awake one.
     #[test]
-    fn a_sleeping_terminal_is_listed_once_as_sleeping() {
-        let rows = vec![agent(7, 1, "claude", "sleeping")];
+    fn a_sleeping_spaces_tabs_are_listed_under_sleeping() {
+        let mut asleep = space(2, "api");
+        asleep.asleep = true;
+        asleep.sleeping = vec![qoro_runtime::control::SleepingTab {
+            terminal: 7,
+            title: None,
+            agent: Some("claude".into()),
+            cwd: "/tmp".into(),
+        }];
         let entries = Palette::open().items(
-            &rows,
             &[],
+            &[space(1, "default"), asleep],
             0,
             &crate::sidebar::Seen::new(),
             &crate::sidebar::Unseen::new(),
@@ -562,6 +588,8 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1, "listed exactly once: {entries:?}");
         assert_eq!(hits[0].section, "sleeping");
+        assert_eq!(hits[0].text, "api claude");
+        assert!(entries.iter().any(|e| e.item == Item::Sleep));
     }
 
     /// The empty query stays short: one agent row that asks which command,

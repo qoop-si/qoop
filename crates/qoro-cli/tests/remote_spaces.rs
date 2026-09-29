@@ -271,7 +271,6 @@ fn scenario() {
                 vec![Remote {
                     name: "devbox".into(),
                     target: "devbox.example".into(),
-                    session: "default".into(),
                 }],
             ));
             let (rd, wr) = tokio::io::split(tui_side);
@@ -438,38 +437,11 @@ fn scenario() {
             })
             .await;
 
-            // From the `+`: the sessions on a machine by its address, as its qoro lists them.
-            tui.ask(ControlRequest::ListRemoteSessions {
-                id: "probe-1".into(),
-                target: "admin@10.0.0.5".into(),
-            })
-            .await;
-            let sessions = tui
-                .until("the remote's sessions", |incoming| match incoming {
-                    Incoming::Control(ControlResponse::RemoteSessions { id, sessions, .. })
-                        if id == "probe-1" =>
-                    {
-                        Some(sessions.clone())
-                    }
-                    Incoming::Control(ControlResponse::Failed { id, reason })
-                        if id == "probe-1" =>
-                    {
-                        panic!("the sessions were not listed: {reason}")
-                    }
-                    _ => None,
-                })
-                .await;
-            assert!(
-                sessions.iter().any(|s| s.name == "default" && s.running),
-                "the running remote session is not listed: {sessions:?}"
-            );
-
-            // Connected from there, into a new session: it is kept, named after its host,
-            // and its spaces arrive without the interface restarting.
+            // From the `+`, by its address: asked whether qoro is there, then kept, named
+            // after its host, and its spaces arrive without the interface restarting.
             tui.ask(ControlRequest::ConnectRemote {
                 id: "connect-1".into(),
                 target: "admin@10.0.0.5".into(),
-                session: "work".into(),
             })
             .await;
             let name = tui
@@ -491,8 +463,7 @@ fn scenario() {
             let kept = qoro_remote::saved::load_from(&home.path().join("remotes.json"))
                 .expect("remotes saved");
             assert!(
-                kept.iter()
-                    .any(|r| r.target == "admin@10.0.0.5" && r.session == "work"),
+                kept.iter().any(|r| r.target == "admin@10.0.0.5"),
                 "the machine was not kept: {kept:?}"
             );
             tui.spaces_where("the new machine's space", |s| {
@@ -505,7 +476,6 @@ fn scenario() {
             tui.ask(ControlRequest::ConnectRemote {
                 id: "connect-2".into(),
                 target: "admin@10.0.0.5".into(),
-                session: "work".into(),
             })
             .await;
             let again = tui
@@ -564,8 +534,8 @@ fn scenario() {
 /// boxed by the caller, because one async block holding every step of this test is a
 /// future larger than a test thread's stack.
 async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
-    // A machine with no qoro: said so, with its platform, rather than failed.
-    tui.ask(ControlRequest::ListRemoteSessions {
+    // A machine with no qoro: said so, with its platform, rather than failed or added.
+    tui.ask(ControlRequest::ConnectRemote {
         id: "probe-bare".into(),
         target: "bare.example".into(),
     })
@@ -624,26 +594,21 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
         "a staged copy was left behind"
     );
 
-    // Now it answers like any machine with qoro.
-    tui.ask(ControlRequest::ListRemoteSessions {
+    // Now it answers like any machine with qoro, and is added.
+    tui.ask(ControlRequest::ConnectRemote {
         id: "probe-bare-2".into(),
         target: "bare.example".into(),
     })
     .await;
-    tui.until(
-        "the sessions after the install",
-        |incoming| match incoming {
-            Incoming::Control(ControlResponse::RemoteSessions { id, .. })
-                if id == "probe-bare-2" =>
-            {
-                Some(())
-            }
-            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "probe-bare-2" => {
-                panic!("the probe after the install failed: {reason}")
-            }
-            _ => None,
-        },
-    )
+    tui.until("the connect after the install", |incoming| match incoming {
+        Incoming::Control(ControlResponse::RemoteAdded { id, .. }) if id == "probe-bare-2" => {
+            Some(())
+        }
+        Incoming::Control(ControlResponse::Failed { id, reason }) if id == "probe-bare-2" => {
+            panic!("the probe after the install failed: {reason}")
+        }
+        _ => None,
+    })
     .await;
 
     // And a second install never replaces the qoro that is there.

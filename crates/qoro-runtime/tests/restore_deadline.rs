@@ -43,6 +43,10 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
         let daemon = Daemon::bind(dir.path(), Path::new("/bin/sh"))
             .await
             .expect("the daemon binds");
+        daemon
+            .open_first_terminal()
+            .await
+            .expect("the first terminal");
         let terminals = daemon.terminals();
         let store = daemon.store();
         let workspace = daemon.workspace();
@@ -92,7 +96,7 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
         "restoring {} tabs with unanswered directories took {took:?}: {report:?}",
         TABS + 1
     );
-    // The daemon's own first tab plus the ones recorded above, every one reopened in the
+    // The first tab plus the ones recorded above, every one reopened in the
     // daemon's directory because nothing could say its own was there.
     assert_eq!(report.brought_back, TABS + 1, "{report:?}");
     assert_eq!(report.cwd_fallback, TABS + 1, "{report:?}");

@@ -1,7 +1,7 @@
 //! The remotes a person has added, and the one command that reaches each.
 //!
-//! A remote is a name for the interface, an ssh target for the person's own ssh config to
-//! resolve, and the session to open over there. Nothing else: the host, the user, the key
+//! A remote is a name for the interface and an ssh target for the person's own ssh config
+//! to resolve. Nothing else: the host, the user, the key
 //! and the jump host all live in `~/.ssh/config`, where the person already keeps them.
 
 use std::path::{Path, PathBuf};
@@ -24,12 +24,6 @@ pub const MARKER_LIMIT: usize = 64 * 1024;
 pub struct Remote {
     pub name: String,
     pub target: String,
-    #[serde(default = "default_session")]
-    pub session: String,
-}
-
-fn default_session() -> String {
-    "default".to_string()
 }
 
 /// Where the list lives: the override when set, else `qoro/remotes.json` under the
@@ -59,12 +53,19 @@ pub fn path() -> PathBuf {
 /// error rather than an empty list: saving over it would lose what the person wrote.
 pub fn load_from(path: &Path) -> std::io::Result<Vec<Remote>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{}: {e}", path.display()),
-            )
-        }),
+        Ok(text) => {
+            let mut list: Vec<Remote> = serde_json::from_str(&text).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: {e}", path.display()),
+                )
+            })?;
+            // A list written when a machine had several sessions can name one machine
+            // twice; it has one daemon now, and twice would list its spaces twice.
+            let mut seen = std::collections::HashSet::new();
+            list.retain(|r| seen.insert(r.target.clone()));
+            Ok(list)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
     }
@@ -114,66 +115,25 @@ pub fn shell_quote(word: &str) -> String {
 }
 
 /// The command ssh runs on the remote: print the marker, then run qoro's `verb`
-/// (`relay`, or `--hello`) in `session`.
+/// (`relay`, or `--hello`).
 ///
-/// Run through `sh -c` so a fish login shell runs it as well, and the session is a
-/// positional parameter rather than part of the script: a name is data, and data spliced
-/// into a script is a script somebody else wrote. qoro is looked for on the PATH and in
-/// the two places an install puts it, because a non-interactive ssh command gets a PATH
-/// without whatever the person's interactive profile adds.
-pub fn remote_command(session: &str, verb: &str) -> String {
+/// `--session default` is passed on purpose: a qoro from before sessions were folded into
+/// spaces opens the last session opened there when given none, and this machine's spaces
+/// are the default one's. A newer qoro accepts and ignores it.
+///
+/// Run through `sh -c` so a fish login shell runs it as well, and the verb is a positional
+/// parameter rather than part of the script: data spliced into a script is a script
+/// somebody else wrote. qoro is looked for on the PATH and in the two places an install
+/// puts it, because a non-interactive ssh command gets a PATH without whatever the
+/// person's interactive profile adds.
+pub fn remote_command(verb: &str) -> String {
     let script = format!(
         "printf '%s\\n' {RELAY_MARKER}; \
          for q in qoro \"$HOME/.local/bin/qoro\" \"$HOME/.cargo/bin/qoro\"; do \
-         if command -v \"$q\" >/dev/null 2>&1; then exec \"$q\" --session \"$1\" \"$2\"; fi; \
+         if command -v \"$q\" >/dev/null 2>&1; then exec \"$q\" --session default \"$1\"; fi; \
          done; echo 'qoro is not installed on this host' >&2; exit 127"
     );
-    format!(
-        "sh -c {} qoro {} {}",
-        shell_quote(&script),
-        shell_quote(session),
-        shell_quote(verb)
-    )
-}
-
-/// One session as `qoro ls` prints it: name, whether it is running, how many tabs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListedSession {
-    pub name: String,
-    pub running: bool,
-    pub tabs: usize,
-}
-
-/// The sessions in `qoro ls` output, read from the text every released version prints
-/// (`* name  running  3 tabs`) rather than from a newer flag an older remote would not
-/// know. A line that does not read that way is skipped, not guessed at.
-pub fn parse_sessions(text: &str) -> Vec<ListedSession> {
-    text.lines()
-        .filter_map(|line| {
-            let words: Vec<&str> = line.trim_start_matches('*').split_whitespace().collect();
-            let [name, state, tabs, unit] = words.as_slice() else {
-                return None;
-            };
-            let running = match *state {
-                "running" => true,
-                "stopped" => false,
-                _ => return None,
-            };
-            if !matches!(*unit, "tab" | "tabs") {
-                return None;
-            }
-            // A name is shown and typed back: one with a control character in it is
-            // not a session name any qoro would have made.
-            if name.chars().any(char::is_control) {
-                return None;
-            }
-            Some(ListedSession {
-                name: name.to_string(),
-                running,
-                tabs: tabs.parse().ok()?,
-            })
-        })
-        .collect()
+    format!("sh -c {} qoro {}", shell_quote(&script), shell_quote(verb))
 }
 
 /// A name for a machine added by its address: the host, without the user, with anything a
@@ -211,30 +171,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sessions_are_read_from_the_text_every_version_prints() {
-        let text = "  idle-e2e             stopped  0 tabs\n\
-                    * work                 running  1 tab\n\
-                    \x1b]52;c;aGk=\x07 running 1 tab\n\
-                    no sessions yet. `qoro` starts the default one.\n\
-                    \n";
-        assert_eq!(
-            parse_sessions(text),
-            vec![
-                ListedSession {
-                    name: "idle-e2e".into(),
-                    running: false,
-                    tabs: 0
-                },
-                ListedSession {
-                    name: "work".into(),
-                    running: true,
-                    tabs: 1
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn a_machine_is_named_after_its_host_and_never_twice_the_same() {
         assert_eq!(name_for("admin@10.0.0.5", &[]), "10.0.0.5");
         assert_eq!(name_for("devbox", &[]), "devbox");
@@ -255,18 +191,29 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_list_reads_back_and_the_session_defaults() {
+    fn a_saved_list_reads_back_and_an_old_one_names_each_machine_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("qoro").join("remotes.json");
         let list = vec![Remote {
             name: "devbox".into(),
             target: "me@devbox".into(),
-            session: "work".into(),
         }];
         save_to(&file, &list).expect("save");
         assert_eq!(load_from(&file).expect("load"), list);
-        std::fs::write(&file, r#"[{"name":"a","target":"b"}]"#).expect("write");
-        assert_eq!(load_from(&file).expect("load")[0].session, "default");
+        // Written when a machine had sessions: the field is read past, and a second entry
+        // for the same machine is dropped.
+        std::fs::write(
+            &file,
+            r#"[{"name":"a","target":"b","session":"work"},{"name":"a2","target":"b","session":"play"}]"#,
+        )
+        .expect("write");
+        assert_eq!(
+            load_from(&file).expect("load"),
+            vec![Remote {
+                name: "a".into(),
+                target: "b".into()
+            }]
+        );
     }
 
     #[test]
@@ -282,13 +229,13 @@ mod tests {
     }
 
     /// The command goes through the remote's login shell and then `sh`. Run it through a
-    /// real `sh` here with a session built to break out of quoting: it must arrive as one
-    /// argument, and nothing in it may run.
+    /// real `sh` here with a verb built to break out of quoting: it must arrive as one
+    /// argument after `--session default`, and nothing in it may run.
     #[test]
-    fn a_hostile_session_arrives_as_data_and_runs_nothing() {
+    fn a_hostile_verb_arrives_as_data_and_runs_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let probe = dir.path().join("ran");
-        let session = format!(
+        let verb = format!(
             "x'; touch {} ; echo '$(touch {})",
             probe.display(),
             probe.display()
@@ -301,7 +248,7 @@ mod tests {
             .expect("chmod");
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(remote_command(&session, "relay"))
+            .arg(remote_command(&verb))
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .output()
             .expect("sh");
@@ -311,15 +258,15 @@ mod tests {
             .expect("marker")
             .1
             .trim_start();
-        assert_eq!(after, format!("--session|{session}|relay|"));
-        assert!(!probe.exists(), "the session ran as a command");
+        assert_eq!(after, format!("--session|default|{verb}|"));
+        assert!(!probe.exists(), "the verb ran as a command");
     }
 
     #[test]
     fn a_host_without_qoro_says_so() {
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(remote_command("default", "relay"))
+            .arg(remote_command("relay"))
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/nonexistent")
             .output()

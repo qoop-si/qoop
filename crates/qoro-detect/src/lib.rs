@@ -437,6 +437,18 @@ pub fn resume_argv(program: &str, session: Option<&str>) -> Option<Vec<String>> 
     for_program(program)?.resume()?.argv(session)
 }
 
+/// Whether a program can be resumed into a named conversation, not only the latest one.
+///
+/// What a sleep needs: coming back to "whichever conversation in this directory is newest"
+/// is a different conversation the moment there are two.
+pub fn resumes_by_id(program: &str) -> bool {
+    for_program(program).is_some_and(|manifest| {
+        manifest
+            .resume()
+            .is_some_and(|resume| !resume.session.is_empty())
+    })
+}
+
 fn parse_state(state: &str, rule: &str) -> Result<AgentRuntimeState, ManifestError> {
     match state {
         "starting" => Ok(AgentRuntimeState::Starting),

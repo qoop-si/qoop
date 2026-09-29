@@ -78,36 +78,68 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             )));
         }
         println!(
-            "update available: {current} -> {}: run `qoro update` with no session running to install it",
+            "update available: {current} -> {}: run `qoro update` with nothing awake to install it",
             latest.version
         );
         return Ok(());
     }
-    let live = live_sessions();
-    if !live.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "refusing to update: session{} running: {}. Stop {} first (`qoro stop <name>`), \
-             then update, so no agent dies to a routine upgrade",
-            if live.len() == 1 { "" } else { "s" },
-            live.join(", "),
-            if live.len() == 1 { "it" } else { "them" },
-        )));
-    }
+    clear_the_way()?;
     install(&latest, current)
 }
 
-/// Every session with a daemon answering, read off the disk the way `qoro ls` does.
-fn live_sessions() -> Vec<String> {
-    let Ok(base) = paths::runtime_base() else {
-        return Vec::new();
-    };
-    paths::sessions(&base)
-        .into_iter()
-        .filter(|name| {
-            let dir = paths::session_dir(&base, name);
-            std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok()
-        })
-        .collect()
+/// Refuse while a tab is awake, so no agent dies to a routine upgrade; a daemon with
+/// nothing awake is asked to go and waited out, so the new binary is the one that starts.
+fn clear_the_way() -> std::io::Result<()> {
+    use qoro_runtime::control::{ControlRequest, ControlResponse};
+
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let awake = runtime.block_on(async {
+        match crate::ask_daemon(
+            &socket,
+            "qoro-update",
+            &ControlRequest::ListTerminals {
+                id: crate::request_id("update"),
+            },
+        )
+        .await?
+        {
+            ControlResponse::Terminals { terminals, .. } => Ok(terminals.len()),
+            _ => Err(std::io::Error::other(
+                "unexpected answer to the terminal list",
+            )),
+        }
+    })?;
+    if awake > 0 {
+        return Err(std::io::Error::other(format!(
+            "refusing to update: {awake} tab{} awake. Put {} spaces to sleep (`qoro sleep \
+             <space>`) or stop qoro (`qoro stop`) first, so no agent dies to a routine upgrade",
+            if awake == 1 { "" } else { "s" },
+            if awake == 1 { "its" } else { "their" },
+        )));
+    }
+    runtime.block_on(crate::ask_daemon(
+        &socket,
+        "qoro-update",
+        &ControlRequest::Shutdown {
+            id: crate::request_id("update"),
+        },
+    ))?;
+    // Gone, not only told: the answer comes before the daemon has left, and a swap while it
+    // runs would leave the old binary answering the next `qoro`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && std::os::unix::net::UnixStream::connect(&socket).is_ok()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 /// Fetch the tarball, check it, and swap it over this binary atomically.

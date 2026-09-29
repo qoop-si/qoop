@@ -17,6 +17,8 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
         id,
         name: name.to_string(),
         terminals: 4,
+        asleep: false,
+        sleeping: Vec::new(),
     }
 }
 

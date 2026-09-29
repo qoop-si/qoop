@@ -13,7 +13,7 @@
 //! marks selection. At frame zero, which is what a test, a pipe and `QORO_MOTION=0` get,
 //! the rows are the same static text every time.
 
-use qoro_runtime::control::{AgentRow, WorkspaceRow};
+use qoro_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
 
 /// One painted row of the chrome: its text, and the colour its state gives it.
 ///
@@ -1061,6 +1061,16 @@ fn content(c: &Column) -> Vec<Row> {
                     let (line, hit) = second_row(&inside, tab, 2, place_of(tab, space));
                     out.push((boxed(line, c.width, ink), hit));
                 }
+                // A sleeping space has no terminals, only the tabs a wake brings back: one
+                // faint row each, under the same fold as live tabs.
+                for tab in &space.sleeping {
+                    if open || tab.terminal == c.focused_terminal {
+                        out.push((
+                            boxed(sleeping_line(&inside, tab, space), c.width, ink),
+                            Some(Hit::Terminal(tab.terminal)),
+                        ));
+                    }
+                }
                 out.push((box_bottom(c.width, ink), None));
             }
             // An agent in a space the client has not heard of yet still draws, under no
@@ -1096,6 +1106,12 @@ fn content(c: &Column) -> Vec<Row> {
 /// when that agent wants a person, so a fold never hides a blocked agent silently. Open,
 /// they stay grey: the agents are right there, wearing their own dots. Only agents
 /// colour it: a shell never wants a person.
+///
+/// A sleeping space carries a `z` after its name, and counts the tabs a wake brings back:
+///
+/// ```text
+///  ╭─ ▸ default z ────── 3 ─╮
+/// ```
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
     use crate::theme::Role;
     let width = c.width;
@@ -1103,29 +1119,39 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
     let mark = hot.unwrap_or(Role::Faint);
-    let arrow = if kids.is_empty() {
+    let held = if space.asleep {
+        space.sleeping.len()
+    } else {
+        kids.len()
+    };
+    let arrow = if held == 0 {
         '\u{b7}'
     } else if open {
         '\u{25be}'
     } else {
         '\u{25b8}'
     };
-    let count = if kids.is_empty() {
+    let count = if held == 0 {
         String::new()
     } else {
-        kids.len().to_string()
+        held.to_string()
     };
     let count_w = crate::width::width(&count);
-    // ` ╭▾ ` then the name, a space, the dashes, ` 3 ─` when it holds tabs, and the
-    // corner, one column in from the right as the pin's boxes are. The name gives way
-    // before the count and the arrow do.
+    let asleep = if space.asleep { " z" } else { "" };
+    let asleep_w = asleep.len();
+    // ` ╭▾ ` then the name, the sleep mark when asleep, a space, the dashes, ` 3 ─`
+    // when it holds tabs, and the corner, one column in from the right as the pin's boxes
+    // are. The name gives way before the count, the mark and the arrow do.
     let end_w = if count.is_empty() { 0 } else { count_w + 3 };
-    let room = width.saturating_sub(FOLD_CELLS + 1 + 1 + end_w + 2);
+    let room = width.saturating_sub(FOLD_CELLS + asleep_w + 1 + 1 + end_w + 2);
     let name = shorten_middle(&space.name, room);
     let name_w = crate::width::width(&name);
-    let fill = width.saturating_sub(FOLD_CELLS + name_w + 1 + end_w + 2);
-    let dashes_at = FOLD_CELLS + name_w + 1;
+    let fill = width.saturating_sub(FOLD_CELLS + name_w + asleep_w + 1 + end_w + 2);
+    let dashes_at = FOLD_CELLS + name_w + asleep_w + 1;
     let mut runs = vec![(1, 1, ink), (dashes_at, fill, ink)];
+    if space.asleep {
+        runs.push((FOLD_CELLS + name_w + 1, 1, Role::Sleeping));
+    }
     let end = if count.is_empty() {
         runs.push((dashes_at + fill, 1, ink));
         String::new()
@@ -1136,7 +1162,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         format!(" {count} \u{2500}")
     };
     let text = format!(
-        " \u{256d}{arrow} {name} {}{end}\u{256e}",
+        " \u{256d}{arrow} {name}{asleep} {}{end}\u{256e}",
         "\u{2500}".repeat(fill)
     );
     Line {
@@ -1553,6 +1579,30 @@ fn tab_line(c: &Column, tab: &AgentRow, space: &WorkspaceRow) -> Line {
     }
 }
 
+/// A tab of a sleeping space: faint like a shell's row, with no dot, since nothing runs
+/// in it. What a person called it, else the agent that comes back in it, else a shell (a
+/// sleep refuses any other program), and where.
+fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
+    let name = tab
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .or(tab.agent.as_deref())
+        .map_or_else(|| "shell".to_string(), str::to_string);
+    let text = match cwd_basename(Some(&tab.cwd)).filter(|b| !b.eq_ignore_ascii_case(&space.name)) {
+        Some(place) => format!("{name} \u{b7} {place}"),
+        None => name,
+    };
+    let lead = "\u{b7} ";
+    let room = c.width.saturating_sub(crate::width::width(lead));
+    Line {
+        text: fit(&format!("{lead}{}", shorten_middle(&text, room)), c.width),
+        colour: Some(crate::theme::Role::Faint),
+        ..Line::default()
+    }
+}
+
 /// An agent in a flat list, the pin or the priority view: the dot, the session, and the
 /// space it lives in on the right, in the space's own colour.
 fn flat_line(c: &Column, agent: &AgentRow, inline: bool) -> Line {
@@ -1670,7 +1720,10 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             let folds = !collapsed
                 && c.view == View::Tree
                 && col <= FOLD_CELLS
-                && c.agents.iter().any(|a| a.agent && a.workspace == id);
+                && (c.agents.iter().any(|a| a.agent && a.workspace == id)
+                    || c.spaces
+                        .iter()
+                        .any(|s| s.id == id && !s.sleeping.is_empty()));
             Some(if folds { Act::Fold(id) } else { Act::Space(id) })
         }
         Hit::Title => {
@@ -2435,6 +2488,8 @@ mod tests {
             id,
             name: name.to_string(),
             terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
         }
     }
 
@@ -6131,5 +6186,74 @@ mod tests {
             Some((BOX_LEAD, 1, crate::theme::Role::Sleeping))
         );
         assert!(pinned(&rows).is_empty());
+    }
+
+    /// A sleeping space is a box like any other with a `z` after its name and the count of
+    /// what a wake brings back. Folded it draws no tab; unfolded its tabs are faint rows
+    /// with no dot, each reaching its tab, and its arrow folds it like a live space's.
+    #[test]
+    fn a_sleeping_space_draws_folded_with_its_mark_and_dim_tabs() {
+        let mut asleep = space(2, "api");
+        asleep.asleep = true;
+        asleep.sleeping = vec![
+            SleepingTab {
+                terminal: 7,
+                title: None,
+                agent: Some("claude".into()),
+                cwd: "/src/api".into(),
+            },
+            SleepingTab {
+                terminal: 8,
+                title: Some("logs".into()),
+                agent: None,
+                cwd: "/src/wt".into(),
+            },
+        ];
+        let spaces = vec![space(1, "app"), asleep];
+        let agents = vec![agent(1, 1, "claude", "idle")];
+        let folded = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::from([2]));
+        let head = rule_row(&folded, 2);
+        assert!(head.text.contains("\u{25b8} api z "), "{:?}", head.text);
+        assert!(head.text.contains(" 2 \u{2500}"), "{:?}", head.text);
+        assert_eq!(crate::width::width(&head.text), WIDTH);
+        assert!(
+            head.runs
+                .contains(&(FOLD_CELLS + 4, 1, crate::theme::Role::Sleeping)),
+            "{:?}",
+            head.runs
+        );
+        assert!(!order(&folded).contains(&7), "folded, no tab draws");
+
+        let open = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::new());
+        assert_eq!(order(&open), vec![1, 7, 8]);
+        let line = |t| {
+            &open
+                .iter()
+                .find(|(_, h)| *h == Some(Hit::Terminal(t)))
+                .expect("the tab draws")
+                .0
+        };
+        let dim = line(7);
+        assert_eq!(dim.colour, Some(crate::theme::Role::Faint));
+        assert_eq!(dim.indicator, None, "no state dot");
+        assert_eq!(unbox(&dim.text), "   \u{b7} claude");
+        assert_eq!(unbox(&line(8).text), "   \u{b7} logs \u{b7} wt");
+
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        assert_eq!(act(Hit::Space(2), 4, &c, false), Some(Act::Fold(2)));
+        assert_eq!(act(Hit::Terminal(7), 9, &c, false), Some(Act::Terminal(7)));
     }
 }

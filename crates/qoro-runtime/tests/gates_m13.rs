@@ -42,6 +42,14 @@ where
     let daemon = Daemon::bind(dir, Path::new("/bin/sh"))
         .await
         .expect("the daemon binds");
+    // What `qoro` does against a daemon that restored nothing: open a shell. These gates
+    // were written against the daemon doing it itself.
+    if daemon.terminals().streams().is_empty() {
+        daemon
+            .open_first_terminal()
+            .await
+            .expect("the first terminal");
+    }
     body(daemon).await
 }
 

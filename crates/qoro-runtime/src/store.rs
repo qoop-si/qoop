@@ -26,6 +26,42 @@ pub enum HandleError {
     Store(#[from] StoreError),
 }
 
+/// Writes this process still owes the disk: every store call and every history writer.
+/// Per process rather than per daemon, which is the same thing outside the tests. An exit
+/// waits for them, because `process::exit` runs no destructors and a buffered history or a
+/// close in flight would otherwise be lost with the process.
+static OWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One write owed, for as long as it is held. Taken before the task that does the write
+/// is spawned, so an exit can never look between the spawn and the task's first step.
+pub(crate) struct Owed;
+
+impl Owed {
+    pub(crate) fn new() -> Self {
+        OWED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Owed
+    }
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        OWED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait, until `deadline`, for every owed write to land.
+pub(crate) async fn settle_owed(deadline: tokio::time::Instant) {
+    while OWED.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let left = OWED.load(std::sync::atomic::Ordering::SeqCst);
+    if left > 0 {
+        eprintln!("qorod: exiting with {left} writes to disk unfinished");
+    }
+}
+
 #[derive(Clone)]
 pub struct StoreHandle {
     inner: Arc<Mutex<Store>>,
@@ -51,9 +87,13 @@ impl StoreHandle {
         F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
     {
         let inner = self.inner.clone();
+        // Owed from here until the closure is done, whether or not this caller is still
+        // waiting: a call past its deadline still runs, and an exit must wait for it.
+        let owed = Owed::new();
         // On the store pool, not a raw blocking thread: a hung `qoro.db` then holds the
         // pool's threads and no more, where every call used to add one blocked thread.
         let work = crate::blocking::run_within(STORE_DEADLINE, move || {
+            let _owed = owed;
             // A panic under the lock leaves SQLite consistent (an unfinished transaction
             // rolls back when its statement drops), so the lock is taken back rather than
             // failing every later call for the rest of the daemon's life.
@@ -112,6 +152,26 @@ impl StoreHandle {
     ) -> Result<i64, HandleError> {
         self.run(move |s| s.create_terminal(id, workspace, &cwd, &argv, now()))
             .await
+    }
+
+    /// The workspaces asleep, the one that went to sleep last first.
+    pub async fn asleep(&self) -> Result<Vec<(i64, i64)>, HandleError> {
+        self.run(|s| s.asleep()).await
+    }
+
+    /// Put a workspace to sleep with its agents written down; one transaction.
+    pub async fn sleep_workspace(
+        &self,
+        workspace: i64,
+        checkpoints: Vec<qoro_store::Checkpoint>,
+    ) -> Result<(), HandleError> {
+        self.run(move |s| s.sleep_workspace(workspace, now(), &checkpoints))
+            .await
+    }
+
+    /// Take the sleep mark off a workspace. Answers whether it had one.
+    pub async fn wake_workspace(&self, workspace: i64) -> Result<bool, HandleError> {
+        self.run(move |s| s.wake_workspace(workspace)).await
     }
 
     /// Record an agent's own id for the conversation in a terminal.

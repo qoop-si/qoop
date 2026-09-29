@@ -89,8 +89,8 @@ whatever is already in it. The skill lands beside the agent's own skills the sam
 Both are optional: every agent is read from its screen without a hook, and the skill
 only teaches an agent what the commands are for. What a hook buys is a state known
 the moment it changes rather than after it is drawn, and the agent's own id for its
-conversation, which is what lets a stopped session come back to that conversation
-rather than to whichever one in the directory is newest. `qoro hooks status` says
+conversation, which is what lets a tab that slept or stopped come back to that
+conversation rather than to whichever one in the directory is newest. `qoro hooks status` says
 what is installed and `qoro hooks uninstall` takes out exactly what was added;
 `qoro skills status` and `qoro skills uninstall` do the same for the skill.
 How a screen is read, and how to override a misreading, is in
@@ -103,12 +103,21 @@ skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro`
 private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
 `gh` login.
 
-Sessions are named, and a stopped one comes back as itself:
+A space you are not using can sleep: every tab in it ends, nothing of it takes CPU or
+memory, and waking it brings back the same tabs, numbers, names, splits, directories and
+scrollback, the last screen included, with each agent resumed into its own conversation.
+A space sleeps whole or not at all: a command still running, an agent that is working or
+has not told its conversation yet, or a job left in the background keeps it awake, and the
+refusal says which tab and why. When nothing is awake and no interface is attached, the
+daemon itself leaves ten seconds later, so a machine with everything asleep runs nothing
+of qoro; the next `qoro` starts it and wakes the space that slept last.
 
 ```
-qoro --session work     open one, or make it
-qoro ls                 what there is, and what is running
-qoro stop work          end it: the tabs come back on the next open
+ctrl-a Z                sleep the space you are in, or wake the one you are on
+qoro sleep api          the same from a shell, by name or id
+qoro wake [api]         wake one, or the one that slept last
+qoro ls                 every space, awake, asleep or stopped, and its tabs
+qoro stop               end everything now: what was awake comes back on the next open
 ```
 
 The interface reads `~/.config/qoro/config.toml` (or `$XDG_CONFIG_HOME/qoro/config.toml`)
@@ -121,18 +130,23 @@ theme = "auto"      # auto | dark | light
 [notify]
 desktop = true      # tell the desktop when an agent needs you and you are not looking
 sound = false
+[sleep]
+idle_minutes = 0    # 0 = never; else a space whose tabs are all idle this long sleeps
+[daemon]
+exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 ```
 
 A value it cannot use keeps its default and is named on the hint row. The settings box
-shows what is in effect and where a notification would go. How long an idle terminal
-lives stays the daemon's `QORO_IDLE_TIMEOUT_MINUTES`.
+shows what is in effect and where a notification would go. `[sleep]` and `[daemon]` are
+the daemon's own, read by it from the same file; every key is in
+[docs/config.md](docs/config.md).
 
 ### Other machines
 
 A qoro on a server keeps running when you log out, like the one here does. Add it once and
 its spaces are listed beside this machine's. From the interface, the `+` beside "spaces"
-offers `connect a machine`: type its ssh address, pick one of the sessions already running
-there or name a new one, and the screen moves to it. From a shell:
+offers `connect a machine`: type its ssh address and the screen moves to it. From a
+shell:
 
 ```
 qoro remote add devbox me@devbox      runs ssh in the foreground, checks the qoro there
@@ -149,6 +163,9 @@ over there: a new tab, a split, a space made with `ctrl-a w` while you are in on
 new space `devbox:tests` from anywhere makes it on devbox. If the connection drops, its
 spaces read as offline within about fifteen seconds and come back on their own, with the same
 tabs, at most ten seconds after the network does, or at once when you reach for one of them.
+Spaces over there sleep the same way, and a machine with everything asleep is let go: its
+qoro leaves as this one would, its spaces read as asleep rather than offline, and waking
+one connects again.
 A machine with no qoro is offered one: this version, for its platform, put in its
 `~/.local/bin` over the same ssh and run once there before it is kept. A release downloaded
 for another platform is checked against its checksum first. A qoro already there is never
@@ -172,7 +189,7 @@ Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm6
 2.17 and newer) live on GitHub Releases, all built on one Mac with `./scripts/release.sh
 0.1.0`: GitHub only hosts the files, nothing is compiled there. `qoro update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
-how it installs, and `qoro update` installs it once no session is running. How a release is
+how it installs, and `qoro update` installs it once nothing is awake. How a release is
 cut and how an update lands: [docs/update.md](docs/update.md).
 
 ## What is measured

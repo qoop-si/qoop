@@ -1745,3 +1745,51 @@ async fn a_terminal_whose_spawn_failed_leaves_no_tab_and_no_row() {
         "the failed tab's row is still open, so the next start brings it back"
     );
 }
+
+/// A workspace whose tab is open but not running still holds it.
+///
+/// A stopped or sleeping tab is a row with no process behind it, and deleting its workspace
+/// cascades to the row: counting only live terminals turned "close this empty space" into
+/// losing the tabs in it for good.
+#[tokio::test]
+async fn a_workspace_holding_a_tab_that_is_not_running_does_not_close() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("resting").await;
+    let made = match c
+        .control(
+            &ControlRequest::CreateWorkspace {
+                id: "r1".into(),
+                name: "resting".into(),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("a created workspace")
+    {
+        ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+        other => panic!("expected a created workspace, got {other:?}"),
+    };
+    let row = d.terminals_arc().mint();
+    d.store()
+        .create_terminal(row as i64, made, "/tmp".into(), "/bin/sh".into())
+        .await
+        .expect("a row with no process");
+    let refused = c
+        .control(
+            &ControlRequest::CloseWorkspace {
+                id: "r2".into(),
+                workspace: made,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "a workspace holding a resting tab was closed: {refused:?}"
+    );
+    assert_eq!(
+        d.store().open_terminals(made).await.expect("rows").len(),
+        1,
+        "the resting tab's row is gone"
+    );
+}

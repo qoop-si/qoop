@@ -10,7 +10,7 @@
 //! the hooks and skills shape: `status` says what is there, `uninstall` takes out
 //! exactly what was put in.
 
-/// `qoro notch ...`. The notch shows every running session, so it takes none.
+/// `qoro notch ...`.
 pub fn run(args: &[String]) -> std::io::Result<()> {
     let help = "usage: qoro notch install|uninstall|status\n       qoro notch run";
     #[cfg(target_os = "macos")]
@@ -99,6 +99,11 @@ mod mac {
 
     /// Write the app out when this build's copy is not there yet, and become it.
     pub fn run_app() -> std::io::Result<()> {
+        // A login item installed when a machine had named sessions carries one in its
+        // environment, and every `qoro` the notch starts would refuse it. There is one
+        // daemon now: the notch follows it.
+        // SAFETY: before the app, or anything else here, starts a thread.
+        unsafe { std::env::remove_var(qoro_runtime::paths::SESSION_ENV) };
         let exe = std::env::current_exe()?;
         let dir = cache_dir()?;
         let app = dir.join(format!("notch-{:016x}", super::fnv(APP)));
@@ -153,8 +158,8 @@ mod mac {
     }
 
     pub(super) fn plist(exe: &str) -> String {
-        // The launchd environment has none of the shell's. What moves where the session
-        // sockets live and where the pet was picked is carried over, or the notch would
+        // The launchd environment has none of the shell's. What moves where the daemon's
+        // socket lives and where the pet was picked is carried over, or the notch would
         // look somewhere the install did not.
         let env: String = ["QORO_RUNTIME_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
             .iter()
@@ -311,10 +316,10 @@ mod tests {
         assert_ne!(fnv(b"notch 1"), fnv(b"notch 2"));
     }
 
-    /// The login item runs this binary and keeps to no session: the notch shows them all.
+    /// The login item runs this binary's notch and names no session: there is one daemon.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_plist_runs_the_notch_in_no_session() {
+    fn the_plist_runs_the_notch_and_names_no_session() {
         let plist = mac::plist("/bin/qoro");
         assert!(plist.contains("<string>/bin/qoro</string><string>notch</string>"));
         assert!(!plist.contains("QORO_SESSION"), "{plist}");

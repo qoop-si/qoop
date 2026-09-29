@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use qoro_remote::SshTransport;
-use qoro_remote::saved::{
-    ListedSession, MARKER_LIMIT, RELAY_MARKER, Remote, parse_sessions, remote_command, shell_quote,
-};
+use qoro_remote::saved::{MARKER_LIMIT, RELAY_MARKER, Remote, remote_command, shell_quote};
 use qoro_runtime::client;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -73,7 +71,7 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
     if batch {
         transport = transport.batch();
     }
-    let argv = transport.argv(&remote_command(&remote.session, "relay"));
+    let argv = transport.argv(&remote_command("relay"));
     let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(std::process::Stdio::piped())
@@ -144,10 +142,11 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
     }
 }
 
-/// What a machine said when asked about its sessions.
+/// What a machine said when asked whether qoro is there.
 #[derive(Debug)]
 pub enum Probe {
-    Sessions(Vec<ListedSession>),
+    /// A qoro this build can talk to.
+    Ready,
     /// No qoro there, on a machine qoro is built for.
     Missing(Platform),
 }
@@ -167,14 +166,14 @@ impl Platform {
     }
 }
 
-/// The sessions on the machine at `target`, as its own `qoro ls` lists them, or that qoro
-/// is not there.
+/// Whether the machine at `target` has a qoro this build can talk to, or which machine
+/// it is when it has none.
 ///
 /// Asked from inside the interface, where nobody can answer a prompt: it never asks, and
 /// it takes a host key it has not seen before, since the person just typed that address.
 /// What ssh says when it cannot get in is the error, word for word.
-pub async fn list_sessions(target: &str) -> io::Result<Probe> {
-    let hello = run(target, &remote_command("default", "--hello"), None).await?;
+pub async fn probe(target: &str) -> io::Result<Probe> {
+    let hello = run(target, &remote_command("--hello"), None).await?;
     // Told apart by what happened, not by what was said: the remote command prints the
     // marker and exits 127 when it finds no qoro, and nothing else does both.
     if hello.marked.is_some() && hello.status == Some(127) {
@@ -185,8 +184,7 @@ pub async fn list_sessions(target: &str) -> io::Result<Probe> {
     let hello: qoro_remote::RemoteHello = serde_json::from_str(&hello.answer()?)
         .map_err(|_| io::Error::other(format!("{target} answered something that is not qoro")))?;
     qoro_remote::compatibility(&hello).map_err(|e| io::Error::other(e.to_string()))?;
-    let listed = run(target, &remote_command("default", "ls"), None).await?;
-    Ok(Probe::Sessions(parse_sessions(&listed.answer()?)))
+    Ok(Probe::Ready)
 }
 
 /// Which platform the machine at `target` is, refusing one no build of qoro runs on.

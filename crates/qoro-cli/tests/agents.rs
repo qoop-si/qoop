@@ -32,6 +32,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(socket.exists(), "the daemon never bound its socket");
+        qoro_testkit::open_first_terminal(&socket);
         std::thread::sleep(Duration::from_millis(500));
         Self { child, dir }
     }
@@ -110,19 +111,19 @@ fn agents_refuses_an_unknown_flag() {
     assert!(stderr.contains("unknown flag"), "no usage hint: {stderr:?}");
 }
 
+/// No daemon is nothing awake, and that is an answer: an empty list, not an error.
 #[test]
-fn agents_without_a_daemon_fails_cleanly() {
+fn agents_without_a_daemon_answers_an_empty_list() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    for args in [vec!["agents"], vec!["agents", "--json"]] {
+    for (args, said) in [(vec!["agents"], ""), (vec!["agents", "--json"], "[]\n")] {
         let out = Command::new(env!("CARGO_BIN_EXE_qoro"))
             .args(&args)
             .env("QORO_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .output()
             .expect("run qoro");
-        assert!(!out.status.success(), "{args:?} with no daemon succeeded");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!stderr.is_empty(), "{args:?} failed silently: {stderr:?}");
+        assert!(out.status.success(), "{args:?} with no daemon failed");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), said, "{args:?}");
     }
 }

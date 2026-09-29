@@ -796,6 +796,89 @@ pub fn scan_key(tty_dev: u64) -> u64 {
     (major << 32) | minor
 }
 
+/// One process, as the decision to put a terminal to sleep reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcRow {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    /// Its controlling terminal, keyed like [`scan_key`]; `None` for a process with none,
+    /// which is what a `setsid` child is.
+    pub tty: Option<u64>,
+    pub name: String,
+}
+
+/// Every process this user can read, with its parent, group and terminal.
+///
+/// One pass, read when a person asks for a sleep and not on any timer. What it is for is
+/// the one thing tty membership cannot see: a descendant that left the terminal with
+/// `setsid`, which teardown would never reach.
+#[cfg(target_os = "macos")]
+pub fn process_table() -> Vec<ProcRow> {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let mut out = Vec::new();
+    for pid in scan_all_pids() {
+        // SAFETY: zeroed proc_bsdinfo is a valid out-param of the size we pass.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: info is a live, correctly sized buffer for PROC_PIDTBSDINFO.
+        let rc = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if rc != size {
+            continue;
+        }
+        let dev = info.e_tdev as u64;
+        // SAFETY: the kernel NUL-terminates pbi_name within its fixed buffer.
+        let name = unsafe { std::ffi::CStr::from_ptr(info.pbi_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        out.push(ProcRow {
+            pid,
+            ppid: info.pbi_ppid as i32,
+            pgid: info.pbi_pgid as i32,
+            tty: (dev != u32::MAX as u64).then_some(dev),
+            name,
+        });
+    }
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_table() -> Vec<ProcRow> {
+    let mut out = Vec::new();
+    for pid in scan_all_pids() {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
+        let name = stat[open + 1..close].to_string();
+        let f: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let tty_nr: i64 = f[4].parse().unwrap_or(0);
+        out.push(ProcRow {
+            pid,
+            ppid: f[1].parse().unwrap_or(0),
+            pgid: f[2].parse().unwrap_or(0),
+            tty: (tty_nr > 0).then(|| {
+                let (major, minor) = decode_linux_dev(tty_nr as u64);
+                (major << 32) | minor
+            }),
+            name,
+        });
+    }
+    out
+}
+
 /// Every process on any controlling terminal, grouped by terminal device.
 ///
 /// One pass for the whole daemon. Per terminal it was 360 microseconds of syscalls inside

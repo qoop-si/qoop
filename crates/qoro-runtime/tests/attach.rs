@@ -29,6 +29,7 @@ fn runtime_dir() -> tempfile::TempDir {
 async fn start_daemon(dir: &std::path::Path) -> std::path::PathBuf {
     let shell = std::path::PathBuf::from("/bin/sh");
     let daemon = Daemon::bind(dir, &shell).await.expect("bind");
+    daemon.open_first_terminal().await.expect("first terminal");
     let socket = daemon.socket().to_path_buf();
     tokio::spawn(async move {
         let _ = daemon.serve().await;

@@ -67,6 +67,11 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
         ) {
             continue;
         }
+        // `agents --watch` with no daemon waits for one to start rather than returning,
+        // on macOS: the notch keeps it running for exactly that.
+        if args == ["agents", "--watch"] {
+            continue;
+        }
         if args.is_empty() {
             continue;
         }
@@ -289,16 +294,22 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
     assert_eq!(code, Some(0), "bare `qoro setup` is its usage");
 }
 
-/// A trailing `--session` with nothing after it is a mistake, not the default session.
+/// A session other than the default was a space's worth of tabs: it is refused, as the
+/// flag or as `qoro stop <name>`, with where it went, and a flag with nothing after it is a
+/// mistake rather than the default.
 #[test]
-fn an_empty_session_is_refused_rather_than_the_default() {
-    for args in [&["stop", "--session"][..], &["stop", ""][..]] {
+fn a_named_session_is_refused_with_where_it_went() {
+    for args in [
+        &["stop", "--session"][..],
+        &["stop", "work"][..],
+        &["--session", "work", "ls"][..],
+    ] {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let (stdout, stderr, code) = run(&args, false);
         assert_ne!(code, Some(0), "{args:?} went on: {stdout:?}");
         assert!(
-            stderr.contains("cannot be a session name"),
-            "{args:?} did not name the problem: {stderr:?}"
+            stderr.contains("replaced by spaces"),
+            "{args:?} did not say where it went: {stderr:?}"
         );
     }
 }

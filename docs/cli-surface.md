@@ -5,7 +5,8 @@ exists before a gate needs it rather than being invented when one does.
 
 Gate G9.1 reads this file: with the control-plane host blackholed, every subcommand here
 produces the same result as when it is reachable. Some rows are listed but not run by it:
-`qoro`, `qoro attach`, `qoro daemon` and `qoro bridge` do not return, `qoro relay` starts a daemon and then prints
+`qoro`, `qoro attach`, `qoro daemon` and `qoro bridge` do not return, nor does `qoro agents --watch` on macOS
+with no daemon, which waits for one; `qoro relay` starts a daemon and then prints
 whatever that daemon says to a client rather than a result of its own, and the `qoro notch`
 rows start a window or change what the person's login starts, which a comparison run twice
 must not do to the machine it runs on. They are still
@@ -24,30 +25,31 @@ a claim nobody has to keep.
 | `qoro daemon` | run the daemon in the foreground | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
+| `qoro ensure-awake` | wake the space that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |
 | `qoro --remote <remote>` | the interface for another machine's qoro alone, over ssh, by an added name or an ssh target; a dropped connection comes back on its own | yes |
-| `qoro remote add <name> <ssh-target> [--session S]` | reach a machine over ssh in the foreground, check its qoro speaks this codec, offer to install this version there when it has none, and list its spaces in `qoro` as `<name>:<space>` beside this machine's | yes |
+| `qoro remote add <name> <ssh-target>` | reach a machine over ssh in the foreground, check its qoro speaks this codec, offer to install this version there when it has none, and list its spaces in `qoro` as `<name>:<space>` beside this machine's | yes |
 | `qoro remote rm <name>` | stop listing a machine's spaces | no |
-| `qoro remote ls` | the machines added, their ssh targets and sessions | no |
+| `qoro remote ls` | the machines added and their ssh targets | no |
 | `qoro setup show <file>` | what a Setup will run, its content hash and its reproducibility level | no |
 | `qoro setup trust <file>` | confirm a Setup on this machine | no |
 | `qoro setup check <file>` | whether a Setup may run here | no |
 | `qoro hook-report --state <state>` | what an agent's own hook script calls to report a state change, from inside a qoro terminal | no |
 | `qoro hook-report --session-id <id>` | report only the agent's conversation id, without claiming a state | no |
-| `qoro send <terminal> <text>` | type into another terminal's session, over the addressed terminal channel; after `--` every word is text, dashes included | no |
+| `qoro send <terminal> <text>` | type into another terminal, over the addressed terminal channel; after `--` every word is text, dashes included | no |
 | `qoro send <terminal> --key <name>` | press named keys in another terminal, one frame each: `enter esc tab shift-tab backspace space up down left right home end pageup pagedown ctrl-a..ctrl-z`; arrows follow the program's cursor key mode | no |
 | `qoro read <terminal> [--lines N] [--json] [--watch]` | print another terminal's current screen; `--json` prints it as styled runs (`{"cols","cursor","behind","alt","rows":[[{"t","fg","bg","b",...}]]}`, colours as hex), `--watch` again on each change, at most about every 150 ms, without sending a size | no |
 | `qoro read <terminal> --back UP [--lines N] [--json]` | read the terminal's history instead: N rows (200 by default), the first of them UP rows before the newest one written; `--json` answers `{"from","total","rows"}` | no |
-| `qoro prompt <target> [--wait] [--timeout SECS] [--] <text>` | send text plus Enter to another session, refused while it is blocked or waiting on a trust prompt. Flags go right after the target; the first other word starts the text, `--` lets the text start with a dash, and a text ending in `--wait` or `--timeout N` is refused as a misplaced flag unless it follows `--`. `--wait` then waits for the turn the prompt caused, with the exit status of `qoro wait`: from a stopped agent it ends on the first stop after the agent took the prompt; from a busy one (which may fold the prompt into its running turn or queue it) it ends once the agent has stayed stopped for 2 s. Blocked counts as stopped, since it needs a person | no |
+| `qoro prompt <target> [--wait] [--timeout SECS] [--] <text>` | send text plus Enter to another terminal, refused while it is blocked or waiting on a trust prompt. Flags go right after the target; the first other word starts the text, `--` lets the text start with a dash, and a text ending in `--wait` or `--timeout N` is refused as a misplaced flag unless it follows `--`. `--wait` then waits for the turn the prompt caused, with the exit status of `qoro wait`: from a stopped agent it ends on the first stop after the agent took the prompt; from a busy one (which may fold the prompt into its running turn or queue it) it ends once the agent has stayed stopped for 2 s. Blocked counts as stopped, since it needs a person | no |
 | `qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]` | block until a target reaches a state (default `idle,done,blocked,failed`; no target means every agent terminal but the caller's), print the matching rows; exits 124 on timeout and 1 when a target closes. A target already there returns at once, so after writing to one use `prompt --wait`. `--match` names one target and waits for TEXT on its live screen (never the scrollback); with `--until` both must hold | no |
-| `qoro new [--name N] [--cwd DIR] [--space ID\|NAME] [-- command...]` | open a terminal in the caller's directory, print its number, and type the command into its shell once it has drawn a prompt, quoted so each argument stays one word; nothing is typed after 10 s. `--space` takes an id or a name, and a new name is made once however many callers race for it. Refused when no session runs: it never starts one | no |
+| `qoro new [--name N] [--cwd DIR] [--space ID\|NAME] [-- command...]` | open a terminal in the caller's directory, print its number, and type the command into its shell once it has drawn a prompt, quoted so each argument stays one word; nothing is typed after 10 s. `--space` takes an id or a name, and a new name is made once however many callers race for it. Refused when qoro is not running: it never starts one | no |
 | `qoro close <terminal>` | end a terminal and everything it started, as `ctrl-a x` does; refused for the terminal the command runs in | no |
 | `qoro worktree new <branch> [--base REF] [--path DIR] [--space ID\|NAME] [--name NAME] [-- CMD...]` | add a git worktree at `<parent>/<repo>-wt-<slug>`, where the slug is the branch lowercased with every run of other characters one dash (`feat/Login` becomes `feat-login`), and open a terminal in it named after the branch. A new branch starts from `--base` or HEAD; an existing one is checked out as is, and one that exists only on a remote is checked out tracking it. A branch checked out elsewhere is refused with where | no |
-| `qoro worktree ls [--json]` | every worktree of the current repository, and this session's terminals inside each | no |
+| `qoro worktree ls [--json]` | every worktree of the current repository, and this machine's terminals inside each | no |
 | `qoro worktree rm <branch\|path> [--force]` | remove a linked worktree, keeping its branch. Refused while any process of this user has its directory inside, whatever started it, named by pid and by qoro terminal where known; `--force` never overrides that. qoro's own clients do not count; a qoro daemon running from inside is named and refused, because new terminals start in its directory; a caller whose shell is inside is told to run it from outside; if the processes cannot be listed it refuses. A dirty tree is refused without `--force`, and a worktree whose directory is already gone says to run `git worktree prune` | no |
 | `qoro history <target> [--last N] [--role user\|assistant] [--json]` | print another agent's recent transcript window from its own product store, local files only | no |
 | `qoro context <target> [--last N] [--role user\|assistant] [--lines N] [--json]` | understand another agent before writing to it: who it is, whether it is writable, its live screen and its recent transcript window, local only | no |
 | `qoro agents [--json]` | every terminal: number, state, program, name, workspace, generation | no |
-| `qoro agents --watch [--all] [--json]` | the same list now and again each time it reads differently, woken by the daemon's own news on one connection, never by a timer; ends when the daemon does. `--all` follows every running session as one list, each row naming its session, hears a session start by a bell in the runtime's `bells` directory that each daemon rings, and runs until its reader goes | no |
+| `qoro agents --watch [--all] [--json]` | the same list now and again each time it reads differently, woken by the daemon's own news on one connection, never by a timer. It only watches, so it keeps no daemon up; when the daemon leaves it prints the empty list and, on macOS, waits without a timer for the next one to start and follows it, elsewhere it ends. `--all` names the session, `default`, on every row, which is what the notch reads | no |
 | `qoro agents explain <target> [--json]` | one terminal: state, the source holding it, the screen rule that last matched and its manifest, and what its screen discarded when anything was | no |
 | `qoro focus <terminal> [--json]` | show that terminal in every attached interface, as a click on its row would; `--json` answers `{"clients":[pid,...]}`, the interface processes asked, so a launcher can raise the window one runs in | no |
 | `qoro reload-manifests` | re-read the agent-detection overrides without restarting the daemon | no |
@@ -68,13 +70,15 @@ a claim nobody has to keep.
 | `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
 | `qoro notch status` | whether the notch is installed and running | no |
 | `qoro notch run` | write this build's notch app out when missing and run it against this binary | no |
-| `qoro ls` | every session, whether it is running, and how many tabs it holds | no |
-| `qoro stop [name]` | end a session: its daemon and every terminal in it. The tabs come back on the next start | no |
+| `qoro ls [--json]` | every space: its id, name, whether it is awake, asleep or stopped, and how many tabs it holds; read from the record when qoro is not running | no |
+| `qoro sleep <space> [--json]` | put a space to sleep, by id or by a name only one space has: every tab in it ends, its tabs are kept, and nothing of it runs until it wakes. All or nothing: a command running, an agent working, blocked or not yet telling its conversation (`qoro hooks install`), a job in the background or a wait between tabs keeps the whole space awake, and the refusal names the tab and why. With qoro not running it says nothing is awake | no |
+| `qoro wake [space] [--json]` | bring a sleeping space back, or the one that slept last: the same tabs, numbers, names, splits, directories and scrollback, each agent resumed into its own conversation by its id; starts qoro when it is not running | no |
+| `qoro stop` | end qoro now: every terminal ends and what was awake comes back on the next start; a space that was asleep stays asleep | no |
 | `qoro pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |
 | `qoro devices ls` | the phones paired with this machine, with their key fingerprints | no |
 | `qoro devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
-| `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to a running session | yes |
-| `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it; refused while a session runs, and `--check` only notes what is newest | yes |
+| `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoro while it runs | yes |
+| `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it; refused while a tab is awake (a qoro with nothing awake is stopped first), and `--check` only notes what is newest | yes |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
 | `qoro --version` | the version | no |
@@ -83,20 +87,14 @@ a claim nobody has to keep.
 
 | Option | What it does |
 |---|---|
-| `--session <name>` | which session to work in. Sessions do not see each other: each is its own daemon, its own socket and its own record of what is open. `QORO_SESSION` does the same for a shell that would rather set it once. The flag wins over the environment, which wins over the session last opened, which wins over the `default` session: a bare `qoro` reopens whatever was opened last. |
-| `QORO_IDLE_TIMEOUT_MINUTES` | idle auto-sleep: when set to a whole number of minutes N (recommended: `30`), the daemon closes terminals idle past N minutes with no background task running, through the same path as closing the tab by hand. Unset, `0` or invalid means disabled, which is the default. A reaped tab stays listed as a `sleeping` row until dismissed with `qoro`'s close; the agent's own conversation survives in the agent's own store. An agent that sent to another terminal with `qoro send` or `qoro prompt` stays awake while that terminal is still busy, for at most a day. |
+| `--session default` | accepted and ignored: it is what an older qoro on the other end of ssh sends. Named sessions were replaced by spaces, so any other name, as the flag or as `QORO_SESSION`, is refused with where that session's files are and how to use them instead. |
 
 `send`, `prompt` and `close` take `--generation G`, the number `qoro agents` prints: the
 write is refused unless the terminal still runs that generation, so an answer meant for one
-process never reaches the one that replaced it. A sleeping row has no generation, so close
-it without the flag.
+process never reaches the one that replaced it.
 
-The flag may be written anywhere in the command, so `qoro --session work send 2 "x"` and
-`qoro send --session work 2 "x"` are the same thing. It is put into the environment of
-everything the session starts, which is what lets a shell inside a session say `qoro send`
-and reach its own daemon rather than the default one. It has no short form, because the
-text of `qoro send` and `qoro prompt` is searched too and `du -s` there is text. An empty
-value (a trailing `--session`, or `qoro stop ""`) is refused rather than read as `default`.
+How long an idle space waits before it sleeps by itself, and whether qoro leaves when
+nothing is awake, are settings in `config.toml`, not options: [config.md](config.md).
 
 A word that is not a subcommand is an error naming it, not the interface: `qoro stauts`
 says so and exits 1. Every error prints as one `qoro: ...` line on stderr and exits

@@ -108,7 +108,7 @@ qoro worktree ls [--json]
 qoro worktree rm <branch|path> [--force]
 ```
 
-`new` never starts a session, and a new `--space` name is made once.
+`new` never starts qoro, and a new `--space` name is made once.
 `worktree new` adds `<repo>-wt-<slug>` beside the repository (the slug is
 the branch lowercased, other characters as dashes) and opens a terminal
 there named after the branch; a branch only on a remote is checked out
@@ -135,19 +135,24 @@ When you supervise for a person:
   worker until the person approves that action.
 * Before writing, read that worker again; after writing, confirm with
   `wait` and `context` and report what you saw, not what you expected.
-* Never `stop` a session, and `close` a worker only when asked. Sit in
-  your own session, so ending the workers' cannot end you.
+* Never `stop` qoro or `sleep` a space, and `close` a worker only when
+  asked. Sit in a space of your own, so putting the workers' to sleep
+  cannot end you.
 * This skill pre-approves `qoro` for one turn only; a supervisor runs for
   many. Start it with `claude --allowedTools "Bash(qoro *)"` and run each
   `qoro` command on its own, without pipes, so that rule covers it.
 
-## Sessions
+## Spaces and sleep
 
 ```bash
-qoro --session work            # which session to work in (or QORO_SESSION)
-qoro ls                        # sessions and their tab counts
-qoro stop [name]               # end a session; tabs come back on next open
+qoro ls [--json]               # spaces: id, name, awake/asleep/stopped, tabs
+qoro sleep <space>             # end its tabs, keep them; refused with reasons
+qoro wake [space]              # bring one back, or the one that slept last
+qoro stop                      # end qoro; what was awake comes back next open
 ```
 
-Sessions do not see each other. A shell inside a session reaches its own
-daemon, so plain `qoro ...` targets the right place.
+One qoro per machine; spaces are how tabs are grouped. A sleeping space
+runs nothing; its agents resume into their own conversations on wake. A
+sleep is refused while a tab runs a command, an agent is busy or has not
+reported its conversation, or a job runs in the background. `qoro agents`
+lists only what is awake, and with nothing awake answers an empty list.

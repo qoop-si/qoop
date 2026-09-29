@@ -152,6 +152,24 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "put a space to sleep",
+            method: || {
+                Method::Control(ControlRequest::SleepWorkspace {
+                    id: "a".into(),
+                    workspace: 2,
+                })
+            },
+        },
+        Action {
+            name: "wake a sleeping space",
+            method: || {
+                Method::Control(ControlRequest::WakeWorkspace {
+                    id: "a".into(),
+                    workspace: Some(2),
+                })
+            },
+        },
+        Action {
             name: "ask for the geometry",
             method: || {
                 Method::Control(ControlRequest::RequestOwnership {
@@ -252,21 +270,11 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
-            name: "list the sessions on another machine before connecting it",
-            method: || {
-                Method::Control(ControlRequest::ListRemoteSessions {
-                    id: "a".into(),
-                    target: "me@devbox".into(),
-                })
-            },
-        },
-        Action {
             name: "connect another machine from the interface",
             method: || {
                 Method::Control(ControlRequest::ConnectRemote {
                     id: "a".into(),
                     target: "me@devbox".into(),
-                    session: "default".into(),
                 })
             },
         },
@@ -384,6 +392,14 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             workspace: 0,
         },
+        ControlRequest::SleepWorkspace {
+            id: String::new(),
+            workspace: 0,
+        },
+        ControlRequest::WakeWorkspace {
+            id: String::new(),
+            workspace: None,
+        },
         ControlRequest::Subscribe {
             id: String::new(),
             terminals: Vec::new(),
@@ -450,14 +466,9 @@ fn every_control_method_is_reachable_from_some_action() {
             terminal: 0,
             last_n: 0,
         },
-        ControlRequest::ListRemoteSessions {
-            id: String::new(),
-            target: String::new(),
-        },
         ControlRequest::ConnectRemote {
             id: String::new(),
             target: String::new(),
-            session: String::new(),
         },
         ControlRequest::InstallRemote {
             id: String::new(),
@@ -484,6 +495,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }
+            | ControlRequest::SleepWorkspace { .. }
+            | ControlRequest::WakeWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
@@ -492,7 +505,6 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
             | ControlRequest::ListFocusEvents { .. }
-            | ControlRequest::ListRemoteSessions { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }

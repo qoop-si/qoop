@@ -180,6 +180,11 @@ pub enum Action {
     PaneNext,
     /// ctrl-a z: zoom the focused pane, or go back.
     Zoom,
+    /// ctrl-a Z: put the space on screen to sleep, or wake it when it is asleep.
+    ///
+    /// Uppercase on purpose, like the space close: lowercase `z` is the zoom, pressed
+    /// often, and a slip of the shift key must not end every process in a space.
+    Sleep,
     /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
     /// alive as a tab. Lowercase `x` keeps killing the terminal.
     DetachPane,
@@ -404,6 +409,7 @@ impl Keys {
                     b'L' => Action::PaneMove(crate::layout::Move::Right),
                     b'o' => Action::PaneNext,
                     b'z' => Action::Zoom,
+                    b'Z' => Action::Sleep,
                     b'X' => Action::DetachPane,
                     b'e' => Action::Resize,
                     b'=' => Action::Equalize,
@@ -586,6 +592,13 @@ mod tests {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01W"), vec![Action::CloseSpace]);
         assert_eq!(keys.feed(b"\x01w"), vec![Action::CreateSpace]);
+    }
+
+    #[test]
+    fn uppercase_z_sleeps_the_space_while_lowercase_zooms() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01Z"), vec![Action::Sleep]);
+        assert_eq!(keys.feed(b"\x01z"), vec![Action::Zoom]);
     }
 
     #[test]

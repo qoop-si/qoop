@@ -41,7 +41,8 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
         wait_for(Duration::from_secs(10), || socket.exists()),
         "the daemon never bound its socket"
     );
-    // The terminal is spawned with the daemon, so the master exists by now, but give the
+    qoro_testkit::open_first_terminal(&socket);
+    // The first terminal was opened above, so the master exists by now, but give the
     // shell a moment to be exec'd before asking the OS about its tty.
     std::thread::sleep(Duration::from_millis(500));
 

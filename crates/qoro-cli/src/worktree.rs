@@ -131,7 +131,7 @@ fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// This session's rows, or none when no session runs: with no daemon there are no
+/// This machine's rows, or none when qoro is not running: with no daemon there are no
 /// terminals, which is the true answer and not a failure.
 fn session_rows() -> std::io::Result<Vec<qoro_runtime::control::AgentRow>> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
@@ -252,11 +252,11 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
         path,
         mut new,
     } = parse_worktree_new_args(args).map_err(crate::usage)?;
-    // Checked before git runs, so a missing session does not leave a worktree behind.
+    // Checked before git runs, so qoro not running does not leave a worktree behind.
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
         return Err(std::io::Error::other(
-            "no session running: `qoro` starts one",
+            "nothing is awake: `qoro` or `qoro wake` starts it",
         ));
     }
     let list = worktrees()?;
@@ -312,7 +312,7 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     supervise::open_terminal(&new, |terminal| println!("terminal={terminal}"))
 }
 
-/// `qoro worktree ls`: every worktree, and the terminals of this session inside each.
+/// `qoro worktree ls`: every worktree, and this machine's terminals inside each.
 fn worktree_ls(args: &[String]) -> std::io::Result<()> {
     let json = match args.get(3).map(String::as_str) {
         None => false,
@@ -371,15 +371,15 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
 struct Occupant {
     pid: i32,
     program: String,
-    /// `Some` for a qoro daemon: the session it serves, when its arguments name one.
-    daemon: Option<Option<String>>,
+    /// Whether it is a qoro daemon.
+    daemon: bool,
 }
 
 /// Every process of this user whose directory is inside `root`.
 ///
 /// Read from the processes themselves, never from the index: the index learns a
 /// terminal's directory on a throttle, misses an agent a subshell started somewhere else,
-/// and knows nothing of another session's terminals or of a shell outside qoro. A process
+/// and knows nothing of a shell outside qoro. A process
 /// of another user is not readable and is not ours to protect. qoro's own clients are left
 /// out, this one included: an interface or a `wait` started from inside holds no work
 /// there. A qoro daemon is kept, because its directory is where every terminal it opens
@@ -410,13 +410,13 @@ fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
                         .map(|n| n.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "?".to_string());
-            let mut daemon = None;
+            let mut daemon = false;
             if program == "qoro" {
                 let argv = sys::argv_of(qoro_pty::Pid(pid));
                 if !argv.iter().any(|a| a == "daemon") {
                     return None;
                 }
-                daemon = Some(take_session_arg(&argv));
+                daemon = true;
             }
             Some(Occupant {
                 pid,
@@ -425,14 +425,6 @@ fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
             })
         })
         .collect())
-}
-
-/// The session a qoro command line names with `--session`/`-s`, if it names one.
-fn take_session_arg(argv: &[String]) -> Option<String> {
-    argv.iter().enumerate().find_map(|(i, a)| match a.as_str() {
-        "--session" | "-s" => argv.get(i + 1).cloned(),
-        _ => a.strip_prefix("--session=").map(str::to_string),
-    })
 }
 
 /// `qoro worktree rm`: remove a linked worktree, keeping its branch.
@@ -483,18 +475,10 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
     }
     let root = real(&tree.path);
     let live = processes_inside(&root)?;
-    if let Some(Occupant {
-        pid,
-        daemon: Some(session),
-        ..
-    }) = live.iter().find(|o| o.daemon.is_some())
-    {
-        let whose = session
-            .as_deref()
-            .map_or_else(String::new, |s| format!(" for session {s}"));
+    if let Some(Occupant { pid, .. }) = live.iter().find(|o| o.daemon) {
         return Err(std::io::Error::other(format!(
-            "the qoro daemon{whose} (pid {pid}) runs from inside {}: stop it or start it \
-             elsewhere, because new terminals start in its directory",
+            "a qoro daemon (pid {pid}) runs from inside {}: stop it or start it elsewhere, \
+             because new terminals start in its directory",
             tree.path.display()
         )));
     }
