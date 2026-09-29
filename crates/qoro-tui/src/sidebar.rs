@@ -6496,7 +6496,8 @@ mod tests {
             Some(Act::CancelClose)
         );
         assert_eq!(act(Hit::Space(1), 8, &c, false), Some(Act::CancelClose));
-        // A rule that is not armed is untouched by another one being armed.
+        // Another space's own row is its own act, and the run loop is what takes this
+        // question down for it: `act` answers about the row it was asked about.
         assert_eq!(
             act(Hit::Space(3), WIDTH - 2 + 1, &c, false),
             Some(Act::Close(3))

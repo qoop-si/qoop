@@ -555,6 +555,10 @@ struct State {
     /// refuses, so a refusal says what is still in the way instead of the client having
     /// forgotten it was in the middle of something.
     closing: Option<Closing>,
+    /// A close begun by a key rather than a click. The give-up timer is the loop's, and
+    /// this is how a key's close reaches it: a close against a daemon that never answers
+    /// would otherwise hold the column for ever, because no response would arm the timer.
+    close_begun: bool,
     /// The space whose rule is asking whether it should close, once the close has been
     /// asked for and not yet answered.
     ///
@@ -652,11 +656,13 @@ struct Closing {
     /// index, and a second `CloseWorkspace` for a space the first one deleted is answered
     /// with a refusal that would be reported against a close that worked.
     space_asked: bool,
-    /// A tab that would not take the close, and how many times it has been asked. The
-    /// daemon's only refusal here is a full command channel, which is exactly the kind that
-    /// succeeds the second time.
+    /// A tab that would not take the close, and how many times it has been asked for it.
+    /// The daemon's only refusal here is a full command channel, which is exactly the kind
+    /// that succeeds the second time, so the tab is asked again before the chain gives up
+    /// on it. The count is only advanced here, never reset by a refusal: a reset would
+    /// make the budget unreachable and the tab would be asked until the give-up timer.
     stuck: Option<u32>,
-    asked_stuck: usize,
+    stuck_tries: usize,
     /// The id each close was sent under and the tab it was for, because a refusal names its
     /// request and not its terminal, and a refusal for anything else is somebody else's.
     pending: Vec<(String, u32)>,
@@ -2218,21 +2224,27 @@ fn sleep_space(state: &mut State, space: i64, request: &mut u64) {
 
 /// Wake a sleeping space, and show `to` (else its first tab) once the index lists it.
 fn wake(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
+    let to = to.or_else(|| first_sleeping_tab(state, space));
     wake_quiet(state, space, to, request);
 }
 
-/// The same wake without asking the interface to follow it, for a space the person did not
-/// ask to be moved to.
+/// The first tab a wake of this space brings back, which is the one the interface follows
+/// when nobody named another.
+fn first_sleeping_tab(state: &State, space: i64) -> Option<u32> {
+    state
+        .spaces
+        .iter()
+        .find(|w| w.id == space)
+        .and_then(|w| w.sleeping.first())
+        .map(|t| t.terminal)
+}
+
+/// A wake without asking the interface to follow it, for a space the person did not ask to
+/// be moved to. `to` is used exactly as given: a caller that means to move fills the
+/// fallback in itself, and a caller that does not leaves it `None`, so there is nothing to
+/// follow and the screen stays where it is.
 fn wake_quiet(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
     *request += 1;
-    let to = to.or_else(|| {
-        state
-            .spaces
-            .iter()
-            .find(|w| w.id == space)
-            .and_then(|w| w.sleeping.first())
-            .map(|t| t.terminal)
-    });
     // `to` is `None` for a wake the person did not ask to be moved by, so there is nothing
     // to follow and the screen stays where it is.
     state.waking = to.map(|to| (space, to));
@@ -2282,7 +2294,28 @@ fn nothing_awake(state: &State) -> bool {
 /// Whether a read is a mouse report rather than keys, which is what an armed rule has to
 /// let through: the question is on a row, and a row is answered with a click.
 fn is_mouse(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&0x1b) && bytes.get(1) == Some(&b'[') && bytes.get(2) == Some(&b'<')
+    if !bytes.starts_with(b"\x1b[<") {
+        return false;
+    }
+    // A read is whatever the kernel had, and can carry a key and a report in one. The
+    // question is whether anything in it is a mouse report at all, because a read that is
+    // nothing but reports is the only shape that can be handed to the mouse arm whole: a
+    // mixed read is left to the ordinary path, where the key is a key and the report is a
+    // click, which is what both of them are.
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if !rest.starts_with(b"\x1b[<") {
+            return false;
+        }
+        // A report ends at its `M` (a press) or `m` (a release), and the next report or
+        // the next key starts there.
+        let end = match rest.iter().position(|b| *b == b'M' || *b == b'm') {
+            Some(at) => at + 1,
+            None => return false,
+        };
+        rest = &rest[end..];
+    }
+    true
 }
 
 /// The answer to a space rule's own question: `y` closes it, `n` or anything else keeps it.
@@ -2294,7 +2327,9 @@ fn is_mouse(bytes: &[u8]) -> bool {
 fn armed_key(state: &mut State, space: i64, bytes: &[u8], request: &mut u64) -> ModeOutcome {
     state.armed = None;
     if bytes.first() == Some(&b'y') {
-        start_close(state, space, request);
+        if start_close(state, space, request) {
+            state.close_begun = true;
+        }
     } else {
         state.message = Some(format!("kept {}", space_name(state, space)));
     }
@@ -2359,7 +2394,10 @@ fn arm_close(state: &mut State, space: i64) {
 /// burst can execute out of order and the close of the space can land before a single tab
 /// does. One at a time, each pushed when the previous one answers, is the only ordering this
 /// protocol can give.
-fn start_close(state: &mut State, space: i64, request: &mut u64) {
+/// Answers whether a close was started, so the caller arms the give-up timer for the
+/// keyboard path as well as the mouse one. A close refused because one is already running
+/// answers false, and the timer is left alone.
+fn start_close(state: &mut State, space: i64, request: &mut u64) -> bool {
     // One close at a time. The `x` is on every rule while a close is in flight, so asking
     // about another space is one click away, and overwriting the state would leave the
     // first space's tabs half closed with nothing chasing them and the give-up message
@@ -2374,7 +2412,7 @@ fn start_close(state: &mut State, space: i64, request: &mut u64) {
                 space_name(state, space)
             )
         });
-        return;
+        return false;
     }
     let mut asked: Vec<u32> = state
         .rows
@@ -2401,14 +2439,14 @@ fn start_close(state: &mut State, space: i64, request: &mut u64) {
         sent: 0,
         space_asked: false,
         stuck: None,
-        asked_stuck: 0,
+        stuck_tries: 0,
         pending: Vec::new(),
     });
     if left == 0 {
         // Nothing in it and nothing running: this is the case `CloseWorkspace` was built
         // for, and there is nothing to wait for.
         close_the_space(state, request);
-        return;
+        return true;
     }
     state.message = Some(format!(
         "closing {left} {} of {}",
@@ -2416,6 +2454,7 @@ fn start_close(state: &mut State, space: i64, request: &mut u64) {
         space_name(state, space)
     ));
     close_one(state, request);
+    true
 }
 
 /// Send the next tab's close, if there is one.
@@ -2423,31 +2462,25 @@ fn close_one(state: &mut State, request: &mut u64) {
     let Some(closing) = state.closing.as_mut() else {
         return;
     };
-    // A tab that refused is asked again before the chain gives up on it, because the only
-    // refusal a close can make is a command channel that was full at that instant.
+    // The next tab, or the one that refused if it has not been asked too often already.
     let terminal = match closing.stuck {
-        Some(stuck) if closing.asked_stuck < STUCK_TRIES => {
-            closing.asked_stuck += 1;
+        Some(stuck) if closing.stuck_tries < STUCK_TRIES => {
+            closing.stuck_tries += 1;
             stuck
         }
-        Some(_) => {
-            // Asked enough times: the chain goes on to the next tab rather than stalling,
-            // and the space close is left to the daemon to refuse with the count.
+        // Asked enough times. The chain leaves this tab behind rather than stalling, and
+        // the space is left open: the daemon would refuse a close over a tab that is still
+        // there, and the person is told which one now rather than after the wait.
+        Some(stuck) => {
             closing.stuck = None;
-            closing.asked_stuck = 0;
-            match closing.asked.get(closing.sent).copied() {
-                Some(terminal) => {
-                    closing.sent += 1;
-                    terminal
-                }
+            closing.stuck_tries = 0;
+            match next_tab(closing, Some(stuck)) {
+                Some(terminal) => terminal,
                 None => return,
             }
         }
-        None => match closing.asked.get(closing.sent).copied() {
-            Some(terminal) => {
-                closing.sent += 1;
-                terminal
-            }
+        None => match next_tab(closing, None) {
+            Some(terminal) => terminal,
             None => return,
         },
     };
@@ -2460,6 +2493,21 @@ fn close_one(state: &mut State, request: &mut u64) {
         .modes
         .outbox
         .push(ControlRequest::CloseTerminal { id, terminal });
+}
+
+/// The next tab on the list, skipping one that has given up, and counting it as asked.
+///
+/// `skip` is the tab the chain gave up on, which stays in `asked` (the count a person was
+/// told includes it) but is not asked again and does not hold up the tabs behind it.
+fn next_tab(closing: &mut Closing, skip: Option<u32>) -> Option<u32> {
+    while let Some(terminal) = closing.asked.get(closing.sent).copied() {
+        closing.sent += 1;
+        if Some(terminal) == skip {
+            continue;
+        }
+        return Some(terminal);
+    }
+    None
 }
 
 /// Ask the daemon to close the space itself, which it will only do once nothing in it is
@@ -3277,6 +3325,7 @@ where
     let mut state = State {
         armed: None,
         closing: None,
+        close_begun: false,
         rows: Vec::new(),
         focused: 0,
         snapshot: None,
@@ -4346,7 +4395,18 @@ where
                                 if state.selection.take().is_some() {
                                     dirty = true;
                                 }
+                                // A click takes the question down whatever it lands on, so a
+                                // rule cannot sit on screen asking while the keyboard is dead
+                                // and its row is scrolled out of view. The two arms that
+                                // mean to ask set the flag again, because asking is what they
+                                // are for. Taken here rather than in a catch-all arm, because
+                                // a catch-all can only run after every real arm has declined
+                                // to match and would never be reached.
+                                // Asked before the flag is taken: `clicked` reads the
+                                // armed row's own columns through `act`, and taking the
+                                // flag first would answer `y` as the sleep toggle.
                                 let clicked = state.clicked(row, col);
+                                let asked_about = state.armed.take();
                                 match clicked {
                                     // A sleeping tab: its space wakes, and the screen goes
                                     // to the tab once it is live again.
@@ -4399,6 +4459,15 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::Sleep(space)) => {
+                                        // Asking about another space while one is asking
+                                        // here: the sleep goes through and the question on
+                                        // the other row is gone, so it is said.
+                                        if let Some(was) = asked_about.filter(|w| *w != space) {
+                                            state.message = Some(format!(
+                                                "kept {}",
+                                                space_name(&state, was)
+                                            ));
+                                        }
                                         sleep_space(&mut state, space, &mut request);
                                         dirty = true;
                                     }
@@ -4414,7 +4483,10 @@ where
                                     // nothing left in it.
                                     Some(Clicked::ConfirmClose(space)) => {
                                         state.armed = None;
-                                        start_close(&mut state, space, &mut request);
+                                        if start_close(&mut state, space, &mut request) {
+                                            closing_since = Some(tokio::time::Instant::now());
+                                        }
+                                        state.close_begun = false;
                                         dirty = true;
                                     }
                                     // Anything else on the row, or anywhere else while a
@@ -4429,12 +4501,10 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::View) => {
-                                        state.armed = None;
                                         state.view = state.view.toggle();
                                         dirty = true;
                                     }
                                     Some(Clicked::Collapse) => {
-                                        state.armed = None;
                                         state.collapsed = !state.collapsed;
                                         // The pane's width changed with the column, and a
                                         // child that is not told reflows its output against
@@ -4446,17 +4516,17 @@ where
                                         }
                                         dirty = true;
                                     }
-                                    // A click anywhere else takes the question down, so a
-                                    // row that is asking cannot sit on screen with the
-                                    // keyboard dead and a rule scrolled out of view. Last
-                                    // in the match on purpose: every arm above is a click
-                                    // that means something, and a catch-all above them
+                                    // Every click that is not one of the two answers, and
+                                    // not one of the controls, takes the question down and
+                                    // says so: a question that silently stayed up would hold
+                                    // the keyboard from a person who never saw it. Last in
+                                    // the match on purpose, because above the real arms it
                                     // would answer `y` with "kept".
-                                    _ if state.armed.is_some() => {
-                                        if let Some(space) = state.armed.take() {
-                                            state.message =
-                                                Some(format!("kept {}", space_name(&state, space)));
-                                        }
+                                    _ if asked_about.is_some() => {
+                                        state.message = Some(format!(
+                                            "kept {}",
+                                            space_name(&state, asked_about.unwrap_or_default())
+                                        ));
                                         dirty = true;
                                     }
                                     None => {}
@@ -5354,15 +5424,17 @@ where
                                     refresh |= std::mem::take(&mut index_owed);
                                 }
                                 apply(&mut state, response, &mut request, &mut dirty);
-                                // The give-up timer follows the close, and is set in one
-                                // place so the keyboard and the mouse agree: a close begun
-                                // against a daemon that never answers is still reported.
-                                match (state.closing.is_some(), closing_since.is_some()) {
-                                    (true, false) => {
-                                        closing_since = Some(tokio::time::Instant::now());
-                                    }
-                                    (false, true) => closing_since = None,
-                                    _ => {}
+                                // The give-up timer is armed where the close is created,
+                                // by a click or by the key, and only cleared here, so a
+                                // close begun against a daemon that accepts the connection
+                                // and never answers is still reported rather than holding
+                                // the column for ever.
+                                if state.close_begun {
+                                    state.close_begun = false;
+                                    closing_since = Some(tokio::time::Instant::now());
+                                }
+                                if state.closing.is_none() {
+                                    closing_since = None;
                                 }
                             }
                         }
@@ -5469,7 +5541,9 @@ where
                     fire_notes(&mut state, &mut out)?;
                 }
                 // A close that has not finished in [`CLOSE_PATIENCE`] is not going to.
-                // Said once, with the count, rather than left as a row that never changes.
+                // Said once, with what is left, rather than left as a row that never
+                // changes. A tab the daemon would not take is named, because that is the
+                // one thing the person can do something about.
                 _ = async {
                     match closing_since {
                         Some(at) => tokio::time::sleep_until(at + CLOSE_PATIENCE).await,
@@ -5478,15 +5552,22 @@ where
                 } => {
                     if let Some(space) = state.closing.as_ref().map(|c| c.space) {
                         let left = tabs_left(&state, space);
-                        state.message = Some(format!(
-                            "close of {} gave up, {} still there",
-                            space_name(&state, space),
-                            if left == 0 {
-                                "a tab nobody answered for".to_string()
-                            } else {
-                                format!("{left} {}", plural(left))
-                            }
-                        ));
+                        let stuck = state.closing.as_ref().and_then(|c| c.stuck);
+                        state.message = Some(match (left, stuck) {
+                            (0, Some(terminal)) => format!(
+                                "tab {terminal} would not close, {} kept",
+                                space_name(&state, space)
+                            ),
+                            (0, None) => format!(
+                                "close of {} gave up, a tab nobody answered for",
+                                space_name(&state, space)
+                            ),
+                            (left, _) => format!(
+                                "close of {} gave up, {left} {} still there",
+                                space_name(&state, space),
+                                plural(left)
+                            ),
+                        });
                         state.closing = None;
                     }
                     closing_since = None;
@@ -6963,13 +7044,17 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         }
         // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
         // on the hint row until the person does something, rather than one frame.
-        // A space close the daemon refused: something is still in the space, so the
-        // space stays and the person is told what. The state is kept rather than
-        // forgotten, because the tabs are still on their way out and the next index
-        // will ask again.
+        // A space close the daemon refused: something is still in the space, so the space
+        // stays and the person is told what. The gate re-arms, because the tabs that caused
+        // the refusal are on their way out and the next index will find the space empty.
+        // A refusal with nothing left to wait for is the one that repeats, and the give-up
+        // timer is what ends that rather than a loop.
         ControlResponse::Failed { id, reason } if id.starts_with("close-space-") => {
-            if let Some(closing) = state.closing.clone() {
-                let left = tabs_left(state, closing.space);
+            if let Some(space) = state.closing.as_ref().map(|c| c.space) {
+                let left = tabs_left(state, space);
+                if let Some(closing) = state.closing.as_mut() {
+                    closing.space_asked = false;
+                }
                 state.hint = Some(if left == 0 {
                     reason
                 } else {
@@ -6996,12 +7081,14 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 let at = c.pending.iter().position(|(asked, _)| *asked == id)?;
                 let (_, terminal) = c.pending.remove(at);
                 c.stuck = Some(terminal);
-                c.asked_stuck = 0;
                 Some(terminal)
             });
+            // Ours says what is left in the space as well; somebody else's is the ordinary
+            // refusal of one tab, which has always been on the notice row, and the hint
+            // carries it too so a full pane's own render cannot wipe the reason.
+            state.hint = Some(reason.clone());
             if ours.is_some() {
                 close_one(state, request);
-                state.hint = Some(reason.clone());
             } else {
                 state.message = Some(reason.clone());
             }
@@ -7412,6 +7499,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             {
                 if let Some(closing) = state.closing.as_mut() {
                     closing.pending.retain(|(_, t)| *t != terminal);
+                    // A retry that worked ends the trouble: the tab is closed, and asking
+                    // for it again would be asking the daemon to refuse.
+                    if closing.stuck == Some(terminal) {
+                        closing.stuck = None;
+                        closing.stuck_tries = 0;
+                    }
                 }
                 close_one(state, request);
             }
@@ -8016,7 +8109,14 @@ mod tests {
             &mut 0,
             &mut dirty,
         );
-        assert_eq!(solo.hint, None, "a plain tab close took the hint row");
+        // The refusal rides on both rows: the notice is what a person reads, and the hint
+        // is what survives a full pane's own render wiping the notice.
+        assert!(
+            solo.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not accept")
+        );
         assert!(
             solo.message
                 .as_deref()
@@ -8118,6 +8218,141 @@ mod tests {
         );
     }
 
+    /// A tab that refuses is asked a bounded number of times, and then the chain leaves it
+    /// behind rather than asking it for ever.
+    ///
+    /// The counter is the whole point: a reset on every refusal makes the budget
+    /// unreachable, the tab is asked until the give-up timer, and the tabs behind it are
+    /// never reached at all.
+    #[test]
+    fn a_tab_that_always_refuses_is_left_behind_after_a_few_asks() {
+        let mut s = state();
+        s.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "claude", "working"),
+            agent(3, 1, "claude", "working"),
+        ];
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        assert!(start_close(&mut s, 1, &mut request), "the close started");
+        let mut asked: Vec<u32> = Vec::new();
+        let mut dirty = false;
+        for round in 0..8 {
+            let id = match s.modes.outbox.last() {
+                Some(ControlRequest::CloseTerminal { id, terminal }) => {
+                    asked.push(*terminal);
+                    id.clone()
+                }
+                other => panic!("round {round}: {other:?}"),
+            };
+            // The first tab answers, so the chain moves on to the second, which never does.
+            if asked[round] == 1 {
+                apply(
+                    &mut s,
+                    ControlResponse::TerminalClosed {
+                        id: id.clone(),
+                        terminal: 1,
+                    },
+                    &mut request,
+                    &mut dirty,
+                );
+            } else {
+                apply(
+                    &mut s,
+                    ControlResponse::Failed {
+                        id: id.clone(),
+                        reason: format!("terminal {} did not accept the close: full", asked[round]),
+                    },
+                    &mut request,
+                    &mut dirty,
+                );
+            }
+        }
+        assert_eq!(
+            asked,
+            vec![1, 2, 2, 2, 2, 3, 3, 3],
+            "the stuck tab was not left behind: {asked:?}"
+        );
+        assert!(
+            !s.modes
+                .outbox
+                .iter()
+                .any(|r| matches!(r, ControlRequest::CloseWorkspace { .. })),
+            "the space was asked to close over a tab that is still there"
+        );
+    }
+
+    /// A retry that works ends the trouble: the tab is closed, and asking for it again
+    /// would be asking the daemon to refuse.
+    #[test]
+    fn a_retry_that_works_is_not_asked_again() {
+        let mut s = state();
+        s.rows = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+        ];
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        let mut dirty = false;
+        // The first tab refuses once and then takes the close.
+        let id = match &s.modes.outbox[0] {
+            ControlRequest::CloseTerminal { id, .. } => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: id.clone(),
+                reason: "terminal 1 did not accept the close: full".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        let retried = match &s.modes.outbox[1] {
+            ControlRequest::CloseTerminal { id, terminal } => {
+                assert_eq!(*terminal, 1, "the retry was for another tab");
+                id.clone()
+            }
+            other => panic!("{other:?}"),
+        };
+        apply(
+            &mut s,
+            ControlResponse::TerminalClosed {
+                id: retried,
+                terminal: 1,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        // The next ask is the second tab, never the first again.
+        let next = s.modes.outbox.last().cloned();
+        assert!(
+            matches!(
+                next,
+                Some(ControlRequest::CloseTerminal { terminal: 2, .. })
+            ),
+            "{next:?}"
+        );
+        assert_eq!(s.closing.as_ref().and_then(|c| c.stuck), None);
+    }
+
+    /// A read that carries a key and a report in it is not handed to the question whole.
+    /// The key is a key and the report is a click, which is what both of them are, and
+    /// treating the read as one or the other loses one of them.
+    #[test]
+    fn a_read_is_only_the_mouse_when_it_is_nothing_but_the_mouse() {
+        assert!(is_mouse(b"\x1b[<0;28;5M"), "a bare press");
+        assert!(
+            is_mouse(b"\x1b[<0;28;5m\x1b[<0;26;5m"),
+            "a click, two reports"
+        );
+        assert!(!is_mouse(b"y"), "a key");
+        assert!(!is_mouse(b"y\x1b[<0;28;5M"), "a key and a report");
+        assert!(!is_mouse(b"\x1b[<0;28;5My"), "a report and a key");
+        assert!(!is_mouse(b"\x1b[A"), "an arrow key, which is also a CSI");
+    }
+
     /// The question names what will refuse, because the daemon's own close checks nothing
     /// and a count alone would not say which tab is still working.
     #[test]
@@ -8151,6 +8386,7 @@ mod tests {
 
     fn state() -> State {
         State {
+            close_begun: false,
             rows: vec![
                 agent(1, 1, "codex", "blocked"),
                 agent(2, 2, "claude", "working"),
@@ -8740,6 +8976,7 @@ mod tests {
     /// A state with nothing in it, for the arithmetic above.
     fn bare_state() -> State {
         State {
+            close_begun: false,
             rows: Vec::new(),
             focused: 1,
             snapshot: None,
@@ -8853,6 +9090,7 @@ mod tests {
         let mut state = State {
             armed: None,
             closing: None,
+            close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
             focused: 1,
             snapshot: Some(snapshot_with_behind(0)),
