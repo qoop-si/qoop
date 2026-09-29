@@ -334,6 +334,15 @@ impl Keys {
     /// them allow: a read is usually a paste or a burst of typing, and one write to the
     /// terminal is worth a great deal more than one action per byte. Order is preserved
     /// exactly, which is what makes a character split across reads arrive intact.
+    /// Whether a half-read report is being held, waiting for its tail.
+    ///
+    /// The run loop reads the input before it feeds the decoder, so anything that decides
+    /// what a read *is* has to ask: a read that ends half way through a report is the tail
+    /// of one the decoder already has the head of, and both halves belong to the mouse.
+    pub fn mouse_pending(&self) -> bool {
+        !self.pending_mouse.is_empty()
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut pending = Vec::new();

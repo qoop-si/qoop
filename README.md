@@ -31,8 +31,9 @@ itself, not as `node`.
 
 A space's own line ends in two controls, in the same three columns on every line whatever
 the name is: `z` sleeps the space or wakes it, and `x` asks whether to close it. The
-question is drawn on the line itself, as `y` and `n` under the pointer that asked, and a `y`
-closes the space's tabs and then the space. Neither control has a key of its own: `ctrl-a Z`
+question is drawn on the line itself, with `y` in the column `x` was in and `n` beside it,
+so a second click in the same place answers yes, and a `y` closes the space's tabs and then
+the space. Neither control has a key of its own: `ctrl-a Z`
 sleeps the space you are in and `ctrl-a x` closes the tab you are on.
 
 Each agent wears a small square of nine dots in its state's colour. While it works the dots

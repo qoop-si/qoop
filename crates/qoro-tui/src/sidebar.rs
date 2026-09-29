@@ -976,8 +976,8 @@ fn content(c: &Column) -> Vec<Row> {
 /// own colour.
 ///
 /// ```text
-///  ╭▾ qoro (4)─────────────z x╮
-///  ╭▾ qoro sleeping───────z x╮
+///  ▾ qoro (4)                z x
+///  ▾ qoro sleeping          z x
 /// ```
 ///
 /// The arrow sits right after the corner, so the name starts one column right of the
@@ -1034,14 +1034,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     // space that would starve to a single column keeps its name and says its state in
     // colour instead.
     let slot = if c.armed == Some(space.id) {
-        // The question, in the slot the count and the word would have used, and held to
-        // the same floor: a rule that is asking is the rule a person is looking at, so
-        // the name is not what gives way.
-        if room_for(width, QUESTION) >= MIN_NAME_COLS {
-            QUESTION.to_string()
-        } else {
-            QUESTION_SHORT.to_string()
-        }
+        // The question, in the slot the count and the word would have used. The name is
+        // what gives way to it, because `room` below is computed from the slot: a rule
+        // that is asking is the rule a person is looking at.
+        QUESTION.to_string()
     } else if space.asleep && room_for(width, SLEEPING) >= MIN_NAME_COLS {
         SLEEPING.to_string()
     } else if held == 0 {
@@ -1104,10 +1100,6 @@ const SLEEPING: &str = " sleeping";
 /// reason, so the rule itself only has to ask.
 const QUESTION: &str = " close?";
 
-/// The same question for a column with no room for it, which is still a question: the
-/// answers are in the block and the row is the only place they can be drawn.
-const QUESTION_SHORT: &str = " ?";
-
 /// What a name must keep to stay a name. A space whose row cannot hold this many columns
 /// for the name is a row that has said its name is not the most important thing on it.
 const MIN_NAME_COLS: usize = 3;
@@ -1159,8 +1151,8 @@ impl Block {
         // Armed, the two cells are the two answers; otherwise they are the two controls.
         // Either way the block is three columns and neither cell ever moves.
         let [left, right] = match self.answer {
-            // `answer` is the cell the affirmative is drawn in, and the affirmative is
-            // always the left one: a question puts `y` under the pointer that armed it.
+            // `answer` is the cell the affirmative is drawn in, and which cell that is
+            // depends on where the person pressed: `y` stays under the pointer.
             Some(yes) => [
                 if self.sleep == Some(yes) { "y" } else { "n" },
                 if self.close == Some(yes) { "y" } else { "n" },
@@ -1180,7 +1172,10 @@ fn armed_block(width: usize) -> Block {
     Block {
         sleep: Some((width.saturating_sub(4), 1)),
         close: Some((width.saturating_sub(2), 1)),
-        answer: Some((width.saturating_sub(4), 1)),
+        // `y` in the cell `x` was in, because a second click in the cell that asked is
+        // what a hand does without looking, and answering that click "no" would be the
+        // one thing a question must not do.
+        answer: Some((width.saturating_sub(2), 1)),
     }
 }
 
@@ -6370,9 +6365,10 @@ mod tests {
         assert_eq!(shorten_middle("qoro", 1), "\u{2026}");
         assert_eq!(shorten_middle("qoro", 4), "qoro");
         assert_eq!(shorten_middle("qoro", 3), "qo\u{2026}");
-        // The width a rule can be drawn at, and the widest count that leaves nothing for
-        // the name at all, agree on the budget: the fold cells, the block and the blank
-        // last column are what a name never gets.
+        // What a name never gets on the narrowest column the interface draws: the fold
+        // cells, the block and the blank last column. A count wide enough to take the
+        // rest is what makes a rule sit on the budget, and `shorten_middle` is the shared
+        // helper that has to be right about the case for its other callers too.
         assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 11);
         assert_eq!(crate::width::width(&format!(" ({})", 999_999_usize)), 9);
     }
@@ -6537,14 +6533,16 @@ mod tests {
             .map(|(l, _)| l.text)
             .expect("the armed rule");
         assert!(row.contains("close?"), "{row:?}");
-        assert_eq!(column_of(&row, 'y'), Some(WIDTH - 4), "{row:?}");
-        assert_eq!(column_of(&row, 'n'), Some(WIDTH - 2), "{row:?}");
+        // `y` in the cell `x` was in, because a second click where the question was
+        // asked is the click a hand makes, and `n` in the cell `z` was in.
+        assert_eq!(column_of(&row, 'n'), Some(WIDTH - 4), "{row:?}");
+        assert_eq!(column_of(&row, 'y'), Some(WIDTH - 2), "{row:?}");
         assert_eq!(
-            act(Hit::Space(1), WIDTH - 4 + 1, &c, false),
+            act(Hit::Space(1), WIDTH - 2 + 1, &c, false),
             Some(Act::ConfirmClose(1))
         );
         assert_eq!(
-            act(Hit::Space(1), WIDTH - 2 + 1, &c, false),
+            act(Hit::Space(1), WIDTH - 4 + 1, &c, false),
             Some(Act::CancelClose)
         );
         // The fold arrow and the body of the row are not answers, they take the question
@@ -6555,6 +6553,7 @@ mod tests {
             Some(Act::CancelClose)
         );
         assert_eq!(act(Hit::Space(1), 8, &c, false), Some(Act::CancelClose));
+        // And the close on another space is its own act, in the cell the close moved to.
         // Another space's own row is its own act, and the run loop is what takes this
         // question down for it: `act` answers about the row it was asked about.
         assert_eq!(

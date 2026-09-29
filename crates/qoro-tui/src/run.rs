@@ -2295,6 +2295,14 @@ fn nothing_awake(state: &State) -> bool {
 
 /// Whether a read is a mouse report rather than keys, which is what an armed rule has to
 /// let through: the question is on a row, and a row is answered with a click.
+/// A read that begins a mouse report and has not finished one.
+///
+/// The decoder buffers the rest of it, so a read that looks like this belongs to the mouse
+/// arm and must not be read as a keypress by anything upstream of it.
+fn is_report_head(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b[<") && !bytes.iter().any(|b| *b == b'M' || *b == b'm')
+}
+
 fn is_mouse(bytes: &[u8]) -> bool {
     if !bytes.starts_with(b"\x1b[<") {
         return false;
@@ -4212,7 +4220,11 @@ where
                             }
                             PromptOutcome::Passthrough(rest) => feed = Some(rest),
                         }
-                    } else if state.armed.is_some() && !is_mouse(&bytes) {
+                    } else if state.armed.is_some()
+                        && !is_mouse(&bytes)
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
                         // An armed rule owns the keyboard while it is asking, without being
                         // a mode: its question is on a row rather than an overlay, but the
                         // bytes belong to the question the same way.
@@ -4220,6 +4232,12 @@ where
                         // Not the mouse. A click is how the question is answered, and this
                         // arm is reached before the mouse one, so taking the pointer here
                         // would leave a rule asking a question nothing could ever answer.
+                        //
+                        // And not half a report. One can arrive in two reads, and the
+                        // decoder is holding the rest of it, so the half falls through to
+                        // it and the whole report reaches the mouse arm when the tail comes.
+                        // Reading the half as an answer would close a space the person was
+                        // in the middle of asking about.
                         let outcome = mode_input(&mut state, &bytes, keys.prefix(), &mut request);
                         // The give-up timer is armed where the close is created, and a key is
                         // as much a place as a click. Armed here rather than on the next
@@ -4403,6 +4421,15 @@ where
                                 // and consumes the press whole, so it never
                                 // reaches a tile, the column, or the fold mark
                                 // the divider also crosses.
+                                // A click on the divider, on a tile or inside a running pane
+                                // answers that click and returns before the space arm, and a
+                                // re-focus moves the column out from under the rule that was
+                                // asking. The question comes down here, where every click
+                                // passes, rather than in a branch that some clicks never
+                                // reach; the three clicks that are about it set it again.
+                                let clicked = state.clicked(row, col);
+                                let asked_about = put_question_down(&mut state, clicked);
+
                                 if !shift && (state.divider_press(col, row) || state.split_press(col, row)) {
                                     // A press anywhere else puts down whatever
                                     // was selected, divider presses included.
@@ -4475,8 +4502,6 @@ where
                                 // Asked before the flag is taken: `clicked` reads the
                                 // armed row's own columns through `act`, and taking the
                                 // flag first would answer `y` as the sleep toggle.
-                                let clicked = state.clicked(row, col);
-                                let asked_about = put_question_down(&mut state, clicked);
                                 match clicked {
                                     // A sleeping tab: its space wakes, and the screen goes
                                     // to the tab once it is live again.
@@ -7156,12 +7181,20 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             let ours = state.closing.as_mut().and_then(|c| {
                 let at = c.pending.iter().position(|(asked, _)| *asked == id)?;
                 let (_, terminal) = c.pending.remove(at);
+                // The budget is one tab's, not the chain's. A tab the chain has given up
+                // on never closes, so without this every tab behind it would inherit an
+                // allowance of zero and be abandoned on its first refusal, which is the
+                // case the budget exists for.
+                if c.stuck != Some(terminal) {
+                    c.stuck_tries = 0;
+                }
                 c.stuck = Some(terminal);
                 Some(terminal)
             });
-            // Ours says what is left in the space as well, and somebody else's stays the
-            // ordinary refusal of one tab. The hint is written either way, so neither
-            // reason can be wiped by a pane's own render.
+            // Ours asks the tab again and says what is left of the space on the hint row
+            // below; somebody else's stays the ordinary refusal of one tab, on the notice
+            // row it has always had. The hint is written either way, so neither reason can
+            // be wiped by a pane's own render.
             state.hint = Some(reason.clone());
             if ours.is_some() {
                 close_one(state, request);
@@ -8704,6 +8737,108 @@ mod tests {
         }
     }
 
+    /// One tab spending the whole budget does not spend the next tab's. The daemon's only
+    /// refusal is a command channel that was full at that instant, which a retry fixes, so
+    /// a tab behind a given-up one is entitled to its own retries rather than being
+    /// abandoned on its first refusal with an allowance of zero.
+    #[test]
+    fn a_tab_behind_a_given_up_one_gets_its_own_retries() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle"), agent(2, 1, "codex", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        let mut request = 0u64;
+        start_close(&mut s, 1, &mut request);
+        let mut dirty = false;
+        let asked = |s: &State, at: usize| match &s.modes.outbox[at] {
+            ControlRequest::CloseTerminal { id, terminal } => (id.clone(), *terminal),
+            other => panic!("{other:?}"),
+        };
+        // Tab 1 refuses until its budget is spent and the chain leaves it behind.
+        let mut last = None;
+        for _ in 0..=STUCK_TRIES {
+            let (id, terminal) = asked(&s, s.modes.outbox.len() - 1);
+            assert_eq!(terminal, 1, "the chain left tab 1 too early");
+            last = Some(id.clone());
+            apply(
+                &mut s,
+                ControlResponse::Failed {
+                    id,
+                    reason: "terminal 1 did not accept the close: full".into(),
+                },
+                &mut request,
+                &mut dirty,
+            );
+        }
+        let at = s.modes.outbox.len() - 1;
+        let (id, terminal) = asked(&s, at);
+        assert_eq!(terminal, 2, "the chain never reached the tab behind it");
+        assert_ne!(Some(&id), last.as_ref(), "tab 2 was asked under tab 1's id");
+        // And it gets a full budget of its own, not the one tab 1 spent.
+        let mut refuses = 0;
+        for _ in 0..=STUCK_TRIES {
+            let (id, terminal) = asked(&s, s.modes.outbox.len() - 1);
+            assert_eq!(
+                terminal, 2,
+                "tab 2 was given up on after {refuses} refusals"
+            );
+            refuses += 1;
+            apply(
+                &mut s,
+                ControlResponse::Failed {
+                    id: id.clone(),
+                    reason: "terminal 2 did not accept the close: full".into(),
+                },
+                &mut request,
+                &mut dirty,
+            );
+        }
+        assert_eq!(refuses, STUCK_TRIES + 1);
+    }
+
+    /// A report can arrive in two reads. The half that begins one belongs to the mouse,
+    /// and the decoder is holding the rest of it, so a rule mid question must not read
+    /// the half as an answer: that would close a space over a click still on its way.
+    #[test]
+    fn half_a_mouse_report_is_not_an_answer() {
+        let mut s = state();
+        s.rows = vec![agent(1, 1, "claude", "idle")];
+        s.spaces = vec![space(1, "qoro")];
+        arm_close(&mut s, 1);
+        assert_eq!(s.armed, Some(1));
+        assert!(
+            is_mouse(b"\x1b[<0;28;5M\x1b[<0;28;5m"),
+            "the whole pair is a mouse read"
+        );
+        assert!(!is_mouse(b"\x1b[<0;28;5"), "half of one is not");
+        assert!(
+            is_report_head(b"\x1b[<0;28;5"),
+            "and the armed arm has to be able to tell the difference"
+        );
+        assert!(
+            !is_report_head(b"y"),
+            "a keypress is not the head of a report"
+        );
+        // Which is the whole point: the gate leaves the half to the decoder, which is
+        // holding the tail.
+        let mut keys = Keys::with_prefix(s.config.prefix);
+        assert!(keys.feed(b"\x1b[<0;28;5").is_empty());
+        assert!(
+            keys.mouse_pending(),
+            "the decoder did not hold the half, so the tail would be read as keys"
+        );
+        assert!(
+            keys.feed(b";5M")
+                .iter()
+                .any(|a| matches!(a, Action::Click { .. }))
+        );
+        assert!(!keys.mouse_pending());
+    }
+
+    /// The give-up timer is armed where the close is created, by a click and by a key, and
+    /// never on a later answer: a daemon that takes the request and says nothing is exactly
+    /// the case the timer exists for, and it would never answer. `start_close` refuses a
+    /// second close, so a close whose flag the next close wipes would wait out the timer
+    /// with nobody watching.
     /// The give-up timer is armed where the close is created, by a click and by a key, and
     /// never on a later answer: a daemon that takes the request and says nothing is exactly
     /// the case the timer exists for, and it would never answer. `start_close` refuses a
@@ -8736,11 +8871,6 @@ mod tests {
         assert!(s.closing.is_some());
     }
 
-    /// The affirmative cell, from the key and from the pointer, is the only thing standing
-    /// between a question and a dead end: `start_close` refuses a second close, so a close
-    /// begun with a flag the next close wipes would wait for the give-up timer with nobody
-    /// watching. Both paths arm it, and the flag is read on the very next line of the
-    /// keyboard arm, not on the next answer.
     #[test]
     fn a_close_from_the_key_arms_the_give_up_timer() {
         let mut s = state();
