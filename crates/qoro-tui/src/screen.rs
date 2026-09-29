@@ -590,13 +590,16 @@ pub fn paint(frame: &Frame) -> String {
         // for the one row that needs them, and a coloured word inside an otherwise grey
         // line is a word they have to find first.
         //
-        // The keyboard's own rows also carry the raised background, which is
+        // The keyboard's own terminal rows carry the raised background, which is
         // what the designs draw as a selected background. No marker character:
         // the rows are text and the background alone says where the
-        // keyboard is.
+        // keyboard is. A space rule never takes it: the focused space already
+        // reads as the tab bar's colour and the raised rows sitting inside its
+        // box, so raising the rule too paints one selection straddling the box
+        // edge.
         if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
-                Some(sidebar::Hit::Space(id)) => *id == frame.space.unwrap_or_default(),
+                Some(sidebar::Hit::Space(_)) => false,
                 Some(sidebar::Hit::Terminal(terminal)) => *terminal == column.focused_terminal,
                 Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Pinned(_)) | None => {
                     false
