@@ -2,8 +2,21 @@
 
 Status: accepted
 Date: 2026-09-10
+Amended: 2026-09-29, recorded that no bundle was ever producible from a running daemon.
 Evidence: `crates/qoro-support/src/lib.rs` and its tests
 Reproduce: `./scripts/bundle-check.sh`
+
+## Who can build one
+
+A bundle is a slice of the daemon's event log, and since 2026-09-29 the daemon writes no
+events, so there is nothing for it to slice. `qoro-support` and its tests are here and
+`scripts/bundle-check.sh` passes: its tests build a `Vec<Event>` by hand and hand it to
+`Bundle::build`, so it is a proof about the format and about nothing else.
+
+To be exact about what this change cost, it cost nothing. `qoro-support` had no callers
+before it and has none now, and no `qoro support` command exists. A bundle could not be
+produced from a running daemon before this change either. What the log's removal forecloses
+is the first one ever being written.
 
 ## Context
 

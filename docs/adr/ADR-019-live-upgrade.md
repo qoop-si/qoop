@@ -45,13 +45,16 @@ the codec, keeps its terminals through every one of those releases.
 
 ### What survives a deliberate restart
 
-Everything that is metadata: workspaces, terminals, layout, the event log, history, the
-confirmation ledger. What does not survive is what cannot: the pty, the engine state and the
+Everything that is metadata: workspaces, terminals, layout, split trees, sleeping spaces,
+the idempotency ledger, history, the confirmation ledger. The event log is not in that list
+because the daemon no longer writes it; see ADR-005. What does not survive is what cannot: the pty, the engine state and the
 child processes. A restart that reconstructs a terminal mints a new generation, because it
 cannot prove the process is the same one, which is the rule `GenerationId` already carries.
 
-A restart after an unclean shutdown appends a gap event covering the interval nobody
-watched, so a reader does not assume continuity across it.
+A restart after an unclean shutdown used to append a gap event covering the interval
+nobody watched. It no longer does, because the daemon writes no events; the ledger row a
+command wrote before a restart is still there, which is the only continuity a reader of this
+store gets.
 
 ### The upgrade is not the daemon's job
 

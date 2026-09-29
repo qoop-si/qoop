@@ -168,7 +168,7 @@ pub fn sessions_dir(runtime: &Path) -> PathBuf {
     runtime.join("sessions")
 }
 
-/// One session's own directory: its socket, its database, its history, its event log.
+/// One session's own directory: its socket, its database and its history.
 ///
 /// A session is a directory and a daemon, which is what makes stopping one possible at
 /// all: ending a session is ending its process, and the operating system does the rest.

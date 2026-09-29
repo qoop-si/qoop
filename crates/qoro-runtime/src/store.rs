@@ -11,6 +11,14 @@ use std::time::Duration;
 
 use qoro_store::{Store, StoreError, TerminalRow};
 
+/// How long a command answer is kept before the ledger forgets it.
+///
+/// The same window the ledger had when it lived in the event log (ADR-017). A client's
+/// retry is seconds behind the answer it missed, so this is about forensics on a reap
+/// rather than about the retry, and a table that is never trimmed is the one row per
+/// mutating command that would grow for as long as the machine is switched on.
+pub const LEDGER_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
 /// How long a metadata write may take before the caller stops waiting for it.
 ///
 /// A create is acknowledged only when it is durable (ADR-005 rule 2), so this is how long a
@@ -225,6 +233,34 @@ impl StoreHandle {
     /// Replace every stored split tree in one transaction.
     pub async fn set_splits(&self, trees: Vec<String>) -> Result<(), HandleError> {
         self.run(move |s| s.set_splits(&trees)).await
+    }
+
+    /// Write down what a command with this key produced, so a retry of it returns the same
+    /// answer instead of doing the work again.
+    pub async fn record_applied(
+        &self,
+        key: String,
+        ok: bool,
+        detail: serde_json::Value,
+    ) -> Result<(), HandleError> {
+        self.run(move |s| s.record_applied(&key, ok, &detail, now()))
+            .await
+    }
+
+    /// What a command with this key already produced, if it has been applied.
+    pub async fn applied(
+        &self,
+        key: String,
+    ) -> Result<Option<(bool, serde_json::Value)>, HandleError> {
+        self.run(move |s| s.applied(&key)).await
+    }
+
+    /// Forget what a retry can no longer be waiting for.
+    ///
+    /// Once per start, on the store pool like every other write.
+    pub async fn prune_applied(&self) -> Result<usize, HandleError> {
+        self.run(move |s| s.prune_applied(now() - LEDGER_RETENTION_SECONDS))
+            .await
     }
 }
 

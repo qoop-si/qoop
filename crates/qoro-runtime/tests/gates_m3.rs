@@ -128,7 +128,6 @@ async fn a_terminals_child_is_launched_with_that_terminals_token() {
         None,
         d.scanner_arc(),
         d.agents_arc(),
-        d.events(),
         None,
     )
     .expect("a second terminal");

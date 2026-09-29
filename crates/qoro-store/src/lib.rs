@@ -30,6 +30,13 @@ pub enum StoreError {
          {understood}); use that build or move the file aside"
     )]
     FromTheFuture { found: i64, understood: i64 },
+    /// A ledger row that is not the JSON this build writes, so something other than this
+    /// build wrote it. A distinct variant rather than a string inside `Sqlite` because the
+    /// caller has to be able to tell it apart from "the store is busy", and it is reported
+    /// rather than hidden either way. What the daemon does with it is ADR-005's rule 1: it
+    /// is on the terminal's path, so it never turns a command into a refusal.
+    #[error("a stored command outcome is not readable: {0}")]
+    Outcome(#[from] serde_json::Error),
 }
 
 /// The schema version this build writes and expects.
@@ -161,6 +168,17 @@ impl Store {
              CREATE TABLE IF NOT EXISTS asleep (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  since INTEGER NOT NULL
+             );
+             -- What a mutating command with this key already produced, so a retry after an
+             -- ambiguous failure returns the original answer instead of doing the work
+             -- again. The same reasoning as split_tree and asleep: the table is new and the
+             -- version is not, because a version bump makes every older binary refuse the
+             -- file and cost the person their workspaces. An older binary that ignores this
+             -- table loses only retry safety, which it never had a reader for anyway.
+             CREATE TABLE IF NOT EXISTS applied (
+                 idempotency_key TEXT PRIMARY KEY,
+                 outcome TEXT NOT NULL,
+                 at_unix INTEGER NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -213,6 +231,55 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Write down what a command with this key produced.
+    ///
+    /// `INSERT OR IGNORE`, so the first answer is the one that stands. A command that
+    /// answers twice has already done the work twice by the time the second write lands,
+    /// and overwriting would replace the answer the first caller received with one that
+    /// does not match what happened.
+    pub fn record_applied(
+        &self,
+        key: &str,
+        ok: bool,
+        detail: &serde_json::Value,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO applied (idempotency_key, outcome, at_unix)
+             VALUES (?1, ?2, ?3)",
+            params![key, serde_json::to_string(&(ok, detail))?, now],
+        )?;
+        Ok(())
+    }
+
+    /// What a command with this key already produced, if it has been applied.
+    pub fn applied(&self, key: &str) -> Result<Option<(bool, serde_json::Value)>, StoreError> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT outcome FROM applied WHERE idempotency_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        }
+    }
+
+    /// Forget what is older than `before_unix`.
+    ///
+    /// A client's retry is seconds behind the answer it missed, so the ledger only has to
+    /// outlive that. Without this the table is the one part of this store that would grow
+    /// for as long as the machine is switched on.
+    pub fn prune_applied(&self, before_unix: i64) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM applied WHERE at_unix < ?1",
+            params![before_unix],
+        )?)
     }
 
     /// How many terminals a session was holding when it was last left.
@@ -579,6 +646,191 @@ mod tests {
     #[test]
     fn split_trees_do_not_bump_the_schema_version() {
         assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    /// The same argument for the idempotency ledger, and it matters more than the splits:
+    /// a version bump makes every build with `SCHEMA_VERSION = 2` refuse the file, and the
+    /// error it prints tells the person to move the file aside, which is deleting their
+    /// workspaces.
+    ///
+    /// The tripwire is the constant, because that is the only way a table added behind a
+    /// bump could get in. Whether an older build then opens the file is the next test, and
+    /// it cannot be asserted from here: this build does know the table.
+    #[test]
+    fn the_ledger_does_not_bump_the_schema_version() {
+        assert_eq!(
+            SCHEMA_VERSION, 2,
+            "a new table must be created unconditionally; a version bump makes every older \
+             build refuse the file and cost the person their workspaces"
+        );
+    }
+
+    /// The upgrade this change actually ships: a version 2 database with no `applied` table.
+    ///
+    /// Written by hand rather than by a constructor, because the old constructor is exactly
+    /// what changed and using it would test the new code against itself. This is the file
+    /// every existing install has.
+    #[test]
+    fn a_version_two_database_gains_the_ledger_table_on_open() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("qoro.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE workspace (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE terminal (
+                     id INTEGER PRIMARY KEY,
+                     workspace INTEGER NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+                     title TEXT,
+                     cwd TEXT NOT NULL,
+                     argv TEXT NOT NULL,
+                     agent TEXT,
+                     agent_session TEXT,
+                     created_at INTEGER NOT NULL,
+                     closed_at INTEGER
+                 );
+                 CREATE TABLE layout (
+                     workspace INTEGER NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+                     terminal INTEGER NOT NULL REFERENCES terminal(id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL,
+                     PRIMARY KEY (workspace, terminal)
+                 );
+                 CREATE TABLE split_tree (tree TEXT NOT NULL);
+                 INSERT INTO workspace (id, name, created_at) VALUES (1, 'app', 100);
+                 INSERT INTO terminal (id, workspace, cwd, argv, created_at)
+                      VALUES (1, 1, '/tmp', '/bin/sh', 100);
+                 INSERT INTO layout (workspace, terminal, ordinal) VALUES (1, 1, 0);",
+            )
+            .expect("a version 2 database, without the ledger");
+            conn.pragma_update(None, "user_version", 2i64)
+                .expect("stamp");
+        }
+
+        let s = Store::open(&path).expect("an existing database must open, not be refused");
+        assert_eq!(s.applied("k1").expect("the table exists"), None);
+        s.record_applied("k1", true, &serde_json::json!({ "terminal": 1 }), 200)
+            .expect("record");
+        // The person's own state came through untouched, and the row reads back.
+        assert_eq!(s.workspaces().expect("workspaces")[0].name, "app");
+        assert_eq!(s.open_terminals(1).expect("terminals").len(), 1);
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 1 })))
+        );
+    }
+
+    /// A retry returns the answer the first attempt produced.
+    #[test]
+    fn a_replayed_command_returns_the_original_answer() {
+        let s = Store::in_memory().expect("a store");
+        assert_eq!(s.applied("k1").expect("lookup"), None);
+        s.record_applied("k1", true, &serde_json::json!({ "terminal": 7 }), 100)
+            .expect("record");
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 7 })))
+        );
+    }
+
+    /// A row this build cannot read is an error, not an absence.
+    ///
+    /// The distinction is the whole reason `Outcome` is its own variant: a caller that
+    /// cannot tell a broken row from a missing one cannot reason about which it has. What
+    /// the daemon then does with that error is its own decision, and ADR-005's rule 1 makes
+    /// it. This test only pins that the two are not the same answer.
+    #[test]
+    fn a_row_this_build_cannot_read_is_an_error_rather_than_an_absence() {
+        let s = Store::in_memory().expect("a store");
+        s.conn
+            .execute(
+                "INSERT INTO applied (idempotency_key, outcome, at_unix) VALUES ('k1', 'not json', 100)",
+                [],
+            )
+            .expect("write a row another build left");
+
+        let answer = s.applied("k1");
+        assert!(
+            matches!(answer, Err(StoreError::Outcome(_))),
+            "a row that cannot be read was answered as: {answer:?}"
+        );
+        // And it is specifically not the absence a caller would treat as "go ahead".
+        assert!(
+            !matches!(answer, Ok(None)),
+            "an unreadable row read as not applied, so a create would run twice"
+        );
+    }
+
+    /// The first answer is the one that stands.
+    ///
+    /// A command that answers twice has already done the work twice by the time the second
+    /// write lands, so the second answer describes a state the first caller never saw.
+    #[test]
+    fn a_second_write_to_the_same_key_does_not_overwrite_the_first() {
+        let s = Store::in_memory().expect("a store");
+        s.record_applied("k1", true, &serde_json::json!({ "terminal": 7 }), 100)
+            .expect("record");
+        s.record_applied("k1", true, &serde_json::json!({ "terminal": 9 }), 200)
+            .expect("record again");
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 7 }))),
+            "the retry replaced the answer the first caller received"
+        );
+    }
+
+    /// A recorded failure replays as a failure, not as a success.
+    ///
+    /// Neither call site records one today: both write `true`, so the flag exists for the
+    /// first command recorded before it knows how it will end. The alternative is to drop
+    /// the flag and answer a retry of a failed command with a success, which is the worse
+    /// error. Pinned here so the encoding is known to carry it.
+    #[test]
+    fn a_recorded_failure_replays_as_a_failure() {
+        let s = Store::in_memory().expect("a store");
+        s.record_applied(
+            "k1",
+            false,
+            &serde_json::json!({ "reason": "no space" }),
+            100,
+        )
+        .expect("record");
+        let (ok, detail) = s.applied("k1").expect("lookup").expect("recorded");
+        assert!(!ok, "a failure replayed as a success");
+        assert_eq!(detail["reason"], "no space");
+    }
+
+    /// The ledger is the one table here that would otherwise grow forever.
+    #[test]
+    fn pruning_the_ledger_keeps_what_a_retry_can_still_ask_about() {
+        let s = Store::in_memory().expect("a store");
+        s.record_applied("old", true, &serde_json::json!({}), 100)
+            .expect("record");
+        s.record_applied("new", true, &serde_json::json!({}), 9_000)
+            .expect("record");
+        assert_eq!(s.prune_applied(1_000).expect("prune"), 1);
+        assert_eq!(s.applied("old").expect("lookup"), None);
+        assert!(
+            s.applied("new").expect("lookup").is_some(),
+            "pruning reached past the cutoff"
+        );
+    }
+
+    /// The ledger survives a reopen, which is the whole reason it is in this file.
+    #[test]
+    fn the_ledger_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("qoro.db");
+        {
+            let s = Store::open(&path).expect("open");
+            s.record_applied("k1", true, &serde_json::json!({ "terminal": 7 }), 100)
+                .expect("record");
+        }
+        let s = Store::open(&path).expect("reopen");
+        assert!(s.applied("k1").expect("lookup").is_some());
     }
 
     /// A database written by the build before sessions existed, opened by this build.

@@ -1208,7 +1208,6 @@ dependencies = [
  "libc",
  "qoro-detect",
  "qoro-domain",
- "qoro-events",
  "qoro-proto",
  "qoro-pty",
  "qoro-store",
@@ -1241,6 +1240,7 @@ version = "0.4.0"
 dependencies = [
  "qoro-domain",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
 ]

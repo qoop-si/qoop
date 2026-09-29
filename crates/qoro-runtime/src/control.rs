@@ -220,10 +220,10 @@ pub enum ControlRequest {
         session: Option<String>,
         /// What happened, as a closed kind: `user`, `tool`, `blocked`, `done`.
         ///
-        /// Display only: it never enters the belief, the push payload, or the
-        /// event log. Absent or outside the closed set means "a state report
-        /// with nothing to show", and the daemon records no event. Defaulted
-        /// so reports from older hooks parse without it.
+        /// Display only: it never enters the belief, the push payload or the
+        /// store. Absent or outside the closed set means "a state report with
+        /// nothing to show", and the daemon records nothing. Defaulted so
+        /// reports from older hooks parse without it.
         #[serde(default)]
         event: Option<String>,
         /// One line saying what the event was: a tool name with its file-ish

@@ -9,7 +9,6 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod daemon;
-pub mod eventlog;
 pub mod idle;
 pub mod lock;
 pub mod paths;

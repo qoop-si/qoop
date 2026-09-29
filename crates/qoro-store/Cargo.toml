@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 qoro-domain = { path = "../qoro-domain" }
 rusqlite = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

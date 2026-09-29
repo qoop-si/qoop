@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-09
+Amended: 2026-09-29, the event log became unwired. See "The log is not written" below.
 
 ## Context
 A comparable multiplexer has no database. It writes two JSON files per session with
@@ -11,15 +12,98 @@ is adequate for layout metadata and inadequate for a durable event log, which th
 attention client and any audit or replay use case require.
 
 ## Decision
-- SQLite with WAL for durable metadata: workspaces, terminals, setups, machines, agents,
-  events, requests, messages and projections.
+- SQLite with WAL for durable metadata: workspaces, terminals, layouts, split trees,
+  sleeping spaces, and the idempotency ledger.
 - Segmented append-only files for terminal history and snapshots. Terminal output never
   becomes a large SQLite row.
 - All database work runs on the blocking pool with a deadline. Never on the reactor.
-- Event appends are batched. A batch is one transaction.
-- Structural writes that are not events keep the temp file plus rename pattern where a
-  plain file is the right shape, including manual symlink resolution so a dotfile
-  managed path is not replaced by a regular file.
+- Structural writes keep the temp file plus rename pattern where a plain file is the right
+  shape, including manual symlink resolution so a dotfile managed path is not replaced by a
+  regular file.
+- A new table is created unconditionally, never behind a version bump. A bump makes every
+  older binary refuse the file, and the error tells the person to move it aside, which is
+  deleting their workspaces. `split_tree` and `applied` each have a test that says so.
+
+## The ledger is what the log was for
+
+A mutating command writes down its answer before the client is told, keyed by the client's
+idempotency key. A retry of that key returns the recorded answer instead of doing the work
+again. This is the whole of what the daemon read from the event log, and it is what
+`applied` in `qoro.db` is for. The first answer stands: a second write is ignored, because a
+command that answers twice has already done the work twice by the time the second write
+lands.
+
+The table is trimmed once a start, on the same 30 day window the log used. A retry is
+seconds behind the answer it missed, so the window is for forensics on a reap, not for the
+retry.
+
+## The log is not written
+
+The event log described by ADR-017 is implemented in `qoro-events`, and its tests still
+prove that a projection is a pure fold over a log. **The daemon does not write it.** Before
+this change a running daemon had written hundreds of observations and commands and read
+none of them: the only query was the ledger, and no crate in the workspace opened the log
+besides it. The CLI, TUI, bridge, hub, remote transport and mobile path never opened it at
+all, and they still do not.
+
+Everything the log was going to feed reads somewhere else. The agent state every surface
+sees comes from `AgentRegistry` and the store, written by separate paths. `FocusEvents` is
+answered from daemon memory and says so at its own arm. A sleeping space's promise, that
+tabs, scrollback, splits and agent conversation ids are kept, is carried by the store rows
+and the history files, not by the log.
+
+What was lost, and what it was not:
+
+- **A `Command` intent with no `Outcome`.** Never reconciled. `unreconciled()` had no
+  production caller, and what reconciles a restart is `restore_report`, which reads
+  `store.open_terminals` per space and never consulted the log. Killing the daemon between
+  a create's intent and its outcome already opened a duplicate tab on the retry, because
+  only an `Outcome` ever wrote the ledger row. The intent changed nothing at any point in
+  that trace.
+- **Replay, projections, the gap that tells a reader to re-read, lossy observations.** Real
+  once, all unwired. `qoro-events` still holds the fold and the `Gap` body, and its tests
+  still replay a log it built in memory. What is gone with it: the bounded buffer that
+  dropped under pressure, the counting of what was dropped, the code that appended the
+  `gap`, and the waiter that re-read rather than folded forward. None of that is covered
+  anywhere now, and the first reader of the log decides whether any of it is written again.
+- **A support bundle from a running daemon** (ADR-016), which is a log slice. It could not
+  be produced from one before this change either: `qoro-support` had no callers at all. The
+  crate and its tests remain.
+
+The `Command` intent is the one that needs a second reader to believe it was load-bearing,
+so it is worth being exact: `EventStore::append` wrote the ledger row only inside its
+`Outcome` branch, so the lookup was structurally unable to see an intent.
+
+## A hole this change does not close
+
+If a create's ledger write fails while the terminal is alive, the client is told
+`Failed`, the tab keeps running, and a retry opens a second one. That predates this change
+and gate G4.6 does not cover it. It is closable now that the row and the ledger are in one
+database: `create_terminal` and `record_applied` can share a transaction. Filed, not done
+here, because it changes crash semantics.
+
+## What lives in the runtime directory, and what that costs
+
+`qoro.db` and `history/` are both opened in the runtime directory. On macOS
+`XDG_RUNTIME_DIR` is unset, so `runtime_base()` (`crates/qoro-runtime/src/paths.rs:71-86`)
+falls back to `std::env::temp_dir()` and both land in `$TMPDIR/qoro-<uid>`, which macOS
+clears: measured on a machine that had been up three days, none of the files at depth 2 of
+that `TMPDIR` predated its boot, while the sibling cache directory beside it had the large
+majority of its files older. The measurement is scoped to that depth and that machine, and
+it is evidence of a policy rather than a measurement of how long anything survives.
+
+So on macOS a sleeping space does not survive a restart today, whatever the log does. The
+XDG spec is right that a runtime directory must not survive a reboot; it is right about
+sockets and wrong about databases. Moving the stores to `$XDG_DATA_HOME` with a migration
+is a separate change, and it is the one that makes any durability claim worth making.
+
+## Consequences
+- The daemon keeps one SQLite file instead of two, one WAL, and one set of schema,
+  migration and busy-timeout handling.
+- A durable, replayable event log exists in `qoro-events` and is exercised by its own tests.
+  It is not what this daemon runs on.
+- Build cost: SQLite is compiled in via a bundled feature so there is no system
+  dependency.
 
 ### The overload triangle, resolved explicitly
 
@@ -37,55 +121,64 @@ The resolution, stated rather than discovered in production:
    Terminal input is deliberately not journalled. A restart therefore cannot reconstruct
    what a user typed, and input is classified as non-mutating for degraded-mode purposes,
    so a full disk never stops anyone typing.
-2. **A command is acknowledged only after its event is durable.** A client that asks to
-   create a workspace is told it succeeded only once the log says so. This is what makes
-   idempotent retry meaningful.
-3. **Observations, which are things we noticed rather than things we were asked to do,
-   are lossy under pressure and the loss is recorded.** When the event buffer is full,
-   observations are dropped and gap state is accumulated in memory as a count plus a time
-   range, which is O(1) and needs no buffer slot. It is appended as a single `gap` event
-   on the next successful write. Appending the gap through the buffer that is by
-   definition full would lose the gap along with the observations it describes, which is
-   the failure the whole mechanism exists to prevent.
+2. **A command is acknowledged only after its answer is durable.** A client that asks for a
+   terminal is told it succeeded only once the ledger row is written, which is what makes
+   its retry a replay rather than a second tab. The ledger covers `CreateTerminal` and
+   `CloseTerminal`, which are the two commands whose repetition is visible; a workspace
+   command repeated today creates a second workspace.
+3. **Observations were lossy under pressure, and the loss was recorded.** This is written
+   in the past tense because the mechanism is gone with the log it belonged to, and the
+   reason it is here at all is that the design it settles is the one the next writer has to
+   settle again.
 
-   Gap state that is still unflushed is lost if the process dies, and that is precisely
-   when the process is most likely to die, because the accumulator is largest while writes
-   are failing. So: **on every start after an unclean shutdown, a gap event is appended
-   covering the interval between the last durable event and startup.** The daemon cannot
-   prove nothing was lost across an unclean stop, and claiming continuity would be the
-   silent inconsistency this whole section exists to prevent.
+   When the event buffer was full, observations were dropped and the gap state accumulated
+   in memory as a count plus a time range, which is O(1) and needs no buffer slot. It was
+   appended as a single `gap` event on the next successful write. Appending the gap through
+   the buffer that is by definition full would have lost the gap along with the
+   observations it described, which is the failure the whole mechanism exists to prevent.
 
-   A subscription is therefore defined as "state snapshot at cursor C, then events after
-   C", and a `gap` obliges the subscriber to re-read state rather than merely noting a
-   hole. This matters because a waiter blocked on `agent.blocked` must still resolve
-   across a drop; a pure event subscription that misses its trigger would be less reliable
-   than the polling loop it replaces.
+   Gap state still unflushed was lost if the process died, and that is precisely when the
+   process is most likely to die, because the accumulator is largest while writes are
+   failing. So every start after an unclean shutdown appended a gap covering the interval
+   between the last durable event and startup. The daemon could not prove nothing was lost
+   across an unclean stop, and claiming continuity would have been the silent
+   inconsistency this whole section exists to prevent.
+
+   A subscription was therefore defined as "state snapshot at cursor C, then events after
+   C", and a `gap` obliged the subscriber to re-read state rather than merely note a hole.
+   A waiter blocked on `agent.blocked` had to resolve across a drop, because a pure event
+   subscription that missed its trigger would be less reliable than the polling loop it
+   replaces.
+
+   The buffer, the counter, the code that appended the gap and the waiter were all in
+   `eventlog.rs`, and none of them had a production caller. Rule 1 still governs the
+   terminal's path and its implementation is untouched. If the log is written again, this
+   is the rule it needs, and it is the reason a projection is a fold rather than a
+   subscription.
 4. **Degraded storage mode** is entered when writes fail or exceed their deadline
    repeatedly. In degraded mode the daemon keeps every terminal running, refuses
    mutating commands with a typed retryable error, continues to serve reads from memory,
    and surfaces the condition in status output. It leaves degraded mode when a write
-   succeeds, and appends a gap event covering the degraded window.
+   succeeds.
 
 The one thing that never happens is a silent inconsistency.
 
 ### Crash windows
 
-Every externally visible **lifecycle** side effect is preceded by an intent record and
-followed by an outcome record. Lifecycle means spawning a process, tearing one down,
-writing a file, or sending an outbound message. It explicitly does not mean delivering a
-keystroke to a child, which is irreversible but is never journalled, per rule 1. On restart, an intent with no outcome is reconciled rather than assumed:
-a spawn intent with no outcome causes the daemon to look for the process, a teardown
-intent with no outcome causes teardown to re-run from its idempotent step. The window is
-therefore never "did this happen", it is always "check and converge". For `CreateTerminal` the
-store row is the reconciliation: the row is written before the spawn and closed when it
-fails, and restore reopens every open row.
+For `CreateTerminal` the store row is the reconciliation: the row is written before the
+spawn, closed when it fails, and `restore_report` reopens every open row. The ledger row is
+the second half, written after the spawn and before the answer, and it is what makes a
+retry a replay rather than a second tab.
 
-## Consequences
-- A durable, replayable event log exists from milestone 4, which is a capability
-  other multiplexers do not have at all.
-- Build cost: SQLite is compiled in via a bundled feature so there is no system
-  dependency.
+An earlier version of this ADR claimed that an intent with no outcome caused the daemon to
+look for the process, and that a teardown intent re-ran teardown from its idempotent step.
+No such code existed. `unreconciled()` had no production caller and the store row was what
+restore read, which the next sentence of that version already said.
 
 ## Rollback
-`EventStore` is a trait. A different backing store can replace SQLite without touching
-domain or runtime code.
+
+`qoro.db` gains a table and `SCHEMA_VERSION` does not move, so a build that predates this
+one still opens the file and ignores the table. `events.db` is left on disk unread, so
+reverting loses nothing. `EventStore` remains a trait, so a different backing store can
+replace SQLite in `qoro-events` without touching domain or runtime code; `qoro-store` is
+the one with no replacement, and its schema is a ladder rather than a version check.

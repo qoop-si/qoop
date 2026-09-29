@@ -60,9 +60,14 @@ the operating system does the rest, which is a mechanism that already works and 
 half done.
 
 So: a session is a named directory under the runtime directory, holding one daemon's
-socket, database, history and event log, and the unnamed default is one of them rather than
-a special case. `qoro --session <name>` picks one, `qoro ls` lists them, `qoro stop [name]`
-ends one.
+socket, database and history, and the unnamed default is one of them rather than a special
+case. `qoro ls` lists the spaces of the one daemon there is per machine, and ADR-005 says
+what its directory holds and where that directory is.
+
+Amended 2026-09-29. There is one daemon per machine now and `qoro --session` takes only
+`default`; spaces are the only grouping. `qoro stop <name>` still takes a name and still
+stops a daemon of that name left running from before this decision, because nothing else
+reaches it. `qoro ls` lists spaces rather than sessions. ADR-005 covers the stores.
 
 The path duplication the Context warns about is the real risk and is answered directly:
 every session path is built by `paths::session_dir`, and there is no second place that

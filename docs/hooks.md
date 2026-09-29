@@ -110,7 +110,7 @@ Notes:
 - focus events (claude, codex, gemini, opencode): the scripts add `--event
   user|tool|blocked|done` with a one-line `--label` beside the unchanged
   state word. The daemon keeps the last 50 per terminal in memory for the
-  focus view: no journal, no push payload, no event log. Labels are
+  focus view: no journal, no push payload, nothing written to the store. Labels are
   best-effort (tool name plus its command, path or pattern, cut to 120
   characters, control characters removed); a payload without the field
   reports label-less. Claude sends the prompt head as the `user` label for

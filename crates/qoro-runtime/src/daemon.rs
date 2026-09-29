@@ -687,9 +687,6 @@ pub struct Daemon {
     terminals: Arc<TerminalRegistry>,
     /// Who is running in each terminal, and the token that admits a claim about it.
     agents: Arc<crate::agents::AgentRegistry>,
-    /// The durable log. Commands are in it before they are acknowledged; observations are
-    /// in it when the disk allows, and the loss is recorded (ADR-005, ADR-017).
-    events: crate::eventlog::EventLog,
     connections: Arc<ConnectionRegistry>,
     warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
     /// Outbound bytes buffered across every connection, against ADR-004's ceiling.
@@ -742,29 +739,11 @@ impl Daemon {
         };
 
         let terminals = Arc::new(TerminalRegistry::default());
-        // Whether this is a restart is decided before the file is opened, because opening
-        // it creates it: a first start would otherwise record a gap for an interval that
-        // never existed.
-        let log_path = dir.join("events.db");
-        let restarting = log_path.exists();
-        let last_seen = std::fs::metadata(&log_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let events = crate::eventlog::EventLog::new(
-            qoro_events::EventStore::open(&log_path).map_err(io::Error::other)?,
-        );
-        // A gap covering the interval nobody watched. The daemon cannot know what it
-        // missed, and a reader that assumed continuity across a restart would be wrong
-        // exactly when it matters most (ADR-005).
-        if restarting {
-            let _ = events.note_restart_gap(last_seen).await;
-        }
-        // The log keeps a window (ADR-017), trimmed once a start: it grows by what people
-        // and agents did, and without this it grew for as long as qoro was installed.
-        let _ = events.prune().await;
+        // The idempotency ledger keeps a window (ADR-017), trimmed once a start: it grows by
+        // what people and agents asked for, and without this it grew for as long as qoro was
+        // installed. A retry is seconds behind the answer it missed, so the window is about
+        // forensics on a reap, not about the retry.
+        let _ = store.prune_applied().await;
         let agents = Arc::new(crate::agents::AgentRegistry::new()?);
         let scanner = Arc::new(ContainmentScanner::default());
         // One pass before the first terminal exists, so a terminal created immediately has
@@ -819,7 +798,6 @@ impl Daemon {
             history_dir: Some(dir.join("history")),
             scanner: scanner.clone(),
             agents: agents.clone(),
-            events: events.clone(),
         })
         .await;
         restore_splits(&terminals, &books).await;
@@ -836,7 +814,6 @@ impl Daemon {
             history_dir: Some(dir.join("history")),
             scanner,
             agents,
-            events,
             books,
             leaves: false,
             watched: crate::idle::WatchCounts::default(),
@@ -897,7 +874,6 @@ impl Daemon {
             self.history_dir.clone(),
             self.scanner.clone(),
             self.agents.clone(),
-            self.events.clone(),
             Some(self.books.clone()),
         )?;
         Ok(stream)
@@ -917,11 +893,6 @@ impl Daemon {
     /// The shared containment scanner.
     pub fn scanner(&self) -> Arc<ContainmentScanner> {
         self.scanner.clone()
-    }
-
-    /// The durable log.
-    pub fn events(&self) -> crate::eventlog::EventLog {
-        self.events.clone()
     }
 
     /// Who is running in each terminal.
@@ -1002,20 +973,6 @@ impl Daemon {
             }
         });
 
-        // The observation writer (ADR-005 rule 3, ADR-017). Parked until something is
-        // observed, so an idle daemon still makes no wakeups, then one batch per window:
-        // observations are frequent and a write per observation would put the disk on the
-        // path of every state change. Nothing called `flush` before this, so every
-        // observation stayed in memory and the loss past the buffer was never written.
-        let observed = self.events.clone();
-        tokio::spawn(async move {
-            loop {
-                observed.wait_for_observations().await;
-                tokio::time::sleep(crate::eventlog::OBSERVATION_BATCH).await;
-                let _ = observed.flush().await;
-            }
-        });
-
         // Spaces that sleep by themselves. Spawned only when `[sleep] idle_minutes` is set:
         // off (the default) means no task and zero wakeups, which is what keeps ADR-009's
         // macOS literal-zero-idle claim intact. On, it parks while nothing is awake and
@@ -1041,7 +998,6 @@ impl Daemon {
                     history_dir: self.history_dir.clone(),
                     scanner: self.scanner.clone(),
                     agents: self.agents.clone(),
-                    events: self.events.clone(),
                 },
                 self.watched.clone(),
                 std::time::Duration::from_secs(minutes.saturating_mul(60)),
@@ -1164,7 +1120,6 @@ impl Daemon {
             let served_history = self.history_dir.clone();
             let served_scanner = self.scanner.clone();
             let served_agents = self.agents.clone();
-            let served_events = self.events.clone();
             let served_watched = self.watched.clone();
             let served_books = self.books.clone();
             // Registered before the task exists, so the task's own `remove` on exit always
@@ -1205,7 +1160,6 @@ impl Daemon {
                         history_dir: served_history,
                         scanner: served_scanner,
                         agents: served_agents,
-                        events: served_events,
                         watched: served_watched,
                         connections: registry.clone(),
                         books: served_books,
@@ -1545,7 +1499,7 @@ pub struct ServeContext {
     pub history_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
     pub agents: Arc<crate::agents::AgentRegistry>,
-    pub events: crate::eventlog::EventLog,
+
     /// Which terminals live connections watch. Incremented on subscribe,
     /// decremented on unsubscribe and disconnect; the idle reaper reads it.
     pub watched: crate::idle::WatchCounts,
@@ -1572,7 +1526,6 @@ async fn serve_client(
         history_dir,
         scanner,
         agents,
-        events,
         watched,
         connections,
         books,
@@ -1902,7 +1855,6 @@ async fn serve_client(
                                 let client = client.clone();
                                 let scanner = scanner.clone();
                                 let agents = agents.clone();
-                                let events = events.clone();
                                 let watched = watched.clone();
                                 let connections = connections.clone();
                                 let books = books.clone();
@@ -1919,7 +1871,6 @@ async fn serve_client(
                                         &client,
                                         &scanner,
                                         &agents,
-                                        &events,
                                         &watched,
                                         &connections,
                                         &books,
@@ -1952,7 +1903,6 @@ async fn serve_client(
                                     &client,
                                     &scanner,
                                     &agents,
-                                    &events,
                                     &watched,
                                     &connections,
                                     &books,
@@ -2514,28 +2464,20 @@ fn verify_waiter(
         && agents.token_of(waiter).is_some_and(|t| t.as_str() == token)
 }
 
-/// Write down a close the way every close is written down: the command and its outcome,
-/// so a retry of the same request finds it applied rather than closing twice or failing.
-async fn record_close(events: &crate::eventlog::EventLog, id: &str, terminal: u32) {
-    let _ = events
-        .append_durable(vec![
-            (
-                qoro_events::Stream::Command(id.to_string()),
-                qoro_events::Body::Command {
-                    idempotency_key: id.to_string(),
-                    operation: "CloseTerminal".into(),
-                    detail: serde_json::json!({ "terminal": terminal }),
-                },
-            ),
-            (
-                qoro_events::Stream::Command(id.to_string()),
-                qoro_events::Body::Outcome {
-                    idempotency_key: id.to_string(),
-                    ok: true,
-                    detail: serde_json::json!({ "terminal": terminal }),
-                },
-            ),
-        ])
+/// Write down that a close happened, so a retry of the same request finds it applied
+/// rather than reporting a terminal that is already gone.
+async fn record_close(store: &crate::store::StoreHandle, id: &str, terminal: u32) {
+    // The error is deliberately dropped, which is what this did when the ledger lived in
+    // the event log. A terminal that is already gone is what the caller wanted; refusing
+    // the close because the answer could not be written down would leave a tab the client
+    // cannot get rid of. The cost is that a retry of an unrecorded close is answered from
+    // the terminal rather than from here, and that is the better failure for a close.
+    let _ = store
+        .record_applied(
+            id.to_string(),
+            true,
+            serde_json::json!({ "terminal": terminal }),
+        )
         .await;
 }
 
@@ -2597,7 +2539,7 @@ async fn handle_control(
     client: &ClientId,
     scanner: &Arc<ContainmentScanner>,
     agents: &Arc<crate::agents::AgentRegistry>,
-    events: &crate::eventlog::EventLog,
+
     watched: &crate::idle::WatchCounts,
     connections: &Arc<ConnectionRegistry>,
     books: &Bookkeeping,
@@ -2615,15 +2557,23 @@ async fn handle_control(
         history_dir: history_dir.clone(),
         scanner: scanner.clone(),
         agents: agents.clone(),
-        events: events.clone(),
     };
 
     // A command that has already been applied returns its original answer rather than
     // being done again. ADR-017: the ledger is what makes a retry after an ambiguous
-    // failure safe, and the reason it is a lookup and not a scan of the log is that a scan
-    // gets slower exactly as the log grows.
+    // failure safe, and the reason it is a lookup and not a scan is that a scan gets
+    // slower exactly as the table grows.
+    //
+    // A lookup that fails is treated as "not applied" rather than refused, which is the
+    // same decision `record_close` makes on the write side and for the same reason: the two
+    // costs are not symmetric. A create that runs twice opens a tab the client can see and
+    // close. A close refused because the ledger could not be read leaves a shell the
+    // client cannot get rid of, and that is the failure worth avoiding. The read and the
+    // write go through the same connection under the same deadline, so a store that is
+    // stalling is already refusing to record what it does, and ADR-005's rule 1 says the
+    // terminal never waits for it.
     if is_mutating(&request)
-        && let Ok(Some((ok, detail))) = events.applied(id.clone()).await
+        && let Ok(Some((ok, detail))) = store.applied(id.clone()).await
     {
         return replayed_response(&id, ok, &detail, &request);
     }
@@ -2713,27 +2663,6 @@ async fn handle_control(
                     reason: format!("could not record the terminal: {e}"),
                 };
             }
-            // The intent, durable before anything is started. A restart that finds this
-            // with no outcome knows a terminal may have been created and not recorded.
-            if let Err(e) = events
-                .append_durable(vec![(
-                    qoro_events::Stream::Command(id.clone()),
-                    qoro_events::Body::Command {
-                        idempotency_key: id.clone(),
-                        operation: "CreateTerminal".into(),
-                        detail: serde_json::json!({ "cwd": recorded_cwd }),
-                    },
-                )])
-                .await
-            {
-                // The row is already written and nothing will run in it: closed here, or
-                // the next start brings back a tab the client was told was never made.
-                let _ = store.close_terminal(stream as i64).await;
-                return ControlResponse::Failed {
-                    id,
-                    reason: format!("could not record the intent: {e}"),
-                };
-            }
             if let Some(name) = name.as_deref() {
                 // Written now rather than at the next rename, so a tab named at birth
                 // comes back under its name.
@@ -2750,7 +2679,6 @@ async fn handle_control(
                 history_dir.clone(),
                 scanner.clone(),
                 agents.clone(),
-                events.clone(),
                 Some(books.clone()),
             ) {
                 Ok(_) => {
@@ -2759,17 +2687,10 @@ async fn handle_control(
                     // first output is lost.
                     subscribe(terminals, subscriptions, renders, watched, stream);
                     // The outcome, durable before the client is told. ADR-005 rule 2: a
-                    // client is told it succeeded only once the log says so, which is what
-                    // makes its retry idempotent rather than a second terminal.
-                    if let Err(e) = events
-                        .append_durable(vec![(
-                            qoro_events::Stream::Command(id.clone()),
-                            qoro_events::Body::Outcome {
-                                idempotency_key: id.clone(),
-                                ok: true,
-                                detail: serde_json::json!({ "terminal": stream }),
-                            },
-                        )])
+                    // client is told it succeeded only once the answer is written down,
+                    // which is what makes its retry a replay rather than a second terminal.
+                    if let Err(e) = store
+                        .record_applied(id.clone(), true, serde_json::json!({ "terminal": stream }))
                         .await
                     {
                         return ControlResponse::Failed {
@@ -2821,7 +2742,7 @@ async fn handle_control(
                     // shell keeps running, with no way for that client to find out.
                     return match handle.commands.try_send(ClientCommand::Close) {
                         Ok(()) => {
-                            record_close(events, &id, terminal).await;
+                            record_close(store, &id, terminal).await;
                             ControlResponse::TerminalClosed { id, terminal }
                         }
                         Err(e) => {
@@ -2845,7 +2766,7 @@ async fn handle_control(
             // it. Anything else is refused.
             match close_sleeping_tab(books, history_dir.as_deref(), terminal).await {
                 Ok(true) => {
-                    record_close(events, &id, terminal).await;
+                    record_close(store, &id, terminal).await;
                     return ControlResponse::TerminalClosed { id, terminal };
                 }
                 Ok(false) => {}
@@ -3452,12 +3373,12 @@ async fn handle_control(
                     id,
                     reason: format!("the report for terminal {terminal} was refused"),
                 },
-                Ok(changed) => {
+                Ok(_) => {
                     // A focus event is display only: recorded after admission,
-                    // so a forged token cannot write the log, and kept out of
-                    // the belief, the push payload, the event log and the
-                    // store. An absent or out-of-set kind means "a state
-                    // report with nothing to show": no row, still a success.
+                    // so a forged token cannot write it, and kept out of
+                    // the belief, the push payload and the store. An absent
+                    // or out-of-set kind means "a state report with nothing
+                    // to show": no row, still a success.
                     if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
                         let at_unix = crate::agents::now_unix();
                         let before = agents.activity(terminal);
@@ -3495,24 +3416,6 @@ async fn handle_control(
                         let generation = agents.agent(terminal).map(|a| a.belief.generation.0);
                         terminals.set_session(terminal, Some(session.clone()), generation);
                         let _ = store.set_agent_session(terminal as i64, session).await;
-                    }
-                    if changed {
-                        let generation = agents
-                            .agent(terminal)
-                            .map(|a| a.belief.generation.0)
-                            .unwrap_or(0);
-                        events.observe(
-                            qoro_events::Stream::Terminal(terminal),
-                            qoro_events::Body::Observation {
-                                terminal,
-                                state: format!("{reported:?}"),
-                                source: "Hook".into(),
-                                confidence: "High".into(),
-                                sampled_generation: generation,
-                                evidence: "hook".into(),
-                                redacted: false,
-                            },
-                        );
                     }
                     ControlResponse::AgentStateReported { id, terminal }
                 }
@@ -4063,7 +3966,7 @@ pub fn open_terminal(
     history_dir: Option<PathBuf>,
     scanner: Arc<ContainmentScanner>,
     agents: Arc<crate::agents::AgentRegistry>,
-    events: crate::eventlog::EventLog,
+
     books: Option<Bookkeeping>,
 ) -> io::Result<TerminalHandle> {
     let (commands, from_clients) = mpsc::channel(256);
@@ -4133,7 +4036,6 @@ pub fn open_terminal(
             token,
             stream,
             agents,
-            events,
             terminals: terminals.clone(),
             books: books.clone(),
         },
@@ -4509,7 +4411,6 @@ pub struct Restore {
     pub history_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
     pub agents: Arc<crate::agents::AgentRegistry>,
-    pub events: crate::eventlog::EventLog,
 }
 
 /// What a restart brought back, counted by kind rather than as one number.
@@ -4663,7 +4564,6 @@ async fn restore_rows(
             into.history_dir.clone(),
             into.scanner.clone(),
             into.agents.clone(),
-            into.events.clone(),
             Some(into.books.clone()),
         );
         let Ok(handle) = opened else {
@@ -5766,7 +5666,7 @@ pub struct TerminalSpawn {
     pub token: qoro_domain::CapabilityToken,
     pub stream: u32,
     pub agents: Arc<crate::agents::AgentRegistry>,
-    pub events: crate::eventlog::EventLog,
+
     /// The live index, so the terminal's own task can publish where it is
     /// without going through the store. The task is the single writer.
     pub terminals: Arc<TerminalRegistry>,
@@ -5791,7 +5691,6 @@ fn spawn_terminal(
         token,
         stream,
         agents,
-        events,
         terminals,
         books,
     } = spawn;
@@ -5895,7 +5794,6 @@ fn spawn_terminal(
             scanner,
             agents.clone(),
             stream,
-            events.clone(),
             terminals,
             books,
             started_in,
@@ -5911,22 +5809,6 @@ fn spawn_terminal(
                 eprintln!("qorod: terminal ended: {error}");
             }
             TaskEnd::Panicked => {
-                let generation = agents
-                    .agent(stream)
-                    .map(|a| a.belief.generation.0)
-                    .unwrap_or(0);
-                events.observe(
-                    qoro_events::Stream::Terminal(stream),
-                    qoro_events::Body::Observation {
-                        terminal: stream,
-                        state: "failed".into(),
-                        source: "supervisor".into(),
-                        confidence: "High".into(),
-                        sampled_generation: generation,
-                        evidence: "terminal task panicked and was contained".into(),
-                        redacted: false,
-                    },
-                );
                 agents.announce(stream);
                 // The ordered teardown died with the task, so the tree would
                 // otherwise survive with no tab: kill it by tty identity before
@@ -6317,7 +6199,7 @@ async fn terminal_task(
     scanner: Arc<ContainmentScanner>,
     agents: Arc<crate::agents::AgentRegistry>,
     stream: u32,
-    events: crate::eventlog::EventLog,
+
     terminals: Arc<TerminalRegistry>,
     books: Option<Bookkeeping>,
     // Where this terminal was started, which is what its row already says.
@@ -6913,32 +6795,17 @@ async fn terminal_task(
                             }
                             None => screen_verdict(reading, known),
                         };
-                        if let Some(verdict) = verdict
-                            && agents.observe_screen(
+                        if let Some(verdict) = verdict {
+                            // Whether or not this changed the belief, the call is the
+                            // point: it filters the repeat and announces the news. It used
+                            // to be followed by a write to the event log, which nothing
+                            // read.
+                            agents.observe_screen(
                                 stream,
                                 &manifest.id,
                                 &verdict,
                                 crate::agents::now_unix(),
-                            )
-                        {
-                        // Recorded when it changed, not on every look. The log is what a
-                        // client that was not connected reads to find out what happened
-                        // while it was away, and a row per evaluation would bury that in
-                        // repetitions of the same fact.
-                        events.observe(
-                            qoro_events::Stream::Terminal(stream),
-                            qoro_events::Body::Observation {
-                                terminal: stream,
-                                state: format!("{:?}", verdict.state),
-                                source: "ScreenHeuristic".into(),
-                                confidence: "Medium".into(),
-                                sampled_generation: 0,
-                                // The rule's name, never the screen it matched: a screen is
-                                // somebody's source code and their client's name.
-                                evidence: verdict.rule.clone(),
-                                redacted: false,
-                            },
-                        );
+                            );
                         }
                     }
                     // Armed only while a blocker holds. A re-announce is a

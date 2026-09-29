@@ -113,7 +113,6 @@ pub struct TestDaemon {
     terminals: std::sync::Arc<qoro_runtime::daemon::TerminalRegistry>,
     agents: std::sync::Arc<qoro_runtime::agents::AgentRegistry>,
     scanner: std::sync::Arc<qoro_runtime::daemon::ContainmentScanner>,
-    events: qoro_runtime::eventlog::EventLog,
     warnings: std::sync::Arc<Mutex<Vec<qoro_runtime::daemon::Warning>>>,
 }
 
@@ -159,7 +158,6 @@ impl TestDaemon {
         let terminals = daemon.terminals();
         let agents = daemon.agents();
         let scanner = daemon.scanner();
-        let events = daemon.events();
         let warnings = daemon.warnings();
         let store = daemon.store();
         let workspace = daemon.workspace();
@@ -173,7 +171,6 @@ impl TestDaemon {
             terminals,
             agents,
             scanner,
-            events,
             warnings,
             store,
             workspace,
@@ -227,11 +224,6 @@ impl TestDaemon {
 
     pub fn warnings_arc(&self) -> std::sync::Arc<Mutex<Vec<qoro_runtime::daemon::Warning>>> {
         self.warnings.clone()
-    }
-
-    /// The daemon's durable log.
-    pub fn events(&self) -> qoro_runtime::eventlog::EventLog {
-        self.events.clone()
     }
 
     /// Who the daemon believes is running in a terminal.

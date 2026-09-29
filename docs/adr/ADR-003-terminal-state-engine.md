@@ -158,12 +158,16 @@ storage, absolutely). It would also reintroduce the failure those rules exist to
 an exiting child cannot complete until its tty output is drained, so a terminal task
 blocked on a slow disk makes the user's `exit` hang in the kernel.
 
-The correct resolution is the one ADR-005 already uses for observations. The spill hands
-rows to a bounded queue drained by the `store` pool. When that queue is full, rows are
-dropped, the count and the row range are accumulated in memory, and a `gap` record is
-written with the next successful segment write. History acquires a hole that is visible and
-counted rather than a hang that is not. Losing history is a real cost and it is the smaller
-one: the alternative is losing the terminal.
+The spill hands rows to a bounded queue drained by the `store` pool. When that queue is
+full, rows are dropped and the count and the row range are accumulated in memory, and the
+daemon says so on its own output when the terminal ends. History acquires a hole that is
+counted and said aloud rather than a hang that is not. Losing history is a real cost and it
+is the smaller one: the alternative is losing the terminal.
+
+The observations ADR-005 used to drop had a `gap` event written next to them, which is what
+made the loss durable rather than spoken. That log is not written any more, so history's
+loss has no record beyond the line on stderr, and anyone who needs a durable count for it
+has to add one.
 
 The engine adapter reports the same condition from the other side. It counts feeds that
 happened while the in-memory ring was already saturated, because the engine emits no event
