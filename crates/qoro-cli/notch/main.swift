@@ -108,6 +108,9 @@ struct Run: Decodable {
 }
 
 struct Screen: Decodable {
+    /// The terminal's width in columns, which the peek fits itself to. Left out by an older
+    /// qoro, which reads as a terminal the box already fits.
+    var cols: Int? = nil
     let alt: Bool
     let behind: Int
     let rows: [[Run]]
@@ -353,6 +356,7 @@ struct PeekRow: Identifiable {
 final class Mirror: ObservableObject {
     let tab: Tab
     @Published var screen: [PeekRow] = []
+    @Published var cols = 0
     @Published var older: [PeekRow] = []
     @Published var more = true
     /// What qoro would not read, said in place of the rows it would not read: a terminal
@@ -452,6 +456,7 @@ final class Mirror: ObservableObject {
         // of history this app no longer draws.
         guard !stopped else { return }
         generation += 1
+        if let cols = s.cols, cols != self.cols { self.cols = cols }
         var rows = s.rows
         // A screen's blank bottom is room the program has not used, not something to read.
         while let last = rows.last, last.allSatisfy({ $0.t.trimmingCharacters(in: .whitespaces).isEmpty }) {
@@ -1082,7 +1087,7 @@ struct RefusalLine: View {
 }
 
 /// One terminal row drawn in its own colours.
-func line(_ runs: [Run]) -> Text {
+func line(_ runs: [Run], size: CGFloat = 10) -> Text {
     var out = AttributedString(runs.isEmpty ? " " : "")
     for r in runs {
         var piece = AttributedString(r.t)
@@ -1095,7 +1100,7 @@ func line(_ runs: [Run]) -> Text {
         }
         piece.foregroundColor = r.d == true ? fg.opacity(0.55) : fg
         if let bg { piece.backgroundColor = bg }
-        if r.b == true { piece.font = .system(size: 10, weight: .bold, design: .monospaced) }
+        if r.b == true { piece.font = .system(size: size, weight: .bold, design: .monospaced) }
         if r.u == true { piece.underlineStyle = .single }
         if r.s == true { piece.strikethroughStyle = .single }
         out += piece
@@ -1107,8 +1112,23 @@ func line(_ runs: [Run]) -> Text {
 /// ellipsis, since the view scrolls sideways to what is past the edge.
 struct TermLine: View {
     let runs: [Run]
+    var size: CGFloat = 10
     var body: some View {
-        line(runs).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+        line(runs, size: size).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+/// The size a terminal of `cols` columns is drawn at so all of it is on the box, never
+/// cut off and never wrapped: a program places its text by column, so a wrapped row is a
+/// different picture. A terminal the box already fits is drawn at the full size.
+enum Fit {
+    static let full: CGFloat = 10
+    /// One column at the full size, as the system monospaced font sets it.
+    static let column: CGFloat = NSFont.monospacedSystemFont(ofSize: full, weight: .regular).maximumAdvancement.width
+
+    static func size(cols: Int, width: CGFloat) -> CGFloat {
+        guard cols > 0, width > 0 else { return full }
+        return min(full, full * width / (CGFloat(cols) * column))
     }
 }
 
@@ -1217,7 +1237,9 @@ struct TermPeek: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ScrollView([.vertical, .horizontal], showsIndicators: false) {
+            GeometryReader { box in
+            let size = Fit.size(cols: m.cols, width: box.size.width - 16)
+            ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if m.more {
                         Text("earlier")
@@ -1231,20 +1253,21 @@ struct TermPeek: View {
                     if m.screenRefusal == nil, let why = m.pageRefusal {
                         RefusalLine(why: why)
                     }
-                    ForEach(m.older) { TermLine(runs: $0.runs) }
+                    ForEach(m.older) { TermLine(runs: $0.runs, size: size) }
                     if !m.older.isEmpty {
                         Rectangle().fill(.white.opacity(0.12)).frame(height: 1).padding(.vertical, 4)
                     }
                     if let why = m.screenRefusal {
                         RefusalLine(why: why)
                     } else {
-                        ForEach(m.screen) { TermLine(runs: $0.runs) }
+                        ForEach(m.screen) { TermLine(runs: $0.runs, size: size) }
                     }
                 }
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: size, design: .monospaced))
                 .padding(8)
             }
             .defaultScrollAnchor(.bottomLeading)
+            }
             .frame(height: TermPeek.height)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color(white: 0.05)))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(typing ? focus.opacity(0.8) : .white.opacity(0.08), lineWidth: typing ? 1.5 : 1))
