@@ -5658,13 +5658,16 @@ where
                                 }
                                 dirty = true;
                             }
-                            // Only in the tree, and only a space with agents in it: a fold with
+                            // Only in the tree, and only a space with agents or sleeping tabs in it: a fold with
                             // nothing under it shows nothing, and would hide the first agent that
                             // arrives later without anybody having seen it fold.
                             Action::FoldSpace => {
                                 if let Some(space) = state.space
                                     && state.view == sidebar::View::Tree
-                                    && state.rows.iter().any(|a| a.agent && a.workspace == space)
+                                    && (state.rows.iter().any(|a| a.agent && a.workspace == space)
+                                        || state.spaces.iter().any(|w| {
+                                            w.id == space && !w.sleeping.is_empty()
+                                        }))
                                     && !state.shut.remove(&space)
                                 {
                                     state.shut.insert(space);
@@ -7815,29 +7818,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     state.adopted_resize = true;
                 }
             }
-            // A space that falls asleep is folded, and opens again when it wakes: its tabs
-            // are only what a wake would bring back, and the fold keeps them out of the way
-            // until somebody asks. A person can still unfold it by its arrow.
-            let was = |id: i64| state.spaces.iter().find(|w| w.id == id).map(|w| w.asleep);
-            let mut slept_here = false;
-            let mut folds = Vec::new();
-            for space in &workspaces {
-                match (was(space.id), space.asleep) {
-                    (Some(true), false) => folds.push((space.id, false)),
-                    (before, true) if before != Some(true) => {
-                        folds.push((space.id, true));
-                        slept_here |= before == Some(false) && state.space == Some(space.id);
-                    }
-                    _ => {}
-                }
-            }
-            for (id, shut) in folds {
-                if shut {
-                    state.shut.insert(id);
-                } else {
-                    state.shut.remove(&id);
-                }
-            }
+            // Sleep leaves the fold alone: a sleeping space stays open or folded as a
+            // person left it, and its rule folds it like any other.
+            let slept_here = state.space.is_some_and(|here| {
+                workspaces.iter().any(|w| w.id == here && w.asleep)
+                    && state.spaces.iter().any(|w| w.id == here && !w.asleep)
+            });
             state.spaces = workspaces;
             // A fold outlives nothing it folded: a space that went away takes its fold
             // with it, so a later space reusing the id does not start folded.
@@ -13458,7 +13444,7 @@ mod tests {
         );
         assert_eq!(state.space, Some(1));
         assert_eq!(state.pending_focus, Some(1));
-        assert!(state.shut.contains(&2), "a sleeping space is drawn folded");
+        assert!(!state.shut.contains(&2), "sleep does not fold a space");
         assert!(!state.done);
 
         // `qoro sleep app` from a shell: the index loses its tabs first, the space list

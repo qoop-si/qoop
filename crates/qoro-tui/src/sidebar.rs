@@ -1739,12 +1739,11 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             if c.armed == Some(id) {
                 return Some(Act::CancelClose);
             }
-            // The blank before the name folds (`col` counts from one), and the name itself
-            // opens the space; a rule with nothing under it has nothing to fold, so every
-            // cell of it moves to the space.
+            // In the tree the whole rule, name included, folds its space and opens it again;
+            // its tabs are what move the screen there. A rule with nothing under it has
+            // nothing to fold, so every cell of it moves to the space.
             let folds = !collapsed
                 && c.view == View::Tree
-                && col <= NAME_AT
                 && (c.agents.iter().any(|a| a.agent && a.workspace == id)
                     || c.spaces
                         .iter()
@@ -4950,17 +4949,18 @@ mod tests {
                     );
                 }
 
-                // A rule folds at the blank before its name, in the tree only, and only when there is something under it to fold. Its two controls answer in their own
+                // A rule folds anywhere off its controls, in the tree only, and only when
+                // there is something under it to fold. Its controls answer in their own
                 // columns, which are the same whatever the name and the count are.
                 for col in 1..=width {
-                    let want = if view == View::Tree && col <= NAME_AT {
-                        Act::Fold(1)
-                    } else if col == width - 6 + 1 {
+                    let want = if col == width - 6 + 1 {
                         Act::New(1)
                     } else if col == width - 4 + 1 {
                         Act::Sleep(1)
                     } else if col == width - 2 + 1 {
                         Act::Close(1)
+                    } else if view == View::Tree {
+                        Act::Fold(1)
                     } else {
                         Act::Space(1)
                     };
@@ -4981,8 +4981,7 @@ mod tests {
                 assert_eq!(act(Hit::Terminal(3), 1, &c, false), Some(Act::Terminal(3)));
             }
         }
-        // The fold cell is exactly the blank before the name; the name's first letter is
-        // the next cell and opens the space.
+        // The blank before the name and the name itself both fold.
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let head: String = rule_row(&rows, 1).text.chars().take(NAME_AT + 1).collect();
         assert_eq!(head, " c");
@@ -5003,7 +5002,7 @@ mod tests {
         assert_eq!(act(Hit::Space(1), NAME_AT, &c, false), Some(Act::Fold(1)));
         assert_eq!(
             act(Hit::Space(1), NAME_AT + 1, &c, false),
-            Some(Act::Space(1))
+            Some(Act::Fold(1))
         );
     }
 
@@ -6843,12 +6842,12 @@ mod tests {
                 Some(Act::Close(1)),
                 "width {width}"
             );
-            // One column either side of a control is the space, never the control.
+            // One column either side of a control is the rule's fold, never the control.
             for at in [width - 5, width - 3, width - 1] {
                 if (1..=width).contains(&(at + 1)) && at > NAME_AT {
                     assert_eq!(
                         act(Hit::Space(1), at + 1, &c, false),
-                        Some(Act::Space(1)),
+                        Some(Act::Fold(1)),
                         "column {at} of {width}"
                     );
                 }
