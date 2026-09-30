@@ -1745,6 +1745,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         Some(Prompt {
             what,
             text: String::new(),
+            was: String::new(),
         })
     };
     match std::mem::take(&mut state.menu_kind) {
@@ -1808,6 +1809,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             state.prompt = Some(Prompt {
                 what: Naming::Terminal,
                 text: String::new(),
+                was: String::new(),
             });
             MenuSend::Nothing
         }
@@ -1815,6 +1817,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             state.prompt = Some(Prompt {
                 what: Naming::Space,
                 text: String::new(),
+                was: String::new(),
             });
             MenuSend::Nothing
         }
@@ -1828,7 +1831,8 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     .unwrap_or_default();
                 state.prompt = Some(Prompt {
                     what: Naming::RenameTerminal(state.focused),
-                    text: current,
+                    text: String::new(),
+                    was: current,
                 });
             } else {
                 state.message = Some(format!(
@@ -1848,7 +1852,8 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     .unwrap_or_default();
                 state.prompt = Some(Prompt {
                     what: Naming::RenameSpace(space),
-                    text: current,
+                    text: String::new(),
+                    was: current,
                 });
             } else {
                 state.message = Some("nothing to rename yet".to_string());
@@ -1993,6 +1998,11 @@ pub enum Reading {
 pub struct Prompt {
     pub what: Naming,
     pub text: String,
+    /// The name it has, for a rename: shown faint in the empty box, and what an empty
+    /// answer keeps. The box opens empty over it, so a new name is typed straight in
+    /// rather than after rubbing the old one out, and a look that changes nothing leaves
+    /// it as it was.
+    pub was: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2042,34 +2052,47 @@ impl Naming {
         }
     }
 
-    /// The box's footer: the keys, and what an empty answer means here, which is not the
-    /// same thing in every case. The example an answer needs comes last.
-    pub fn hint(self) -> &'static [(&'static str, &'static str)] {
+    /// What the field holds, written over it.
+    pub fn label(self) -> &'static str {
         match self {
-            Naming::Space | Naming::Terminal => &[
-                ("enter", "make"),
-                ("esc", "close"),
-                ("empty", "default name"),
-            ],
-            Naming::Agent(_) => &[("enter", "start"), ("esc", "close"), ("like", "claude")],
-            Naming::RenameTerminal(_) => &[
-                ("enter", "rename"),
-                ("esc", "close"),
-                ("empty", "program name"),
-            ],
-            Naming::RenameSession(_) => &[
-                ("enter", "rename"),
-                ("esc", "close"),
-                ("empty", "its own title"),
-            ],
+            Naming::Agent(_) => "command",
+            Naming::Remote => "address",
+            _ => "name",
+        }
+    }
+
+    /// The word on the enter button.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Naming::Space | Naming::Terminal => "make",
+            Naming::Agent(_) => "start",
+            Naming::Remote => "connect",
+            Naming::RenameSpace(_) | Naming::RenameTerminal(_) | Naming::RenameSession(_) => {
+                "rename"
+            }
+        }
+    }
+
+    /// Whether ctrl-r gives the thing back its default name: a tab its program's, a
+    /// conversation its agent's title. A space has none, and a box that makes something
+    /// has nothing yet to reset.
+    pub fn resets(self) -> bool {
+        matches!(self, Naming::RenameTerminal(_) | Naming::RenameSession(_))
+    }
+
+    /// The line under the field: what an empty answer does here, which is not the same
+    /// thing in every case, or the shape an answer takes. `was` is the name a rename keeps.
+    pub fn note(self, was: &str) -> String {
+        match self {
+            Naming::Space | Naming::Terminal => "empty gives it the default name".to_string(),
+            Naming::Agent(_) => "like claude".to_string(),
+            Naming::Remote => "like admin@10.0.0.5".to_string(),
+            _ if !was.is_empty() => format!("empty keeps \"{was}\""),
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
-            Naming::RenameSpace(_) => &[("enter", "rename"), ("esc", "close")],
-            Naming::Remote => &[
-                ("enter", "connect"),
-                ("esc", "close"),
-                ("like", "admin@10.0.0.5"),
-            ],
+            Naming::RenameSpace(_) => "empty is a cancel".to_string(),
+            Naming::RenameTerminal(_) => "empty keeps the program name".to_string(),
+            Naming::RenameSession(_) => "empty keeps its own title".to_string(),
         }
     }
 }
@@ -2098,6 +2121,7 @@ enum PromptOutcome {
 /// `ctrl-a d` still detaches out of it, which is the same rule the palette follows.
 fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
     let prefix = state.config.prefix;
+    let (cols, lines) = (state.cols, state.lines);
     let Some(prompt) = state.prompt.as_mut() else {
         return PromptOutcome::Passthrough(bytes.to_vec());
     };
@@ -2112,6 +2136,35 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
         if *byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
             match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
                 Some(end) => {
+                    // A press on one of the box's buttons is its key, typed where the
+                    // report was, with whatever came after it still behind.
+                    let report = &bytes[at..at + end + 1];
+                    let key = report
+                        .starts_with(b"\x1b[<")
+                        .then(|| crate::keys::mouse(report))
+                        .flatten()
+                        .flatten()
+                        .and_then(|action| match action {
+                            crate::keys::Action::Click { row, col, .. } => {
+                                crate::screen::prompt_click(
+                                    cols,
+                                    lines,
+                                    prompt.what,
+                                    usize::from(row).saturating_sub(1),
+                                    usize::from(col).saturating_sub(1),
+                                )
+                            }
+                            _ => None,
+                        });
+                    // Cancel closes here: typed ahead of what followed, an escape could
+                    // read as the start of a sequence.
+                    if key == Some(0x1b) {
+                        state.prompt = None;
+                        return PromptOutcome::Closed;
+                    }
+                    if let Some(key) = key {
+                        return prompt_key(state, &[&[key][..], &bytes[at + end + 1..]].concat());
+                    }
                     at += end + 1;
                     continue;
                 }
@@ -2127,6 +2180,12 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
             b'\r' | b'\n' => {
                 let what = prompt.what;
                 let text = prompt.text.trim().to_string();
+                // Nothing typed over a name keeps it, the same as esc. The keys after the
+                // enter still run.
+                if text.is_empty() && !prompt.was.is_empty() {
+                    state.prompt = None;
+                    return PromptOutcome::Passthrough(bytes[at + 1..].to_vec());
+                }
                 state.prompt = None;
                 return PromptOutcome::Confirm(
                     what,
@@ -2149,6 +2208,14 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
             byte if *byte == prefix || *byte == crate::keys::DETACH => {
                 state.prompt = None;
                 return PromptOutcome::Passthrough(bytes[at..].to_vec());
+            }
+            // ctrl-u, the line kill every shell knows: start the answer over.
+            0x15 => prompt.text.clear(),
+            // ctrl-r, back to the default name, where the thing has one to go back to.
+            0x12 if prompt.what.resets() => {
+                let what = prompt.what;
+                state.prompt = None;
+                return PromptOutcome::Confirm(what, None, bytes[at + 1..].to_vec());
             }
             byte if (byte.is_ascii_graphic() || *byte == b' ')
                 && crate::width::width(&prompt.text) < prompt.what.limit() =>
@@ -4400,12 +4467,14 @@ where
                                         state.prompt = Some(Prompt {
                                             what: Naming::Terminal,
                                             text: String::new(),
+                                            was: String::new(),
                                         });
                                     }
                                     palette::Item::NewAgentAsk => {
                                         state.prompt = Some(Prompt {
                                             what: Naming::Agent(state.space),
                                             text: String::new(),
+                                            was: String::new(),
                                         });
                                     }
                                     palette::Item::NewAgent(program) => {
@@ -4427,6 +4496,7 @@ where
                                         state.prompt = Some(Prompt {
                                             what: Naming::Space,
                                             text: String::new(),
+                                            was: String::new(),
                                         });
                                     }
                                     palette::Item::CopyMode => enter_copy(&mut state),
@@ -4655,7 +4725,12 @@ where
                                 }
                                 dirty = true;
                             }
-                            PromptOutcome::Passthrough(rest) => feed = Some(rest),
+                            // The box closed, so the screen changed even when nothing
+                            // follows: an enter that kept the name has no keys behind it.
+                            PromptOutcome::Passthrough(rest) => {
+                                dirty = true;
+                                feed = Some(rest);
+                            }
                         }
                     } else if state.armed.is_some()
                         && !is_mouse(&bytes)
@@ -4994,6 +5069,7 @@ where
                                                 state.prompt = Some(Prompt {
                                                     what: Naming::Terminal,
                                                     text: String::new(),
+                                                    was: String::new(),
                                                 });
                                             }
                                         }
@@ -5448,6 +5524,7 @@ where
                                 state.prompt = Some(Prompt {
                                     what: Naming::Terminal,
                                     text: String::new(),
+                                    was: String::new(),
                                 });
                                 dirty = true;
                             }
@@ -5455,6 +5532,7 @@ where
                                 state.prompt = Some(Prompt {
                                     what: Naming::Space,
                                     text: String::new(),
+                                    was: String::new(),
                                 });
                                 dirty = true;
                             }
@@ -5502,7 +5580,8 @@ where
                                     .unwrap_or_default();
                                 state.prompt = Some(Prompt {
                                     what: Naming::RenameTerminal(state.focused),
-                                    text: current,
+                                    text: String::new(),
+                                    was: current,
                                 });
                                 dirty = true;
                             }
@@ -5539,7 +5618,8 @@ where
                                         .unwrap_or_default();
                                     state.prompt = Some(Prompt {
                                         what: Naming::RenameSpace(space),
-                                        text: current,
+                                        text: String::new(),
+                                        was: current,
                                     });
                                     dirty = true;
                                 }
@@ -7040,12 +7120,14 @@ fn rename_from_row(state: &mut State, terminal: u32) {
     state.prompt = Some(if row.agent_session.is_some() {
         Prompt {
             what: Naming::RenameSession(terminal),
-            text: row.agent_title.clone().unwrap_or_default(),
+            text: String::new(),
+            was: row.agent_title.clone().unwrap_or_default(),
         }
     } else {
         Prompt {
             what: Naming::RenameTerminal(terminal),
-            text: row.name.clone().unwrap_or_default(),
+            text: String::new(),
+            was: row.name.clone().unwrap_or_default(),
         }
     });
 }
@@ -10377,6 +10459,67 @@ mod tests {
             .to_string()
     }
 
+    /// A rename opened over its name: enter with nothing typed keeps it and passes on what
+    /// came after, ctrl-u starts the answer over, ctrl-r gives the default back, and a
+    /// press on a button is its key.
+    #[test]
+    fn the_naming_box_keeps_clears_resets_and_takes_clicks() {
+        let open = |state: &mut State| {
+            state.prompt = Some(Prompt {
+                what: Naming::RenameTerminal(1),
+                text: String::new(),
+                was: "build logs".to_string(),
+            });
+        };
+        let mut state = state();
+        open(&mut state);
+        match prompt_key(&mut state, b"\rx") {
+            PromptOutcome::Passthrough(rest) => assert_eq!(rest, b"x"),
+            _ => panic!("an empty enter did not keep the name"),
+        }
+        assert!(state.prompt.is_none());
+
+        open(&mut state);
+        assert!(matches!(
+            prompt_key(&mut state, b"abc\x15d"),
+            PromptOutcome::Typing
+        ));
+        assert_eq!(state.prompt.as_ref().map(|p| p.text.as_str()), Some("d"));
+        match prompt_key(&mut state, b"\r") {
+            PromptOutcome::Confirm(Naming::RenameTerminal(1), Some(name), _) => {
+                assert_eq!(name, "d");
+            }
+            _ => panic!("a typed name was not confirmed"),
+        }
+
+        open(&mut state);
+        assert!(matches!(
+            prompt_key(&mut state, b"\x12"),
+            PromptOutcome::Confirm(Naming::RenameTerminal(1), None, _)
+        ));
+        // A space has no default name, so ctrl-r is nothing there.
+        state.prompt = Some(Prompt {
+            what: Naming::RenameSpace(1),
+            text: String::new(),
+            was: "work".to_string(),
+        });
+        assert!(matches!(
+            prompt_key(&mut state, b"\x12"),
+            PromptOutcome::Typing
+        ));
+
+        (state.cols, state.lines) = (100, 24);
+        open(&mut state);
+        prompt_key(&mut state, b"ab");
+        let reset = crate::screen::prompt_button(100, 24, Naming::RenameTerminal(1), 0x12)
+            .expect("a reset button");
+        let click = format!("\x1b[<0;{};{}M", reset.1 + 1, reset.0 + 1);
+        assert!(matches!(
+            prompt_key(&mut state, click.as_bytes()),
+            PromptOutcome::Confirm(Naming::RenameTerminal(1), None, _)
+        ));
+    }
+
     /// With another prefix, every overlay hands that one back and treats ctrl-a as the
     /// person's own key, and a paste holding a ctrl-a reaches the pane untouched.
     #[test]
@@ -10400,6 +10543,7 @@ mod tests {
         state.prompt = Some(Prompt {
             what: Naming::Terminal,
             text: String::new(),
+            was: String::new(),
         });
         match prompt_key(&mut state, b"\x02d") {
             PromptOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02d"),
@@ -12490,6 +12634,7 @@ mod tests {
         state.prompt = Some(Prompt {
             what: Naming::Space,
             text: String::new(),
+            was: String::new(),
         });
         apply(&mut state, answer("probe-2"), &mut 0, &mut dirty);
         assert_eq!(state.menu, None, "the list opened over a box");

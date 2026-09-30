@@ -27,6 +27,11 @@ pub fn show_prefix(byte: u8) {
     SHOWN_PREFIX.store(byte, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The prefix byte the screen names.
+pub fn shown_prefix() -> u8 {
+    SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The prefix as a person writes it: `ctrl-a`.
 pub fn prefix_name() -> String {
     name_of(SHOWN_PREFIX.load(std::sync::atomic::Ordering::Relaxed))
@@ -256,7 +261,7 @@ pub(crate) fn report(bytes: &[u8]) -> Report {
 /// `\x1b[<button;col;rowM` for a press and `m` for a release, the terminator being the
 /// last byte of `bytes`. Only the press is turned into an action: acting on both would
 /// switch twice for one click.
-fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
+pub(crate) fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
     let end = bytes.len() - 1;
     let body = std::str::from_utf8(&bytes[3..end]).ok()?;
     let mut parts = body.split(';');

@@ -201,6 +201,17 @@ pub fn fg_for(role: Role, level: crate::colorlevel::Level) -> String {
     }
 }
 
+/// A button in a box: the one that answers wears the brand, the others the raised
+/// background. In monochrome the answer is reversed and the others bold.
+pub fn button(primary: bool) -> String {
+    match crate::colorlevel::level() {
+        crate::colorlevel::Level::Mono if primary => "\x1b[0;7m".to_string(),
+        crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
+        _ if primary => format!("\x1b[0;1;48;5;{};38;5;16m", ink(Role::Brand)),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", raised().0, ink(Role::Text)),
+    }
+}
+
 /// The escape for a row that has the keyboard: its own ink on a raised background.
 ///
 /// A background and not reverse video. Reverse paints the full width of the column in the

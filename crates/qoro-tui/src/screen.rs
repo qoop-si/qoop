@@ -938,12 +938,12 @@ pub fn paint(frame: &Frame) -> String {
     // types appears where they are looking. With the palette open it sits at the end of
     // the query instead, because that is where typing goes.
     if let Some(prompt) = frame.prompt {
-        let w = palette_width(frame.cols);
-        let left = (frame.cols as usize).saturating_sub(w) / 2;
-        // Past the border and the ` > ` marker, at the end of what has been typed, the
-        // same sum as the palette's query row below.
-        let col = (left + 4 + width::width(&prompt.text)).min(left + w.saturating_sub(2));
-        out.push_str(&at(prompt_row(frame.lines) + 1, col + 1));
+        // At the end of what has been typed, as much of it as the field shows, or at the
+        // start of an empty field before the faint name it keeps.
+        if let Some(b) = PromptBox::at(frame.cols, frame.lines) {
+            let shown = width::width(&field_tail(&prompt.text, b.span() - 1));
+            out.push_str(&at(b.text_row() + 1, b.field_col() + shown + 1));
+        }
     } else if let Some(palette) = frame.palette {
         // At the end of the query, inside the box, wherever the box ended up.
         let w = palette_width(frame.cols);
@@ -1352,58 +1352,285 @@ fn cursor_column(line: &str, cell: usize) -> usize {
     cols + (cell - cells)
 }
 
-/// The naming box, painted over the middle of the screen.
+/// Where the naming box sits and how its rows fall. Shared by the painter, the cursor and
+/// the mouse, so a click and a repaint agree on where each button is.
+pub(crate) struct PromptBox {
+    /// Zero based screen column of the left edge and row of the top edge, and the width.
+    left: usize,
+    top: usize,
+    w: usize,
+    /// With its blank rows and the label over the field, or squeezed into a short window
+    /// without them.
+    roomy: bool,
+}
+
+/// Both edges and eight rows: blank, label, field, underline, note, blank, buttons, blank.
+const PROMPT_ROOMY: usize = 10;
+/// Both edges and the three rows a short window keeps: field, note, buttons.
+const PROMPT_TIGHT: usize = 5;
+
+/// One button of the naming box: zero based row and column, its label, and the key it
+/// stands for, which is what a click on it presses.
+pub(crate) struct PromptButton {
+    row: usize,
+    col: usize,
+    label: String,
+    key: u8,
+    primary: bool,
+}
+
+impl PromptButton {
+    /// Its columns on screen: the label and a cell of padding either side.
+    fn width(&self) -> usize {
+        width::width(&self.label) + 2
+    }
+}
+
+impl PromptBox {
+    /// In the upper third of the pane, where the eye already is, or `None` on a window
+    /// too small for even the tight box.
+    pub(crate) fn at(cols: u16, lines: u16) -> Option<Self> {
+        let (cols, lines) = (cols as usize, lines as usize);
+        let room = lines.saturating_sub(TABS + STATUS);
+        let (roomy, h) = match room {
+            _ if cols < 20 => return None,
+            r if r >= PROMPT_ROOMY => (true, PROMPT_ROOMY),
+            r if r >= PROMPT_TIGHT => (false, PROMPT_TIGHT),
+            _ => return None,
+        };
+        let w = cols.min(66);
+        Some(Self {
+            left: (cols - w) / 2,
+            top: TABS + (room - h) / 3,
+            w,
+            roomy,
+        })
+    }
+
+    /// The blank columns inside each side rule.
+    fn pad(&self) -> usize {
+        if self.roomy { 2 } else { 1 }
+    }
+
+    /// The columns between the paddings: the field, its underline and the buttons row.
+    fn span(&self) -> usize {
+        self.w - 2 - 2 * self.pad()
+    }
+
+    /// Zero based screen column where the field starts.
+    fn field_col(&self) -> usize {
+        self.left + 1 + self.pad()
+    }
+
+    /// Zero based screen row of the typed text.
+    fn text_row(&self) -> usize {
+        self.top + BOX_FIRST_ROW + if self.roomy { 2 } else { 0 }
+    }
+
+    /// The buttons: clear and reset on the left, cancel and the answer on the right, the
+    /// answer last where the eye ends. A narrow box drops the left ones first, then
+    /// cancel, and never the answer.
+    fn buttons(&self, what: crate::run::Naming) -> Vec<PromptButton> {
+        let chip = |label: &str, key: u8, primary: bool| (label.to_string(), key, primary);
+        let verb = format!("\u{21b5} {}", what.verb());
+        let mut right = vec![chip("esc cancel", 0x1b, false), chip(&verb, b'\r', true)];
+        let mut left = vec![chip("^u clear", 0x15, false)];
+        if what.resets() {
+            left.push(chip("^r reset", 0x12, false));
+        }
+        // A prefix chosen as ctrl-u or ctrl-r is the prefix in here too, so its button
+        // would say a key that does something else.
+        left.retain(|(_, key, _)| *key != crate::keys::shown_prefix());
+        let size = |set: &[(String, u8, bool)]| {
+            set.iter().map(|(l, ..)| width::width(l) + 2).sum::<usize>()
+                + 2 * set.len().saturating_sub(1)
+        };
+        let room = self.span();
+        if size(&right) > room {
+            right.remove(0);
+        }
+        if size(&left) + 2 + size(&right) > room {
+            left.clear();
+        }
+        let row = self.top + BOX_FIRST_ROW + if self.roomy { 6 } else { 2 };
+        let mut out = Vec::new();
+        for (set, mut col) in [
+            (left, self.field_col()),
+            (right.clone(), self.field_col() + room - size(&right)),
+        ] {
+            for (label, key, primary) in set {
+                let button = PromptButton {
+                    row,
+                    col,
+                    label,
+                    key,
+                    primary,
+                };
+                col += button.width() + 2;
+                out.push(button);
+            }
+        }
+        out
+    }
+}
+
+/// The key a click at the zero based `row` and `col` presses in the naming box, when it
+/// lands on one of the box's buttons.
+pub(crate) fn prompt_click(
+    cols: u16,
+    lines: u16,
+    what: crate::run::Naming,
+    row: usize,
+    col: usize,
+) -> Option<u8> {
+    PromptBox::at(cols, lines)?
+        .buttons(what)
+        .into_iter()
+        .find(|b| b.row == row && (b.col..b.col + b.width()).contains(&col))
+        .map(|b| b.key)
+}
+
+/// The zero based row and column of the naming box's button for `key`, for a test to
+/// click it.
+#[cfg(test)]
+pub(crate) fn prompt_button(
+    cols: u16,
+    lines: u16,
+    what: crate::run::Naming,
+    key: u8,
+) -> Option<(usize, usize)> {
+    PromptBox::at(cols, lines)?
+        .buttons(what)
+        .into_iter()
+        .find(|b| b.key == key)
+        .map(|b| (b.row, b.col))
+}
+
+/// What fits of `text` in `room` columns: all of it, or its end behind a `…`, so the
+/// letter being typed is always the one on screen and the cursor never lands on it.
+fn field_tail(text: &str, room: usize) -> String {
+    if width::width(text) <= room {
+        return text.to_string();
+    }
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for c in text.chars().rev() {
+        let w = width::columns(c);
+        if used + w > room {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
+    std::iter::once('\u{2026}')
+        .chain(kept.into_iter().rev())
+        .collect()
+}
+
+/// The naming box, painted over the upper middle of the screen.
 ///
-/// The palette's box: what is being asked on the edge, what has been typed, and the keys.
+/// A form: what is asked on the edge, a label over the field, the answer on an underline,
+/// a note under it saying what an empty answer does, and buttons for the keys. A rename
+/// opens empty over the name it has, shown faint, so a new name is typed straight in.
 /// In the middle of the pane rather than in the column, because it is a question about
 /// something that is about to exist and has no row of its own to sit in yet.
 fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
-    let cols = frame.cols as usize;
-    let lines = frame.lines as usize;
-    if cols < 20 || lines < TABS + STATUS + 4 {
+    let Some(b) = PromptBox::at(frame.cols, frame.lines) else {
         return;
-    }
-    let w = palette_width(frame.cols);
-    let left = cols.saturating_sub(w) / 2;
-    let inner = w - 2;
-    // The typed row where it always was, so the edge sits one row above it.
-    let top = prompt_row(frame.lines) - BOX_FIRST_ROW;
-    // At the limit typing stops, and says so: the count in orange at the footer's end.
-    let limit = prompt.what.limit();
-    let full = width::width(&prompt.text) >= limit;
-    let count = format!("{limit}/{limit} ");
-    let footer = if full && footer_width(&prompt.what.hint()[..1]) + count.len() <= inner {
-        format!(
-            "{}{}{count}",
-            hint_line(prompt.what.hint(), inner - count.len()),
-            theme::fg(theme::Role::Brand)
-        )
-    } else {
-        hint_line(prompt.what.hint(), inner)
     };
-    let body = [
+    let inner = b.w - 2;
+    let span = b.span();
+    let pad = " ".repeat(b.pad());
+    let tail = " ".repeat(b.pad());
+    // One row: the padding, `text` (at most `span` columns) in its ink, then blanks. Text,
+    // not a grid row, so a space after a wide character is a space.
+    let row = |text: &str, ink: &str| {
         format!(
-            "{} > {}{}",
-            theme::fg(theme::Role::Brand),
-            theme::fg(theme::Role::Focused),
-            width::fit(&prompt.text, inner - 3)
-        ),
-        footer,
-    ];
+            "{}{pad}{ink}{}{}{tail}",
+            theme::RESET,
+            width::text(text, span),
+            theme::RESET
+        )
+    };
+    let limit = prompt.what.limit();
+    let typed = width::width(&prompt.text);
+    let field = if prompt.text.is_empty() {
+        // The cursor's cell, then the name it has, faint.
+        row(&format!(" {}", prompt.was), &theme::fg(theme::Role::Faint))
+    } else {
+        row(
+            &field_tail(&prompt.text, span - 1),
+            &theme::fg(theme::Role::Focused),
+        )
+    };
+    let underline = row(
+        &"\u{2594}".repeat(span),
+        &theme::fg(if prompt.text.is_empty() {
+            theme::Role::Rule
+        } else {
+            theme::Role::Brand
+        }),
+    );
+    // What empty does, or at the limit that typing has stopped, and the count on the right
+    // once anything is typed.
+    let full = typed >= limit;
+    let count = if typed > 0 {
+        format!("{typed}/{limit}")
+    } else {
+        String::new()
+    };
+    let (said, said_ink) = if full {
+        ("at the limit".to_string(), theme::Role::Brand)
+    } else {
+        (prompt.what.note(&prompt.was), theme::Role::Faint)
+    };
+    let note = format!(
+        "{}{pad}{}{}{}{count}{}{tail}",
+        theme::RESET,
+        theme::fg(said_ink),
+        width::text(&said, span - count.len()),
+        theme::fg(if full {
+            theme::Role::Brand
+        } else {
+            theme::Role::Faint
+        }),
+        theme::RESET
+    );
+    let mut buttons = theme::RESET.to_string();
+    let mut used = 0;
+    for button in b.buttons(prompt.what) {
+        let at = button.col - (b.left + 1);
+        buttons.push_str(&" ".repeat(at - used));
+        buttons.push_str(&theme::button(button.primary));
+        buttons.push_str(&format!(" {} ", button.label));
+        buttons.push_str(theme::RESET);
+        used = at + button.width();
+    }
+    buttons.push_str(&" ".repeat(inner - used));
+    let blank = " ".repeat(inner);
+    let body: Vec<String> = if b.roomy {
+        vec![
+            blank.clone(),
+            row(prompt.what.label(), &theme::fg(theme::Role::Detail)),
+            field,
+            underline,
+            note,
+            blank.clone(),
+            buttons,
+            blank,
+        ]
+    } else {
+        vec![field, note, buttons]
+    };
     let (rule, title) = spot_inks();
     paint_boxed(
         out,
-        lines,
-        (left, top, w),
+        frame.lines as usize,
+        (b.left, b.top, b.w),
         prompt.what.asks(),
         (&rule, &title),
         &body,
     );
-}
-
-/// The zero based row the naming box's typed text sits on.
-fn prompt_row(lines: u16) -> usize {
-    ((lines as usize) / 3).max(TABS + 1)
 }
 
 /// Where the centred menu box sits: left, top, width and height in cells.
@@ -3044,19 +3271,10 @@ mod tests {
         assert!(painted.contains("link"), "{painted:?}");
     }
 
-    /// The naming box cursor sits at the end of what has been typed, past the
-    /// ` > ` marker: one cell left of where it used to sit, when the sum was
-    /// copied from the bordered palette row.
-    #[test]
-    fn the_naming_box_cursor_sits_at_the_end_of_the_typed_text() {
+    /// The whole screen with the naming box open over one idle shell.
+    fn painted_prompt(prompt: &crate::run::Prompt, cols: u16, lines: u16) -> String {
         let rows = [row(1, "zsh", "idle")];
-        let prompt = crate::run::Prompt {
-            what: crate::run::Naming::Space,
-            text: "ab".to_string(),
-        };
-        let cols = 100u16;
-        let lines = 24u16;
-        let painted = paint(&Frame {
+        paint(&Frame {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
@@ -3069,7 +3287,7 @@ mod tests {
             message: None,
             hint: None,
             palette: None,
-            prompt: Some(&prompt),
+            prompt: Some(prompt),
             menu: None,
             collapsed: false,
             reading: None,
@@ -3092,77 +3310,120 @@ mod tests {
             },
             image_notice: None,
             chrome: Default::default(),
-        });
-        // The box is centred: ` > ab` starts three cells past its left edge,
-        // so the caret lands on the cell right after the `b`.
-        let w = cols.min(60).max(cols.min(20)) as usize;
-        let left = (cols as usize - w) / 2;
-        let top = ((lines as usize) / 3).max(TABS + 1);
-        let want = format!("\x1b[{};{}H", top + 1, left + 5 + 2);
+        })
+    }
+
+    fn prompt(what: crate::run::Naming, text: &str, was: &str) -> crate::run::Prompt {
+        crate::run::Prompt {
+            what,
+            text: text.to_string(),
+            was: was.to_string(),
+        }
+    }
+
+    /// The escape that puts the caret `shown` columns into the naming box's field.
+    fn caret_in_field(cols: u16, lines: u16, shown: usize) -> String {
+        let b = PromptBox::at(cols, lines).expect("the box fits");
+        at(b.text_row() + 1, b.field_col() + shown + 1)
+    }
+
+    /// The caret sits right after what has been typed.
+    #[test]
+    fn the_naming_box_cursor_sits_at_the_end_of_the_typed_text() {
+        let painted = painted_prompt(&prompt(crate::run::Naming::Space, "ab", ""), 100, 24);
         assert!(
-            painted.contains(&want),
+            painted.contains(&caret_in_field(100, 24, 2)),
             "no caret at the end of the typed text: {painted:?}"
         );
     }
 
     /// A name at the limit says so with a count, and the caret still sits after its last
-    /// letter rather than on it.
+    /// letter rather than on it. Behind the box, the tab's pill fades with the rest.
     #[test]
     fn a_name_at_the_limit_shows_the_count_and_a_caret_past_it() {
-        let rows = [row(1, "zsh", "idle")];
-        let prompt = crate::run::Prompt {
-            what: crate::run::Naming::RenameSession(1),
-            text: "x".repeat(crate::run::Naming::RenameSession(1).limit()),
-        };
-        let cols = 100u16;
-        let lines = 24u16;
-        let painted = paint(&Frame {
-            armed: None,
-            rows: &rows,
-            spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
-            space: Some(1),
-            focused: 1,
-            snapshot: None,
-            cols,
-            lines,
-            message: None,
-            hint: None,
-            palette: None,
-            prompt: Some(&prompt),
-            menu: None,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            tick: 0,
-            now_unix: TEST_NOW,
-            sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Tree,
-            seen: &sidebar::Seen::new(),
-            unseen: &sidebar::Unseen::new(),
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            behind: &crate::run::Behind {
-                terminal: 0,
-                from: 0,
-                lines: Vec::new(),
-                total: 0,
-            },
-            image_notice: None,
-            chrome: Default::default(),
-        });
+        let what = crate::run::Naming::RenameSession(1);
+        let painted = painted_prompt(&prompt(what, &"x".repeat(what.limit()), ""), 100, 24);
         assert!(painted.contains("54/54"), "no count: {painted:?}");
-        // Behind the box the focused tab's pill fades with everything else.
-        assert!(!painted.contains(&theme::tab_on()), "{painted:?}");
-        let w = cols.min(60).max(cols.min(20)) as usize;
-        let left = (cols as usize - w) / 2;
-        let top = ((lines as usize) / 3).max(TABS + 1);
-        let caret = format!("\x1b[{};{}H", top + 1, left + 4 + 54 + 1);
+        assert!(painted.contains("at the limit"), "{painted:?}");
         assert!(
-            painted.contains(&caret),
+            painted.contains(&caret_in_field(100, 24, 54)),
             "caret on the last letter: {painted:?}"
+        );
+        assert!(!painted.contains(&theme::tab_on()), "{painted:?}");
+    }
+
+    /// A name longer than the field, one given before today's limit, shows its end behind
+    /// a `…`, and the caret sits after its last letter inside the box.
+    #[test]
+    fn a_name_wider_than_the_field_shows_its_end() {
+        let long = format!("{}END", "x".repeat(80));
+        let painted = painted_prompt(&prompt(crate::run::Naming::Remote, &long, ""), 70, 24);
+        let b = PromptBox::at(70, 24).expect("fits");
+        assert!(painted.contains("\u{2026}"), "{painted:?}");
+        assert!(painted.contains("xEND"), "{painted:?}");
+        assert!(
+            painted.contains(&caret_in_field(70, 24, b.span() - 1)),
+            "{painted:?}"
+        );
+    }
+
+    /// A rename opens empty over the name it has, shown in the field and in the note.
+    #[test]
+    fn a_rename_opens_empty_over_the_name_it_has() {
+        let what = crate::run::Naming::RenameTerminal(1);
+        let painted = painted_prompt(&prompt(what, "", "build logs"), 100, 24);
+        assert!(painted.contains(" build logs"), "{painted:?}");
+        assert!(
+            painted.contains("empty keeps \"build logs\""),
+            "{painted:?}"
+        );
+        assert!(painted.contains(&caret_in_field(100, 24, 0)), "{painted:?}");
+        assert!(painted.contains("^r reset"), "{painted:?}");
+        // A space has no default to go back to.
+        let space = painted_prompt(
+            &prompt(crate::run::Naming::RenameSpace(1), "", "x"),
+            100,
+            24,
+        );
+        assert!(!space.contains("^r reset"), "{space:?}");
+    }
+
+    /// Each button is painted where a click on it lands, the answer last on the right.
+    #[test]
+    fn the_buttons_are_where_a_click_lands() {
+        let what = crate::run::Naming::RenameTerminal(1);
+        let b = PromptBox::at(100, 24).expect("fits");
+        let buttons = b.buttons(what);
+        let keys: Vec<u8> = buttons.iter().map(|b| b.key).collect();
+        assert_eq!(keys, [0x15, 0x12, 0x1b, b'\r']);
+        let painted = painted_prompt(&prompt(what, "", ""), 100, 24);
+        for button in &buttons {
+            assert!(
+                painted.contains(&format!(" {} ", button.label)),
+                "{painted:?}"
+            );
+            assert_eq!(
+                prompt_click(100, 24, what, button.row, button.col + 1),
+                Some(button.key)
+            );
+        }
+        assert_eq!(prompt_click(100, 24, what, buttons[0].row, 0), None);
+        // A window too narrow for all of them keeps the answer.
+        let narrow = PromptBox::at(24, 24).expect("fits").buttons(what);
+        assert!(narrow.iter().any(|b| b.key == b'\r'), "{:?}", narrow.len());
+    }
+
+    /// A short window keeps the field, the note and the buttons, without the blank rows.
+    #[test]
+    fn a_short_window_gets_the_tight_box() {
+        let lines = (TABS + STATUS + PROMPT_TIGHT) as u16;
+        let b = PromptBox::at(80, lines).expect("the tight box fits");
+        assert!(!b.roomy);
+        assert!(PromptBox::at(80, lines - 1).is_none());
+        let painted = painted_prompt(&prompt(crate::run::Naming::Space, "ab", ""), 80, lines);
+        assert!(
+            painted.contains(&caret_in_field(80, lines, 2)),
+            "{painted:?}"
         );
     }
 
