@@ -2100,6 +2100,13 @@ pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
         .collect()
 }
 
+/// The word of `docs/brand/` in braille, two cells a letter (three dots and a gap), the
+/// letters on the lower three dot rows of the row so the q's tail can start the next row.
+const LOGO: &str = "\u{28d6}\u{2846}\u{28d6}\u{2846}\u{2856}\u{2800}\u{28d6}\u{2846}";
+/// The q's tail: the top dot of the cell under the q's right column. A terminal cell holds
+/// one colour, so the tail has a cell of its own and is the only dot in ember.
+const LOGO_TAIL: char = '\u{2801}';
+
 /// The product's name, as it signs itself.
 const BRAND: &str = "qoro";
 /// The dot beside the name where braille is not drawn.
@@ -2111,15 +2118,16 @@ const BRAND_MARK: char = '\u{25cf}';
 /// then the version with the pet's name.
 ///
 /// ```text
-/// ⠯⡇⠯⠇⠏⠀⠯⠇        ⢠⣤⣤⡄        ⠯⡇⠯⠇⠏⠀⠯⠇      menu «
-/// 0.4.0           ⢸⣛⣟⡃        0.4.0  Mohawk Pink
+/// ⣖⡆⣖⡆⡖⠀⣖⡆        ⢠⣤⣤⡄        ⣖⡆⣖⡆⡖⠀⣖⡆      menu «
+///  ⠁ 0.5.0         ⢸⣛⣟⡃         ⠁ 0.5.0  Mohawk Pink
 /// Mohawk Pink     ⠈⠋⠙⠁
 ///             menu «
 /// ```
 ///
-/// The logo is the word of `docs/brand/` in braille, two cells a letter, the letters in the
-/// text colour and the q's right cell, its stem and its tail, in the brand ember (a terminal
-/// gives a cell one colour). Where braille is not drawn it is `● qoro` in ember. The menu's
+/// The logo is the word of `docs/brand/` in braille ([`LOGO`]), the letters in the text
+/// colour; the q's tail ([`LOGO_TAIL`]) opens the row under it, the one dot in ember, in a
+/// cell of its own because a terminal gives a cell one colour. Where braille is not drawn it
+/// is `● qoro` in ember. The menu's
 /// row answers a click the way the foot always has (the menu at its word, the fold
 /// elsewhere); the other rows are text and answer nothing.
 fn foot_rows(
@@ -2132,19 +2140,18 @@ fn foot_rows(
     let tail = format!("{MENU_LABEL} \u{ab} ");
     let braille = crate::colorlevel::braille();
     let logo = if braille {
-        "\u{282f}\u{2847}\u{282f}\u{2807}\u{280f}\u{2800}\u{282f}\u{2807}".to_string()
+        LOGO.to_string()
     } else {
         format!("{BRAND_MARK} {BRAND}")
     };
     let logo_w = crate::width::width(&logo);
-    let runs = if braille {
-        vec![
-            (1, 1, Role::Text),
-            (2, 1, Role::Brand),
-            (3, logo_w - 2, Role::Text),
-        ]
+    let runs = vec![(1, logo_w, if braille { Role::Text } else { Role::Brand })];
+    // The row under the logo opens with the q's tail, the one ember dot, alone in its cell
+    // under the q's right side; the version follows it.
+    let (lead, lead_runs) = if braille {
+        (format!("  {LOGO_TAIL} "), vec![(2, 1, Role::Brand)])
     } else {
-        vec![(1, logo_w, Role::Brand)]
+        (" ".to_string(), Vec::new())
     };
     // Beside the pet the words stop short of it: its widest, a space before it and a margin.
     let room = if pet {
@@ -2156,7 +2163,7 @@ fn foot_rows(
     // A version cut short reads as another version, and a name cut short as a smudge: each
     // shows whole or not at all.
     let version = match update {
-        Some(new) if 1 + w(VERSION) + 1 + w(new) <= room => format!("{VERSION}>{new}"),
+        Some(new) if w(&lead) + w(VERSION) + 1 + w(new) <= room => format!("{VERSION}>{new}"),
         _ => VERSION.to_string(),
     };
     let name = avatar.map(|found| found.name()).unwrap_or_default();
@@ -2177,9 +2184,13 @@ fn foot_rows(
             runs,
             ..Line::default()
         };
+        let version_row = Line {
+            runs: lead_runs,
+            ..faint(&format!("{lead}{version}"))
+        };
         return vec![
             (logo_row, None),
-            (faint(&format!(" {version}")), None),
+            (version_row, None),
             (faint(&whole(format!(" {name}"), room)), None),
             (faint(&menu("")), Some(Hit::Foot)),
         ];
@@ -2190,13 +2201,17 @@ fn foot_rows(
         runs,
         ..Line::default()
     };
-    let under = whole(format!(" {version}  {name}"), room);
+    let under = whole(format!("{lead}{version}  {name}"), room);
     let under = if name.is_empty() || under.is_empty() {
-        format!(" {version}")
+        format!("{lead}{version}")
     } else {
         under
     };
-    vec![(top, Some(Hit::Foot)), (faint(&under), None)]
+    let under = Line {
+        runs: lead_runs,
+        ..faint(&under)
+    };
+    vec![(top, Some(Hit::Foot)), (under, None)]
 }
 
 /// `text` when it fits in `cols`, else nothing.
@@ -3697,10 +3712,6 @@ mod tests {
         );
     }
 
-    /// The braille rendering of the logo `foot_rows` draws in its top row, copied from
-    /// there so a test can look for it without touching a private constant.
-    const LOGO: &str = "\u{282f}\u{2847}\u{282f}\u{2807}\u{280f}\u{2800}\u{282f}\u{2807}";
-
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         let rows = foot_rows(WIDTH, None, false, None);
@@ -3720,13 +3731,9 @@ mod tests {
             top.text
         );
         assert_eq!(*hit, Some(Hit::Foot));
-        // The logo's ring and tail wear the accent in `runs`; the row carries no
-        // accent field at all.
+        // The letters wear the text colour; the row carries no accent field at all.
         assert_eq!(top.accent, None);
-        assert!(
-            top.runs.contains(&(2, 1, crate::theme::Role::Brand)),
-            "{top:?}"
-        );
+        assert_eq!(top.runs, vec![(1, 8, crate::theme::Role::Text)], "{top:?}");
         // The version is under the logo, on a row of its own that answers no click.
         let (bottom, hit) = &rows[1];
         assert_eq!(
@@ -3741,6 +3748,13 @@ mod tests {
             bottom.text
         );
         assert_eq!(*hit, None);
+        // The q's tail opens the version row under the q's right column, alone in its
+        // cell, the only dot in ember.
+        assert!(
+            bottom.text.starts_with(&format!("  {LOGO_TAIL} ")),
+            "{bottom:?}"
+        );
+        assert_eq!(bottom.runs, vec![(2, 1, crate::theme::Role::Brand)]);
 
         // The word opens the menu and the rest of the row folds the column.
         let (spaces, agents) = sample();
@@ -3827,10 +3841,16 @@ mod tests {
     fn beside_the_pet_the_foot_never_cuts_a_version_or_a_name() {
         let pet = art_pet();
         let narrow = foot_rows(PET_COLS + LOGO_COLS + 3, Some(&pet), true, Some("0.10.0"));
-        assert_eq!(narrow[1].0.text.trim_end(), format!(" {VERSION}"));
+        assert_eq!(
+            narrow[1].0.text.trim_end(),
+            format!("  {LOGO_TAIL} {VERSION}")
+        );
         assert_eq!(narrow[2].0.text.trim_end(), "");
         let wide = foot_rows(SIDEBAR_MAX, Some(&pet), true, Some("0.10.0"));
-        assert_eq!(wide[1].0.text.trim_end(), format!(" {VERSION}>0.10.0"));
+        assert_eq!(
+            wide[1].0.text.trim_end(),
+            format!("  {LOGO_TAIL} {VERSION}>0.10.0")
+        );
         assert_eq!(wide[2].0.text.trim_end(), format!(" {}", pet.name()));
     }
 
@@ -3841,11 +3861,7 @@ mod tests {
         assert_eq!(line.accent, None);
         assert_eq!(
             line.runs,
-            vec![
-                (1, 1, crate::theme::Role::Text),
-                (2, 1, crate::theme::Role::Brand),
-                (3, crate::width::width(LOGO) - 2, crate::theme::Role::Text),
-            ]
+            vec![(1, crate::width::width(LOGO), crate::theme::Role::Text)]
         );
         assert_eq!(line.indicator, None);
         assert!(line.text.contains(LOGO));

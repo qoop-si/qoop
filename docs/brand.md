@@ -46,10 +46,12 @@ ground, or ground on cream.
 
 `brand/make.py` draws all of them (`uv run --no-project python docs/brand/make.py`).
 
-The terminal's foot draws the word in braille, two cells a letter (`⠯⡇⠯⠇⠏⠀⠯⠇`), the version
-and the pet's name under it, and the picked pet in dots at the right beside those three rows.
-A terminal cell holds one colour, so the q's whole right cell (its stem and tail) is ember
-there. Where braille is not drawn the foot says `● qoro` in ember.
+The terminal's foot draws the word in braille (`⣖⡆⣖⡆⡖⠀⣖⡆`), cream letters on the lower three
+dot rows of its row, and the q's tail as one ember dot (`⠁`) opening the row under it, right
+under the q's right column, with the version beside it. A terminal cell holds one colour, so
+the tail gets a cell of its own; the r's first dot shares its cell with the r's stem and
+stays cream there. The pet's name sits under the version, and the picked pet in dots at the
+right beside those three rows. Where braille is not drawn the foot says `● qoro` in ember.
 
 ## State marks
 
