@@ -47,11 +47,61 @@ pub struct Entry {
     pub state: Option<String>,
 }
 
+/// Which kind of row the palette shows, cycled with tab: everything, or one kind.
+///
+/// Named on the query row so the list never shrinks without saying why.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Filter {
+    #[default]
+    All,
+    Tabs,
+    Spaces,
+    Agents,
+    Actions,
+}
+
+impl Filter {
+    /// In the order tab walks them, which is the order the query row shows them.
+    pub const ORDER: [Filter; 5] = [
+        Filter::All,
+        Filter::Tabs,
+        Filter::Spaces,
+        Filter::Agents,
+        Filter::Actions,
+    ];
+
+    /// The word on the query row.
+    pub fn name(self) -> &'static str {
+        match self {
+            Filter::All => "all",
+            Filter::Tabs => "tab",
+            Filter::Spaces => "space",
+            Filter::Agents => "agent",
+            Filter::Actions => "action",
+        }
+    }
+
+    /// Whether a row of this item stays under this filter. By what the row does, not by
+    /// the header it sits under, so a new section can never slip past a filter.
+    fn keeps(self, item: &Item) -> bool {
+        let agent = matches!(item, Item::NewAgent(_) | Item::NewAgentAsk);
+        match self {
+            Filter::All => true,
+            Filter::Tabs => matches!(item, Item::Terminal(_)),
+            Filter::Spaces => matches!(item, Item::Space(_)),
+            Filter::Agents => agent,
+            Filter::Actions => !agent && !matches!(item, Item::Terminal(_) | Item::Space(_)),
+        }
+    }
+}
+
 /// Open palette state: the query and which filtered row is selected.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Palette {
     pub query: String,
     pub selected: usize,
+    /// The kind of row on show; `All` every time the palette opens.
+    pub filter: Filter,
     /// The config's `[agents]`, read when the palette opened, so an edit shows the next
     /// time without the file being read per frame.
     pub agents: Vec<crate::config::Launcher>,
@@ -86,6 +136,19 @@ impl Palette {
     /// Rub one out. An empty query stays open: closing is `esc`, not backspace.
     pub fn backspace(&mut self) {
         self.query.pop();
+        self.selected = 0;
+    }
+
+    /// The next filter, or the one before, and the selection back to the top: the list
+    /// it was on is not the list on screen any more.
+    pub fn cycle(&mut self, forward: bool) {
+        let at = Filter::ORDER
+            .iter()
+            .position(|f| *f == self.filter)
+            .unwrap_or(0);
+        let len = Filter::ORDER.len();
+        let next = if forward { at + 1 } else { at + len - 1 };
+        self.filter = Filter::ORDER[next % len];
         self.selected = 0;
     }
 
@@ -187,9 +250,16 @@ impl Palette {
             (Item::Sleep, "sleep this space", "Z"),
             (Item::NewSpace, "new space", "w"),
         ] {
+            // Under the agent filter the ask row leads the agents it offers, not a `do`
+            // header of its own.
+            let section = if item == Item::NewAgentAsk && self.filter == Filter::Agents {
+                "agents"
+            } else {
+                "do"
+            };
             out.push(Entry {
                 item,
-                section: "do",
+                section,
                 text: text.to_string(),
                 sub: if key.is_empty() {
                     "type any agent".to_string()
@@ -201,9 +271,10 @@ impl Palette {
                 state: None,
             });
         }
-        // One row per known agent, but only while filtering: the empty query stays
-        // short with the single agent row above, and typing a name finds its own.
-        if !self.query.is_empty() {
+        // One row per known agent, but only while filtering or when agents are what is
+        // asked for: the empty query stays short with the single agent row above, and
+        // typing a name finds its own.
+        if !self.query.is_empty() || self.filter == Filter::Agents {
             let needle = self.query.to_lowercase();
             // The person's own first: picking one types its command, not its name.
             for agent in &self.agents {
@@ -222,7 +293,9 @@ impl Palette {
             }
             for name in qoro_domain::program::agent_names() {
                 let text = format!("new {name} terminal");
-                if text.contains(&needle) {
+                // The person's own entry of the same name already offered it, their way.
+                let theirs = self.agents.iter().any(|a| a.name == name);
+                if !theirs && text.contains(&needle) {
                     out.push(Entry {
                         item: Item::NewAgent(name.to_string()),
                         section: "agents",
@@ -236,12 +309,11 @@ impl Palette {
             }
         }
         let query = self.query.to_lowercase();
-        if query.is_empty() {
-            return out;
-        }
         out.into_iter()
+            .filter(|e| self.filter.keeps(&e.item))
             .filter(|e| {
-                e.text.to_lowercase().contains(&query)
+                query.is_empty()
+                    || e.text.to_lowercase().contains(&query)
                     || e.sub.to_lowercase().contains(&query)
                     || e.section.contains(&query)
             })
@@ -399,6 +471,65 @@ mod tests {
         assert!(entries.iter().any(|e| e.item == Item::Space(1)));
         assert!(entries.iter().any(|e| e.item == Item::NewTerminal));
         assert_eq!(entries.last().unwrap().item, Item::NewSpace);
+    }
+
+    #[test]
+    fn each_filter_keeps_its_own_kind_and_tab_comes_back_round() {
+        let (rows, spaces) = sample();
+        let seen = crate::sidebar::Seen::new();
+        let unseen = crate::sidebar::Unseen::new();
+        let mut palette = Palette::with_agents(vec![crate::config::Launcher {
+            name: "claude".to_string(),
+            command: "claude --fast".to_string(),
+        }]);
+        let mut shown = Vec::new();
+        for _ in Filter::ORDER {
+            palette.cycle(true);
+            shown.push((
+                palette.filter,
+                palette.items(&rows, &spaces, 0, &seen, &unseen),
+            ));
+        }
+        assert_eq!(palette.filter, Filter::All, "five steps come back to all");
+        for (filter, entries) in &shown {
+            assert!(!entries.is_empty(), "{filter:?} left nothing");
+            assert!(
+                entries.iter().all(|e| filter.keeps(&e.item)),
+                "{filter:?} let in another kind"
+            );
+        }
+        let of = |f: Filter| &shown.iter().find(|(g, _)| *g == f).unwrap().1;
+        // Agents on an empty query: the ask row first, all under one header, and the
+        // person's own claude offered once, their way.
+        let agents = of(Filter::Agents);
+        assert_eq!(agents[0].item, Item::NewAgentAsk);
+        assert!(agents.iter().all(|e| e.section == "agents"));
+        assert_eq!(
+            agents
+                .iter()
+                .filter(|e| e.text == "new claude terminal")
+                .count(),
+            1
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|e| e.item == Item::NewAgent("claude --fast".to_string()))
+        );
+        assert!(
+            !of(Filter::Actions)
+                .iter()
+                .any(|e| e.item == Item::NewAgentAsk)
+        );
+        assert!(
+            of(Filter::Tabs)
+                .iter()
+                .all(|e| matches!(e.item, Item::Terminal(_)))
+        );
+        // Back from all is the last one.
+        palette.cycle(false);
+        assert_eq!(palette.filter, Filter::Actions);
+        assert_eq!(palette.selected, 0);
     }
 
     #[test]

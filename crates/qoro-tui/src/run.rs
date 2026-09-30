@@ -4699,6 +4699,15 @@ where
                     for action in keys.feed(&input) {
                         match action {
                             Action::Input(bytes) => {
+                                // Typed in the same read as `ctrl-a space`: the palette's,
+                                // not the pane's, or a fast tab lands in the shell as a
+                                // completion. Held for the palette's next read.
+                                // ponytail: waits for the next key rather than replaying
+                                // the palette's whole outcome handling from here.
+                                if state.palette.is_some() {
+                                    state.palette_pending.extend_from_slice(&bytes);
+                                    continue;
+                                }
                                 // Typed in the same read as the key that opened a mode,
                                 // as in `ctrl-a [ k`: the mode's, like everything after it.
                                 let bytes = if state.modes.open() {
@@ -6577,6 +6586,11 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
                         palette.move_by(1, count);
                         i += 3;
                     }
+                    // Shift-tab, the filter before. Only as a read of its own, like tab.
+                    Some(b'Z') if i == 0 && buf.len() == 3 => {
+                        palette.cycle(false);
+                        i += 3;
+                    }
                     // A mouse report, swallowed whole, read the way the key decoder
                     // reads one. Split across the read, it is stashed like the key
                     // decoder stashes its own.
@@ -6634,6 +6648,14 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
             }
             0x7f | 0x08 => {
                 palette.backspace();
+                i += 1;
+            }
+            // Tab, the next filter. Only as a read of its own: a tab inside a paste is
+            // text the palette cannot hold, dropped as any control byte is.
+            // ponytail: no bracketed paste here, so two tabs batched into one read (ssh,
+            // autorepeat) are dropped too; turn on ?2004 if that ever bites.
+            b'\t' if buf.len() == 1 => {
+                palette.cycle(true);
                 i += 1;
             }
             byte if byte == prefix => {
@@ -10290,6 +10312,25 @@ mod tests {
         assert!(state.palette.is_some());
     }
 
+    #[test]
+    fn tab_walks_the_palette_filters_and_a_pasted_tab_does_not() {
+        let mut state = state();
+        let filter = |state: &State| state.palette.as_ref().map(|p| p.filter);
+        palette_key(&mut state, b"\t");
+        assert_eq!(filter(&state), Some(palette::Filter::Tabs));
+        // Shift-tab walks back, past `all` round to the last.
+        palette_key(&mut state, b"\x1b[Z");
+        palette_key(&mut state, b"\x1b[Z");
+        assert_eq!(filter(&state), Some(palette::Filter::Actions));
+        // A tab inside a paste is not the key: the filter stays and the text is typed.
+        palette_key(&mut state, b"ab\tc");
+        assert_eq!(filter(&state), Some(palette::Filter::Actions));
+        assert_eq!(
+            state.palette.as_ref().map(|p| p.query.as_str()),
+            Some("abc")
+        );
+    }
+
     /// What is asked for has to cover what the window will read, or the rows come back
     /// blank: the first version asked for a range on the wrong side of the window and
     /// every scrolled row was empty.
@@ -11444,7 +11485,7 @@ mod tests {
             panic!("no menu rect on 80x24");
         };
         // The third row's middle cell.
-        let row = (top + 2 + 2 + 1) as u16;
+        let row = (top + crate::screen::MENU_FIRST_ROW + 2 + 1) as u16;
         let col = (left + w / 2 + 1) as u16;
         let press = format!("\x1b[<0;{col};{row}M").into_bytes();
         assert_eq!(menu_click(&press, cols, lines, &main), Some(Some(2)));

@@ -8,7 +8,7 @@
 use qoro_runtime::control::{AgentRow, FocusEvent, WorkspaceRow};
 use qoro_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
 
-use crate::palette::Palette;
+use crate::palette::{Filter, Palette};
 use crate::{layout, sidebar, tabs, theme, width};
 
 /// One visible terminal and where it sits in the pane, in pane-local cells.
@@ -914,8 +914,12 @@ pub fn paint(frame: &Frame) -> String {
             .len()
             .max(1);
         let row = palette_query_row(frame.lines, rows + count_headers(frame, palette));
-        // Past the border and the prompt marker, at the end of what has been typed.
-        let col = (left + 4 + width::width(&palette.query)).min(left + w.saturating_sub(2));
+        // Past the border and the prompt marker, at the end of what has been typed, and
+        // never on the filters beside it.
+        let inner = w.saturating_sub(2);
+        let chips = chips_width(&palette_chips(palette.filter, &palette.query, inner));
+        let col = (left + 4 + width::width(&palette.query))
+            .min(left + 3 + inner.saturating_sub(3 + chips).max(1));
         out.push_str(&at(row + 1, col + 1));
     } else if let Some(snapshot) = frame.snapshot {
         // Shown only when the program wants it seen. A child redraws with its
@@ -1079,8 +1083,8 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     if display.is_empty() {
         display.push((Kind::Empty, false));
     }
-    // The query line and a border above and below it, and the entries take what is left.
-    let chrome = 3;
+    // The edges, the query line and the footer, and the entries take what is left.
+    let chrome = PALETTE_CHROME;
     let budget = (lines.saturating_sub(TABS + STATUS + chrome))
         .max(1)
         .min(display.len());
@@ -1102,56 +1106,38 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     let top = (lines.saturating_sub(height)) / 2;
     let inner = w.saturating_sub(2);
 
-    // The frame, so the box has edges: a floating list with no border is a list that has
-    // fallen into whatever is behind it.
-    let border = theme::fg(theme::Role::Rule);
-    let line_at = |row: usize, out: &mut String| -> bool {
-        if row >= lines {
-            return false;
-        }
-        out.push_str(&at(row + 1, left + 1));
-        true
-    };
-    let mut row = top;
-    if line_at(row, out) {
-        out.push_str(&border);
-        out.push('\u{256d}');
-        for _ in 0..inner {
-            out.push('\u{2500}');
-        }
-        out.push('\u{256e}');
-        out.push_str(theme::RESET);
-    }
-    row += 1;
     // The query, with the prompt in the colour the pane's own prompts are not, so the box
-    // says where typing goes.
-    if line_at(row, out) {
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(&theme::fg(theme::Role::Faint));
-        out.push_str(" > ");
-        out.push_str(&theme::fg(theme::Role::Focused));
-        out.push_str(&width::fit(&palette.query, inner.saturating_sub(3)));
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(theme::RESET);
+    // says where typing goes. The filters sit at its right, the one in force bright.
+    let chips = palette_chips(palette.filter, &palette.query, inner);
+    let mut query = format!(
+        "{} > {}{}",
+        theme::fg(theme::Role::Faint),
+        theme::fg(theme::Role::Focused),
+        width::fit(
+            &palette.query,
+            inner.saturating_sub(3 + chips_width(&chips))
+        )
+    );
+    for (i, chip) in chips.iter().enumerate() {
+        query.push_str(&theme::fg(if *chip == palette.filter {
+            theme::Role::Focused
+        } else {
+            theme::Role::Faint
+        }));
+        query.push_str(chip.name());
+        query.push_str(if i + 1 == chips.len() { " " } else { "  " });
     }
-    row += 1;
+    let mut body = vec![query];
     for (kind, selected) in display.iter().skip(first).take(budget) {
-        if !line_at(row, out) {
-            break;
-        }
-        row += 1;
-        out.push_str(&border);
-        out.push('\u{2502}');
+        let mut line = String::new();
         match kind {
             Kind::Header(name) => {
-                out.push_str(&theme::fg(theme::Role::Title));
-                out.push_str(&width::fit(&format!(" {name}"), inner));
+                line.push_str(&theme::fg(theme::Role::Title));
+                line.push_str(&width::fit(&format!(" {name}"), inner));
             }
             Kind::Empty => {
-                out.push_str(&theme::fg(theme::Role::Faint));
-                out.push_str(&width::fit(" no match", inner));
+                line.push_str(&theme::fg(theme::Role::Faint));
+                line.push_str(&width::fit(" no match", inner));
             }
             Kind::Row(entry) => {
                 // The same three colours the column uses, for the same three things: the
@@ -1175,11 +1161,11 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                 // Composed text, so every space in it is meant: the grid fitter would drop
                 // the one after a wide character.
                 let head = width::text(&head, room);
-                out.push_str(&base);
-                out.push(' ');
+                line.push_str(&base);
+                line.push(' ');
                 match (space_ink, entry.space_len) {
                     (Some(ink), len) if len > 0 && len <= width::width(&head) => {
-                        out.push_str(&if *selected {
+                        line.push_str(&if *selected {
                             theme::selected_in(ink)
                         } else {
                             theme::fg(ink)
@@ -1197,36 +1183,60 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                             })
                             .unwrap_or(head.len());
                         let (lead, tail) = head.split_at(cut);
-                        out.push_str(lead);
-                        out.push_str(&base);
-                        out.push_str(tail);
+                        line.push_str(lead);
+                        line.push_str(&base);
+                        line.push_str(tail);
                     }
-                    _ => out.push_str(&head),
+                    _ => line.push_str(&head),
                 }
-                out.push(' ');
-                out.push_str(&match (state_ink, *selected) {
+                line.push(' ');
+                line.push_str(&match (state_ink, *selected) {
                     (Some(ink), true) => theme::selected_in(ink),
                     (Some(ink), false) => theme::fg(ink),
                     (None, true) => theme::selected(),
                     (None, false) => theme::fg(theme::Role::Faint),
                 });
-                out.push_str(&sub);
-                out.push_str(&base);
+                line.push_str(&sub);
+                line.push_str(&base);
             }
         }
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(theme::RESET);
+        body.push(line);
     }
-    if line_at(row, out) {
-        out.push_str(&border);
-        out.push('\u{2570}');
-        for _ in 0..inner {
-            out.push('\u{2500}');
-        }
-        out.push('\u{256f}');
-        out.push_str(theme::RESET);
+    body.push(hint_line(PALETTE_HINT, inner));
+    // The frame, so the box has edges: a floating list with no border is a list that has
+    // fallen into whatever is behind it.
+    let rule = theme::fg(theme::Role::Rule);
+    paint_boxed(out, lines, (left, top, w), "find", (&rule, &rule), &body);
+}
+
+/// The palette's rows that are not entries: both edges, the query line and the footer.
+const PALETTE_CHROME: usize = 4;
+
+/// The palette's keys. Tab is the one nobody would guess, so it is said here.
+const PALETTE_HINT: &[(&str, &str)] = &[("enter", "go"), ("tab", "filter"), ("esc", "close")];
+
+/// Which filters the query row can name beside a query of this width.
+///
+/// All of them when they fit. Otherwise the query wins, but the filter in force stays
+/// named, or the list would shrink with nothing on screen saying why; under `all` there
+/// is nothing to explain, so nothing is shown.
+fn palette_chips(filter: Filter, query: &str, inner: usize) -> Vec<Filter> {
+    let all = Filter::ORDER.to_vec();
+    if 3 + width::width(query) + 1 + chips_width(&all) <= inner {
+        all
+    } else if filter != Filter::All && 3 + 1 + chips_width(&[filter]) <= inner {
+        vec![filter]
+    } else {
+        Vec::new()
     }
+}
+
+/// The columns the named filters take: two spaces between them and one after the last.
+fn chips_width(chips: &[Filter]) -> usize {
+    if chips.is_empty() {
+        return 0;
+    }
+    chips.iter().map(|c| c.name().len()).sum::<usize>() + 2 * (chips.len() - 1) + 1
 }
 
 /// How many section headers the palette will draw, which take rows like anything else.
@@ -1252,8 +1262,10 @@ fn count_headers(frame: &Frame, palette: &Palette) -> usize {
 /// Where the palette's query line is drawn, so the cursor can be put at the end of it.
 fn palette_query_row(lines: u16, rows: usize) -> usize {
     let lines = lines as usize;
-    let budget = (lines.saturating_sub(TABS + STATUS + 3)).max(1).min(rows);
-    (lines.saturating_sub(budget + 3)) / 2 + 1
+    let budget = (lines.saturating_sub(TABS + STATUS + PALETTE_CHROME))
+        .max(1)
+        .min(rows);
+    (lines.saturating_sub(budget + PALETTE_CHROME)) / 2 + 1
 }
 
 /// The screen column the cursor sits at, counted from zero, given the row it is on and the
@@ -1327,8 +1339,8 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
 
 /// Where the centred menu box sits: left, top, width and height in cells.
 ///
-/// Zero based, like the painter counts. The height covers both borders plus the
-/// title row, one row per menu entry and one hint row. Shared with hit testing,
+/// Zero based, like the painter counts. The height covers both borders (the title sits
+/// in the top one), one row per menu entry and one hint row. Shared with hit testing,
 /// so a click and a repaint agree on which row is which and a second copy of
 /// this arithmetic cannot drift.
 pub(crate) fn menu_rect(
@@ -1347,12 +1359,11 @@ pub(crate) fn menu_rect(
         };
         (n.max(width::width(name)), k.max(keypart))
     });
-    let hint = "arrows/jk move  enter choose  esc close";
     let inner = (1 + max_name + 1 + max_key)
-        .max(width::width(title) + 1)
-        .max(width::width(hint) + 1);
+        .max(width::width(title.trim()) + 4)
+        .max(footer_width(MENU_HINT));
     let w = inner + 2;
-    let height = rows.len() + 4;
+    let height = rows.len() + 3;
     if cols < w + 2 || lines < height + 2 {
         return None;
     }
@@ -1376,9 +1387,16 @@ pub(crate) fn menu_row_at(
     if c < left || c >= left + w || r < top || r >= top + height {
         return None;
     }
-    let item = r.checked_sub(top + 2)?;
+    let item = r.checked_sub(top + MENU_FIRST_ROW)?;
     (item < rows.len()).then_some(item)
 }
+
+/// How far below the menu's top edge its first entry sits: where `paint_boxed` puts
+/// every box's first row.
+pub(crate) const MENU_FIRST_ROW: usize = BOX_FIRST_ROW;
+
+/// The menu's keys, said once for the box and for the width it needs.
+const MENU_HINT: &[(&str, &str)] = &[("j k", "move"), ("enter", "choose"), ("esc", "close")];
 
 /// The menu, centred over the pane like the palette.
 ///
@@ -1394,64 +1412,32 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
         return;
     };
     let inner = w.saturating_sub(2);
-    let border = theme::fg(theme::Role::Rule);
-    let edge = |out: &mut String, row: usize, open: char, fill: char, close: char| {
-        out.push_str(&at(row + 1, left + 1));
-        out.push_str(&border);
-        out.push(open);
-        for _ in 0..w.saturating_sub(2) {
-            out.push(fill);
-        }
-        out.push(close);
-        out.push_str(theme::RESET);
-    };
-    edge(out, top, '\u{256d}', '\u{2500}', '\u{256e}');
+    let mut body: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, keypart))| {
+            let ink = if i == selected {
+                theme::selected()
+            } else {
+                theme::fg(theme::Role::Text)
+            };
+            // The name on the left, its key or its state on the right: the main menu
+            // teaches the shortcut each row replaces, so the next visit skips it.
+            let gap = inner.saturating_sub(1 + width::width(name) + width::width(keypart));
+            let cell = format!(" {name}{}{keypart}", " ".repeat(gap));
+            format!("{ink}{}", width::fit(&cell, inner))
+        })
+        .collect();
+    body.push(hint_line(MENU_HINT, inner));
+    let rule = theme::fg(theme::Role::Rule);
     // The title names what is open, the way the palette names its query.
-    out.push_str(&at(top + 2, left + 1));
-    out.push_str(&border);
-    out.push('\u{2502}');
-    out.push_str(&theme::fg(theme::Role::Title));
-    out.push_str(&width::fit(&title, inner));
-    out.push_str(&border);
-    out.push('\u{2502}');
-    out.push_str(theme::RESET);
-    for (i, (name, keypart)) in rows.iter().enumerate() {
-        let row = top + 2 + i;
-        out.push_str(&at(row + 1, left + 1));
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(&if i == selected {
-            theme::selected()
-        } else {
-            theme::fg(theme::Role::Text)
-        });
-        // The name on the left, its key or its state on the right: the main menu
-        // teaches the shortcut each row replaces, so the next visit skips it.
-        let gap = inner.saturating_sub(1 + width::width(name) + width::width(keypart));
-        let cell = format!(" {name}{}{keypart}", " ".repeat(gap));
-        out.push_str(&width::fit(&cell, inner));
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(theme::RESET);
-    }
-    let hint_row = top + 2 + rows.len();
-    out.push_str(&at(hint_row + 1, left + 1));
-    out.push_str(&border);
-    out.push('\u{2502}');
-    out.push_str(&theme::fg(theme::Role::Faint));
-    out.push_str(&width::fit(
-        " arrows/jk move  enter choose  esc close",
-        inner,
-    ));
-    out.push_str(&border);
-    out.push('\u{2502}');
-    out.push_str(theme::RESET);
-    edge(
+    paint_boxed(
         out,
-        top + 3 + rows.len(),
-        '\u{2570}',
-        '\u{2500}',
-        '\u{256f}',
+        frame.lines as usize,
+        (left, top, w),
+        &title,
+        (&rule, &rule),
+        &body,
     );
 }
 
@@ -1606,7 +1592,8 @@ fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
         .map(|r| width::width(r))
         .max()
         .unwrap_or(0);
-    let w = (widest + 3).min(cols);
+    // The title rides the top edge, which needs `─ ` before it and ` ─` after it.
+    let w = (widest.max(width::width(title.trim()) + 2) + 3).min(cols);
     // Clipped to the window rather than skipped: the keybind list is taller than an
     // 80x24 window, and skipping painted nothing while the overlay still took the next
     // key, which read as a frozen screen.
@@ -1615,41 +1602,116 @@ fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
         return;
     }
     let left = cols.saturating_sub(w) / 2;
-    let top = lines.saturating_sub(rows.len() + 3) / 2;
-    let border = theme::fg(theme::Role::Rule);
+    let top = lines.saturating_sub(rows.len() + 2) / 2;
     let inner = w - 2;
-    let mut row = top;
-    let edge = |out: &mut String, row: usize, open: char, close: char| {
-        out.push_str(&at(row + 1, left + 1));
-        out.push_str(&border);
-        out.push(open);
-        for _ in 0..inner {
-            out.push('\u{2500}');
+    let body: Vec<String> = rows
+        .iter()
+        .map(|text| {
+            format!(
+                "{}{}",
+                theme::fg(theme::Role::Text),
+                width::fit(text, inner)
+            )
+        })
+        .collect();
+    let rule = theme::fg(theme::Role::Rule);
+    paint_boxed(out, lines, (left, top, w), title, (&rule, &rule), &body);
+}
+
+/// The row under a box's top edge, where its first row goes.
+const BOX_FIRST_ROW: usize = 1;
+
+/// One floating box: the rounded edge in `inks.0`, `title` cut into the top edge in
+/// `inks.1`, and `rows` between the side rules, each already styled and exactly `w - 2`
+/// columns wide.
+///
+/// Every overlay goes through here, so a box looks the same whoever opens it. A row past
+/// the bottom of the window is dropped rather than written below the screen.
+fn paint_boxed(
+    out: &mut String,
+    lines: usize,
+    (left, top, w): (usize, usize, usize),
+    title: &str,
+    (ink, title_ink): (&str, &str),
+    rows: &[String],
+) {
+    let inner = w.saturating_sub(2);
+    let put = |row: usize, text: &str, out: &mut String| {
+        if row < lines {
+            out.push_str(&at(row + 1, left + 1));
+            out.push_str(text);
+            out.push_str(theme::RESET);
         }
-        out.push(close);
-        out.push_str(theme::RESET);
     };
-    edge(out, row, '\u{256d}', '\u{256e}');
-    row += 1;
-    for (i, text) in std::iter::once(title.to_string())
-        .chain(rows.iter().cloned())
-        .enumerate()
-    {
-        out.push_str(&at(row + 1, left + 1));
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(&theme::fg(if i == 0 {
-            theme::Role::Title
-        } else {
-            theme::Role::Text
-        }));
-        out.push_str(&width::fit(&text, inner));
-        out.push_str(&border);
-        out.push('\u{2502}');
-        out.push_str(theme::RESET);
-        row += 1;
+    let title = title.trim();
+    // `─ title ` and at least one more rule after it, or no title at all. A wide character
+    // cut at the limit leaves a pad, which is not part of the name.
+    let shown = width::text(title, width::width(title).min(inner.saturating_sub(4)));
+    let shown = shown.trim_end();
+    let used = width::width(shown);
+    let top_edge = if used == 0 {
+        format!("{ink}\u{256d}{}\u{256e}", "\u{2500}".repeat(inner))
+    } else {
+        format!(
+            "{ink}\u{256d}\u{2500} {title_ink}{shown}{ink} {}\u{256e}",
+            "\u{2500}".repeat(inner - used - 3)
+        )
+    };
+    put(top, &top_edge, out);
+    for (i, row) in rows.iter().enumerate() {
+        put(
+            top + BOX_FIRST_ROW + i,
+            &format!("{ink}\u{2502}{row}{ink}\u{2502}"),
+            out,
+        );
     }
-    edge(out, row, '\u{2570}', '\u{256f}');
+    let bottom = format!("{ink}\u{2570}{}\u{256f}", "\u{2500}".repeat(inner));
+    put(top + BOX_FIRST_ROW + rows.len(), &bottom, out);
+}
+
+/// The columns a footer of `hints` needs: a leading space, each `key word`, two spaces
+/// between them, and one to spare.
+fn footer_width(hints: &[(&str, &str)]) -> usize {
+    hints
+        .iter()
+        .map(|(key, word)| width::width(key) + 1 + width::width(word))
+        .sum::<usize>()
+        + 2 * hints.len()
+}
+
+/// A box's footer: keys bright, what they do faint, two spaces apart, padded to `inner`.
+///
+/// Cut whole from the end when the box is narrow, never the first entry: it is the one
+/// that says how to answer.
+fn hint_line(hints: &[(&str, &str)], inner: usize) -> String {
+    let mut shown = hints.len();
+    while shown > 1 && footer_width(&hints[..shown]) > inner {
+        shown -= 1;
+    }
+    let mut line = String::new();
+    let mut plain = String::new();
+    for (i, (key, word)) in hints[..shown].iter().enumerate() {
+        let gap = if i == 0 { " " } else { "  " };
+        line.push_str(&theme::fg(theme::Role::Faint));
+        line.push_str(gap);
+        line.push_str(&theme::fg(theme::Role::Focused));
+        line.push_str(key);
+        line.push_str(&theme::fg(theme::Role::Faint));
+        line.push(' ');
+        line.push_str(word);
+        plain.push_str(&format!("{gap}{key} {word}"));
+    }
+    let used = width::width(&plain);
+    if used > inner {
+        // Narrower than even the first entry: its words, cut, in one ink.
+        return format!(
+            "{}{}",
+            theme::fg(theme::Role::Faint),
+            width::fit(&plain, inner)
+        );
+    }
+    line.push_str(&" ".repeat(inner - used));
+    line
 }
 
 /// One row of the terminal, with its colour.
@@ -2619,7 +2681,7 @@ mod tests {
             image_notice: None,
             chrome: Default::default(),
         });
-        assert!(painted.contains(" keybinds"), "no keybinds box on 80x24");
+        assert!(painted.contains("keybinds"), "no keybinds box on 80x24");
         assert!(
             !painted.contains("\x1b[25;"),
             "the box ran past the last row"
@@ -2906,20 +2968,35 @@ mod tests {
         let Some((left, top, w, height)) = menu_rect(80, 24, &rows, " menu") else {
             panic!("no menu rect on 80x24");
         };
-        assert_eq!(height, crate::run::MENU.len() + 4);
+        assert_eq!(height, crate::run::MENU.len() + 3);
         assert_eq!(left, (80 - w) / 2, "menu not centred across");
         assert_eq!(top, (24 - height) / 2, "menu not centred down");
         assert!(left > 0, "menu still hugs the left edge");
     }
 
     #[test]
+    fn the_palette_names_its_filters_and_keeps_the_one_in_force_when_narrow() {
+        assert_eq!(palette_chips(Filter::All, "", 58), Filter::ORDER.to_vec());
+        let long = "x".repeat(40);
+        assert_eq!(
+            palette_chips(Filter::Spaces, &long, 58),
+            vec![Filter::Spaces],
+            "a long query hid the filter in force"
+        );
+        assert!(palette_chips(Filter::All, &long, 58).is_empty());
+        // The row the chips share is still exactly the box: query room plus chips.
+        let chips = palette_chips(Filter::All, "", 58);
+        assert_eq!(chips_width(&chips), 31);
+    }
+
+    #[test]
     fn a_menu_click_address_matches_the_painted_rows() {
-        // Row 0 sits two rows under the box top: border plus title.
+        // Row 0 sits right under the top edge, which carries the title.
         let rows = crate::run::menu_rows(&crate::run::MenuKind::Main);
         let Some((left, top, _, _)) = menu_rect(80, 24, &rows, " menu") else {
             panic!("no menu rect on 80x24");
         };
-        let row = (top + 2 + 4 + 1) as u16;
+        let row = (top + MENU_FIRST_ROW + 4 + 1) as u16;
         let col = (left + 3 + 1) as u16;
         assert_eq!(
             menu_row_at(80, 24, &rows, " menu", row, col),
