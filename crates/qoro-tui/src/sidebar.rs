@@ -65,9 +65,9 @@ pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
 /// Columns the left column occupies, unless the person pulled it wider or
 /// narrower.
 ///
-/// Thirty. A comparable multiplexer ships twenty six as a default a
-/// person can drag between eighteen and thirty six, and the wide end of
-/// that range is the right default here: this column carries a space name,
+/// Thirty, dragged anywhere between [`SIDEBAR_MIN`] and half the window. Twenty
+/// six is too narrow, and thirty is the right default
+/// here: this column carries a space name,
 /// a separator, a mark, a name and a state word flush against the right
 /// edge, and at twenty two the state had nothing left. Thirty leaves a
 /// real project name room to be read rather than recognised from its first
@@ -77,13 +77,15 @@ pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
 /// pulling asked to pay: explicit drags reflow, arrivals never do.
 pub const WIDTH: usize = 30;
 
-/// The narrowest the open column drags to, and the widest.
-///
-/// Kept to the range (eighteen to thirty six); the default above
-/// stays qoro's own. Below eighteen the place rows are mostly ellipsis,
-/// above thirty six the pane starts paying real columns for furniture.
+/// The narrowest the open column drags to. Below eighteen the place rows are mostly
+/// ellipsis.
 pub const SIDEBAR_MIN: usize = 18;
-pub const SIDEBAR_MAX: usize = 36;
+
+/// The widest the open column drags to: half the window, so long names and places fit
+/// when a person wants them to, and the pane always keeps the other half.
+pub fn sidebar_max(cols: u16) -> usize {
+    (cols as usize / 2).max(SIDEBAR_MIN)
+}
 
 /// Columns the left column occupies when it is folded away.
 ///
@@ -278,6 +280,8 @@ pub enum Act {
     /// Put a space to sleep, or wake it: the toggle on its rule, which reads the space
     /// from the row it was on rather than from whatever is on screen.
     Sleep(i64),
+    /// The `+` on a space's rule: a new terminal or agent in that space.
+    New(i64),
     /// The close on a space's rule. Only ever arms: the row asks, and the answer is a
     /// second click on the same row.
     Close(i64),
@@ -1011,8 +1015,8 @@ fn content(c: &Column) -> Vec<Row> {
 /// two controls in fixed columns at the right.
 ///
 /// ```text
-/// ⡆qoro (4)                  z x
-/// ⡆qoro sleeping             z x
+/// ⡆qoro (4)                + z x
+/// ⡆qoro sleeping               z x
 /// ```
 ///
 /// The line starts halfway down the name's row, in the space's colour, and runs down beside
@@ -1057,7 +1061,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         // by a second click on the same cells.
         armed_block(width)
     } else {
-        block(width, space.closable, space.asleep || !kids.is_empty())
+        block(width, space, !kids.is_empty())
     };
     // One slot after the name, and only one: the count while awake, the word while asleep,
     // because they are the same fact and never both true. The slot carries its own leading
@@ -1101,7 +1105,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     // them. The sleeping ink means a space is asleep, so it cannot also be the affirmative
     // of a question that destroys one, and the two answers are deliberately not the same
     // weight: `y` is a word, `n` is quieter.
-    for cell in [block.sleep, block.close] {
+    for cell in [block.new, block.sleep, block.close] {
         let Some((at, w)) = cell else { continue };
         let role = match block.answer {
             // The affirmative is a word and the other is quieter, so a question cannot be
@@ -1139,7 +1143,7 @@ const QUESTION: &str = " close?";
 const MIN_NAME_COLS: usize = 3;
 
 /// The columns the block takes.
-const BLOCK_W: usize = 3;
+const BLOCK_W: usize = 5;
 
 /// Everything on the row that is neither the name, the slot nor the fill: the fold
 /// cells, the block, and the blank last column the block leaves. A name gets what is
@@ -1157,10 +1161,11 @@ fn room_for(width: usize, slot: &str) -> usize {
         .saturating_sub(crate::width::width(slot))
 }
 
-/// The control block at the right of a space rule: the sleep toggle and the close, in three
-/// columns that never change shape, laid out from the right edge inward.
+/// The control block at the right of a space rule: the new tab, the sleep toggle and the
+/// close, in five columns that never change shape, laid out from the right edge inward.
 ///
-/// `z` at `width - 4` and `x` at `width - 2`, whenever drawn. The block being fixed is the
+/// `+` at `width - 6`, `z` at `width - 4` and `x` at `width - 2`, whenever drawn. A sleeping
+/// space gets no `+`: it has to wake first, and `z` is right beside it. The block being fixed is the
 /// whole point: the slot beside the name grows a column at 10 tabs, and a control that
 /// moved with it would be a control nobody could learn.
 ///
@@ -1169,7 +1174,9 @@ fn room_for(width: usize, slot: &str) -> usize {
 /// asleep always gets one, because `z` is then the only way back with a mouse: a sleeping
 /// space has no tab rows to press, so there is nothing else to click.
 struct Block {
-    /// (zero-based column, width) of the sleep toggle, if it is drawn.
+    /// (zero-based column, width) of the new tab control, if it is drawn.
+    new: Option<(usize, usize)>,
+    /// The same for the sleep toggle.
     sleep: Option<(usize, usize)>,
     /// The same for the close.
     close: Option<(usize, usize)>,
@@ -1179,11 +1186,11 @@ struct Block {
 }
 
 impl Block {
-    /// The three columns, in the order they are drawn. A control that is not drawn is a
-    /// blank, so the block keeps its shape and the other control keeps its column.
+    /// The five columns, in the order they are drawn. A control that is not drawn is a
+    /// blank, so the block keeps its shape and the other controls keep their columns.
     fn text(&self) -> String {
         // Armed, the two cells are the two answers; otherwise they are the two controls.
-        // Either way the block is three columns and neither cell ever moves.
+        // Either way the block is five columns and no cell ever moves.
         let [left, right] = match self.answer {
             // `answer` is the cell the affirmative is drawn in, and which cell that is
             // depends on where the person pressed: `y` stays under the pointer.
@@ -1196,7 +1203,8 @@ impl Block {
                 if self.close.is_some() { "x" } else { " " },
             ],
         };
-        format!("{left} {right}")
+        let new = if self.new.is_some() { "+" } else { " " };
+        format!("{new} {left} {right}")
     }
 }
 
@@ -1204,6 +1212,7 @@ impl Block {
 /// `y` and `n` under the pointer rather than somewhere else on the row.
 fn armed_block(width: usize) -> Block {
     Block {
+        new: None,
         sleep: Some((width.saturating_sub(4), 1)),
         close: Some((width.saturating_sub(2), 1)),
         // `y` in the cell `x` was in, because a second click in the cell that asked is
@@ -1213,10 +1222,12 @@ fn armed_block(width: usize) -> Block {
     }
 }
 
-fn block(width: usize, closable: bool, can_sleep: bool) -> Block {
+/// The block of a rule that is not asking: `busy` is whether anything runs in the space.
+fn block(width: usize, space: &WorkspaceRow, busy: bool) -> Block {
     Block {
-        sleep: can_sleep.then_some((width.saturating_sub(4), 1)),
-        close: closable.then_some((width.saturating_sub(2), 1)),
+        new: (!space.asleep).then_some((width.saturating_sub(6), 1)),
+        sleep: (space.asleep || busy).then_some((width.saturating_sub(4), 1)),
+        close: space.closable.then_some((width.saturating_sub(2), 1)),
         answer: None,
     }
 }
@@ -1705,7 +1716,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
                 let drawn = if c.armed == Some(id) {
                     armed_block(c.width)
                 } else {
-                    block(c.width, space.closable, space.asleep || !kids.is_empty())
+                    block(c.width, space, !kids.is_empty())
                 };
                 let at = col.saturating_sub(1);
                 if let Some(yes) = drawn.answer {
@@ -1720,6 +1731,9 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
                     });
                 }
                 // Not armed: the controls do what they say.
+                if drawn.new.is_some_and(|(at, _)| col.saturating_sub(1) == at) {
+                    return Some(Act::New(id));
+                }
                 if drawn
                     .sleep
                     .is_some_and(|(at, _)| col.saturating_sub(1) == at)
@@ -2292,6 +2306,9 @@ fn fit_to(text: &str, cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wide column for the width sweeps: what half of a 120 column window drags to.
+    const SIDEBAR_MAX: usize = 60;
 
     /// The state a terminal has when nothing has been able to say what it is doing.
     const UNKNOWN: &str = "unknown";
@@ -2969,7 +2986,7 @@ mod tests {
         let (spaces, agents) = sample();
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let app = rule_row(&rows, 1);
-        assert_eq!(app.text, format!("\u{2846}app (1){}z x ", " ".repeat(18)));
+        assert_eq!(app.text, format!("\u{2846}app (1){}+ z x ", " ".repeat(16)));
         assert_eq!(crate::width::width(&app.text), WIDTH);
 
         let ink = crate::theme::space_of(1);
@@ -2979,16 +2996,17 @@ mod tests {
         assert_eq!(
             app.runs,
             vec![
-                (8, 18, ink),
+                (8, 16, ink),
                 (4, 4, crate::theme::Role::Faint),
+                (WIDTH - 6, 1, crate::theme::Role::Faint),
                 (WIDTH - 4, 1, crate::theme::Role::Faint),
                 (WIDTH - 2, 1, crate::theme::Role::Faint),
             ]
         );
-        // An empty space has nothing to count and nothing running, so it draws no slot
-        // and a close with nothing beside it.
+        // An empty space has nothing to count and nothing running, so it draws no slot,
+        // no sleep toggle, and the `+` and the close.
         let dub = rule_row(&rows, 3);
-        assert_eq!(dub.text, format!("\u{2846}dub{}  x ", " ".repeat(22)));
+        assert_eq!(dub.text, format!("\u{2846}dub{}+   x ", " ".repeat(20)));
         assert_eq!(crate::width::width(&dub.text), WIDTH);
 
         // Folded, the line's top stays put and the count stays.
@@ -4795,6 +4813,8 @@ mod tests {
                 for col in 1..=width {
                     let want = if view == View::Tree && col <= NAME_AT {
                         Act::Fold(1)
+                    } else if col == width - 6 + 1 {
+                        Act::New(1)
                     } else if col == width - 4 + 1 {
                         Act::Sleep(1)
                     } else if col == width - 2 + 1 {
@@ -4803,9 +4823,11 @@ mod tests {
                         Act::Space(1)
                     };
                     assert_eq!(act(Hit::Space(1), col, &c, false), Some(want), "space 1");
-                    // The empty space draws no sleep toggle, so every column but the close
-                    // is the space itself.
-                    let want = if col == width - 2 + 1 {
+                    // The empty space draws no sleep toggle, so every column but the `+`
+                    // and the close is the space itself.
+                    let want = if col == width - 6 + 1 {
+                        Act::New(3)
+                    } else if col == width - 2 + 1 {
                         Act::Close(3)
                     } else {
                         Act::Space(3)
@@ -6551,7 +6573,7 @@ mod tests {
         // cells, the block and the blank last column. A count wide enough to take the
         // rest is what makes a rule sit on the budget, and `shorten_middle` is the shared
         // helper that has to be right about the case for its other callers too.
-        assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 13);
+        assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 11);
         assert_eq!(crate::width::width(&format!(" ({})", 999_999_usize)), 9);
     }
 

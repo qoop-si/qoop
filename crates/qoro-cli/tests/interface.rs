@@ -1312,8 +1312,8 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
         "part of a mouse report reached the terminal"
     );
 
-    // The `+` at the end of the bar is a way to make a terminal without knowing
-    // a key binding, not decoration: a click on it starts one in this space.
+    // The `+` at the end of the bar is a way to make a terminal or an agent without
+    // knowing a key binding, not decoration: a click on it offers both for this space.
     let bar = ui
         .tab_bar()
         .unwrap_or_else(|| panic!("no tab bar: {:?}", ui.tab_bar()));
@@ -1326,17 +1326,22 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
         plus as u16 + 1 + qoro_tui::screen::left(COLS) as u16,
         qoro_tui::screen::TABS as u16,
     );
-    // It asks what to call it rather than making one unasked, so the tab a person gets is
-    // one they can find again by name.
-    ui.answer_prompt(mark, "release");
+    // It asks which: `agent` first, `terminal` under it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !ui.painted[mark..].contains("new in") {
+        let _ = ui.wait_for("this needle never appears", Duration::from_millis(80));
+    }
+    assert!(
+        ui.painted[mark..].contains("new in"),
+        "the + menu never opened:\n{}",
+        &ui.painted[mark..]
+    );
+    ui.type_in(b"j");
+    std::thread::sleep(Duration::from_millis(50));
+    ui.type_in(b"\r");
     assert!(
         ui.wait_for_tab(3, Duration::from_secs(15)),
         "a click on + did not start a terminal: {:?}",
-        ui.tab_bar()
-    );
-    assert!(
-        ui.tab_bar().is_some_and(|bar| bar.contains("release")),
-        "the tab is not called what it was named: {:?}",
         ui.tab_bar()
     );
 }
@@ -2213,7 +2218,7 @@ fn radar_dragging_the_divider_resizes_the_panel() {
                 .screen
                 .text(row)
                 .and_then(|line| line.chars().position(|c| c == '│' || c == '┤'))
-                .filter(|at| *at < 45)
+                .filter(|at| *at <= COLS as usize / 2)
             {
                 return Some(at);
             }
@@ -2248,16 +2253,17 @@ fn radar_dragging_the_divider_resizes_the_panel() {
         rule_at(&ui)
     );
 
-    // Pull past the end: clamps at 36, never further.
+    // Pull past the end: clamps at half the window, never further.
+    let half = COLS as usize / 2;
     ui.drag(35, 5, &[60, 90]);
     assert!(
-        wait_for_rule(&mut ui, 36),
-        "the panel did not clamp at 36: {:?}",
+        wait_for_rule(&mut ui, half),
+        "the panel did not clamp at {half}: {:?}",
         rule_at(&ui)
     );
 
     // Pull left past the start: clamps at 18.
-    ui.drag(37, 5, &[20, 10]);
+    ui.drag(half as u16 + 1, 5, &[20, 10]);
     assert!(
         wait_for_rule(&mut ui, 18),
         "the panel did not clamp at 18: {:?}",

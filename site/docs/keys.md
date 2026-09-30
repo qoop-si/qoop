@@ -58,6 +58,7 @@ program.
 | click | focus a tab, a pane, a space or an agent |
 | drag | select, and copy when you let go |
 | drag a divider | resize the panes on either side |
-| drag the column's edge | widen or narrow the left column |
+| click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory |
+| drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |
 | wheel | scroll back through the history |

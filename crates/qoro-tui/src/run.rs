@@ -420,6 +420,10 @@ struct State {
     /// opens one and shows it at once gets there first. Shown once an index has it; a
     /// few seconds on, a terminal that never came is forgotten rather than jumped to.
     show_when_listed: Option<(u32, std::time::Instant)>,
+    /// The id of a create asked for in a space that is not on screen, from a space's `+`.
+    /// Its tab is shown once an index lists it, because only the row says which space to
+    /// bring on screen with it.
+    elsewhere: Option<String>,
     /// A wake asked for from here, as the space and the tab to show once it is back: the
     /// clicked one, or the space's first. Handed to `show_when_listed` by the answer.
     waking: Option<(i64, u32)>,
@@ -984,7 +988,7 @@ impl State {
         }
         let new = (col as usize)
             .saturating_sub(1)
-            .clamp(sidebar::SIDEBAR_MIN, sidebar::SIDEBAR_MAX);
+            .clamp(sidebar::SIDEBAR_MIN, sidebar::sidebar_max(self.cols));
         if new == self.sidebar_width {
             return false;
         }
@@ -1119,6 +1123,7 @@ impl State {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
             sidebar::Act::Sleep(space) => Some(Clicked::Sleep(space)),
+            sidebar::Act::New(space) => Some(Clicked::New(space)),
             sidebar::Act::Close(space) => Some(Clicked::Close(space)),
             sidebar::Act::ConfirmClose(space) => Some(Clicked::ConfirmClose(space)),
             sidebar::Act::CancelClose => Some(Clicked::CancelClose),
@@ -1371,6 +1376,15 @@ pub enum MenuKind {
     Main,
     /// What the `+` beside "spaces" offers.
     Plus,
+    /// What a space's `+`, or the tab bar's, offers: a terminal or an agent there. `name`
+    /// is the space's, for the title.
+    New { space: i64, name: String },
+    /// The agents a new tab in `space` can start, found when the list opened.
+    Agents {
+        space: i64,
+        name: String,
+        agents: Vec<crate::config::Launcher>,
+    },
     /// A machine being connected has no qoro: put this version there, or not.
     Install {
         target: String,
@@ -1398,6 +1412,27 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             ("new space".to_string(), crate::keys::named("ctrl-a w")),
             ("connect a machine (ssh)".to_string(), String::new()),
         ],
+        MenuKind::New { .. } => vec![
+            ("agent".to_string(), String::new()),
+            ("terminal".to_string(), String::new()),
+        ],
+        MenuKind::Agents { agents, .. } => agents
+            .iter()
+            .map(|a| {
+                // A long command is cut, so the box stays a box and not the width of the
+                // screen: the name already says which line it is.
+                let right = if a.command == a.name {
+                    String::new()
+                } else if crate::width::width(&a.command) > MENU_COMMAND {
+                    let cut = crate::width::text(&a.command, MENU_COMMAND - 1);
+                    format!("{}\u{2026}", cut.trim_end())
+                } else {
+                    a.command.clone()
+                };
+                (a.name.clone(), right)
+            })
+            .chain([("other command".to_string(), String::new())])
+            .collect(),
         MenuKind::Install { platform, .. } => vec![
             (
                 format!("install qoro {} there", env!("CARGO_PKG_VERSION")),
@@ -1408,11 +1443,23 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
     }
 }
 
+/// The most columns an `[agents]` command takes on the right of the agents list.
+const MENU_COMMAND: usize = 30;
+
+/// Open what a `+` offers for `space`.
+fn open_new(state: &mut State, space: i64) {
+    let name = space_name(state, space);
+    state.menu_kind = MenuKind::New { space, name };
+    state.menu = Some(0);
+}
+
 /// What the menu box says it is.
 pub fn menu_title(kind: &MenuKind) -> String {
     match kind {
         MenuKind::Main => " menu".to_string(),
         MenuKind::Plus => " spaces".to_string(),
+        MenuKind::New { name, .. } => format!(" new in {name}"),
+        MenuKind::Agents { name, .. } => format!(" new agent in {name}"),
         // As root said out loud: every agent started there will run as root.
         MenuKind::Install { target, root, .. } => {
             let who = if *root { " as root" } else { "" };
@@ -1439,16 +1486,77 @@ enum MenuSend {
 /// request. A stale, relative or vanished directory falls back to `None`, which is the
 /// daemon's own directory, rather than failing the create.
 fn focused_cwd(state: &State) -> Option<String> {
-    let cwd = state
-        .rows
-        .iter()
-        .find(|r| r.terminal == state.focused)?
-        .cwd
-        .clone()?;
+    let row = state.rows.iter().find(|r| r.terminal == state.focused)?;
+    usable_cwd(row)
+}
+
+/// A row's last reported directory, when a new tab can start there.
+fn usable_cwd(row: &AgentRow) -> Option<String> {
+    let cwd = row.cwd.clone()?;
     // A remote terminal's directory is on its own machine, so this one cannot check it;
     // the mux carries it only to that same machine.
-    let here = crate::mux::is_remote_terminal(state.focused) || std::path::Path::new(&cwd).is_dir();
+    let here = crate::mux::is_remote_terminal(row.terminal) || std::path::Path::new(&cwd).is_dir();
     (!cwd.is_empty() && std::path::Path::new(&cwd).is_absolute() && here).then_some(cwd)
+}
+
+/// Where a new tab in `space` starts: the focused terminal's directory when that space is
+/// on screen, else the first of its tabs with a usable one, else the daemon's own.
+fn space_cwd(state: &State, space: i64) -> Option<String> {
+    if state.space == Some(space)
+        && let Some(cwd) = focused_cwd(state)
+    {
+        return Some(cwd);
+    }
+    state
+        .rows
+        .iter()
+        .filter(|r| r.workspace == space)
+        .find_map(usable_cwd)
+}
+
+/// Remember a create aimed at a space that is not on screen, so its tab is shown with its
+/// space once listed rather than focused into the space on screen.
+fn follow_elsewhere(state: &mut State, space: i64, ask: ControlRequest) -> ControlRequest {
+    if state.space != Some(space)
+        && let ControlRequest::CreateTerminal { id, .. } = &ask
+    {
+        state.elsewhere = Some(id.clone());
+    }
+    ask
+}
+
+/// The agents a `+` offers: the config's `[agents]` first, then every known agent whose
+/// command is on this machine's `PATH`.
+///
+/// ponytail: this machine's PATH even for a remote space; a missing agent there fails in
+/// its own shell, where a person sees why. Ask the remote when that proves annoying.
+fn installed_agents() -> Vec<crate::config::Launcher> {
+    agents_on(
+        crate::config::agents(),
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+}
+
+/// `own` followed by every known agent found in the directories of `path` and not already
+/// started by one of `own`.
+fn agents_on(
+    own: Vec<crate::config::Launcher>,
+    path: &std::ffi::OsStr,
+) -> Vec<crate::config::Launcher> {
+    let mut out = own;
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
+    for name in qoro_domain::program::agent_names() {
+        let listed = out
+            .iter()
+            .any(|l| l.command.split_whitespace().next() == Some(name));
+        if !listed && dirs.iter().any(|dir| dir.join(name).is_file()) {
+            out.push(crate::config::Launcher {
+                name: name.to_string(),
+                command: name.to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// Ask the daemon for a tab running an agent command, and remember the line to
@@ -1459,7 +1567,12 @@ fn focused_cwd(state: &State) -> Option<String> {
 /// word as its name, so it reads as the agent until renamed. Empty commands never
 /// reach here: the prompt treats them as a cancel. The caller owns the request
 /// number, incremented the same way every other prompt answer is.
-fn start_agent_terminal(state: &mut State, id: u64, command: &str) -> ControlRequest {
+fn start_agent_terminal(
+    state: &mut State,
+    id: u64,
+    command: &str,
+    space: Option<i64>,
+) -> ControlRequest {
     let id = format!("agent-{id}");
     let name = command
         .split_whitespace()
@@ -1478,9 +1591,10 @@ fn start_agent_terminal(state: &mut State, id: u64, command: &str) -> ControlReq
         id,
         // Like every other new tab: the agent starts where the
         // person already is rather than where the daemon started.
-        cwd: focused_cwd(state),
-        // The space the person is looking at.
-        workspace: state.space,
+        cwd: space
+            .and_then(|space| space_cwd(state, space))
+            .or_else(|| focused_cwd(state)),
+        workspace: space,
         name,
     }
 }
@@ -1547,6 +1661,36 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                 Naming::Remote
             });
             return MenuSend::Nothing;
+        }
+        MenuKind::New { space, name } => {
+            if item == 0 {
+                state.menu_kind = MenuKind::Agents {
+                    space,
+                    name,
+                    agents: installed_agents(),
+                };
+                state.menu = Some(0);
+                return MenuSend::Nothing;
+            }
+            *request += 1;
+            state.message = Some("starting a terminal".to_string());
+            let ask = ControlRequest::CreateTerminal {
+                id: format!("new-{request}"),
+                cwd: space_cwd(state, space),
+                workspace: Some(space),
+                name: None,
+            };
+            return MenuSend::Control(follow_elsewhere(state, space, ask));
+        }
+        MenuKind::Agents { space, agents, .. } => {
+            let Some(agent) = agents.get(item) else {
+                state.prompt = ask(Naming::Agent(Some(space)));
+                return MenuSend::Nothing;
+            };
+            *request += 1;
+            state.message = Some(format!("starting {}", agent.name));
+            let ask = start_agent_terminal(state, *request, &agent.command, Some(space));
+            return MenuSend::Control(follow_elsewhere(state, space, ask));
         }
         MenuKind::Install { target, .. } => {
             if item != 0 {
@@ -1762,8 +1906,9 @@ pub enum Naming {
     /// Which agent to run in a new tab, from the palette's agent row. The answer is a
     /// command line, not a tab name: the tab takes the command's first word, and the
     /// whole line is typed into its shell once the tab opens. Any command works, so
-    /// an agent the table never heard of starts the same way a listed one does.
-    Agent,
+    /// an agent the table never heard of starts the same way a listed one does. The space
+    /// it starts in, or `None` when none is on screen.
+    Agent(Option<i64>),
     /// Rename what already exists, which is the common case: a name given at creation is a
     /// guess, and the terminal somebody opened to "look at something" is the one they are
     /// still in an hour later doing the thing it should have been called after.
@@ -1779,7 +1924,7 @@ impl Naming {
         match self {
             Naming::Space => "name the new space",
             Naming::Terminal => "name the new terminal",
-            Naming::Agent => "which agent to run",
+            Naming::Agent(_) => "which agent to run",
             Naming::RenameSpace(_) => "rename this space",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::Remote => "ssh address of the machine",
@@ -1791,7 +1936,7 @@ impl Naming {
     /// carry flags, so it gets the wider box too.
     pub fn limit(self) -> usize {
         match self {
-            Naming::Remote | Naming::Agent => 56,
+            Naming::Remote | Naming::Agent(_) => 56,
             _ => NAME_LIMIT,
         }
     }
@@ -1802,7 +1947,7 @@ impl Naming {
             Naming::Space | Naming::Terminal => {
                 "enter to make it, esc to stop, empty for a default name"
             }
-            Naming::Agent => "an agent command, like claude; enter to start it, esc to stop",
+            Naming::Agent(_) => "an agent command, like claude; enter to start it, esc to stop",
             Naming::RenameTerminal(_) => {
                 "enter to rename, esc to stop, empty for the program's own name"
             }
@@ -3351,6 +3496,8 @@ enum Clicked {
     CancelClose,
     Terminal(u32),
     NewTerminal,
+    /// A space's `+`: a terminal or an agent in that space.
+    New(i64),
     NewSpace,
 }
 
@@ -3510,6 +3657,7 @@ where
         pending_focus: None,
         last: LastFocus::read(last_focus),
         show_when_listed: None,
+        elsewhere: None,
         waking: None,
         dim: 0,
         spaces: Vec::new(),
@@ -3976,6 +4124,11 @@ where
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
+                    // A column pulled to half a wide window stays at most half of a
+                    // narrower one, so the pane and the edge to drag never vanish.
+                    state.sidebar_width = state
+                        .sidebar_width
+                        .min(sidebar::sidebar_max(cols));
                     // The window moved: refresh what is shown before
                     // sizing, or the child reflows against the width the pane no longer
                     // has.
@@ -4102,16 +4255,18 @@ where
                                     }
                                     palette::Item::NewAgentAsk => {
                                         state.prompt = Some(Prompt {
-                                            what: Naming::Agent,
+                                            what: Naming::Agent(state.space),
                                             text: String::new(),
                                         });
                                     }
                                     palette::Item::NewAgent(program) => {
                                         request += 1;
+                                        let space = state.space;
                                         let ask = start_agent_terminal(
                                             &mut state,
                                             request,
                                             &program,
+                                            space,
                                         );
                                         state.message = Some(format!("starting {program}"));
                                         wr.write_all(&client::encode_control_seq(
@@ -4258,8 +4413,14 @@ where
                                     // A command line, not a name: empty is a cancel, as
                                     // with a space's name, and anything else starts an
                                     // agent tab, listed or not.
-                                    Naming::Agent => name.map(|command| {
-                                        start_agent_terminal(&mut state, request, &command)
+                                    Naming::Agent(space) => name.map(|command| {
+                                        let ask = start_agent_terminal(
+                                            &mut state, request, &command, space,
+                                        );
+                                        match space {
+                                            Some(space) => follow_elsewhere(&mut state, space, ask),
+                                            None => ask,
+                                        }
                                     }),
                                     Naming::Space => Some(ControlRequest::CreateWorkspace {
                                         id: format!("space-{request}"),
@@ -4287,7 +4448,7 @@ where
                                     )?).await?;
                                     state.message = Some(match what {
                                         Naming::Terminal => "starting a terminal".to_string(),
-                                        Naming::Agent => match &ask {
+                                        Naming::Agent(_) => match &ask {
                                             ControlRequest::CreateTerminal {
                                                 name: Some(tab),
                                                 ..
@@ -4591,16 +4752,12 @@ where
                                 // armed row's own columns through `act`, and taking the
                                 // flag first would answer `y` as the sleep toggle.
                                 match clicked {
-                                    // A sleeping tab: looked at, not woken. Enter or
-                                    // ctrl-a Z wakes it once the person has seen it.
+                                    // A sleeping tab: a click wakes its space and follows
+                                    // that tab. The palette and ctrl-a n/p still only peek.
                                     Some(Clicked::Terminal(picked))
                                         if let Some(space) = state.sleeping_space_of(picked) =>
                                     {
-                                        if let Some(bytes) = peek(
-                                            &mut state, space, picked, &mut control_seq, &mut seqs,
-                                        )? {
-                                            wr.write_all(&bytes).await?;
-                                        }
+                                        wake(&mut state, space, Some(picked), &mut request);
                                         dirty = true;
                                     }
                                     Some(Clicked::Terminal(picked)) => {
@@ -4611,11 +4768,26 @@ where
                                             dirty = true;
                                         }
                                     }
+                                    // The tab bar's `+` is the space on screen's `+`.
                                     Some(Clicked::NewTerminal) => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Terminal,
-                                            text: String::new(),
-                                        });
+                                        match state.space {
+                                            // A sleeping space wakes first, as its
+                                            // column row has no `+` until then.
+                                            Some(space) if state.asleep(space) => {
+                                                wake(&mut state, space, None, &mut request);
+                                            }
+                                            Some(space) => open_new(&mut state, space),
+                                            None => {
+                                                state.prompt = Some(Prompt {
+                                                    what: Naming::Terminal,
+                                                    text: String::new(),
+                                                });
+                                            }
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::New(space)) => {
+                                        open_new(&mut state, space);
                                         dirty = true;
                                     }
                                     // Two things a new space can be: one here, or the
@@ -6996,7 +7168,9 @@ fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
     state.probing = None;
     let target = match &kind {
         MenuKind::Install { target, .. } => target.clone(),
-        MenuKind::Main | MenuKind::Plus => String::new(),
+        MenuKind::Main | MenuKind::Plus | MenuKind::New { .. } | MenuKind::Agents { .. } => {
+            String::new()
+        }
     };
     let fits = crate::screen::menu_rect(
         state.cols,
@@ -7720,7 +7894,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // has moved to another tab since.
             let on_screen =
                 bound && matches!(home, Some((space, None)) if state.space == Some(space));
-            if on_screen || !is_split {
+            if state.elsewhere.as_deref() == Some(id.as_str()) {
+                state.elsewhere = None;
+                state.show_when_listed = Some((terminal, std::time::Instant::now()));
+            } else if on_screen || !is_split {
                 state.pending_focus = Some(terminal);
             }
             // An agent tab's shell is up: queue its command line. The shell holds
@@ -7816,6 +7993,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // An agent tab that never opened types nothing: its line goes with it.
             // The refusal itself is shown below, like any other.
             take_agent_command(state, &id);
+            if state.elsewhere.as_deref() == Some(id.as_str()) {
+                state.elsewhere = None;
+            }
             // A daemon older than this client, refusing the colours it was told. It has
             // nothing to do with them anyway: said once, silently, and never again.
             if id.is_empty() && reason.contains("`HostColors`") {
@@ -8111,10 +8291,10 @@ mod tests {
         assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MIN);
         // Past the pane edge the drag stays latched.
         assert!(s.divider_motion(70, false));
-        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MAX);
+        assert_eq!(s.sidebar_width, sidebar::sidebar_max(s.cols));
         // Shift motions are ignored while the drag stays armed.
         assert!(!s.divider_motion(20, true));
-        assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MAX);
+        assert_eq!(s.sidebar_width, sidebar::sidebar_max(s.cols));
         assert!(s.sidebar_drag.is_some());
         // Back inside: moves again.
         assert!(s.divider_motion(25, false));
@@ -9077,6 +9257,7 @@ mod tests {
             pending_focus: None,
             last: LastFocus::default(),
             show_when_listed: None,
+            elsewhere: None,
             waking: None,
             dim: 0,
             spaces: vec![space(1, "app"), space(2, "webshop")],
@@ -9218,7 +9399,7 @@ mod tests {
     #[test]
     fn an_agent_tab_takes_the_commands_first_word_as_its_name() {
         let mut s = state();
-        let ask = start_agent_terminal(&mut s, 7, "claude");
+        let ask = start_agent_terminal(&mut s, 7, "claude", None);
         match ask {
             ControlRequest::CreateTerminal { id, name, .. } => {
                 assert_eq!(id, "agent-7");
@@ -9237,7 +9418,7 @@ mod tests {
     #[test]
     fn an_agent_command_with_flags_keeps_the_whole_line() {
         let mut s = state();
-        let ask = start_agent_terminal(&mut s, 7, "my-agent --resume");
+        let ask = start_agent_terminal(&mut s, 7, "my-agent --resume", None);
         match ask {
             ControlRequest::CreateTerminal { name, .. } => {
                 assert_eq!(name.as_deref(), Some("my-agent"));
@@ -9248,6 +9429,127 @@ mod tests {
             s.pending_agents.get("agent-7").map(String::as_str),
             Some("my-agent --resume")
         );
+    }
+
+    /// A space's `+` starts its tab in that space and that space's directory, even when
+    /// another space is on screen: `agent` lists the agents, `terminal` opens a shell, and
+    /// the last agent row asks for any command, still for that space.
+    #[test]
+    fn a_spaces_plus_starts_a_terminal_or_an_agent_in_that_space() {
+        let dir = std::env::temp_dir().display().to_string();
+        let mut s = state();
+        s.rows
+            .iter_mut()
+            .find(|r| r.terminal == 1)
+            .expect("space 1 row")
+            .cwd = Some(dir.clone());
+        let mut request = 0;
+
+        open_new(&mut s, 1);
+        match apply_menu_choice(&mut s, 1, &mut request) {
+            MenuSend::Control(ControlRequest::CreateTerminal {
+                workspace,
+                cwd,
+                name,
+                ..
+            }) => {
+                assert_eq!(workspace, Some(1));
+                assert_eq!(cwd.as_deref(), Some(dir.as_str()));
+                assert_eq!(name, None);
+            }
+            _ => panic!("terminal is a create"),
+        }
+        // Space 1 is not on screen, so the answer waits for the index to show the tab.
+        let id = s.elsewhere.clone().expect("a create elsewhere is followed");
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::TerminalCreated { id, terminal: 9 },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.elsewhere, None);
+        assert_eq!(s.pending_focus, None);
+        assert_eq!(s.show_when_listed.map(|(t, _)| t), Some(9));
+
+        open_new(&mut s, 1);
+        assert!(matches!(
+            apply_menu_choice(&mut s, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        assert!(matches!(s.menu_kind, MenuKind::Agents { space: 1, .. }));
+        assert_eq!(s.menu, Some(0));
+
+        let agents = vec![crate::config::Launcher {
+            name: "zed".to_string(),
+            command: "claude --resume".to_string(),
+        }];
+        s.menu_kind = MenuKind::Agents {
+            space: 1,
+            name: "app".to_string(),
+            agents: agents.clone(),
+        };
+        assert_eq!(menu_title(&s.menu_kind), " new agent in app");
+        assert_eq!(
+            menu_rows(&s.menu_kind),
+            vec![
+                ("zed".to_string(), "claude --resume".to_string()),
+                ("other command".to_string(), String::new()),
+            ]
+        );
+        match apply_menu_choice(&mut s, 0, &mut request) {
+            MenuSend::Control(ControlRequest::CreateTerminal {
+                id, workspace, cwd, ..
+            }) => {
+                assert_eq!(workspace, Some(1));
+                assert_eq!(cwd.as_deref(), Some(dir.as_str()));
+                assert_eq!(
+                    s.pending_agents.get(&id).map(String::as_str),
+                    Some("claude --resume")
+                );
+            }
+            _ => panic!("an agent is a create"),
+        }
+
+        s.menu_kind = MenuKind::Agents {
+            space: 1,
+            name: "app".to_string(),
+            agents,
+        };
+        assert!(matches!(
+            apply_menu_choice(&mut s, 1, &mut request),
+            MenuSend::Nothing
+        ));
+        assert!(matches!(
+            s.prompt.as_ref().map(|p| p.what),
+            Some(Naming::Agent(Some(1)))
+        ));
+    }
+
+    /// A `+` offers the person's own agents first, then the known agents on PATH that
+    /// none of them already starts, and nothing that is not there.
+    #[test]
+    fn a_plus_offers_own_agents_then_the_known_ones_on_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["claude", "codex", "not-an-agent"] {
+            std::fs::write(dir.path().join(name), "").expect("write");
+        }
+        let own = vec![crate::config::Launcher {
+            name: "yolo".to_string(),
+            command: "claude --dangerously-skip-permissions".to_string(),
+        }];
+        let names: Vec<String> = agents_on(own, dir.path().as_os_str())
+            .into_iter()
+            .map(|l| l.name)
+            .collect();
+        assert_eq!(names, ["yolo", "codex"]);
+    }
+
+    /// The column drags out to half the window, and never below its narrowest.
+    #[test]
+    fn the_column_drags_to_half_the_window() {
+        assert_eq!(sidebar::sidebar_max(200), 100);
+        assert_eq!(sidebar::sidebar_max(20), sidebar::SIDEBAR_MIN);
     }
 
     /// The `TerminalCreated` answer for an agent queues its line with enter,
@@ -9679,6 +9981,7 @@ mod tests {
             pending_focus: None,
             last: LastFocus::default(),
             show_when_listed: None,
+            elsewhere: None,
             waking: None,
             dim: 0,
             spaces: Vec::new(),
@@ -9793,6 +10096,7 @@ mod tests {
             pending_focus: None,
             last: LastFocus::default(),
             show_when_listed: None,
+            elsewhere: None,
             waking: None,
             dim: 0,
             spaces: vec![space(1, "app")],
@@ -12261,7 +12565,7 @@ mod tests {
         );
     }
 
-    /// Reaching for a sleeping tab (a click, a palette jump) only puts the keyboard on it:
+    /// Reaching for a sleeping tab from the keyboard (a palette jump) only puts it on screen:
     /// its space comes on screen with that tab picked and nothing is asked of the daemon.
     #[test]
     fn reaching_for_a_sleeping_tab_shows_it_and_wakes_nothing() {
