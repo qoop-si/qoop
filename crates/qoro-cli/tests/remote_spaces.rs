@@ -522,6 +522,10 @@ fn scenario() {
     drop(rt);
     stop(remote.path());
     stop(local.path());
+    // The bare machine's daemon too: the connect after the install starts one there, under
+    // `run`, and nothing else ends it. Left alone it outlives the test and its deleted
+    // directory, one orphan per run.
+    stop(&bare.path().join("run"));
     let _ = daemon.kill();
     let _ = daemon.wait();
     if let Err(panic) = outcome {

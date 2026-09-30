@@ -115,6 +115,15 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
             .env("RES_OPTIONS", "timeout:1 attempts:1");
     }
     let out = command.output().expect("run qoro");
+    // A row that starts a daemon on demand (`ensure-awake` opens a first tab) leaves it
+    // running, and the scratch directory is deleted under it: one orphan per such row per
+    // run. Stopped here, for every row, so a row added later cannot leak one either.
+    let _ = Command::new(qoro())
+        .arg("stop")
+        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env_remove("QORO_SESSION")
+        .output();
     let here = dir.path().display().to_string();
     (
         String::from_utf8_lossy(&out.stdout).replace(&here, "<scratch>"),
