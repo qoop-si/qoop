@@ -24,15 +24,15 @@ use qoro_store::Store;
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
-/// A runtime directory that a test owns outright, so a restart can reuse it.
+/// A runtime directory the test owns, reused by a restart and removed when the test ends.
 ///
-/// Not a `TempDir`: one of those deletes what it holds when it goes out of scope, and the
-/// whole point of the restart test is that the second daemon reads the first one's files.
+/// The name is short on purpose: the daemon's socket lives two levels down, and a macOS
+/// `$TMPDIR` leaves little of the 104 bytes a socket path may have.
 struct Runtime(PathBuf);
 
 impl Runtime {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("qoro-ledger-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ql-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("a runtime directory");
         // The daemon refuses a directory anything group or other can reach (ADR-012), and
@@ -95,7 +95,6 @@ impl Daemon {
             socket.display()
         );
         qoro_testkit::open_first_terminal(&socket);
-        std::thread::sleep(Duration::from_millis(500));
         daemon
     }
 
@@ -321,11 +320,8 @@ async fn a_retry_after_a_restart_is_still_a_replay() {
 /// terminal task deregisters itself: measured with the packaged binary at 278 to 294 ms
 /// after the close is issued, against a 12 to 40 ms round trip. A retry sent inside that
 /// window finds a live terminal and is answered by a second real close, so waiting is the
-/// only thing that makes the close assertion mean anything.
-///
-/// `ListTerminals` is the probe because it is a read of daemon memory: no lock, no store,
-/// no fork, and nothing to clean up. An earlier version probed with a create, which minted
-/// a terminal and wrote a row to the very ledger it was meant to be verifying.
+/// only thing that makes the close assertion mean anything. `ListTerminals` is the probe
+/// because it reads daemon memory and writes nothing, least of all the ledger.
 async fn wait_until_gone(d: &Daemon, runtime: &Runtime, terminal: u32) {
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -334,7 +330,7 @@ async fn wait_until_gone(d: &Daemon, runtime: &Runtime, terminal: u32) {
             .await
             .control(
                 &ControlRequest::ListTerminals { id: "probe".into() },
-                Duration::from_secs(5),
+                PATIENCE,
             )
             .await
             .expect("the probe answers");

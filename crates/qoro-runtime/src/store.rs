@@ -162,6 +162,31 @@ impl StoreHandle {
             .await
     }
 
+    /// Record a terminal and the answer to the command that asked for it, in one
+    /// transaction.
+    pub async fn create_terminal_answering(
+        &self,
+        key: String,
+        id: i64,
+        workspace: i64,
+        cwd: String,
+        argv: String,
+        title: Option<String>,
+    ) -> Result<i64, HandleError> {
+        self.run(move |s| {
+            s.create_terminal_answering(
+                Some(&key),
+                id,
+                workspace,
+                &cwd,
+                &argv,
+                title.as_deref(),
+                now(),
+            )
+        })
+        .await
+    }
+
     /// The workspaces asleep, the one that went to sleep last first.
     pub async fn asleep(&self) -> Result<Vec<(i64, i64)>, HandleError> {
         self.run(|s| s.asleep()).await
@@ -253,6 +278,11 @@ impl StoreHandle {
         key: String,
     ) -> Result<Option<(bool, serde_json::Value)>, HandleError> {
         self.run(move |s| s.applied(&key)).await
+    }
+
+    /// Undo a create whose shell never started: its row and its answer, in one transaction.
+    pub async fn abandon_create(&self, key: String, id: i64) -> Result<(), HandleError> {
+        self.run(move |s| s.abandon_create(&key, id, now())).await
     }
 
     /// Forget what a retry can no longer be waiting for.

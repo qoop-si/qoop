@@ -74,13 +74,23 @@ The `Command` intent is the one that needs a second reader to believe it was loa
 so it is worth being exact: `EventStore::append` wrote the ledger row only inside its
 `Outcome` branch, so the lookup was structurally unable to see an intent.
 
-## A hole this change does not close
+## A create and its answer are one write
 
-If a create's ledger write fails while the terminal is alive, the client is told
-`Failed`, the tab keeps running, and a retry opens a second one. That predates this change
-and gate G4.6 does not cover it. It is closable now that the row and the ledger are in one
-database: `create_terminal` and `record_applied` can share a transaction. Filed, not done
-here, because it changes crash semantics.
+A create writes the terminal row, its layout place and its ledger row in one transaction,
+before the shell is started. Three holes close with it. A ledger write can no longer fail
+after the shell is running, so a client is never told `Failed` about a live tab. A daemon
+killed between the write and the answer comes back with the tab restored and the answer
+that names it, so the retry is a replay. And two attempts at one create, racing on two
+connections, cannot both open a tab: the lookup runs under the space's lock, after the
+first attempt has started its shell or undone itself, and the insert fails on a key already
+answered. A spawn that fails closes the row and takes the answer back in one transaction,
+so a retry tries again. A write past its deadline still commits, so a create that finds its
+own answer there carries on, and one that finds nothing undoes the write in case it lands
+later. That undo is best effort: the store's lock is not FIFO, so a write stalled past its
+deadline can still land after the undo and leave a tab for the next start. Closing it needs
+a cancel flag checked before the commit, and it has not been worth one. The name a tab is
+born with is in the same transaction. Gate G4.4 breaks the ledger under a running daemon
+and checks that a create is refused with no tab left behind.
 
 ## What lives in the runtime directory, and what that costs
 
@@ -161,14 +171,19 @@ The resolution, stated rather than discovered in production:
    and surfaces the condition in status output. It leaves degraded mode when a write
    succeeds.
 
+   Not built. What exists is per command: a create whose write fails is refused in words
+   with no tab left behind, a ledger that cannot be read is treated as "not applied", and a
+   close proceeds whether or not its answer can be written, because a refused close leaves
+   a shell the client cannot get rid of. No mode, no status line.
+
 The one thing that never happens is a silent inconsistency.
 
 ### Crash windows
 
-For `CreateTerminal` the store row is the reconciliation: the row is written before the
-spawn, closed when it fails, and `restore_report` reopens every open row. The ledger row is
-the second half, written after the spawn and before the answer, and it is what makes a
-retry a replay rather than a second tab.
+For `CreateTerminal` the store row is the reconciliation: the row and its ledger row are
+written together before the spawn, both undone in one transaction when it fails, and
+`restore_report` reopens every open row. The ledger row is what makes a retry a replay
+rather than a second tab.
 
 An earlier version of this ADR claimed that an intent with no outcome caused the daemon to
 look for the process, and that a teardown intent re-ran teardown from its idempotent step.
@@ -178,7 +193,7 @@ restore read, which the next sentence of that version already said.
 ## Rollback
 
 `qoro.db` gains a table and `SCHEMA_VERSION` does not move, so a build that predates this
-one still opens the file and ignores the table. `events.db` is left on disk unread, so
-reverting loses nothing. `EventStore` remains a trait, so a different backing store can
-replace SQLite in `qoro-events` without touching domain or runtime code; `qoro-store` is
-the one with no replacement, and its schema is a ladder rather than a version check.
+one still opens the file and ignores the table. That older build reads its ledger from
+`events.db`, which this one no longer writes, so a retry that spans a downgrade opens a
+second tab; nothing else is lost. `events.db` is left on disk unread. `qoro-store` has no
+replacement, and its schema is a ladder rather than a version check.

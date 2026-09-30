@@ -39,6 +39,11 @@ pub enum StoreError {
     Outcome(#[from] serde_json::Error),
 }
 
+/// The ledger's answer to a create that made terminal `id`, as it is stored.
+fn created_answer(id: i64) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&(true, serde_json::json!({ "terminal": id })))
+}
+
 /// The schema version this build writes and expects.
 ///
 /// Checked on open rather than assumed. A daemon that silently runs against a newer
@@ -270,6 +275,25 @@ impl Store {
         }
     }
 
+    /// Undo a create whose shell never started: close its row and take back its answer, in
+    /// one transaction, so a retry tries again instead of being told about a dead tab.
+    ///
+    /// Only an answer naming this terminal is taken back. A key answered by another
+    /// attempt at the same create stands, whatever this one saw.
+    pub fn abandon_create(&mut self, key: &str, id: i64, now: i64) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE terminal SET closed_at = ?2 WHERE id = ?1 AND closed_at IS NULL",
+            params![id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM applied WHERE idempotency_key = ?1 AND outcome = ?2",
+            params![key, created_answer(id)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Forget what is older than `before_unix`.
     ///
     /// A client's retry is seconds behind the answer it missed, so the ledger only has to
@@ -310,6 +334,28 @@ impl Store {
         argv: &str,
         now: i64,
     ) -> Result<i64, StoreError> {
+        self.create_terminal_answering(None, id, workspace, cwd, argv, None, now)
+    }
+
+    /// The same, with its name and the answer to the command that asked for it written
+    /// down in the same transaction.
+    ///
+    /// A create answered only after a second write can start a shell and then fail to
+    /// record it, which leaves a client told `Failed` with a tab running and a retry that
+    /// opens another. Here the row, its place, its name and the answer land together or
+    /// not at all, and a key already answered fails the insert, so two attempts at one
+    /// create cannot both make a terminal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_terminal_answering(
+        &mut self,
+        key: Option<&str>,
+        id: i64,
+        workspace: i64,
+        cwd: &str,
+        argv: &str,
+        title: Option<&str>,
+        now: i64,
+    ) -> Result<i64, StoreError> {
         let tx = self.conn.transaction()?;
         let exists: Option<i64> = tx
             .query_row(
@@ -322,9 +368,9 @@ impl Store {
             return Err(StoreError::NoWorkspace(workspace));
         }
         tx.execute(
-            "INSERT INTO terminal (id, workspace, cwd, argv, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, workspace, cwd, argv, now],
+            "INSERT INTO terminal (id, workspace, cwd, argv, created_at, title) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, workspace, cwd, argv, now, title],
         )?;
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM layout WHERE workspace = ?1",
@@ -335,6 +381,12 @@ impl Store {
             "INSERT INTO layout (workspace, terminal, ordinal) VALUES (?1, ?2, ?3)",
             params![workspace, id, next],
         )?;
+        if let Some(key) = key {
+            tx.execute(
+                "INSERT INTO applied (idempotency_key, outcome, at_unix) VALUES (?1, ?2, ?3)",
+                params![key, created_answer(id)?, now],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -642,26 +694,14 @@ mod tests {
         assert!(s.splits().unwrap().is_empty());
     }
 
-    /// Splits must not cost an older binary the file: the table is new, the version is not.
+    /// Splits and the ledger must not cost an older binary the file: the tables are new, the
+    /// version is not. A bump makes every older build refuse the file, and the error it
+    /// prints tells the person to move it aside, which is deleting their workspaces.
     #[test]
-    fn split_trees_do_not_bump_the_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 2);
-    }
-
-    /// The same argument for the idempotency ledger, and it matters more than the splits:
-    /// a version bump makes every build with `SCHEMA_VERSION = 2` refuse the file, and the
-    /// error it prints tells the person to move the file aside, which is deleting their
-    /// workspaces.
-    ///
-    /// The tripwire is the constant, because that is the only way a table added behind a
-    /// bump could get in. Whether an older build then opens the file is the next test, and
-    /// it cannot be asserted from here: this build does know the table.
-    #[test]
-    fn the_ledger_does_not_bump_the_schema_version() {
+    fn new_tables_do_not_bump_the_schema_version() {
         assert_eq!(
             SCHEMA_VERSION, 2,
-            "a new table must be created unconditionally; a version bump makes every older \
-             build refuse the file and cost the person their workspaces"
+            "a new table must be created unconditionally, never behind a version bump"
         );
     }
 
@@ -757,11 +797,73 @@ mod tests {
             matches!(answer, Err(StoreError::Outcome(_))),
             "a row that cannot be read was answered as: {answer:?}"
         );
-        // And it is specifically not the absence a caller would treat as "go ahead".
-        assert!(
-            !matches!(answer, Ok(None)),
-            "an unreadable row read as not applied, so a create would run twice"
+    }
+
+    /// A create and its answer land together: the terminal row, its layout place and the
+    /// ledger row, in one transaction.
+    #[test]
+    fn a_create_writes_its_answer_in_the_same_transaction() {
+        let mut s = Store::in_memory().expect("a store");
+        let ws = s.create_workspace("w", 1).expect("workspace");
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", Some("build"), 100)
+            .expect("create");
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 7 })))
         );
+        let rows = s.open_terminals(ws).expect("terminals");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_deref(), Some("build"));
+    }
+
+    /// A second create under an answered key fails whole: no second terminal row, and the
+    /// first answer still stands. This is what stops two attempts at one create, racing on
+    /// two connections, from both opening a tab.
+    #[test]
+    fn a_create_under_an_answered_key_makes_nothing() {
+        let mut s = Store::in_memory().expect("a store");
+        let ws = s.create_workspace("w", 1).expect("workspace");
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+            .expect("create");
+        assert!(
+            s.create_terminal_answering(Some("k1"), 8, ws, "/tmp", "/bin/sh", None, 200)
+                .is_err(),
+            "a second create under the same key was written"
+        );
+        assert_eq!(s.open_terminals(ws).expect("terminals").len(), 1);
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 7 })))
+        );
+    }
+
+    /// A create whose shell never started is undone whole: no open row to come back at
+    /// the next start, and no answer, so a retry tries again.
+    #[test]
+    fn an_abandoned_create_leaves_no_tab_and_no_answer() {
+        let mut s = Store::in_memory().expect("a store");
+        let ws = s.create_workspace("w", 1).expect("workspace");
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+            .expect("create");
+        s.abandon_create("k1", 7, 200).expect("abandon");
+        assert_eq!(s.applied("k1").expect("lookup"), None);
+        assert!(s.open_terminals(ws).expect("terminals").is_empty());
+    }
+
+    /// Abandoning takes back only an answer that names this terminal: a key another
+    /// attempt answered stands.
+    #[test]
+    fn abandoning_keeps_an_answer_that_names_another_terminal() {
+        let mut s = Store::in_memory().expect("a store");
+        let ws = s.create_workspace("w", 1).expect("workspace");
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+            .expect("create");
+        s.abandon_create("k1", 8, 200).expect("abandon");
+        assert_eq!(
+            s.applied("k1").expect("lookup"),
+            Some((true, serde_json::json!({ "terminal": 7 })))
+        );
+        assert_eq!(s.open_terminals(ws).expect("terminals").len(), 1);
     }
 
     /// The first answer is the one that stands.

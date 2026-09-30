@@ -1499,7 +1499,6 @@ pub struct ServeContext {
     pub history_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
     pub agents: Arc<crate::agents::AgentRegistry>,
-
     /// Which terminals live connections watch. Incremented on subscribe,
     /// decremented on unsubscribe and disconnect; the idle reaper reads it.
     pub watched: crate::idle::WatchCounts,
@@ -2467,11 +2466,9 @@ fn verify_waiter(
 /// Write down that a close happened, so a retry of the same request finds it applied
 /// rather than reporting a terminal that is already gone.
 async fn record_close(store: &crate::store::StoreHandle, id: &str, terminal: u32) {
-    // The error is deliberately dropped, which is what this did when the ledger lived in
-    // the event log. A terminal that is already gone is what the caller wanted; refusing
-    // the close because the answer could not be written down would leave a tab the client
-    // cannot get rid of. The cost is that a retry of an unrecorded close is answered from
-    // the terminal rather than from here, and that is the better failure for a close.
+    // Best effort. Refusing a close because its answer could not be written down would
+    // leave a tab the client cannot get rid of; a retry of an unrecorded close is answered
+    // from the terminal instead, which is the better failure for a close.
     let _ = store
         .record_applied(
             id.to_string(),
@@ -2539,7 +2536,6 @@ async fn handle_control(
     client: &ClientId,
     scanner: &Arc<ContainmentScanner>,
     agents: &Arc<crate::agents::AgentRegistry>,
-
     watched: &crate::idle::WatchCounts,
     connections: &Arc<ConnectionRegistry>,
     books: &Bookkeeping,
@@ -2564,18 +2560,17 @@ async fn handle_control(
     // failure safe, and the reason it is a lookup and not a scan is that a scan gets
     // slower exactly as the table grows.
     //
-    // A lookup that fails is treated as "not applied" rather than refused, which is the
-    // same decision `record_close` makes on the write side and for the same reason: the two
-    // costs are not symmetric. A create that runs twice opens a tab the client can see and
-    // close. A close refused because the ledger could not be read leaves a shell the
-    // client cannot get rid of, and that is the failure worth avoiding. The read and the
-    // write go through the same connection under the same deadline, so a store that is
-    // stalling is already refusing to record what it does, and ADR-005's rule 1 says the
-    // terminal never waits for it.
-    if is_mutating(&request)
+    // A create looks under its space's lock instead, below, so it never answers from a row
+    // whose shell another attempt is still starting.
+    //
+    // A lookup that fails is treated as "not applied" rather than refused. A create is
+    // still safe: its own write carries the answer and fails on a key already answered. A
+    // close refused because the ledger could not be read would leave a shell the client
+    // cannot get rid of, which is the failure worth avoiding (ADR-005 rule 1).
+    if matches!(request, ControlRequest::CloseTerminal { .. })
         && let Ok(Some((ok, detail))) = store.applied(id.clone()).await
     {
-        return replayed_response(&id, ok, &detail, &request);
+        return replayed_response(&id, ok, &detail, false);
     }
 
     match request {
@@ -2596,6 +2591,11 @@ async fn handle_control(
                 Some(guard) => guard,
                 None => books.lock_of(workspace).lock_owned().await,
             };
+            // Asked under the lock: an earlier attempt at this create in this space has
+            // either started its shell and answered, or undone itself, by now.
+            if let Ok(Some((ok, detail))) = store.applied(id.clone()).await {
+                return replayed_response(&id, ok, &detail, true);
+            }
             if books.is_asleep(workspace)
                 && let Err(reason) = wake_locked(&restore(), workspace).await
             {
@@ -2649,24 +2649,40 @@ async fn handle_control(
             // Minted before the row is written, because the row is keyed by it. One
             // number for one terminal, in the registry and in the database.
             let stream = terminals.mint();
+            // The row, its name and the answer are one transaction, so a client is never
+            // told `Failed` about a shell that is running, and a daemon killed after this
+            // point comes back with the tab and the answer that names it (ADR-005).
             if let Err(e) = store
-                .create_terminal(
+                .create_terminal_answering(
+                    id.clone(),
                     stream as i64,
                     workspace,
                     recorded_cwd.clone(),
                     shell.display().to_string(),
+                    name.clone(),
                 )
                 .await
             {
-                return ControlResponse::Failed {
-                    id,
-                    reason: format!("could not record the terminal: {e}"),
-                };
-            }
-            if let Some(name) = name.as_deref() {
-                // Written now rather than at the next rename, so a tab named at birth
-                // comes back under its name.
-                let _ = store.set_title(stream as i64, name.to_string()).await;
+                // A deadline does not cancel the write, so this may be our own commit
+                // landing late, which is carried on with. Or another attempt at this create,
+                // in another space, got there first: its answer is this one's too.
+                match store.applied(id.clone()).await {
+                    Ok(Some((true, detail)))
+                        if detail.get("terminal").and_then(|t| t.as_u64())
+                            == Some(u64::from(stream)) => {}
+                    Ok(Some((ok, detail))) => {
+                        return replayed_response(&id, ok, &detail, true);
+                    }
+                    _ => {
+                        // Undone in case it still lands, so a late commit leaves neither a
+                        // tab for the next start nor an answer naming one.
+                        let _ = store.abandon_create(id.clone(), stream as i64).await;
+                        return ControlResponse::Failed {
+                            id,
+                            reason: format!("could not record the terminal: {e}"),
+                        };
+                    }
+                }
             }
             match open_terminal(
                 terminals,
@@ -2686,26 +2702,15 @@ async fn handle_control(
                     // see it, and a separate round trip to say so is a race in which the
                     // first output is lost.
                     subscribe(terminals, subscriptions, renders, watched, stream);
-                    // The outcome, durable before the client is told. ADR-005 rule 2: a
-                    // client is told it succeeded only once the answer is written down,
-                    // which is what makes its retry a replay rather than a second terminal.
-                    if let Err(e) = store
-                        .record_applied(id.clone(), true, serde_json::json!({ "terminal": stream }))
-                        .await
-                    {
-                        return ControlResponse::Failed {
-                            id,
-                            reason: format!("the terminal started but was not recorded: {e}"),
-                        };
-                    }
                     ControlResponse::TerminalCreated {
                         id,
                         terminal: stream,
                     }
                 }
                 Err(e) => {
-                    // The same: a spawn that failed leaves no tab behind to come back.
-                    let _ = store.close_terminal(stream as i64).await;
+                    // The same: a spawn that failed leaves no tab behind to come back,
+                    // and no answer naming it, so a retry tries again.
+                    let _ = store.abandon_create(id.clone(), stream as i64).await;
                     ControlResponse::Failed {
                         id,
                         reason: format!("cannot create a terminal: {e}"),
@@ -3553,21 +3558,13 @@ fn host_colors() -> Option<([u8; 3], [u8; 3])> {
     (packed & HOST_COLORS_SET != 0).then(|| (unpack(packed >> 24), unpack(packed)))
 }
 
-/// Whether a control request changes anything. Only these are journalled and only these
-/// are idempotent: a listing that was answered from a ledger would be a stale listing.
-fn is_mutating(request: &ControlRequest) -> bool {
-    matches!(
-        request,
-        ControlRequest::CreateTerminal { .. } | ControlRequest::CloseTerminal { .. }
-    )
-}
-
-/// The answer a replayed command gets: the original one.
+/// The answer a replayed create or close gets: the original one. Only those two are
+/// recorded and replayed; a listing answered from a ledger would be a stale listing.
 fn replayed_response(
     id: &str,
     ok: bool,
     detail: &serde_json::Value,
-    request: &ControlRequest,
+    created: bool,
 ) -> ControlResponse {
     if !ok {
         return ControlResponse::Failed {
@@ -3580,15 +3577,16 @@ fn replayed_response(
         };
     }
     let terminal = detail.get("terminal").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-    match request {
-        ControlRequest::CreateTerminal { .. } => ControlResponse::TerminalCreated {
+    if created {
+        ControlResponse::TerminalCreated {
             id: id.to_string(),
             terminal,
-        },
-        _ => ControlResponse::TerminalClosed {
+        }
+    } else {
+        ControlResponse::TerminalClosed {
             id: id.to_string(),
             terminal,
-        },
+        }
     }
 }
 
@@ -3966,7 +3964,6 @@ pub fn open_terminal(
     history_dir: Option<PathBuf>,
     scanner: Arc<ContainmentScanner>,
     agents: Arc<crate::agents::AgentRegistry>,
-
     books: Option<Bookkeeping>,
 ) -> io::Result<TerminalHandle> {
     let (commands, from_clients) = mpsc::channel(256);
@@ -5666,7 +5663,6 @@ pub struct TerminalSpawn {
     pub token: qoro_domain::CapabilityToken,
     pub stream: u32,
     pub agents: Arc<crate::agents::AgentRegistry>,
-
     /// The live index, so the terminal's own task can publish where it is
     /// without going through the store. The task is the single writer.
     pub terminals: Arc<TerminalRegistry>,
@@ -6199,7 +6195,6 @@ async fn terminal_task(
     scanner: Arc<ContainmentScanner>,
     agents: Arc<crate::agents::AgentRegistry>,
     stream: u32,
-
     terminals: Arc<TerminalRegistry>,
     books: Option<Bookkeeping>,
     // Where this terminal was started, which is what its row already says.
@@ -6796,10 +6791,8 @@ async fn terminal_task(
                             None => screen_verdict(reading, known),
                         };
                         if let Some(verdict) = verdict {
-                            // Whether or not this changed the belief, the call is the
-                            // point: it filters the repeat and announces the news. It used
-                            // to be followed by a write to the event log, which nothing
-                            // read.
+                            // Whether or not this changed the belief: it filters the
+                            // repeat and announces the news itself.
                             agents.observe_screen(
                                 stream,
                                 &manifest.id,

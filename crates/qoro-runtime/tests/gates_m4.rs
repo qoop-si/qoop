@@ -1,24 +1,23 @@
 //! Milestone 4 gates: the idempotency ledger, and what depends on it.
 //!
-//! ADR-017. The log it describes is still implemented in `qoro-events`, and that crate's
-//! tests still prove a projection is a pure fold over a log. What this daemon keeps is the
-//! one part of that log it ever read: the ledger that makes a retry return the original
-//! answer. It lives in the metadata store now, so these are the gates that cover it.
-//!
-//! What is gone is not covered elsewhere, and this is the list. `qoro-events` still
-//! round-trips a log through a real SQLite file and still proves a projection is a pure
-//! fold over the events, but the gate that did both together is gone: no test now appends
-//! to a store, replays what came back, and folds that. The bounded observation buffer, the
-//! drop accounting and the `gap` that records the loss went with the code that held them,
-//! and nothing replaces them. So did the waiter that re-read rather than folded forward,
-//! and the 1 Hz task that wrote observations at all. All of it was in `eventlog.rs`, none of
-//! it had a production caller, and the first reader of the log decides whether any of it is
-//! written again.
+//! ADR-017. The daemon no longer writes an event log; what it keeps is the one part of it
+//! it ever read, the ledger that makes a retry return the original answer. It lives in the
+//! metadata store, and these are its gates. What went with the log and is covered nowhere
+//! now is listed in ADR-005, "The log is not written".
 
 use std::time::{Duration, Instant};
 
 use qoro_runtime::control::{ControlRequest, ControlResponse};
 use qoro_testkit::{PATIENCE, TestDaemon};
+
+fn create(id: &str) -> ControlRequest {
+    ControlRequest::CreateTerminal {
+        id: id.into(),
+        cwd: None,
+        workspace: None,
+        name: None,
+    }
+}
 
 /// The new connection is the whole point. A retry on the same connection is a retry the
 /// daemon could answer from memory, which is not the case the gate is about: a client that
@@ -30,17 +29,9 @@ async fn g4_6_a_replayed_command_applies_once_and_returns_the_original_answer() 
 
     let first_answer = {
         let mut c = d.attach("first").await;
-        c.control(
-            &ControlRequest::CreateTerminal {
-                id: "same-key".into(),
-                cwd: None,
-                workspace: None,
-                name: None,
-            },
-            PATIENCE,
-        )
-        .await
-        .expect("a response")
+        c.control(&create("same-key"), PATIENCE)
+            .await
+            .expect("a response")
     };
     let ControlResponse::TerminalCreated { terminal, .. } = first_answer else {
         panic!("expected a created terminal, got {first_answer:?}");
@@ -50,15 +41,7 @@ async fn g4_6_a_replayed_command_applies_once_and_returns_the_original_answer() 
     // A new connection, as if the first one had died before the answer arrived.
     let mut second = d.attach("second").await;
     let replayed = second
-        .control(
-            &ControlRequest::CreateTerminal {
-                id: "same-key".into(),
-                cwd: None,
-                workspace: None,
-                name: None,
-            },
-            PATIENCE,
-        )
+        .control(&create("same-key"), PATIENCE)
         .await
         .expect("a response");
     match replayed {
@@ -155,17 +138,9 @@ async fn g4_6_a_replayed_command_is_answered_from_the_store_not_from_memory() {
 
     {
         let mut c = d.attach("writer").await;
-        c.control(
-            &ControlRequest::CreateTerminal {
-                id: "in-the-store".into(),
-                cwd: None,
-                workspace: None,
-                name: None,
-            },
-            PATIENCE,
-        )
-        .await
-        .expect("a response");
+        c.control(&create("in-the-store"), PATIENCE)
+            .await
+            .expect("a response");
     }
     assert_eq!(d.terminals().len(), before + 1);
 
@@ -183,6 +158,9 @@ async fn g4_6_a_replayed_command_is_answered_from_the_store_not_from_memory() {
 /// The rule is ADR-005's first and it is absolute. A terminal that waits for a disk is a
 /// terminal whose child cannot exit, because an exiting child cannot complete until its tty
 /// output is drained.
+///
+/// The ledger table is dropped from a second connection, so every read and write of it
+/// fails for real. A chmod would not do: the daemon holds its descriptor open.
 #[tokio::test]
 async fn g4_4_a_failing_store_does_not_stop_a_terminal() {
     let d = TestDaemon::start().await;
@@ -192,36 +170,54 @@ async fn g4_4_a_failing_store_does_not_stop_a_terminal() {
     c.input_to(terminal, b"echo BEFORE_$((6*7))\n").await;
     assert!(c.wait_for_text_on(terminal, "BEFORE_42", PATIENCE).await);
 
-    // Make the store unwritable, which is what a full or read only filesystem looks like.
-    // The daemon holds its file descriptor open, so this does not make an open connection
-    // fail; it is here to prove that whatever the store answers, the terminal is untouched.
-    let db = d.dir().join("qoro.db");
-    let mut perms = std::fs::metadata(&db).expect("metadata").permissions();
-    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::set_mode(&mut perms, 0o400);
-    std::fs::set_permissions(&db, perms).expect("chmod");
+    rusqlite::Connection::open(d.dir().join("qoro.db"))
+        .expect("a second connection")
+        .execute_batch("DROP TABLE applied")
+        .expect("break the ledger");
 
-    // A mutating command may fail, and must fail in words rather than hang.
-    let answer = c
+    // A create whose answer cannot be written is refused in words, and leaves no tab
+    // behind: a client told `Failed` must not have a shell running.
+    let before = d.terminals().len();
+    let rows = || async {
+        d.store()
+            .open_terminals(d.workspace())
+            .await
+            .expect("the terminal table still reads")
+            .len()
+    };
+    let rows_before = rows().await;
+    let answer = c.control(&create("while-degraded"), PATIENCE).await;
+    assert!(
+        matches!(answer, Some(ControlResponse::Failed { .. })),
+        "a create with no ledger was answered as: {answer:?}"
+    );
+    assert_eq!(d.terminals().len(), before, "a refused create left a tab");
+    assert_eq!(
+        rows().await,
+        rows_before,
+        "a refused create left a row the next start would open"
+    );
+
+    // The terminal is untouched.
+    c.input_to(terminal, b"echo AFTER_$((6*8))\n").await;
+    assert!(
+        c.wait_for_text_on(terminal, "AFTER_48", PATIENCE).await,
+        "the terminal stopped when the store did"
+    );
+
+    // And a close still closes: a ledger that cannot be read is "not applied", not a refusal.
+    let closed = c
         .control(
-            &ControlRequest::CreateTerminal {
-                id: "while-degraded".into(),
-                cwd: None,
-                workspace: None,
-                name: None,
+            &ControlRequest::CloseTerminal {
+                id: "close-while-degraded".into(),
+                terminal,
             },
             PATIENCE,
         )
         .await;
     assert!(
-        answer.is_some(),
-        "a mutating command hung while the store was failing"
-    );
-
-    // And the terminal is untouched.
-    c.input_to(terminal, b"echo AFTER_$((6*8))\n").await;
-    assert!(
-        c.wait_for_text_on(terminal, "AFTER_48", PATIENCE).await,
-        "the terminal stopped when the store did"
+        matches!(closed, Some(ControlResponse::TerminalClosed { .. })),
+        "a close with no ledger was answered as: {closed:?}"
     );
 }
 
