@@ -39,6 +39,9 @@ struct Row: Decodable, Equatable, Identifiable {
     let agent: Bool
     let agent_title: String?
     let cwd: String?
+    /// The space it belongs to (`qoro agents --json`, `AgentRow.workspace`), so its rows
+    /// can carry the same rail the sidebar draws down a space's left edge.
+    let workspace: Int64
 
     var tab: Tab { Tab(session: session, terminal: terminal) }
     var id: Tab { tab }
@@ -57,14 +60,33 @@ struct Row: Decodable, Equatable, Identifiable {
         }
     }
 
+    /// The row's state as one of the sidebar's six pictures (`DotMark.Kind`): waiting
+    /// splits into wants (blocked) or failed, by the row's own state rather than the
+    /// section's worst.
+    var dotKind: DotMark.Kind {
+        switch kind {
+        case .working: return .working
+        case .waiting: return state == "failed" ? .failed : .wants
+        case .done: return .done
+        case .idle: return .idle
+        }
+    }
+
     var label: String { name ?? program ?? "terminal" }
     var place: String { cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "" }
     var detail: String {
         if state == "failed" { return "failed" }
         return agent_title ?? (kind == .waiting ? "needs you" : "")
     }
-    /// Blocked or Failed for a row that needs you, nothing for the rest.
-    var ink: Color? { state == "failed" ? failed : kind == .waiting ? blocked : kind == .done ? done : nil }
+    /// Blocked or Failed for a row that needs you, its state's green once done, nothing
+    /// for the rest (working keeps plain text; the mark carries its colour instead).
+    var ink: Color? {
+        switch kind {
+        case .waiting: return DotMark.ink(dotKind)
+        case .done: return DotMark.ink(.done)
+        default: return nil
+        }
+    }
 }
 
 struct Pet: Decodable {
@@ -157,19 +179,16 @@ final class Store: ObservableObject {
 
     var waiting: Int { rows.filter { $0.kind == .waiting }.count }
     /// The worst state that needs you, as the TUI ranks them: blocked, then failed.
-    var needInk: Color { rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? failed : blocked }
+    var needKind: DotMark.Kind {
+        rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? .failed : .wants
+    }
+    var needInk: Color { DotMark.ink(needKind) }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
     /// Finished while the person was elsewhere, as the qoro interface shows it.
     var finished: Int { rows.filter { $0.kind == .done }.count }
     /// Whether the rows come from more than one session, so each says which.
     var mixed: Bool { Set(rows.map(\.session)).count > 1 }
-
-    /// The right ear in words, zeros left out: what is drawn, and what its width is measured by.
-    var countsText: String {
-        [finished > 0 ? "\(finished) done" : nil, working > 0 ? "\(working) working" : nil, idle > 0 ? "\(idle) idle" : nil]
-            .compactMap { $0 }.joined(separator: " \u{00b7} ")
-    }
 
     func take(_ next: [Row]) {
         let before = Dictionary(rows.map { ($0.tab, $0.kind) }, uniquingKeysWith: { a, _ in a })
@@ -716,13 +735,148 @@ func hostApp(of pid: pid_t) -> NSRunningApplication? {
 
 // MARK: views
 
-// The TUI's roles on a dark ground (crates/qoro-tui/src/theme.rs), so an agent wears
-// the same ink here as in the sidebar and on the phone.
-let blocked = hex("#ff8700")!
-let failed = hex("#ff00ff")!
-let done = hex("#00af5f")!
-let focus = hex("#ff87d7")!
+/// The product's dot language: the same inks, marks and logo geometry as the terminal
+/// sidebar (`crates/qoro-tui/src/theme.rs`, `crates/qoro-tui/src/sidebar.rs`) and
+/// `docs/brand.md`, so an agent's state, a space's identity or the logo reads the same
+/// wherever it is drawn.
+enum Palette {
+    static let working = hex("#00afff")!
+    static let wants = hex("#ff8700")!
+    static let failed = hex("#ff00ff")!
+    static let done = hex("#00af5f")!
+    static let idle = hex("#6c6c6c")!
+    static let asleep = hex("#af87d7")!
+    /// The selected tab's ink, and a peek being typed into: not a state, kept alongside
+    /// the rest since it was one of the four globals this enum replaces.
+    static let focus = hex("#ff87d7")!
+    static let ember = hex("#fd4b03")!
+    /// `ember` reads 2.9:1 on the settings window's light background, under the 3:1 a
+    /// mark needs; this is the same hue a step darker, 4.7:1 there.
+    static let emberOnLight = hex("#c23e00")!
+    static let cream = hex("#fcf7f1")!
+    static let ground = hex("#0f0f11")!
+    /// The identity palette, dark: violet, lime, cyan, pink, sky, yellow, the hex of the
+    /// sidebar's `SPACE_INKS` (177 191 87 218 117 228). The notch is always a dark ground.
+    private static let spaceHex = ["#d787ff", "#d7ff5f", "#5fffff", "#ffafd7", "#87d7ff", "#ffff87"]
+    static let spaces: [Color] = spaceHex.map { hex($0)! }
+
+    /// A space's ink by id, the sidebar's `space_of`: `abs(id) % 6`. One daemon per
+    /// machine (since bdb5544) makes a workspace id unique here too.
+    static func space(_ id: Int64) -> Color { spaces[Int(id.magnitude % UInt64(spaces.count))] }
+}
+
+// Kept as the names the rest of the file already reads them by.
+let blocked = Palette.wants
+let failed = Palette.failed
+let done = Palette.done
+let focus = Palette.focus
 let spring = Animation.spring(response: 0.42, dampingFraction: 0.74)
+
+/// An agent's state as the sidebar's nine-dot picture (`cell_mark`/`breath` in
+/// `crates/qoro-tui/src/sidebar.rs`, pictures in `docs/brand.md`): lit dots in the
+/// state's ink, unlit dots nothing, the same grid everywhere an agent's state is drawn.
+struct DotMark: View {
+    enum Kind { case working, wants, failed, done, idle, asleep }
+
+    let kind: Kind
+    let size: CGFloat
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    static func ink(_ kind: Kind) -> Color {
+        switch kind {
+        case .working: return Palette.working
+        case .wants: return Palette.wants
+        case .failed: return Palette.failed
+        case .done: return Palette.done
+        case .idle: return Palette.idle
+        case .asleep: return Palette.asleep
+        }
+    }
+
+    /// The empty ring: wants, and the logo's letters.
+    static let ring: [(Int, Int)] = [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (1, 2), (0, 2), (0, 1)]
+
+    /// The centre and its arms at breath `frame`, ported from the sidebar's `breath`: arm
+    /// order top, right, bottom, left; a breath's eight steps deepen 1,1,2,3,4,4,3,2; the
+    /// next breath starts one arm further clockwise, so the loop is thirty two frames.
+    private static let arm: [(Int, Int)] = [(1, 0), (2, 1), (1, 2), (0, 1)]
+    /// The still picture, under reduce motion: centre, top, right.
+    private static let still: [(Int, Int)] = [(1, 1), arm[0], arm[1]]
+
+    private static func breath(_ frame: Int) -> [(Int, Int)] {
+        let depth = [1, 1, 2, 3, 4, 4, 3, 2]
+        let base = frame / 8
+        var dots = [(1, 1)]
+        for i in 0..<depth[frame % 8] { dots.append(DotMark.arm[(base + i) % 4]) }
+        return dots
+    }
+
+    private var dots: [(Int, Int)] {
+        switch kind {
+        case .working: return DotMark.still
+        case .wants: return DotMark.ring
+        case .failed: return [(0, 0), (2, 0), (1, 1), (0, 2), (2, 2)]
+        case .done: return (0..<3).flatMap { y in (0..<3).map { x in (x, y) } }
+        case .idle: return [(1, 1)]
+        case .asleep: return [(0, 1), (1, 1), (2, 1)]
+        }
+    }
+
+    /// A working mark breathes on its own clock, the frame read off the wall clock, so every
+    /// working mark on screen shows the same frame and only these small canvases redraw.
+    /// Under reduce motion it holds the still picture.
+    var body: some View {
+        Group {
+            if kind == .working, !reduceMotion {
+                TimelineView(.periodic(from: .now, by: 0.16)) { t in
+                    canvas(DotMark.breath(Int(t.date.timeIntervalSinceReferenceDate / 0.16) % 32))
+                }
+            } else {
+                canvas(dots)
+            }
+        }
+        .frame(width: size, height: size)
+        // Decorative: the row, section or count beside it already reads out the state.
+        .accessibilityHidden(true)
+    }
+
+    private func canvas(_ dots: [(Int, Int)]) -> some View {
+        Canvas { ctx, sz in
+            let cell = sz.width / 3, r = cell * 0.32
+            let ink = DotMark.ink(kind)
+            for (x, y) in dots {
+                let cx = cell * (CGFloat(x) + 0.5), cy = cell * (CGFloat(y) + 0.5)
+                ctx.fill(Path(ellipseIn: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)), with: .color(ink))
+            }
+        }
+    }
+}
+
+/// The q mark, the same geometry as `docs/brand/make.py`'s `mark()`: the ring dead
+/// centre, the tail hanging below it outside the centring, the only dot in ember.
+/// Follows the settings window's own light or dark appearance, ground on cream or
+/// cream on ground, the way the logo's two SVG variants do.
+struct QMark: View {
+    let size: CGFloat
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        Canvas { ctx, _ in
+            let step = size * 0.176, r = size * 0.0625
+            let ox = size / 2 - step, oy = size / 2 - step
+            let ink = scheme == .dark ? Palette.cream : Palette.ground
+            let tailInk = scheme == .dark ? Palette.ember : Palette.emberOnLight
+            for (x, y) in DotMark.ring {
+                let cx = ox + CGFloat(x) * step, cy = oy + CGFloat(y) * step
+                ctx.fill(Path(ellipseIn: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)), with: .color(ink))
+            }
+            let tx = ox + 2 * step, ty = oy + 3 * step
+            ctx.fill(Path(ellipseIn: CGRect(x: tx - r, y: ty - r, width: r * 2, height: r * 2)), with: .color(tailInk))
+        }
+        .frame(width: size, height: size)
+        .accessibilityLabel("qoro")
+    }
+}
 
 /// The concave-shouldered shape of the camera housing, grown to any size.
 struct NotchShape: Shape {
@@ -818,23 +972,52 @@ struct Badge: View {
     }
 }
 
+/// The right ear: a mark and its number per bucket shown, no words, so `[done] 1 ·
+/// [working] 2 · [idle] 8` reads at a glance in the space words used to take.
 struct Counts: View {
     @ObservedObject var s: Store
+    /// The counts' own font size; the mark is sized off it, not a fixed constant.
+    static let fontSize: CGFloat = 12
+    /// As tall as the digits' cap height, roughly three quarters of the font size, so a
+    /// mark never reads as a stray punctuation mark beside the number it belongs to.
+    static let markSize: CGFloat = fontSize * 0.75
+    /// The gap between a mark and its number.
+    static let markGap: CGFloat = 3
+    /// What separates one bucket from the next, now that there is no separator glyph to
+    /// do it: about one digit's width at this font.
+    static let bucketGap: CGFloat = 10
+
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: Counts.bucketGap) {
             if s.finished > 0 {
-                Text("\(s.finished) done").foregroundStyle(done).contentTransition(.numericText())
+                HStack(spacing: Counts.markGap) {
+                    DotMark(kind: .done, size: Counts.markSize)
+                    Text("\(s.finished)").contentTransition(.numericText())
+                }
+                .foregroundStyle(done)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(s.finished) done")
             }
-            if s.finished > 0, s.working + s.idle > 0 { Text("\u{00b7}").foregroundStyle(.white.opacity(0.35)) }
             if s.working > 0 {
-                Text("\(s.working) working").foregroundStyle(.white).contentTransition(.numericText())
+                HStack(spacing: Counts.markGap) {
+                    DotMark(kind: .working, size: Counts.markSize)
+                    Text("\(s.working)").contentTransition(.numericText())
+                }
+                .foregroundStyle(.white)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(s.working) working")
             }
-            if s.working > 0, s.idle > 0 { Text("\u{00b7}").foregroundStyle(.white.opacity(0.35)) }
             if s.idle > 0 {
-                Text("\(s.idle) idle").foregroundStyle(.white.opacity(0.5)).contentTransition(.numericText())
+                HStack(spacing: Counts.markGap) {
+                    DotMark(kind: .idle, size: Counts.markSize)
+                    Text("\(s.idle)").contentTransition(.numericText())
+                }
+                .foregroundStyle(.white.opacity(0.5))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(s.idle) idle")
             }
         }
-        .font(.system(size: 12, weight: .medium))
+        .font(.system(size: Counts.fontSize, weight: .medium))
         .lineLimit(1)
         .fixedSize()
     }
@@ -853,6 +1036,7 @@ struct RowView: View {
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.45))
                 .rotationEffect(.degrees(open ? 90 : 0))
+            DotMark(kind: row.dotKind, size: 11)
             Text(row.label)
                 .fontWeight(.medium)
                 .foregroundStyle(row.ink ?? (row.kind == .idle ? .white.opacity(0.6) : .white))
@@ -872,6 +1056,10 @@ struct RowView: View {
         .frame(height: 30)
         .background(RoundedRectangle(cornerRadius: 8).fill(
             row.ink?.opacity(over || open ? 0.18 : 0.1) ?? .white.opacity(over || open ? 0.08 : 0)))
+        // The space's rail down the row's left edge, so rows of one space read as a block.
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1).fill(Palette.space(row.workspace)).frame(width: 2).padding(.vertical, 3)
+        }
         .contentShape(Rectangle())
         .onHover { over = $0 }
     }
@@ -1136,10 +1324,10 @@ struct Island: View {
             }
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
-                    section("needs you", .waiting)
-                    section("done", .done)
-                    section("working", .working)
-                    section("idle", .idle)
+                    section("needs you", .waiting, s.needKind)
+                    section("done", .done, .done)
+                    section("working", .working, .working)
+                    section("idle", .idle, .idle)
                 }
                 // Room for the rows' highlight, which reaches past the text on both sides.
                 .padding(.horizontal, 8)
@@ -1151,14 +1339,17 @@ struct Island: View {
     }
 
     @ViewBuilder
-    private func section(_ title: String, _ kind: Row.Kind) -> some View {
+    private func section(_ title: String, _ kind: Row.Kind, _ dot: DotMark.Kind) -> some View {
         let rows = s.rows.filter { $0.kind == kind }
         if !rows.isEmpty {
-            Text(title.uppercased())
-                .font(.system(size: 10.5, design: .monospaced))
-                .tracking(0.6)
-                .foregroundStyle(.white.opacity(0.38))
-                .padding(.top, 8).padding(.bottom, 3)
+            HStack(spacing: 5) {
+                DotMark(kind: dot, size: 10)
+                Text(title.uppercased())
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .tracking(0.6)
+                    .foregroundStyle(.white.opacity(0.38))
+            }
+            .padding(.top, 8).padding(.bottom, 3)
             ForEach(rows) { row in
                 let isOpen = s.expanded == row.tab
                 RowView(row: row, open: isOpen, session: s.mixed)
@@ -1295,14 +1486,17 @@ struct SettingsView: View {
     @ObservedObject var store: Store
 
     var body: some View {
-        Form {
-            if let c = m.config {
-                content(c)
-            } else {
-                ProgressView().frame(maxWidth: .infinity)
+        VStack(spacing: 0) {
+            QMark(size: 48).padding(.top, 22).padding(.bottom, 6)
+            Form {
+                if let c = m.config {
+                    content(c)
+                } else {
+                    ProgressView().frame(maxWidth: .infinity)
+                }
             }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
         .frame(width: 460, height: 640)
     }
 
@@ -1435,12 +1629,19 @@ struct Geometry {
     /// The gear beside the counts once open, with its gap.
     static let gear: CGFloat = 28
 
+    /// The right ear's width: not the sentence `countsText` was measured as, but what
+    /// `Counts` now draws, a mark and a number per bucket shown, spaced apart with no
+    /// separator glyph. Each bucket's own width is the fixed mark plus its gap plus the
+    /// measured number, so the pill never clips a mark or crowds a number.
     func closedWidth(_ s: Store) -> CGFloat {
         guard !s.rows.isEmpty else { return notch.width }
-        let text = NSAttributedString(
-            string: s.countsText,
-            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)])
-        let ear = max(Geometry.petEar, ceil(text.size().width) + 26)
+        let counts = [s.finished, s.working, s.idle].filter { $0 > 0 }
+        guard !counts.isEmpty else { return notch.width + 2 * Geometry.petEar }
+        let font: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: Counts.fontSize, weight: .medium)]
+        func width(_ text: String) -> CGFloat { ceil(NSAttributedString(string: text, attributes: font).size().width) }
+        let buckets = counts.reduce(CGFloat(0)) { $0 + Counts.markSize + Counts.markGap + width("\($1)") }
+        let gaps = CGFloat(counts.count - 1) * Counts.bucketGap
+        let ear = max(Geometry.petEar, ceil(buckets + gaps) + 26)
         return notch.width + 2 * ear
     }
 
