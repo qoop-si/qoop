@@ -546,6 +546,9 @@ pub struct TerminalRegistry {
     /// What a person called each conversation here, by the agent's own id for it. Kept
     /// in memory as well as on disk, like the splits, so an index reads no row for it.
     session_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The conversation id last written down for each terminal, so a report that names
+    /// the same one again (every tool call does) costs no write.
+    saved_sessions: std::sync::Mutex<BTreeMap<u32, String>>,
 }
 
 impl TerminalRegistry {
@@ -661,6 +664,31 @@ impl TerminalRegistry {
             splits.clone()
         };
         store.set_splits(splits_json(&trees)).await
+    }
+
+    /// Write down the conversation a terminal is in, once it is one that can be carried on:
+    /// a new id that names nothing yet leaves the last one that did. Always the newest
+    /// such id, because every report of the agent names its current conversation.
+    async fn save_session(
+        &self,
+        stream: u32,
+        session: String,
+        program: Option<&str>,
+        store: &crate::store::StoreHandle,
+    ) {
+        if self.saved_sessions.lock().unwrap().get(&stream) == Some(&session) {
+            return;
+        }
+        if !resumable(program, &session) {
+            return;
+        }
+        if store
+            .set_agent_session(stream as i64, session.clone())
+            .await
+            .is_ok()
+        {
+            self.saved_sessions.lock().unwrap().insert(stream, session);
+        }
     }
 
     /// Give a terminal a different name. False when there is no such terminal.
@@ -2381,19 +2409,32 @@ fn claude_session_title(id: &str) -> Option<String> {
     claude_transcript(id).and_then(|path| claude_session_title_at(&path))
 }
 
+/// Whether an agent's conversation can be carried on from its own storage. Claude writes a
+/// conversation down only once it has a message, so the id of a session opened and never
+/// used (a `/clear`, a fresh start) names nothing and `claude --resume` on it fails. Other
+/// agents are taken at their word.
+fn resumable(program: Option<&str>, session: &str) -> bool {
+    program != Some("claude") || claude_transcript(session).is_some()
+}
+
 /// `<projects>/<slug>/<id>.jsonl`: the id is the file name, so one stat per
 /// project directory finds it. `CLAUDE_CONFIG_DIR` first, as Claude reads it.
 /// An id that could climb out of the directory is refused up front.
 fn claude_transcript(id: &str) -> Option<PathBuf> {
-    if id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return None;
-    }
     let mut roots = Vec::new();
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         roots.push(PathBuf::from(dir).join("projects"));
     }
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(PathBuf::from(home).join(".claude/projects"));
+    }
+    claude_transcript_in(&roots, id)
+}
+
+/// The same, under these `projects` directories.
+fn claude_transcript_in(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
+    if id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
     }
     let file = format!("{id}.jsonl");
     roots
@@ -3713,7 +3754,10 @@ async fn handle_control(
                     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
                         let generation = agents.agent(terminal).map(|a| a.belief.generation.0);
                         terminals.set_session(terminal, Some(session.clone()), generation);
-                        let _ = store.set_agent_session(terminal as i64, session).await;
+                        let program = agent_program(agents, terminal);
+                        terminals
+                            .save_session(terminal, session, program.as_deref(), store)
+                            .await;
                     }
                     ControlResponse::AgentStateReported { id, terminal }
                 }
@@ -3754,7 +3798,10 @@ async fn handle_control(
                 };
             }
             terminals.set_session(terminal, Some(session.clone()), Some(generation.0));
-            let _ = store.set_agent_session(terminal as i64, session).await;
+            let program = agent_program(agents, terminal);
+            terminals
+                .save_session(terminal, session, program.as_deref(), store)
+                .await;
             ControlResponse::AgentStateReported { id, terminal }
         }
         ControlRequest::ListFocusEvents {
@@ -5005,10 +5052,16 @@ async fn restore_rows(
             into.terminals
                 .set_session(stream, Some(session.to_string()), None);
         }
+        // A conversation the agent never wrote down cannot be carried on: the newest one
+        // in the directory is asked for instead, rather than a resume that fails.
+        let session = row
+            .agent_session
+            .as_deref()
+            .filter(|session| resumable(row.agent.as_deref(), session));
         let resume = row
             .agent
             .as_deref()
-            .and_then(|agent| qoro_detect::resume_argv(agent, row.agent_session.as_deref()));
+            .and_then(|agent| qoro_detect::resume_argv(agent, session));
         // The resume command is typed into the shell, and the send is what does
         // it: a tab whose send failed holds a shell, not a resumed agent, and the
         // report says so rather than counting an intent as a recovery.
@@ -7818,7 +7871,9 @@ mod nudge_tests {
 
 #[cfg(test)]
 mod session_title_tests {
-    use super::{claude_session_title_at, opencode_session_title_at};
+    use super::{
+        claude_session_title_at, claude_transcript_in, opencode_session_title_at, resumable,
+    };
 
     fn fake_db_with(title: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7851,6 +7906,23 @@ mod session_title_tests {
             Some("Second line".to_string()),
             "a stored newline never reaches the row"
         );
+    }
+
+    /// A Claude id is a conversation only once Claude wrote it down: a session opened and
+    /// never used has no transcript, and is not one a restart can resume.
+    #[test]
+    fn a_claude_session_without_a_transcript_is_not_resumable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slug = dir.path().join("-Users-u-wend");
+        std::fs::create_dir(&slug).expect("slug");
+        std::fs::write(slug.join("dc1edc15.jsonl"), "{}").expect("write");
+        let roots = [dir.path().to_path_buf()];
+        assert!(claude_transcript_in(&roots, "dc1edc15").is_some());
+        assert!(claude_transcript_in(&roots, "ac935191").is_none());
+        assert!(claude_transcript_in(&roots, "../dc1edc15").is_none());
+        // Other agents keep their ids: nothing here can say they are gone.
+        assert!(resumable(Some("opencode"), "ses_x"));
+        assert!(resumable(None, "whatever"));
     }
 
     /// Claude's transcript names the conversation: the newest generated
