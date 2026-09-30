@@ -124,6 +124,13 @@ pub struct Chrome<'a> {
     /// The sleeping tab the keyboard rests on while the space on screen is asleep, zero
     /// otherwise. The column raises it the way it raises the focused terminal.
     pub dim: u32,
+    /// What is typed into the keys overlay's search, while one runs.
+    pub keys_query: Option<&'a str>,
+    /// The busy terminal a close is waiting on its capital `Y` for, asked in a box.
+    pub closing: Option<u32>,
+    /// A mode on the notice row: its name and its keys, empty when the mode has something
+    /// else to say (copy mode's search), which `message` then carries.
+    pub mode: Option<(&'static str, &'static [(&'static str, &'static str)])>,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
@@ -138,6 +145,9 @@ impl Default for Chrome<'_> {
             usage: &NO_USAGE,
             answer: false,
             dim: 0,
+            keys_query: None,
+            closing: None,
+            mode: None,
         }
     }
 }
@@ -266,11 +276,12 @@ fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
         })
         .collect()
 }
-/// The columns one entry takes: ` [key→action]`, or ` label` for the prefix.
+/// The columns one entry takes: `  key action`, or `  label` for the prefix. The first on
+/// the row takes one space less, at the edge.
 fn hint_width(hint: &Hint) -> usize {
     match hint.1 {
-        Some(action) => 4 + width::width(hint.0) + width::width(action),
-        None => 1 + width::width(hint.0),
+        Some(action) => 3 + width::width(hint.0) + width::width(action),
+        None => 2 + width::width(hint.0),
     }
 }
 
@@ -297,15 +308,15 @@ fn fitted(context: KeyContext, place: Place, cols: usize) -> Vec<Hint> {
     kept
 }
 
-/// The key row in brackets, `[key→action]`, in the status colours, exactly `cols` wide.
+/// The key row, `key action` two spaces apart, in the status colours, exactly `cols` wide.
 ///
-/// The key wears the brand orange so the eye finds the letters first; the arrow and
-/// brackets are quiet, the action is detail.
+/// The key bright and the action quiet, as every box's footer says them.
 fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for hint in fitted(context, place, cols) {
-        let wide = hint_width(&hint);
+        let lead = if used == 0 { " " } else { "  " };
+        let wide = hint_width(&hint) + lead.len() - 2;
         if used + wide > cols {
             break;
         }
@@ -313,26 +324,23 @@ fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
         match hint.1 {
             None => {
                 out.push_str(&theme::status_in(theme::Role::Faint));
-                out.push(' ');
+                out.push_str(lead);
                 out.push_str(hint.0);
             }
             Some(action) => {
-                out.push_str(&theme::status_in(theme::Role::Rule));
-                out.push_str(" [");
-                out.push_str(&theme::status_in(theme::Role::Brand));
+                out.push_str(&theme::status());
+                out.push_str(lead);
+                out.push_str(&theme::status_key());
                 out.push_str(hint.0);
-                out.push_str(&theme::status_in(theme::Role::Faint));
-                out.push('\u{2192}');
-                out.push_str(&theme::status_in(theme::Role::Detail));
+                out.push_str(&theme::status());
+                out.push(' ');
                 out.push_str(action);
-                out.push_str(&theme::status_in(theme::Role::Rule));
-                out.push(']');
             }
         }
     }
     out.push_str(&theme::status());
     if used == 0 {
-        // Narrower than one bracketed entry: the way out, plainly, cut to what fits.
+        // Narrower than one entry: the way out, plainly, cut to what fits.
         let plain = width::fit(" d detach", cols);
         used = width::width(&plain);
         out.push_str(&plain);
@@ -752,10 +760,19 @@ pub fn paint(frame: &Frame) -> String {
     // a real pty: a row that came and went would resize the child and reflow its output
     // every time an agent changed state.
     out.push_str(&at(frame.lines as usize - 1, 1));
+    // A close waiting on its answer asks in a box, and the notice row goes back to its
+    // news. Only when the box fits: otherwise the question stays here, or the keys would
+    // be taken with nothing on screen saying why.
+    let confirm = frame.chrome.closing.filter(|t| confirm_fits(frame, *t));
+    let message = if confirm.is_some() {
+        None
+    } else {
+        frame.message
+    };
     // A transient message wins, then the single next thing to do, then where the keyboard
     // is. Never empty: a blank row is a row that has to be explained.
     let (notice, notice_role) = match (
-        frame.message,
+        message,
         triage(
             frame.rows,
             frame.spaces,
@@ -793,26 +810,33 @@ pub fn paint(frame: &Frame) -> String {
             None => (here(frame), None),
         },
     };
-    out.push_str(&match notice_role {
-        Some(role) => theme::status_in(role),
-        None => theme::status(),
-    });
-    out.push_str(&width::fit(&notice, frame.cols as usize));
+    match (frame.chrome.mode, confirm) {
+        (Some((word, keys)), None) => {
+            out.push_str(&mode_row(word, keys, &notice, frame.cols as usize));
+        }
+        _ => {
+            out.push_str(&match notice_role {
+                Some(role) => theme::status_in(role),
+                None => theme::status(),
+            });
+            out.push_str(&width::fit(&notice, frame.cols as usize));
+        }
+    }
     out.push_str(theme::RESET);
 
     out.push_str(&at(frame.lines as usize, 1));
     // Raised, not reverse. A full width bar of reverse video is the brightest thing on the
     // screen, and the key list is the least urgent thing on it.
     out.push_str(&theme::status());
-    // A mode names its own keys, because in a mode the others do not work.
-    let mode = if frame.prompt.is_some() {
-        Some("enter to make it  esc to stop")
-    } else if frame.palette.is_some() {
-        Some("ctrl-a space find  enter go  esc back")
-    } else if frame.menu.is_some() {
-        Some("up/down or j/k move  enter choose  esc close")
-    } else if frame.reading.is_some() {
-        Some("any key to close")
+    // A box says its own keys in its footer, so under one the row is quiet. Otherwise a
+    // mode names its own keys, because in a mode the others do not work.
+    let boxed = frame.prompt.is_some()
+        || frame.palette.is_some()
+        || frame.menu.is_some()
+        || frame.reading.is_some()
+        || confirm.is_some();
+    let mode = if boxed {
+        Some("")
     } else if frame.chrome.answer {
         Some("j/k scroll  space page  g/G top/bottom  q close")
     } else {
@@ -883,8 +907,11 @@ pub fn paint(frame: &Frame) -> String {
     if let Some((selected, kind)) = frame.menu {
         paint_menu(frame, selected, kind, &mut out);
     }
-    if let Some(reading) = frame.reading {
-        paint_reading(frame, reading, &mut out);
+    let reading_cursor = frame
+        .reading
+        .and_then(|reading| paint_reading(frame, reading, &mut out));
+    if let Some(terminal) = confirm {
+        paint_confirm(frame, terminal, &mut out);
     }
 
     // The cursor goes where the child put it, offset into the pane, so that what the user
@@ -893,12 +920,10 @@ pub fn paint(frame: &Frame) -> String {
     if let Some(prompt) = frame.prompt {
         let w = palette_width(frame.cols);
         let left = (frame.cols as usize).saturating_sub(w) / 2;
-        let top = ((frame.lines as usize) / 3).max(TABS + 1);
-        // Past the ` > ` marker, at the end of what has been typed. The row
-        // carries no border cell, unlike the palette's query row below, so
-        // this is one less than the palette's otherwise identical sum.
-        let col = (left + 3 + width::width(&prompt.text)).min(left + w.saturating_sub(1));
-        out.push_str(&at(top + 1, col + 1));
+        // Past the border and the ` > ` marker, at the end of what has been typed, the
+        // same sum as the palette's query row below.
+        let col = (left + 4 + width::width(&prompt.text)).min(left + w.saturating_sub(2));
+        out.push_str(&at(prompt_row(frame.lines) + 1, col + 1));
     } else if let Some(palette) = frame.palette {
         // At the end of the query, inside the box, wherever the box ended up.
         let w = palette_width(frame.cols);
@@ -921,6 +946,9 @@ pub fn paint(frame: &Frame) -> String {
         let col = (left + 4 + width::width(&palette.query))
             .min(left + 3 + inner.saturating_sub(3 + chips).max(1));
         out.push_str(&at(row + 1, col + 1));
+    } else if let Some((row, col)) = reading_cursor {
+        // At the end of the keys search, where typing goes.
+        out.push_str(&at(row + 1, col + 1));
     } else if let Some(snapshot) = frame.snapshot {
         // Shown only when the program wants it seen. A child redraws with its
         // cursor hidden, and a shown-anyway cursor is one the program hid:
@@ -937,6 +965,7 @@ pub fn paint(frame: &Frame) -> String {
     // has produced nothing yet keeps the visible default it always had.
     let show = frame.prompt.is_some()
         || frame.palette.is_some()
+        || reading_cursor.is_some()
         || frame.snapshot.is_none_or(|s| s.modes.cursor_visible);
     if show {
         out.push_str("\x1b[?25h");
@@ -1303,38 +1332,43 @@ fn cursor_column(line: &str, cell: usize) -> usize {
 
 /// The naming box, painted over the middle of the screen.
 ///
-/// Three rows: what is being asked, what has been typed, and how to get out. In the middle
-/// of the pane rather than in the column, because it is a question about something that is
-/// about to exist and has no row of its own to sit in yet.
+/// The palette's box: what is being asked on the edge, what has been typed, and the keys.
+/// In the middle of the pane rather than in the column, because it is a question about
+/// something that is about to exist and has no row of its own to sit in yet.
 fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
     let cols = frame.cols as usize;
     let lines = frame.lines as usize;
-    if cols < 20 || lines < TABS + STATUS + 3 {
+    if cols < 20 || lines < TABS + STATUS + 4 {
         return;
     }
     let w = palette_width(frame.cols);
     let left = cols.saturating_sub(w) / 2;
-    let top = (lines / 3).max(TABS + 1);
-    let rows = [
-        (
-            theme::fg(theme::Role::Title),
-            format!(" {}", prompt.what.asks()),
-        ),
-        (theme::selected(), format!(" > {}", prompt.text)),
-        (
+    let inner = w - 2;
+    // The typed row where it always was, so the edge sits one row above it.
+    let top = prompt_row(frame.lines) - BOX_FIRST_ROW;
+    let body = [
+        format!(
+            "{} > {}{}",
             theme::fg(theme::Role::Faint),
-            format!(" {}", prompt.what.hint()),
+            theme::fg(theme::Role::Focused),
+            width::fit(&prompt.text, inner - 3)
         ),
+        hint_line(prompt.what.hint(), inner),
     ];
-    for (i, (ink, text)) in rows.iter().enumerate() {
-        if top + i >= lines {
-            break;
-        }
-        out.push_str(&at(top + i, left + 1));
-        out.push_str(ink);
-        out.push_str(&width::fit(text, w));
-        out.push_str(theme::RESET);
-    }
+    let rule = theme::fg(theme::Role::Rule);
+    paint_boxed(
+        out,
+        lines,
+        (left, top, w),
+        prompt.what.asks(),
+        (&rule, &rule),
+        &body,
+    );
+}
+
+/// The zero based row the naming box's typed text sits on.
+fn prompt_row(lines: u16) -> usize {
+    ((lines as usize) / 3).max(TABS + 1)
 }
 
 /// Where the centred menu box sits: left, top, width and height in cells.
@@ -1445,177 +1479,499 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
 ///
 /// Every line of it is a real value read from the interface itself rather than a screen
 /// somebody drew once: a settings page that says what the program wishes were true is worse
-/// than no settings page.
-fn paint_reading(frame: &Frame, reading: crate::run::Reading, out: &mut String) {
-    let lines: Vec<String> = match reading {
-        crate::run::Reading::Keybinds => {
-            fold_to_fit(keybind_lines(), frame.lines as usize, frame.cols as usize)
-        }
-        crate::run::Reading::Settings => vec![
-            format!(" window          {} by {}", frame.cols, frame.lines),
-            format!(
-                " left column     {} columns{}",
-                if frame.collapsed {
-                    sidebar::COLLAPSED
-                } else {
-                    frame.sidebar_width
-                },
-                if frame.collapsed { ", folded" } else { "" }
-            ),
-            format!(" spaces          {}", frame.spaces.len()),
-            format!(" terminals       {}", frame.rows.len()),
-            format!(
-                " agents          {}",
-                frame
-                    .rows
-                    .iter()
-                    .filter(|r| r.agent && r.state != "sleeping")
-                    .count()
-            ),
-            format!(
-                " waiting         {}",
-                frame
-                    .rows
-                    .iter()
-                    .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
-                    .count()
-            ),
-        ]
-        .into_iter()
-        .chain(crate::config::shown())
-        .collect(),
-    };
-    let title = match reading {
-        crate::run::Reading::Keybinds => " keybinds",
-        crate::run::Reading::Settings => " settings",
-    };
-    // The keys are written with ctrl-a and named here, so the list says the prefix in
-    // effect, including one the settings box just read.
-    let lines: Vec<String> = match reading {
-        crate::run::Reading::Keybinds => {
-            lines.iter().map(|line| crate::keys::named(line)).collect()
-        }
-        crate::run::Reading::Settings => lines,
-    };
-    paint_box(frame, title, &lines, out);
-}
-
-/// Every key, as the keys overlay lists them, written with `ctrl-a` and named on the way
-/// out like every other list of keys.
-///
-/// Short on purpose: two columns of these have to fit an 80 by 24 window, which is where a
-/// person who does not know the keys yet is most likely to be. No section headings, for
-/// the same reason; the keys are grouped by what they act on instead.
-pub(crate) fn keybind_lines() -> Vec<String> {
-    let key = |keys: &str, what: &str| format!(" {keys:<15}{what}");
-    let cmd = |keys: &str, what: &str| key(&format!("ctrl-a {keys}"), what);
-    vec![
-        cmd("n/p", "next, previous tab"),
-        cmd("1..9", "the nth tab"),
-        cmd("c", "new tab"),
-        cmd("r", "rename tab"),
-        cmd("x", "close tab, may ask"),
-        cmd("s/S", "next, previous space"),
-        cmd("w", "new space"),
-        cmd("W", "close an empty space"),
-        cmd("Z", "sleep or wake space"),
-        cmd("R", "rename space"),
-        cmd("space", "find anything"),
-        cmd("tab", "what needs you next"),
-        cmd("g", "spaces: tree or rank"),
-        cmd("f", "fold this space"),
-        cmd("M", "last answer, as a page"),
-        cmd("F", "agent focus view"),
-        cmd("b", "fold the left column"),
-        cmd("m", "menu"),
-        cmd("?", "this list"),
-        cmd("v/-", "split beside, below"),
-        cmd("H/J/K/L", "focus pane by side"),
-        cmd("o", "next pane"),
-        cmd("z", "zoom pane"),
-        cmd("X", "pane back to a tab"),
-        cmd("e", "resize: hjkl, esc"),
-        cmd("=", "equalize panes"),
-        cmd("[", "copy mode, then:"),
-        key("  hjkl w b e", "move"),
-        key("  g G ^u ^d", "jump, half a page"),
-        key("  v V y", "select, copy"),
-        key("  / ? n N", "search history"),
-        key("  q esc", "leave"),
-        cmd("d", "detach, also ctrl-q"),
-        cmd("U", "update waiting?"),
-        cmd("l", "repaint"),
-        // The mouse is not a key, and it is the part of this a person is least likely to
-        // guess: an interface that takes the mouse has taken their terminal's own
-        // selection with it, so it owes them these lines.
-        key("click", "focus what is there"),
-        key("drag", "select and copy"),
-        key("drag a rule", "resize panes"),
-        key("shift-drag", "over a mouse app"),
-        key("wheel", "scroll back"),
+/// than no settings page. Answers where the cursor goes while the keys are searched.
+fn paint_reading(
+    frame: &Frame,
+    reading: crate::run::Reading,
+    out: &mut String,
+) -> Option<(usize, usize)> {
+    if reading == crate::run::Reading::Keybinds {
+        return paint_keys(frame, frame.chrome.keys_query, out);
+    }
+    let lines = [
+        format!(" window          {} by {}", frame.cols, frame.lines),
+        format!(
+            " left column     {} columns{}",
+            if frame.collapsed {
+                sidebar::COLLAPSED
+            } else {
+                frame.sidebar_width
+            },
+            if frame.collapsed { ", folded" } else { "" }
+        ),
+        format!(" spaces          {}", frame.spaces.len()),
+        format!(" terminals       {}", frame.rows.len()),
+        format!(
+            " agents          {}",
+            frame
+                .rows
+                .iter()
+                .filter(|r| r.agent && r.state != "sleeping")
+                .count()
+        ),
+        format!(
+            " waiting         {}",
+            frame
+                .rows
+                .iter()
+                .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
+                .count()
+        ),
     ]
+    .into_iter()
+    .chain(crate::config::shown())
+    .collect::<Vec<_>>();
+    let widest = lines.iter().map(|l| width::width(l)).max().unwrap_or(0);
+    let inner = box_inner(frame, widest + 1, "settings");
+    let rows: Vec<String> = lines
+        .iter()
+        .map(|line| settings_row(line, inner))
+        .chain(std::iter::once(hint_line(CLOSE_HINT, inner)))
+        .collect();
+    paint_box(frame, "settings", inner, &rows, out);
+    None
 }
 
-/// The keys as the window can show them: one column when they fit, two when two fit, and
-/// otherwise as many as fit with a line saying there is more.
-fn fold_to_fit(lines: Vec<String>, rows: usize, cols: usize) -> Vec<String> {
-    // A box takes its borders and a title: four rows, three columns.
-    let room = rows.saturating_sub(4);
-    if lines.len() <= room {
-        return lines;
+/// What closes a box that is only being read. Any key does; esc is the one to say.
+const CLOSE_HINT: &[(&str, &str)] = &[("esc", "close")];
+
+/// One settings row, split where its first run of two spaces ends: what matters bright and
+/// what explains it faint. A live row is a name and its value, so the value is the bright
+/// part; a line of the file (`prefix = "ctrl-a"`) is itself the value and its note explains
+/// it. A `[section]` is a heading, and somebody waiting is said in the colour that says so.
+fn settings_row(text: &str, inner: usize) -> String {
+    let fitted = width::fit(text, inner);
+    let body = fitted.trim_start();
+    if body.starts_with('[') {
+        return format!("{}{fitted}", theme::fg(theme::Role::Title));
     }
-    let half = lines.len().div_ceil(2);
-    let wide = |part: &[String]| part.iter().map(|l| width::width(l)).max().unwrap_or(0);
-    let (left, right) = (wide(&lines[..half]), wide(&lines[half..]));
-    if half <= room && left + 2 + right + 3 <= cols {
-        return (0..half)
-            .map(|i| {
-                let near = &lines[i];
-                let far = lines.get(half + i).map_or("", String::as_str);
-                let pad = " ".repeat(left - width::width(near) + 2);
-                format!("{near}{pad}{far}")
-            })
-            .collect();
-    }
-    let mut shown: Vec<String> = lines.into_iter().take(room.saturating_sub(1)).collect();
-    shown.push(" more in a larger window".to_string());
-    shown
+    let Some(gap) = body.find("  ") else {
+        return format!("{}{fitted}", theme::fg(theme::Role::Text));
+    };
+    let after = &body[gap..];
+    let at = (fitted.len() - body.len()) + gap + (after.len() - after.trim_start().len());
+    let (head, tail) = fitted.split_at(at);
+    let (head_ink, tail_ink) = if head.contains('=') {
+        (theme::Role::Text, theme::Role::Faint)
+    } else if head.trim() == "waiting" && tail.trim() != "0" {
+        (theme::Role::Faint, theme::Role::Blocked)
+    } else {
+        (theme::Role::Faint, theme::Role::Text)
+    };
+    format!("{}{head}{}{tail}", theme::fg(head_ink), theme::fg(tail_ink))
 }
 
-/// A bordered box in the middle of the screen, with a title and some rows.
-fn paint_box(frame: &Frame, title: &str, rows: &[String], out: &mut String) {
+/// One group of the keys overlay: its name, which ink of the space wheel tells it apart,
+/// and each key with what it does.
+type KeyGroup = (&'static str, usize, &'static [(&'static str, &'static str)]);
+
+/// Every key, grouped the way a person looks for one. The keys are what follows `ctrl-a`,
+/// which the box's title says once; copy mode's and the mouse's say where they work.
+/// Short on purpose: three columns of these fit an 80 by 24 window, which is where a person
+/// who does not know the keys yet is most likely to be.
+pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
+    (
+        "tab",
+        3,
+        &[
+            ("n/p", "next, prev"),
+            ("1..9", "go to tab"),
+            ("c", "new tab"),
+            ("r", "rename tab"),
+            ("x", "close tab"),
+        ],
+    ),
+    (
+        "space",
+        4,
+        &[
+            ("s/S", "next, prev"),
+            ("w", "new space"),
+            ("W", "close empty"),
+            ("R", "rename space"),
+            ("Z", "sleep, wake"),
+            ("f", "fold"),
+            ("g", "tree or rank"),
+        ],
+    ),
+    (
+        "pane",
+        1,
+        &[
+            ("v/-", "split beside, below"),
+            ("H/J/K/L", "focus side"),
+            ("o", "next pane"),
+            ("z", "zoom"),
+            ("X", "back to a tab"),
+            ("e", "resize"),
+            ("=", "equalize"),
+        ],
+    ),
+    (
+        "copy mode",
+        0,
+        &[
+            ("[", "start, then:"),
+            ("hjkl", "move"),
+            ("w b e", "by word"),
+            ("g G", "top, bottom"),
+            ("v V y", "select, copy"),
+            ("/ ? n N", "search"),
+            ("q", "leave"),
+        ],
+    ),
+    (
+        "general",
+        5,
+        &[
+            ("space", "find"),
+            ("tab", "needs you"),
+            ("m", "menu"),
+            ("M", "last answer"),
+            ("F", "focus view"),
+            ("b", "fold column"),
+            ("d", "detach, ctrl-q"),
+            ("U", "update"),
+            ("l", "repaint"),
+            ("?", "this list"),
+        ],
+    ),
+    // The mouse is not a key, and it is the part of this a person is least likely to
+    // guess: an interface that takes the mouse has taken their terminal's own selection
+    // with it, so it owes them these lines.
+    (
+        "mouse",
+        2,
+        &[
+            ("click", "focus"),
+            ("drag", "select"),
+            ("drag rule", "resize"),
+            ("wheel", "scroll"),
+            ("shift-drag", "over apps"),
+        ],
+    ),
+];
+
+/// Which groups stand side by side, widest first: the first that fits the window is used.
+/// Always every group, so a search empties rows and never moves the box.
+const KEY_COLUMNS: [&[&[usize]]; 3] = [
+    &[&[0, 1], &[2, 3], &[4, 5]],
+    &[&[0, 1, 2], &[3, 4, 5]],
+    &[&[0, 1, 2, 3, 4, 5]],
+];
+
+const KEYS_HINT: &[(&str, &str)] = &[("/", "search"), ("esc", "close")];
+
+/// The keys overlay: the groups in columns, filtered by the search when one is typed.
+/// Answers where the cursor goes while searching.
+fn paint_keys(frame: &Frame, query: Option<&str>, out: &mut String) -> Option<(usize, usize)> {
+    let title = crate::keys::named("keys, after ctrl-a");
+    let key_w = |ids: &[usize]| {
+        ids.iter()
+            .flat_map(|i| KEY_GROUPS[*i].2.iter())
+            .map(|(key, _)| width::width(key))
+            .max()
+            .unwrap_or(0)
+    };
+    let cell_w = |ids: &[usize]| {
+        let words = ids
+            .iter()
+            .flat_map(|i| KEY_GROUPS[*i].2.iter())
+            .map(|(_, word)| width::width(word))
+            .max()
+            .unwrap_or(0);
+        let names = ids
+            .iter()
+            .map(|i| width::width(KEY_GROUPS[*i].0))
+            .max()
+            .unwrap_or(0);
+        (1 + key_w(ids) + 1 + words).max(1 + names)
+    };
+    let room = (frame.cols as usize).saturating_sub(2);
+    let wanted = |columns: &[&[usize]]| {
+        columns.iter().map(|ids| cell_w(ids)).sum::<usize>() + 2 * (columns.len() - 1) + 1
+    };
+    // The widest layout that fits, or one column cut to the window.
+    let columns = KEY_COLUMNS
+        .iter()
+        .find(|columns| wanted(columns) <= room)
+        .unwrap_or(&KEY_COLUMNS[2]);
+    let inner = box_inner(frame, wanted(columns), &title);
+    let cells: Vec<usize> = if columns.len() == 1 {
+        vec![inner - 1]
+    } else {
+        columns.iter().map(|ids| cell_w(ids)).collect()
+    };
+
+    let needle = query.unwrap_or("").to_lowercase();
+    let full = |ids: &[usize]| {
+        ids.iter()
+            .map(|i| 1 + KEY_GROUPS[*i].2.len())
+            .sum::<usize>()
+            + ids.len()
+            - 1
+    };
+    let height = columns.iter().map(|ids| full(ids)).max().unwrap_or(0);
+    let painted: Vec<Vec<String>> = columns
+        .iter()
+        .zip(&cells)
+        .map(|(ids, &cell)| {
+            let mut rows = Vec::new();
+            for &i in *ids {
+                let (name, ink, keys) = KEY_GROUPS[i];
+                let whole = name.contains(&needle);
+                let shown: Vec<_> = keys
+                    .iter()
+                    .filter(|(key, word)| {
+                        whole
+                            || key.to_lowercase().contains(&needle)
+                            || word.to_lowercase().contains(&needle)
+                    })
+                    .collect();
+                if shown.is_empty() {
+                    continue;
+                }
+                if !rows.is_empty() {
+                    rows.push(" ".repeat(cell));
+                }
+                rows.push(format!(
+                    "{}{}",
+                    theme::fg(theme::Role::Space(ink)),
+                    width::fit(&format!(" {name}"), cell)
+                ));
+                let kw = key_w(ids).min(cell.saturating_sub(2));
+                for (key, word) in shown {
+                    rows.push(key_cell(key, word, kw, cell, &needle));
+                }
+            }
+            rows.resize(height, " ".repeat(cell));
+            rows
+        })
+        .collect();
+    let mut body: Vec<String> = (0..height)
+        .map(|row| {
+            let mut line = String::new();
+            for (i, column) in painted.iter().enumerate() {
+                if i > 0 {
+                    line.push_str("  ");
+                }
+                line.push_str(&column[row]);
+            }
+            line.push(' ');
+            line
+        })
+        .collect();
+    // Taller than the window: what fits, then a line that says the rest can be searched.
+    let lines = frame.lines as usize;
+    let fit = lines.saturating_sub(4).saturating_sub(1);
+    if body.len() > fit {
+        body.truncate(fit.saturating_sub(1));
+        body.push(format!(
+            "{}{}",
+            theme::fg(theme::Role::Faint),
+            width::fit(" more: / search", inner)
+        ));
+    }
+    let (footer, typed_at) = match query {
+        Some(query) => {
+            // ` / query  esc clear`, the query cut to what is left of the row.
+            let room = inner.saturating_sub(3 + "  esc clear".len() + 1);
+            let shown = width::text(query, width::width(query).min(room));
+            let shown = shown.trim_end();
+            let plain = 3 + width::width(shown) + "  esc clear".len();
+            (
+                format!(
+                    "{} {}/ {}{shown}{}  {}esc{} clear{}",
+                    theme::fg(theme::Role::Faint),
+                    theme::fg(theme::Role::Focused),
+                    theme::fg(theme::Role::Text),
+                    theme::fg(theme::Role::Faint),
+                    theme::fg(theme::Role::Focused),
+                    theme::fg(theme::Role::Faint),
+                    " ".repeat(inner.saturating_sub(plain))
+                ),
+                Some(3 + width::width(shown)),
+            )
+        }
+        None => (hint_line(KEYS_HINT, inner), None),
+    };
+    body.push(footer);
+    let (left, top) = paint_box(frame, &title, inner, &body, out)?;
+    typed_at.map(|col| (top + BOX_FIRST_ROW + body.len() - 1, left + 1 + col))
+}
+
+/// One key of the keys overlay, `cell` columns: the key bright, what it does faint, and the
+/// part of that the search matched underlined.
+fn key_cell(key: &str, word: &str, kw: usize, cell: usize, needle: &str) -> String {
+    let key = width::text(key, kw);
+    let room = cell.saturating_sub(kw + 2);
+    let word = width::text(word, width::width(word).min(room));
+    let word = word.trim_end();
+    let pad = " ".repeat(room.saturating_sub(width::width(word)));
+    let faint = theme::fg(theme::Role::Faint);
+    let marked = match word.to_lowercase().find(needle) {
+        Some(at) if !needle.is_empty() && word.is_ascii() => format!(
+            "{}\x1b[4m{}\x1b[24m{}",
+            &word[..at],
+            &word[at..at + needle.len()],
+            &word[at + needle.len()..]
+        ),
+        _ => word.to_string(),
+    };
+    format!(
+        "{faint} {}{key}{faint} {marked}{pad}",
+        theme::fg(theme::Role::Focused)
+    )
+}
+
+/// The inner width of a box whose rows need `content` columns, with this title on its
+/// edge, on this window.
+fn box_inner(frame: &Frame, content: usize, title: &str) -> usize {
+    content
+        .max(width::width(title.trim()) + 4)
+        .min((frame.cols as usize).saturating_sub(2))
+}
+
+/// A bordered box in the middle of the screen: `rows` already styled to `inner` columns,
+/// clipped to the window. Answers where its top left corner went.
+fn paint_box(
+    frame: &Frame,
+    title: &str,
+    inner: usize,
+    rows: &[String],
+    out: &mut String,
+) -> Option<(usize, usize)> {
     let cols = frame.cols as usize;
     let lines = frame.lines as usize;
-    let widest = rows
-        .iter()
-        .chain(std::iter::once(&title.to_string()))
-        .map(|r| width::width(r))
-        .max()
-        .unwrap_or(0);
-    // The title rides the top edge, which needs `─ ` before it and ` ─` after it.
-    let w = (widest.max(width::width(title.trim()) + 2) + 3).min(cols);
-    // Clipped to the window rather than skipped: the keybind list is taller than an
-    // 80x24 window, and skipping painted nothing while the overlay still took the next
-    // key, which read as a frozen screen.
+    let w = inner + 2;
+    // Clipped to the window rather than skipped: skipping painted nothing while the
+    // overlay still took the next key, which read as a frozen screen.
     let rows = &rows[..rows.len().min(lines.saturating_sub(4))];
     if rows.is_empty() || w < 6 {
-        return;
+        return None;
     }
     let left = cols.saturating_sub(w) / 2;
     let top = lines.saturating_sub(rows.len() + 2) / 2;
-    let inner = w - 2;
-    let body: Vec<String> = rows
-        .iter()
-        .map(|text| {
-            format!(
-                "{}{}",
-                theme::fg(theme::Role::Text),
-                width::fit(text, inner)
-            )
-        })
-        .collect();
     let rule = theme::fg(theme::Role::Rule);
-    paint_boxed(out, lines, (left, top, w), title, (&rule, &rule), &body);
+    paint_boxed(out, lines, (left, top, w), title, (&rule, &rule), rows);
+    Some((left, top))
+}
+
+/// Resize mode's keys, for the notice row.
+pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
+    ("hjkl", "move 5%"),
+    ("HJKL", "20%"),
+    ("=", "equalize"),
+    ("esc", "done"),
+];
+
+/// Copy mode's keys, for the notice row while it has nothing else to say.
+pub(crate) const COPY_HINT: &[(&str, &str)] = &[
+    ("hjkl", "move"),
+    ("w b e", "words"),
+    ("/ ?", "search"),
+    ("n N", "again"),
+    ("v V", "select"),
+    ("y", "copy"),
+    ("q", "quit"),
+];
+
+/// A mode on the notice row: its name in the brand colour, the one mode colour, then its
+/// keys the way the key row says them, or what it has to say instead when `keys` is empty.
+fn mode_row(word: &str, keys: &[(&str, &str)], said: &str, cols: usize) -> String {
+    let mut out = format!("{} {word}", theme::status_in(theme::Role::Brand));
+    let mut used = 1 + width::width(word);
+    if keys.is_empty() {
+        let text = width::fit(&format!("  {said}"), cols.saturating_sub(used));
+        used += width::width(&text);
+        out.push_str(&theme::status());
+        out.push_str(&text);
+    }
+    for (key, what) in keys {
+        let wide = 3 + width::width(key) + width::width(what);
+        if used + wide > cols {
+            break;
+        }
+        used += wide;
+        out.push_str(&theme::status());
+        out.push_str("  ");
+        out.push_str(&theme::status_key());
+        out.push_str(key);
+        out.push_str(&theme::status());
+        out.push(' ');
+        out.push_str(what);
+    }
+    out.push_str(&theme::status());
+    out.push_str(&" ".repeat(cols.saturating_sub(used)));
+    out
+}
+
+/// Whether the box asking about closing `terminal` fits this window, so the notice row
+/// can leave the question to it.
+fn confirm_fits(frame: &Frame, terminal: u32) -> bool {
+    frame.cols >= 24
+        && frame.lines as usize >= TABS + STATUS + 5
+        && frame.rows.iter().any(|r| r.terminal == terminal)
+}
+
+/// Asking before a busy agent is closed: the only box in the colour that says work can be
+/// lost, what it is and what it is doing, and the one key that closes it.
+fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
+    let Some(row) = frame.rows.iter().find(|r| r.terminal == terminal) else {
+        return;
+    };
+    let program = row
+        .program
+        .as_deref()
+        .map(|p| p.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(p))
+        .unwrap_or("this agent");
+    let space = frame
+        .spaces
+        .iter()
+        .find(|s| s.id == row.workspace)
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
+    let cols = frame.cols as usize;
+    let lines = frame.lines as usize;
+    let w = palette_width(frame.cols);
+    let inner = w - 2;
+    let plain = format!(" {space} / {program} is {}", row.state);
+    let body = if width::width(&plain) <= inner {
+        format!(
+            "{} {}{space}{} / {}{program} is {}{}{}",
+            theme::fg(theme::Role::Text),
+            theme::fg(theme::space_of(row.workspace)),
+            theme::fg(theme::Role::Faint),
+            theme::fg(theme::Role::Text),
+            theme::fg(theme::of(&row.state)),
+            row.state,
+            " ".repeat(inner - width::width(&plain))
+        )
+    } else {
+        format!(
+            "{}{}",
+            theme::fg(theme::Role::Text),
+            width::fit(&plain, inner)
+        )
+    };
+    let footer = hint_line(&[("Y", "close it"), ("any other key", "keep it")], inner);
+    let ink = theme::fg(theme::Role::Blocked);
+    // In one colour the warning ink is plain, so the title says it in bold instead.
+    let title_ink = if crate::colorlevel::level() == crate::colorlevel::Level::Mono {
+        theme::fg(theme::Role::Focused)
+    } else {
+        ink.clone()
+    };
+    let left = cols.saturating_sub(w) / 2;
+    let top = lines.saturating_sub(4) / 2;
+    paint_boxed(
+        out,
+        lines,
+        (left, top, w),
+        &format!("close {program}?"),
+        (&ink, &title_ink),
+        &[body, footer],
+    );
 }
 
 /// The row under a box's top edge, where its first row goes.
@@ -2632,7 +2988,7 @@ mod tests {
         let w = cols.min(60).max(cols.min(20)) as usize;
         let left = (cols as usize - w) / 2;
         let top = ((lines as usize) / 3).max(TABS + 1);
-        let want = format!("\x1b[{};{}H", top + 1, left + 4 + 2);
+        let want = format!("\x1b[{};{}H", top + 1, left + 5 + 2);
         assert!(
             painted.contains(&want),
             "no caret at the end of the typed text: {painted:?}"
@@ -2681,7 +3037,7 @@ mod tests {
             image_notice: None,
             chrome: Default::default(),
         });
-        assert!(painted.contains("keybinds"), "no keybinds box on 80x24");
+        assert!(painted.contains("keys, after"), "no keys box on 80x24");
         assert!(
             !painted.contains("\x1b[25;"),
             "the box ran past the last row"
@@ -2733,7 +3089,7 @@ mod tests {
         // Once on the tab and once in the column: the bar says what is open in this
         // space and the panel says what it is doing.
         assert!(painted.matches("claude").count() >= 2, "{painted:?}");
-        assert!(strip(&painted).contains("d\u{2192}detach"));
+        assert!(strip(&painted).contains("d detach"));
         assert!(painted.contains("agents"), "no agents panel: {painted:?}");
         assert!(
             painted.contains("app"),
@@ -2957,7 +3313,7 @@ mod tests {
         );
         assert!(painted.contains(" menu"), "menu missing title: {painted:?}");
         assert!(
-            painted.contains("enter choose"),
+            strip(&painted).contains("enter choose"),
             "menu missing hint: {painted:?}"
         );
     }
@@ -3576,23 +3932,23 @@ mod tests {
         };
         let plain = |context, cols| strip(&key_row(context, open, cols));
         let pane = plain(KeyContext::Pane, 200);
-        assert!(pane.starts_with(" ctrl-a: [space\u{2192}find]"), "{pane:?}");
+        assert!(pane.starts_with(" ctrl-a:  space find"), "{pane:?}");
         let column = plain(KeyContext::Sidebar, 200);
-        assert!(column.contains("[click\u{2192}open]"), "{column:?}");
-        assert!(column.contains("[g\u{2192}tree/priority]"), "{column:?}");
+        assert!(column.contains("click open"), "{column:?}");
+        assert!(column.contains("g tree/priority"), "{column:?}");
         let prefix = plain(KeyContext::Prefix, 200);
         assert!(
             !prefix.contains("ctrl-a:"),
             "the prefix is already down: {prefix:?}"
         );
-        assert!(prefix.contains("[z\u{2192}zoom]"), "{prefix:?}");
+        assert!(prefix.contains("z zoom"), "{prefix:?}");
         for context in [KeyContext::Pane, KeyContext::Sidebar, KeyContext::Prefix] {
             for cols in [5usize, 10, 11, 18, 20, 40, 80, 120, 200] {
                 let row = plain(context, cols);
                 assert_eq!(width::width(&row), cols, "{context:?} at {cols}: {row:?}");
-                // Under one bracketed entry the way out is said plainly, cut to fit.
+                // Under one entry the way out is said plainly, cut to fit.
                 assert!(
-                    row.contains("d\u{2192}detach") || (cols < 11 && row.starts_with(" d")),
+                    row.contains("d detach") || (cols < 10 && row.starts_with(" d")),
                     "{context:?} at {cols}: {row:?}"
                 );
             }
@@ -3601,7 +3957,7 @@ mod tests {
         // columns fold, focus and split go and the rest stay in order.
         assert_eq!(
             plain(KeyContext::Pane, 80).trim_end(),
-            " ctrl-a: [space\u{2192}find] [c\u{2192}new tab] [n\u{2192}next] [m\u{2192}menu] [?\u{2192}keys] [d\u{2192}detach]"
+            " ctrl-a:  space find  c new tab  n next  m menu  v split  ? keys  d detach"
         );
         // Where nothing folds the row offers no fold, and the strip has no edge to drag.
         let strip_place = Place {
@@ -3611,10 +3967,7 @@ mod tests {
         let strip_row = strip(&key_row(KeyContext::Sidebar, strip_place, 200));
         assert!(!strip_row.contains("fold"), "{strip_row:?}");
         assert!(!strip_row.contains("drag edge"), "{strip_row:?}");
-        assert!(
-            strip_row.contains("[b\u{2192}show column]"),
-            "{strip_row:?}"
-        );
+        assert!(strip_row.contains("b show column"), "{strip_row:?}");
     }
     /// The way out is the one key a person stuck in here has to be able to read, so it is
     /// never the one the cut takes.
@@ -3656,7 +4009,7 @@ mod tests {
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
-                keys.contains("d\u{2192}detach"),
+                keys.contains("d detach"),
                 "{cols} columns: no way out on the key row: {keys:?}"
             );
             assert!(
@@ -3792,13 +4145,17 @@ mod tests {
         numbers.sort();
         numbers.dedup();
         assert_eq!(numbers, (0..COMMANDS).collect::<Vec<_>>());
-        let lines = keybind_lines();
         for action in &every {
             let Some(taught) = taught_as(action).1 else {
                 continue;
             };
+            // The overlay writes a command without its prefix, which its title says.
+            let key = taught.strip_prefix("ctrl-a ").unwrap_or(taught);
             assert!(
-                lines.iter().any(|l| l.starts_with(&format!(" {taught} "))),
+                KEY_GROUPS
+                    .iter()
+                    .flat_map(|(_, _, keys)| keys.iter())
+                    .any(|(k, _)| *k == key),
                 "{action:?} has no line in the keys overlay under {taught:?}"
             );
         }
@@ -3843,11 +4200,19 @@ mod tests {
                 chrome: Default::default(),
             });
             let shown = strip(&painted);
-            for line in keybind_lines() {
-                assert!(
-                    shown.contains(line.trim_end()),
-                    "{cols}x{lines}: {line:?} is not on screen"
-                );
+            assert!(
+                !shown.contains("more: / search"),
+                "{cols}x{lines}: the keys were cut"
+            );
+            for (name, _, keys) in KEY_GROUPS {
+                assert!(shown.contains(name), "{cols}x{lines}: no {name} group");
+                for (key, word) in *keys {
+                    // The key, its padding and what it does, as one run of the screen.
+                    let run = shown
+                        .lines()
+                        .any(|l| l.contains(&format!(" {key} ")) && l.contains(word));
+                    assert!(run, "{cols}x{lines}: {key} {word} is not on screen");
+                }
             }
         }
     }
@@ -4324,7 +4689,7 @@ mod tests {
             image_notice: None,
             chrome: Default::default(),
         });
-        assert!(strip(&painted).contains("d\u{2192}detach"), "{painted:?}");
+        assert!(strip(&painted).contains("d detach"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
     }
 
@@ -5634,8 +5999,9 @@ mod tests {
             crate::run::Reading::Settings,
             &mut out,
         );
-        assert!(out.contains(" agents          1"), "{out:?}");
-        assert!(out.contains(" terminals       2"), "{out:?}");
+        let shown = strip(&out);
+        assert!(shown.contains(" agents          1"), "{out:?}");
+        assert!(shown.contains(" terminals       2"), "{out:?}");
     }
 
     /// A focused slept tab has a blank pane that takes no keys: the notice

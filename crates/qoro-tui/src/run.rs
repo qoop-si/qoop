@@ -589,8 +589,11 @@ struct State {
     paint_now: i64,
     /// The open search palette, or `None` when the terminal has the keyboard.
     palette: Option<Palette>,
-    /// The start of a palette key sequence the read ended in the middle of.
+    /// The start of a key sequence the read ended in the middle of, for the palette or the
+    /// keys search, which are never open together.
     palette_pending: Vec<u8>,
+    /// What is typed into the keys overlay's search, `None` while nobody is searching.
+    keys_query: Option<String>,
     /// Copy mode, resize mode, a close waiting for its `y`, and what they leave for the
     /// loop to send.
     modes: Modes,
@@ -814,6 +817,27 @@ impl State {
                 usage: &self.usage,
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
+                keys_query: self.keys_query.as_deref(),
+                closing: self
+                    .modes
+                    .confirm_close
+                    .as_ref()
+                    .map(|(terminal, _)| *terminal),
+                mode: if self.modes.confirm_close.is_some() {
+                    None
+                } else if self.modes.resizing {
+                    Some(("resize", screen::RESIZE_HINT))
+                } else {
+                    self.modes.copy.as_ref().map(|copy| {
+                        let keys: &'static [(&'static str, &'static str)] =
+                            if copy.status == crate::copy::KEYS {
+                                screen::COPY_HINT
+                            } else {
+                                &[]
+                            };
+                        ("copy", keys)
+                    })
+                },
                 keys: if self.prefix_pending {
                     screen::KeyContext::Prefix
                 } else if self.in_column
@@ -1911,6 +1935,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         }
         "keybinds" => {
             state.reading = Some(Reading::Keybinds);
+            state.keys_query = None;
             MenuSend::Nothing
         }
         "settings" => {
@@ -2015,29 +2040,42 @@ impl Naming {
 
     /// How many columns an answer may take. An address is longer than a name and is shown
     /// in the box, which is wider than the column a name has to fit. An agent command can
-    /// carry flags, so it gets the wider box too.
+    /// carry flags, so it gets the wider box too: all of the box's row after ` > `.
     pub fn limit(self) -> usize {
         match self {
-            Naming::Remote | Naming::Agent(_) | Naming::RenameSession(_) => 56,
+            Naming::Remote | Naming::Agent(_) | Naming::RenameSession(_) => 55,
             _ => NAME_LIMIT,
         }
     }
 
-    /// What an empty answer means here, which is not the same thing in all four cases.
-    pub fn hint(self) -> &'static str {
+    /// The box's footer: the keys, and what an empty answer means here, which is not the
+    /// same thing in every case. The example an answer needs comes last.
+    pub fn hint(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Naming::Space | Naming::Terminal => {
-                "enter to make it, esc to stop, empty for a default name"
-            }
-            Naming::Agent(_) => "an agent command, like claude; enter to start it, esc to stop",
-            Naming::RenameTerminal(_) => {
-                "enter to rename, esc to stop, empty for the program's own name"
-            }
-            Naming::RenameSession(_) => "enter to rename, esc to stop, empty for its own title",
+            Naming::Space | Naming::Terminal => &[
+                ("enter", "make"),
+                ("esc", "close"),
+                ("empty", "default name"),
+            ],
+            Naming::Agent(_) => &[("enter", "start"), ("esc", "close"), ("like", "claude")],
+            Naming::RenameTerminal(_) => &[
+                ("enter", "rename"),
+                ("esc", "close"),
+                ("empty", "program name"),
+            ],
+            Naming::RenameSession(_) => &[
+                ("enter", "rename"),
+                ("esc", "close"),
+                ("empty", "its own title"),
+            ],
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
-            Naming::RenameSpace(_) => "enter to rename, esc to stop",
-            Naming::Remote => "like admin@10.0.0.5; enter connects it, esc to stop",
+            Naming::RenameSpace(_) => &[("enter", "rename"), ("esc", "close")],
+            Naming::Remote => &[
+                ("enter", "connect"),
+                ("esc", "close"),
+                ("like", "admin@10.0.0.5"),
+            ],
         }
     }
 }
@@ -3813,6 +3851,7 @@ where
         sidebar_sized: sidebar::opening_width(cols),
         palette: None,
         palette_pending: Vec::new(),
+        keys_query: None,
         menu_kind: MenuKind::Main,
         connecting: None,
         probing: None,
@@ -4478,12 +4517,26 @@ where
                             }
                         }
                     } else if state.reading.is_some() {
+                        dirty = true;
+                        // The keys can be searched: `/` starts it, and while it runs the
+                        // bytes are the search's. What it hands back (a prefix and
+                        // after) goes through the decoder like any key here.
+                        let rest = if state.keys_query.is_some() {
+                            keys_search(&mut state, &bytes)
+                        } else if state.reading == Some(Reading::Keybinds) && bytes == b"/" {
+                            state.keys_query = Some(String::new());
+                            None
+                        } else {
+                            Some(bytes)
+                        };
                         // A key or a click closes a thing that is only being read.
                         // Through the one decoder, so half a report carried across
                         // reads is still half a report, not two keys.
-                        if closes_reading(&keys.feed(&bytes)) {
+                        if let Some(rest) = rest
+                            && closes_reading(&keys.feed(&rest))
+                        {
                             state.reading = None;
-                            dirty = true;
+                            state.keys_query = None;
                         }
                     } else if state.prompt.is_some() {
                         // The naming box owns the keyboard the same way the palette does,
@@ -5464,6 +5517,7 @@ where
                             }
                             Action::Keybinds => {
                                 state.reading = Some(Reading::Keybinds);
+                                state.keys_query = None;
                                 dirty = true;
                             }
                             Action::Collapse => {
@@ -8582,6 +8636,83 @@ fn clamped_to_focused(state: &State, row: u16, col: u16) -> (usize, usize) {
     )
 }
 
+/// Typing into the keys overlay's search.
+///
+/// Printable text is the query and backspace rubs it out. A lone esc ends the search, and a
+/// key after it in the same read closes the overlay, as a key does with no search open.
+/// Enter closes it. A click closes it and the wheel or a drag does nothing. Any other
+/// sequence is skipped whole and any other byte dropped. The prefix, `ctrl-q`, and a key
+/// after an esc are handed back from there on, for the decoder to close the overlay
+/// with, so `ctrl-a d` here closes the list and types nothing, as it always did.
+fn keys_search(state: &mut State, bytes: &[u8]) -> Option<Vec<u8>> {
+    let prefix = state.config.prefix;
+    let mut buf = std::mem::take(&mut state.palette_pending);
+    buf.extend_from_slice(bytes);
+    let close = |state: &mut State| {
+        state.reading = None;
+        state.keys_query = None;
+    };
+    let mut i = 0;
+    while i < buf.len() {
+        let Some(query) = state.keys_query.as_mut() else {
+            return Some(buf[i..].to_vec());
+        };
+        match buf[i] {
+            0x1b => match buf.get(i + 1) {
+                Some(b'[') if buf.get(i + 2) == Some(&b'<') => match crate::keys::report(&buf[i..])
+                {
+                    crate::keys::Report::Whole(used, action) => {
+                        if matches!(action, Some(Action::Click { .. })) {
+                            close(state);
+                            return None;
+                        }
+                        i += used;
+                    }
+                    crate::keys::Report::Broken(used) => i += used,
+                    crate::keys::Report::Partial => {
+                        state.palette_pending = buf[i..].to_vec();
+                        return None;
+                    }
+                },
+                // An arrow, a function key: skipped whole, split ones held.
+                Some(b'[' | b'O') => {
+                    match buf[i + 2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
+                        Some(at) => i += 2 + at + 1,
+                        None => {
+                            state.palette_pending = buf[i..].to_vec();
+                            return None;
+                        }
+                    }
+                }
+                // Esc on its own, or with a key after it: the search is over.
+                _ => {
+                    state.keys_query = None;
+                    i += 1;
+                }
+            },
+            b'\r' | b'\n' => {
+                close(state);
+                return None;
+            }
+            0x7f | 0x08 => {
+                query.pop();
+                i += 1;
+            }
+            b if b == prefix || b == 0x11 => {
+                state.keys_query = None;
+                return Some(buf[i..].to_vec());
+            }
+            // The keys and what they do are ASCII, so nothing else could match.
+            0x20..=0x7e => {
+                query.push(buf[i] as char);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Whether a read closes an overlay that is only being read: a key or a click does. The
 /// release of the click that chose it from the menu, or the pointer jittering with the
 /// button still down, arrives after the overlay is up, and closing on those closed it
@@ -9762,6 +9893,7 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
+            keys_query: None,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
@@ -10313,6 +10445,38 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_search_types_ends_on_esc_and_hands_a_prefix_back() {
+        let mut state = state();
+        state.palette = None;
+        state.reading = Some(Reading::Keybinds);
+        state.keys_query = Some(String::new());
+        assert_eq!(keys_search(&mut state, b"new"), None);
+        assert_eq!(state.keys_query.as_deref(), Some("new"));
+        assert_eq!(keys_search(&mut state, b"\x7f"), None);
+        assert_eq!(state.keys_query.as_deref(), Some("ne"));
+        // An arrow is skipped whole and the wheel does nothing.
+        assert_eq!(keys_search(&mut state, b"\x1b[A\x1b[<64;5;5M"), None);
+        assert_eq!(state.keys_query.as_deref(), Some("ne"));
+        // Two escs in one read: the search ends, and the second is a key for the decoder,
+        // which closes the list as any key does.
+        assert_eq!(keys_search(&mut state, b"\x1b\x1b"), Some(b"\x1b".to_vec()));
+        assert_eq!(state.keys_query, None);
+        assert!(state.reading.is_some());
+        // The prefix is handed back whole, typing nothing into the search.
+        state.keys_query = Some("x".to_string());
+        assert_eq!(keys_search(&mut state, b"\x01d"), Some(b"\x01d".to_vec()));
+        assert_eq!(state.keys_query, None);
+        // A click closes the list; enter does too.
+        state.keys_query = Some(String::new());
+        assert_eq!(keys_search(&mut state, b"\x1b[<0;5;5M"), None);
+        assert!(state.reading.is_none());
+        state.reading = Some(Reading::Keybinds);
+        state.keys_query = Some("z".to_string());
+        assert_eq!(keys_search(&mut state, b"\r"), None);
+        assert!(state.reading.is_none() && state.keys_query.is_none());
+    }
+
+    #[test]
     fn tab_walks_the_palette_filters_and_a_pasted_tab_does_not() {
         let mut state = state();
         let filter = |state: &State| state.palette.as_ref().map(|p| p.filter);
@@ -10507,6 +10671,7 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
+            keys_query: None,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
@@ -10624,6 +10789,7 @@ mod tests {
             sidebar_sized: sidebar::WIDTH,
             palette: None,
             palette_pending: Vec::new(),
+            keys_query: None,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,

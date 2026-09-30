@@ -860,11 +860,11 @@ impl Interface {
     /// on either answered "was a box ever open" and typed the name into a shell.
     fn answer_prompt(&mut self, mark: usize, name: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !self.painted[mark..].contains("esc to stop") {
+        while Instant::now() < deadline && !self.painted[mark..].contains("name the new") {
             let _ = self.wait_for("this needle never appears", Duration::from_millis(80));
         }
         assert!(
-            self.painted[mark..].contains("esc to stop"),
+            self.painted[mark..].contains("name the new"),
             "the naming box never opened:\n{}",
             &self.painted[mark..]
         );
