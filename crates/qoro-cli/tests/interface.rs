@@ -854,17 +854,26 @@ impl Interface {
 
     /// Type a name into the box that opened after `mark`, and confirm it.
     ///
-    /// After `mark` and not merely somewhere on screen. The box is painted into the stream
-    /// like everything else, so a box from the previous press is still in it, and a frame
-    /// painted before this press is still the last one until the test reads again: waiting
-    /// on either answered "was a box ever open" and typed the name into a shell.
+    /// After `mark`, not anywhere in the stream. The box is painted into the stream like
+    /// everything else, so a box from an earlier press is still in it: waiting on that
+    /// answered "was a box ever open" and typed the name into a shell.
+    ///
+    /// Or on the screen as it stands. A box opened in the same read that confirmed the one
+    /// before it takes that box's rows byte for byte, and a row that did not change is
+    /// never written again, so nothing after `mark` shows it. Keys reach the interface in
+    /// order, so the box on screen, or the one this press opens after it, is where the
+    /// name lands.
     fn answer_prompt(&mut self, mark: usize, name: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !self.painted[mark..].contains("name the new") {
+        let open = |ui: &Self| {
+            ui.painted[mark..].contains("name the new")
+                || ui.screen.to_string().contains("name the new")
+        };
+        while Instant::now() < deadline && !open(self) {
             let _ = self.wait_for("this needle never appears", Duration::from_millis(80));
         }
         assert!(
-            self.painted[mark..].contains("name the new"),
+            open(self),
             "the naming box never opened:\n{}",
             &self.painted[mark..]
         );

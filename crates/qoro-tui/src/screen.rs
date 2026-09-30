@@ -153,6 +153,21 @@ impl Default for Chrome<'_> {
 }
 
 impl Frame<'_> {
+    /// A close waiting on its answer, when its box fits. Otherwise the question stays on
+    /// the notice row, or the keys would be taken with nothing on screen saying why.
+    fn confirm(&self) -> Option<u32> {
+        self.chrome.closing.filter(|t| confirm_fits(self, *t))
+    }
+
+    /// Whether a box is open over the screen, which fades everything behind it.
+    fn spotlight(&self) -> bool {
+        self.prompt.is_some()
+            || self.palette.is_some()
+            || self.menu.is_some()
+            || self.reading.is_some()
+            || self.confirm().is_some()
+    }
+
     /// The pieces the left column is drawn from, at this frame's clock and tick.
     pub fn column(&self) -> sidebar::Column<'_> {
         sidebar::Column {
@@ -558,6 +573,10 @@ pub fn paint(frame: &Frame) -> String {
 
     let wide_enough = left > 0;
 
+    // Any box open fades what is behind it to one grey, so the box is what gets read.
+    let spotlight = frame.spotlight();
+    let faded = theme::fg(theme::Role::Unobserved);
+
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
     out.push_str(&at(1, left + 1));
@@ -567,6 +586,7 @@ pub fn paint(frame: &Frame) -> String {
         .collect();
     for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize, frame.unseen) {
         out.push_str(&match style {
+            _ if spotlight => faded.clone(),
             tabs::Ink::Focused => theme::tab_on(),
             // The bar shows one space's terminals, so one space colour lands on
             // all of them: identity, not confetti. Focus keeps the pink pill.
@@ -621,7 +641,11 @@ pub fn paint(frame: &Frame) -> String {
         // reads as the tab bar's colour and the raised rows sitting inside its
         // box, so raising the rule too paints one selection straddling the box
         // edge.
-        if let Some((line, hit)) = panel.get(row) {
+        if let Some((line, _)) = panel.get(row).filter(|_| spotlight) {
+            out.push_str(&faded);
+            out.push_str(&line.text);
+            out.push_str(theme::RESET);
+        } else if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
                 // A tab with no agent has no row in the column, so the keyboard on one is
                 // shown on its space's rule instead: the column always says where it is.
@@ -762,9 +786,8 @@ pub fn paint(frame: &Frame) -> String {
     // every time an agent changed state.
     out.push_str(&at(frame.lines as usize - 1, 1));
     // A close waiting on its answer asks in a box, and the notice row goes back to its
-    // news. Only when the box fits: otherwise the question stays here, or the keys would
-    // be taken with nothing on screen saying why.
-    let confirm = frame.chrome.closing.filter(|t| confirm_fits(frame, *t));
+    // news.
+    let confirm = frame.confirm();
     let message = if confirm.is_some() {
         None
     } else {
@@ -832,12 +855,7 @@ pub fn paint(frame: &Frame) -> String {
     out.push_str(&theme::status());
     // A box says its own keys in its footer, so under one the row is quiet. Otherwise a
     // mode names its own keys, because in a mode the others do not work.
-    let boxed = frame.prompt.is_some()
-        || frame.palette.is_some()
-        || frame.menu.is_some()
-        || frame.reading.is_some()
-        || confirm.is_some();
-    let mode = if boxed {
+    let mode = if spotlight {
         Some("")
     } else if frame.chrome.answer {
         Some("j/k scroll  space page  g/G top/bottom  q close")
@@ -894,7 +912,7 @@ pub fn paint(frame: &Frame) -> String {
             frame.collapsed,
             wide_enough,
             avatar.as_ref(),
-            crate::colorlevel::level() != crate::colorlevel::Level::Mono,
+            crate::colorlevel::level() != crate::colorlevel::Level::Mono && !spotlight,
         ));
     }
 
@@ -1144,7 +1162,7 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     let chips = palette_chips(palette.filter, &palette.query, inner);
     let mut query = format!(
         "{} > {}{}",
-        theme::fg(theme::Role::Faint),
+        theme::fg(theme::Role::Brand),
         theme::fg(theme::Role::Focused),
         width::fit(
             &palette.query,
@@ -1238,8 +1256,8 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     body.push(hint_line(PALETTE_HINT, inner));
     // The frame, so the box has edges: a floating list with no border is a list that has
     // fallen into whatever is behind it.
-    let rule = theme::fg(theme::Role::Rule);
-    paint_boxed(out, lines, (left, top, w), "find", (&rule, &rule), &body);
+    let (rule, title) = spot_inks();
+    paint_boxed(out, lines, (left, top, w), "find", (&rule, &title), &body);
 }
 
 /// The palette's rows that are not entries: both edges, the query line and the footer.
@@ -1372,8 +1390,7 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
         ),
         footer,
     ];
-    let rule = theme::fg(theme::Role::Detail);
-    let title = format!("{}\x1b[1m", theme::fg(theme::Role::Focused));
+    let (rule, title) = spot_inks();
     paint_boxed(
         out,
         lines,
@@ -1382,13 +1399,6 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
         (&rule, &title),
         &body,
     );
-    // The brand's one dash on the edge, beside the corner.
-    if top < lines {
-        out.push_str(&at(top + 1, left + 2));
-        out.push_str(&theme::fg(theme::Role::Brand));
-        out.push('\u{2500}');
-        out.push_str(theme::RESET);
-    }
 }
 
 /// The zero based row the naming box's typed text sits on.
@@ -1484,14 +1494,14 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
         })
         .collect();
     body.push(hint_line(MENU_HINT, inner));
-    let rule = theme::fg(theme::Role::Rule);
+    let (rule, ink) = spot_inks();
     // The title names what is open, the way the palette names its query.
     paint_boxed(
         out,
         frame.lines as usize,
         (left, top, w),
         &title,
-        (&rule, &rule),
+        (&rule, &ink),
         &body,
     );
 }
@@ -1905,8 +1915,8 @@ fn paint_box(
     let top = (lines.saturating_sub(rows.len() + 2) / 2)
         .max(TABS)
         .min(lines.saturating_sub(STATUS + rows.len() + 2));
-    let rule = theme::fg(theme::Role::Rule);
-    paint_boxed(out, lines, (left, top, w), title, (&rule, &rule), rows);
+    let (rule, ink) = spot_inks();
+    paint_boxed(out, lines, (left, top, w), title, (&rule, &ink), rows);
     Some((left, top))
 }
 
@@ -2034,6 +2044,15 @@ fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
 /// The row under a box's top edge, where its first row goes. Hit testing reads it too.
 pub(crate) const BOX_FIRST_ROW: usize = 1;
 
+/// A box's rule and title inks: a rule bright enough to stand over the faded screen
+/// behind it, and a bold title. The close question keeps its warning ink instead.
+fn spot_inks() -> (String, String) {
+    (
+        theme::fg(theme::Role::Detail),
+        format!("{}\x1b[1m", theme::fg(theme::Role::Focused)),
+    )
+}
+
 /// One floating box: the rounded edge in `inks.0`, `title` cut into the top edge in
 /// `inks.1`, and `rows` between the side rules, each already styled and exactly `w - 2`
 /// columns wide.
@@ -2062,11 +2081,17 @@ fn paint_boxed(
     let shown = width::text(title, width::width(title).min(inner.saturating_sub(4)));
     let shown = shown.trim_end();
     let used = width::width(shown);
+    // The brand's one dash beside the corner, on every box.
+    let brand = theme::fg(theme::Role::Brand);
     let top_edge = if used == 0 {
-        format!("{ink}\u{256d}{}\u{256e}", "\u{2500}".repeat(inner))
+        format!(
+            "{ink}\u{256d}{brand}{}{ink}{}\u{256e}",
+            "\u{2500}".repeat(inner.min(1)),
+            "\u{2500}".repeat(inner.saturating_sub(1))
+        )
     } else {
         format!(
-            "{ink}\u{256d}\u{2500} {title_ink}{shown}{ink} {}\u{256e}",
+            "{ink}\u{256d}{brand}\u{2500}{ink} {title_ink}{shown}{ink} {}\u{256e}",
             "\u{2500}".repeat(inner - used - 3)
         )
     };
@@ -2502,8 +2527,7 @@ pub(crate) fn paint_row(
     out
 }
 
-/// One row of a terminal in the pane, faded to a single grey while the naming box asks
-/// something, so the box is the only thing on the screen a person reads. The text stays,
+/// One row of a terminal in the pane, faded to a single grey while a box is open, so the box is the only thing on the screen a person reads. The text stays,
 /// only its colour, selection and links go, and they come back with the next frame.
 fn pane_row_paint(
     frame: &Frame,
@@ -2513,7 +2537,7 @@ fn pane_row_paint(
     cols: usize,
     selected: Option<std::ops::Range<usize>>,
 ) -> String {
-    if frame.prompt.is_none() {
+    if !frame.spotlight() {
         return paint_row(line, spans, links, cols, selected);
     }
     format!(
@@ -3130,6 +3154,8 @@ mod tests {
             chrome: Default::default(),
         });
         assert!(painted.contains("54/54"), "no count: {painted:?}");
+        // Behind the box the focused tab's pill fades with everything else.
+        assert!(!painted.contains(&theme::tab_on()), "{painted:?}");
         let w = cols.min(60).max(cols.min(20)) as usize;
         let left = (cols as usize - w) / 2;
         let top = ((lines as usize) / 3).max(TABS + 1);
