@@ -373,22 +373,22 @@ pub fn call(program: Program, body: &str) -> Call {
     }
 }
 
-/// The sound for a note: louder for something that is waiting on a person. Off by default,
+/// The sound for a note: `alert` (one of `config::SOUNDS`) for something that is waiting
+/// on a person or failed, `done` otherwise; on Linux the desktop's own two. Off by default,
 /// so this is only reached when `sound = true`. `None` when this machine has no player or
 /// no sound file to give it.
-pub fn sound(urgent: bool, macos: bool) -> Option<Call> {
+pub fn sound(urgent: bool, macos: bool, done: &str, alert: &str) -> Option<Call> {
     let play = |program: &'static str, file: &str| Call {
         program,
         args: vec![file.to_string()],
         stdin: None,
     };
     if macos {
-        let file = if urgent {
-            "/System/Library/Sounds/Funk.aiff"
-        } else {
-            "/System/Library/Sounds/Glass.aiff"
-        };
-        return on_path("afplay").map(|_| play("afplay", file));
+        let file = format!(
+            "/System/Library/Sounds/{}.aiff",
+            if urgent { alert } else { done }
+        );
+        return on_path("afplay").map(|_| play("afplay", &file));
     }
     let file = if urgent {
         "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
@@ -671,12 +671,12 @@ mod tests {
     #[test]
     fn a_sound_is_the_calm_one_or_the_urgent_one() {
         // Whether a player is installed differs by machine; the files named do not.
-        if let Some(play) = sound(false, true) {
+        if let Some(play) = sound(false, true, "Glass", "Funk") {
             assert_eq!(play.program, "afplay");
-            assert!(play.args[0].ends_with("Glass.aiff"));
+            assert_eq!(play.args[0], "/System/Library/Sounds/Glass.aiff");
         }
-        if let Some(play) = sound(true, true) {
-            assert!(play.args[0].ends_with("Funk.aiff"));
+        if let Some(play) = sound(true, true, "Glass", "Hero") {
+            assert_eq!(play.args[0], "/System/Library/Sounds/Hero.aiff");
         }
     }
 }

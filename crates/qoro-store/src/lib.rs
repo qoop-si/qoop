@@ -195,6 +195,14 @@ impl Store {
                  idempotency_key TEXT PRIMARY KEY,
                  outcome TEXT NOT NULL,
                  at_unix INTEGER NOT NULL
+             );
+             -- What a person called a conversation here, keyed by the agent's own id
+             -- for it, so the name follows the conversation through a sleep and a
+             -- restart and is never written into the agent's storage. New table, no
+             -- version bump, for the reason the ones above give.
+             CREATE TABLE IF NOT EXISTS session_title (
+                 session TEXT PRIMARY KEY,
+                 title TEXT NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -442,6 +450,54 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every conversation a person named, as `(session, title)`.
+    pub fn session_titles(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session, title FROM session_title")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Name a conversation, or with `None` give it back its agent's own title.
+    pub fn set_session_title(&self, session: &str, title: Option<&str>) -> Result<(), StoreError> {
+        match title {
+            Some(title) => self.conn.execute(
+                "INSERT INTO session_title (session, title) VALUES (?1, ?2) \
+                 ON CONFLICT(session) DO UPDATE SET title = excluded.title",
+                params![session, title],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM session_title WHERE session = ?1",
+                params![session],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Move an open terminal to another workspace, at the end of its tabs. One
+    /// transaction for the row and its place, so a crash leaves it where it was.
+    /// Answers whether a row moved.
+    pub fn move_terminal(&mut self, id: i64, workspace: i64) -> Result<bool, StoreError> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE terminal SET workspace = ?2 WHERE id = ?1 AND closed_at IS NULL",
+            params![id, workspace],
+        )?;
+        if n == 1 {
+            tx.execute("DELETE FROM layout WHERE terminal = ?1", params![id])?;
+            tx.execute(
+                "INSERT INTO layout (workspace, terminal, ordinal) VALUES (?2, ?1, \
+                 (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM layout WHERE workspace = ?2))",
+                params![id, workspace],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n == 1)
     }
 
     /// The highest terminal id ever written, open or closed, or 0 for none.

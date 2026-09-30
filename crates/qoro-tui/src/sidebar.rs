@@ -1245,54 +1245,54 @@ fn place_of(agent: &AgentRow, space: &WorkspaceRow) -> Option<String> {
     cwd_basename(agent.cwd.as_deref()).filter(|base| !base.eq_ignore_ascii_case(&space.name))
 }
 
-/// An agent's second row: which tab it is, and what it is doing now or, while it rests,
+/// An agent's second row: what it is doing now or, while it rests, which tab it is and
 /// where it runs.
 ///
 /// Every agent has one, so a row never grows or shrinks under the eye as an agent starts
-/// and stops, and the tab a person named (or the program, when nobody did) stays on
-/// screen for a calm agent too. While the daemon reports an activity (working, starting,
-/// waiting, failed) it follows the tab in a person's words ([`humanize`]): quietly while
-/// it works, what it wants in the blocked colour, and the failure in the failed colour.
-/// Otherwise the directory it runs in follows, when that says something the space name
-/// does not. The row reaches the same terminal as the name above it.
+/// and stops. While the daemon reports an activity (working, starting, waiting, failed)
+/// the row is that activity alone, in a person's words ([`humanize`]): quietly while it
+/// works, what it wants in the blocked colour, and the failure in the failed colour. The
+/// tab and the place are what a person reads to find a resting agent, and beside a live
+/// activity they were two words of noise cutting it short. At rest the tab a person
+/// named (or the program, when nobody did) comes back, followed by the directory it runs
+/// in when that says something the space name does not. The row reaches the same
+/// terminal as the name above it.
 fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) -> Row {
     use crate::theme::Role;
     let lead = format!("{}\u{2514} ", " ".repeat(at));
     let lead_w = crate::width::width(&lead);
     let room = c.width.saturating_sub(lead_w);
-    let doing = said(agent);
-    let tab = label(agent);
-    // The tab gives way to what the agent is doing, never the other way round.
-    let tail_w = |tail: &str| crate::width::width(tail) + 3;
-    let tab_room = match (&doing, &place) {
-        (Some((what, _)), _) => room.saturating_sub(tail_w(what)).max(room.min(8)),
-        (None, Some(place)) => room.saturating_sub(tail_w(place)).max(room.min(12)),
-        (None, None) => room,
-    };
-    let tab = shorten_middle(&tab, tab_room);
-    let mut text = format!("{lead}{tab}");
     let mut runs = vec![(at, 1, Role::Rule)];
-    let rest = room.saturating_sub(crate::width::width(&tab) + 3);
-    let after = match (doing, place) {
-        (Some((what, ink)), _) => Some((what, ink, true)),
-        (None, Some(place)) => Some((place, Role::Faint, false)),
-        (None, None) => None,
-    };
-    if let Some((what, ink, doing)) = after.filter(|_| rest >= 2) {
-        let what = shorten_middle(&what, rest);
-        let at_what = crate::width::width(&text) + 3;
-        runs.push((at_what - 2, 1, Role::Rule));
-        if doing && agent.state == "working" && c.tick > 0 {
-            // While it works and the column moves, a band of brighter greys crosses what
-            // it is doing, left to right: the row says "alive" without a word for it.
-            // Only what it is doing: a worktree name is a place, and a place never moves.
-            runs.extend(sweep(&what, at_what, c.tick));
-        } else if ink != Role::Faint {
-            runs.push((at_what, crate::width::width(&what), ink));
+    let text = match said(agent) {
+        Some((what, ink)) => {
+            let what = shorten_middle(&what, room);
+            if agent.state == "working" && c.tick > 0 {
+                // While it works and the column moves, a band of brighter greys crosses
+                // what it is doing, left to right: the row says "alive" without a word
+                // for it.
+                runs.extend(sweep(&what, lead_w, c.tick));
+            } else if ink != Role::Faint {
+                runs.push((lead_w, crate::width::width(&what), ink));
+            }
+            format!("{lead}{what}")
         }
-        text.push_str(" \u{b7} ");
-        text.push_str(&what);
-    }
+        None => {
+            let tail_w = |tail: &str| crate::width::width(tail) + 3;
+            let tab_room = place
+                .as_deref()
+                .map_or(room, |p| room.saturating_sub(tail_w(p)).max(room.min(12)));
+            let tab = shorten_middle(&label(agent), tab_room);
+            let mut text = format!("{lead}{tab}");
+            let rest = room.saturating_sub(crate::width::width(&tab) + 3);
+            // A place is a place and never moves: no band, only the quiet grey.
+            if let Some(place) = place.filter(|_| rest >= 2) {
+                runs.push((crate::width::width(&text) + 1, 1, Role::Rule));
+                text.push_str(" \u{b7} ");
+                text.push_str(&shorten_middle(&place, rest));
+            }
+            text
+        }
+    };
     (
         Line {
             text: fit(&text, c.width),
@@ -1861,7 +1861,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
 /// whatever happens to be running. No program beside any of them: the row
 /// below already says what runs in which tab, and a program prefix is how
 /// four live sessions all read `opencode`.
-fn session_name(agent: &AgentRow) -> String {
+pub(crate) fn session_name(agent: &AgentRow) -> String {
     if let Some(title) = agent.agent_title.as_deref() {
         let title = title.trim();
         if !title.is_empty() {
@@ -5256,9 +5256,9 @@ mod tests {
         }
     }
 
-    /// A working agent says what it is doing on a row of its own under its name; a waiting
-    /// one says what it wants in the blocked colour.
-    /// A calm agent keeps one row, whatever its last tool was.
+    /// A working agent says what it is doing on a row of its own under its name, and only
+    /// that; a waiting one says what it wants in the blocked colour. A calm agent keeps its
+    /// tab on that row, whatever its last tool was.
     #[test]
     fn activity_rides_a_sub_row_in_the_tree() {
         let spaces = vec![space(1, "app")];
@@ -5283,22 +5283,18 @@ mod tests {
         };
         let one = under(1);
         assert_eq!(one.len(), 2, "{texts:?}");
-        // The tab, then what it does; inside the box at the default width the activity is
-        // the one cut.
+        // What it does and nothing else: the tab gives the whole row to it.
         assert_eq!(
             unbox(&one[1].text),
-            "   \u{2514} claude \u{b7} editing sidebar_rows_a\u{2026}"
+            "   \u{2514} editing sidebar_rows_and_the_fo\u{2026}"
         );
         assert_eq!(one[1].colour, Some(crate::theme::Role::Faint));
         let two = under(2);
-        assert_eq!(
-            unbox(&two[1].text),
-            "   \u{2514} codex \u{b7} wants: bun test"
-        );
+        assert_eq!(unbox(&two[1].text), "   \u{2514} wants: bun test");
         // Quiet grey, with what it wants in the blocked colour.
         assert_eq!(two[1].colour, Some(crate::theme::Role::Faint));
         assert!(
-            two[1].runs.contains(&(13, 15, crate::theme::Role::Blocked)),
+            two[1].runs.contains(&(5, 15, crate::theme::Role::Blocked)),
             "{:?}",
             two[1].runs
         );

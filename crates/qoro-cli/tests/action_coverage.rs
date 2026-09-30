@@ -124,6 +124,26 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "rename a conversation",
+            method: || {
+                Method::Control(ControlRequest::RenameSession {
+                    id: "a".into(),
+                    terminal: 1,
+                    title: Some("release".into()),
+                })
+            },
+        },
+        Action {
+            name: "move a terminal to another workspace",
+            method: || {
+                Method::Control(ControlRequest::MoveTerminal {
+                    id: "a".into(),
+                    terminal: 1,
+                    workspace: 2,
+                })
+            },
+        },
+        Action {
             name: "rename a workspace",
             method: || {
                 Method::Control(ControlRequest::RenameWorkspace {
@@ -475,6 +495,16 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             name: String::new(),
         },
+        ControlRequest::RenameSession {
+            id: String::new(),
+            terminal: 0,
+            title: None,
+        },
+        ControlRequest::MoveTerminal {
+            id: String::new(),
+            terminal: 0,
+            workspace: 0,
+        },
         ControlRequest::ListFocusEvents {
             id: String::new(),
             terminal: 0,
@@ -517,6 +547,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SleepWorkspace { .. }
             | ControlRequest::WakeWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
+            | ControlRequest::RenameSession { .. }
+            | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }

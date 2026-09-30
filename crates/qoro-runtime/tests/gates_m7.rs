@@ -156,6 +156,17 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x24".into(),
             terminals: vec![terminal],
         },
+        // A name for the conversation and a place for the tab: nothing typed.
+        ControlRequest::RenameSession {
+            id: "x25".into(),
+            terminal,
+            title: Some("renamed".into()),
+        },
+        ControlRequest::MoveTerminal {
+            id: "x26".into(),
+            terminal,
+            workspace: 999,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -172,6 +183,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SleepWorkspace { .. }
             | ControlRequest::WakeWorkspace { .. }
             | ControlRequest::RenameTerminal { .. }
+            | ControlRequest::RenameSession { .. }
+            | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }

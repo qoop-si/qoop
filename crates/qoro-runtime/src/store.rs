@@ -236,6 +236,26 @@ impl StoreHandle {
         self.run(move |s| s.set_title(id, &title)).await
     }
 
+    /// Every conversation a person named, as `(session, title)`.
+    pub async fn session_titles(&self) -> Result<Vec<(String, String)>, HandleError> {
+        self.run(|s| s.session_titles()).await
+    }
+
+    /// Name a conversation, or with `None` give it back its agent's own title.
+    pub async fn set_session_title(
+        &self,
+        session: String,
+        title: Option<String>,
+    ) -> Result<(), HandleError> {
+        self.run(move |s| s.set_session_title(&session, title.as_deref()))
+            .await
+    }
+
+    /// Move an open terminal to another workspace. Answers whether a row moved.
+    pub async fn move_terminal(&self, id: i64, workspace: i64) -> Result<bool, HandleError> {
+        self.run(move |s| s.move_terminal(id, workspace)).await
+    }
+
     /// Forget a terminal's name, so a cleared tab comes back cleared too.
     pub async fn clear_title(&self, id: i64) -> Result<(), HandleError> {
         self.run(move |s| s.clear_title(id)).await

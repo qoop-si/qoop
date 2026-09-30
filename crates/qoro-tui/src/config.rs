@@ -74,6 +74,10 @@ pub struct Config {
     pub desktop: bool,
     /// And play a sound when it does.
     pub sound: bool,
+    /// The sound for an agent that finished, one of [`SOUNDS`] (macOS).
+    pub done_sound: &'static str,
+    /// The sound for one that waits on a person or failed, one of [`SOUNDS`] (macOS).
+    pub alert_sound: &'static str,
     /// Show the agents in the macOS notch. Read by the notch app, through `qoro config`.
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
@@ -87,10 +91,38 @@ impl Default for Config {
             theme: Theme::Auto,
             desktop: true,
             sound: false,
+            done_sound: "Glass",
+            alert_sound: "Funk",
             notch: true,
             lifecycle: qoro_runtime::config::Lifecycle::default(),
         }
     }
+}
+
+/// The sounds macOS keeps in `/System/Library/Sounds`, by the names the files have there.
+pub const SOUNDS: [&str; 14] = [
+    "Basso",
+    "Blow",
+    "Bottle",
+    "Frog",
+    "Funk",
+    "Glass",
+    "Hero",
+    "Morse",
+    "Ping",
+    "Pop",
+    "Purr",
+    "Sosumi",
+    "Submarine",
+    "Tink",
+];
+
+/// A sound named as the file is, in any case: `hero` is `Hero`.
+fn sound_named(name: &str) -> Option<&'static str> {
+    SOUNDS
+        .iter()
+        .copied()
+        .find(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// One thing in the file that could not be used, and the line it is on when that is known.
@@ -335,6 +367,20 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             ("notify", toml::Value::Table(notify)) => {
                 for (key, value) in notify {
                     let line = line_of(&nested.notify, key);
+                    if let Some(slot) = match key.as_str() {
+                        "done_sound" => Some(&mut config.done_sound),
+                        "alert_sound" => Some(&mut config.alert_sound),
+                        _ => None,
+                    } {
+                        match value.as_str().and_then(sound_named) {
+                            Some(name) => *slot = name,
+                            None => refuse(
+                                line,
+                                format!("{key} = {value} is not one of {}", SOUNDS.join(", ")),
+                            ),
+                        }
+                        continue;
+                    }
                     let slot = match key.as_str() {
                         "desktop" => &mut config.desktop,
                         "sound" => &mut config.sound,
@@ -452,11 +498,13 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 5] = [
+pub const KEYS: [&str; 7] = [
     "prefix",
     "theme",
     "notify.desktop",
     "notify.sound",
+    "notify.done_sound",
+    "notify.alert_sound",
     "notch.enabled",
 ];
 
@@ -470,6 +518,10 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "prefix" => return Err(format!("prefix is {PREFIX_SAID}")),
         "theme" if matches!(value, "auto" | "dark" | "light") => toml_edit::value(value),
         "theme" => return Err("theme is auto, dark or light".to_string()),
+        "notify.done_sound" | "notify.alert_sound" => match sound_named(value) {
+            Some(name) => toml_edit::value(name),
+            None => return Err(format!("{key} is one of {}", SOUNDS.join(", "))),
+        },
         "notify.desktop" | "notify.sound" | "notch.enabled" => match value {
             "true" => toml_edit::value(true),
             "false" => toml_edit::value(false),
@@ -555,7 +607,7 @@ pub fn shown() -> Vec<String> {
 pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
     let config = read.config;
     // Each setting as it is written in the file, then what it may be, in one column.
-    let row = |written: String, about: &str| format!(" {written:<20}{about}");
+    let row = |written: String, about: &str| format!(" {written:<19} {about}");
     let theme_now = match config.theme {
         Theme::Auto if light => "auto | dark | light, light now",
         Theme::Auto => "auto | dark | light, dark now",
@@ -584,6 +636,14 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
         " [notify]".to_string(),
         row(format!("desktop = {}", config.desktop), &notes),
         row(format!("sound = {}", config.sound), "true | false"),
+        row(
+            format!("done_sound = \"{}\"", config.done_sound),
+            "a finished agent, macOS",
+        ),
+        row(
+            format!("alert_sound = \"{}\"", config.alert_sound),
+            "one that waits on you or failed",
+        ),
         " [notch]".to_string(),
         row(format!("enabled = {}", config.notch), "true | false, macOS"),
         " [sleep]".to_string(),
@@ -693,7 +753,7 @@ mod tests {
                 desktop: false,
                 sound: true,
                 notch: false,
-                lifecycle: qoro_runtime::config::Lifecycle::default(),
+                ..Config::default()
             }
         );
         let dotted = parse("notify.desktop = false\n").0;
@@ -792,13 +852,15 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
-        assert_eq!(rows[6], " [notch]");
-        assert!(rows[7].starts_with(" enabled = true"), "{rows:?}");
-        assert_eq!(rows[8], " [sleep]");
-        assert!(rows[9].starts_with(" idle_minutes = 0"), "{rows:?}");
-        assert_eq!(rows[10], " [daemon]");
-        assert!(rows[11].starts_with(" exit_when_asleep = true"), "{rows:?}");
-        assert_eq!(rows[12], " ! line 1: needs quotes: theme = \"blue\"");
+        assert_eq!(rows[6], " done_sound = \"Glass\" a finished agent, macOS");
+        assert!(rows[7].starts_with(" alert_sound = \"Funk\" "), "{rows:?}");
+        assert_eq!(rows[8], " [notch]");
+        assert!(rows[9].starts_with(" enabled = true"), "{rows:?}");
+        assert_eq!(rows[10], " [sleep]");
+        assert!(rows[11].starts_with(" idle_minutes = 0"), "{rows:?}");
+        assert_eq!(rows[12], " [daemon]");
+        assert!(rows[13].starts_with(" exit_when_asleep = true"), "{rows:?}");
+        assert_eq!(rows[14], " ! line 1: needs quotes: theme = \"blue\"");
     }
 
     /// Nothing from the file reaches the screen with a line break or a control character
@@ -876,10 +938,22 @@ mod tests {
             (config.prefix, config.sound, config.notch),
             (0x02, false, true)
         );
+        // A sound is written as its file is named, whatever case it was typed in.
+        set(&file, "notify.alert_sound", "hero").unwrap();
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("alert_sound = \"Hero\""), "{written}");
+        let (config, problems) = parse(&written);
+        assert_eq!((config.done_sound, config.alert_sound), ("Glass", "Hero"));
+        assert!(
+            !problems.iter().any(|p| p.what.contains("sound")),
+            "{problems:?}"
+        );
+        let text = written;
         for (key, value) in [
             ("prefix", "ctrl-c"),
             ("theme", "blue"),
             ("notify.sound", "yes"),
+            ("notify.done_sound", "Kazoo"),
             ("nope", "1"),
         ] {
             assert!(set(&file, key, value).is_err(), "{key} = {value}");

@@ -200,13 +200,25 @@ if [ "$(uname -s)" = "Darwin" ]; then
     "$DEST" notch install || echo "the notch was not turned on; the rest of qoro is installed"
 fi
 
-# The one question the install asks, and only when there is a person to answer
-# it: pick the terminal pet. Piped runs and CI stay non-interactive by
-# construction, and quitting keeps the install just done.
+# The questions the install asks, and only when there is a person to answer them:
+# pick the terminal pet, and whether a finished or waiting agent plays a sound. Piped
+# runs and CI stay non-interactive by construction, and quitting keeps the install
+# just done. The sound is asked once: a config.toml that already says is kept.
 if [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
     "$DEST" avatar pick || true
+    cfg=$("$DEST" config | head -n 1 | sed 's/  (no file.*//')
+    if ! grep -Eqs '(^|[.{,[:space:]])sound[[:space:]]*=' "$cfg"; then
+        printf 'play a sound when an agent finishes or needs you? [Y/n] '
+        read -r answer || answer=n
+        case "$answer" in
+            [nN]*) sound=false ;;
+            *) sound=true ;;
+        esac
+        "$DEST" config set notify.sound "$sound" || true
+    fi
 else
     echo "pick an avatar when ready: qoro avatar pick"
+    echo "sounds when an agent finishes or needs you: qoro config set notify.sound true"
 fi
 
 # The hooks call `qoro` by name, so it has to be on PATH. Said, not done: an rc

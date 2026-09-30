@@ -44,6 +44,28 @@ pub enum ControlRequest {
         /// `None` gives the terminal back to its program's name.
         name: Option<String>,
     },
+    /// Call the conversation in a terminal something else here, or with `None` give it
+    /// back the title its agent gave it.
+    ///
+    /// Keyed by the agent's own id for the conversation, so the name follows it through a
+    /// sleep and a restart. Never written into the agent's storage: it is what this
+    /// machine calls the conversation, and every client reads it off `AgentRow::agent_title`.
+    /// Refused for a terminal whose agent has not said which conversation it is in.
+    RenameSession {
+        id: String,
+        terminal: TerminalStream,
+        title: Option<String>,
+    },
+    /// Put a terminal in another workspace, at the end of its tabs.
+    ///
+    /// A pane leaves the split it was in and the rest of that split stays. Refused for a
+    /// sleeping space on either side: a sleeping tab has nothing running to move, and one
+    /// moved into a sleep would be running where nothing may run.
+    MoveTerminal {
+        id: String,
+        terminal: TerminalStream,
+        workspace: i64,
+    },
     /// Give a workspace a different name.
     /// Rows of a terminal's scrollback, so a person can read what has gone past.
     ///
@@ -328,6 +350,8 @@ impl ControlRequest {
         match self {
             Self::CreateTerminal { id, .. }
             | Self::RenameTerminal { id, .. }
+            | Self::RenameSession { id, .. }
+            | Self::MoveTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
@@ -454,6 +478,12 @@ pub enum ControlResponse {
     },
     Renamed {
         id: String,
+    },
+    /// A terminal is in `workspace` now.
+    TerminalMoved {
+        id: String,
+        terminal: TerminalStream,
+        workspace: i64,
     },
     Subscribed {
         id: String,
@@ -903,6 +933,7 @@ impl ControlResponse {
             | Self::WorkspaceAsleep { id, .. }
             | Self::WorkspaceAwake { id, .. }
             | Self::Renamed { id, .. }
+            | Self::TerminalMoved { id, .. }
             | Self::Stopping { id, .. }
             | Self::Scrollback { id, .. }
             | Self::ScrollbackMatch { id, .. }

@@ -543,6 +543,9 @@ pub struct TerminalRegistry {
     /// Held across a split change and its write, so two clients changing splits at
     /// once cannot land on disk in the other order from memory.
     split_write: tokio::sync::Mutex<()>,
+    /// What a person called each conversation here, by the agent's own id for it. Kept
+    /// in memory as well as on disk, like the splits, so an index reads no row for it.
+    session_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl TerminalRegistry {
@@ -593,6 +596,71 @@ impl TerminalRegistry {
             }
             None => false,
         }
+    }
+
+    /// Put a terminal in another workspace. False when there is no such terminal.
+    fn move_to(&self, stream: u32, workspace: i64) -> bool {
+        match self.inner.lock().unwrap().get_mut(&stream) {
+            Some(handle) => {
+                handle.workspace = workspace;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The name a person gave a conversation here, if they gave one.
+    pub fn session_title(&self, session: Option<&str>) -> Option<String> {
+        self.session_titles.lock().unwrap().get(session?).cloned()
+    }
+
+    /// Replace every conversation name at once, as a start reads them back.
+    pub fn load_session_titles(&self, titles: Vec<(String, String)>) {
+        *self.session_titles.lock().unwrap() = titles.into_iter().collect();
+    }
+
+    /// Name a conversation, or with `None` forget its name, on disk and in memory.
+    async fn set_session_title(
+        &self,
+        session: String,
+        title: Option<String>,
+        store: &crate::store::StoreHandle,
+    ) -> Result<(), crate::store::HandleError> {
+        // Held across the write, so two renames land on disk and in memory in one order;
+        // and the disk first, so a write that fails leaves the old name in both.
+        let _order = self.split_write.lock().await;
+        store
+            .set_session_title(session.clone(), title.clone())
+            .await?;
+        let mut titles = self.session_titles.lock().unwrap();
+        match title {
+            Some(title) => titles.insert(session, title),
+            None => titles.remove(&session),
+        };
+        Ok(())
+    }
+
+    /// Take a terminal out of every split tree, keeping the rest of each tree, and write
+    /// the set down. What a pane moved to another space leaves behind.
+    async fn drop_from_splits(
+        &self,
+        stream: u32,
+        store: &crate::store::StoreHandle,
+    ) -> Result<(), crate::store::HandleError> {
+        let _order = self.split_write.lock().await;
+        let trees = {
+            let mut splits = self.splits.lock().unwrap();
+            if !splits.iter().any(|tree| tree.leaves().contains(&stream)) {
+                return Ok(());
+            }
+            *splits = splits
+                .iter()
+                .filter_map(|tree| tree.retain(&|t| t != stream))
+                .filter(|tree| tree.leaves().len() > 1)
+                .collect();
+            splits.clone()
+        };
+        store.set_splits(splits_json(&trees)).await
     }
 
     /// Give a terminal a different name. False when there is no such terminal.
@@ -836,6 +904,7 @@ impl Daemon {
         })
         .await;
         restore_splits(&terminals, &books).await;
+        terminals.load_session_titles(books.store.session_titles().await.unwrap_or_default());
         Ok(Self {
             listener,
             socket,
@@ -2602,6 +2671,8 @@ fn dispatch(
             None => Dispatch::Apart,
         },
         ControlRequest::CloseWorkspace { workspace, .. } => take(*workspace),
+        // Two spaces' locks, taken in order off the read loop.
+        ControlRequest::MoveTerminal { .. } => Dispatch::Apart,
         // Seconds of disk for a large picture: never on the read loop, where it would hold
         // up this connection's typing.
         ControlRequest::SaveUpload { .. } => Dispatch::Apart,
@@ -2820,11 +2891,21 @@ async fn handle_control(
             // which rows to keep never sees this tab half closed, and this close never acts
             // on what it saw before a sleep or a wake moved the tab.
             let mut held = held;
-            if let Some(space) = terminals.workspace_of(terminal) {
+            // Read again once the lock is held: a move to another space may have finished
+            // while this waited, and then the lock that orders this close is that space's.
+            let mut space = terminals.workspace_of(terminal);
+            let locked = loop {
+                let Some(at) = space else { break None };
                 let guard = match held.take() {
                     Some(guard) => guard,
-                    None => books.lock_of(space).lock_owned().await,
+                    None => books.lock_of(at).lock_owned().await,
                 };
+                space = terminals.workspace_of(terminal);
+                if space == Some(at) {
+                    break Some(guard);
+                }
+            };
+            if let Some(guard) = locked {
                 if let Some(handle) = terminals.get(terminal) {
                     // Closing is a request to the terminal, not a registry edit: the
                     // terminal owns its teardown, which has to contain what it started
@@ -3014,7 +3095,9 @@ async fn handle_control(
                         .map(|tab| crate::control::SleepingTab {
                             terminal: tab.id as u32,
                             title: tab.title,
-                            session: agent_title(tab.agent_session.as_deref()),
+                            session: terminals
+                                .session_title(tab.agent_session.as_deref())
+                                .or_else(|| agent_title(tab.agent_session.as_deref())),
                             agent: tab.agent,
                             cwd: tab.cwd,
                         })
@@ -3066,6 +3149,115 @@ async fn handle_control(
                     id,
                     reason: format!("there is no terminal {terminal}"),
                 }
+            }
+        }
+        ControlRequest::RenameSession {
+            terminal, title, ..
+        } => {
+            let title = title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+            let Some(session) = terminals.session_of(terminal) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: if terminals.get(terminal).is_some() {
+                        "its agent has not said which conversation this is yet".to_string()
+                    } else {
+                        format!("there is no terminal {terminal}")
+                    },
+                };
+            };
+            if let Err(e) = terminals.set_session_title(session, title, store).await {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the name could not be saved: {e}"),
+                };
+            }
+            agents.announce(terminal);
+            ControlResponse::Renamed { id }
+        }
+        ControlRequest::MoveTerminal {
+            terminal,
+            workspace: to,
+            ..
+        } => {
+            let Some(from) = terminals.workspace_of(terminal) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no terminal {terminal}"),
+                };
+            };
+            if from == to {
+                return ControlResponse::TerminalMoved {
+                    id,
+                    terminal,
+                    workspace: to,
+                };
+            }
+            // Both spaces' locks, the lower id first so two moves the other way round
+            // cannot each hold one and wait for the other. A sleep deciding what to keep
+            // and a close counting what is left never see the tab between the two.
+            let (low, high) = (from.min(to), from.max(to));
+            let _low = books.lock_of(low).lock_owned().await;
+            let _high = books.lock_of(high).lock_owned().await;
+            if terminals.workspace_of(terminal) != Some(from) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "the tab moved while this was asked, try again".to_string(),
+                };
+            }
+            if !store
+                .workspaces()
+                .await
+                .is_ok_and(|spaces| spaces.iter().any(|s| s.id == to))
+            {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no space {to}"),
+                };
+            }
+            if books.is_asleep(from) || books.is_asleep(to) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "a sleeping space cannot take or give a tab, wake it first".to_string(),
+                };
+            }
+            if agents.is_closed(terminal) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("terminal {terminal} is closing"),
+                };
+            }
+            // Out of its split first: a move that then fails leaves a pane with no split,
+            // which is a tab; the other order could leave a tree spanning two spaces on disk
+            // for the next start to bring back.
+            if let Err(e) = terminals.drop_from_splits(terminal, store).await {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the split could not be saved: {e}"),
+                };
+            }
+            match store.move_terminal(terminal as i64, to).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("there is no open terminal {terminal}"),
+                    };
+                }
+                Err(e) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("the move could not be saved: {e}"),
+                    };
+                }
+            }
+            terminals.move_to(terminal, to);
+            agents.announce(terminal);
+            ControlResponse::TerminalMoved {
+                id,
+                terminal,
+                workspace: to,
             }
         }
         ControlRequest::RenameWorkspace {
@@ -3236,7 +3428,11 @@ async fn handle_control(
                         .unwrap_or("unknown")
                         .to_string();
                     let agent_session = terminals.session_of(terminal);
-                    let agent_title = titles.get(&terminal).cloned();
+                    // What a person called it here comes first: it is the one name
+                    // they chose, and the agent's own title is a guess made for them.
+                    let agent_title = terminals
+                        .session_title(agent_session.as_deref())
+                        .or_else(|| titles.get(&terminal).cloned());
                     // The explanation rides the row: what holds the belief,
                     // and what the screen last matched. A client that does
                     // not know these fields ignores them; `qoro agents

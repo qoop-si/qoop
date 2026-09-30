@@ -20,6 +20,8 @@ theme = "auto"
 [notify]
 desktop = true
 sound = false
+done_sound = "Glass"
+alert_sound = "Funk"
 
 [sleep]
 idle_minutes = 0
@@ -33,7 +35,9 @@ exit_when_asleep = true
 | `prefix` | `"ctrl-a"` | the key that starts a command: `ctrl-` and one of `a b e f g k l n o p r t u v w x y` |
 | `theme` | `"auto"` | `auto` asks the terminal for its background; `dark` or `light` say it |
 | `notify.desktop` | `true` | tell the desktop when an agent needs you and you are not looking |
-| `notify.sound` | `false` | and play a sound when it does |
+| `notify.sound` | `false` | and play a sound when it does; the install asks |
+| `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink` |
+| `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list |
 | `sleep.idle_minutes` | `0` | a space whose tabs have all been idle and unwatched this many minutes sleeps by itself, the same way `ctrl-a Z` puts it to sleep, refusals included. `0` is never, and then nothing runs for it at all |
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached, so a machine with everything asleep runs nothing of qoro; the next `qoro` starts it again. `false` keeps it up |
 

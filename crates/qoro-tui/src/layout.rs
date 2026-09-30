@@ -183,6 +183,27 @@ impl Layout {
         true
     }
 
+    /// Put `terminal`, which is in no pane of this tree, beside `target` on the side
+    /// `side` names, with the keyboard in it. What a row dropped on a pane's edge does.
+    /// Refuses what `split_placeholder` refuses: no room, no such target, a zoom, and
+    /// a terminal already here.
+    pub fn insert_beside(&mut self, target: u32, terminal: u32, side: Move, area: Rect) -> bool {
+        let dir = match side {
+            Move::Left | Move::Right => Dir::V,
+            Move::Up | Move::Down => Dir::H,
+        };
+        if self.contains(terminal) || !self.split_placeholder(target, dir, area) {
+            return false;
+        }
+        bind_first_placeholder(&mut self.root, terminal);
+        if matches!(side, Move::Left | Move::Up) {
+            put_first(&mut self.root, terminal);
+        }
+        self.zoomed = None;
+        self.set_focus(terminal);
+        true
+    }
+
     /// Bind the pending placeholder to a real terminal. Refuses a duplicate
     /// id and a bind with no pending split beside a live leaf: both would
     /// leave two panes answering to one terminal.
@@ -537,6 +558,18 @@ fn split_node(node: &mut Node, target: u32, dir: Dir) -> bool {
     }
 }
 
+/// Swap the two sides of the split whose second side is `terminal`'s own leaf.
+fn put_first(node: &mut Node, terminal: u32) -> bool {
+    let Node::Split { first, second, .. } = node else {
+        return false;
+    };
+    if matches!(**second, Node::Leaf { terminal: Some(t) } if t == terminal) {
+        std::mem::swap(first, second);
+        return true;
+    }
+    put_first(first, terminal) || put_first(second, terminal)
+}
+
 fn bind_first_placeholder(node: &mut Node, terminal: u32) -> bool {
     match node {
         Node::Leaf { terminal: slot } => {
@@ -884,6 +917,37 @@ mod tests {
             cols,
             rows,
         }
+    }
+
+    /// A row dropped on a pane's edge lands on that side of it, with the keyboard.
+    #[test]
+    fn a_dropped_terminal_lands_on_the_side_it_was_dropped_on() {
+        let a = area(80, 24);
+        let sides = [
+            (Move::Left, Dir::V, vec![2, 1]),
+            (Move::Right, Dir::V, vec![1, 2]),
+            (Move::Up, Dir::H, vec![2, 1]),
+            (Move::Down, Dir::H, vec![1, 2]),
+        ];
+        for (side, dir, order) in sides {
+            let mut layout = Layout::single(1);
+            assert!(layout.insert_beside(1, 2, side, a), "{side:?}");
+            assert_eq!(layout.leaves(), order, "{side:?}");
+            assert_eq!(layout.focus, 2, "{side:?}");
+            assert!(!layout.has_pending(), "{side:?}");
+            assert!(matches!(layout.root, Node::Split { dir: d, .. } if d == dir));
+        }
+        // Into the middle of a tree: beside its own target, the rest untouched.
+        let mut layout = Layout::single(1);
+        assert!(layout.insert_beside(1, 2, Move::Right, a));
+        assert!(layout.insert_beside(1, 3, Move::Up, a));
+        assert_eq!(layout.leaves(), vec![3, 1, 2]);
+        // Twice, no target, no room: refused and nothing changed.
+        let before = layout.clone();
+        assert!(!layout.insert_beside(1, 3, Move::Left, a));
+        assert!(!layout.insert_beside(9, 4, Move::Left, a));
+        assert!(!layout.insert_beside(1, 4, Move::Left, area(10, 4)));
+        assert_eq!(layout, before);
     }
 
     #[test]

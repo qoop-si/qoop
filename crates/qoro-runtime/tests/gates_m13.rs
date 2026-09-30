@@ -1128,3 +1128,235 @@ async fn a_recorded_split_rides_the_index_until_a_pane_closes() {
     };
     assert!(splits.is_empty(), "a tree of one is a tab: {splits:?}");
 }
+
+/// A conversation named here rides the index as its title, and forgetting the name gives
+/// the agent's own back. Refused while the agent has not said which conversation it is.
+#[tokio::test]
+async fn a_session_name_rides_the_index_and_clears() {
+    use qoro_runtime::control::ControlResponse;
+
+    let d = qoro_testkit::TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut client = d.attach("session-namer").await;
+    let rename = |id: &str, title: Option<&str>| ControlRequest::RenameSession {
+        id: id.into(),
+        terminal,
+        title: title.map(str::to_string),
+    };
+    let refused = client
+        .control(&rename("early", Some("release")), qoro_testkit::PATIENCE)
+        .await;
+    assert!(
+        matches!(refused, Some(ControlResponse::Failed { .. })),
+        "a name for no conversation was taken: {refused:?}"
+    );
+    let reported = client
+        .control(
+            &ControlRequest::ReportAgentSession {
+                id: "session".into(),
+                terminal,
+                token,
+                session: "conv-1".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(reported, Some(ControlResponse::AgentStateReported { .. })),
+        "{reported:?}"
+    );
+    let title = |response: Option<ControlResponse>| match response {
+        Some(ControlResponse::Agents { agents, .. }) => agents
+            .into_iter()
+            .find(|a| a.terminal == terminal)
+            .and_then(|a| a.agent_title),
+        other => panic!("expected the index, got {other:?}"),
+    };
+    let named = client
+        .control(&rename("name", Some("  bağlama  ")), qoro_testkit::PATIENCE)
+        .await;
+    assert!(
+        matches!(named, Some(ControlResponse::Renamed { .. })),
+        "{named:?}"
+    );
+    let listed = client
+        .control(
+            &ControlRequest::ListAgents { id: "i1".into() },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert_eq!(title(listed).as_deref(), Some("bağlama"));
+    assert_eq!(
+        d.store().session_titles().await.expect("titles"),
+        vec![("conv-1".to_string(), "bağlama".to_string())],
+        "the answer went out before the name was written down"
+    );
+    let cleared = client
+        .control(&rename("clear", None), qoro_testkit::PATIENCE)
+        .await;
+    assert!(
+        matches!(cleared, Some(ControlResponse::Renamed { .. })),
+        "{cleared:?}"
+    );
+    let listed = client
+        .control(
+            &ControlRequest::ListAgents { id: "i2".into() },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert_eq!(title(listed), None);
+    assert!(d.store().session_titles().await.expect("titles").is_empty());
+}
+
+/// A tab moves to another space whole: the index, the row on disk and its place at the
+/// end of that space's tabs. A pane leaves its split and the rest of the split stays;
+/// a move to a space that does not exist changes nothing.
+#[tokio::test]
+async fn a_tab_moves_to_another_space_and_leaves_its_split() {
+    use qoro_runtime::control::ControlResponse;
+
+    let d = qoro_testkit::TestDaemon::start().await;
+    let first = d.terminals().streams()[0];
+    let mut client = d.attach("mover").await;
+    let mut open = Vec::new();
+    for id in ["t2", "t3"] {
+        match client
+            .control(
+                &ControlRequest::CreateTerminal {
+                    id: id.into(),
+                    cwd: None,
+                    workspace: None,
+                    name: None,
+                },
+                qoro_testkit::PATIENCE,
+            )
+            .await
+        {
+            Some(ControlResponse::TerminalCreated { terminal, .. }) => open.push(terminal),
+            other => panic!("expected a terminal, got {other:?}"),
+        }
+    }
+    let (second, third) = (open[0], open[1]);
+    let tree = beside(beside(leaf(first), leaf(second)), leaf(third));
+    let saved = client
+        .control(
+            &ControlRequest::SetSplit {
+                id: "tree".into(),
+                tree,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(saved, Some(ControlResponse::SplitSaved { .. })),
+        "{saved:?}"
+    );
+    let space = match client
+        .control(
+            &ControlRequest::CreateWorkspace {
+                id: "w".into(),
+                name: "elsewhere".into(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    {
+        Some(ControlResponse::WorkspaceCreated { workspace, .. }) => workspace,
+        other => panic!("expected a workspace, got {other:?}"),
+    };
+    let nowhere = client
+        .control(
+            &ControlRequest::MoveTerminal {
+                id: "m0".into(),
+                terminal: second,
+                workspace: space + 100,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(nowhere, Some(ControlResponse::Failed { .. })),
+        "{nowhere:?}"
+    );
+    assert_eq!(d.terminals().workspace_of(second), Some(d.workspace()));
+    let moved = client
+        .control(
+            &ControlRequest::MoveTerminal {
+                id: "m1".into(),
+                terminal: second,
+                workspace: space,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(moved, Some(ControlResponse::TerminalMoved { terminal, workspace, .. })
+            if terminal == second && workspace == space),
+        "{moved:?}"
+    );
+    match client
+        .control(
+            &ControlRequest::ListAgents { id: "i".into() },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    {
+        Some(ControlResponse::Agents { agents, splits, .. }) => {
+            let at = |t: u32| agents.iter().find(|a| a.terminal == t).map(|a| a.workspace);
+            assert_eq!(at(second), Some(space));
+            assert_eq!(at(first), Some(d.workspace()));
+            assert_eq!(
+                splits,
+                vec![beside(leaf(first), leaf(third))],
+                "the split kept the pane that left, or lost the ones that stayed"
+            );
+        }
+        other => panic!("expected the index, got {other:?}"),
+    }
+    let rows = d.store().open_terminals(space).await.expect("rows");
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![second as i64],
+        "the row on disk stayed in the space it left"
+    );
+    let left = d.store().open_terminals(d.workspace()).await.expect("rows");
+    assert!(!left.iter().any(|r| r.id == second as i64), "{left:?}");
+    // On disk too, or the next start brings back a split spanning two spaces.
+    let stored: Vec<qoro_runtime::control::Pane> = d
+        .store()
+        .splits()
+        .await
+        .expect("splits")
+        .iter()
+        .map(|json| serde_json::from_str(json).expect("a tree"))
+        .collect();
+    assert_eq!(stored, vec![beside(leaf(first), leaf(third))]);
+    // A second tab lands after the first.
+    let again = client
+        .control(
+            &ControlRequest::MoveTerminal {
+                id: "m2".into(),
+                terminal: third,
+                workspace: space,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(again, Some(ControlResponse::TerminalMoved { .. })),
+        "{again:?}"
+    );
+    let rows = d.store().open_terminals(space).await.expect("rows");
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![second as i64, third as i64]
+    );
+    assert!(d.store().splits().await.expect("splits").is_empty());
+}
