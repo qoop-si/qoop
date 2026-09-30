@@ -46,6 +46,13 @@ pub enum ClientCommand {
         from: ClientId,
         bytes: Bytes,
     },
+    /// Input that is a paste: wrapped in the bracketed paste markers when the program asked
+    /// for them, which only this terminal's engine knows. A program such as Claude Code
+    /// attaches a pasted picture path and keeps a typed one as text.
+    Paste {
+        from: ClientId,
+        bytes: Bytes,
+    },
     Resize {
         from: ClientId,
         writable: bool,
@@ -1328,6 +1335,9 @@ pub struct RenderQueue {
     images: std::sync::Mutex<BTreeMap<u32, StoredImage>>,
     put_at: std::sync::Mutex<Option<std::time::Instant>>,
     notify: tokio::sync::Notify,
+    /// Rung when the client acknowledges, or the queue closes: what a writer holding
+    /// renders for a paced client waits on.
+    acked: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
     /// This queue's share of the global outbound total, so that adding and removing keep
     /// the shared counter honest without walking the map.
@@ -1359,6 +1369,7 @@ impl RenderQueue {
             images: std::sync::Mutex::new(BTreeMap::new()),
             put_at: std::sync::Mutex::new(None),
             notify: tokio::sync::Notify::new(),
+            acked: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             global,
@@ -1451,6 +1462,7 @@ impl RenderQueue {
         let _ = self.take();
         let _ = self.take_images();
         self.notify.notify_one();
+        self.acked.notify_one();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1459,6 +1471,15 @@ impl RenderQueue {
 
     async fn wait(&self) {
         self.notify.notified().await
+    }
+
+    /// The client acknowledged: a paced writer may send again.
+    pub fn ack(&self) {
+        self.acked.notify_one();
+    }
+
+    async fn wait_ack(&self) {
+        self.acked.notified().await
     }
 }
 
@@ -1601,6 +1622,15 @@ async fn serve_client(
             hello.extra.get(crate::client::OBSERVER) == Some(&serde_json::Value::Bool(true));
         connections.mark_welcomed(&client, observer);
     }
+    // At most this many terminal messages unacknowledged, when the client asks: past it the
+    // writer holds renders, latest wins, until an ack. A phone behind a relay needs it, or
+    // screens pile up in the relay's buffers and a typed key's echo waits behind all of
+    // them; a local client drains at socket speed and never asks.
+    let window = hello
+        .extra
+        .get(crate::client::RENDER_WINDOW)
+        .and_then(serde_json::Value::as_u64)
+        .map(|w| w.clamp(1, 16));
     stream.write_all(&out).await?;
     if matches!(outcome, qoro_proto::HandshakeOutcome::Refuse(_)) {
         return Ok(());
@@ -1681,7 +1711,15 @@ async fn serve_client(
             }
 
             let mut rendered = 0usize;
-            for (stream, snapshot) in writer_renders.take() {
+            // Held while the window is full: the renders stay in the queue, each replaced by
+            // its terminal's next, so what goes out after the ack is the newest screen.
+            let paced = window.is_some_and(|w| writer_progress.outstanding() >= w);
+            let fresh = if paced {
+                Vec::new()
+            } else {
+                writer_renders.take()
+            };
+            for (stream, snapshot) in fresh {
                 let mut wire = SnapshotWire::from(&snapshot);
                 // What is behind this terminal's screen, as of now. The renderer has the
                 // stream, and the registry has the count.
@@ -1726,6 +1764,13 @@ async fn serve_client(
                 if frames.iter().any(|f| f.encode(&mut buf).is_err()) {
                     return;
                 }
+                // A paced client counts pictures in its acks (the phone does), and without
+                // them here its acks run ahead of what was sent and the window never fills.
+                // The others count screens only: counted for them, a picture would stay
+                // outstanding for ever and get a healthy reader evicted as wedged.
+                if window.is_some() {
+                    rendered += 1;
+                }
             }
 
             if !buf.is_empty() {
@@ -1741,7 +1786,8 @@ async fn serve_client(
                 return;
             }
             tokio::select! {
-                _ = writer_renders.wait() => {}
+                _ = writer_renders.wait(), if !paced => {}
+                _ = writer_renders.wait_ack(), if paced => {}
                 Some(bytes) = control_rx.recv() => {
                     if wr.write_all(&bytes).await.is_err() {
                         return;
@@ -1935,6 +1981,7 @@ async fn serve_client(
                     // reading.
                     progress.acked.fetch_max(ack, Ordering::Relaxed);
                     *progress.last_ack.lock().unwrap() = Some(std::time::Instant::now());
+                    renders.ack();
                 }
                 if message.body.is_empty() {
                     // A standalone acknowledgement carries nothing else.
@@ -1979,6 +2026,10 @@ async fn serve_client(
                         writable,
                         cols,
                         rows,
+                    },
+                    ClientWire::Paste { bytes } => ClientCommand::Paste {
+                        from: client.clone(),
+                        bytes: Bytes::from(bytes),
                     },
                 };
                 // A terminal whose task has ended is one stale address, not the end of
@@ -2514,6 +2565,9 @@ fn dispatch(
             None => Dispatch::Apart,
         },
         ControlRequest::CloseWorkspace { workspace, .. } => take(*workspace),
+        // Seconds of disk for a large picture: never on the read loop, where it would hold
+        // up this connection's typing.
+        ControlRequest::SaveUpload { .. } => Dispatch::Apart,
         _ => Dispatch::Inline(None),
     }
 }
@@ -3533,7 +3587,102 @@ async fn handle_control(
             set_host_colors(fg, bg);
             ControlResponse::HostColorsNoted { id }
         }
+        ControlRequest::SaveUpload { ext, data, .. } => {
+            let Some(dir) = history_dir.as_deref().and_then(Path::parent) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "this daemon keeps no files".into(),
+                };
+            };
+            let dir = dir.join("uploads");
+            match crate::blocking::run(move || save_upload(&dir, &ext, &data)).await {
+                Ok(Ok(path)) => ControlResponse::Uploaded {
+                    id,
+                    path: path.to_string_lossy().into_owned(),
+                },
+                Ok(Err(reason)) => ControlResponse::Failed { id, reason },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: e.to_string(),
+                },
+            }
+        }
     }
+}
+
+/// The largest upload kept, decoded. Base64 makes it a third larger on the wire, which
+/// stays under the 8 MiB a message may reassemble to.
+pub const MAX_UPLOAD: usize = 5 * 1024 * 1024;
+
+/// How long an upload is kept: long enough for the program it was pasted to to read it.
+const UPLOAD_KEPT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// The most the uploads of a day may hold together, so a sender cannot fill the disk five
+/// megabytes at a time.
+const UPLOADS_MOST: u64 = 200 * 1024 * 1024;
+
+/// The kinds of picture kept, by extension.
+pub const UPLOAD_KINDS: [&str; 5] = ["jpg", "png", "heic", "gif", "webp"];
+
+/// Write one upload into `dir` (made private if missing) under a fresh name, and drop
+/// uploads older than a day while there. The runtime dir outlives a reboot on macOS, so
+/// nothing else would.
+fn save_upload(dir: &Path, ext: &str, data: &str) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if !UPLOAD_KINDS.contains(&ext) {
+        return Err(format!(
+            "qoro keeps only {} pictures",
+            UPLOAD_KINDS.join(", ")
+        ));
+    }
+    // Checked before decoding, so an oversized message never becomes an allocation.
+    if data.len() / 4 * 3 > MAX_UPLOAD {
+        return Err(format!(
+            "the picture is over {} MB",
+            MAX_UPLOAD / 1024 / 1024
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| format!("the picture did not arrive whole: {e}"))?;
+    crate::paths::ensure_private_dir(dir).map_err(|e| e.to_string())?;
+    let mut held = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > UPLOAD_KEPT);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            } else {
+                held += meta.len();
+            }
+        }
+    }
+    if held + bytes.len() as u64 > UPLOADS_MOST {
+        return Err("too many pictures today: try again tomorrow".into());
+    }
+    // The clock and a count: two uploads in the same instant still get two names.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{stamp:x}-{n}.{ext}"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// The outer terminal's foreground and background, as the latest client reported them:
@@ -3914,6 +4063,26 @@ pub enum ClientWire {
         cols: u16,
         rows: u16,
     },
+    /// Bytes to paste, as a person pasting them: the daemon adds the markers the program
+    /// asked for. An older daemon drops the message as unknown.
+    Paste {
+        bytes: Vec<u8>,
+    },
+}
+
+/// A paste as the program asked to receive it: between `ESC [ 200 ~` and `ESC [ 201 ~`
+/// when it turned bracketed paste on, as it is otherwise. Inside the markers every escape
+/// byte is dropped, as xterm drops them: no end marker, whole or spliced from pieces, can
+/// end the paste early and run the rest as typed keys.
+fn bracketed(bytes: &[u8], on: bool) -> Bytes {
+    if !on {
+        return Bytes::copy_from_slice(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend(bytes.iter().copied().filter(|&b| b != 0x1b));
+    out.extend_from_slice(b"\x1b[201~");
+    Bytes::from(out)
 }
 
 /// Spawn the PTY, the child, and the task that owns both.
@@ -6284,7 +6453,17 @@ async fn terminal_task(
             tokio::select! {
                 cmd = from_clients.recv() => {
                     let Some(cmd) = cmd else { break };
+                    // A paste is input once its markers are on.
+                    let cmd = match cmd {
+                        ClientCommand::Paste { from, bytes } => ClientCommand::Input {
+                            from,
+                            bytes: bracketed(&bytes, engine.modes().bracketed_paste),
+                        },
+                        other => other,
+                    };
                     match cmd {
+                        // Made input just above.
+                        ClientCommand::Paste { .. } => {}
                         ClientCommand::Input { bytes, from } => {
                         let arrived = std::time::Instant::now();
                         pending_input = Some(arrived);

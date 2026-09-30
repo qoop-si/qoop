@@ -125,6 +125,13 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             fg: [0, 0, 0],
             bg: [255, 255, 255],
         },
+        // Keeps a file and answers its path: nothing is typed, the sender pastes the path
+        // itself on the terminal channel it already holds.
+        ControlRequest::SaveUpload {
+            id: "x25".into(),
+            ext: "png".into(),
+            data: "aGk=".into(),
+        },
         // A search reads history and answers where it matched: a query, never bytes for
         // the child.
         ControlRequest::SearchScrollback {
@@ -175,6 +182,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
+            | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }

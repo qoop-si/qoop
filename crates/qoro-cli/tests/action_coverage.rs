@@ -289,6 +289,20 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "attach a picture from the phone",
+            method: || {
+                Method::Control(ControlRequest::SaveUpload {
+                    id: "a".into(),
+                    ext: "jpg".into(),
+                    data: String::new(),
+                })
+            },
+        },
+        Action {
+            name: "paste the picture's path into the agent",
+            method: || Method::Terminal("Paste"),
+        },
+        Action {
             name: "split a tab, or take a pane out of it",
             method: || {
                 Method::Control(ControlRequest::SetSplit {
@@ -483,6 +497,11 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             tree: qoro_runtime::control::Pane::Leaf { terminal: 0 },
         },
+        ControlRequest::SaveUpload {
+            id: String::new(),
+            ext: String::new(),
+            data: String::new(),
+        },
     ];
     for request in &all {
         match request {
@@ -508,6 +527,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
+            | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }

@@ -298,6 +298,19 @@ pub enum ControlRequest {
         fg: [u8; 3],
         bg: [u8; 3],
     },
+    /// Keep a file sent from another device (a picture attached on the phone) for a
+    /// program here to read, and answer where it is.
+    ///
+    /// Written 0600 into the session's own `uploads/` under a name the daemon makes, so
+    /// nothing the sender says reaches the path. Never typed anywhere: the sender pastes
+    /// the path on the terminal channel, with the authority of any keystroke.
+    SaveUpload {
+        id: String,
+        /// The picture's kind, as its extension (`daemon::UPLOAD_KINDS`).
+        ext: String,
+        /// The bytes, as standard base64.
+        data: String,
+    },
     /// Record one tab's split tree, so a restart or a new client brings the panes back
     /// as one tab rather than as a tab each.
     ///
@@ -336,6 +349,7 @@ impl ControlRequest {
             | Self::ReportAgentSession { id, .. }
             | Self::ListFocusEvents { id, .. }
             | Self::HostColors { id, .. }
+            | Self::SaveUpload { id, .. }
             | Self::SetSplit { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
@@ -509,6 +523,11 @@ pub enum ControlResponse {
     /// `HostColors` was taken: programs asking from now on get these.
     HostColorsNoted {
         id: String,
+    },
+    /// `SaveUpload` kept the file here.
+    Uploaded {
+        id: String,
+        path: String,
     },
     /// `News` was taken: the rows say it from now on.
     NewsNoted {
@@ -897,6 +916,7 @@ impl ControlResponse {
             | Self::RemoteMissing { id, .. }
             | Self::RemoteInstalled { id, .. }
             | Self::HostColorsNoted { id }
+            | Self::Uploaded { id, .. }
             | Self::NewsNoted { id }
             | Self::SplitSaved { id }
             | Self::Failed { id, .. } => id,

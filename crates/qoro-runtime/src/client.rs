@@ -105,6 +105,11 @@ pub fn outer_size() -> (u16, u16) {
 /// not stay up for it. An older client never says it, so it counts as somebody there.
 pub const OBSERVER: &str = "observer";
 
+/// The hello key a client sets to cap how many terminal messages it has unacknowledged
+/// (1 to 16). The daemon then holds renders, newest kept, until an ack: a client behind a
+/// relay gets the newest screen instead of a queue of old ones. Absent means unpaced.
+pub const RENDER_WINDOW: &str = "render_window";
+
 fn hello(client_id: &str, observer: bool) -> ClientHello {
     let mut extra = serde_json::Map::new();
     if observer {
