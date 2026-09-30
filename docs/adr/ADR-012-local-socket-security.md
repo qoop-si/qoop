@@ -33,7 +33,8 @@ stale, unlink it and bind its own, leaving two daemons and one unreachable works
 overridden path exactly as it does to the default one. This is not the optional session
 namespace ADR-006 rejects: it exists so that integration tests, which run in parallel, each
 get their own daemon and socket, and so a contributor running the suite does not attach to
-their own working daemon.
+their own working daemon. With it set, the database and the history stay in that directory
+too rather than in the data directory (ADR-005), so a test never writes into a home.
 
 ### Authentication
 Filesystem permissions are the first gate, not the only one. Every connection is

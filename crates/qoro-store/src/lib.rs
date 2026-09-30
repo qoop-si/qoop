@@ -30,6 +30,10 @@ pub enum StoreError {
          {understood}); use that build or move the file aside"
     )]
     FromTheFuture { found: i64, understood: i64 },
+    /// The caller stopped waiting before the write was committed, so it was rolled back
+    /// rather than landing after the caller had already answered.
+    #[error("abandoned by its caller before it was committed")]
+    Abandoned,
     /// A ledger row that is not the JSON this build writes, so something other than this
     /// build wrote it. A distinct variant rather than a string inside `Sqlite` because the
     /// caller has to be able to tell it apart from "the store is busy", and it is reported
@@ -121,6 +125,13 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         Self::prepare(conn)
+    }
+
+    /// The same, for a file that must already exist: a reader that finds nothing gets an
+    /// error rather than an empty database left behind in its place.
+    pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+        let flags = rusqlite::OpenFlags::default() - rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        Self::prepare(Connection::open_with_flags(path, flags)?)
     }
 
     /// An in-memory store, for tests and for a daemon told not to persist.
@@ -334,7 +345,7 @@ impl Store {
         argv: &str,
         now: i64,
     ) -> Result<i64, StoreError> {
-        self.create_terminal_answering(None, id, workspace, cwd, argv, None, now)
+        self.create_terminal_answering(None, id, workspace, cwd, argv, None, None, now)
     }
 
     /// The same, with its name and the answer to the command that asked for it written
@@ -345,6 +356,11 @@ impl Store {
     /// opens another. Here the row, its place, its name and the answer land together or
     /// not at all, and a key already answered fails the insert, so two attempts at one
     /// create cannot both make a terminal.
+    ///
+    /// `abandoned` is read under the store's lock just before the commit: a caller whose
+    /// deadline passed sets it, and the write rolls back instead of landing after the caller
+    /// has already answered. A write already committed is visible to the caller's next read,
+    /// which waits for the same lock.
     #[allow(clippy::too_many_arguments)]
     pub fn create_terminal_answering(
         &mut self,
@@ -354,6 +370,7 @@ impl Store {
         cwd: &str,
         argv: &str,
         title: Option<&str>,
+        abandoned: Option<&std::sync::atomic::AtomicBool>,
         now: i64,
     ) -> Result<i64, StoreError> {
         let tx = self.conn.transaction()?;
@@ -386,6 +403,9 @@ impl Store {
                 "INSERT INTO applied (idempotency_key, outcome, at_unix) VALUES (?1, ?2, ?3)",
                 params![key, created_answer(id)?, now],
             )?;
+        }
+        if abandoned.is_some_and(|a| a.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(StoreError::Abandoned);
         }
         tx.commit()?;
         Ok(id)
@@ -805,8 +825,17 @@ mod tests {
     fn a_create_writes_its_answer_in_the_same_transaction() {
         let mut s = Store::in_memory().expect("a store");
         let ws = s.create_workspace("w", 1).expect("workspace");
-        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", Some("build"), 100)
-            .expect("create");
+        s.create_terminal_answering(
+            Some("k1"),
+            7,
+            ws,
+            "/tmp",
+            "/bin/sh",
+            Some("build"),
+            None,
+            100,
+        )
+        .expect("create");
         assert_eq!(
             s.applied("k1").expect("lookup"),
             Some((true, serde_json::json!({ "terminal": 7 })))
@@ -823,10 +852,10 @@ mod tests {
     fn a_create_under_an_answered_key_makes_nothing() {
         let mut s = Store::in_memory().expect("a store");
         let ws = s.create_workspace("w", 1).expect("workspace");
-        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, None, 100)
             .expect("create");
         assert!(
-            s.create_terminal_answering(Some("k1"), 8, ws, "/tmp", "/bin/sh", None, 200)
+            s.create_terminal_answering(Some("k1"), 8, ws, "/tmp", "/bin/sh", None, None, 200)
                 .is_err(),
             "a second create under the same key was written"
         );
@@ -837,13 +866,38 @@ mod tests {
         );
     }
 
+    /// A create whose caller stopped waiting before the commit leaves nothing: no row, no
+    /// answer. This is what keeps a write stalled past its deadline from landing after the
+    /// daemon has told the client it failed.
+    #[test]
+    fn an_abandoned_write_rolls_back_before_its_commit() {
+        let mut s = Store::in_memory().expect("a store");
+        let ws = s.create_workspace("w", 1).expect("workspace");
+        let gone = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            s.create_terminal_answering(
+                Some("k1"),
+                7,
+                ws,
+                "/tmp",
+                "/bin/sh",
+                None,
+                Some(&gone),
+                100
+            ),
+            Err(StoreError::Abandoned)
+        ));
+        assert_eq!(s.applied("k1").expect("lookup"), None);
+        assert!(s.open_terminals(ws).expect("terminals").is_empty());
+    }
+
     /// A create whose shell never started is undone whole: no open row to come back at
     /// the next start, and no answer, so a retry tries again.
     #[test]
     fn an_abandoned_create_leaves_no_tab_and_no_answer() {
         let mut s = Store::in_memory().expect("a store");
         let ws = s.create_workspace("w", 1).expect("workspace");
-        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, None, 100)
             .expect("create");
         s.abandon_create("k1", 7, 200).expect("abandon");
         assert_eq!(s.applied("k1").expect("lookup"), None);
@@ -856,7 +910,7 @@ mod tests {
     fn abandoning_keeps_an_answer_that_names_another_terminal() {
         let mut s = Store::in_memory().expect("a store");
         let ws = s.create_workspace("w", 1).expect("workspace");
-        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, 100)
+        s.create_terminal_answering(Some("k1"), 7, ws, "/tmp", "/bin/sh", None, None, 100)
             .expect("create");
         s.abandon_create("k1", 8, 200).expect("abandon");
         assert_eq!(

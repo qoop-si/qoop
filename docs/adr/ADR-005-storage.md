@@ -84,17 +84,44 @@ that names it, so the retry is a replay. And two attempts at one create, racing 
 connections, cannot both open a tab: the lookup runs under the space's lock, after the
 first attempt has started its shell or undone itself, and the insert fails on a key already
 answered. A spawn that fails closes the row and takes the answer back in one transaction,
-so a retry tries again. A write past its deadline still commits, so a create that finds its
-own answer there carries on, and one that finds nothing undoes the write in case it lands
-later. That undo is best effort: the store's lock is not FIFO, so a write stalled past its
-deadline can still land after the undo and leave a tab for the next start. Closing it needs
-a cancel flag checked before the commit, and it has not been worth one. The name a tab is
-born with is in the same transaction. Gate G4.4 breaks the ledger under a running daemon
-and checks that a create is refused with no tab left behind.
+so a retry tries again. A deadline does not cancel a write, so a create past its deadline
+marks the write abandoned, and the write checks that mark under the store's lock just
+before it commits: one not yet committed rolls back, and one that did commit is seen by the
+lookup that follows, which waits for the same lock, and the create carries on. The name a
+tab is born with is in the same transaction. Gate G4.4 breaks the ledger under a running
+daemon and checks that a create is refused with no tab left behind.
 
-## What lives in the runtime directory, and what that costs
+## Where the stores live
 
-`qoro.db` and `history/` are both opened in the runtime directory. On macOS
+Amended 2026-09-30: `qoro.db` and `history/` live in the data directory
+(`paths::state_dir`: `$XDG_DATA_HOME/qoro`, `~/Library/Application Support/qoro` on macOS,
+`~/.local/share/qoro` elsewhere), private like the runtime directory, beside the machine
+key. The runtime directory keeps what should die with a reboot: the socket, the locks, the
+bridge's doorbell and the phone's uploads, which are a day's scratch and whose path is
+pasted into a terminal as is, so it must not have a space in it.
+
+The first daemon of this build to start moves an existing install's files, once, after it
+has taken the data directory's lifetime lock and bound the socket, which together prove
+nobody else has them open: the history first, then the database by `VACUUM INTO`, which
+reads it with its write-ahead log applied. The copy is synced before the old files are
+deleted, and the database arriving is the mark that the move is done, so an interrupted
+start is finished by the next. A database already in the data directory that has held a tab
+is never overwritten, and the old one is left and named on stderr; one that never held a
+tab is set aside as `qoro.db.empty`, so a daemon that started first with nothing to move
+cannot shadow the real one. The lifetime lock also stops a second daemon under another
+runtime directory (an ssh relay with no `XDG_RUNTIME_DIR`) from opening the same database
+and sweeping this one's history; it waits two seconds for a daemon of the same runtime
+directory to finish exiting, then refuses before binding, and says why in `qorod.failed`,
+which the client that started it prints.
+
+With `QORO_RUNTIME_DIR` set, the state stays beside the socket, as before: every test
+isolates its daemon through that variable, and a test must never write into a person's
+home. So does a daemon with no home to resolve a data directory from. The cost: a person
+who exports `QORO_RUNTIME_DIR` themselves keeps the old, cleared location.
+
+What follows is why, as it was measured before the move.
+
+`qoro.db` and `history/` were both opened in the runtime directory. On macOS
 `XDG_RUNTIME_DIR` is unset, so `runtime_base()` (`crates/qoro-runtime/src/paths.rs:71-86`)
 falls back to `std::env::temp_dir()` and both land in `$TMPDIR/qoro-<uid>`, which macOS
 clears: measured on a machine that had been up three days, none of the files at depth 2 of
@@ -102,10 +129,10 @@ that `TMPDIR` predated its boot, while the sibling cache directory beside it had
 majority of its files older. The measurement is scoped to that depth and that machine, and
 it is evidence of a policy rather than a measurement of how long anything survives.
 
-So on macOS a sleeping space does not survive a restart today, whatever the log does. The
+So on macOS a sleeping space did not survive a restart, and macOS also removes files in
+`$TMPDIR` untouched for about three days, which is what an idle daemon's database is. The
 XDG spec is right that a runtime directory must not survive a reboot; it is right about
-sockets and wrong about databases. Moving the stores to `$XDG_DATA_HOME` with a migration
-is a separate change, and it is the one that makes any durability claim worth making.
+sockets and wrong about databases.
 
 ## Consequences
 - The daemon keeps one SQLite file instead of two, one WAL, and one set of schema,
@@ -197,3 +224,7 @@ one still opens the file and ignores the table. That older build reads its ledge
 `events.db`, which this one no longer writes, so a retry that spans a downgrade opens a
 second tab; nothing else is lost. `events.db` is left on disk unread. `qoro-store` has no
 replacement, and its schema is a ladder rather than a version check.
+
+A build from before the stores moved looks for them in the runtime directory, finds none,
+and starts with no spaces. Nothing is deleted: moving `qoro.db` and `history/` from the
+data directory back beside the socket, with qoro stopped, restores them.

@@ -155,6 +155,62 @@ pub fn data_dir() -> Option<PathBuf> {
     })
 }
 
+/// Where the daemon keeps what has to outlive a reboot: its database and its history.
+///
+/// Not the runtime directory. On macOS that is `$TMPDIR`, which the system clears at boot
+/// and of files untouched for about three days, and on Linux `XDG_RUNTIME_DIR` is a tmpfs
+/// cleared at logout: a sleeping space kept there did not survive either. So it is
+/// `data_dir()`, beside this machine's key.
+///
+/// With `QORO_RUNTIME_DIR` set it is the session directory itself, as before. Every test
+/// isolates its daemon through that variable, and a test daemon must never write into the
+/// person's real data directory. Also the session directory when there is no home to
+/// resolve a data directory from.
+///
+/// Created private, and a loose mode on a directory we own is tightened, which is what
+/// the machine key's writer already does for the same directory; a symlink or another
+/// owner is refused like the runtime directory's.
+pub fn state_dir(session: &Path) -> Result<PathBuf, PathError> {
+    let dir = state_location(session);
+    if dir == session {
+        return Ok(dir);
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e.into()),
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(&dir)?;
+    if meta.is_dir()
+        && !meta.file_type().is_symlink()
+        && std::os::unix::fs::MetadataExt::uid(&meta) == current_uid()
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    verify_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Where `state_dir` is, without creating or checking anything, for a reader such as
+/// `qoro ls` that must not leave a directory behind.
+pub fn state_location(session: &Path) -> PathBuf {
+    state_location_from(
+        std::env::var_os(RUNTIME_DIR_ENV).is_some(),
+        data_dir(),
+        session,
+    )
+}
+
+fn state_location_from(explicit_runtime: bool, data: Option<PathBuf>, session: &Path) -> PathBuf {
+    match data {
+        Some(data) if !explicit_runtime => data,
+        _ => session.to_path_buf(),
+    }
+}
+
 /// Where a running bridge listens for "look again" (the doorbell).
 ///
 /// Beside the sessions, in the runtime base, so a daemon can find it from its own session
@@ -386,6 +442,23 @@ mod tests {
     /// test harness runs them on parallel threads, and one test's `remove_var` landing
     /// between another's `set_var` and its read failed it at random.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A test daemon names its runtime directory, and its state stays there: resolving the
+    /// person's data directory instead would put every test's database in their home.
+    #[test]
+    fn state_stays_in_an_explicit_runtime_directory() {
+        let session = Path::new("/tmp/rt/sessions/default");
+        let data = PathBuf::from("/Users/a/Library/Application Support/qoro");
+        assert_eq!(
+            state_location_from(true, Some(data.clone()), session),
+            session
+        );
+        assert_eq!(
+            state_location_from(false, Some(data.clone()), session),
+            data
+        );
+        assert_eq!(state_location_from(false, None, session), session);
+    }
 
     /// The XDG spec: an empty or relative XDG_CONFIG_HOME is ignored, because a relative
     /// one would put a person's configuration under whatever directory a command ran in.

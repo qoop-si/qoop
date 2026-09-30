@@ -701,6 +701,14 @@ pub struct Daemon {
     store: crate::store::StoreHandle,
     /// Where terminal history segments live, one directory per terminal beneath it.
     history_dir: Option<PathBuf>,
+    /// Where pictures sent from a phone are kept for a day. Beside the socket rather than
+    /// with the history: they are scratch, and their path is pasted into a terminal as is,
+    /// so it must not have a space in it the way `Application Support` does.
+    uploads_dir: Option<PathBuf>,
+    /// Held for the daemon's life when its state is outside its runtime directory, so a
+    /// second daemon under another runtime directory cannot open the same database and
+    /// sweep this one's history.
+    _state_lock: Option<crate::lock::StartupLock>,
     scanner: Arc<ContainmentScanner>,
     /// The workspace new terminals are recorded in. One per daemon for now: workspace
     /// switching is a client surface and a later milestone, but the row has to exist from
@@ -722,11 +730,25 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Bind and restore what was awake. The caller must already hold the
-    /// startup lock (ADR-012), which is what makes the stale-socket removal below safe.
+    /// Bind and restore what was awake, with the database and the history beside the
+    /// socket. The caller must already hold the startup lock (ADR-012), which is what makes
+    /// the stale-socket removal below safe.
     pub async fn bind(dir: &Path, shell: &Path) -> io::Result<Self> {
+        Self::bind_in(dir, dir, shell).await
+    }
+
+    /// The same, with the database and the history in `state` (`paths::state_dir`), moved
+    /// there from `dir` by the first start that finds them in the old place.
+    pub async fn bind_in(dir: &Path, state: &Path, shell: &Path) -> io::Result<Self> {
         let socket = paths::socket_path(dir);
         remove_stale_socket(&socket)?;
+        // Before the bind, so a daemon refused because another has this state never answers
+        // on a socket first and leaves every client waiting on a handshake that cannot come.
+        let state_lock = if state == dir {
+            None
+        } else {
+            Some(hold_state(state).await?)
+        };
         let listener = UnixListener::bind(&socket)?;
         // Restricted right after bind. Between the two the socket has default permissions,
         // and what protects it then is the verified 0700 directory around it: nobody else
@@ -735,10 +757,16 @@ impl Daemon {
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 
-        // The database lives beside the socket, in the same private directory, so its
-        // permissions are the ones ADR-012 already checks.
+        // Only now, with the socket bound: a daemon still stopping keeps its store open for
+        // a few seconds after its socket goes, and the bind is what proves it has gone.
+        if state != dir {
+            crate::state::migrate(dir, state)?;
+            eprintln!("qorod: state in {}", state.display());
+        }
+        // In a verified private directory: the runtime one, or `paths::state_dir`, which
+        // is checked the same way.
         let store = crate::store::StoreHandle::new(
-            qoro_store::Store::open(&dir.join("qoro.db")).map_err(io::Error::other)?,
+            qoro_store::Store::open(&state.join("qoro.db")).map_err(io::Error::other)?,
         );
         let workspace = match store.open_workspace().await {
             Ok(id) => id,
@@ -802,7 +830,7 @@ impl Daemon {
             books: books.clone(),
             shell: shell.to_path_buf(),
             warnings: warnings.clone(),
-            history_dir: Some(dir.join("history")),
+            history_dir: Some(state.join("history")),
             scanner: scanner.clone(),
             agents: agents.clone(),
         })
@@ -818,7 +846,9 @@ impl Daemon {
             outbound: Arc::default(),
             store,
             workspace,
-            history_dir: Some(dir.join("history")),
+            history_dir: Some(state.join("history")),
+            uploads_dir: Some(dir.join("uploads")),
+            _state_lock: state_lock,
             scanner,
             agents,
             books,
@@ -1125,6 +1155,7 @@ impl Daemon {
             let served_outbound = self.outbound.clone();
             let workspace = self.workspace;
             let served_history = self.history_dir.clone();
+            let served_uploads = self.uploads_dir.clone();
             let served_scanner = self.scanner.clone();
             let served_agents = self.agents.clone();
             let served_watched = self.watched.clone();
@@ -1165,6 +1196,7 @@ impl Daemon {
                         outbound: served_outbound,
                         workspace,
                         history_dir: served_history,
+                        uploads_dir: served_uploads,
                         scanner: served_scanner,
                         agents: served_agents,
                         watched: served_watched,
@@ -1518,6 +1550,7 @@ pub struct ServeContext {
     pub outbound: Arc<std::sync::atomic::AtomicUsize>,
     pub workspace: i64,
     pub history_dir: Option<PathBuf>,
+    pub uploads_dir: Option<PathBuf>,
     pub scanner: Arc<ContainmentScanner>,
     pub agents: Arc<crate::agents::AgentRegistry>,
     /// Which terminals live connections watch. Incremented on subscribe,
@@ -1544,6 +1577,7 @@ async fn serve_client(
         outbound,
         workspace,
         history_dir,
+        uploads_dir,
         scanner,
         agents,
         watched,
@@ -1897,6 +1931,7 @@ async fn serve_client(
                                 let shell = shell.clone();
                                 let warnings = warnings.clone();
                                 let history_dir = history_dir.clone();
+                                let uploads_dir = uploads_dir.clone();
                                 let client = client.clone();
                                 let scanner = scanner.clone();
                                 let agents = agents.clone();
@@ -1913,6 +1948,7 @@ async fn serve_client(
                                         &warnings,
                                         workspace,
                                         history_dir,
+                                        uploads_dir,
                                         &client,
                                         &scanner,
                                         &agents,
@@ -1945,6 +1981,7 @@ async fn serve_client(
                                     &warnings,
                                     workspace,
                                     history_dir.clone(),
+                                    uploads_dir.clone(),
                                     &client,
                                     &scanner,
                                     &agents,
@@ -2587,6 +2624,7 @@ async fn handle_control(
     warnings: &Arc<std::sync::Mutex<Vec<Warning>>>,
     workspace: i64,
     history_dir: Option<PathBuf>,
+    uploads_dir: Option<PathBuf>,
     client: &ClientId,
     scanner: &Arc<ContainmentScanner>,
     agents: &Arc<crate::agents::AgentRegistry>,
@@ -2706,6 +2744,7 @@ async fn handle_control(
             // The row, its name and the answer are one transaction, so a client is never
             // told `Failed` about a shell that is running, and a daemon killed after this
             // point comes back with the tab and the answer that names it (ADR-005).
+            let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Err(e) = store
                 .create_terminal_answering(
                     id.clone(),
@@ -2714,12 +2753,16 @@ async fn handle_control(
                     recorded_cwd.clone(),
                     shell.display().to_string(),
                     name.clone(),
+                    abandoned.clone(),
                 )
                 .await
             {
-                // A deadline does not cancel the write, so this may be our own commit
-                // landing late, which is carried on with. Or another attempt at this create,
-                // in another space, got there first: its answer is this one's too.
+                // A deadline does not cancel the write. Marked abandoned first, so one not
+                // yet committed rolls back; one that did commit is seen by the lookup,
+                // which waits for the same lock, and is carried on with. Or another attempt
+                // at this create, in another space, got there first: its answer is this
+                // one's too.
+                abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
                 match store.applied(id.clone()).await {
                     Ok(Some((true, detail)))
                         if detail.get("terminal").and_then(|t| t.as_u64())
@@ -2728,8 +2771,8 @@ async fn handle_control(
                         return replayed_response(&id, ok, &detail, true);
                     }
                     _ => {
-                        // Undone in case it still lands, so a late commit leaves neither a
-                        // tab for the next start nor an answer naming one.
+                        // The lookup itself failed, so whether the write landed is unknown:
+                        // undone, which queues behind it on the same lock either way.
                         let _ = store.abandon_create(id.clone(), stream as i64).await;
                         return ControlResponse::Failed {
                             id,
@@ -3588,13 +3631,12 @@ async fn handle_control(
             ControlResponse::HostColorsNoted { id }
         }
         ControlRequest::SaveUpload { ext, data, .. } => {
-            let Some(dir) = history_dir.as_deref().and_then(Path::parent) else {
+            let Some(dir) = uploads_dir else {
                 return ControlResponse::Failed {
                     id,
                     reason: "this daemon keeps no files".into(),
                 };
             };
-            let dir = dir.join("uploads");
             match crate::blocking::run(move || save_upload(&dir, &ext, &data)).await {
                 Ok(Ok(path)) => ControlResponse::Uploaded {
                     id,
@@ -3625,8 +3667,7 @@ const UPLOADS_MOST: u64 = 200 * 1024 * 1024;
 pub const UPLOAD_KINDS: [&str; 5] = ["jpg", "png", "heic", "gif", "webp"];
 
 /// Write one upload into `dir` (made private if missing) under a fresh name, and drop
-/// uploads older than a day while there. The runtime dir outlives a reboot on macOS, so
-/// nothing else would.
+/// uploads older than a day while there. Nothing else clears them while the daemon runs.
 fn save_upload(dir: &Path, ext: &str, data: &str) -> Result<PathBuf, String> {
     use base64::Engine as _;
     use std::io::Write as _;
@@ -4494,6 +4535,27 @@ fn splits_json(trees: &[crate::control::Pane]) -> Vec<String> {
         .iter()
         .filter_map(|tree| serde_json::to_string(tree).ok())
         .collect()
+}
+
+/// Take the state directory's lifetime lock, waiting out the moment a daemon of the same
+/// runtime directory takes to close its files as it exits, and refusing one that is running
+/// under another runtime directory. Short, well inside the five seconds a client waits for
+/// a daemon it started, so the reason is written before the client gives up.
+async fn hold_state(state: &Path) -> io::Result<crate::lock::StartupLock> {
+    let path = paths::lock_path(state);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(lock) = crate::lock::StartupLock::try_acquire(&path)? {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "another qoro daemon is using {}; stop it first",
+                state.display()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Everything bringing a session back needs.

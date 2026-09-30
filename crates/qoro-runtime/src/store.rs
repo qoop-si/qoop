@@ -164,6 +164,7 @@ impl StoreHandle {
 
     /// Record a terminal and the answer to the command that asked for it, in one
     /// transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_terminal_answering(
         &self,
         key: String,
@@ -172,6 +173,7 @@ impl StoreHandle {
         cwd: String,
         argv: String,
         title: Option<String>,
+        abandoned: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<i64, HandleError> {
         self.run(move |s| {
             s.create_terminal_answering(
@@ -181,6 +183,7 @@ impl StoreHandle {
                 &cwd,
                 &argv,
                 title.as_deref(),
+                Some(&abandoned),
                 now(),
             )
         })

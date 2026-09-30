@@ -14,6 +14,7 @@ pub mod lock;
 pub mod paths;
 pub mod release;
 pub mod spill;
+pub mod state;
 pub mod store;
 pub mod terminal;
 

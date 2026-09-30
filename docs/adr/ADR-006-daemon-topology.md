@@ -61,8 +61,9 @@ half done.
 
 So: a session is a named directory under the runtime directory, holding one daemon's
 socket, database and history, and the unnamed default is one of them rather than a special
-case. `qoro ls` lists the spaces of the one daemon there is per machine, and ADR-005 says
-what its directory holds and where that directory is.
+case. (Amended 2026-09-30: the default session's database and history now live in the data
+directory; ADR-005.) `qoro ls` lists the spaces of the one daemon there is per machine, and
+ADR-005 says what its directory holds and where that directory is.
 
 Amended 2026-09-29. There is one daemon per machine now and `qoro --session` takes only
 `default`; spaces are the only grouping. `qoro stop <name>` still takes a name and still

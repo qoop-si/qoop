@@ -245,16 +245,31 @@ fn run_daemon() -> std::io::Result<()> {
     // Two daemons started at once therefore serialise here rather than both concluding the
     // socket is stale and unlinking each other's.
     let lock = lock::StartupLock::acquire(&paths::lock_path(&dir))?;
+    // Why a start failed, left where `ensure_daemon` looks: a daemon started on demand has
+    // no terminal to say it on, and "the daemon did not start" alone sent people to the
+    // socket when the cause was the data directory.
+    let failed = dir.join("qorod.failed");
+    let _ = std::fs::remove_file(&failed);
+    let state = match paths::state_dir(&dir) {
+        Ok(state) => state,
+        Err(e) => {
+            let _ = std::fs::write(&failed, e.to_string());
+            return Err(std::io::Error::other(e));
+        }
+    };
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let daemon = match Daemon::bind(&dir, &shell()).await {
+        let daemon = match Daemon::bind_in(&dir, &state, &shell()).await {
             Ok(d) => d.leaving_when_idle(),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Another daemon won the race and is already serving. This is the expected
                 // outcome for the loser, not a failure.
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _ = std::fs::write(&failed, e.to_string());
+                return Err(e);
+            }
         };
         eprintln!("qorod: listening on {}", daemon.socket().display());
         drop(lock);
@@ -2340,6 +2355,7 @@ fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
+    let spawned = std::time::SystemTime::now();
     // Its own process group, so the hangup a closing window or a dropped ssh connection
     // sends the starter's job does not take the daemon, and every tab, with it.
     Command::new(exe)
@@ -2355,6 +2371,16 @@ fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    // Only a reason written by the daemon just started, not one left by an earlier start.
+    let failed = socket.with_file_name("qorod.failed");
+    let fresh = std::fs::metadata(&failed)
+        .and_then(|m| m.modified())
+        .is_ok_and(|at| at >= spawned);
+    if fresh && let Ok(why) = std::fs::read_to_string(&failed) {
+        return Err(std::io::Error::other(format!(
+            "the daemon did not start: {why}"
+        )));
     }
     Err(std::io::Error::other(format!(
         "the daemon did not start; check {}",
@@ -2412,7 +2438,29 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let running = std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok();
-    let store = qoro_store::Store::open(&dir.join("qoro.db")).map_err(std::io::Error::other)?;
+    // Where the daemon keeps it, or beside the socket when no daemon of this build has
+    // started yet to move it. Never created, so a listing never leaves an empty database
+    // behind for the next daemon to take as the real one.
+    let db = [paths::state_location(&dir), dir.clone()]
+        .into_iter()
+        .map(|d| d.join("qoro.db"))
+        .find(|db| db.exists());
+    // Opened without create: a file gone between the look and the open is an error to
+    // report, not an empty database to leave in its place.
+    let store = db
+        .map(|db| qoro_store::Store::open_existing(&db).map_err(std::io::Error::other))
+        .transpose()?;
+    let Some(store) = store else {
+        println!(
+            "{}",
+            if json {
+                "[]"
+            } else {
+                "no spaces yet. `qoro` starts one."
+            }
+        );
+        return Ok(());
+    };
     let asleep: Vec<i64> = store
         .asleep()
         .map_err(std::io::Error::other)?
