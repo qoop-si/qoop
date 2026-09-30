@@ -2033,10 +2033,11 @@ impl Naming {
 
     /// How many columns an answer may take. An address is longer than a name and is shown
     /// in the box, which is wider than the column a name has to fit. An agent command can
-    /// carry flags, so it gets the wider box too: all of the box's row after ` > `.
+    /// carry flags, so it gets the wider box too: all of the box's row after ` > `, less
+    /// the one cell the cursor needs after the last letter. At 55 the cursor sat on it.
     pub fn limit(self) -> usize {
         match self {
-            Naming::Remote | Naming::Agent(_) | Naming::RenameSession(_) => 55,
+            Naming::Remote | Naming::Agent(_) | Naming::RenameSession(_) => 54,
             _ => NAME_LIMIT,
         }
     }

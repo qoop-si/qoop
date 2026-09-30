@@ -737,7 +737,8 @@ pub fn paint(frame: &Frame) -> String {
             let selected = frame
                 .selection
                 .and_then(|s| s.columns_on(pane_row, pane_cols as usize));
-            out.push_str(&paint_row(
+            out.push_str(&pane_row_paint(
+                frame,
                 line,
                 spans,
                 links_of(frame.snapshot),
@@ -1349,24 +1350,45 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
     let inner = w - 2;
     // The typed row where it always was, so the edge sits one row above it.
     let top = prompt_row(frame.lines) - BOX_FIRST_ROW;
+    // At the limit typing stops, and says so: the count in orange at the footer's end.
+    let limit = prompt.what.limit();
+    let full = width::width(&prompt.text) >= limit;
+    let count = format!("{limit}/{limit} ");
+    let footer = if full && footer_width(&prompt.what.hint()[..1]) + count.len() <= inner {
+        format!(
+            "{}{}{count}",
+            hint_line(prompt.what.hint(), inner - count.len()),
+            theme::fg(theme::Role::Brand)
+        )
+    } else {
+        hint_line(prompt.what.hint(), inner)
+    };
     let body = [
         format!(
             "{} > {}{}",
-            theme::fg(theme::Role::Faint),
+            theme::fg(theme::Role::Brand),
             theme::fg(theme::Role::Focused),
             width::fit(&prompt.text, inner - 3)
         ),
-        hint_line(prompt.what.hint(), inner),
+        footer,
     ];
-    let rule = theme::fg(theme::Role::Rule);
+    let rule = theme::fg(theme::Role::Detail);
+    let title = format!("{}\x1b[1m", theme::fg(theme::Role::Focused));
     paint_boxed(
         out,
         lines,
         (left, top, w),
         prompt.what.asks(),
-        (&rule, &rule),
+        (&rule, &title),
         &body,
     );
+    // The brand's one dash on the edge, beside the corner.
+    if top < lines {
+        out.push_str(&at(top + 1, left + 2));
+        out.push_str(&theme::fg(theme::Role::Brand));
+        out.push('\u{2500}');
+        out.push_str(theme::RESET);
+    }
 }
 
 /// The zero based row the naming box's typed text sits on.
@@ -2350,7 +2372,14 @@ fn paint_tiled_row(
         } else {
             tile.snapshot
         });
-        out.push_str(&paint_row(line, spans, links, tile.rect.cols, selected));
+        out.push_str(&pane_row_paint(
+            frame,
+            line,
+            spans,
+            links,
+            tile.rect.cols,
+            selected,
+        ));
     }
     let space = theme::space_of(frame.space.unwrap_or_default());
     let row = edges.get(pane_row);
@@ -2471,6 +2500,28 @@ pub(crate) fn paint_row(
         out.push(' ');
     }
     out
+}
+
+/// One row of a terminal in the pane, faded to a single grey while the naming box asks
+/// something, so the box is the only thing on the screen a person reads. The text stays,
+/// only its colour, selection and links go, and they come back with the next frame.
+fn pane_row_paint(
+    frame: &Frame,
+    line: &str,
+    spans: &[SpanWire],
+    links: &[String],
+    cols: usize,
+    selected: Option<std::ops::Range<usize>>,
+) -> String {
+    if frame.prompt.is_none() {
+        return paint_row(line, spans, links, cols, selected);
+    }
+    format!(
+        "{}{}{}",
+        theme::fg(theme::Role::Unobserved),
+        paint_row(line, &[], &[], cols, None),
+        theme::RESET
+    )
 }
 
 fn is_plain(s: &SpanWire) -> bool {
@@ -3027,6 +3078,65 @@ mod tests {
         assert!(
             painted.contains(&want),
             "no caret at the end of the typed text: {painted:?}"
+        );
+    }
+
+    /// A name at the limit says so with a count, and the caret still sits after its last
+    /// letter rather than on it.
+    #[test]
+    fn a_name_at_the_limit_shows_the_count_and_a_caret_past_it() {
+        let rows = [row(1, "zsh", "idle")];
+        let prompt = crate::run::Prompt {
+            what: crate::run::Naming::RenameSession(1),
+            text: "x".repeat(crate::run::Naming::RenameSession(1).limit()),
+        };
+        let cols = 100u16;
+        let lines = 24u16;
+        let painted = paint(&Frame {
+            armed: None,
+            rows: &rows,
+            spaces: &spaces(),
+            panes: std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols,
+            lines,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: Some(&prompt),
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+            image_notice: None,
+            chrome: Default::default(),
+        });
+        assert!(painted.contains("54/54"), "no count: {painted:?}");
+        let w = cols.min(60).max(cols.min(20)) as usize;
+        let left = (cols as usize - w) / 2;
+        let top = ((lines as usize) / 3).max(TABS + 1);
+        let caret = format!("\x1b[{};{}H", top + 1, left + 4 + 54 + 1);
+        assert!(
+            painted.contains(&caret),
+            "caret on the last letter: {painted:?}"
         );
     }
 
