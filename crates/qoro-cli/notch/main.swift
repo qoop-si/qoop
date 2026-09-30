@@ -95,7 +95,7 @@ struct Pet: Decodable {
 
 /// A stretch of one terminal row sharing a style, as `qoro read --json` prints it.
 struct Run: Decodable {
-    let t: String
+    var t: String
     var fg: String? = nil
     var bg: String? = nil
     var b: Bool? = nil
@@ -108,9 +108,6 @@ struct Run: Decodable {
 }
 
 struct Screen: Decodable {
-    /// The terminal's width in columns, which the peek fits itself to. Left out by an older
-    /// qoro, which reads as a terminal the box already fits.
-    var cols: Int? = nil
     let alt: Bool
     let behind: Int
     let rows: [[Run]]
@@ -356,7 +353,6 @@ struct PeekRow: Identifiable {
 final class Mirror: ObservableObject {
     let tab: Tab
     @Published var screen: [PeekRow] = []
-    @Published var cols = 0
     @Published var older: [PeekRow] = []
     @Published var more = true
     /// What qoro would not read, said in place of the rows it would not read: a terminal
@@ -456,7 +452,6 @@ final class Mirror: ObservableObject {
         // of history this app no longer draws.
         guard !stopped else { return }
         generation += 1
-        if let cols = s.cols, cols != self.cols { self.cols = cols }
         var rows = s.rows
         // A screen's blank bottom is room the program has not used, not something to read.
         while let last = rows.last, last.allSatisfy({ $0.t.trimmingCharacters(in: .whitespaces).isEmpty }) {
@@ -1087,7 +1082,7 @@ struct RefusalLine: View {
 }
 
 /// One terminal row drawn in its own colours.
-func line(_ runs: [Run], size: CGFloat = 10) -> Text {
+func line(_ runs: [Run]) -> Text {
     var out = AttributedString(runs.isEmpty ? " " : "")
     for r in runs {
         var piece = AttributedString(r.t)
@@ -1100,7 +1095,7 @@ func line(_ runs: [Run], size: CGFloat = 10) -> Text {
         }
         piece.foregroundColor = r.d == true ? fg.opacity(0.55) : fg
         if let bg { piece.backgroundColor = bg }
-        if r.b == true { piece.font = .system(size: size, weight: .bold, design: .monospaced) }
+        if r.b == true { piece.font = .system(size: TermLine.size, weight: .bold, design: .monospaced) }
         if r.u == true { piece.underlineStyle = .single }
         if r.s == true { piece.strikethroughStyle = .single }
         out += piece
@@ -1108,27 +1103,66 @@ func line(_ runs: [Run], size: CGFloat = 10) -> Text {
     return Text(out)
 }
 
-/// A row as the peek draws it: one line at its full width, never cut short with an
-/// ellipsis, since the view scrolls sideways to what is past the edge.
-struct TermLine: View {
-    let runs: [Run]
-    var size: CGFloat = 10
-    var body: some View {
-        line(runs, size: size).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+/// A row as it reads in a box far narrower than its terminal, as the phone reads it. A
+/// program lays its rows out for the Mac's width, so a row padded to the edge would wrap
+/// into lines of blanks, and a box's right border would land alone on a line of its own.
+/// The blank tail goes, unless something is painted on it, and so does a box border
+/// standing after a gap: the inside reads the same without it. An ASCII `|` stays, since a
+/// table needs it. Cut at the end only, so the rest of the row keeps its places.
+func trimTail(_ runs: [Run]) -> [Run] {
+    let text = runs.map(\.t).joined()
+    var bare = Substring(text)
+    while bare.last?.isWhitespace == true { bare.removeLast() }
+    if let c = bare.last, "│┃║".contains(c), bare.dropLast().hasSuffix("  ") {
+        bare.removeLast()
+        while bare.last?.isWhitespace == true { bare.removeLast() }
     }
+    // A background, inverse video, a line under or through all show on a blank, so a
+    // coloured bar is kept to its last painted cell.
+    var painted = 0, at = 0
+    for r in runs {
+        at += r.t.count
+        if r.bg != nil || r.v == true || r.u == true || r.s == true { painted = at }
+    }
+    var left = max(bare.count, painted)
+    guard left < at else { return runs }
+    var out: [Run] = []
+    for var r in runs where left > 0 {
+        if r.t.count > left { r.t = String(r.t.prefix(left)) }
+        left -= r.t.count
+        out.append(r)
+    }
+    return out
 }
 
-/// The size a terminal of `cols` columns is drawn at so all of it is on the box, never
-/// cut off and never wrapped: a program places its text by column, so a wrapped row is a
-/// different picture. A terminal the box already fits is drawn at the full size.
-enum Fit {
-    static let full: CGFloat = 10
-    /// One column at the full size, as the system monospaced font sets it.
-    static let column: CGFloat = NSFont.monospacedSystemFont(ofSize: full, weight: .regular).maximumAdvancement.width
+/// A row drawn only of rule and box characters (the rules around an agent's input box, a
+/// box's top and bottom): wrapped, a 224 column rule becomes four, so it is cut at the
+/// edge. Box drawing only, and ASCII dashes and equals, never a pipe or an underscore a
+/// row of text or a table could be made of.
+func isRule(_ runs: [Run]) -> Bool {
+    let text = runs.map(\.t).joined()
+    return text.trimmingCharacters(in: .whitespaces).count >= 8
+        && text.allSatisfy { $0.isWhitespace || "─━═╌┄-=│┃║╭╮╰╯┌┐└┘├┤┬┴┼╔╗╚╝".contains($0) }
+}
 
-    static func size(cols: Int, width: CGFloat) -> CGFloat {
-        guard cols > 0, width > 0 else { return full }
-        return min(full, full * width / (CGFloat(cols) * column))
+/// A row as the peek draws it: at a size read at a glance whatever the terminal's width,
+/// wrapped at the box's edge rather than scrolled sideways past it, since a peek is a
+/// glance and a third of every row is not one. A rule is the exception, cut to one line.
+struct TermLine: View {
+    static let size: CGFloat = 10
+    let runs: [Run]
+
+    var body: some View {
+        let runs = trimTail(self.runs)
+        if isRule(runs) {
+            // The zero minimum keeps the frame at the box's width: without it the frame
+            // grows to the whole rule and the cut lands on the box's border instead.
+            line(runs).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading).clipped()
+        } else {
+            line(runs).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -1237,8 +1271,6 @@ struct TermPeek: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            GeometryReader { box in
-            let size = Fit.size(cols: m.cols, width: box.size.width - 16)
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if m.more {
@@ -1253,21 +1285,20 @@ struct TermPeek: View {
                     if m.screenRefusal == nil, let why = m.pageRefusal {
                         RefusalLine(why: why)
                     }
-                    ForEach(m.older) { TermLine(runs: $0.runs, size: size) }
+                    ForEach(m.older) { TermLine(runs: $0.runs) }
                     if !m.older.isEmpty {
                         Rectangle().fill(.white.opacity(0.12)).frame(height: 1).padding(.vertical, 4)
                     }
                     if let why = m.screenRefusal {
                         RefusalLine(why: why)
                     } else {
-                        ForEach(m.screen) { TermLine(runs: $0.runs, size: size) }
+                        ForEach(m.screen) { TermLine(runs: $0.runs) }
                     }
                 }
-                .font(.system(size: size, design: .monospaced))
+                .font(.system(size: TermLine.size, design: .monospaced))
                 .padding(8)
             }
             .defaultScrollAnchor(.bottomLeading)
-            }
             .frame(height: TermPeek.height)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color(white: 0.05)))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(typing ? focus.opacity(0.8) : .white.opacity(0.08), lineWidth: typing ? 1.5 : 1))
