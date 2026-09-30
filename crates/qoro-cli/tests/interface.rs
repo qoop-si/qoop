@@ -237,7 +237,7 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
 
 /// Whether `line` is a space's rule: one blank, then the name straight after it, where an
 /// agent's row has its braille mark. Two other rows also open with a blank and something
-/// that is neither: the foot's thick logo, whose rows open with a dot (`●`), and its menu
+/// that is neither: the foot's q, whose rows open with a dot (`●`), and its menu
 /// row, which opens with the version and ends in the menu's mark. Neither is a rule. There
 /// is no fold arrow: `ctrl-a f` folds, and so does a click on the blank before the name.
 fn is_rule_line(line: &str) -> bool {

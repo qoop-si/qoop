@@ -190,7 +190,7 @@ mod tests {
     /// The chrome's whole glyph set settles everywhere: box lines, state dots,
     /// braille steps and half blocks carry no joiner, selector, regional
     /// indicator, tag or keycap. The literals below mirror the sidebar and
-    /// screen constants (`DOT`, `FAILED_DOT`, `THICK_LOGO`, the spinner ramp,
+    /// screen constants (`DOT`, `FAILED_DOT`, `Q_LOGO`, the spinner ramp,
     /// the pet half block, the box corners); a glyph added to the chrome
     /// belongs in this string too.
     #[test]

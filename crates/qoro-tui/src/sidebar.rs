@@ -68,8 +68,7 @@ pub fn colour_for(state: &str) -> Option<crate::theme::Role> {
 /// six is too narrow: this column carries a space name, a
 /// separator, a mark, a name and a state word flush against the right edge, and at twenty
 /// two the state had nothing left. Thirty left a real project name room to be read rather
-/// than recognised from its first eight characters, and thirty eight is what the foot's
-/// thick logo and the widest pet need side by side ([`THICK_PET_WIDTH`]).
+/// than recognised from its first eight characters.
 ///
 /// A pulled width reflows the pane beside it, which is the price the person
 /// pulling asked to pay: explicit drags reflow, arrivals never do.
@@ -607,12 +606,7 @@ pub(crate) fn rows_folded(
     let pet = pet_shown(c, height, avatar.is_some());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let feet = foot_rows(
-        c.width,
-        pet,
-        pet_drawn(avatar.is_some()),
-        update_available().as_deref(),
-    );
+    let feet = foot_rows(c.width, pet, update_available().as_deref());
     let foot = feet.len().min(height);
     let room = height - foot;
     let mut out: Vec<Row> = Vec::with_capacity(height);
@@ -2080,55 +2074,34 @@ pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The word of `docs/brand/make.py` in thick dots: its letters (the three by three ring for
-/// q and o, the two dot wide r) drawn one `●` a cell with a blank cell between dots, so the
-/// gaps across and down read equal on a cell about half as wide as it is tall. Letters sit
-/// one empty dot apart, and the q's tail hangs under the q's right column.
-const THICK_LOGO: [&str; 4] = [
-    "\u{25cf} \u{25cf} \u{25cf}   \u{25cf} \u{25cf} \u{25cf}   \u{25cf} \u{25cf}   \u{25cf} \u{25cf} \u{25cf}",
-    "\u{25cf}   \u{25cf}   \u{25cf}   \u{25cf}   \u{25cf}     \u{25cf}   \u{25cf}",
-    "\u{25cf} \u{25cf} \u{25cf}   \u{25cf} \u{25cf} \u{25cf}   \u{25cf}     \u{25cf} \u{25cf} \u{25cf}",
+/// The q of `docs/brand/make.py` in thick dots: the three by three ring drawn one `●` a cell
+/// with a blank cell between dots, so the gaps across and down read equal on a cell about
+/// half as wide as it is tall, and its tail hanging under the ring's right column.
+const Q_LOGO: [&str; 4] = [
+    "\u{25cf} \u{25cf} \u{25cf}",
+    "\u{25cf}   \u{25cf}",
+    "\u{25cf} \u{25cf} \u{25cf}",
     "    \u{25cf}",
 ];
-/// The two dots `make.py` draws in ember, as (row, cell) of [`THICK_LOGO`]: the q's tail and
-/// the r's first dot. Every other dot is cream. A dot is a cell of its own, so both are exact.
-const THICK_EMBER: [(usize, usize); 2] = [(3, 4), (0, 16)];
-/// The thick logo's cells across.
-const THICK_COLS: usize = 27;
-/// The rows the foot takes with the thick logo and no pet: the logo's four, then the menu.
-const THICK_FOOT_ROWS: usize = THICK_LOGO.len() + 1;
-/// The narrowest column that holds the thick logo: a margin, the logo, a margin.
-const THICK_WIDTH: usize = THICK_COLS + 2;
-/// The narrowest column that holds the thick logo and the widest pet side by side, with a
-/// cell between them and a margin at each edge.
-const THICK_PET_WIDTH: usize = 1 + THICK_COLS + 1 + PET_COLS + 1;
-/// The q's cells across: the first letter of [`THICK_LOGO`], its tail included.
+/// The tail, as (row, cell) of [`Q_LOGO`]: the one dot `make.py` draws in ember. Every other
+/// dot is cream. A dot is a cell of its own, so it is exact.
+const Q_TAIL: (usize, usize) = (3, 4);
+/// The q's cells across.
 const Q_COLS: usize = 5;
-/// The narrowest column that holds the q and the widest pet side by side, spaced the same
-/// way. Under [`SIDEBAR_MIN`], so an open column always has room for the pet.
+/// The rows the foot takes with no pet: the q's four, then the menu.
+const Q_FOOT_ROWS: usize = Q_LOGO.len() + 1;
+/// The narrowest column that holds the q and the widest pet side by side, with a cell
+/// between them and a margin at each edge. Under [`SIDEBAR_MIN`], so an open column always
+/// has room for the pet.
 const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 
 /// The foot of the open column, its last row always the menu row: the version at the left
 /// and `menu « ` at the right.
 ///
-/// Where the column holds it, the logo is [`THICK_LOGO`] on the four rows above the menu.
-/// With a pet picked (`picked`) it needs [`THICK_PET_WIDTH`], so the pet has its room beside
-/// it, and while the pet stands (`pet`) one blank row goes on top and the pet stands at the
+/// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
+/// in ember. While the pet stands (`pet`) one blank row goes on top and the pet stands at the
 /// right of the foot's first five rows (stamped by the overlay), its feet on the row above
-/// the menu. The logo follows the pick, not whether the pet stands this frame, so a pet
-/// giving its rows to a long list never swaps one logo for the other.
-///
-/// ```text
-///                                ▀▀▀▀▀▀
-///  ● ● ●   ● ● ●   ● ●   ● ● ●   ▀▀▀▀▀▀
-///  ●   ●   ●   ●   ●     ●   ●   ▀▀▀▀▀▀
-///  ● ● ●   ● ● ●   ●     ● ● ●   ▀▀▀▀▀▀
-///      ●                         ▀▀▀▀▀▀
-///  0.5.0                         menu «
-/// ```
-///
-/// A narrower column keeps the q alone, the first letter of the same dots at the same size,
-/// its tail the one ember dot, and the pet the same size beside it.
+/// the menu.
 ///
 /// ```text
 ///               ▀▀▀▀▀▀
@@ -2143,7 +2116,7 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
 /// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
 /// rows are text and answer nothing.
-fn foot_rows(width: usize, pet: bool, picked: bool, update: Option<&str>) -> Vec<Row> {
+fn foot_rows(width: usize, pet: bool, update: Option<&str>) -> Vec<Row> {
     use crate::theme::Role;
     let tail = format!("{MENU_LABEL} \u{ab} ");
     // The menu closes the last row: `menu « ` flush right, the version before it.
@@ -2155,23 +2128,20 @@ fn foot_rows(width: usize, pet: bool, picked: bool, update: Option<&str>) -> Vec
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
-    let word = width >= if picked { THICK_PET_WIDTH } else { THICK_WIDTH };
-    let cells = if word { THICK_COLS } else { Q_COLS };
     let mut out: Vec<Row> = Vec::with_capacity(PET_FOOT_ROWS);
     if pet {
-        out.extend((0..PET_FOOT_ROWS - THICK_FOOT_ROWS).map(|_| blank(width)));
+        out.extend((0..PET_FOOT_ROWS - Q_FOOT_ROWS).map(|_| blank(width)));
     }
-    out.extend(THICK_LOGO.iter().enumerate().map(|(row, dots)| {
-        let dots: String = dots.chars().take(cells).collect();
-        let runs = THICK_EMBER
-            .iter()
-            .filter(|(at, cell)| *at == row && *cell < cells)
-            .map(|(_, cell)| (1 + cell, 1, Role::Brand))
-            .collect();
+    out.extend(Q_LOGO.iter().enumerate().map(|(row, dots)| {
+        let (at, cell) = Q_TAIL;
         let line = Line {
             text: fit(&format!(" {dots}"), width),
             colour: Some(Role::Text),
-            runs,
+            runs: if row == at {
+                vec![(1 + cell, 1, Role::Brand)]
+            } else {
+                Vec::new()
+            },
             ..Line::default()
         };
         (line, None)
@@ -3098,11 +3068,7 @@ mod tests {
                     // Never the foot: at a small height there is no title above it yet to
                     // set `in_tree`, and its logo (the word, or the q alone) also opens with
                     // a space.
-                    let q =
-                        |row: &str| format!(" {}", row.chars().take(Q_COLS).collect::<String>());
-                    let logo = THICK_LOGO
-                        .iter()
-                        .any(|row| text == format!(" {row}") || text == q(row).trim_end());
+                    let logo = Q_LOGO.iter().any(|row| text == format!(" {row}"));
                     let next = !text.ends_with('\u{ab}')
                         && !logo
                         && (text
@@ -3720,27 +3686,17 @@ mod tests {
 
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
-        // Under the width the word needs, the q alone: the same dots, its tail in ember.
-        let narrow = THICK_WIDTH - 1;
-        let rows = foot_rows(narrow, false, false, None);
-        assert_eq!(
-            rows.len(),
-            THICK_FOOT_ROWS,
-            "the q's four rows and the menu"
-        );
+        // The q alone, its tail in ember, then the menu.
+        let rows = foot_rows(WIDTH, false, None);
+        assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
                 crate::width::width(&line.text),
-                narrow,
+                WIDTH,
                 "a row has to fill the column exactly or the one under it shifts: {line:?}"
             );
         }
-        let q = [
-            "\u{25cf} \u{25cf} \u{25cf}",
-            "\u{25cf}   \u{25cf}",
-            "\u{25cf} \u{25cf} \u{25cf}",
-            "    \u{25cf}",
-        ];
+        let q = Q_LOGO;
         let brand = crate::theme::Role::Brand;
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for (i, (line, hit)) in rows[..4].iter().enumerate() {
@@ -3789,14 +3745,13 @@ mod tests {
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
-    /// A standing pet only adds blank rows above the words, with the thick logo and with the
-    /// small one, so the words sit in the same rows counted from the bottom whether the pet
-    /// stands or gives its rows to the list.
+    /// A standing pet only adds blank rows above the words, so the words sit in the same rows
+    /// counted from the bottom whether the pet stands or gives its rows to the list.
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
-        for width in [THICK_PET_WIDTH - 1, WIDTH] {
-            let gave_way = foot_rows(width, false, true, None);
-            let stands = foot_rows(width, true, true, None);
+        for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
+            let gave_way = foot_rows(width, false, None);
+            let stands = foot_rows(width, true, None);
             assert_eq!(stands.len(), PET_FOOT_ROWS);
             let blanks = PET_FOOT_ROWS - gave_way.len();
             for (line, hit) in &stands[..blanks] {
@@ -3807,18 +3762,17 @@ mod tests {
         }
     }
 
-    /// The thick logo: the word of `docs/brand/make.py`, one dot a cell with a blank between,
-    /// cream but for its two ember dots, the r's first and the q's tail, on the four rows
-    /// right above the menu, one column in.
+    /// The logo is the q of `docs/brand/make.py` alone at every width: one dot a cell with a
+    /// blank between, cream but for its ember tail, on the four rows right above the menu,
+    /// one column in. The pet beside it fits every open column.
     #[test]
-    fn the_thick_logo_draws_the_word_with_its_two_ember_dots() {
-        assert_eq!(crate::width::width(THICK_LOGO[0]), THICK_COLS);
-        for row in THICK_LOGO {
-            assert!(crate::width::width(row) <= THICK_COLS, "{row:?}");
+    fn the_foot_draws_the_q_alone_at_every_width() {
+        for row in Q_LOGO {
+            assert!(crate::width::width(row) <= Q_COLS, "{row:?}");
             assert!(row.chars().all(|c| c == ' ' || c == '\u{25cf}'), "{row:?}");
         }
-        // The dots, row by row, as make.py places them: the ring, the ring, the r, the
-        // ring, one empty dot apart, and the tail under the q's right column.
+        // The dots, row by row, as make.py places them: the ring, and the tail under its
+        // right column.
         let dots = |row: &str| -> Vec<usize> {
             row.chars()
                 .enumerate()
@@ -3826,58 +3780,30 @@ mod tests {
                 .map(|(at, _)| at)
                 .collect()
         };
-        assert_eq!(
-            dots(THICK_LOGO[0]),
-            [0, 2, 4, 8, 10, 12, 16, 18, 22, 24, 26]
-        );
-        assert_eq!(dots(THICK_LOGO[1]), [0, 4, 8, 12, 16, 22, 26]);
-        assert_eq!(dots(THICK_LOGO[2]), [0, 2, 4, 8, 10, 12, 16, 22, 24, 26]);
-        assert_eq!(dots(THICK_LOGO[3]), [4]);
-        for (row, cell) in THICK_EMBER {
-            assert!(dots(THICK_LOGO[row]).contains(&cell), "({row}, {cell})");
-        }
+        assert_eq!(dots(Q_LOGO[0]), [0, 2, 4]);
+        assert_eq!(dots(Q_LOGO[1]), [0, 4]);
+        assert_eq!(dots(Q_LOGO[2]), [0, 2, 4]);
+        assert_eq!(dots(Q_LOGO[3]), [4]);
+        assert!(dots(Q_LOGO[Q_TAIL.0]).contains(&Q_TAIL.1));
 
-        let rows = foot_rows(WIDTH, false, false, None);
-        assert_eq!(rows.len(), THICK_FOOT_ROWS);
         let brand = crate::theme::Role::Brand;
-        let embers = [vec![(17, 1, brand)], vec![], vec![], vec![(5, 1, brand)]];
-        for (i, (line, hit)) in rows[..4].iter().enumerate() {
-            assert_eq!(line.text.trim_end(), format!(" {}", THICK_LOGO[i]));
-            assert_eq!(crate::width::width(&line.text), WIDTH);
-            assert_eq!(line.colour, Some(crate::theme::Role::Text));
-            assert_eq!(line.runs, embers[i], "row {i}");
-            assert_eq!(*hit, None);
-        }
-        let (menu, hit) = &rows[4];
-        assert!(menu.text.starts_with(&format!(" {VERSION} ")), "{menu:?}");
-        assert_eq!(*hit, Some(Hit::Foot));
-        // The default column holds the thick logo and the widest pet side by side.
-        const { assert!(WIDTH >= THICK_PET_WIDTH) };
-        let with_pet = foot_rows(WIDTH, true, true, None);
-        assert_eq!(with_pet[1].0.text.trim_end(), format!(" {}", THICK_LOGO[0]));
-    }
-
-    /// Below the width that holds the thick logo and a pet beside it, a column with a pet
-    /// picked keeps the q alone; with no pet the word holds down to its own width, and under
-    /// that the q again. The pet beside the q fits every open column.
-    #[test]
-    fn the_logo_falls_back_to_the_q_below_the_width_that_holds_it() {
-        let q = |width: usize, pet: bool, picked: bool| {
-            let rows = foot_rows(width, pet, picked, None);
-            rows[rows.len() - 5].0.text.trim_end() == " \u{25cf} \u{25cf} \u{25cf}"
-        };
+        let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            assert_eq!(
-                q(width, true, true),
-                width < THICK_PET_WIDTH,
-                "width {width}"
-            );
-            assert_eq!(
-                q(width, false, true),
-                width < THICK_PET_WIDTH,
-                "width {width}"
-            );
-            assert_eq!(q(width, false, false), width < THICK_WIDTH, "width {width}");
+            for pet in [false, true] {
+                let rows = foot_rows(width, pet, None);
+                let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
+                for (i, (line, hit)) in logo.iter().enumerate() {
+                    assert_eq!(
+                        line.text.trim_end(),
+                        format!(" {}", Q_LOGO[i]),
+                        "width {width}"
+                    );
+                    assert_eq!(crate::width::width(&line.text), width);
+                    assert_eq!(line.colour, Some(crate::theme::Role::Text));
+                    assert_eq!(line.runs, embers[i], "row {i}");
+                    assert_eq!(*hit, None);
+                }
+            }
             assert!(avatar_fits(30, width, true), "width {width}");
         }
         const { assert!(Q_PET_WIDTH <= SIDEBAR_MIN) };
@@ -4024,7 +3950,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Option<&str>| {
-            foot_rows(width, false, false, update)
+            foot_rows(width, false, update)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -4115,7 +4041,7 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, false, true, None).len();
+        let kept = foot_rows(WIDTH, false, None).len();
         for row in &crowded[30 - PET_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
@@ -4147,7 +4073,7 @@ mod tests {
             WIDTH,
             None,
         );
-        let freed = 30 - PET_FOOT_ROWS..30 - foot_rows(WIDTH, false, false, None).len();
+        let freed = 30 - PET_FOOT_ROWS..30 - foot_rows(WIDTH, false, None).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -5513,7 +5439,7 @@ mod tests {
                 .take_while(|(_, hit)| *hit != Some(Hit::Title))
                 .count();
             // The foot takes its rows; the next row needs three more above them.
-            let want = usize::from(h > foot_rows(WIDTH, false, false, None).len() + 2);
+            let want = usize::from(h > foot_rows(WIDTH, false, None).len() + 2);
             if rows.iter().any(|(_, hit)| *hit == Some(Hit::Title)) {
                 assert_eq!(above, want, "height {h}: {rows:?}");
             }
@@ -6313,7 +6239,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, false, None).len() + 2;
+        let least = foot_rows(WIDTH, false, None).len() + 2;
         for height in [least, least + 1, 10, 14, 30] {
             let rows = rows12(
                 &spaces,
