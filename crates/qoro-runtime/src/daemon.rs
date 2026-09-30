@@ -6928,6 +6928,7 @@ fn spawn_terminal(
             });
     }
     cmd.env("TERM", "xterm-256color");
+    scrub_parent_agent_env(&mut cmd);
     // The capability token, handed to the child of a terminal we started. ADR-015: it binds
     // the terminal and not the generation, because a child's environment cannot be rewritten
     // when the generation changes and a generation bound token would be stale from the
@@ -7192,6 +7193,35 @@ async fn reap_child(child_pid: u32) {
             continue;
         }
         return;
+    }
+}
+
+/// What a coding agent sets for the processes it runs, and nothing the person set.
+///
+/// A daemon first started from inside an agent's shell (Claude Code running `qoro`) holds
+/// these, and every tab would inherit them: a Claude started in a tab then believes it is a
+/// child session and stops saving its transcript, so `qoro history` reads a stale one. User
+/// settings of the same family (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
+/// `CLAUDE_CODE_USE_BEDROCK`, ...) are the person's and stay, which is why this is a list and
+/// not a prefix.
+const PARENT_AGENT_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+    "TRACEPARENT",
+];
+
+fn scrub_parent_agent_env(cmd: &mut std::process::Command) {
+    for name in PARENT_AGENT_ENV {
+        cmd.env_remove(name);
     }
 }
 
@@ -8574,6 +8604,33 @@ mod warning_tests {
             "the oldest were not the ones dropped"
         );
         assert_eq!(kept.last(), Some(&paste(MAX_WARNINGS + 9)));
+    }
+}
+
+#[cfg(test)]
+mod parent_env_tests {
+    use super::{PARENT_AGENT_ENV, scrub_parent_agent_env};
+    use std::ffi::OsStr;
+
+    /// A tab must not inherit the agent the daemon was started from, and must keep the
+    /// person's own settings of the same name family.
+    #[test]
+    fn a_tab_drops_the_parent_agent_and_keeps_user_settings() {
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "kept");
+        scrub_parent_agent_env(&mut cmd);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for name in PARENT_AGENT_ENV {
+            assert!(
+                envs.contains(&(OsStr::new(name), None)),
+                "{name} would reach the tab"
+            );
+        }
+        assert!(envs.contains(&(
+            OsStr::new("CLAUDE_CODE_OAUTH_TOKEN"),
+            Some(OsStr::new("kept"))
+        )));
+        assert!(!envs.iter().any(|(k, _)| *k == "CLAUDE_CONFIG_DIR"));
     }
 }
 
