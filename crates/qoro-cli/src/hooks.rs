@@ -103,6 +103,7 @@ fn targets() -> Vec<Target> {
                     Event("PermissionRequest", None),
                     Event("SubagentStop", None),
                     Event("Stop", None),
+                    Event("StopFailure", None),
                     Event("SessionEnd", None),
                 ],
                 matcher: Some(""),

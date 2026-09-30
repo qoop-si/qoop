@@ -22,6 +22,8 @@
 #         "command": "/path/to/qoro-hook.sh" }] }],
 #       "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
 #         "command": "/path/to/qoro-hook.sh" }] }],
+#       "StopFailure": [{ "matcher": "", "hooks": [{ "type": "command",
+#         "command": "/path/to/qoro-hook.sh" }] }],
 #       "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
 #         "command": "/path/to/qoro-hook.sh" }] }]
 #     }
@@ -53,6 +55,8 @@
 #     -> blocked + `--event blocked`, no label (it carries no tool); every other
 #     notification type reports nothing
 #   Stop, SessionEnd -> idle + `--event done`, no label
+#   StopFailure (the turn ended on an API error or a usage limit) -> failed,
+#     no event: the agent stopped and will not go on by itself
 
 set -eu
 
@@ -143,6 +147,8 @@ elif name == "Notification":
     state, flags, event, label = "blocked", "--visible-blocker", "blocked", ""
 elif name in ("Stop", "SessionEnd"):
     state, flags, event, label = "idle", "--visible-idle", "done", ""
+elif name == "StopFailure":
+    state, flags, event, label = "failed", "", "", ""
 else:
     raise SystemExit(0)
 
