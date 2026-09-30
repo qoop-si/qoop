@@ -56,7 +56,8 @@ ground, or ground on cream.
 The terminal's foot draws the word in thick dots, the letters of `make.py` one `●` a cell
 with a blank cell between dots, so the gaps across and down read equal on a cell about half as
 wide as it is tall. Letters sit one empty dot apart and the q's tail hangs under the q's right
-column: four rows, twenty seven cells.
+column: four rows, twenty seven cells. A column too narrow for the word keeps the q alone, the
+same dots at the same size, its tail in ember.
 
 ```text
 ● ● ●   ● ● ●   ● ●   ● ● ●

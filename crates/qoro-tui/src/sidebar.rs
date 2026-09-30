@@ -2007,23 +2007,18 @@ pub(crate) fn current_avatar() -> Option<qoro_runtime::avatar::Avatar> {
     FILES.read().unwrap_or_else(|e| e.into_inner()).0.clone()
 }
 
-/// Whether the pet itself fits in the foot: open column, wide enough for the logo and the
-/// widest pet beside it with a margin each side, tall enough that the foot still leaves six
-/// rows of list.
+/// Whether the pet itself fits in the foot: open column, wide enough for the thick q and the
+/// widest pet beside it ([`Q_PET_WIDTH`]), tall enough that the foot still leaves six rows
+/// of list.
 pub(crate) fn avatar_fits(height: usize, width: usize, present: bool) -> bool {
-    present && width >= LOGO_COLS + PET_COLS + 3 && height >= PET_FOOT_ROWS + 6
+    present && width >= Q_PET_WIDTH && height >= PET_FOOT_ROWS + 6
 }
 
-/// The rows the foot of the open column takes with the small logo: the logo, the q's tail,
-/// then the menu.
-pub(crate) const FOOT_ROWS: usize = 3;
 /// The widest pet once trimmed to the columns it lights, in cells.
 pub(crate) const PET_COLS: usize = 8;
 /// The foot with the pet in it: the pet's five half-block rows standing on the menu row.
 /// The same for every avatar, so the words sit in the same rows whatever the pet is.
 pub(crate) const PET_FOOT_ROWS: usize = qoro_runtime::avatar::ART_ROWS + 1;
-/// The logo's cells, two a letter.
-const LOGO_COLS: usize = 8;
 
 /// The pet as itself: its five half-block rows (a cell is two pixels, top in the
 /// foreground and bottom in the background), trimmed to the columns any row lights, the
@@ -2086,18 +2081,6 @@ pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The word of `docs/brand/` in braille, two cells a letter (three dots and a gap), the
-/// letters on the lower three dot rows of the row so the q's tail can start the next row.
-const LOGO: &str = "\u{28d6}\u{2846}\u{28d6}\u{2846}\u{2856}\u{2800}\u{28d6}\u{2846}";
-/// The q's tail: the top dot of the cell under the q's right column. A terminal cell holds
-/// one colour, so the tail has a cell of its own and is the only dot in ember.
-const LOGO_TAIL: char = '\u{2801}';
-
-/// The product's name, as it signs itself.
-const BRAND: &str = "qoro";
-/// The dot beside the name where braille is not drawn.
-const BRAND_MARK: char = '\u{25cf}';
-
 /// The word of `docs/brand/make.py` in thick dots: its letters (the three by three ring for
 /// q and o, the two dot wide r) drawn one `●` a cell with a blank cell between dots, so the
 /// gaps across and down read equal on a cell about half as wide as it is tall. Letters sit
@@ -2120,6 +2103,11 @@ const THICK_WIDTH: usize = THICK_COLS + 2;
 /// The narrowest column that holds the thick logo and the widest pet side by side, with a
 /// cell between them and a margin at each edge.
 const THICK_PET_WIDTH: usize = 1 + THICK_COLS + 1 + PET_COLS + 1;
+/// The q's cells across: the first letter of [`THICK_LOGO`], its tail included.
+const Q_COLS: usize = 5;
+/// The narrowest column that holds the q and the widest pet side by side, spaced the same
+/// way. Under [`SIDEBAR_MIN`], so an open column always has room for the pet.
+const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 
 /// The foot of the open column, its last row always the menu row: the version at the left
 /// and `menu « ` at the right.
@@ -2140,23 +2128,22 @@ const THICK_PET_WIDTH: usize = 1 + THICK_COLS + 1 + PET_COLS + 1;
 ///  0.5.0                         menu «
 /// ```
 ///
-/// A narrower column falls back to the small logo: the word in braille ([`LOGO`]) in the
-/// text colour, the q's tail ([`LOGO_TAIL`]) alone on the row under it, the one dot in ember,
-/// then the menu; with the pet, three blank rows on top so the pet stands the same way.
+/// A narrower column keeps the q alone, the first letter of the same dots at the same size,
+/// its tail the one ember dot, and the pet the same size beside it.
 ///
 /// ```text
-///                        ▀▀▀▀▀▀
-///                        ▀▀▀▀▀▀
-///                        ▀▀▀▀▀▀
-///  ⣖⡆⣖⡆⡖⠀⣖⡆              ▀▀▀▀▀▀
-///   ⠁                    ▀▀▀▀▀▀
-///  0.5.0                 menu «
+///               ▀▀▀▀▀▀
+///  ● ● ●        ▀▀▀▀▀▀
+///  ●   ●        ▀▀▀▀▀▀
+///  ● ● ●        ▀▀▀▀▀▀
+///      ●        ▀▀▀▀▀▀
+///  0.5.0        menu «
 /// ```
 ///
-/// Where braille is not drawn the small logo is `● qoro` in ember and the tail's row is
-/// blank. Whatever the pet, the words sit in the same rows counted from the bottom: nothing a
-/// person reads ever moves. The menu row answers a click the way the foot always has (the
-/// menu at its word, the fold elsewhere); the other rows are text and answer nothing.
+/// A dot is a plain `●`, which every terminal draws. Whatever the pet, the words sit in the
+/// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
+/// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
+/// rows are text and answer nothing.
 fn foot_rows(width: usize, pet: bool, picked: bool, update: Option<&str>) -> Vec<Row> {
     use crate::theme::Role;
     let tail = format!("{MENU_LABEL} \u{ab} ");
@@ -2169,55 +2156,28 @@ fn foot_rows(width: usize, pet: bool, picked: bool, update: Option<&str>) -> Vec
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
-    if width >= if picked { THICK_PET_WIDTH } else { THICK_WIDTH } {
-        let mut out: Vec<Row> = Vec::with_capacity(PET_FOOT_ROWS);
-        if pet {
-            out.extend((0..PET_FOOT_ROWS - THICK_FOOT_ROWS).map(|_| blank(width)));
-        }
-        out.extend(THICK_LOGO.iter().enumerate().map(|(row, dots)| {
-            let runs = THICK_EMBER
-                .iter()
-                .filter(|(at, _)| *at == row)
-                .map(|(_, cell)| (1 + cell, 1, Role::Brand))
-                .collect();
-            let line = Line {
-                text: fit(&format!(" {dots}"), width),
-                colour: Some(Role::Text),
-                runs,
-                ..Line::default()
-            };
-            (line, None)
-        }));
-        out.push(menu_row);
-        return out;
-    }
-    let braille = crate::colorlevel::braille();
-    let logo = if braille {
-        LOGO.to_string()
-    } else {
-        format!("{BRAND_MARK} {BRAND}")
-    };
-    let logo_w = crate::width::width(&logo);
-    let faint = |text: &str, runs| Line {
-        text: fit(text, width),
-        colour: Some(Role::Faint),
-        runs,
-        ..Line::default()
-    };
-    let logo_row = faint(
-        &format!(" {logo}"),
-        vec![(1, logo_w, if braille { Role::Text } else { Role::Brand })],
-    );
-    let tail_row = if braille {
-        faint(&format!("  {LOGO_TAIL}"), vec![(2, 1, Role::Brand)])
-    } else {
-        faint("", Vec::new())
-    };
+    let word = width >= if picked { THICK_PET_WIDTH } else { THICK_WIDTH };
+    let cells = if word { THICK_COLS } else { Q_COLS };
     let mut out: Vec<Row> = Vec::with_capacity(PET_FOOT_ROWS);
     if pet {
-        out.extend((0..PET_FOOT_ROWS - FOOT_ROWS).map(|_| blank(width)));
+        out.extend((0..PET_FOOT_ROWS - THICK_FOOT_ROWS).map(|_| blank(width)));
     }
-    out.extend([(logo_row, None), (tail_row, None), menu_row]);
+    out.extend(THICK_LOGO.iter().enumerate().map(|(row, dots)| {
+        let dots: String = dots.chars().take(cells).collect();
+        let runs = THICK_EMBER
+            .iter()
+            .filter(|(at, cell)| *at == row && *cell < cells)
+            .map(|(_, cell)| (1 + cell, 1, Role::Brand))
+            .collect();
+        let line = Line {
+            text: fit(&format!(" {dots}"), width),
+            colour: Some(Role::Text),
+            runs,
+            ..Line::default()
+        };
+        (line, None)
+    }));
+    out.push(menu_row);
     out
 }
 
@@ -3137,10 +3097,13 @@ mod tests {
                         _ => Some(Hit::Terminal(3)),
                     };
                     // Never the foot: at a small height there is no title above it yet to
-                    // set `in_tree`, and its logo (braille, not the plain word) also opens
-                    // with a space and a braille cell.
-                    let logo = text.starts_with(&format!(" {LOGO}"))
-                        || THICK_LOGO.iter().any(|row| text == format!(" {row}"));
+                    // set `in_tree`, and its logo (the word, or the q alone) also opens with
+                    // a space.
+                    let q =
+                        |row: &str| format!(" {}", row.chars().take(Q_COLS).collect::<String>());
+                    let logo = THICK_LOGO
+                        .iter()
+                        .any(|row| text == format!(" {row}") || text == q(row).trim_end());
                     let next = !text.ends_with('\u{ab}')
                         && !logo
                         && (text
@@ -3165,7 +3128,7 @@ mod tests {
                     } else if text.ends_with('\u{ab}') {
                         // The menu row, the foot's last: the version and `menu «`.
                         Some(Hit::Foot)
-                    } else if logo || text == format!("  {LOGO_TAIL}") {
+                    } else if logo {
                         // The logo and the q's tail are text and answer nothing.
                         None
                     } else if in_tree
@@ -3758,35 +3721,38 @@ mod tests {
 
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
-        // Under the width the thick logo needs, the small one: braille, its tail, the menu.
-        let small = THICK_WIDTH - 1;
-        let rows = foot_rows(small, false, false, None);
-        assert_eq!(rows.len(), FOOT_ROWS, "the logo, the tail and the menu");
+        // Under the width the word needs, the q alone: the same dots, its tail in ember.
+        let narrow = THICK_WIDTH - 1;
+        let rows = foot_rows(narrow, false, false, None);
+        assert_eq!(
+            rows.len(),
+            THICK_FOOT_ROWS,
+            "the q's four rows and the menu"
+        );
         for (line, _) in &rows {
             assert_eq!(
                 crate::width::width(&line.text),
-                small,
+                narrow,
                 "a row has to fill the column exactly or the one under it shifts: {line:?}"
             );
         }
-        // Under braille the logo is drawn in dots, in the text colour, and answers nothing.
-        let (logo, hit) = &rows[0];
-        assert!(logo.text.starts_with(&format!(" {LOGO}")), "{logo:?}");
-        assert_eq!(logo.accent, None);
-        assert_eq!(
-            logo.runs,
-            vec![(1, 8, crate::theme::Role::Text)],
-            "{logo:?}"
-        );
-        assert_eq!(*hit, None);
-        // The q's tail under the q's right column, alone on its row, the only ember dot.
-        let (tail, hit) = &rows[1];
-        assert_eq!(tail.text.trim_end(), format!("  {LOGO_TAIL}"), "{tail:?}");
-        assert_eq!(tail.runs, vec![(2, 1, crate::theme::Role::Brand)]);
-        assert_eq!(*hit, None);
+        let q = [
+            "\u{25cf} \u{25cf} \u{25cf}",
+            "\u{25cf}   \u{25cf}",
+            "\u{25cf} \u{25cf} \u{25cf}",
+            "    \u{25cf}",
+        ];
+        let brand = crate::theme::Role::Brand;
+        let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
+        for (i, (line, hit)) in rows[..4].iter().enumerate() {
+            assert_eq!(line.text.trim_end(), format!(" {}", q[i]), "row {i}");
+            assert_eq!(line.colour, Some(crate::theme::Role::Text));
+            assert_eq!(line.runs, embers[i], "row {i}");
+            assert_eq!(*hit, None);
+        }
         // The menu row: the version at the left, a person reporting a bug reads it off the
         // screen, and `menu « ` closing the row.
-        let (menu, hit) = &rows[2];
+        let (menu, hit) = &rows[4];
         assert!(menu.text.starts_with(&format!(" {VERSION} ")), "{menu:?}");
         assert!(
             menu.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
@@ -3819,7 +3785,7 @@ mod tests {
         // Folded to a strip there is no room for the logo, and the fold mark is the row.
         let (strip, hit) = collapse_row();
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
-        assert!(!strip.text.contains(BRAND));
+        assert!(!strip.text.contains('\u{25cf}'));
         assert_eq!(hit, Some(Hit::Foot));
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
@@ -3893,31 +3859,29 @@ mod tests {
     }
 
     /// Below the width that holds the thick logo and a pet beside it, a column with a pet
-    /// picked falls back to the small braille logo; with no pet the thick logo holds down to
-    /// its own width, and under that the small one again.
+    /// picked keeps the q alone; with no pet the word holds down to its own width, and under
+    /// that the q again. The pet beside the q fits every open column.
     #[test]
-    fn the_logo_falls_back_to_braille_below_the_width_that_holds_it() {
-        let logo_row = |rows: &[Row]| rows[rows.len() - 3].0.text.clone();
-        let small = |width: usize, pet: bool, picked: bool| {
-            logo_row(&foot_rows(width, pet, picked, None)).starts_with(&format!(" {LOGO}"))
+    fn the_logo_falls_back_to_the_q_below_the_width_that_holds_it() {
+        let q = |width: usize, pet: bool, picked: bool| {
+            let rows = foot_rows(width, pet, picked, None);
+            rows[rows.len() - 5].0.text.trim_end() == " \u{25cf} \u{25cf} \u{25cf}"
         };
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
             assert_eq!(
-                small(width, true, true),
+                q(width, true, true),
                 width < THICK_PET_WIDTH,
                 "width {width}"
             );
             assert_eq!(
-                small(width, false, true),
+                q(width, false, true),
                 width < THICK_PET_WIDTH,
                 "width {width}"
             );
-            assert_eq!(
-                small(width, false, false),
-                width < THICK_WIDTH,
-                "width {width}"
-            );
+            assert_eq!(q(width, false, false), width < THICK_WIDTH, "width {width}");
+            assert!(avatar_fits(30, width, true), "width {width}");
         }
+        const { assert!(Q_PET_WIDTH <= SIDEBAR_MIN) };
     }
 
     /// With a pet standing, every width from the narrowest to the widest keeps the column's
@@ -4095,9 +4059,9 @@ mod tests {
     #[test]
     fn art_fits_an_open_column_of_decent_size_only() {
         assert!(avatar_fits(30, 30, true));
-        assert!(avatar_fits(12, 19, true));
+        assert!(avatar_fits(12, Q_PET_WIDTH, true));
         assert!(!avatar_fits(30, 30, false));
-        assert!(!avatar_fits(30, 18, true));
+        assert!(!avatar_fits(30, Q_PET_WIDTH - 1, true));
         assert!(!avatar_fits(11, 30, true));
     }
 
