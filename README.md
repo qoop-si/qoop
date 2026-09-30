@@ -150,6 +150,7 @@ ctrl-a Z                sleep the space you are in, or wake the one you are on
 qoro sleep api          the same from a shell, by name or id
 qoro wake [api]         wake one, or the one that slept last
 qoro ls                 every space, awake, asleep or stopped, and its tabs
+qoro --space api        the interface with that one space in it; `qoro` shows them all
 qoro stop               end everything now: what was awake comes back on the next open
 ```
 

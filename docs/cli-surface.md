@@ -26,6 +26,7 @@ a claim nobody has to keep.
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
 | `qoro ensure-awake` | wake the space that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |
+| `qoro --space <id\|name>` | the interface with that one space in it and no other: made when the name is new, woken when asleep, given a tab when empty; a new space is refused there, and `qoro` still shows them all | yes |
 | `qoro --remote <remote>` | the interface for another machine's qoro alone, over ssh, by an added name or an ssh target; a dropped connection comes back on its own | yes |
 | `qoro remote add <name> <ssh-target>` | reach a machine over ssh in the foreground, check its qoro speaks this codec, offer to install this version there when it has none, and list its spaces in `qoro` as `<name>:<space>` beside this machine's | yes |
 | `qoro remote rm <name>` | stop listing a machine's spaces | no |

@@ -1268,6 +1268,61 @@ pub(crate) fn ensure_awake() -> std::io::Result<()> {
     })
 }
 
+/// `qoro --space`: the space named, made when the name is new, awake and with a tab in it,
+/// so an interface that shows it alone has something to show. Its id.
+pub(crate) fn open_space(wanted: &str) -> std::io::Result<i64> {
+    let here = std::env::current_dir().ok();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        // A daemon that was leaving as this connected closes it: started again, once.
+        let mut link = match Link::open("qoro-space").await {
+            Ok(link) => link,
+            Err(e) if daemon_gone(&e) => {
+                let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+                super::ensure_daemon(&paths::socket_path(&dir))?;
+                Link::open("qoro-space").await?
+            }
+            Err(e) => return Err(e),
+        };
+        let space = link.space(wanted).await?;
+        let row = link.spaces().await?.into_iter().find(|s| s.id == space);
+        let mut tabs = row.as_ref().map_or(0, |s| s.terminals);
+        if row.is_some_and(|s| s.asleep) {
+            match link
+                .ask(&ControlRequest::WakeWorkspace {
+                    id: super::request_id("space"),
+                    workspace: Some(space),
+                })
+                .await?
+                .0
+            {
+                ControlResponse::WorkspaceAwake { terminals, .. } => tabs = terminals,
+                ControlResponse::Failed { reason, .. } => {
+                    return Err(std::io::Error::other(reason));
+                }
+                _ => return Err(std::io::Error::other("unexpected answer to a wake")),
+            }
+        }
+        if tabs > 0 {
+            return Ok(space);
+        }
+        match link
+            .ask(&ControlRequest::CreateTerminal {
+                id: super::request_id("space"),
+                cwd: here.map(|h| h.display().to_string()),
+                workspace: Some(space),
+                name: None,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::TerminalCreated { .. } => Ok(space),
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a create")),
+        }
+    })
+}
+
 /// Open one terminal as `opts` says, tell `announce` its number, then type its command.
 pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::io::Result<()> {
     // Where the caller is, not where the daemon started: a person opening a

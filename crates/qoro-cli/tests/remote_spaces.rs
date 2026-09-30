@@ -272,6 +272,7 @@ fn scenario() {
                     name: "devbox".into(),
                     target: "devbox.example".into(),
                 }],
+                None,
             ));
             let (rd, wr) = tokio::io::split(tui_side);
             let mut tui = Tui {

@@ -291,6 +291,9 @@ struct Mux<W> {
     last_link: usize,
     /// For the tasks the mux starts itself: a new link's supervisor, a session list.
     events: mpsc::Sender<FromLink>,
+    /// `qoro --space`: the one local space this interface shows. Every other space, and
+    /// every tab in one, is left out of the lists it is given.
+    only: Option<i64>,
 }
 
 impl<W: AsyncWrite + Unpin> Mux<W> {
@@ -364,11 +367,13 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             return Ok(());
         }
         let agents = self.merged_agents();
+        let shown: BTreeSet<u32> = agents.iter().map(|row| row.terminal).collect();
         let splits = self
             .links
             .iter()
             .flatten()
-            .flat_map(|l| l.splits.iter().cloned())
+            .flat_map(|l| l.splits.iter())
+            .filter_map(|tree| tree.retain(&|t| shown.contains(&t)))
             .collect();
         self.respond(&ControlResponse::Agents {
             id: id.to_string(),
@@ -384,6 +389,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             .enumerate()
             .filter_map(|(i, l)| l.as_ref().map(|l| l.listed_spaces(i)))
             .flatten()
+            .filter(|w| self.only.is_none_or(|only| w.id == only))
             .collect()
     }
 
@@ -392,6 +398,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             .iter()
             .flatten()
             .flat_map(|l| l.agents.iter().cloned())
+            .filter(|row| self.only.is_none_or(|only| row.workspace == only))
             .collect()
     }
 
@@ -629,7 +636,9 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         let (link, w) = workspace_in(w);
                         (link, Some(w))
                     }
-                    None => (self.home, None),
+                    // Scoped, a tab with no space named goes to the one on screen, not to
+                    // the daemon's default where this interface would never show it.
+                    None => (self.home, self.only),
                 };
                 // A directory is a place on one machine. Carried to another it is at best
                 // missing and at worst somewhere else with the same name.
@@ -644,6 +653,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     },
                 )
                 .await
+            }
+            R::CreateWorkspace { id, .. } if self.only.is_some() => {
+                self.failed(id, "this shows one space; `qoro` shows them all".into())
+                    .await
             }
             R::CreateWorkspace { id, name } => {
                 let named = name.split_once(':').and_then(|(prefix, rest)| {
@@ -1503,6 +1516,7 @@ pub async fn serve<D>(
     down: D,
     local: Option<(tokio::net::UnixStream, BytesMut)>,
     remotes: Vec<Remote>,
+    only: Option<i64>,
 ) where
     D: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -1537,6 +1551,7 @@ pub async fn serve<D>(
         pushed_spaces: Vec::new(),
         last_link: home,
         events: link_tx,
+        only,
     };
     for remote in remotes {
         mux.add_remote(remote);
@@ -1590,11 +1605,13 @@ async fn route<W: AsyncWrite + Unpin>(
     }
 }
 
-/// The interface over the local daemon at `socket` (when given) and `remotes`.
+/// The interface over the local daemon at `socket` (when given) and `remotes`, showing
+/// only the local space `only` when one is named.
 pub async fn run(
     socket: Option<&Path>,
     remotes: Vec<Remote>,
     notice: Option<String>,
+    only: Option<i64>,
 ) -> io::Result<()> {
     let local = match socket {
         Some(socket) => Some(client::connect(socket, "qoro-tui").await?),
@@ -1603,7 +1620,7 @@ pub async fn run(
     // A megabyte each way: a full screen snapshot is tens of kilobytes, and the interface
     // reads as fast as it paints.
     let (tui_side, mux_side) = tokio::io::duplex(1 << 20);
-    tokio::spawn(serve(mux_side, local, remotes));
+    tokio::spawn(serve(mux_side, local, remotes, only));
     crate::run::run_stream(
         tui_side,
         BytesMut::new(),
@@ -1715,6 +1732,7 @@ mod tests {
             pushed_spaces: Vec::new(),
             last_link: 0,
             events,
+            only: None,
         };
         let there = terminal_out(1, 21).expect("fits");
         mux.control(ControlRequest::SearchScrollback {
@@ -1754,6 +1772,99 @@ mod tests {
                 col: 4,
                 resume: None,
             }
+        );
+    }
+
+    /// `qoro --space`: the interface is given the one space and its tabs, and a tab asked
+    /// for with no space named is made in that space rather than the daemon's default.
+    #[tokio::test]
+    async fn a_scoped_mux_passes_one_space_and_its_tabs() {
+        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
+        let mut home = Link::new(String::new(), None);
+        home.conn = Some((1, home_tx));
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![Some(home)],
+            home: 0,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 0,
+            events,
+            only: Some(2),
+        };
+        let space = |id: i64, name: &str| WorkspaceRow {
+            id,
+            name: name.into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+        };
+        mux.answer(
+            0,
+            ControlResponse::Workspaces {
+                id: "list-1".into(),
+                workspaces: vec![space(1, "default"), space(2, "alpha")],
+            },
+        )
+        .await
+        .expect("answered");
+        let listed: ControlResponse = body_of(&std::mem::take(&mut mux.down));
+        assert_eq!(
+            listed,
+            ControlResponse::Workspaces {
+                id: "list-1".into(),
+                workspaces: vec![space(2, "alpha")],
+            }
+        );
+
+        let tab = |terminal: u32, workspace: i64| -> AgentRow {
+            serde_json::from_value(serde_json::json!({
+                "terminal": terminal, "workspace": workspace, "program": null,
+                "behind": null, "state": "idle", "generation": null,
+            }))
+            .expect("row")
+        };
+        let leaf = |terminal| Pane::Leaf { terminal };
+        mux.answer(
+            0,
+            ControlResponse::Agents {
+                id: "list-2".into(),
+                agents: vec![tab(5, 1), tab(6, 2)],
+                splits: vec![leaf(5), leaf(6)],
+            },
+        )
+        .await
+        .expect("answered");
+        let listed: ControlResponse = body_of(&std::mem::take(&mut mux.down));
+        assert_eq!(
+            listed,
+            ControlResponse::Agents {
+                id: "list-2".into(),
+                agents: vec![tab(6, 2)],
+                splits: vec![leaf(6)],
+            }
+        );
+
+        mux.control(ControlRequest::CreateTerminal {
+            id: "new-1".into(),
+            cwd: None,
+            workspace: None,
+            name: None,
+        })
+        .await
+        .expect("sent");
+        let asked: ControlRequest = body_of(&home_rx.try_recv().expect("the daemon was asked"));
+        assert!(
+            matches!(
+                asked,
+                ControlRequest::CreateTerminal {
+                    workspace: Some(2),
+                    ..
+                }
+            ),
+            "{asked:?}"
         );
     }
 }

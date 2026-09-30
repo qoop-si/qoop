@@ -105,6 +105,7 @@ fn run() -> std::io::Result<()> {
         Some("ensure-awake") => supervise::ensure_awake(),
         Some("remote") => remote::run(&args),
         Some("--remote") => run_remote(&args),
+        Some("--space") => run_space(&args),
         Some("send") => run_send(&args),
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
@@ -148,6 +149,8 @@ fn run() -> std::io::Result<()> {
                  \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
                  \x20 qoro ensure-awake  wake the space that slept last, or open a first tab\n\
                  \x20 qoro --remote <name|ssh-target>  the interface for another machine's qoro\n\
+                 \x20 qoro --space <id|name>  the interface with that one space in it, made\n\
+                 \x20                 when the name is new; `qoro` still shows them all\n\
                  \x20 qoro remote add <name> <ssh-target>  show that\n\
                  \x20                 machine's spaces in `qoro`, beside this one's\n\
                  \x20 qoro remote rm <name>  stop showing them\n\
@@ -325,7 +328,27 @@ fn run_client() -> std::io::Result<()> {
             (Vec::new(), Some(notice))
         }
     };
-    rt.block_on(qoro_tui::mux::run(Some(&socket), remotes, notice))
+    rt.block_on(qoro_tui::mux::run(Some(&socket), remotes, notice, None))
+}
+
+/// `qoro --space <id|name>`: the interface with one space in it and nothing else. The
+/// space is made when the name is new, and woken, or given a tab, when there is nothing in
+/// it to show. Remotes are left out: their spaces would be filtered away anyway.
+fn run_space(args: &[String]) -> std::io::Result<()> {
+    let [_, _, wanted] = args else {
+        return Err(usage("usage: qoro --space <id|name>"));
+    };
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    let socket = paths::socket_path(&dir);
+    ensure_daemon(&socket)?;
+    let space = supervise::open_space(wanted)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(qoro_tui::mux::run(
+        Some(&socket),
+        Vec::new(),
+        None,
+        Some(space),
+    ))
 }
 
 /// `qoro --remote <name|target>`: the interface for another machine's qoro alone.
@@ -360,7 +383,7 @@ fn run_remote(args: &[String]) -> std::io::Result<()> {
     }
     remote::wake(&remote);
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(qoro_tui::mux::run(None, vec![remote], None))
+    rt.block_on(qoro_tui::mux::run(None, vec![remote], None, None))
 }
 
 /// Attach to one terminal, with no interface around it.
