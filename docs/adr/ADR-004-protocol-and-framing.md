@@ -168,9 +168,12 @@ Failure behaviour is explicit rather than implied:
   they can do is suppress each other's retries or observe that a key was used, which is the
   same authority they already have over each other. It is deliberately **not** the key that
   ADR-007 uses for resize ownership: ownership is per connection, because it must end when
-  the connection does, and a stable identity would survive a crash and strand the geometry. Applied keys
-  are recorded against that identity, with their outcomes, alongside the outcome record in
-  the durable log, and are retained for 10 minutes.
+  the connection does, and a stable identity would survive a crash and strand the geometry.
+
+  Amended 2026-09-30: what is built is narrower. The ledger is keyed by the request id
+  alone, not by that identity, and lives in `qoro.db`'s `applied` table with the outcome,
+  kept for 30 days (ADR-005). A create writes its row in the same transaction as the
+  terminal, so a key already answered cannot open a second tab.
 
   Scoping this to the connection, which an earlier draft did, defeats the case it was
   written for: a client that has crashed reconnects on a new connection with an empty key

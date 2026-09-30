@@ -47,9 +47,10 @@ the codec, keeps its terminals through every one of those releases.
 
 Everything that is metadata: workspaces, terminals, layout, split trees, sleeping spaces,
 the idempotency ledger, history, the confirmation ledger. The event log is not in that list
-because the daemon no longer writes it; see ADR-005. What does not survive is what cannot: the pty, the engine state and the
-child processes. A restart that reconstructs a terminal mints a new generation, because it
-cannot prove the process is the same one, which is the rule `GenerationId` already carries.
+because the daemon no longer writes it; see ADR-005. What does not survive is what cannot:
+the pty, the engine state and the child processes. A restart that reconstructs a terminal
+mints a new generation, because it cannot prove the process is the same one, which is the
+rule `GenerationId` already carries.
 
 A restart after an unclean shutdown used to append a gap event covering the interval
 nobody watched. It no longer does, because the daemon writes no events; the ledger row a

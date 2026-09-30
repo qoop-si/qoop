@@ -242,7 +242,9 @@ out-of-scope list, the behaviour is stated per milestone:
 - Through M3: a daemon killed mid-teardown leaves an orphaned process tree with no record.
   This is documented, not silently hoped for, and it is what the M1 scope allows.
 - From M4, when the durable log exists: the `Closing` state is journalled, and the next
-  start resumes teardown from step 3, which is idempotent.
+  start resumes teardown from step 3, which is idempotent. Amended 2026-09-30: this was
+  never built, and the log it needed is no longer written (ADR-005). A daemon killed
+  mid-teardown still leaves the tree it was tearing down.
 
 ### Orphans on Unix
 
