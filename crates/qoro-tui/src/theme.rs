@@ -58,6 +58,10 @@ pub enum Role {
     /// agent belongs to is something the eye gets for free instead of a word it has to read
     /// on every one of nine rows.
     Space(usize),
+    /// The same space's ink one step quieter, worn by the title of an agent in it that is
+    /// calm (idle, done, asleep, not yet seen). The space still reads by hue, and the rows
+    /// that want a person stand out of it without a second colour.
+    SpaceCalm(usize),
     /// The picked avatar's own two inks, worn only on the foot of the column.
     ///
     /// The payload is a 256-palette entry the avatar file vouched for: loading
@@ -79,6 +83,11 @@ pub fn space_of(id: i64) -> Role {
     Role::Space(id.unsigned_abs() as usize % SPACE_INKS.len())
 }
 
+/// The quieter step of [`space_of`], for a calm agent's title in that space.
+pub fn space_calm_of(id: i64) -> Role {
+    Role::SpaceCalm(id.unsigned_abs() as usize % SPACE_CALM_INKS.len())
+}
+
 /// The identity palette. Six, because a seventh distinct hue that is neither a state nor
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
@@ -88,9 +97,15 @@ pub fn space_of(id: i64) -> Role {
 /// step that reads on a dark ground (violet 177, lime 191, cyan 87, pink 218, sky 117,
 /// yellow 228). Ordered so the two closest pairs (cyan and sky, 32 dE; lime and yellow, 23)
 /// are never neighbours on the wheel. The nearest a space comes to a state is violet to
-/// asleep (24) and sky to working (27): a space ink sits on the name and on the space's line,
+/// asleep (24) and sky to working (27): a space ink sits on the name and on its agents' titles,
 /// a state on the agent's mark, so they never share a cell.
 const SPACE_INKS: [u8; 6] = [177, 191, 87, 218, 117, 228];
+
+/// The wheel one step quieter, slot for slot: each family at a lower lightness and
+/// saturation (violet 134, lime 107, cyan 73, pink 175, sky 67, yellow 143), every one still
+/// at least 4.5 to 1 on black because a title is read, not found. Sky steps down to the
+/// muted 67 rather than the brighter 74, which sits too close to working's electric sky.
+const SPACE_CALM_INKS: [u8; 6] = [134, 107, 73, 175, 67, 143];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
@@ -156,6 +171,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::AvatarBody(ink) => ink,
         Role::Shimmer(level) => 244 + if level > 11 { 11 } else { level },
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
+        Role::SpaceCalm(n) => SPACE_CALM_INKS[n % SPACE_CALM_INKS.len()],
     }
 }
 
@@ -412,12 +428,29 @@ const fn light_ink(role: Role) -> u8 {
         // quiet row is a light grey here, and emphasis on a light page is a darker ink.
         Role::Shimmer(level) => 244 - if level > 11 { 11 } else { level },
         Role::Space(n) => LIGHT_SPACE_INKS[n % LIGHT_SPACE_INKS.len()],
+        Role::SpaceCalm(n) => LIGHT_SPACE_CALM_INKS[n % LIGHT_SPACE_CALM_INKS.len()],
     }
 }
 
-/// The identity wheel on white: the same six families, darker steps that read on white
-/// (violet, olive lime, teal, deep pink, deep sky, olive gold), so no space reads as a state.
-const LIGHT_SPACE_INKS: [u8; 6] = [92, 64, 30, 125, 24, 100];
+/// The identity wheel on white: the same six families, the darker steps that read as text,
+/// at least 4.5 to 1 on white and on the selected row (violet 92, olive 58, deep teal 23,
+/// deep pink 125, deep sky 24, amber 94), so a title in its space's colour is read, not
+/// found. The lime and yellow families have one cube entry between them that dark (58), so
+/// lime takes it and yellow steps to amber 94, the nearest a space comes to a state on
+/// white: 20 dE from blocked's 130, about what deep pink stands from the selected tab (18).
+const LIGHT_SPACE_INKS: [u8; 6] = [92, 58, 23, 125, 24, 94];
+
+/// The light wheel's quieter steps, slot for slot: each lighter than its base on white, so a
+/// calm agent reads quieter than one that is working or wants a person (violet 98, lime 64,
+/// teal 29, dusty rose 95, bright sky 27, olive gold 100). Four hold the 4.5 to 1 a title
+/// needs. Lime and yellow cannot: the cube has nothing lighter than 58 and 94 in those
+/// families that still reads at 4.5, so their calm steps are the old bases, 64 at 4.2 and
+/// 100 at 3.8, above the 3 to 1 of a glyph a person finds.
+const LIGHT_SPACE_CALM_INKS: [u8; 6] = [98, 64, 29, 95, 27, 100];
+
+/// The slots of [`LIGHT_SPACE_CALM_INKS`] held to 3 to 1 rather than 4.5: lime and yellow.
+#[cfg(test)]
+const LIGHT_CALM_UNDER_TEXT: [usize; 2] = [1, 5];
 
 /// Raised backgrounds on white: the selected row a shade under the page, the status bar
 /// a shade lighter still, the same order of depth as the dark table.
@@ -478,6 +511,7 @@ mod tests {
         ]
         .into_iter()
         .chain((0..SPACE_INKS.len()).map(Role::Space))
+        .chain((0..SPACE_CALM_INKS.len()).map(Role::SpaceCalm))
         .chain((0..=11).map(Role::Shimmer))
         {
             assert!(ink(role) >= 16, "{role:?} uses a themed colour");
@@ -641,6 +675,15 @@ mod tests {
         .map(ink)
         .to_vec();
         taken.push(TAB_ON_FG);
+        taken.extend(SPACE_INKS);
+        for n in 0..SPACE_INKS.len() {
+            assert!(
+                !taken.contains(&ink(Role::SpaceCalm(n))),
+                "calm space {n} wears a colour that already means something"
+            );
+        }
+        taken.truncate(taken.len() - SPACE_INKS.len());
+        taken.extend(SPACE_CALM_INKS);
         for n in 0..SPACE_INKS.len() {
             assert!(
                 !taken.contains(&ink(Role::Space(n))),
@@ -661,8 +704,16 @@ mod tests {
                 !sweep.contains(&ink(Role::Space(n))),
                 "space {n} wears a sweep step"
             );
+            assert!(
+                !sweep.contains(&ink(Role::SpaceCalm(n))),
+                "calm space {n} wears a sweep step"
+            );
         }
-        for (name, pool) in [("space", SPACE_INKS.to_vec()), ("sweep", sweep.clone())] {
+        for (name, pool) in [
+            ("space", SPACE_INKS.to_vec()),
+            ("calm space", SPACE_CALM_INKS.to_vec()),
+            ("sweep", sweep.clone()),
+        ] {
             assert!(
                 !pool.contains(&TAB_ON_FG),
                 "the selected tab wears a {name} pool colour"
@@ -779,9 +830,37 @@ mod tests {
             Role::Detail,
             Role::Faint,
         ];
-        for role in text {
+        // A title is read, so its space ink holds the text floor, on the page and, for the
+        // keyboard's row, on the selected row. The calm steps hold it too, but for the two
+        // families the cube cannot give a lighter readable step (see the table).
+        let spaces = (0..LIGHT_SPACE_INKS.len()).map(Role::Space);
+        let calm = (0..LIGHT_SPACE_CALM_INKS.len())
+            .filter(|n| !LIGHT_CALM_UNDER_TEXT.contains(n))
+            .map(Role::SpaceCalm);
+        for role in text.into_iter().chain(spaces.clone()).chain(calm) {
             let ratio = contrast(light_ink(role), WHITE);
             assert!(ratio >= 4.5, "{role:?} is {ratio:.2}:1 on white");
+        }
+        for role in spaces {
+            let ratio = contrast(light_ink(role), LIGHT_SELECTED_BG);
+            assert!(ratio >= 4.5, "{role:?} on the selected row is {ratio:.2}:1");
+        }
+        // Quieter is the point of the calm step: on white it sits clearly under its base.
+        for n in 0..LIGHT_SPACE_INKS.len() {
+            let (base, calm) = (
+                contrast(light_ink(Role::Space(n)), WHITE),
+                contrast(light_ink(Role::SpaceCalm(n)), WHITE),
+            );
+            assert!(
+                calm * 1.2 <= base,
+                "calm space {n} is {calm:.2} beside {base:.2}"
+            );
+            let floor = if LIGHT_CALM_UNDER_TEXT.contains(&n) {
+                3.0
+            } else {
+                4.5
+            };
+            assert!(calm >= floor, "calm space {n} is {calm:.2}:1 on white");
         }
         let states = [
             Role::Working,
@@ -831,9 +910,23 @@ mod tests {
             Role::Focused,
             Role::Detail,
             Role::Faint,
-        ] {
+        ]
+        .into_iter()
+        .chain((0..SPACE_CALM_INKS.len()).map(Role::SpaceCalm))
+        {
             let ratio = contrast(dark_ink(role), BLACK);
             assert!(ratio >= 4.5, "{role:?} is {ratio:.2}:1 on black");
+        }
+        // Quieter is the point of the calm step: on black it sits clearly under its base.
+        for n in 0..SPACE_INKS.len() {
+            let (base, calm) = (
+                contrast(dark_ink(Role::Space(n)), BLACK),
+                contrast(dark_ink(Role::SpaceCalm(n)), BLACK),
+            );
+            assert!(
+                calm * 1.3 <= base,
+                "calm space {n} is {calm:.2} beside {base:.2}"
+            );
         }
         let found = [
             Role::Working,
@@ -886,13 +979,18 @@ mod tests {
         assert_eq!(distinct.len(), states.len(), "two states share an ink");
         taken.push(LIGHT_TAB_ON_FG);
         let sweep: Vec<u8> = (1..=9).map(|n| light_ink(Role::Shimmer(n))).collect();
-        for space in LIGHT_SPACE_INKS {
+        for space in LIGHT_SPACE_INKS.into_iter().chain(LIGHT_SPACE_CALM_INKS) {
             assert!(
                 !taken.contains(&space),
                 "space {space} already means something"
             );
             assert!(!sweep.contains(&space), "space {space} is a sweep step");
         }
+        let mut wheel = LIGHT_SPACE_INKS.to_vec();
+        wheel.extend(LIGHT_SPACE_CALM_INKS);
+        wheel.sort_unstable();
+        wheel.dedup();
+        assert_eq!(wheel.len(), 12, "two light space steps share an ink");
         assert!(!sweep.contains(&LIGHT_TAB_ON_FG));
     }
 

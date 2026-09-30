@@ -202,8 +202,6 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
         ],
         KeyContext::Sidebar => &[
             ("click", Some("open"), 1),
-            // The top of a space's line folds it: there is no arrow any more.
-            ("line", Some("fold"), 2),
             ("drag edge", Some("resize"), 7),
             ("ctrl-a:", None, 0),
             ("g", Some("tree/priority"), 3),
@@ -2292,7 +2290,7 @@ mod tests {
     }
 
     /// The overlay stamps the pet itself: cursor moves plus art rows, in the
-    /// pet's own inks, at the right of the foot's first three rows.
+    /// pet's own inks, at the right of the foot's first five rows.
     #[test]
     fn the_overlay_stamps_the_pet_above_the_foot() {
         let pet = sky_pet();
@@ -2303,12 +2301,12 @@ mod tests {
         assert!(out.starts_with(&at(rows[0], col)), "{out:?}");
         assert!(out.contains(&at(rows[1], col)), "{out:?}");
         assert!(out.contains("\x1b[38;5;39m"), "hair ink: {out:?}");
-        assert!(out.contains("\x1b[38;5;33m"), "body ink: {out:?}");
-        // Three rows of braille dots, the pet's own width, stamped byte for byte.
+        assert!(out.contains("\x1b[48;5;33m"), "body ink: {out:?}");
+        // Five rows of half blocks, the pet's own width, stamped byte for byte.
         for row in &art {
             assert!(out.contains(row.as_str()), "{out:?}");
         }
-        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows.len(), qoro_runtime::avatar::ART_ROWS, "{rows:?}");
     }
 
     /// Folded, narrow, short, colourless, or petless: no overlay bytes at all.
@@ -3100,7 +3098,7 @@ mod tests {
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
-            cols: 40,
+            cols: 50,
             lines: 5,
             message: None,
             hint: None,
@@ -3133,7 +3131,7 @@ mod tests {
         // chrome around it resets after every piece it paints, so the pane's own run
         // starts at one of those resets; which rule glyph precedes it depends on whether
         // the panel drew a separator on that row, and that is not what is being tested.
-        let (pane_cols, _) = pane_size(40, 5);
+        let (pane_cols, _) = pane_size(50, 5);
         let pane = painted
             .split(theme::RESET)
             .map(|after| after.split('\x1b').next().unwrap_or_default())
@@ -4773,7 +4771,7 @@ mod tests {
             .map(|l| l.text.trim_end().to_string())
             .collect();
         // Under the title: the next row above it names one of the same agents. Each
-        // agent's row opens with the space's line, then its two-cell state mark
+        // agent's row opens with a blank, then its two-cell state mark
         // (braille U+2800..=U+28FF), whatever state it is in, straight into the name
         // with no space.
         assert_eq!(
@@ -4781,17 +4779,16 @@ mod tests {
                 .iter()
                 .skip_while(|t| !t.starts_with(" agents"))
                 .filter(|t| {
-                    t.strip_prefix(['\u{2846}', '\u{2847}', '\u{28c7}'])
-                        .is_some_and(|rest| {
-                            rest.chars()
-                                .next()
-                                .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-                                && rest
-                                    .trim_start_matches(|c: char| {
-                                        ('\u{2800}'..='\u{28ff}').contains(&c)
-                                    })
-                                    .starts_with("claude")
-                        })
+                    t.strip_prefix(' ').is_some_and(|rest| {
+                        rest.chars()
+                            .next()
+                            .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                            && rest
+                                .trim_start_matches(|c: char| {
+                                    ('\u{2800}'..='\u{28ff}').contains(&c)
+                                })
+                                .starts_with("claude")
+                    })
                 })
                 .count(),
             9,

@@ -235,11 +235,16 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .collect()
 }
 
-/// Whether `line` is a space's rule: it opens with the top of the space's own line, in
-/// column zero, with the name straight after it. There is no fold arrow any more: `ctrl-a
-/// f` folds, and so does a click on this same column.
+/// Whether `line` is a space's rule: one blank, then the name straight after it, where an
+/// agent's row has its braille mark. Two other rows also open with a blank and something
+/// that is neither: the foot's thick logo, whose rows open with a dot (`●`), and its menu
+/// row, which opens with the version and ends in the menu's mark. Neither is a rule. There
+/// is no fold arrow: `ctrl-a f` folds, and so does a click on the blank before the name.
 fn is_rule_line(line: &str) -> bool {
-    line.starts_with('\u{2846}')
+    line.strip_prefix(' ')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c != ' ' && c != '\u{25cf}' && !('\u{2800}'..='\u{28ff}').contains(&c))
+        && !line.trim_end().ends_with('\u{ab}')
 }
 
 /// A row inside a space's box with the box's sides blanked, column for column, so what it
@@ -720,8 +725,8 @@ impl Interface {
 
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
-    /// Found by its shape rather than by arithmetic: a rule opens with its fold arrow (or
-    /// the dot of an empty space), and agents move the rules down as they come and go.
+    /// Found by its shape rather than by arithmetic: a rule opens with a blank and the
+    /// space's name, and agents move the rules down as they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
@@ -961,23 +966,19 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         ui.tab_bar()
     );
     // The panel lists agents only: a plain shell is a tab, not an agent, so it never
-    // gets a row there, and the space's rule opens with its line and the name straight
+    // gets a row there, and the space's rule opens with a blank and the name straight
     // after, holding nothing to fold.
     assert!(
-        ui.wait_for_agents(
-            |row| row.starts_with("\u{2846}default"),
-            Duration::from_secs(10)
-        ),
+        ui.wait_for_agents(|row| row.starts_with(" default"), Duration::from_secs(10)),
         "the empty space is not an open rule first: {:?}",
         agents_panel(&ui.screen)
     );
     let list = agents_panel(&ui.screen);
     assert!(
-        // No row drew for the shell, or for anything else: the space holds nothing
-        // an agents-only panel lists, so every row under the rule is blank.
-        !list
-            .iter()
-            .any(|row| row.starts_with("   ") && !row.trim().is_empty()),
+        // No row drew for the shell, or for anything else: the space holds nothing an
+        // agents-only panel lists, so no row under the rule is an agent's (every agent
+        // draws a `└` row under its name).
+        !list.iter().any(|row| row.contains('\u{2514}')),
         "a plain shell is listed as an agent: {list:?}"
     );
     // And the terminal itself is being drawn: the shell's own output reaches the pane.
@@ -2148,19 +2149,18 @@ fn radar_tree_order_holds_creation_order() {
         .expect("chmod");
     }
 
-    // A state row opens with its space's line, then its two-cell braille mark
-    // straight into the program name, with no space between them; a place row
-    // (`└ claude · ...`) never does, so this pins the match to the state row alone.
+    // A state row opens with a blank, then its two-cell braille mark straight into
+    // the program name, with no space between them; a place row (`└ claude · ...`)
+    // never does, so this pins the match to the state row alone.
     fn is_state_row(line: &str, program: &str) -> bool {
-        line.strip_prefix(['\u{2847}', '\u{28c7}'])
-            .is_some_and(|rest| {
-                rest.chars()
-                    .next()
-                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-                    && rest
-                        .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
-                        .starts_with(program)
-            })
+        line.strip_prefix(' ').is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                && rest
+                    .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+                    .starts_with(program)
+        })
     }
 
     ui.type_in(format!("{}\n", dir.join("claude").display()).as_bytes());
@@ -2236,26 +2236,30 @@ fn radar_dragging_the_divider_resizes_the_panel() {
         rule_at(ui) == Some(want)
     }
 
-    assert_eq!(rule_at(&ui), Some(30), "the panel does not start at 30");
+    // The default width, and the one based column of the divider after it.
+    let w = qoro_tui::sidebar::WIDTH;
+    let d = w as u16 + 1;
+    assert_eq!(rule_at(&ui), Some(w), "the panel does not start at {w}");
 
     // A motionless press and release: no-op, not even a refetch flicker.
-    ui.drag(31, 5, &[]);
+    ui.drag(d, 5, &[]);
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(rule_at(&ui), Some(30), "a motionless press moved the panel");
+    assert_eq!(rule_at(&ui), Some(w), "a motionless press moved the panel");
 
     // Pull right: the panel widens to the dragged column minus one. The
-    // first drag ends at width 34 (motion column 35), so the divider sits
-    // at 35 for the next press.
-    ui.drag(31, 5, &[33, 35]);
+    // first drag ends at width w + 4 (motion column d + 4), so the divider
+    // sits at d + 4 for the next press.
+    ui.drag(d, 5, &[d + 2, d + 4]);
     assert!(
-        wait_for_rule(&mut ui, 34),
-        "the panel did not widen to 34: {:?}",
+        wait_for_rule(&mut ui, w + 4),
+        "the panel did not widen to {}: {:?}",
+        w + 4,
         rule_at(&ui)
     );
 
     // Pull past the end: clamps at half the window, never further.
     let half = COLS as usize / 2;
-    ui.drag(35, 5, &[60, 90]);
+    ui.drag(d + 4, 5, &[60, 90]);
     assert!(
         wait_for_rule(&mut ui, half),
         "the panel did not clamp at {half}: {:?}",

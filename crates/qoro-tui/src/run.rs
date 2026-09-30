@@ -3697,9 +3697,11 @@ where
         // Read now, not zero: the first paint lands on the first loop turn,
         // and a click before it must still test a real clock.
         paint_now: sidebar::now_unix(),
-        sidebar_width: sidebar::WIDTH,
+        // The default, held to half the window the way a resize holds it, so a window
+        // under twice the default never opens with the column past the half-window rule.
+        sidebar_width: sidebar::opening_width(cols),
         sidebar_drag: None,
-        sidebar_sized: sidebar::WIDTH,
+        sidebar_sized: sidebar::opening_width(cols),
         palette: None,
         palette_pending: Vec::new(),
         menu_kind: MenuKind::Main,
@@ -8248,19 +8250,21 @@ mod tests {
     /// mark the divider also crosses.
     #[test]
     fn a_divider_drag_arms_only_on_the_divider() {
+        // The divider is the column after the default width, one based.
+        let d = sidebar::WIDTH as u16 + 1;
         let mut s = state();
         s.palette = None;
-        // Divider at width + 1, one based, rows 1 through lines - STATUS.
-        assert!(s.divider_press(31, 5));
-        assert!(s.divider_press(31, 22));
+        // Rows 1 through lines - STATUS.
+        assert!(s.divider_press(d, 5));
+        assert!(s.divider_press(d, 22));
         assert_eq!(s.sidebar_drag, Some(sidebar::WIDTH));
 
         // Pane, titles, and outside the painted rows: nothing arms.
         let mut s = state();
-        assert!(!s.divider_press(32, 5));
-        assert!(!s.divider_press(30, 5));
-        assert!(!s.divider_press(31, 0));
-        assert!(!s.divider_press(31, 23));
+        assert!(!s.divider_press(d + 1, 5));
+        assert!(!s.divider_press(d - 1, 5));
+        assert!(!s.divider_press(d, 0));
+        assert!(!s.divider_press(d, 23));
         assert_eq!(s.sidebar_drag, None);
 
         // Folded, overlaid, or too narrow to draw the column: nothing arms.
@@ -8269,10 +8273,10 @@ mod tests {
         assert!(!s.divider_press(5, 5));
         let mut s = state();
         s.menu = Some(0);
-        assert!(!s.divider_press(31, 5));
+        assert!(!s.divider_press(d, 5));
         let mut s = state();
         s.cols = 10;
-        assert!(!s.divider_press(31, 5));
+        assert!(!s.divider_press(d, 5));
     }
 
     /// Motions clamp to the sidebar range, latch past the pane, ignore
@@ -8280,9 +8284,11 @@ mod tests {
     /// reflow nothing.
     #[test]
     fn divider_motions_clamp_latch_and_report_movement() {
+        // The divider is the column after the default width, one based.
+        let d = sidebar::WIDTH as u16 + 1;
         let mut s = state();
         s.palette = None;
-        assert!(s.divider_press(31, 5));
+        assert!(s.divider_press(d, 5));
         // Pull left past the end: clamps, and says so.
         assert!(s.divider_motion(5, false));
         assert_eq!(s.sidebar_width, sidebar::SIDEBAR_MIN);
@@ -8306,12 +8312,14 @@ mod tests {
     /// nothing to finish.
     #[test]
     fn divider_release_reports_movement_only() {
+        // The divider is the column after the default width, one based.
+        let d = sidebar::WIDTH as u16 + 1;
         let mut s = state();
         s.palette = None;
         assert!(!s.finish_drag());
-        assert!(s.divider_press(31, 5));
+        assert!(s.divider_press(d, 5));
         assert!(!s.finish_drag(), "a motionless press moved nothing");
-        assert!(s.divider_press(31, 5));
+        assert!(s.divider_press(d, 5));
         assert!(s.divider_motion(40, false));
         assert!(s.finish_drag());
         assert!(s.sidebar_drag.is_none());

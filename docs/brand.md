@@ -29,8 +29,15 @@ States that are not in the palette keep their own inks: failed is magenta 201, i
 ### Space colours
 
 Six, from the families no state spends, in wheel order: violet 177, lime 191, cyan 87 (a
-lighter sky), pink 218, sky 117, yellow 228. On a light terminal: 92, 64, 30, 125, 24, 100.
+lighter sky), pink 218, sky 117, yellow 228. On a light terminal: 92, 58, 23, 125, 24, 94,
+every one at least 4.5 to 1 on white, since a space's colour is worn by its agents' titles.
 The two closest pairs (cyan and sky; lime and yellow) are never neighbours on the wheel.
+
+A calm agent's title (idle, done and read, asleep) wears a quieter step of its space's colour:
+134, 107, 73, 175, 67, 143 on a dark terminal, 98, 64, 29, 95, 27, 100 on a light one. Each is
+lighter on white, or darker on black, than its base. Lime and yellow on white are the two the
+palette cannot give at 4.5 to 1 once the base holds it (64 is 4.2, 100 is 3.8); the rest hold
+4.5.
 
 ## Logo
 
@@ -46,12 +53,30 @@ ground, or ground on cream.
 
 `brand/make.py` draws all of them (`uv run --no-project python docs/brand/make.py`).
 
-The terminal's foot draws the word in braille (`⣖⡆⣖⡆⡖⠀⣖⡆`), cream letters on the lower three
-dot rows of its row, and the q's tail as one ember dot (`⠁`) opening the row under it, right
-under the q's right column, with the version beside it. A terminal cell holds one colour, so
-the tail gets a cell of its own; the r's first dot shares its cell with the r's stem and
-stays cream there. The pet's name sits under the version, and the picked pet in dots at the
-right beside those three rows. Where braille is not drawn the foot says `● qoro` in ember.
+The terminal's foot draws the word in thick dots, the letters of `make.py` one `●` a cell
+with a blank cell between dots, so the gaps across and down read equal on a cell about half as
+wide as it is tall. Letters sit one empty dot apart and the q's tail hangs under the q's right
+column: four rows, twenty seven cells.
+
+```text
+● ● ●   ● ● ●   ● ●   ● ● ●
+●   ●   ●   ●   ●     ●   ●
+● ● ●   ● ● ●   ●     ● ● ●
+    ●
+```
+
+Every dot is cream but two in ember, as in the SVGs: the q's tail and the r's first dot. Each
+dot is a cell of its own, so both are exact. The last row of the column is the menu row: the
+version at the left, `menu «` at the right, and the word sits on the four rows right above it.
+The picked pet stands on the menu row at the right, five rows of half blocks with its feet on
+the row above the menu, and adds only a blank row above the word, so no word moves whatever
+the pet. The column opens thirty eight columns wide, which holds the word and the widest pet
+side by side (twenty nine hold the word alone).
+
+A column too narrow for that falls back to the word in braille (`⣖⡆⣖⡆⡖⠀⣖⡆`), cream letters on
+the lower three dot rows of its row, and the q's tail as one ember dot (`⠁`) alone on the row
+under it; there the r's first dot shares its cell with the r's stem and stays cream. Where
+braille is not drawn that small word is `● qoro` in ember.
 
 ## State marks
 
