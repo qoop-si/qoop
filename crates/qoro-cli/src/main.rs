@@ -2350,7 +2350,7 @@ fn explain_row(row: &qoro_runtime::control::AgentRow) -> String {
 }
 
 /// Start the daemon if there is not one, and wait for its socket.
-fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
     if std::os::unix::net::UnixStream::connect(socket).is_ok() {
         return Ok(());
     }
