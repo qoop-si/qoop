@@ -235,12 +235,11 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .collect()
 }
 
-/// Whether `line` is a space's rule: no line is drawn round a space any more, so a rule
-/// reads by its own leading shape alone, a fold arrow (or the dot of an empty space) one
-/// column in, then a space before the name.
+/// Whether `line` is a space's rule: it opens with the top of the space's own line, in
+/// column zero, with the name straight after it. There is no fold arrow any more: `ctrl-a
+/// f` folds, and so does a click on this same column.
 fn is_rule_line(line: &str) -> bool {
-    let mut chars = line.strip_prefix(' ').unwrap_or("").chars();
-    matches!(chars.next(), Some('\u{25be}' | '\u{25b8}' | '\u{b7}')) && chars.next() == Some(' ')
+    line.starts_with('\u{2846}')
 }
 
 /// A row inside a space's box with the box's sides blanked, column for column, so what it
@@ -962,11 +961,11 @@ fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() 
         ui.tab_bar()
     );
     // The panel lists agents only: a plain shell is a tab, not an agent, so it never
-    // gets a row there, and the space's rule holds nothing to fold, its middle dot
-    // saying so.
+    // gets a row there, and the space's rule opens with its line and the name straight
+    // after, holding nothing to fold.
     assert!(
         ui.wait_for_agents(
-            |row| row.starts_with(" \u{b7} default"),
+            |row| row.starts_with("\u{2846}default"),
             Duration::from_secs(10)
         ),
         "the empty space is not an open rule first: {:?}",
@@ -1937,7 +1936,7 @@ fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     // found, the tab reads as the wrapper, as it does in the tab bar.
     assert!(
         ui.wait_for_agents(
-            |line| line.contains("codex") && !line.starts_with(" \u{b7} "),
+            |line| line.contains("codex") && !is_rule_line(line),
             Duration::from_secs(20)
         ),
         "the agent behind the wrapper is not on the panel: {:?}\n{}",
@@ -2144,18 +2143,19 @@ fn radar_tree_order_holds_creation_order() {
         .expect("chmod");
     }
 
-    // A state row opens with its two-cell braille mark straight into the program
-    // name, with no space between them; a place row (`└ claude · ...`) never does,
-    // so this pins the match to the state row alone.
+    // A state row opens with its space's line, then its two-cell braille mark
+    // straight into the program name, with no space between them; a place row
+    // (`└ claude · ...`) never does, so this pins the match to the state row alone.
     fn is_state_row(line: &str, program: &str) -> bool {
-        line.strip_prefix(' ').is_some_and(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-                && rest
-                    .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
-                    .starts_with(program)
-        })
+        line.strip_prefix(['\u{2847}', '\u{28c7}'])
+            .is_some_and(|rest| {
+                rest.chars()
+                    .next()
+                    .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                    && rest
+                        .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+                        .starts_with(program)
+            })
     }
 
     ui.type_in(format!("{}\n", dir.join("claude").display()).as_bytes());

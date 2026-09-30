@@ -1107,7 +1107,7 @@ impl State {
         let hit = if self.collapsed {
             sidebar::rows_collapsed(&column, column_rows)
         } else {
-            // The paint reserves art rows above the foot when a pet is picked, so the
+            // The paint gives the foot the pet's rows when a pet is picked, so the
             // click maps onto the same layout it drew.
             sidebar::rows_folded(&column, column_rows, sidebar::current_avatar().as_ref())
         }

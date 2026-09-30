@@ -14,15 +14,18 @@ the same one, on the terminal you left: the same space, the same tab, the same p
 ```
  ⠯⠇claude                 12s │ 1 zsh  2 claude  +
  agents                 tree +│~/my-project $ cargo test
- ▾ my-project           1     │
- ⠯⠇claude                     │
- ▸ notes                      │
+⡆my-project (1)           z x │
+⡇⠯⠇claude                     │
+⣇  └ claude · my-project      │
+                              │
+⡆notes                        │
 terminal 2 is blocked
 ```
 
 The index says which space each agent is in and what it is doing: every space is its name
-with its agents under it (only agents: every tab is on the bar above the terminal), and
-`ctrl-a f` folds one away. An agent waiting for an answer is named in the one row at the
+with its agents under it (only agents: every tab is on the bar above the terminal), and a
+line of dots in the space's colour runs down beside them, so a space reads as one block.
+`ctrl-a f` folds one away, and so does a click on the top of its line. An agent waiting for an answer is named in the one row at the
 top, with a mark for each one waiting after it, and `ctrl-a tab`
 goes to it: wants first, then failed, then finished. It also lights its row and rings the
 bell, so you find out without looking, even when its space is folded. The name is the one
@@ -36,10 +39,11 @@ so a second click in the same place answers yes, and a `y` closes the space's ta
 the space. Neither control has a key of its own: `ctrl-a Z`
 sleeps the space you are in and `ctrl-a x` closes the tab you are on.
 
-Each agent wears a small square of nine dots in its state's colour. While it works the dots
-fill the ring and empty it again; when it stops they settle into a picture: an empty ring
-when it wants you, an X when it failed, the full square when it finished, one dot in the
-middle when it is idle. The shape says it as well as the colour, so it reads without colour
+Each agent wears a small square of nine dots in its state's colour. While it works the
+centre breathes: its arms come in clockwise and go back out, each breath starting one arm
+further round. When it stops the dots settle into a picture: an empty ring when it wants
+you, an X when it failed, the full square when it finished, one dot in the middle when it
+is idle, a line across the middle while its space sleeps. The shape says it as well as the colour, so it reads without colour
 too. A split tab draws a frame round its panes, with each pane's name on its top edge, and
 the pane the keyboard is in is drawn in its space's colour.
 

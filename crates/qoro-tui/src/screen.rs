@@ -202,7 +202,8 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
         ],
         KeyContext::Sidebar => &[
             ("click", Some("open"), 1),
-            ("\u{25b8}", Some("fold"), 2),
+            // The top of a space's line folds it: there is no arrow any more.
+            ("line", Some("fold"), 2),
             ("drag edge", Some("resize"), 7),
             ("ctrl-a:", None, 0),
             ("g", Some("tree/priority"), 3),
@@ -439,7 +440,7 @@ pub(crate) fn at(row: usize, col: usize) -> String {
     format!("\x1b[{row};{col}H")
 }
 
-/// The picked pet stamped above the foot of the column, as raw output.
+/// The picked pet stamped at the right of the column's foot, as raw output.
 ///
 /// Pure so tests stamp the same bytes the paint does: same fits gate, same
 /// rows, same escapes. Empty whenever the pet does not fit, the column is
@@ -461,11 +462,13 @@ pub(crate) fn avatar_overlay_paint(
     if !sidebar::avatar_fits(column_rows, sidebar_width, true) {
         return String::new();
     }
-    let art = sidebar::avatar_overlay(pet, colour);
+    let (cols, art) = sidebar::avatar_overlay(pet, colour);
     let rows = sidebar::avatar_overlay_rows(SIDEBAR_TOP, column_rows);
+    // At the right of the foot, one cell of margin before the column's edge.
+    let col = sidebar_width.saturating_sub(cols);
     let mut out = String::new();
     for (i, row) in art.iter().enumerate() {
-        out.push_str(&at(rows[i], 2));
+        out.push_str(&at(rows[i], col));
         out.push_str(row);
     }
     out
@@ -853,7 +856,7 @@ pub fn paint(frame: &Frame) -> String {
         }
     }
 
-    // The picked pet, as itself, on the reserved rows above the foot. An
+    // The picked pet, as itself, at the right of the foot's first rows. An
     // overlay like the picture notice: never grid, so the snapshot contract
     // (plain rows) holds for every gate and the whole corpus. Before the
     // floating overlays, so an open palette covers it the way it covers
@@ -2289,20 +2292,23 @@ mod tests {
     }
 
     /// The overlay stamps the pet itself: cursor moves plus art rows, in the
-    /// pet's own inks, directly above the foot.
+    /// pet's own inks, at the right of the foot's first three rows.
     #[test]
     fn the_overlay_stamps_the_pet_above_the_foot() {
         let pet = sky_pet();
+        let (cols, art) = sidebar::avatar_overlay(&pet, true);
+        let rows = sidebar::avatar_overlay_rows(SIDEBAR_TOP, 38);
+        let col = sidebar::WIDTH.saturating_sub(cols);
         let out = avatar_overlay_paint(38, sidebar::WIDTH, false, true, Some(&pet), true);
-        assert!(out.starts_with("\x1b[33;2H"), "{out:?}");
-        assert!(out.contains("\x1b[34;2H"), "{out:?}");
+        assert!(out.starts_with(&at(rows[0], col)), "{out:?}");
+        assert!(out.contains(&at(rows[1], col)), "{out:?}");
         assert!(out.contains("\x1b[38;5;39m"), "hair ink: {out:?}");
         assert!(out.contains("\x1b[38;5;33m"), "body ink: {out:?}");
-        assert!(out.contains("\x1b[38;5;16m"), "dark slits: {out:?}");
-        // Five rows of sixteen cells: half blocks where the pet is, spaces
-        // where it is not. Escapes carry no spaces, so the count is exact.
-        let cells = out.matches('\u{2580}').count() + out.matches(' ').count();
-        assert_eq!(cells, 5 * 16, "{out:?}");
+        // Three rows of braille dots, the pet's own width, stamped byte for byte.
+        for row in &art {
+            assert!(out.contains(row.as_str()), "{out:?}");
+        }
+        assert_eq!(rows.len(), 3, "{rows:?}");
     }
 
     /// Folded, narrow, short, colourless, or petless: no overlay bytes at all.
@@ -3943,8 +3949,8 @@ mod tests {
         // The still, two-cell mark a working row wears at frame zero, and the frame it
         // turns to at tick one: `cell_mark(Role::Working, true, tick)` in sidebar.rs is
         // the source of truth these are copied from.
-        let still = "\u{2809}\u{2803}";
-        let frame_one = "\u{2809}\u{2800}";
+        let still = "\u{2818}\u{2802}";
+        let frame_one = "\u{2818}\u{2800}";
         let first = paint_at(0);
         assert!(
             strip(&first).contains(still),
@@ -4767,23 +4773,25 @@ mod tests {
             .map(|l| l.text.trim_end().to_string())
             .collect();
         // Under the title: the next row above it names one of the same agents. Each
-        // agent's row opens with its two-cell state mark (braille U+2800..=U+28FF),
-        // whatever state it is in, straight into the name with no space.
+        // agent's row opens with the space's line, then its two-cell state mark
+        // (braille U+2800..=U+28FF), whatever state it is in, straight into the name
+        // with no space.
         assert_eq!(
             texts
                 .iter()
                 .skip_while(|t| !t.starts_with(" agents"))
                 .filter(|t| {
-                    t.strip_prefix(" ").is_some_and(|rest| {
-                        rest.chars()
-                            .next()
-                            .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-                            && rest
-                                .trim_start_matches(|c: char| {
-                                    ('\u{2800}'..='\u{28ff}').contains(&c)
-                                })
-                                .starts_with("claude")
-                    })
+                    t.strip_prefix(['\u{2846}', '\u{2847}', '\u{28c7}'])
+                        .is_some_and(|rest| {
+                            rest.chars()
+                                .next()
+                                .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                                && rest
+                                    .trim_start_matches(|c: char| {
+                                        ('\u{2800}'..='\u{28ff}').contains(&c)
+                                    })
+                                    .starts_with("claude")
+                        })
                 })
                 .count(),
             9,

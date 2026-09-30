@@ -83,22 +83,14 @@ pub fn space_of(id: i64) -> Role {
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
 ///
-/// Anchored in the product palette and ordered for maximum distance: every
-/// neighbour pair round the wheel and back sits at least 89 dE apart, against
-/// a 10-12 guideline for glanceable lists, and the closest two in the whole set
-/// are 37 apart. Measured in CIELAB over the 256 entries, with an L* floor near
-/// 55 and contrast 5+:1 on dark grounds (the old 27 blue failed both, at L* 46
-/// and 3.6:1 against STATUS_BG 233; the new floor is 5.3:1 on the same ground).
-/// The set leans blue-cyan (33, 51, 117) with lightness doing the telling apart.
-/// Order round the wheel:
-/// violet 135, cyan 51, azure 33, lime light 155, sky 117, yellow 226.
-/// 33 is the brighter step of the `0044D7` blue family (the anchor 26 is too dim);
-/// 226 carries the bonus `F7F245` yellow at a safe distance from lime. The two
-/// palette lime-yellows cannot both serve: `C7F245` and `F7F245` land 16 apart
-/// in 256, so the wheel spends 155 and 226 instead, same families, honest distance.
-/// A space ink always sits on the space name on the row below while a state sits
-/// on the first-row dot, so working-adjacent blues never compete for one slot.
-const SPACE_INKS: [u8; 6] = [135, 51, 33, 155, 117, 226];
+/// Drawn only from the product palette's families that no state spends: violet `5A00EB`,
+/// lime `C7F245`, pink `FF8FD9`, yellow `F7F245`, and lighter steps of sky `00BBFF`, each at a
+/// step that reads on a dark ground (violet 177, lime 191, cyan 87, pink 218, sky 117,
+/// yellow 228). Ordered so the two closest pairs (cyan and sky, 32 dE; lime and yellow, 23)
+/// are never neighbours on the wheel. The nearest a space comes to a state is violet to
+/// asleep (24) and sky to working (27): a space ink sits on the name and on the space's line,
+/// a state on the agent's mark, so they never share a cell.
+const SPACE_INKS: [u8; 6] = [177, 191, 87, 218, 117, 228];
 
 /// The colour a state earns, by name, for a caller that has the daemon's string.
 ///
@@ -126,7 +118,8 @@ pub fn of(state: &str) -> Role {
 /// The greys and the accent are the brand's own tokens, matched to the nearest entry in
 /// the 256 colour palette: text `FCF7F1` is 231 (entry 15 is the same white but
 /// belongs to the person, so 231 is the nearest legal one), focused stays 255,
-/// muted `#666666` is 241, and the accent is the logo orange: `#FF6600` is 202,
+/// muted `#666666` would be 241 but reads at 3.4:1 on black, so the faint text is one
+/// step up, 243 (4.6:1), and the accent is the logo orange: `#FF6600` is 202,
 /// and the palette's `FD4B03` lands on the same 202, so the mark renders exactly
 /// as it always has. The states keep their own hues, because a state is not
 /// brand: working `00BBFF` is 39, blocked `FF7700` is 208, done `00BB54` is 35,
@@ -149,7 +142,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Text => 231,
         Role::Focused => 255,
         Role::Detail => 245,
-        Role::Faint => 241,
+        Role::Faint => 243,
         Role::Rule => 237,
         Role::Brand => 202,
         Role::Working => 39,
@@ -422,9 +415,9 @@ const fn light_ink(role: Role) -> u8 {
     }
 }
 
-/// The identity wheel on white: the same six families, one step darker each (violet,
-/// teal, pure blue, olive green, deep sky, olive gold), so no space reads as a state.
-const LIGHT_SPACE_INKS: [u8; 6] = [92, 30, 20, 64, 24, 100];
+/// The identity wheel on white: the same six families, darker steps that read on white
+/// (violet, olive lime, teal, deep pink, deep sky, olive gold), so no space reads as a state.
+const LIGHT_SPACE_INKS: [u8; 6] = [92, 64, 30, 125, 24, 100];
 
 /// Raised backgrounds on white: the selected row a shade under the page, the status bar
 /// a shade lighter still, the same order of depth as the dark table.
@@ -708,18 +701,17 @@ mod tests {
     }
 
     /// Every space wears its own family: six slots, six families, so no two
-    /// projects ever share a hue family however the wheel turns. (Measured:
-    /// the closest pair in the set is 37 dE apart, neighbours 89+.)
+    /// projects ever share a hue family however the wheel turns.
     #[test]
     fn neighbouring_spaces_are_never_of_one_family() {
         fn family(ink: u8) -> &'static str {
             match ink {
-                135 => "violet",
-                51 => "cyan",
-                33 => "azure",
-                155 => "lime",
+                177 => "violet",
+                191 => "lime",
+                87 => "cyan",
+                218 => "pink",
                 117 => "sky",
-                226 => "yellow",
+                228 => "yellow",
                 _ => "other",
             }
         }
@@ -822,6 +814,42 @@ mod tests {
         for role in states {
             let ratio = contrast(light_ink(role), LIGHT_SELECTED_BG);
             assert!(ratio >= 3.0, "{role:?} on the selected row is {ratio:.2}:1");
+        }
+    }
+
+    /// The dark table, measured against black (16), the ground most dark terminals sit on:
+    /// the same floors as the light table, text at least 4.5 to 1, everything a person
+    /// finds rather than reads at least 3 to 1. Exempt by name: the rule, and unobserved,
+    /// the not yet seen agent, kept a step under idle's grey so the two stay apart (idle is
+    /// 242 at 4.0:1; there is no grey between it and 3:1 that still reads as quieter).
+    #[test]
+    fn every_dark_ink_reads_on_a_black_background() {
+        const BLACK: u8 = 16;
+        for role in [
+            Role::Title,
+            Role::Text,
+            Role::Focused,
+            Role::Detail,
+            Role::Faint,
+        ] {
+            let ratio = contrast(dark_ink(role), BLACK);
+            assert!(ratio >= 4.5, "{role:?} is {ratio:.2}:1 on black");
+        }
+        let found = [
+            Role::Working,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+            Role::Idle,
+            Role::Sleeping,
+            Role::Brand,
+        ]
+        .into_iter()
+        .chain((0..SPACE_INKS.len()).map(Role::Space))
+        .chain(avatar::HAIR_INKS.map(Role::AvatarHair));
+        for role in found {
+            let ratio = contrast(dark_ink(role), BLACK);
+            assert!(ratio >= 3.0, "{role:?} is {ratio:.2}:1 on black");
         }
     }
 

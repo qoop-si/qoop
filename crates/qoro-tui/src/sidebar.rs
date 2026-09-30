@@ -32,10 +32,10 @@ pub struct Line {
     /// colour, wherever a row names one.
     pub accent: Option<(usize, usize, crate::theme::Role)>,
     /// The row's opening sign: the state dot at the start of an agent's
-    /// row, or the fold arrow of a space rule, in the colour of the state it
+    /// row, or the top of a space's line, in the colour of the state it
     /// speaks for. Selection is the raised background the painter adds, never a mark.
     pub indicator: Option<(usize, usize, crate::theme::Role)>,
-    /// Any further runs: the dashes of a space rule, a count, a quiet worktree name, a
+    /// Any further runs: a space's count and controls, a quiet worktree name, a
     /// sweeping activity. The painter merges them with the two above by column; runs
     /// never overlap by construction. Still few per row: a row saying five things in
     /// five colours is a row a person parses rather than reads, so every run here is
@@ -99,13 +99,31 @@ pub const COLLAPSED: usize = 4;
 /// one place: a caller that drew its own titles would have to know how many rows this
 /// function had already spent on them.
 const SPACES_TITLE: &str = "agents";
-/// The columns before what a space holds: one, so an agent's mark sits under the space's
-/// arrow and every row of the column starts on the same line.
+/// The columns before what a space holds: one, the space's line, so an agent's mark sits
+/// under the space's name and every row of the column starts on the same line.
 const BOX_LEAD: usize = 1;
 
-/// The columns of a space's rule a click folds with: the space before the arrow, the arrow
-/// and the space after it. Anywhere else on the rule moves to the space.
-pub const FOLD_CELLS: usize = 3;
+/// The column a space's name starts in: right after the space's own line, and the column
+/// every agent's mark starts in, so the name lines up with the marks under it.
+pub const NAME_AT: usize = 1;
+
+/// The top of a space's line, drawn before its name: the left braille column from its second
+/// dot down, so the line starts halfway down the name's row.
+const LINE_TOP: char = '\u{2846}';
+/// The line beside every row of an open space: the whole left braille column.
+const LINE: char = '\u{2847}';
+/// The line's foot, beside the space's last row: the column and one dot out at the bottom.
+const LINE_FOOT: char = '\u{28c7}';
+
+/// The line's top, middle and foot as this terminal draws them: a plain bar where braille is
+/// not drawn (the kernel console, a dumb terminal), like the marks.
+fn line_glyphs() -> [char; 3] {
+    if crate::colorlevel::braille() {
+        [LINE_TOP, LINE, LINE_FOOT]
+    } else {
+        ['|'; 3]
+    }
+}
 
 /// The state dot at the start of an agent's first row: one leading space,
 /// then the dot. The dot says the state in the state's own colour, so no
@@ -136,10 +154,11 @@ fn dot_glyph(role: crate::theme::Role) -> char {
 /// colour, one picture per state.
 ///
 /// ```text
-/// working  fills the ring dot by dot, never closing it, and empties it again
+/// working  breathes: the centre with its arms coming in clockwise and going back out,
+///          each breath starting one arm further round
 /// wants    the empty ring          failed   an X
 /// done     the full square         idle     the centre dot
-/// sleeping a Z
+/// asleep   a line across the middle, an eye shut
 /// ```
 ///
 /// The dots that run while an agent works settle into its next state's picture, so the
@@ -173,26 +192,38 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         (0, 1),
     ];
     let dots: Vec<(usize, usize)> = match role {
-        Role::Working => {
-            // Twelve frames: one to seven dots round the ring, then back down to two. Never
-            // all eight: the closed ring is what waiting looks like, and the two must differ
-            // in shape, not only in colour. Still, it is half full, which reads as under way
-            // without moving.
-            let n = if working && tick > 0 {
-                let k = (tick % 12) as usize;
-                if k < 7 { k + 1 } else { 13 - k }
-            } else {
-                4
-            };
-            RING[..n].to_vec()
-        }
+        Role::Working => breath(if working { tick } else { 0 }),
         Role::Blocked => RING.to_vec(),
         Role::Failed => vec![(0, 0), (2, 0), (1, 1), (0, 2), (2, 2)],
         Role::Done => (0..3).flat_map(|y| (0..3).map(move |x| (x, y))).collect(),
-        Role::Sleeping => vec![(0, 0), (1, 0), (2, 0), (1, 1), (0, 2), (1, 2), (2, 2)],
+        Role::Sleeping => vec![(0, 1), (1, 1), (2, 1)],
         _ => vec![(1, 1)],
     };
     braille_pair(&dots)
+}
+
+/// A working agent's breath at animation frame `tick`: the centre, and the plus's arms
+/// coming in clockwise from a start arm and going back out the same way.
+///
+/// Each breath is eight frames (the start arm alone twice, then one arm more at a time to
+/// the full plus, held, then back), and the next breath starts one arm further clockwise,
+/// so the loop is thirty two frames and never sits at the top. A frame lasts two of the
+/// column's ticks, so a breath takes about 1.3 seconds. Frame zero, the still column, is the
+/// start arm and the one after it. No frame is another state's picture: the centre is never
+/// alone (idle), and left and right are never lit without top or bottom (asleep).
+fn breath(tick: u64) -> Vec<(usize, usize)> {
+    // The arms clockwise from the top.
+    const ARM: [(usize, usize); 4] = [(1, 0), (2, 1), (1, 2), (0, 1)];
+    // How many arms are in at each frame of one breath.
+    const DEPTH: [usize; 8] = [1, 1, 2, 3, 4, 4, 3, 2];
+    if tick == 0 {
+        return vec![(1, 1), ARM[0], ARM[1]];
+    }
+    let frame = (tick / 2) as usize % 32;
+    let base = frame / 8;
+    let mut dots = vec![(1, 1)];
+    dots.extend((0..DEPTH[frame % 8]).map(|i| ARM[(base + i) % 4]));
+    dots
 }
 
 /// Two braille cells holding dots at `(column, row)` of a four by four grid.
@@ -222,8 +253,8 @@ const UNNAMED: &str = "agent";
 /// One answer per row. The rows that do two things answer with the row, and the
 /// column a click landed on decides which, through [`act`]: a space rule folds at its
 /// arrow and moves to the space anywhere else, the title flips the order at its word and
-/// makes a space at its `+`, the foot opens the menu at its word and folds the column
-/// anywhere else.
+/// makes a space at its `+`, the foot's menu row opens the menu at its word and folds the
+/// column anywhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Space(i64),
@@ -514,13 +545,13 @@ type Row = (Line, Option<Hit>);
 /// Whether a row wants a person: blocked, failed, or finished while nobody looked.
 ///
 /// One answer for every place that asks: the queue behind the next row, the colour of a
-/// folded space's arrow, and the status line's triage.
+/// folded space's line, and the status line's triage.
 pub fn needs_person(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
     matches!(agent.state.as_str(), "blocked" | "failed") || is_new(agent, focused, seen, unseen)
 }
 
 /// The most urgent row among `rows` that wants a person, the first one on a tie: blocked,
-/// then failed, then finished while nobody looked. One answer for a folded space's arrow
+/// then failed, then finished while nobody looked. One answer for a folded space's line
 /// and the strip.
 pub fn most_urgent<'a>(
     rows: impl IntoIterator<Item = &'a AgentRow>,
@@ -581,14 +612,12 @@ pub(crate) fn rows_folded(
     if height == 0 {
         return Vec::new();
     }
-    // The foot and the pet over it are taken first, so the list above is laid out in the
+    // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
-    let pet = if pet_shown(c, height, avatar.is_some()) {
-        qoro_runtime::avatar::ART_ROWS
-    } else {
-        0
-    };
-    let room = height - 1 - pet;
+    let pet = pet_shown(c, height, avatar.is_some());
+    // A column shorter than the foot keeps the foot's first rows.
+    let foot = if pet { PET_FOOT_ROWS } else { FOOT_ROWS }.min(height);
+    let room = height - foot;
     let mut out: Vec<Row> = Vec::with_capacity(height);
     if next_rows(room) > 0 {
         out.push(next_row(c));
@@ -598,28 +627,27 @@ pub(crate) fn rows_folded(
     }
     let body = room - out.len();
     out.extend(window(content(c), body, c, c.width));
-    for _ in 0..pet {
-        out.push(blank(c.width));
-    }
-    out.push(collapse_row_with(
-        false,
-        c.width,
-        avatar,
-        update_available().as_deref(),
-    ));
+    out.extend(
+        foot_rows(c.width, avatar, pet, update_available().as_deref())
+            .into_iter()
+            .take(foot),
+    );
     out
 }
 
-/// Whether the pet stands over the foot: it fits the column, and the whole list still fits
+/// Whether the pet stands in the foot: it fits the column, and the whole list still fits
 /// above it. The pet is decoration and the list is not: when the agents need the rows,
 /// the pet gives them up rather than push anyone off the column.
 /// The column and the painter ask this one question, so the art never lands on a row the
 /// list was given.
 pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
-    if !avatar_fits(height, c.width, present) {
+    // The pet is dots in its own inks: without either, the two-row foot names it instead.
+    let drawn = crate::colorlevel::braille()
+        && crate::colorlevel::level() != crate::colorlevel::Level::Mono;
+    if !drawn || !avatar_fits(height, c.width, present) {
         return false;
     }
-    let room = height - 1 - qoro_runtime::avatar::ART_ROWS;
+    let room = height - PET_FOOT_ROWS;
     next_rows(room) + 1 + content(c).len() <= room
 }
 
@@ -928,7 +956,9 @@ fn content(c: &Column) -> Vec<Row> {
                     .collect();
                 let open = !c.shut.contains(&space.id);
                 out.push((rule(c, space, &tabs, open), Some(Hit::Space(space.id))));
-                // The rows are laid out for the space's inside, one column in from each edge.
+                // The rows are laid out for the space's inside, one column in from each edge,
+                // and gathered so the space's line can run down beside them.
+                let first = out.len();
                 let inside = Column {
                     width: box_inside(c.width),
                     ..*c
@@ -954,6 +984,12 @@ fn content(c: &Column) -> Vec<Row> {
                         ));
                     }
                 }
+                let ink = if space.asleep {
+                    crate::theme::Role::Sleeping
+                } else {
+                    crate::theme::space_of(space.id)
+                };
+                with_line(&mut out[first..], ink);
                 out.push((box_bottom(c.width), None));
             }
             // An agent in a space the client has not heard of yet still draws, under no
@@ -971,27 +1007,29 @@ fn content(c: &Column) -> Vec<Row> {
     out
 }
 
-/// A space as the top edge of its box: the fold arrow, the name, what it holds beside
-/// the name, and the two controls in fixed columns at the right, framed in the space's
-/// own colour.
+/// A space's own row: the top of its line, the name, what it holds beside the name, and the
+/// two controls in fixed columns at the right.
 ///
 /// ```text
-///  ▾ qoro (4)                z x
-///  ▾ qoro sleeping          z x
+/// ⡆qoro (4)                  z x
+/// ⡆qoro sleeping             z x
 /// ```
 ///
-/// The arrow sits right after the corner, so the name starts one column right of the
-/// dots below it, instead of two further right behind a dash and a space.
+/// The line starts halfway down the name's row, in the space's colour, and runs down beside
+/// the space's rows (see [`with_line`]), so a space reads as one block with no box round
+/// it. The name starts in the column the agents' marks start in. There is no fold arrow:
+/// `ctrl-a f` folds, and a click on the line's top does too.
 ///
 /// The name and the count beside it share one slot: the count while the space is awake,
 /// the word `sleeping` while it is not, and the word gives way before the name does,
 /// because a name is identity and a state is not. A sleeping space wears `Role::Sleeping`
 /// on its name and its rule, so the state is in the colour as well as the word.
 ///
-/// The two controls are [`Block`], in fixed columns at the right. Folded, the arrow and the
-/// name take the colour of the most urgent agent under them when that agent wants a person,
-/// so a fold never hides a blocked agent silently. Open, they stay grey: the agents are
-/// right there, wearing their own dots. Only agents colour it: a shell never wants a person.
+/// The two controls are [`Block`], in fixed columns at the right. Folded, the line's top,
+/// the count and the controls take the colour of the most urgent agent under them when that
+/// agent wants a person, so a fold never hides a blocked agent silently. Open, the line
+/// keeps the space's colour and the count stays grey: the agents are right there, wearing
+/// their own marks. Only agents colour it: a shell never wants a person.
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
     use crate::theme::Role;
     let width = c.width;
@@ -1007,13 +1045,6 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         space.sleeping.iter().filter(|t| t.agent.is_some()).count()
     } else {
         kids.len()
-    };
-    let arrow = if held == 0 {
-        '\u{b7}'
-    } else if open {
-        '\u{25be}'
-    } else {
-        '\u{25b8}'
     };
     // A sleeping space draws the toggle whenever it has tabs to wake, because nothing of
     // it is running and `z` is then the only way back with a mouse. An awake space draws
@@ -1053,15 +1084,15 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     // one), the fill between them, and the three block columns. The block therefore
     // starts at `width - 4` whatever the name and the slot are, and the last column is
     // left blank, as every row of this column already is.
-    let fill_at = FOLD_CELLS + name_w + slot_w;
+    let fill_at = NAME_AT + name_w + slot_w;
     let fill = width
         .saturating_sub(1)
         .saturating_sub(fill_at)
         .saturating_sub(BLOCK_W);
-    let mut runs = vec![(1, 1, ink), (fill_at, fill, ink)];
+    let mut runs = vec![(fill_at, fill, ink)];
     if !slot.is_empty() {
         runs.push((
-            FOLD_CELLS + name_w,
+            NAME_AT + name_w,
             slot_w,
             if space.asleep { Role::Sleeping } else { mark },
         ));
@@ -1082,12 +1113,15 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         };
         runs.push((at, w, role));
     }
-    let text = format!(" {arrow} {name}{slot}{}{}", " ".repeat(fill), block.text());
+    let [top, _, _] = line_glyphs();
+    let text = format!("{top}{name}{slot}{}{}", " ".repeat(fill), block.text());
     Line {
         text: fit(&text, width),
         colour: None,
-        accent: Some((FOLD_CELLS, name_w, ink)),
-        indicator: Some((FOLD_CELLS - 2, 1, mark)),
+        accent: Some((NAME_AT, name_w, ink)),
+        // The line wears the space's colour, or, folded, the colour of the agent under it
+        // that most wants a person, so a fold never hides one silently.
+        indicator: Some((0, 1, hot.unwrap_or(ink))),
         runs,
     }
 }
@@ -1110,7 +1144,7 @@ const BLOCK_W: usize = 3;
 /// Everything on the row that is neither the name, the slot nor the fill: the fold
 /// cells, the block, and the blank last column the block leaves. A name gets what is
 /// left of the width once these are paid for.
-const BLOCK_TAIL: usize = FOLD_CELLS + BLOCK_W + 1;
+const BLOCK_TAIL: usize = NAME_AT + BLOCK_W + 1;
 
 /// The columns a name has once the slot beside it is paid for, which is what decides
 /// whether the word `sleeping` fits or the count stays.
@@ -1188,7 +1222,7 @@ fn block(width: usize, closable: bool, can_sleep: bool) -> Block {
 }
 
 /// A row of a space: `line`, laid out for the space's inside, one column in from each
-/// edge, so its mark lines up under the space's arrow and its name under the space's name.
+/// edge, so its mark lines up under the space's name, beside the space's line.
 fn boxed(line: Line, width: usize) -> Line {
     let shift = |(at, w, role)| (at + BOX_LEAD, w, role);
     let runs = line.runs.into_iter().map(shift).collect();
@@ -1199,6 +1233,19 @@ fn boxed(line: Line, width: usize) -> Line {
         accent: line.accent.map(shift),
         indicator: line.indicator.map(shift),
         runs,
+    }
+}
+
+/// Draw a space's line down the first column of its rows: the whole column beside each one,
+/// its foot beside the last. A folded space has no rows and so no line under its top.
+fn with_line(rows: &mut [Row], ink: crate::theme::Role) {
+    let last = rows.len().saturating_sub(1);
+    let [_, middle, foot] = line_glyphs();
+    for (i, (line, _)) in rows.iter_mut().enumerate() {
+        let glyph = if i == last { foot } else { middle };
+        let rest: String = line.text.chars().skip(1).collect();
+        line.text = format!("{glyph}{rest}");
+        line.runs.push((0, 1, ink));
     }
 }
 
@@ -1695,7 +1742,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             // every cell of it moves to the space.
             let folds = !collapsed
                 && c.view == View::Tree
-                && col <= FOLD_CELLS
+                && col <= NAME_AT
                 && (c.agents.iter().any(|a| a.agent && a.workspace == id)
                     || c.spaces
                         .iter()
@@ -1801,7 +1848,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
     }
     // Scrolled like the open column, so a long fleet keeps the keyboard's row reachable.
     let mut out = window(content, height - 1, c, COLLAPSED);
-    out.push(collapse_row(true, COLLAPSED));
+    out.push(collapse_row());
     out
 }
 /// What the first row names: the agent's own conversation title, and only
@@ -1907,13 +1954,15 @@ fn strip_space(n: usize) -> String {
     format!("{text}{}", " ".repeat(pad))
 }
 
-/// The row that folds the column away, and unfolds it again.
-fn collapse_row(collapsed: bool, width: usize) -> (Line, Option<Hit>) {
-    collapse_row_with(
-        collapsed,
-        width,
-        current_avatar().as_ref(),
-        update_available().as_deref(),
+/// The strip's one row: the mark that unfolds the column again.
+fn collapse_row() -> Row {
+    (
+        Line {
+            text: format!("{}\u{bb} ", " ".repeat(COLLAPSED.saturating_sub(2))),
+            colour: Some(crate::theme::Role::Faint),
+            ..Line::default()
+        },
+        Some(Hit::Foot),
     )
 }
 
@@ -1956,177 +2005,209 @@ pub(crate) fn current_avatar() -> Option<qoro_runtime::avatar::Avatar> {
     FILES.read().unwrap_or_else(|e| e.into_inner()).0.clone()
 }
 
-/// Whether the pet itself fits above the foot: open column, wide enough for
-/// sixteen art columns plus a margin each side, tall enough that five art
-/// rows still leave six rows of list.
+/// Whether the pet itself fits in the foot: open column, wide enough for the logo and the
+/// widest pet beside it with a margin each side, tall enough that the foot still leaves six
+/// rows of list.
 pub(crate) fn avatar_fits(height: usize, width: usize, present: bool) -> bool {
-    present
-        && width >= qoro_runtime::avatar::ART_COLS + 2
-        && height >= qoro_runtime::avatar::ART_ROWS + 7
+    present && width >= LOGO_COLS + PET_COLS + 3 && height >= PET_FOOT_ROWS + 6
 }
 
-/// The pet as itself: five pre-escaped half-block rows, sixteen columns each,
-/// for the overlay to stamp above the foot. Empty without colour, because dots
-/// and name already say it then.
-pub(crate) fn avatar_overlay(avatar: &qoro_runtime::avatar::Avatar, colour: bool) -> Vec<String> {
-    if !colour {
-        return Vec::new();
+/// The rows the foot of the open column takes: the logo, then the version under it.
+pub(crate) const FOOT_ROWS: usize = 2;
+/// The pet in the foot, in dots: at most eight cells, and three rows for its ten pixels.
+pub(crate) const PET_ROWS: usize = 3;
+pub(crate) const PET_COLS: usize = 8;
+/// The foot with the pet in it: logo, version and the pet's name beside the pet's three rows,
+/// then the menu on a row of its own.
+pub(crate) const PET_FOOT_ROWS: usize = PET_ROWS + 1;
+/// The logo's cells, two a letter.
+const LOGO_COLS: usize = 8;
+
+/// The pet in dots: its sixteen by ten pixels drawn in braille, two pixels across and four
+/// down a cell, three rows cut to the cells any row lights, pre-escaped for the overlay to
+/// stamp at the right of the foot, with its width in cells. A cell holds one colour, so it
+/// wears the ink most of its lit pixels have; the eyes are left unlit, so the face reads as
+/// holes in the dots. Empty without colour, because the name in the foot says it then.
+pub(crate) fn avatar_overlay(
+    avatar: &qoro_runtime::avatar::Avatar,
+    colour: bool,
+) -> (usize, Vec<String>) {
+    if !colour || !crate::colorlevel::braille() {
+        return (0, Vec::new());
     }
-    use qoro_runtime::avatar::{ART_COLS, art_cells};
-    art_cells(avatar)
+    use qoro_runtime::avatar::{ART_COLS, ART_ROWS, eye_rects, pixel};
+    const BIT: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let (_, eye) = eye_rects(&avatar.eyes);
+    let (w, h) = (ART_COLS as i32, (ART_ROWS * 2) as i32);
+    let cells: Vec<Vec<(Option<u8>, u32)>> = (0..PET_ROWS as i32)
+        .map(|cy| {
+            (0..PET_COLS as i32)
+                .map(|cx| {
+                    let mut bits = 0u32;
+                    let mut inks: Vec<u8> = Vec::new();
+                    for dy in 0..4 {
+                        for dx in 0..2 {
+                            let (x, y) = (cx * 2 + dx, cy * 4 + dy);
+                            if x >= w || y >= h {
+                                continue;
+                            }
+                            if let Some(ink) = pixel(avatar, x, y).filter(|ink| *ink != eye) {
+                                bits |= BIT[dy as usize][dx as usize];
+                                inks.push(ink);
+                            }
+                        }
+                    }
+                    let ink = inks
+                        .iter()
+                        .max_by_key(|a| inks.iter().filter(|b| b == a).count())
+                        .copied();
+                    (ink, bits)
+                })
+                .collect()
+        })
+        .collect();
+    let lit = |x: usize| cells.iter().any(|row| row[x].1 != 0);
+    let Some(lo) = (0..PET_COLS).find(|x| lit(*x)) else {
+        return (0, Vec::new());
+    };
+    let hi = (0..PET_COLS).rfind(|x| lit(*x)).unwrap_or(lo);
+    let rows = cells
         .iter()
         .map(|row| {
             let mut line = String::new();
-            let mut cur: (Option<u8>, Option<u8>) = (None, None);
-            for (top, bottom) in row.iter().take(ART_COLS) {
-                if *top != cur.0 {
-                    line.push_str(
-                        &top.map(|ink| qoro_runtime::avatar::fg(crate::theme::pet(ink)))
-                            .unwrap_or_else(|| "\x1b[39m".to_string()),
-                    );
-                    cur.0 = *top;
+            let mut cur: Option<u8> = None;
+            for (ink, bits) in &row[lo..=hi] {
+                if ink.is_some() && *ink != cur {
+                    line.push_str(&qoro_runtime::avatar::fg(crate::theme::pet(
+                        ink.unwrap_or(0),
+                    )));
+                    cur = *ink;
                 }
-                if *bottom != cur.1 {
-                    line.push_str(
-                        &bottom
-                            .map(|ink| qoro_runtime::avatar::bg(crate::theme::pet(ink)))
-                            .unwrap_or_else(|| "\x1b[49m".to_string()),
-                    );
-                    cur.1 = *bottom;
-                }
-                line.push(if top.is_some() || bottom.is_some() {
-                    '\u{2580}'
-                } else {
-                    ' '
-                });
+                line.push(char::from_u32(0x2800 + bits).unwrap_or(' '));
             }
             line.push_str("\x1b[0m");
             line
         })
-        .collect()
+        .collect();
+    (hi - lo + 1, rows)
 }
 
 /// Screen rows the overlay stamps, top first, for a column of `height` rows
 /// starting at `top`. Pure so the paint and the tests agree on arithmetic.
 pub(crate) fn avatar_overlay_rows(top: usize, height: usize) -> Vec<usize> {
-    (0..qoro_runtime::avatar::ART_ROWS)
-        .map(|i| top + height - 1 - qoro_runtime::avatar::ART_ROWS + i)
+    (0..PET_ROWS)
+        .map(|i| top + height - PET_FOOT_ROWS + i)
         .collect()
-}
-
-/// [`collapse_row`] with the avatar passed in, so tests can paint both feet
-/// without touching a home directory.
-/// `update` is what [`update_available`] said, passed in so a test can say it without
-/// writing the notice file every other paint in the process reads.
-fn collapse_row_with(
-    collapsed: bool,
-    width: usize,
-    avatar: Option<&qoro_runtime::avatar::Avatar>,
-    update: Option<&str>,
-) -> (Line, Option<Hit>) {
-    let width = if collapsed { COLLAPSED } else { width };
-    let mark = if collapsed { '\u{bb}' } else { '\u{ab}' };
-    if collapsed {
-        return (
-            Line {
-                text: format!("{}{mark} ", " ".repeat(width.saturating_sub(2))),
-                colour: Some(crate::theme::Role::Faint),
-                accent: None,
-                indicator: None,
-                runs: Vec::new(),
-            },
-            Some(Hit::Foot),
-        );
-    }
-    // The foot of the column says what this is and what version of it, the way a product
-    // signs its own window, and the fold mark sits at the far end of the same row rather
-    // than taking a row of its own: the column is worth more to a person as list than as
-    // furniture. When `qoro update --check` saw something newer, the row says where this
-    // build stands against it, so the update is found rather than remembered.
-    //
-    // The wordmark is the product's and keeps its orange whoever is at the keyboard. A
-    // picked avatar signs beside it with its two dots, hair beside body, then the pet's
-    // name, so the foot reads as the person's own pet at a glance. The product name and
-    // version stay put: a person reporting a bug still reads both off the same row.
-    // A narrow column drops the name first; the dots always fit.
-    let brand = format!(" {BRAND_MARK} {BRAND}");
-    let dots = match avatar {
-        Some(_) => format!("{BRAND_MARK}{BRAND_MARK} "),
-        None => String::new(),
-    };
-    let version = match update {
-        Some(new) => format!("{VERSION}>{new} "),
-        None => format!("{VERSION} "),
-    };
-    // `menu « ` closes the row: the way to everything that is not a space, a tab or an
-    // agent, then the fold mark. Both always fit, and so do the pet's dots. The version
-    // gives way before them, and the pet's name before the version.
-    let tail = format!("{MENU_LABEL} {mark} ");
-    let fixed =
-        crate::width::width(&brand) + 1 + crate::width::width(&dots) + crate::width::width(&tail);
-    let version = if fixed + crate::width::width(&version) <= width {
-        version
-    } else {
-        String::new()
-    };
-    let name = avatar
-        .as_ref()
-        .map(|found| found.name())
-        .unwrap_or_default();
-    let room = width.saturating_sub(fixed + crate::width::width(&version) + 1);
-    // A stub like `Moha…` reads as a smudge, so the name shows only when a word of it
-    // fits; the dots alone still say whose pet it is.
-    let shown = if name.is_empty() || room < 7 {
-        String::new()
-    } else if crate::width::width(&name) <= room {
-        name
-    } else {
-        let mut short = name;
-        while crate::width::width(&short) + 1 > room {
-            short.pop();
-        }
-        short.push('\u{2026}');
-        short
-    };
-    // The row is the wordmark, a space, the version, the pet's dots and name, the gap,
-    // then the menu, the fold mark and its own trailing space.
-    let mid = if shown.is_empty() {
-        format!("{version}{dots}")
-    } else {
-        format!("{version}{dots}{shown} ")
-    };
-    let gap = width.saturating_sub(
-        crate::width::width(&brand) + 1 + crate::width::width(&mid) + crate::width::width(&tail),
-    );
-    // The mark and the name together, so the accent reads as one wordmark rather than as
-    // a coloured bullet next to grey text.
-    let accent = Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand));
-    // Two inks need two runs, one per dot, right after the version.
-    let at = crate::width::width(&brand) + 1 + crate::width::width(&version);
-    let runs = match avatar {
-        Some(found) => vec![
-            (at, 1, crate::theme::Role::AvatarHair(found.hair_ink)),
-            (at + 1, 1, crate::theme::Role::AvatarBody(found.body_ink)),
-        ],
-        None => Vec::new(),
-    };
-    (
-        Line {
-            text: fit(&format!("{brand} {mid}{}{tail}", " ".repeat(gap)), width),
-            colour: Some(crate::theme::Role::Faint),
-            accent,
-            indicator: None,
-            runs,
-        },
-        Some(Hit::Foot),
-    )
 }
 
 /// The product's name, as it signs itself.
 const BRAND: &str = "qoro";
-/// The mark beside it. A filled dot, which every terminal font has, because a mark drawn
-/// from a glyph half of them lack is a mark that renders as a box on the other half.
+/// The dot beside the name where braille is not drawn.
 const BRAND_MARK: char = '\u{25cf}';
+
+/// The foot of the open column. With the pet in it, four rows: the logo, the version and
+/// the pet's name down the left, the pet at the right beside them (stamped by the overlay),
+/// then the menu on a row of its own. Without it, two: the logo with the menu at the right,
+/// then the version with the pet's name.
+///
+/// ```text
+/// ⠯⡇⠯⠇⠏⠀⠯⠇        ⢠⣤⣤⡄        ⠯⡇⠯⠇⠏⠀⠯⠇      menu «
+/// 0.4.0           ⢸⣛⣟⡃        0.4.0  Mohawk Pink
+/// Mohawk Pink     ⠈⠋⠙⠁
+///             menu «
+/// ```
+///
+/// The logo is the word of `docs/brand/` in braille, two cells a letter, the letters in the
+/// text colour and the q's right cell, its stem and its tail, in the brand ember (a terminal
+/// gives a cell one colour). Where braille is not drawn it is `● qoro` in ember. The menu's
+/// row answers a click the way the foot always has (the menu at its word, the fold
+/// elsewhere); the other rows are text and answer nothing.
+fn foot_rows(
+    width: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+    pet: bool,
+    update: Option<&str>,
+) -> Vec<Row> {
+    use crate::theme::Role;
+    let tail = format!("{MENU_LABEL} \u{ab} ");
+    let braille = crate::colorlevel::braille();
+    let logo = if braille {
+        "\u{282f}\u{2847}\u{282f}\u{2807}\u{280f}\u{2800}\u{282f}\u{2807}".to_string()
+    } else {
+        format!("{BRAND_MARK} {BRAND}")
+    };
+    let logo_w = crate::width::width(&logo);
+    let runs = if braille {
+        vec![
+            (1, 1, Role::Text),
+            (2, 1, Role::Brand),
+            (3, logo_w - 2, Role::Text),
+        ]
+    } else {
+        vec![(1, logo_w, Role::Brand)]
+    };
+    // Beside the pet the words stop short of it: its widest, a space before it and a margin.
+    let room = if pet {
+        width.saturating_sub(PET_COLS + 2)
+    } else {
+        width
+    };
+    let w = crate::width::width;
+    // A version cut short reads as another version, and a name cut short as a smudge: each
+    // shows whole or not at all.
+    let version = match update {
+        Some(new) if 1 + w(VERSION) + 1 + w(new) <= room => format!("{VERSION}>{new}"),
+        _ => VERSION.to_string(),
+    };
+    let name = avatar.map(|found| found.name()).unwrap_or_default();
+    let faint = |text: &str| Line {
+        text: fit(text, width),
+        colour: Some(Role::Faint),
+        ..Line::default()
+    };
+    // The menu closes the row it is on: `menu « ` flush right.
+    let menu = |lead: &str| {
+        let gap = width.saturating_sub(crate::width::width(lead) + crate::width::width(&tail));
+        fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width)
+    };
+    if pet {
+        let logo_row = Line {
+            text: fit(&format!(" {logo}"), width),
+            colour: Some(Role::Faint),
+            runs,
+            ..Line::default()
+        };
+        return vec![
+            (logo_row, None),
+            (faint(&format!(" {version}")), None),
+            (faint(&whole(format!(" {name}"), room)), None),
+            (faint(&menu("")), Some(Hit::Foot)),
+        ];
+    }
+    let top = Line {
+        text: menu(&format!(" {logo}")),
+        colour: Some(Role::Faint),
+        runs,
+        ..Line::default()
+    };
+    let under = whole(format!(" {version}  {name}"), room);
+    let under = if name.is_empty() || under.is_empty() {
+        format!(" {version}")
+    } else {
+        under
+    };
+    vec![(top, Some(Hit::Foot)), (faint(&under), None)]
+}
+
+/// `text` when it fits in `cols`, else nothing.
+fn whole(text: String, cols: usize) -> String {
+    if crate::width::width(&text) <= cols {
+        text
+    } else {
+        String::new()
+    }
+}
+
 /// Which build this is, read from the crate rather than written down twice.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -2762,9 +2843,9 @@ mod tests {
         }
         // The focused space and agent still draw their names, the agent under its
         // space's rule with the same mark every other idle agent wears.
-        assert!(texts.iter().any(|t| t.contains(" personal ")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("personal")), "{texts:?}");
         assert!(
-            texts.iter().any(|t| t == " \u{2810}\u{2800}codex"),
+            texts.iter().any(|t| t == "\u{2847}\u{2810}\u{2800}codex"),
             "{texts:?}"
         );
         // And hits still know which rows have the keyboard.
@@ -2785,18 +2866,15 @@ mod tests {
         let texts = unboxed(&lines);
         let head = texts
             .iter()
-            .position(|t| t == " \u{2809}\u{2803}claude")
+            .position(|t| t == "\u{2847}\u{2818}\u{2802}claude")
             .unwrap_or_else(|| panic!("{texts:?}"));
-        assert!(texts[head - 1].starts_with(" \u{25be} app "), "{texts:?}");
-        assert_eq!(texts[head + 1], "   \u{2514} claude", "{texts:?}");
+        assert!(texts[head - 1].starts_with("\u{2846}app"), "{texts:?}");
+        assert_eq!(texts[head + 1], "\u{28c7}  \u{2514} claude", "{texts:?}");
         // The tree lists agents only, so the space's plain shell tab draws no row: the
         // bottom of a space's box, an empty row before the next space starts, follows
         // straight after the agent's own two rows.
         assert!(texts[head + 2].is_empty(), "{texts:?}");
-        assert!(
-            texts[head + 3].starts_with(" \u{25be} personal "),
-            "{texts:?}"
-        );
+        assert!(texts[head + 3].starts_with("\u{2846}personal"), "{texts:?}");
         // No state word on the right: the mark says the state in its colour, three
         // columns in, under the space name the rule carries.
         assert_eq!(
@@ -2830,7 +2908,7 @@ mod tests {
         );
         let app = lines
             .iter()
-            .find(|l| l.text.starts_with(" \u{25be} app "))
+            .find(|l| l.text.starts_with("\u{2846}app"))
             .expect("the app rule");
         // The count is agents only: the shell in the same space does not add to it.
         assert!(app.text.contains("app (1)"), "{:?}", app.text);
@@ -2855,56 +2933,54 @@ mod tests {
             Some((BOX_LEAD, 2, crate::theme::of("working")))
         );
         // A rule has no state to have a colour about: it wears the space's own colour
-        // on the name, and its open arrow stays the rule's quiet grey.
+        // on the name, and its open line stays the space's own ink since nothing under
+        // it wants a person.
         let personal = lines
             .iter()
-            .find(|l| l.text.contains(" personal "))
+            .find(|l| l.text.contains("personal"))
             .expect("the personal rule");
         assert_eq!(personal.colour, None);
         assert_eq!(
             personal.accent,
-            Some((FOLD_CELLS, 8, crate::theme::space_of(2)))
+            Some((NAME_AT, 8, crate::theme::space_of(2)))
         );
-        assert_eq!(
-            personal.indicator,
-            Some((FOLD_CELLS - 2, 1, crate::theme::Role::Faint))
-        );
+        assert_eq!(personal.indicator, Some((0, 1, crate::theme::space_of(2))));
     }
 
-    /// Every space is one box: its top edge carries the fold arrow, the name, what it
-    /// holds beside the name, and the two controls in fixed columns at the right.
+    /// Every space is one box: its line's top carries the name, what it holds beside
+    /// the name, and the two controls in fixed columns at the right.
     #[test]
     fn every_space_draws_one_rule_with_its_arrow_count_and_block() {
         let (spaces, agents) = sample();
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
         let app = rule_row(&rows, 1);
-        assert_eq!(app.text, format!(" \u{25be} app (1){}z x ", " ".repeat(16)));
+        assert_eq!(app.text, format!("\u{2846}app (1){}z x ", " ".repeat(18)));
         assert_eq!(crate::width::width(&app.text), WIDTH);
 
         let ink = crate::theme::space_of(1);
-        // The corner, the dashes, the count, the corner of the dashes at the block, and
-        // the two controls. Every run inside the row, none of them overlapping.
+        // The count, its ink, and the two controls. Every run inside the row, none of
+        // them overlapping. There is no arrow run any more: the line's colour rides
+        // `indicator`, not `runs`.
         assert_eq!(
             app.runs,
             vec![
-                (1, 1, ink),
-                (10, 16, ink),
-                (6, 4, crate::theme::Role::Faint),
+                (8, 18, ink),
+                (4, 4, crate::theme::Role::Faint),
                 (WIDTH - 4, 1, crate::theme::Role::Faint),
                 (WIDTH - 2, 1, crate::theme::Role::Faint),
             ]
         );
-        // An empty space has nothing to fold, nothing to count and nothing running, so it
-        // draws a dot for the arrow, no slot, and a close with nothing beside it.
+        // An empty space has nothing to count and nothing running, so it draws no slot
+        // and a close with nothing beside it.
         let dub = rule_row(&rows, 3);
-        assert_eq!(dub.text, format!(" \u{b7} dub{}  x ", " ".repeat(20)));
+        assert_eq!(dub.text, format!("\u{2846}dub{}  x ", " ".repeat(22)));
         assert_eq!(crate::width::width(&dub.text), WIDTH);
 
-        // Folded, the arrow points right and the count stays.
+        // Folded, the line's top stays put and the count stays.
         let shut = Shut::from([1]);
         let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &shut);
         assert!(
-            rule_row(&rows, 1).text.starts_with(" \u{25b8} app (1)"),
+            rule_row(&rows, 1).text.starts_with("\u{2846}app (1)"),
             "{:?}",
             rule_row(&rows, 1).text
         );
@@ -2981,23 +3057,27 @@ mod tests {
                         Some(Hit::Terminal(_)) => above,
                         _ => Some(Hit::Terminal(3)),
                     };
-                    let next = text
-                        .strip_prefix(' ')
-                        .and_then(|t| t.chars().next())
-                        .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
-                        || text == " nothing needs you";
+                    // Never the foot: at height one there is no title above it yet to
+                    // set `in_tree`, and its logo (braille, not the plain word) also
+                    // opens with a space and a braille cell.
+                    let next = !text.ends_with('\u{ab}')
+                        && (text
+                            .strip_prefix(' ')
+                            .and_then(|t| t.chars().next())
+                            .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+                            || text == " nothing needs you");
                     let want = if !in_tree && next {
                         // The next row reaches the first of the queue, or nothing while
                         // nobody waits.
                         let queue = queue(&agents, 3, &Seen::new(), &Unseen::new());
                         Some(Hit::Next(queue.first().map(|a| a.terminal)))
-                    } else if text.trim_start().starts_with('\u{2514}') {
-                        second
-                    } else if in_tree
-                        && [" \u{25be} ", " \u{25b8} ", " \u{b7} "]
-                            .iter()
-                            .any(|p| text.starts_with(p))
+                    } else if text
+                        .trim_start_matches(['\u{2847}', '\u{28c7}'])
+                        .trim_start()
+                        .starts_with('\u{2514}')
                     {
+                        second
+                    } else if in_tree && text.starts_with('\u{2846}') {
                         // A space's top edge moves to the space it names: the name
                         // sits right after the arrow, with nothing but a word
                         // boundary (a space, or the row's own end) after it.
@@ -3023,12 +3103,16 @@ mod tests {
                         None
                     } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
                         Some(Hit::Title)
-                    } else if text.contains(BRAND) && text.ends_with('\u{ab}') {
+                    } else if (text.contains(BRAND) || text.contains(LOGO))
+                        && text.ends_with('\u{ab}')
+                    {
                         // The foot's one leading space would otherwise pass for a space's
-                        // box now that its own lead is one column too, so the brand is
-                        // named before the box is opened.
+                        // box now that its own lead is one column too, so the logo (or,
+                        // without braille, the brand) is named before the box is opened.
                         Some(Hit::Foot)
-                    } else if in_tree && let Some(inside) = text.strip_prefix(" ") {
+                    } else if in_tree
+                        && let Some(inside) = text.strip_prefix(['\u{2847}', '\u{28c7}'])
+                    {
                         // Inside a space: the row under an agent reaches that agent, the
                         // count of the rest reaches nothing, a shell reaches its tab, and
                         // an agent's row reaches the agent its name names.
@@ -3182,7 +3266,7 @@ mod tests {
                 .position(|(_, h)| *h == Some(Hit::Terminal(terminal)))
                 .expect("an agent row");
             assert_eq!(rows[at - 1].1, Some(Hit::Space(id)), "{terminal}");
-            assert_eq!(unbox(&rows[at].0.text), " \u{2810}\u{2800}opencode");
+            assert_eq!(unbox(&rows[at].0.text), "\u{2847}\u{2810}\u{2800}opencode");
         }
     }
 
@@ -3260,7 +3344,7 @@ mod tests {
         assert_eq!(
             texts
                 .iter()
-                .filter(|t| *t == " \u{2810}\u{2800}release")
+                .filter(|t| *t == "\u{2847}\u{2810}\u{2800}release")
                 .count(),
             2,
             "{texts:?}"
@@ -3312,7 +3396,7 @@ mod tests {
         a.agent_session = Some("abc123".to_string());
         let texts = agent_texts(&spaces, &[a], 1);
         assert!(
-            texts.iter().any(|t| t == " \u{2810}\u{2800}abc123"),
+            texts.iter().any(|t| t == "\u{2847}\u{2810}\u{2800}abc123"),
             "{texts:?}"
         );
         assert!(
@@ -3320,7 +3404,7 @@ mod tests {
             "the program leaked onto a reported session row: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t == "   \u{2514} release"),
+            texts.iter().any(|t| t == "\u{28c7}  \u{2514} release"),
             "the tab label is missing under the name: {texts:?}"
         );
     }
@@ -3370,7 +3454,7 @@ mod tests {
         let texts = agent_texts(&spaces, &[agent(1, 1, "codex", "idle")], 1);
         // No reported session, so the tab's own label answers behind the mark.
         assert!(
-            texts.iter().any(|t| t == " \u{2810}\u{2800}codex"),
+            texts.iter().any(|t| t == "\u{2847}\u{2810}\u{2800}codex"),
             "{texts:?}"
         );
     }
@@ -3458,14 +3542,18 @@ mod tests {
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
         assert!(
-            rule.text.starts_with(" \u{25be} \u{4e2d}\u{6587} (1)"),
+            rule.text.starts_with("\u{2846}\u{4e2d}\u{6587} (1)"),
             "{:?}",
             rule.text
         );
         assert_eq!(crate::width::width(&rule.text), WIDTH);
-        // The agent's row opens with the state mark and then the name.
+        // The agent's row opens with the space's line, then the state mark and the name.
         let row = tree_row(&rows, 1);
-        assert!(row.text.starts_with(" \u{2810}\u{2800}"), "{:?}", row.text);
+        assert!(
+            row.text.starts_with("\u{2847}\u{2810}\u{2800}"),
+            "{:?}",
+            row.text
+        );
         assert_eq!(crate::width::width(&row.text), WIDTH);
     }
 
@@ -3486,7 +3574,7 @@ mod tests {
         assert_eq!(crate::width::width(&row.text), WIDTH);
         assert_eq!(
             unbox(&row.text),
-            " \u{2810}\u{2800}claude",
+            "\u{2847}\u{2810}\u{2800}claude",
             "{:?}",
             row.text
         );
@@ -3600,37 +3688,60 @@ mod tests {
         // Nothing folds on its own: the working agent and the idle one both keep
         // their rows, each with its own state mark.
         assert!(
-            texts.iter().any(|t| t == " \u{2809}\u{2803}claude"),
+            texts.iter().any(|t| t == "\u{2847}\u{2818}\u{2802}claude"),
             "{texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t == " \u{2810}\u{2800}codex"),
+            texts.iter().any(|t| t == "\u{2847}\u{2810}\u{2800}codex"),
             "{texts:?}"
         );
     }
 
+    /// The braille rendering of the logo `foot_rows` draws in its top row, copied from
+    /// there so a test can look for it without touching a private constant.
+    const LOGO: &str = "\u{282f}\u{2847}\u{282f}\u{2807}\u{280f}\u{2800}\u{282f}\u{2807}";
+
     #[test]
-    fn the_foot_of_the_column_carries_the_mark_the_name_the_version_and_the_menu() {
-        let (line, hit) = collapse_row(false, WIDTH);
+    fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
+        let rows = foot_rows(WIDTH, None, false, None);
+        assert_eq!(rows.len(), 2, "the logo row and the version row");
+        let (top, hit) = &rows[0];
         assert_eq!(
-            crate::width::width(&line.text),
+            crate::width::width(&top.text),
             WIDTH,
             "the row has to fill the column exactly or the one under it shifts: {:?}",
-            line.text
+            top.text
         );
-        assert!(line.text.contains(BRAND), "{:?}", line.text);
-        assert!(line.text.contains(BRAND_MARK), "{:?}", line.text);
+        // Under braille the logo is drawn in dots, so the plain word is not on this row.
+        assert!(top.text.contains(LOGO), "{:?}", top.text);
         assert!(
-            line.text.contains(VERSION),
-            "a person reporting a bug has to be able to read the version off the screen: {:?}",
-            line.text
-        );
-        assert!(
-            line.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+            top.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
             "the menu and the fold mark close the row: {:?}",
-            line.text
+            top.text
         );
-        assert_eq!(hit, Some(Hit::Foot));
+        assert_eq!(*hit, Some(Hit::Foot));
+        // The logo's ring and tail wear the accent in `runs`; the row carries no
+        // accent field at all.
+        assert_eq!(top.accent, None);
+        assert!(
+            top.runs.contains(&(2, 1, crate::theme::Role::Brand)),
+            "{top:?}"
+        );
+        // The version is under the logo, on a row of its own that answers no click.
+        let (bottom, hit) = &rows[1];
+        assert_eq!(
+            crate::width::width(&bottom.text),
+            WIDTH,
+            "{:?}",
+            bottom.text
+        );
+        assert!(
+            bottom.text.contains(VERSION),
+            "a person reporting a bug has to be able to read the version off the screen: {:?}",
+            bottom.text
+        );
+        assert_eq!(*hit, None);
+
         // The word opens the menu and the rest of the row folds the column.
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
@@ -3651,24 +3762,19 @@ mod tests {
         assert_eq!(act(Hit::Foot, menu_at, &c, false), Some(Act::Menu));
         assert_eq!(act(Hit::Foot, WIDTH - 1, &c, false), Some(Act::Collapse));
         assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Collapse));
-        // The mark and the name wear the accent, and nothing else on the row does.
-        let (at, len, role) = line.accent.expect("a wordmark is accented");
-        assert_eq!(role, crate::theme::Role::Brand);
-        assert_eq!(run_text(&line, at, len), format!("{BRAND_MARK} {BRAND}"));
 
-        // Folded to a strip there is no room for a name, and the fold mark is the row.
-        let (strip, hit) = collapse_row(true, WIDTH);
+        // Folded to a strip there is no room for the logo, and the fold mark is the row.
+        let (strip, hit) = collapse_row();
         assert_eq!(crate::width::width(&strip.text), COLLAPSED);
         assert!(!strip.text.contains(BRAND));
         assert_eq!(hit, Some(Hit::Foot));
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
-    /// A picked avatar signs the foot beside the wordmark, never in its place: the
-    /// wordmark keeps its orange, the pet's two dots follow the version, hair beside
-    /// body, then its name when a word of it fits, and the fold mark stays put.
+    /// A picked avatar signs the version row with its name, when one is picked; the logo
+    /// row above carries no trace of it, since the pet no longer draws dots there.
     #[test]
-    fn a_picked_avatar_wears_its_two_inks_on_the_foot() {
+    fn a_picked_avatar_names_the_version_row() {
         let pet = qoro_runtime::avatar::Avatar {
             body: qoro_runtime::avatar::BODY.into(),
             hair: "mohawk".into(),
@@ -3676,54 +3782,26 @@ mod tests {
             hair_ink: 212,
             body_ink: 33,
         };
-        let (line, hit) = collapse_row_with(false, WIDTH, Some(&pet), None);
-        assert_eq!(
-            crate::width::width(&line.text),
-            WIDTH,
-            "the row has to fill the column exactly: {:?}",
-            line.text
-        );
-        assert!(
-            line.text.starts_with(&format!(
-                " {BRAND_MARK} {BRAND} {VERSION} {BRAND_MARK}{BRAND_MARK} "
-            )),
-            "{:?}",
-            line.text
-        );
-        assert!(
-            line.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
-            "{:?}",
-            line.text
-        );
-        assert_eq!(
-            line.accent,
-            Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand)),
-            "the wordmark stays the product's: {line:?}"
-        );
-        // ` ● qoro`, a space, the version and its space.
-        let at = 1 + crate::width::width(BRAND) + 2 + 1 + crate::width::width(VERSION) + 1;
-        assert_eq!(
-            line.runs,
-            vec![
-                (at, 1, crate::theme::Role::AvatarHair(212)),
-                (at + 1, 1, crate::theme::Role::AvatarBody(33)),
-            ],
-            "{line:?}"
-        );
-        assert_eq!(line.indicator, None);
-        // At thirty columns only a stub of the name would fit, so the dots stand alone;
-        // at the widest column it reads whole.
-        assert!(!line.text.contains("Moha"), "{:?}", line.text);
-        let (widest, _) = collapse_row_with(false, SIDEBAR_MAX, Some(&pet), None);
-        assert!(widest.text.contains("Mohawk Pink"), "{widest:?}");
-        assert_eq!(crate::width::width(&widest.text), SIDEBAR_MAX);
-        assert_eq!(hit, Some(Hit::Foot));
+        assert_eq!(pet.name(), "Mohawk Pink");
+        let rows = foot_rows(WIDTH, Some(&pet), false, None);
+        let (top, _) = &rows[0];
+        assert!(!top.text.contains("Mohawk"), "{top:?}");
+        let (bottom, hit) = &rows[1];
+        assert_eq!(crate::width::width(&bottom.text), WIDTH, "{bottom:?}");
+        assert!(bottom.text.contains(VERSION), "{bottom:?}");
+        assert!(bottom.text.contains("Mohawk Pink"), "{bottom:?}");
+        assert_eq!(*hit, None);
+
+        // Without a pet the version row carries the version alone.
+        let (bare, _) = &foot_rows(WIDTH, None, false, None)[1];
+        assert!(bare.text.contains(VERSION), "{bare:?}");
+        assert!(!bare.text.contains("Mohawk"), "{bare:?}");
     }
 
-    /// A long pet name is cut with an ellipsis rather than pushing the fold mark off the
-    /// row, and a narrow column drops the name before the dots.
+    /// A pet name the version row cannot hold whole is left off, not cut: a stub reads as
+    /// a smudge. The row stays exactly the column's width either way.
     #[test]
-    fn a_long_name_is_cut_and_a_narrow_column_drops_it() {
+    fn a_long_pet_name_is_left_off_rather_than_cut() {
         let pet = qoro_runtime::avatar::Avatar {
             body: qoro_runtime::avatar::BODY.into(),
             hair: "thin4".into(),
@@ -3732,37 +3810,45 @@ mod tests {
             body_ink: 33,
         };
         assert_eq!(pet.name(), "Thin 4 Blocked");
-        let (wide, _) = collapse_row_with(false, SIDEBAR_MAX, Some(&pet), None);
+        let (wide, _) = &foot_rows(SIDEBAR_MAX, Some(&pet), false, None)[1];
         assert_eq!(crate::width::width(&wide.text), SIDEBAR_MAX);
-        assert!(wide.text.contains("Thin 4 Blo\u{2026}"), "{wide:?}");
-        assert!(
-            wide.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
-            "{wide:?}"
-        );
-        let (narrow, _) = collapse_row_with(false, SIDEBAR_MIN, Some(&pet), None);
+        assert!(wide.text.contains("Thin 4 Blocked"), "{wide:?}");
+
+        let (narrow, _) = &foot_rows(SIDEBAR_MIN, Some(&pet), false, None)[1];
         assert_eq!(crate::width::width(&narrow.text), SIDEBAR_MIN);
-        assert!(
-            !narrow.text.contains("Thin"),
-            "no smudge at eighteen columns: {narrow:?}"
-        );
-        assert!(narrow.text.contains(BRAND), "{narrow:?}");
-        assert!(narrow.text.contains(MENU_LABEL), "{narrow:?}");
-        assert!(
-            narrow.text.contains(&format!("{BRAND_MARK}{BRAND_MARK}")),
-            "{narrow:?}"
-        );
+        assert!(narrow.text.contains(VERSION), "{narrow:?}");
+        assert!(!narrow.text.contains('\u{2026}'), "{narrow:?}");
+        assert!(!narrow.text.contains("Thin"), "{narrow:?}");
     }
 
-    /// Without an avatar the foot is byte for byte what it always was.
+    /// Beside the pet, a version or a name that does not fit whole is not shown: a notice
+    /// cut to `0.4.0>0.` reads as another version.
+    #[test]
+    fn beside_the_pet_the_foot_never_cuts_a_version_or_a_name() {
+        let pet = art_pet();
+        let narrow = foot_rows(PET_COLS + LOGO_COLS + 3, Some(&pet), true, Some("0.10.0"));
+        assert_eq!(narrow[1].0.text.trim_end(), format!(" {VERSION}"));
+        assert_eq!(narrow[2].0.text.trim_end(), "");
+        let wide = foot_rows(SIDEBAR_MAX, Some(&pet), true, Some("0.10.0"));
+        assert_eq!(wide[1].0.text.trim_end(), format!(" {VERSION}>0.10.0"));
+        assert_eq!(wide[2].0.text.trim_end(), format!(" {}", pet.name()));
+    }
+
+    /// Without an avatar the logo row is byte for byte what it always was.
     #[test]
     fn without_an_avatar_the_foot_is_unchanged() {
-        let (line, _) = collapse_row_with(false, WIDTH, None, None);
+        let (line, _) = &foot_rows(WIDTH, None, false, None)[0];
+        assert_eq!(line.accent, None);
         assert_eq!(
-            line.accent,
-            Some((1, crate::width::width(BRAND) + 2, crate::theme::Role::Brand))
+            line.runs,
+            vec![
+                (1, 1, crate::theme::Role::Text),
+                (2, 1, crate::theme::Role::Brand),
+                (3, crate::width::width(LOGO) - 2, crate::theme::Role::Text),
+            ]
         );
         assert_eq!(line.indicator, None);
-        assert!(line.text.contains(&format!("{BRAND_MARK} {BRAND}")));
+        assert!(line.text.contains(LOGO));
     }
 
     fn art_pet() -> qoro_runtime::avatar::Avatar {
@@ -3779,10 +3865,10 @@ mod tests {
     #[test]
     fn art_fits_an_open_column_of_decent_size_only() {
         assert!(avatar_fits(30, 30, true));
-        assert!(avatar_fits(12, 30, true));
+        assert!(avatar_fits(10, 19, true));
         assert!(!avatar_fits(30, 30, false));
-        assert!(!avatar_fits(30, 17, true));
-        assert!(!avatar_fits(11, 30, true));
+        assert!(!avatar_fits(30, 18, true));
+        assert!(!avatar_fits(9, 30, true));
     }
 
     /// Thirty working agents in one space: more than a thirty row column holds, so the
@@ -3796,12 +3882,13 @@ mod tests {
         )
     }
 
-    /// With a pet and a list short enough to stand above it, the five rows over the foot go
-    /// blank for the overlay, the foot keeps its dots and name, and the column keeps its
-    /// exact height. A list that needs those rows keeps them: the pet gives way, and no
-    /// agent is pushed off the column for a picture.
+    /// With a pet and a list short enough to stand above it, the foot takes its four
+    /// rows (the logo, the version and the name beside where the pet stamps, then the
+    /// menu on its own row) and the column keeps its exact height. A list that needs
+    /// those rows keeps them: the pet gives way, and no agent is pushed off the column
+    /// for a picture.
     #[test]
-    fn a_pet_takes_five_rows_only_when_the_list_still_fits() {
+    fn a_pet_takes_four_rows_only_when_the_list_still_fits() {
         let pet = art_pet();
         let at = |(spaces, agents): (Vec<WorkspaceRow>, Vec<AgentRow>)| {
             rows12(
@@ -3821,21 +3908,22 @@ mod tests {
         };
         let rows = at(sample());
         assert_eq!(rows.len(), 30);
-        for (line, hit) in rows[24..29].iter() {
-            assert_eq!(line.text, " ".repeat(WIDTH), "{line:?}");
-            assert_eq!(*hit, None);
+        // The four rows of the foot never carry an agent: the pet's reservation, not
+        // the list's, whatever the overlay stamps over their trailing columns.
+        for (line, hit) in &rows[26..30] {
+            assert!(!matches!(hit, Some(Hit::Terminal(_))), "{line:?}");
         }
-        let (foot, hit) = &rows[29];
+        let (menu_row, hit) = &rows[29];
         assert!(
-            foot.text.contains(&format!("{BRAND_MARK}{BRAND_MARK}")),
-            "{foot:?}"
+            menu_row.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+            "{menu_row:?}"
         );
         assert_eq!(*hit, Some(Hit::Foot));
-        // A crowd needs every row: the pet gives way and the rows over the foot are
-        // agents, or the thin line between two of them.
+        // A crowd needs every row: the pet gives way, and the two rows it would have
+        // reserved carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        for row in &crowded[24..29] {
+        for row in &crowded[26..28] {
             assert!(carries_agents(row), "{row:?}");
         }
     }
@@ -3867,40 +3955,54 @@ mod tests {
             None,
         );
         assert!(
-            plain[24..29].iter().all(carries_agents),
-            "thirty agents must reach rows 24 to 28"
+            plain[26..28].iter().all(carries_agents),
+            "thirty agents must reach the rows a pet would have reserved: {:?}",
+            &plain[26..28]
         );
     }
 
-    /// Overlay rows sit directly above the foot, top first.
+    /// Overlay rows sit directly above the foot's menu row, top first.
     #[test]
     fn overlay_rows_sit_directly_above_the_foot() {
-        assert_eq!(avatar_overlay_rows(1, 30), vec![25, 26, 27, 28, 29]);
+        assert_eq!(avatar_overlay_rows(1, 30), vec![27, 28, 29]);
     }
 
-    /// The overlay paints the pet in its own inks: five sixteen-cell rows,
+    /// The overlay paints the pet in its own inks: three braille rows cut to its lit cells,
     /// each reset at the end, empty without colour.
     #[test]
     fn the_overlay_paints_the_pet_in_its_inks() {
-        let rows = avatar_overlay(&art_pet(), true);
-        assert_eq!(rows.len(), 5);
+        let (cols, rows) = avatar_overlay(&art_pet(), true);
+        assert_eq!(rows.len(), 3);
+        assert!(cols > 0 && cols <= PET_COLS, "{cols}");
+        // Every escape spends a foreground ink; strip them and what is left is braille
+        // dots alone, one cell a column, the row's own width.
+        let strip_escapes = |row: &str| -> String {
+            let mut out = String::new();
+            let mut chars = row.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    for c in chars.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
         for row in &rows {
             assert!(row.ends_with("\x1b[0m"), "{row:?}");
-            let cells = row
-                .replace("\x1b[38;5;212m", "")
-                .replace("\x1b[38;5;33m", "")
-                .replace("\x1b[38;5;231m", "")
-                .replace("\x1b[48;5;212m", "")
-                .replace("\x1b[48;5;33m", "")
-                .replace("\x1b[48;5;231m", "")
-                .replace("\x1b[39m", "")
-                .replace("\x1b[49m", "")
-                .replace("\x1b[0m", "")
-                .replace(['\u{2580}', ' '], "");
-            assert!(cells.is_empty(), "unaccounted cells: {row:?}");
+            let dots = strip_escapes(row);
+            assert_eq!(crate::width::width(&dots), cols, "{row:?}");
+            assert!(
+                dots.chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+                "unaccounted cells: {row:?}"
+            );
         }
         assert!(rows[0].contains("38;5;212"), "hair on top: {:?}", rows[0]);
-        assert!(avatar_overlay(&art_pet(), false).is_empty());
+        assert_eq!(avatar_overlay(&art_pet(), false), (0, Vec::new()));
     }
 
     /// A seen update signs the foot of the column with where this build stands.
@@ -3909,24 +4011,27 @@ mod tests {
         // Said directly rather than through the notice file: every foot painted by any
         // test in this process reads that file, so writing it here changed their rows
         // and failed them at random.
-        let (line, _) = collapse_row_with(false, WIDTH, None, Some("9.9.9"));
+        let rows = foot_rows(WIDTH, None, false, Some("9.9.9"));
+        let (top, bottom) = (&rows[0].0, &rows[1].0);
         assert!(
-            line.text.contains("9.9.9"),
+            bottom.text.contains("9.9.9"),
             "the waiting release has to be readable off the screen: {:?}",
-            line.text
+            bottom.text
         );
         assert_eq!(
-            crate::width::width(&line.text),
+            crate::width::width(&bottom.text),
             WIDTH,
             "the longer row still fills the column exactly: {:?}",
-            line.text
+            bottom.text
         );
+        // The notice rides the version row; the menu is on the logo row above it and
+        // never moves for it.
         assert!(
-            line.text.contains(MENU_LABEL),
+            top.text.contains(MENU_LABEL),
             "the notice never pushes the menu off: {:?}",
-            line.text
+            top.text
         );
-        let (plain, _) = collapse_row_with(false, WIDTH, None, None);
+        let (plain, _) = &foot_rows(WIDTH, None, false, None)[1];
         assert!(
             !plain.text.contains('>'),
             "no notice is the row it always was: {:?}",
@@ -4052,7 +4157,9 @@ mod tests {
             )
         };
         let zero = at(0);
-        let (four, five) = (at(4), at(5));
+        // Two ticks two frames apart: a frame lasts two ticks, so comparing across a
+        // single frame boundary would still catch nothing turned.
+        let (two, six) = (at(2), at(6));
         let mut moved = 0;
         for agent in agents.iter().filter(|a| a.agent) {
             let still = tree_row(&zero, agent.terminal).clone();
@@ -4063,8 +4170,8 @@ mod tests {
                 "frame zero moved: {still:?}"
             );
             let (a, b) = (
-                tree_row(&four, agent.terminal),
-                tree_row(&five, agent.terminal),
+                tree_row(&two, agent.terminal),
+                tree_row(&six, agent.terminal),
             );
             if agent.state == "working" {
                 moved += 1;
@@ -4088,12 +4195,12 @@ mod tests {
         assert!(moved > 0, "the fixture has no working agent to move");
         // An unread done keeps the done square on its mark, steady.
         assert_eq!(
-            tree_row(&five, 5).indicator,
+            tree_row(&six, 5).indicator,
             Some((BOX_LEAD, 2, crate::theme::of("done"))),
             "no steady unread mark"
         );
         // And no state word on the right of any row.
-        for (line, _) in &five {
+        for (line, _) in &six {
             for word in ["working", "blocked", "failed", "done", "idle"] {
                 assert!(
                     !line.text.trim_end().ends_with(word),
@@ -4104,8 +4211,32 @@ mod tests {
         }
     }
 
+    /// Across a full breath (and the next one, which starts one arm further round), a
+    /// working frame never paints another state's fixed picture: the centre alone
+    /// (idle), the middle row (asleep), the full ring (waiting), the full square (done)
+    /// or the diamond cross (failed). Only the shapes differ; colour is not what tells
+    /// them apart here.
+    #[test]
+    fn no_working_frame_is_ever_another_states_picture() {
+        use crate::theme::Role;
+        let others = [
+            cell_mark(Role::Idle, false, 0),
+            cell_mark(Role::Sleeping, false, 0),
+            cell_mark(Role::Blocked, false, 0),
+            cell_mark(Role::Done, false, 0),
+            cell_mark(Role::Failed, false, 0),
+        ];
+        for tick in 1..=64u64 {
+            let mark = cell_mark(Role::Working, true, tick);
+            assert!(
+                !others.contains(&mark),
+                "tick {tick} painted another state's picture: {mark:?}"
+            );
+        }
+    }
+
     /// A working ring never closes into the shape blocked wears: the two must read apart
-    /// by shape, not only by colour, at every frame the twelve-tick loop turns through.
+    /// by shape, not only by colour, at every frame the breath turns through.
     #[test]
     fn a_working_mark_never_closes_into_the_waiting_ring() {
         use crate::theme::Role;
@@ -4343,7 +4474,9 @@ mod tests {
         let agents = vec![agent(2, 2, "claude", "failed")];
         let lines = render(&spaces, &agents, 2, 99, 8);
         let mark = cell_mark(crate::theme::of("failed"), false, 0);
-        let prefix = format!(" {mark}claude");
+        // The space's own line sits in column zero, ahead of the mark: this agent is
+        // its space's only row, so it is not the last and wears `LINE`, not `LINE_FOOT`.
+        let prefix = format!("\u{2847}{mark}claude");
         // The next row at the top wears the same mark on the same agent, so the tree's
         // own row is the last one that opens with it, not the first.
         let row = lines
@@ -4375,7 +4508,7 @@ mod tests {
             fresh_lines
                 .iter()
                 .skip_while(|l| !l.text.starts_with(&format!(" {SPACES_TITLE}")))
-                .any(|l| l.text.starts_with(&format!(" {mark}"))),
+                .any(|l| l.text.starts_with(&format!("\u{2847}{mark}"))),
             "unseen failed lost its mark: {:?}",
             texts(&fresh_lines)
         );
@@ -4622,7 +4755,11 @@ mod tests {
                 assert_eq!(act(Hit::Title, width, &c, false), Some(Act::NewSpace));
                 assert_eq!(act(Hit::Title, 1, &c, false), None);
 
-                let foot = rows.last().map(|(l, _)| l.text.clone()).expect("a foot");
+                let foot = rows
+                    .iter()
+                    .find(|(_, h)| *h == Some(Hit::Foot))
+                    .map(|(l, _)| l.text.clone())
+                    .expect("a foot");
                 let menu: String = (1..=width)
                     .filter(|col| act(Hit::Foot, *col, &c, false) == Some(Act::Menu))
                     .filter_map(|col| foot.chars().nth(col - 1))
@@ -4640,7 +4777,7 @@ mod tests {
                 // there is something under it to fold. Its two controls answer in their own
                 // columns, which are the same whatever the name and the count are.
                 for col in 1..=width {
-                    let want = if view == View::Tree && col <= FOLD_CELLS {
+                    let want = if view == View::Tree && col <= NAME_AT {
                         Act::Fold(1)
                     } else if col == width - 4 + 1 {
                         Act::Sleep(1)
@@ -4664,11 +4801,10 @@ mod tests {
                 assert_eq!(act(Hit::Terminal(3), 1, &c, false), Some(Act::Terminal(3)));
             }
         }
-        // The fold cells are exactly the space before the arrow, the arrow, and the
-        // space after it.
+        // The fold cell is exactly the line's top: the one column before the name.
         let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
-        let head: String = rule_row(&rows, 1).text.chars().take(FOLD_CELLS).collect();
-        assert_eq!(head, " \u{25be} ");
+        let head: String = rule_row(&rows, 1).text.chars().take(NAME_AT).collect();
+        assert_eq!(head, "\u{2846}");
     }
 
     /// No breath between the title and the tree any more: the first rule is itself a
@@ -4915,13 +5051,13 @@ mod tests {
         // the one cut.
         assert_eq!(
             unbox(&one[1].text),
-            "   \u{2514} claude \u{b7} editing sideba\u{2026}"
+            "\u{2847}  \u{2514} claude \u{b7} editing sideba\u{2026}"
         );
         assert_eq!(one[1].colour, Some(crate::theme::Role::Faint));
         let two = under(2);
         assert_eq!(
             unbox(&two[1].text),
-            "   \u{2514} codex \u{b7} wants: bun test"
+            "\u{2847}  \u{2514} codex \u{b7} wants: bun test"
         );
         // Quiet grey, with what it wants in the blocked colour.
         assert_eq!(two[1].colour, Some(crate::theme::Role::Faint));
@@ -4933,7 +5069,7 @@ mod tests {
         // A calm agent keeps its tab row, without the stale activity.
         let three = under(3);
         assert_eq!(three.len(), 2, "{texts:?}");
-        assert_eq!(unbox(&three[1].text), "   \u{2514} gemini");
+        assert_eq!(unbox(&three[1].text), "\u{28c7}  \u{2514} gemini");
         // The next row names the waiting agent; what it wants is its row's job.
         assert!(texts[0].starts_with(" \u{282f}\u{2807}codex"), "{texts:?}");
         for (line, _) in &rows {
@@ -5181,8 +5317,8 @@ mod tests {
                 .iter()
                 .take_while(|(_, hit)| *hit != Some(Hit::Title))
                 .count();
-            // The foot takes the last row; the next row needs two more under it.
-            let want = usize::from(h > 3);
+            // The foot takes its two rows; the next row needs three more above them.
+            let want = usize::from(h > 4);
             if rows.iter().any(|(_, hit)| *hit == Some(Hit::Title)) {
                 assert_eq!(above, want, "height {h}: {rows:?}");
             }
@@ -5232,7 +5368,7 @@ mod tests {
         let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
-        assert!(app.text.starts_with(" \u{25b8} app (3)"), "{:?}", app.text);
+        assert!(app.text.starts_with("\u{2846}app (3)"), "{:?}", app.text);
         // The count sits beside the name it counts, and the block keeps its columns.
         assert!(app.text.contains("(3)"), "the count keeps every agent");
         assert_eq!(column_of(&app.text, 'z'), Some(WIDTH - 4), "{:?}", app.text);
@@ -5243,16 +5379,16 @@ mod tests {
         assert_eq!(order(&rows), vec![4]);
         // And the open space next to it is untouched.
         assert!(
-            rule_row(&rows, 2).text.starts_with(" \u{25be} dub "),
+            rule_row(&rows, 2).text.starts_with("\u{2846}dub"),
             "{:?}",
             rule_row(&rows, 2).text
         );
     }
 
-    /// A fold never hides a blocked agent silently: a folded rule's arrow and count
-    /// take the colour of its most urgent child that needs a person, and stay the
-    /// quiet grey while every child is calm. Open, they stay grey: the dots are right
-    /// there.
+    /// A fold never hides a blocked agent silently: a folded rule's line top and count
+    /// take the colour of its most urgent child that needs a person, and stay quiet
+    /// while every child is calm. Open, the line keeps the space's colour: the marks are
+    /// right there.
     #[test]
     fn a_folded_rule_wears_the_colour_of_its_most_urgent_child() {
         use crate::theme::Role;
@@ -5296,14 +5432,16 @@ mod tests {
             (Role::Done, Role::Done),
             "an unread finish is news"
         );
+        // Nothing under it wants a person, so the line stays the space's own ink
+        // whether the rule is folded or open; only the count keeps the quiet grey.
         assert_eq!(
             marks(&paint(&["idle", "working"], &shut)),
-            (Role::Faint, Role::Faint)
+            (crate::theme::space_of(1), Role::Faint)
         );
         assert_eq!(
             marks(&paint(&["idle", "blocked"], &Shut::new())),
-            (Role::Faint, Role::Faint),
-            "an open rule stays grey"
+            (crate::theme::space_of(1), Role::Faint),
+            "an open rule wears its own ink"
         );
     }
 
@@ -5350,7 +5488,10 @@ mod tests {
         let mut agents = vec![agent(1, 1, "sh", "unknown")];
         agents[0].agent = true;
         let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
-        assert_eq!(unbox(&tree_row(&rows, 1).text), " \u{2810}\u{2800}sh");
+        assert_eq!(
+            unbox(&tree_row(&rows, 1).text),
+            "\u{2847}\u{2810}\u{2800}sh"
+        );
     }
 
     /// An unread done draws inline in its space with the done sage on its dot: news,
@@ -5712,11 +5853,11 @@ mod tests {
             assert!(!row.contains('\u{fffd}'));
         }
         // Fitting session: today's bytes, no ellipsis.
-        assert_eq!(unbox(&rows[0]), " \u{2809}\u{2803}claude");
+        assert_eq!(unbox(&rows[0]), "\u{2847}\u{2818}\u{2802}claude");
         // Cut sessions: the mark and the ellipsis frame the text.
         assert!(unbox(&rows[1]).ends_with('…'), "{:?}", rows[1]);
         assert!(
-            unbox(&rows[1]).starts_with(" \u{2809}\u{2803}Implement"),
+            unbox(&rows[1]).starts_with("\u{2847}\u{2818}\u{2802}Implement"),
             "{:?}",
             rows[1]
         );
@@ -5747,36 +5888,42 @@ mod tests {
     #[test]
     fn the_row_shows_the_worktree_basename_when_different() {
         let row = |cwd| unbox(&worktree_row("app", cwd, "claude").text);
-        // Different: the tab, then the worktree.
+        // Different: the tab, then the worktree. The row is its space's only one, so
+        // it is also the last and wears the line's foot.
         assert_eq!(
             row(Some("/home/u/app-feat-x")),
-            "   \u{2514} claude \u{b7} app-feat-x"
+            "\u{28c7}  \u{2514} claude \u{b7} app-feat-x"
         );
         // Trailing slash is not a name.
         assert_eq!(
             row(Some("/home/u/app-feat-x/")),
-            "   \u{2514} claude \u{b7} app-feat-x"
+            "\u{28c7}  \u{2514} claude \u{b7} app-feat-x"
         );
         // Same name in any case: the bare tab.
-        assert_eq!(row(Some("/home/u/app")), "   \u{2514} claude");
-        assert_eq!(row(Some("/home/u/app")), "   \u{2514} claude");
+        assert_eq!(row(Some("/home/u/app")), "\u{28c7}  \u{2514} claude");
+        assert_eq!(row(Some("/home/u/app")), "\u{28c7}  \u{2514} claude");
         // Root, empty, blank: no basename, the bare tab.
-        assert_eq!(row(Some("/")), "   \u{2514} claude");
-        assert_eq!(row(Some("")), "   \u{2514} claude");
-        assert_eq!(row(Some("   ")), "   \u{2514} claude");
+        assert_eq!(row(Some("/")), "\u{28c7}  \u{2514} claude");
+        assert_eq!(row(Some("")), "\u{28c7}  \u{2514} claude");
+        assert_eq!(row(Some("   ")), "\u{28c7}  \u{2514} claude");
         // No cwd at all: the bare tab.
-        assert_eq!(row(None), "   \u{2514} claude");
+        assert_eq!(row(None), "\u{28c7}  \u{2514} claude");
         // A tilde and dots are names and pass through untouched.
-        assert_eq!(row(Some("~")), "   \u{2514} claude \u{b7} ~");
-        assert_eq!(row(Some("/home/u/.")), "   \u{2514} claude \u{b7} .");
+        assert_eq!(row(Some("~")), "\u{28c7}  \u{2514} claude \u{b7} ~");
+        assert_eq!(row(Some("/home/u/.")), "\u{28c7}  \u{2514} claude \u{b7} .");
         // The row is quiet grey throughout; only the elbow and the dot wear the rule,
-        // and the space's own ink no longer frames a border that is not drawn any more.
+        // and the space's own ink frames the line beside it rather than a border that
+        // is not drawn any more.
         let line = worktree_row("app", Some("/home/u/app-feat-x"), "claude");
         assert_eq!(line.colour, Some(crate::theme::Role::Faint));
         let rule = crate::theme::Role::Rule;
-        assert_eq!(line.runs, vec![(3, 1, rule), (12, 1, rule)]);
+        let ink = crate::theme::space_of(1);
+        assert_eq!(line.runs, vec![(3, 1, rule), (12, 1, rule), (0, 1, ink)]);
         assert_eq!(run_text(&line, 14, 10), "app-feat-x");
-        assert_eq!(worktree_row("app", None, "claude").runs, vec![(3, 1, rule)]);
+        assert_eq!(
+            worktree_row("app", None, "claude").runs,
+            vec![(3, 1, rule), (0, 1, ink)]
+        );
     }
 
     /// The same worktree name under two spaces stays ambiguous on purpose: each agent
@@ -5793,12 +5940,12 @@ mod tests {
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = unboxed(&lines);
         assert_eq!(texts[2], rule_row(&rows, 1).text.trim_end());
-        assert_eq!(texts[3], " \u{2810}\u{2800}claude");
-        assert_eq!(texts[4], "   \u{2514} claude \u{b7} x");
+        assert_eq!(texts[3], "\u{2847}\u{2810}\u{2800}claude");
+        assert_eq!(texts[4], "\u{28c7}  \u{2514} claude \u{b7} x");
         assert!(texts[5].is_empty(), "{texts:?}");
         assert_eq!(texts[6], rule_row(&rows, 2).text.trim_end());
-        assert_eq!(texts[7], " \u{2810}\u{2800}codex");
-        assert_eq!(texts[8], "   \u{2514} codex \u{b7} x");
+        assert_eq!(texts[7], "\u{2847}\u{2810}\u{2800}codex");
+        assert_eq!(texts[8], "\u{28c7}  \u{2514} codex \u{b7} x");
     }
 
     /// A long worktree shortens with an ellipsis while the tab keeps every letter it
@@ -5812,7 +5959,7 @@ mod tests {
             "claude",
         );
         assert!(
-            unbox(&line.text).starts_with("   \u{2514} claude \u{b7} a-very"),
+            unbox(&line.text).starts_with("\u{28c7}  \u{2514} claude \u{b7} a-very"),
             "{:?}",
             line.text
         );
@@ -5832,7 +5979,7 @@ mod tests {
     fn a_wide_worktree_shortens_by_columns() {
         let line = worktree_row("app", Some("/home/u/程程程程程程程程程程程程"), "claude");
         assert!(
-            unbox(&line.text).starts_with("   \u{2514} claude \u{b7} 程"),
+            unbox(&line.text).starts_with("\u{28c7}  \u{2514} claude \u{b7} 程"),
             "{:?}",
             line.text
         );
@@ -5937,12 +6084,12 @@ mod tests {
             assert_eq!(tree_row(&rows, t).accent, None, "{t}");
         }
         assert!(
-            unbox(&tree_row(&rows, 2).text).starts_with(" \u{2809}\u{2803}behind docker"),
+            unbox(&tree_row(&rows, 2).text).starts_with("\u{2847}\u{2818}\u{2802}behind docker"),
             "{:?}",
             tree_row(&rows, 2).text
         );
         assert!(
-            unbox(&tree_row(&rows, 3).text).starts_with(" \u{2809}\u{2803}Muse"),
+            unbox(&tree_row(&rows, 3).text).starts_with("\u{2847}\u{2818}\u{2802}Muse"),
             "{:?}",
             tree_row(&rows, 3).text
         );
@@ -6089,7 +6236,7 @@ mod tests {
             }
             // The space name survives on its rule at every width.
             assert!(
-                lines.iter().any(|l| l.text.contains(" app ")),
+                lines.iter().any(|l| l.text.contains("\u{2846}app")),
                 "width {width}: space name lost"
             );
             // The corners follow the pulled width, not the default.
@@ -6187,7 +6334,7 @@ mod tests {
         let head = rule_row(&folded, 2);
         // Folded, asleep, and saying so in the slot rather than in a mark after the name.
         assert!(
-            head.text.contains("\u{25b8} api sleeping"),
+            head.text.contains("\u{2846}api sleeping"),
             "{:?}",
             head.text
         );
@@ -6226,7 +6373,7 @@ mod tests {
             Some((BOX_LEAD, 2, crate::theme::Role::Sleeping)),
             "the sleeping mark, not a state dot"
         );
-        assert_eq!(unbox(&dim.text), " \u{283d}\u{2805}claude");
+        assert_eq!(unbox(&dim.text), "\u{28c7}\u{2812}\u{2802}claude");
 
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let c = column(
@@ -6242,10 +6389,7 @@ mod tests {
             WIDTH,
             &shut,
         );
-        assert_eq!(
-            act(Hit::Space(2), FOLD_CELLS, &c, false),
-            Some(Act::Fold(2))
-        );
+        assert_eq!(act(Hit::Space(2), NAME_AT, &c, false), Some(Act::Fold(2)));
         assert_eq!(act(Hit::Terminal(7), 9, &c, false), Some(Act::Terminal(7)));
     }
 
@@ -6334,11 +6478,7 @@ mod tests {
         // rather than scrolled: this is about how a rule is drawn, not about the window.
         rows_folded(&c, 4096, current_avatar().as_ref())
             .into_iter()
-            .find(|(l, _)| {
-                l.text.starts_with(" \u{25be} ")
-                    || l.text.starts_with(" \u{25b8} ")
-                    || l.text.starts_with(" \u{b7} ")
-            })
+            .find(|(l, _)| l.text.starts_with('\u{2846}'))
             .map(|(l, _)| l.text)
             .unwrap_or_default()
     }
@@ -6395,7 +6535,7 @@ mod tests {
         // cells, the block and the blank last column. A count wide enough to take the
         // rest is what makes a rule sit on the budget, and `shorten_middle` is the shared
         // helper that has to be right about the case for its other callers too.
-        assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 11);
+        assert_eq!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL), 13);
         assert_eq!(crate::width::width(&format!(" ({})", 999_999_usize)), 9);
     }
 
@@ -6465,9 +6605,9 @@ mod tests {
         let row = rule_at(WIDTH, "qoro", 3, true, true);
         assert!(row.contains("qoro sleeping"), "{row:?}");
         assert!(!row.contains("(3)"), "{row:?}");
-        // At the narrowest column the word does not fit and the count stays, so the name
-        // never starves for a state.
-        let row = rule_at(SIDEBAR_MIN, "qoro", 3, true, true);
+        // Narrower than the interface ever draws, where the word no longer fits, the
+        // count stays, so the name never starves for a state.
+        let row = rule_at(16, "qoro", 3, true, true);
         assert!(row.contains("qoro (3)"), "{row:?}");
     }
 
@@ -6518,7 +6658,7 @@ mod tests {
             );
             // One column either side of a control is the space, never the control.
             for at in [width - 5, width - 3, width - 1] {
-                if (1..=width).contains(&(at + 1)) && at > FOLD_CELLS {
+                if (1..=width).contains(&(at + 1)) && at > NAME_AT {
                     assert_eq!(
                         act(Hit::Space(1), at + 1, &c, false),
                         Some(Act::Space(1)),
@@ -6571,11 +6711,11 @@ mod tests {
             act(Hit::Space(1), WIDTH - 4 + 1, &c, false),
             Some(Act::CancelClose)
         );
-        // The fold arrow and the body of the row are not answers, they take the question
+        // The line's top and the body of the row are not answers, they take the question
         // down: a row mid question neither folds nor navigates nor sleeps.
         assert_eq!(act(Hit::Space(1), 1, &c, false), Some(Act::CancelClose));
         assert_eq!(
-            act(Hit::Space(1), FOLD_CELLS, &c, false),
+            act(Hit::Space(1), NAME_AT, &c, false),
             Some(Act::CancelClose)
         );
         assert_eq!(act(Hit::Space(1), 8, &c, false), Some(Act::CancelClose));
@@ -6636,11 +6776,7 @@ mod tests {
         );
         let rule = rows_folded(&c, 40, current_avatar().as_ref())
             .into_iter()
-            .find(|(l, _)| {
-                l.text.starts_with(" \u{25be} ")
-                    || l.text.starts_with(" \u{25b8} ")
-                    || l.text.starts_with(" \u{b7} ")
-            })
+            .find(|(l, _)| l.text.starts_with('\u{2846}'))
             .expect("the rule");
         let accent = rule.1.and(rule.0.accent).expect("the name's run");
         assert_eq!(accent.2, crate::theme::Role::Sleeping, "{:?}", rule.0);
