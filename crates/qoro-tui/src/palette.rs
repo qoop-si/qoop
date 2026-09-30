@@ -294,7 +294,10 @@ impl Palette {
             for name in qoro_domain::program::agent_names() {
                 let text = format!("new {name} terminal");
                 // The person's own entry of the same name already offered it, their way.
-                let theirs = self.agents.iter().any(|a| a.name == name);
+                let theirs = self
+                    .agents
+                    .iter()
+                    .any(|a| a.name.eq_ignore_ascii_case(name));
                 if !theirs && text.contains(&needle) {
                     out.push(Entry {
                         item: Item::NewAgent(name.to_string()),

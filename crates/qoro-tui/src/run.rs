@@ -742,10 +742,6 @@ impl Modes {
     }
 }
 
-/// What resize mode says on the notice row: its own keys, because in a mode the others do
-/// not work.
-const RESIZE_KEYS: &str = "resize: h j k l move 5%  H J K L 20%  = equalize  esc done";
-
 impl State {
     fn frame(&self) -> Frame<'_> {
         // The pane area in its own cells, shared by every tile rect.
@@ -830,7 +826,7 @@ impl State {
                 } else {
                     self.modes.copy.as_ref().map(|copy| {
                         let keys: &'static [(&'static str, &'static str)] =
-                            if copy.status == crate::copy::KEYS {
+                            if copy.status.is_empty() {
                                 screen::COPY_HINT
                             } else {
                                 &[]
@@ -1060,9 +1056,6 @@ impl State {
     fn mode_line(&self) -> Option<&str> {
         if let Some((_, question)) = &self.modes.confirm_close {
             return Some(question);
-        }
-        if self.modes.resizing {
-            return Some(RESIZE_KEYS);
         }
         self.modes.copy.as_ref().map(|copy| copy.status.as_str())
     }
@@ -3204,7 +3197,7 @@ fn copy_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> M
                 }
                 ModeKey::Esc => {
                     copy.query = None;
-                    copy.status = crate::copy::KEYS.to_string();
+                    copy.status.clear();
                 }
                 ModeKey::Byte(0x7f | 0x08) => {
                     query.pop();
@@ -4523,7 +4516,10 @@ where
                         // after) goes through the decoder like any key here.
                         let rest = if state.keys_query.is_some() {
                             keys_search(&mut state, &bytes)
-                        } else if state.reading == Some(Reading::Keybinds) && bytes == b"/" {
+                        } else if state.reading == Some(Reading::Keybinds)
+                            && bytes == b"/"
+                            && !keys.prefix_pending()
+                        {
                             state.keys_query = Some(String::new());
                             None
                         } else {
@@ -4750,17 +4746,17 @@ where
                         keys = Keys::with_prefix(state.config.prefix);
                     }
                     for action in keys.feed(&input) {
+                        // The palette only opens from this loop, so open here means this
+                        // read opened it: what came after `ctrl-a space` in the same read
+                        // is neither the pane's (a fast tab would complete in the shell)
+                        // nor a command. Dropped.
+                        // ponytail: a batched read loses those keys; replaying them needs
+                        // the palette's outcome handling run from here.
+                        if state.palette.is_some() {
+                            continue;
+                        }
                         match action {
                             Action::Input(bytes) => {
-                                // Typed in the same read as `ctrl-a space`: the palette's,
-                                // not the pane's, or a fast tab lands in the shell as a
-                                // completion. Held for the palette's next read.
-                                // ponytail: waits for the next key rather than replaying
-                                // the palette's whole outcome handling from here.
-                                if state.palette.is_some() {
-                                    state.palette_pending.extend_from_slice(&bytes);
-                                    continue;
-                                }
                                 // Typed in the same read as the key that opened a mode,
                                 // as in `ctrl-a [ k`: the mode's, like everything after it.
                                 let bytes = if state.modes.open() {
@@ -6663,12 +6659,8 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
                     // A control byte before the final one ends it unfinished, as it does
                     // for the parser, and is read as itself: held on, an `ESC [` that
                     // never finished swallowed Enter, esc and the detach after it.
-                    Some(_) => match buf[i + 2..]
-                        .iter()
-                        .position(|b| (0x40..=0x7e).contains(b) || *b < 0x20)
-                    {
-                        Some(at) if buf[i + 2 + at] >= 0x40 => i += 2 + at + 1,
-                        Some(at) => i += 2 + at,
+                    Some(_) => match skip_sequence(&buf, i) {
+                        Some(next) => i = next,
                         None => {
                             state.palette_pending = buf[i..].to_vec();
                             break;
@@ -8636,6 +8628,22 @@ fn clamped_to_focused(state: &State, row: u16, col: u16) -> (usize, usize) {
     )
 }
 
+/// Where the input goes on after the `ESC [` sequence at `i`, or `None` when the read ends
+/// inside it and the rest is still coming.
+///
+/// A control byte before the final one ends it unfinished and is read as itself: held on,
+/// an `ESC [` that never finished swallowed Enter, esc and the detach after it.
+fn skip_sequence(buf: &[u8], i: usize) -> Option<usize> {
+    let at = buf[i + 2..]
+        .iter()
+        .position(|b| (0x40..=0x7e).contains(b) || *b < 0x20)?;
+    Some(if buf[i + 2 + at] >= 0x40 {
+        i + 2 + at + 1
+    } else {
+        i + 2 + at
+    })
+}
+
 /// Typing into the keys overlay's search.
 ///
 /// Printable text is the query and backspace rubs it out. A lone esc ends the search, and a
@@ -8674,16 +8682,15 @@ fn keys_search(state: &mut State, bytes: &[u8]) -> Option<Vec<u8>> {
                         return None;
                     }
                 },
-                // An arrow, a function key: skipped whole, split ones held.
-                Some(b'[' | b'O') => {
-                    match buf[i + 2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
-                        Some(at) => i += 2 + at + 1,
-                        None => {
-                            state.palette_pending = buf[i..].to_vec();
-                            return None;
-                        }
+                // An arrow, a function key: skipped whole, split ones held, the way the
+                // palette skips them.
+                Some(b'[') => match skip_sequence(&buf, i) {
+                    Some(next) => i = next,
+                    None => {
+                        state.palette_pending = buf[i..].to_vec();
+                        return None;
                     }
-                }
+                },
                 // Esc on its own, or with a key after it: the search is over.
                 _ => {
                     state.keys_query = None;
@@ -10466,6 +10473,12 @@ mod tests {
         state.keys_query = Some("x".to_string());
         assert_eq!(keys_search(&mut state, b"\x01d"), Some(b"\x01d".to_vec()));
         assert_eq!(state.keys_query, None);
+        // An unfinished `ESC [` ends at the next control byte, which is read as itself:
+        // the enter after it still closes the list.
+        state.keys_query = Some(String::new());
+        assert_eq!(keys_search(&mut state, b"\x1b[\r"), None);
+        assert!(state.reading.is_none());
+        state.reading = Some(Reading::Keybinds);
         // A click closes the list; enter does too.
         state.keys_query = Some(String::new());
         assert_eq!(keys_search(&mut state, b"\x1b[<0;5;5M"), None);
@@ -11651,7 +11664,7 @@ mod tests {
             panic!("no menu rect on 80x24");
         };
         // The third row's middle cell.
-        let row = (top + crate::screen::MENU_FIRST_ROW + 2 + 1) as u16;
+        let row = (top + crate::screen::BOX_FIRST_ROW + 2 + 1) as u16;
         let col = (left + w / 2 + 1) as u16;
         let press = format!("\x1b[<0;{col};{row}M").into_bytes();
         assert_eq!(menu_click(&press, cols, lines, &main), Some(Some(2)));

@@ -810,11 +810,12 @@ pub fn paint(frame: &Frame) -> String {
             None => (here(frame), None),
         },
     };
-    match (frame.chrome.mode, confirm) {
-        (Some((word, keys)), None) => {
+    // `mode` is never set while a close is asked, so the two never meet.
+    match frame.chrome.mode {
+        Some((word, keys)) => {
             out.push_str(&mode_row(word, keys, &notice, frame.cols as usize));
         }
-        _ => {
+        None => {
             out.push_str(&match notice_role {
                 Some(role) => theme::status_in(role),
                 None => theme::status(),
@@ -949,7 +950,9 @@ pub fn paint(frame: &Frame) -> String {
     } else if let Some((row, col)) = reading_cursor {
         // At the end of the keys search, where typing goes.
         out.push_str(&at(row + 1, col + 1));
-    } else if let Some(snapshot) = frame.snapshot {
+    } else if confirm.is_none()
+        && let Some(snapshot) = frame.snapshot
+    {
         // Shown only when the program wants it seen. A child redraws with its
         // cursor hidden, and a shown-anyway cursor is one the program hid:
         // flicker. The frame starts hidden, so a hidden snapshot cursor stays
@@ -1421,13 +1424,9 @@ pub(crate) fn menu_row_at(
     if c < left || c >= left + w || r < top || r >= top + height {
         return None;
     }
-    let item = r.checked_sub(top + MENU_FIRST_ROW)?;
+    let item = r.checked_sub(top + BOX_FIRST_ROW)?;
     (item < rows.len()).then_some(item)
 }
-
-/// How far below the menu's top edge its first entry sits: where `paint_boxed` puts
-/// every box's first row.
-pub(crate) const MENU_FIRST_ROW: usize = BOX_FIRST_ROW;
 
 /// The menu's keys, said once for the box and for the width it needs.
 const MENU_HINT: &[(&str, &str)] = &[("j k", "move"), ("enter", "choose"), ("esc", "close")];
@@ -1517,15 +1516,27 @@ fn paint_reading(
                 .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
                 .count()
         ),
-    ]
-    .into_iter()
-    .chain(crate::config::shown())
-    .collect::<Vec<_>>();
-    let widest = lines.iter().map(|l| width::width(l)).max().unwrap_or(0);
+    ];
+    let file = crate::config::shown();
+    let widest = lines
+        .iter()
+        .chain(&file)
+        .map(|l| width::width(l))
+        .max()
+        .unwrap_or(0);
     let inner = box_inner(frame, widest + 1, "settings");
     let rows: Vec<String> = lines
         .iter()
-        .map(|line| settings_row(line, inner))
+        .map(|line| live_row(line, inner))
+        .chain(file.iter().map(|line| {
+            // The file's lines as written, a `[section]` as a heading.
+            let ink = if line.trim_start().starts_with('[') {
+                theme::Role::Title
+            } else {
+                theme::Role::Text
+            };
+            format!("{}{}", theme::fg(ink), width::fit(line, inner))
+        }))
         .chain(std::iter::once(hint_line(CLOSE_HINT, inner)))
         .collect();
     paint_box(frame, "settings", inner, &rows, out);
@@ -1535,30 +1546,26 @@ fn paint_reading(
 /// What closes a box that is only being read. Any key does; esc is the one to say.
 const CLOSE_HINT: &[(&str, &str)] = &[("esc", "close")];
 
-/// One settings row, split where its first run of two spaces ends: what matters bright and
-/// what explains it faint. A live row is a name and its value, so the value is the bright
-/// part; a line of the file (`prefix = "ctrl-a"`) is itself the value and its note explains
-/// it. A `[section]` is a heading, and somebody waiting is said in the colour that says so.
-fn settings_row(text: &str, inner: usize) -> String {
+/// One of the live settings rows: its name faint and its value plain, somebody waiting
+/// in the colour that says so. The value starts after the name's run of spaces.
+fn live_row(text: &str, inner: usize) -> String {
     let fitted = width::fit(text, inner);
-    let body = fitted.trim_start();
-    if body.starts_with('[') {
-        return format!("{}{fitted}", theme::fg(theme::Role::Title));
-    }
-    let Some(gap) = body.find("  ") else {
-        return format!("{}{fitted}", theme::fg(theme::Role::Text));
-    };
-    let after = &body[gap..];
-    let at = (fitted.len() - body.len()) + gap + (after.len() - after.trim_start().len());
+    let name = fitted.trim_start();
+    let at = (fitted.len() - name.len())
+        + name.find("  ").map_or(name.len(), |gap| {
+            gap + (name[gap..].len() - name[gap..].trim_start().len())
+        });
     let (head, tail) = fitted.split_at(at);
-    let (head_ink, tail_ink) = if head.contains('=') {
-        (theme::Role::Text, theme::Role::Faint)
-    } else if head.trim() == "waiting" && tail.trim() != "0" {
-        (theme::Role::Faint, theme::Role::Blocked)
+    let ink = if head.trim() == "waiting" && tail.trim() != "0" {
+        theme::Role::Blocked
     } else {
-        (theme::Role::Faint, theme::Role::Text)
+        theme::Role::Text
     };
-    format!("{}{head}{}{tail}", theme::fg(head_ink), theme::fg(tail_ink))
+    format!(
+        "{}{head}{}{tail}",
+        theme::fg(theme::Role::Faint),
+        theme::fg(ink)
+    )
 }
 
 /// One group of the keys overlay: its name, which ink of the space wheel tells it apart,
@@ -1615,9 +1622,10 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("hjkl", "move"),
             ("w b e", "by word"),
             ("g G", "top, bottom"),
+            ("^u ^d", "half page"),
             ("v V y", "select, copy"),
             ("/ ? n N", "search"),
-            ("q", "leave"),
+            ("q esc", "leave"),
         ],
     ),
     (
@@ -1697,6 +1705,9 @@ fn paint_keys(frame: &Frame, query: Option<&str>, out: &mut String) -> Option<(u
         .find(|columns| wanted(columns) <= room)
         .unwrap_or(&KEY_COLUMNS[2]);
     let inner = box_inner(frame, wanted(columns), &title);
+    if inner < 4 {
+        return None;
+    }
     let cells: Vec<usize> = if columns.len() == 1 {
         vec![inner - 1]
     } else {
@@ -1763,35 +1774,47 @@ fn paint_keys(frame: &Frame, query: Option<&str>, out: &mut String) -> Option<(u
         .collect();
     // Taller than the window: what fits, then a line that says the rest can be searched.
     let lines = frame.lines as usize;
-    let fit = lines.saturating_sub(4).saturating_sub(1);
+    let fit = box_rows(lines).saturating_sub(1);
     if body.len() > fit {
         body.truncate(fit.saturating_sub(1));
-        body.push(format!(
-            "{}{}",
-            theme::fg(theme::Role::Faint),
-            width::fit(" more: / search", inner)
-        ));
+        if fit > 0 {
+            body.push(format!(
+                "{}{}",
+                theme::fg(theme::Role::Faint),
+                width::fit(" more: / search", inner)
+            ));
+        }
     }
     let (footer, typed_at) = match query {
         Some(query) => {
             // ` / query  esc clear`, the query cut to what is left of the row.
             let room = inner.saturating_sub(3 + "  esc clear".len() + 1);
+            // Built here and not by `hint_line`: the query is not a key and a word.
             let shown = width::text(query, width::width(query).min(room));
-            let shown = shown.trim_end();
-            let plain = 3 + width::width(shown) + "  esc clear".len();
-            (
-                format!(
-                    "{} {}/ {}{shown}{}  {}esc{} clear{}",
-                    theme::fg(theme::Role::Faint),
-                    theme::fg(theme::Role::Focused),
+            let plain = 3 + width::width(&shown) + "  esc clear".len();
+            if plain > inner {
+                // Too narrow for the words: the query alone, cut to the box.
+                let row = format!(
+                    "{}{}",
                     theme::fg(theme::Role::Text),
-                    theme::fg(theme::Role::Faint),
-                    theme::fg(theme::Role::Focused),
-                    theme::fg(theme::Role::Faint),
-                    " ".repeat(inner.saturating_sub(plain))
-                ),
-                Some(3 + width::width(shown)),
-            )
+                    width::fit(&format!(" / {shown}"), inner)
+                );
+                (row, Some((3 + width::width(&shown)).min(inner - 1)))
+            } else {
+                (
+                    format!(
+                        "{} {}/ {}{shown}{}  {}esc{} clear{}",
+                        theme::fg(theme::Role::Faint),
+                        theme::fg(theme::Role::Focused),
+                        theme::fg(theme::Role::Text),
+                        theme::fg(theme::Role::Faint),
+                        theme::fg(theme::Role::Focused),
+                        theme::fg(theme::Role::Faint),
+                        " ".repeat(inner.saturating_sub(plain))
+                    ),
+                    Some(3 + width::width(&shown)),
+                )
+            }
         }
         None => (hint_line(KEYS_HINT, inner), None),
     };
@@ -1832,6 +1855,11 @@ fn box_inner(frame: &Frame, content: usize, title: &str) -> usize {
         .min((frame.cols as usize).saturating_sub(2))
 }
 
+/// The rows a box can hold between the tab bar and the foot, edges not counted.
+fn box_rows(lines: usize) -> usize {
+    lines.saturating_sub(TABS + STATUS + 2)
+}
+
 /// A bordered box in the middle of the screen: `rows` already styled to `inner` columns,
 /// clipped to the window. Answers where its top left corner went.
 fn paint_box(
@@ -1845,13 +1873,16 @@ fn paint_box(
     let lines = frame.lines as usize;
     let w = inner + 2;
     // Clipped to the window rather than skipped: skipping painted nothing while the
-    // overlay still took the next key, which read as a frozen screen.
-    let rows = &rows[..rows.len().min(lines.saturating_sub(4))];
+    // overlay still took the next key, which read as a frozen screen. Between the tab bar
+    // and the two rows at the foot, which keep saying what is going on.
+    let rows = &rows[..rows.len().min(box_rows(lines))];
     if rows.is_empty() || w < 6 {
         return None;
     }
     let left = cols.saturating_sub(w) / 2;
-    let top = lines.saturating_sub(rows.len() + 2) / 2;
+    let top = (lines.saturating_sub(rows.len() + 2) / 2)
+        .max(TABS)
+        .min(lines.saturating_sub(STATUS + rows.len() + 2));
     let rule = theme::fg(theme::Role::Rule);
     paint_boxed(out, lines, (left, top, w), title, (&rule, &rule), rows);
     Some((left, top))
@@ -1931,11 +1962,15 @@ fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
         .find(|s| s.id == row.workspace)
         .map(|s| s.name.as_str())
         .unwrap_or("");
+    // Cleaned like the title: a name can come from another machine, and a control
+    // character in it would be written to the terminal as one.
+    let clean = |text: &str| width::text(text, width::width(text));
+    let (space, program, state) = (clean(space), clean(program), clean(&row.state));
     let cols = frame.cols as usize;
     let lines = frame.lines as usize;
     let w = palette_width(frame.cols);
     let inner = w - 2;
-    let plain = format!(" {space} / {program} is {}", row.state);
+    let plain = format!(" {space} / {program} is {state}");
     let body = if width::width(&plain) <= inner {
         format!(
             "{} {}{space}{} / {}{program} is {}{}{}",
@@ -1944,7 +1979,7 @@ fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
             theme::fg(theme::Role::Faint),
             theme::fg(theme::Role::Text),
             theme::fg(theme::of(&row.state)),
-            row.state,
+            state,
             " ".repeat(inner - width::width(&plain))
         )
     } else {
@@ -1974,8 +2009,8 @@ fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
     );
 }
 
-/// The row under a box's top edge, where its first row goes.
-const BOX_FIRST_ROW: usize = 1;
+/// The row under a box's top edge, where its first row goes. Hit testing reads it too.
+pub(crate) const BOX_FIRST_ROW: usize = 1;
 
 /// One floating box: the rounded edge in `inks.0`, `title` cut into the top edge in
 /// `inks.1`, and `rows` between the side rules, each already styled and exactly `w - 2`
@@ -3352,7 +3387,7 @@ mod tests {
         let Some((left, top, _, _)) = menu_rect(80, 24, &rows, " menu") else {
             panic!("no menu rect on 80x24");
         };
-        let row = (top + MENU_FIRST_ROW + 4 + 1) as u16;
+        let row = (top + BOX_FIRST_ROW + 4 + 1) as u16;
         let col = (left + 3 + 1) as u16;
         assert_eq!(
             menu_row_at(80, 24, &rows, " menu", row, col),
@@ -6002,6 +6037,64 @@ mod tests {
         let shown = strip(&out);
         assert!(shown.contains(" agents          1"), "{out:?}");
         assert!(shown.contains(" terminals       2"), "{out:?}");
+    }
+
+    /// The close box and the keys box on windows that cannot hold them, and a name that
+    /// carries a control sequence. Found in the last review: the keys box underflowed at
+    /// two columns, and the close box wrote a program's name to the terminal raw.
+    #[test]
+    fn the_close_box_cleans_what_it_names_and_tiny_windows_paint_nothing_wrong() {
+        let rows = [row(1, "claude\x1b]52;c;aGk=\x07", "working")];
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind::default();
+        let frame = |cols, lines, closing, reading| Frame {
+            armed: None,
+            rows: &rows,
+            spaces: &[],
+            panes: std::collections::BTreeSet::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols,
+            lines,
+            message: Some("close claude (working)? Y closes it, any other key keeps it"),
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &seen,
+            unseen: &unseen,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+            image_notice: None,
+            chrome: Chrome {
+                closing,
+                ..Default::default()
+            },
+        };
+        let painted = paint(&frame(100, 30, Some(1), None));
+        assert!(strip(&painted).contains("close claude"), "{painted:?}");
+        assert!(
+            !painted.contains("\x1b]52"),
+            "a name wrote a sequence: {painted:?}"
+        );
+        // Too small for the box: the question stays on the notice row.
+        let small = strip(&paint(&frame(100, 6, Some(1), None)));
+        assert!(small.contains("Y closes it"), "{small:?}");
+        // The keys box at one and two columns paints nothing and does not panic.
+        for cols in [1u16, 2, 3] {
+            let _ = paint(&frame(cols, 24, None, Some(crate::run::Reading::Keybinds)));
+        }
     }
 
     /// A focused slept tab has a blank pane that takes no keys: the notice

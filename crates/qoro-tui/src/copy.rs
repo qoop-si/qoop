@@ -80,14 +80,10 @@ pub struct Copy {
     /// The last search asked for, which `n` and `N` repeat.
     pub last: Option<(String, bool)>,
     pub search: Option<Search>,
-    /// What the notice row says while the mode is open.
+    /// What the notice row says while the mode is open, empty while it has nothing more
+    /// particular to say than its keys.
     pub status: String,
 }
-
-/// What the notice row says when there is nothing more particular to say. It names the
-/// keys, because in a mode the others do not work.
-pub const KEYS: &str =
-    "copy: hjkl move  w b e words  / ? search  n N again  v V select  y copy  q quit";
 
 impl Copy {
     /// Open at `cursor`, with the view's top row at `top`.
@@ -102,7 +98,7 @@ impl Copy {
             query: None,
             last: None,
             search: None,
-            status: KEYS.to_string(),
+            status: String::new(),
         }
     }
 
