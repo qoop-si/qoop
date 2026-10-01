@@ -578,6 +578,10 @@ struct State {
     /// the same two columns. `None` is the ordinary case, and a row that is mid question
     /// answers nothing else: it does not fold, does not navigate and does not sleep.
     armed: Option<i64>,
+    /// Where the wheel moved the column's list: the terminal the keyboard was on, and the
+    /// first list row. A move of the keyboard to another terminal lets the list follow it
+    /// again, so a scroll never hides where the keys went.
+    list_scroll: Option<(u32, usize)>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -813,6 +817,7 @@ impl State {
                 usage: &self.usage,
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
+                list_scroll: self.list_scroll(),
                 keys_query: self.keys_query.as_deref(),
                 closing: self
                     .modes
@@ -1241,17 +1246,29 @@ impl State {
         Some(RowDrop::Pane(target, side))
     }
 
+    /// The terminal the column raises: the focused one, or the sleeping tab the keys rest on.
+    fn column_terminal(&self) -> u32 {
+        if self.focused != 0 {
+            self.focused
+        } else {
+            self.dim_tab().unwrap_or(0)
+        }
+    }
+
+    /// The wheel's first list row, while the keyboard is still on the terminal it was on.
+    fn list_scroll(&self) -> Option<usize> {
+        self.list_scroll
+            .filter(|(terminal, _)| *terminal == self.column_terminal())
+            .map(|(_, at)| at)
+    }
+
     /// The pieces the left column is drawn from, at a given clock and animation frame.
     fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
         sidebar::Column {
             spaces: &self.spaces,
             agents: &self.rows,
             focused_space: self.space.unwrap_or_default(),
-            focused_terminal: if self.focused != 0 {
-                self.focused
-            } else {
-                self.dim_tab().unwrap_or(0)
-            },
+            focused_terminal: self.column_terminal(),
             tick,
             view: self.view,
             seen: &self.seen_done,
@@ -1261,6 +1278,7 @@ impl State {
             shut: &self.shut,
             armed: self.armed,
             usage: Some(&self.usage),
+            scroll: self.list_scroll(),
         }
     }
 
@@ -2296,6 +2314,28 @@ fn focus_height(state: &State) -> usize {
         state.sidebar_width,
     );
     (pane_rows as usize).max(1)
+}
+
+/// The wheel over the open column moves its list, which is longer than the column; true
+/// when the list moved.
+fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
+    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+    if state.collapsed || left == 0 || col as usize > left || (row as usize) < screen::SIDEBAR_TOP {
+        return false;
+    }
+    let column_rows = (state.lines as usize).saturating_sub(screen::STATUS);
+    let column = state.column(state.paint_now, 0);
+    let at = sidebar::wheeled(
+        &column,
+        column_rows,
+        sidebar::current_avatar().as_ref(),
+        up,
+        WHEEL_ROWS,
+    );
+    let next = Some((state.column_terminal(), at));
+    let moved = next != state.list_scroll;
+    state.list_scroll = next;
+    moved
 }
 
 fn scroll_focus(state: &mut State, up: bool, step: usize) {
@@ -3845,6 +3885,7 @@ where
     let (cols, lines) = client::outer_size();
     let mut state = State {
         armed: None,
+        list_scroll: None,
         closing: None,
         close_begun: false,
         rows: Vec::new(),
@@ -5043,6 +5084,11 @@ where
                                     // let go where it went down it is a click, moved
                                     // first it is a drag to another space or a pane.
                                     Some(Clicked::Terminal(picked)) if in_column => {
+                                        // The list stays where the wheel left it when the
+                                        // click moves the keyboard to the row it landed on.
+                                        if let Some((_, at)) = state.list_scroll {
+                                            state.list_scroll = Some((picked, at));
+                                        }
                                         let name = matches!(
                                             state.column_hit(row),
                                             Some((sidebar::Hit::Terminal(_), true))
@@ -5391,6 +5437,9 @@ where
                                     // and where scrolling moves it out of view.
                                     if let Some(said) = take_question(&mut state) {
                                         state.message = Some(said);
+                                        dirty = true;
+                                    }
+                                    if wheel_list(&mut state, row, col, up) {
                                         dirty = true;
                                     }
                                     continue;
@@ -10028,6 +10077,7 @@ mod tests {
             agent_typing: Vec::new(),
             closing: None,
             armed: None,
+            list_scroll: None,
         }
     }
 
@@ -10859,6 +10909,7 @@ mod tests {
             config: crate::config::Config::default(),
             closing: None,
             armed: None,
+            list_scroll: None,
         }
     }
 
@@ -10879,6 +10930,7 @@ mod tests {
         // Space 1 with two terminals side by side, 1 focused, both watched.
         let mut state = State {
             armed: None,
+            list_scroll: None,
             closing: None,
             close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],

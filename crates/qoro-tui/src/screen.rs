@@ -131,6 +131,8 @@ pub struct Chrome<'a> {
     /// A mode on the notice row: its name and its keys, empty when the mode has something
     /// else to say (copy mode's search), which `message` then carries.
     pub mode: Option<(&'static str, &'static [(&'static str, &'static str)])>,
+    /// The first column row the wheel moved the list to, `None` while it follows the keys.
+    pub list_scroll: Option<usize>,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
@@ -148,6 +150,7 @@ impl Default for Chrome<'_> {
             keys_query: None,
             closing: None,
             mode: None,
+            list_scroll: None,
         }
     }
 }
@@ -188,6 +191,7 @@ impl Frame<'_> {
             width: self.sidebar_width,
             shut: self.chrome.shut,
             usage: Some(self.chrome.usage),
+            scroll: self.chrome.list_scroll,
         }
     }
 }
@@ -5666,6 +5670,7 @@ mod tests {
                 width: sidebar::WIDTH,
                 shut: &shut,
                 usage: None,
+                scroll: None,
             },
             44,
         );

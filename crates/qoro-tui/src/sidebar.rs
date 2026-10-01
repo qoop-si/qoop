@@ -553,6 +553,8 @@ pub struct Column<'a> {
     pub armed: Option<i64>,
     /// What each local agent costs, when the person asked to see it.
     pub usage: Option<&'a Usage>,
+    /// The first list row the wheel moved to, `None` while the list follows the keyboard.
+    pub scroll: Option<usize>,
 }
 
 /// One row of the column, and what a click on it means.
@@ -630,24 +632,59 @@ pub(crate) fn rows_folded(
     }
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
+    let (head, feet, body) = parts(c, height, avatar);
+    let mut out = head;
+    out.extend(window(content(c), body, c, c.width));
+    out.extend(feet);
+    out
+}
+
+/// The rows above the list, the foot rows kept, and how many rows the list gets between.
+fn parts(
+    c: &Column,
+    height: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+) -> (Vec<Row>, Vec<Row>, usize) {
+    // The foot, with the pet in it, is taken first, so the list above is laid out in the
+    // rows that are really its own and a scroll never keeps the focused row under the pet.
     let pet = pet_shown(c, height, avatar.is_some());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
     let feet = foot_rows(c.width, pet, update_available().as_deref());
     let foot = feet.len().min(height);
     let room = height - foot;
-    let mut out: Vec<Row> = Vec::with_capacity(height);
+    let mut head: Vec<Row> = Vec::with_capacity(2);
     if next_rows(room) > 0 {
-        out.push(next_row(c));
+        head.push(next_row(c));
     }
-    if out.len() < room {
-        out.push((title_line(c), Some(Hit::Title)));
+    if head.len() < room {
+        head.push((title_line(c), Some(Hit::Title)));
     }
-    let body = room - out.len();
-    out.extend(window(content(c), body, c, c.width));
+    let body = room - head.len();
     let skip = feet.len() - foot;
-    out.extend(feet.into_iter().skip(skip));
-    out
+    (head, feet.into_iter().skip(skip).collect(), body)
+}
+
+/// The first list row after one turn of the wheel over the open column, `step` rows up or
+/// down from where the list sits now, never past either end.
+pub(crate) fn wheeled(
+    c: &Column,
+    height: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+    up: bool,
+    step: usize,
+) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    let (_, _, body) = parts(c, height, avatar);
+    let content = content(c);
+    let at = first_row(&content, body, c);
+    if up {
+        at.saturating_sub(step)
+    } else {
+        (at + step).min(content.len().saturating_sub(body))
+    }
 }
 
 /// Whether the pet stands in the foot: it fits the column, and the whole list still fits
@@ -1666,37 +1703,46 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
     }
 }
 
+/// The first of `content` the window shows in `body` rows: where the wheel put it, or else
+/// where it keeps the keyboard's agent on screen.
+fn first_row(content: &[Row], body: usize, c: &Column) -> usize {
+    let len = content.len();
+    if len <= body {
+        return 0;
+    }
+    if let Some(at) = c.scroll {
+        return at.min(len - body);
+    }
+    let target = content
+        .iter()
+        .rposition(|(_, hit)| *hit == Some(Hit::Terminal(c.focused_terminal)))
+        .or_else(|| {
+            content
+                .iter()
+                .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
+        });
+    // The last row of the target goes at the foot of the window at the latest; the
+    // rule above it stays on screen whenever the two fit together.
+    target.map_or(0, |last| {
+        let first = (last + 1).saturating_sub(body).min(len - body);
+        // Never open on a second row whose name is scrolled off, unless it is the
+        // target itself: a lone `└ claude` reads as broken, a blank foot does not.
+        let orphan = first > 0
+            && first < last
+            && matches!(content[first].1, Some(Hit::Terminal(_)))
+            && content[first].1 == content[first - 1].1;
+        first + usize::from(orphan)
+    })
+}
+
 /// The rows under the title, scrolled into `body` rows and padded out to them.
 ///
-/// Stateless: the window is whatever keeps the keyboard's agent on screen, its space's
-/// rule too when both fit, and the top of the list otherwise. A list that fits never
-/// scrolls, so a calm column is the same rows in the same places on every paint.
+/// The window is where the wheel put it, or else whatever keeps the keyboard's agent on
+/// screen, its space's rule too when both fit, and the top of the list otherwise. A list
+/// that fits never scrolls, so a calm column is the same rows in the same places on every
+/// paint.
 fn window(content: Vec<Row>, body: usize, c: &Column, width: usize) -> Vec<Row> {
-    let len = content.len();
-    let first = if len <= body {
-        0
-    } else {
-        let target = content
-            .iter()
-            .rposition(|(_, hit)| *hit == Some(Hit::Terminal(c.focused_terminal)))
-            .or_else(|| {
-                content
-                    .iter()
-                    .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
-            });
-        // The last row of the target goes at the foot of the window at the latest; the
-        // rule above it stays on screen whenever the two fit together.
-        target.map_or(0, |last| {
-            let first = (last + 1).saturating_sub(body).min(len - body);
-            // Never open on a second row whose name is scrolled off, unless it is the
-            // target itself: a lone `└ claude` reads as broken, a blank foot does not.
-            let orphan = first > 0
-                && first < last
-                && matches!(content[first].1, Some(Hit::Terminal(_)))
-                && content[first].1 == content[first - 1].1;
-            first + usize::from(orphan)
-        })
-    };
+    let first = first_row(&content, body, c);
     let mut out: Vec<Row> = content.into_iter().skip(first).take(body).collect();
     while out.len() < body {
         out.push(blank(width));
@@ -2357,6 +2403,7 @@ mod tests {
             width,
             shut,
             usage: None,
+            scroll: None,
         }
     }
 
@@ -3060,6 +3107,58 @@ mod tests {
         // title.
         let (spaces, agents) = sample();
         assert_eq!(hit(&spaces, &agents, 3, 3, 14, 2), Some(Hit::Space(1)));
+    }
+
+    /// The wheel moves a long list past the keyboard's agent, all the way to the last row
+    /// and back to the first, and never past either end.
+    #[test]
+    fn the_wheel_scrolls_a_long_list_to_its_end_and_back() {
+        let spaces: Vec<WorkspaceRow> = (1..=10).map(|n| space(n, &format!("s{n}"))).collect();
+        let agents: Vec<AgentRow> = (1..=30u32)
+            .map(|n| agent(n, i64::from((n - 1) / 3 + 1), "claude", "idle"))
+            .collect();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let drawn = |c: &Column| -> Vec<Hit> {
+            rows_folded(c, 15, None)
+                .into_iter()
+                .filter_map(|(_, hit)| hit)
+                .collect()
+        };
+        assert!(!drawn(&c).contains(&Hit::Terminal(30)), "the list fits?");
+        // Turned down far enough, the last agent shows and the wheel stops there.
+        let mut last = None;
+        for _ in 0..100 {
+            c.scroll = Some(wheeled(&c, 15, None, false, 3));
+            if c.scroll == last {
+                break;
+            }
+            last = c.scroll;
+        }
+        assert!(drawn(&c).contains(&Hit::Terminal(30)), "{:?}", drawn(&c));
+        assert!(
+            !drawn(&c).contains(&Hit::Terminal(1)),
+            "the focused row pinned it"
+        );
+        assert_eq!(rows_folded(&c, 15, None).len(), 15);
+        // And back up, to the first space's rule under the title.
+        for _ in 0..100 {
+            c.scroll = Some(wheeled(&c, 15, None, true, 3));
+        }
+        assert_eq!(c.scroll, Some(0));
+        assert!(drawn(&c).contains(&Hit::Space(1)));
     }
 
     #[test]
