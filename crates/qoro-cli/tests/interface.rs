@@ -743,14 +743,17 @@ impl Interface {
 
     /// Whether one index row carries the keyboard, read out of the raw bytes.
     ///
-    /// The selected background (`48;5;236`) is the marker, and it is the first
-    /// thing painted after the row's cursor move, so the first bytes decide.
+    /// The keyboard's agent opens its first row with an ember corner (`38;5;202`); a space
+    /// rule that holds the keyboard for a tab with no agent carries the selected
+    /// background (`48;5;236`). Either is the row's first cell, so the first cell decides.
     /// The stripped text cannot answer this: stripping takes the colour out.
     fn panel_selected(&self, row: usize) -> bool {
         self.screen
             .cells(row)
             .and_then(|cells| cells.first())
-            .is_some_and(|(_, style)| style.contains("48;5;236"))
+            .is_some_and(|(c, style)| {
+                style.contains("48;5;236") || (style.contains("38;5;202") && *c == '\u{256d}')
+            })
     }
 
     /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
@@ -2208,7 +2211,8 @@ fn radar_tree_order_holds_creation_order() {
     // in iTerm2), one cell and a space. A place row (`└ claude · ...`) never opens with
     // braille, so this pins the match to the state row alone.
     fn is_state_row(line: &str, program: &str) -> bool {
-        line.strip_prefix(' ').is_some_and(|rest| {
+        // The keyboard's agent opens with its corner where every other row has a blank.
+        line.strip_prefix([' ', '\u{256d}']).is_some_and(|rest| {
             rest.chars()
                 .next()
                 .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))

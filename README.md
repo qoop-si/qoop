@@ -51,8 +51,9 @@ centre breathes: its arms come in clockwise and go back out, each breath startin
 further round. When it stops the dots settle into a picture: an empty ring when it wants
 you, an X when it failed, the full square when it finished, one dot in the middle when it
 is idle, a line across the middle while its space sleeps. The shape says it as well as the colour, so it reads without colour
-too. A split tab draws a frame round its panes, with each pane's name on its top edge, and
-the pane the keyboard is in is drawn in its space's colour.
+too. A split tab names each pane on its top edge and marks only the pane the keyboard is in,
+with an ember curve at each of its corners; the agent the keyboard is on wears the same
+corners in the column.
 
 `ctrl-a` then a key moves between terminals, makes one or closes one; `ctrl-q` detaches. The
 bottom row names the keys that work where you are, and every command while `ctrl-a` waits
