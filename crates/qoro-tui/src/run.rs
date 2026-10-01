@@ -1126,7 +1126,7 @@ impl State {
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
-            if (row as usize) != screen::TABS {
+            if row == 0 || (row as usize) > screen::TABS {
                 // The pane. A terminal application that wants the mouse asks for it, and
                 // passing a click to one that did not would type its report at a prompt.
                 return None;
@@ -1138,9 +1138,10 @@ impl State {
                 self.focused,
                 pane_cols as usize,
                 (col as usize).saturating_sub(left + 1),
-                &self.unseen_finished,
+                row as usize - 1,
             ) {
                 Some(tabs::Hit::Terminal(terminal)) => Some(Clicked::Terminal(terminal)),
+                Some(tabs::Hit::Close(_)) => Some(Clicked::CloseFocused),
                 Some(tabs::Hit::New) => Some(Clicked::NewTerminal),
                 None => None,
             };
@@ -3701,6 +3702,9 @@ enum Clicked {
     /// The question is off. Nothing was sent.
     CancelClose,
     Terminal(u32),
+    /// The close on the focused tab: the same as `ctrl-a x`, a question first when an agent
+    /// in it is busy.
+    CloseFocused,
     NewTerminal,
     /// A space's `+`: a terminal or an agent in that space.
     New(i64),
@@ -5055,6 +5059,10 @@ where
                                             wr.write_all(&bytes).await?;
                                             dirty = true;
                                         }
+                                    }
+                                    Some(Clicked::CloseFocused) => {
+                                        close_focused(&mut state, &mut request);
+                                        dirty = true;
                                     }
                                     // The tab bar's `+` is the space on screen's `+`.
                                     Some(Clicked::NewTerminal) => {
@@ -12324,7 +12332,7 @@ mod tests {
     fn the_focus_list_scrolls_with_arrows_and_j_k() {
         let mut state = bare_state();
         // Three pane rows: five events do not fit.
-        state.lines = 6;
+        state.lines = (3 + screen::TABS + screen::STATUS) as u16;
         state.focus = true;
         state.focus_events = (0..5).map(|i| tool_event(&format!("tool {i}"))).collect();
         assert!(matches!(

@@ -365,7 +365,7 @@ fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
 }
 
 /// Rows the tab bar takes, at the top of the pane.
-pub const TABS: usize = 1;
+pub const TABS: usize = tabs::ROWS;
 
 /// The screen row the left column starts on.
 ///
@@ -579,23 +579,30 @@ pub fn paint(frame: &Frame) -> String {
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
-    out.push_str(&at(1, left + 1));
     let tabs: Vec<AgentRow> = in_space(frame.rows, frame.space)
         .into_iter()
         .filter(|r| !frame.panes.contains(&r.terminal))
         .collect();
-    for (piece, style) in tabs::painted(&tabs, frame.focused, pane_cols as usize, frame.unseen) {
-        out.push_str(&match style {
-            _ if spotlight => faded.clone(),
-            tabs::Ink::Focused => theme::tab_on(),
-            // The bar shows one space's terminals, so one space colour lands on
-            // all of them: identity, not confetti. Focus keeps the pink pill.
-            tabs::Ink::Other => theme::tab_in(theme::space_of(frame.space.unwrap_or_default())),
-            tabs::Ink::Quiet => theme::fg(theme::Role::Faint),
-        });
-        out.push_str(&piece);
+    for (at_row, pieces) in tabs::painted(&tabs, frame.focused, pane_cols as usize)
+        .into_iter()
+        .enumerate()
+    {
+        out.push_str(&at(at_row + 1, left + 1));
+        for (piece, style) in pieces {
+            out.push_str(&match style {
+                _ if spotlight => faded.clone(),
+                tabs::Ink::Focused => theme::tab_on(),
+                tabs::Ink::FocusedMark => theme::fg(theme::Role::Brand),
+                // The bar shows one space's terminals, so one space colour lands on
+                // all of them: identity, not confetti. Focus keeps the pink name.
+                tabs::Ink::Other => theme::tab_in(theme::space_of(frame.space.unwrap_or_default())),
+                tabs::Ink::Curve => theme::fg(theme::Role::Rule),
+                tabs::Ink::Sub | tabs::Ink::Quiet => theme::fg(theme::Role::Faint),
+            });
+            out.push_str(&piece);
+        }
+        out.push_str(theme::RESET);
     }
-    out.push_str(theme::RESET);
 
     // The column runs the whole height, from the top row to the status line. It is taller
     // than the pane by the tab bar's row, which is the row the bar no longer takes from it.
@@ -2116,8 +2123,13 @@ fn box_inner(frame: &Frame, content: usize, title: &str) -> usize {
 
 /// The rows a box can hold between the tab bar and the foot, edges not counted.
 fn box_rows(lines: usize) -> usize {
-    lines.saturating_sub(TABS + STATUS + 2)
+    lines.saturating_sub(BOX_TOP + STATUS + 2)
 }
+
+/// The first row an overlay box may take: under the tab bar's names. It may cover the
+/// folders under them, which a modal box has no use for, so the keys still fit an 80 by 24
+/// window.
+const BOX_TOP: usize = 1;
 
 /// A bordered box in the middle of the screen: `rows` already styled to `inner` columns,
 /// clipped to the window. Answers where its top left corner went.
@@ -2132,15 +2144,15 @@ fn paint_box(
     let lines = frame.lines as usize;
     let w = inner + 2;
     // Clipped to the window rather than skipped: skipping painted nothing while the
-    // overlay still took the next key, which read as a frozen screen. Between the tab bar
-    // and the two rows at the foot, which keep saying what is going on.
+    // overlay still took the next key, which read as a frozen screen. Between the tab bar's
+    // names and the two rows at the foot, which keep saying what is going on.
     let rows = &rows[..rows.len().min(box_rows(lines))];
     if rows.is_empty() || w < 6 {
         return None;
     }
     let left = cols.saturating_sub(w) / 2;
     let top = (lines.saturating_sub(rows.len() + 2) / 2)
-        .max(TABS)
+        .max(BOX_TOP)
         .min(lines.saturating_sub(STATUS + rows.len() + 2));
     let (rule, ink) = spot_inks();
     paint_boxed(out, lines, (left, top, w), title, (&rule, &ink), rows);
@@ -3024,7 +3036,10 @@ mod tests {
     #[test]
     fn the_pane_is_what_is_left_after_the_index_and_the_status_line() {
         // Two rows at the bottom now: the notice and the keys.
-        assert_eq!(pane_size(80, 24), (80 - sidebar::WIDTH as u16 - 1, 21));
+        assert_eq!(
+            pane_size(80, 24),
+            (80 - sidebar::WIDTH as u16 - 1, (24 - TABS - STATUS) as u16)
+        );
     }
 
     #[test]
@@ -3635,7 +3650,7 @@ mod tests {
         );
         assert!(
             bar.contains(&crate::theme::tab_on()),
-            "focused tab lost its pill: {bar:?}"
+            "focused tab lost its pink name: {bar:?}"
         );
     }
 
@@ -5810,7 +5825,8 @@ mod tests {
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 60,
-            lines: 7,
+            // Four pane rows.
+            lines: (4 + TABS + STATUS) as u16,
             message: None,
             hint: None,
             palette: None,
@@ -6372,7 +6388,10 @@ mod tests {
     fn the_pane_shrinks_from_the_right_exactly_as_it_shrinks_from_the_left() {
         assert_eq!(
             pane_size_for(120, 24, false, 39, sidebar::WIDTH),
-            (120 - sidebar::WIDTH as u16 - 1 - 39, 21)
+            (
+                120 - sidebar::WIDTH as u16 - 1 - 39,
+                (24 - TABS - STATUS) as u16
+            )
         );
         assert_eq!(
             pane_size_for(120, 24, false, 0, sidebar::WIDTH),
@@ -6381,7 +6400,10 @@ mod tests {
         // Pulled widths move both the rule and the pane with it.
         assert_eq!(left_for(120, false, 18), 19);
         assert_eq!(left_for(120, false, 36), 37);
-        assert_eq!(pane_size_for(120, 24, false, 0, 18), (120 - 18 - 1, 21));
+        assert_eq!(
+            pane_size_for(120, 24, false, 0, 18),
+            (120 - 18 - 1, (24 - TABS - STATUS) as u16)
+        );
     }
 
     /// The settings census counts live agents: a sleeping tomb is listed,

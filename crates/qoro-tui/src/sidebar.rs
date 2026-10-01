@@ -417,16 +417,6 @@ pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> b
         && unseen.contains(&(agent.terminal, gen_of(agent)))
 }
 
-/// Whether the tab bar should mark this terminal as freshly finished.
-///
-/// Tabs carry no `Seen`: a daemon `done` and a derived idle-after-work both
-/// read as the done glyph until focused. Same glyph as `done`, no new colour.
-pub fn tab_is_new(agent: &AgentRow, focused: u32, unseen: &Unseen) -> bool {
-    agent.terminal != focused
-        && matches!(agent.state.as_str(), "idle" | "done")
-        && unseen.contains(&(agent.terminal, gen_of(agent)))
-}
-
 /// Where a row sorts in the priority view: what wants a person first, then
 /// what is alive, then what is settled.
 ///
@@ -4205,8 +4195,6 @@ mod tests {
         unseen.insert((7, 0));
         assert!(is_new(idle, 1, &seen, &unseen));
         assert!(!is_new(idle, 7, &seen, &unseen));
-        assert!(tab_is_new(idle, 1, &unseen));
-        assert!(!tab_is_new(idle, 7, &unseen));
         // A plain idle with no finish behind it stays calm.
         let calm = agents.iter().find(|a| a.terminal == 8).unwrap();
         assert!(!is_new(calm, 1, &seen, &Unseen::new()));
@@ -6456,7 +6444,7 @@ mod tests {
 
     /// Sleeping earns the violet indicator and sinks below idle: settled,
     /// visible, never attention. And it is never news: no bell, no unread,
-    /// no "new" tab mark, even with an unseen entry sitting there.
+    /// even with an unseen entry sitting there.
     #[test]
     fn a_sleeping_row_is_violet_calm_bottom_and_never_news() {
         assert_eq!(colour_for("sleeping"), Some(crate::theme::Role::Sleeping));
@@ -6468,7 +6456,6 @@ mod tests {
         unseen.insert((7, 3));
         assert!(!is_unread(&slept, focused, &seen));
         assert!(!is_new(&slept, focused, &seen, &unseen));
-        assert!(!tab_is_new(&slept, focused, &unseen));
         assert!(!needs_person(&slept, focused, &seen, &unseen));
         assert_eq!(
             priority_of(&slept, focused, &seen, &unseen),

@@ -298,10 +298,10 @@ pub fn status_in_for(role: Role, level: crate::colorlevel::Level) -> String {
     }
 }
 
-/// The tab with the keyboard: bold pink on the raised background.
+/// The name of the tab with the keyboard: bold pink.
 ///
-/// Findable without reading it, and never a white pill: a white block is the brightest
-/// thing on the bar, and the selected tab is not the most urgent thing on it.
+/// Findable without reading it, and never white: white is the brightest thing on the bar,
+/// and the selected tab is not the most urgent thing on it.
 /// Pink (212, `FF8FD9`) stands clear of the warm alarm pair and every state;
 /// amber would read as alarm, so the tab left amber behind.
 pub fn tab_on() -> String {
@@ -313,7 +313,7 @@ pub fn tab_on() -> String {
 pub fn tab_on_for(level: crate::colorlevel::Level) -> String {
     match level {
         crate::colorlevel::Level::Mono => "\x1b[0;1m".to_string(),
-        _ => format!("\x1b[0;1;48;5;{};38;5;{}m", raised().0, tab_on_fg()),
+        _ => format!("\x1b[0;1;38;5;{}m", tab_on_fg()),
     }
 }
 

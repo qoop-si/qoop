@@ -208,6 +208,10 @@ const ROWS: u16 = 30;
 /// the pane, not over this column, so the column starts at the very top.
 const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + 1;
 
+/// The screen row the tab names are on, one based: the bar's top row. The folders run on
+/// the row under it.
+const TAB_NAMES_ROW: usize = 1;
+
 /// The screen row the first space's rule is drawn on, directly under that title. The next
 /// space's rule follows it directly while the first space holds no agent.
 const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 1;
@@ -566,7 +570,7 @@ impl Interface {
         let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
         Some(
             self.screen
-                .text(qoro_tui::screen::TABS)?
+                .text(TAB_NAMES_ROW)?
                 .chars()
                 .skip(qoro_tui::screen::left(self.cols))
                 .take(pane_cols as usize)
@@ -586,7 +590,7 @@ impl Interface {
     fn focused_tab(&self) -> Option<u32> {
         let (pane_cols, _) = qoro_tui::screen::pane_size(self.cols, self.rows);
         let left = qoro_tui::screen::left(self.cols);
-        let bar = self.screen.cells(qoro_tui::screen::TABS)?;
+        let bar = self.screen.cells(TAB_NAMES_ROW)?;
         let bar = &bar[left.min(bar.len())..(left + pane_cols as usize).min(bar.len())];
         let on = qoro_tui::theme::tab_on();
         let at = bar.iter().position(|(_, style)| style.contains(&on))?;
@@ -634,7 +638,9 @@ impl Interface {
     /// from it the first time a label changed.
     fn tab_column(&self, terminal: u32) -> Option<u16> {
         let bar = self.tab_bar()?;
-        let at = bar.find(&format!(" {terminal} "))?;
+        // Counted in characters, which are columns here: the curves and the close are wider
+        // in bytes than in columns.
+        let at = bar[..bar.find(&format!(" {terminal} "))?].chars().count();
         // The bar is read from its own left edge and a click is sent in screen columns, so
         // the column the pane starts at has to be added back.
         Some(at as u16 + 2 + qoro_tui::screen::left(self.cols) as u16)
@@ -1257,6 +1263,42 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     );
 }
 
+/// The close in the focused tab's top right corner ends that terminal, and only that one:
+/// a shell has nothing busy to ask about, so the click alone is enough.
+#[test]
+fn g12_8_the_close_on_the_focused_tab_ends_that_terminal() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.create_terminal("");
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(15)),
+        "the second terminal never appeared: {:?}",
+        ui.tab_bar()
+    );
+    let bar = ui.tab_bar().unwrap_or_default();
+    let close = bar
+        .chars()
+        .position(|c| c == '\u{00d7}')
+        .unwrap_or_else(|| panic!("the focused tab has no close: {bar:?}"));
+    assert_eq!(bar.matches('\u{00d7}').count(), 1, "{bar:?}");
+    // The bar is read from its own left edge and a click is sent in one based screen
+    // columns, so the column the pane starts at has to be added back.
+    ui.click(
+        close as u16 + 1 + qoro_tui::screen::left(ui.cols) as u16,
+        TAB_NAMES_ROW as u16,
+    );
+    assert!(
+        ui.wait_for_tabs(|bar| !bar.contains(" 2 "), Duration::from_secs(15)),
+        "a click on the close left the tab: {:?}",
+        ui.tab_bar()
+    );
+    assert!(
+        ui.tab_bar().is_some_and(|bar| bar.contains(" 1 ")),
+        "the close took the other tab too: {:?}",
+        ui.tab_bar()
+    );
+}
+
 /// G12.8: the tab bar is clickable, and a panel title is not a target.
 ///
 /// Sent as the terminal sends it, which is the extended report `CSI < button ; col ; row M`
@@ -1277,7 +1319,7 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
     let first = ui
         .tab_column(1)
         .unwrap_or_else(|| panic!("terminal 1 has no tab: {:?}", ui.tab_bar()));
-    ui.click(first, qoro_tui::screen::TABS as u16);
+    ui.click(first, TAB_NAMES_ROW as u16);
     assert!(
         ui.wait_for_tab(1, Duration::from_secs(10)),
         "a click on the first tab did not move to it: {:?}",
@@ -1292,7 +1334,7 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
     let second = ui
         .tab_column(2)
         .unwrap_or_else(|| panic!("terminal 2 has no tab: {:?}", ui.tab_bar()));
-    ui.click(second, qoro_tui::screen::TABS as u16);
+    ui.click(second, TAB_NAMES_ROW as u16);
     assert!(ui.wait_for_tab(2, Duration::from_secs(10)));
     ui.click(5, SPACES_TITLE_ROW as u16);
     let _ = ui.wait_for("never appears", Duration::from_secs(2));
@@ -1327,14 +1369,17 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
     let bar = ui
         .tab_bar()
         .unwrap_or_else(|| panic!("no tab bar: {:?}", ui.tab_bar()));
+    // Counted in characters, which are columns here: the curves and the close are wider in
+    // bytes than in columns.
     let plus = bar
-        .find('+')
+        .chars()
+        .position(|c| c == '+')
         .unwrap_or_else(|| panic!("no new tab button: {bar:?}"));
     // Read off the bar's own left edge, clicked in screen columns.
     let mark = ui.painted.len();
     ui.click(
         plus as u16 + 1 + qoro_tui::screen::left(COLS) as u16,
-        qoro_tui::screen::TABS as u16,
+        TAB_NAMES_ROW as u16,
     );
     // It asks which: `agent` first, `terminal` under it.
     let deadline = Instant::now() + Duration::from_secs(10);
