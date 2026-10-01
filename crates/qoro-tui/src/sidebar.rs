@@ -1279,7 +1279,9 @@ pub(crate) fn machine_of(name: &str) -> (&str, &str) {
 /// The chip a remote space opens with: the word `ssh`, in its link's colour.
 fn machine_chip(name: &str, link: LinkState, style: Chips) -> Option<Machine<'_>> {
     let (host, bare) = machine_of(name);
-    host.chars().next()?;
+    if host.is_empty() {
+        return None;
+    }
     let text = format!("{} ", chip(style, "ssh", 3));
     Some(Machine {
         lead: crate::width::width(&text),
@@ -1847,8 +1849,9 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
 }
 
 /// A tab of a sleeping space: its space's quieter colour, like a calm agent's title, with
-/// the sleeping mark and no other dot, since nothing runs in it. What a person called it, else the agent that
-/// comes back in it, else a shell (a sleep refuses any other program), and where.
+/// the sleeping mark and no other dot, since nothing runs in it. What a person called it,
+/// else the agent that comes back in it, else a shell (a sleep refuses any other program),
+/// and where.
 fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
     let name = tab.label().to_string();
     let text = match cwd_basename(Some(&tab.cwd)).filter(|b| !b.eq_ignore_ascii_case(&space.name)) {
