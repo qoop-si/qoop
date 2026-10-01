@@ -142,7 +142,8 @@ pub fn chips() -> Chips {
 /// Round caps are private use glyphs: Ghostty and kitty draw them whatever the font, and
 /// they meet the chip cleanly there. iTerm2 draws them with a notch where the cap meets
 /// the chip, and anywhere else they would be a box with a question mark in it, so the rest
-/// get half blocks. Inside tmux the terminal outside is not known, so flat.
+/// get plain square chips: a blank end on the chip's own ground, which no font can bend.
+/// Inside tmux the terminal outside is not known, so flat.
 /// `QORO_CHIPS=round` or `flat` forces either, for a terminal with a Nerd Font this cannot
 /// see, and a mono session has no colour to draw a chip in at all.
 fn chips_from(env: &Env) -> Chips {

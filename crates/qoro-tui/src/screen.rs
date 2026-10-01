@@ -630,17 +630,25 @@ fn cut(text: &str, from: usize, to: usize) -> String {
         .collect()
 }
 
-/// A chip of a row, `len` columns from `at`: its two ends drawn in the chip's background,
-/// which rounds or squares the chip off, and the cells between them on that background in
-/// `role`. The caller puts the row's own escape back after it.
+/// A chip of a row, `len` columns from `at`, on the chip's background in `role`. A round
+/// end is a glyph drawn in that background, which rounds the chip off; a blank end is
+/// simply more of the background, which squares it. The caller puts the row's own escape
+/// back after it.
 fn chip(text: &str, (at, len): (usize, usize), role: theme::Role, selected: bool) -> String {
     let end = at + len.max(2) - 1;
-    let mut out = theme::chip_cap(selected);
-    out.push_str(&cut(text, at, at + 1));
+    let cap = |from: usize| {
+        let cell = cut(text, from, from + 1);
+        let ink = if cell == " " {
+            theme::chip_in(role)
+        } else {
+            theme::chip_cap(selected)
+        };
+        format!("{ink}{cell}")
+    };
+    let mut out = cap(at);
     out.push_str(&theme::chip_in(role));
     out.push_str(&cut(text, at + 1, end));
-    out.push_str(&theme::chip_cap(selected));
-    out.push_str(&cut(text, end, end + 1));
+    out.push_str(&cap(end));
     out
 }
 
@@ -5211,7 +5219,6 @@ mod tests {
         let ink = theme::space_of(1);
         assert!(painted.contains(&theme::selected()), "{painted:?}");
         assert!(painted.contains(&theme::chip_in(ink)), "{painted:?}");
-        assert!(painted.contains(&theme::chip_cap(true)), "{painted:?}");
         assert_ne!(theme::chip_in(ink), theme::selected_in(ink));
     }
 

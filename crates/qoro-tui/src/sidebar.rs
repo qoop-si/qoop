@@ -15,7 +15,7 @@
 //! the rows are the same static text every time.
 
 use crate::colorlevel::Chips;
-use qoro_runtime::control::{AgentRow, LinkState, SleepingTab, WorkspaceRow};
+use qoro_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
 
 /// One painted row of the chrome: its text, and the colour its state gives it.
 ///
@@ -1086,10 +1086,8 @@ fn content(c: &Column) -> Vec<Row> {
 /// one step quieter, the way a calm agent does: the word `sleeping` and the `wake` chip
 /// carry the state, and the space is still told apart from the others asleep beside it.
 ///
-/// A space of another machine opens with an `ssh` chip, in the colour of its link: done's
-/// green while connected, blocked's orange while it connects or does not answer, faint
-/// while it is let go. The name is then drawn without the machine, which the settings box
-/// names in full.
+/// A space of another machine is named `host:name`, as the interface lists it; its link is
+/// in the settings box.
 ///
 /// The controls are [`Block`], in fixed columns at the right. Folded, the count and the
 /// controls take the colour of the most urgent agent under them when that agent wants a
@@ -1153,23 +1151,14 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
         slots.push(String::new());
         slots
     };
-    let fits = |slot: &str, lead: usize| room_for(width, slot, lead) >= MIN_NAME_COLS;
-    let pick = |lead: usize| slots.iter().find(|slot| fits(slot, lead));
-    // The machine's chip is one more thing beside the name, under the same rule: it goes
-    // once nothing of the slot is left that lets the name keep its columns, and the name
-    // then carries the machine as `host:name`.
-    let machine = space
-        .link
-        .and_then(|link| machine_chip(&space.name, link, style))
-        .and_then(|machine| pick(machine.lead).map(|slot| (machine, slot)));
-    let (machine, slot) = match machine {
-        Some((machine, slot)) => (Some(machine), slot.clone()),
-        None => (None, pick(0).or(slots.last()).cloned().unwrap_or_default()),
-    };
-    let lead = machine.as_ref().map_or(0, |m| m.lead);
+    let slot = slots
+        .iter()
+        .find(|slot| room_for(width, slot) >= MIN_NAME_COLS)
+        .or(slots.last())
+        .cloned()
+        .unwrap_or_default();
     let slot_w = crate::width::width(&slot);
-    let shown = machine.as_ref().map_or(space.name.as_str(), |m| m.name);
-    let name = shorten_middle(shown, room_for(width, &slot, lead));
+    let name = shorten_middle(&space.name, room_for(width, &slot));
     let name_w = crate::width::width(&name);
     let fold = if folds(c, space.id) {
         if open { "\u{25be}" } else { "\u{25b8}" }
@@ -1181,13 +1170,9 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
     if fold != " " {
         runs.push((0, 1, Role::Faint));
     }
-    if let Some(m) = &machine {
-        runs.push((NAME_AT, m.lead - 1, m.role));
-        chips.push((NAME_AT, m.lead - 1));
-    }
     if !slot.is_empty() {
         runs.push((
-            NAME_AT + lead + name_w,
+            NAME_AT + name_w,
             slot_w,
             if space.asleep { Role::Sleeping } else { mark },
         ));
@@ -1199,10 +1184,9 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
         (at < left_w && w > 0).then(|| (at, w.min(left_w - at), role))
     };
     runs = runs.into_iter().filter_map(clip).collect();
-    let accent = clip((NAME_AT + lead, name_w, ink));
+    let accent = clip((NAME_AT, name_w, ink));
     chips.retain(|&(at, w)| at + w <= left_w);
-    let chip = machine.as_ref().map_or(String::new(), |m| m.text.clone());
-    let left = fit(&format!("{fold}{chip}{name}{slot}"), left_w);
+    let left = fit(&format!("{fold}{name}{slot}"), left_w);
     // The cells of the block, coloured by what they say rather than by which field holds
     // them. The sleeping ink means a space is asleep, so it cannot also be the affirmative
     // of a question that destroys one, and the two answers are deliberately not the same
@@ -1248,20 +1232,8 @@ fn chip(style: Chips, word: &str, inner: usize) -> String {
     let body = format!("{}{word}{}", " ".repeat(pad / 2), " ".repeat(pad - pad / 2));
     match style {
         Chips::Round => format!("\u{e0b6}{body}\u{e0b4}"),
-        Chips::Flat => format!("\u{2590}{body}\u{258c}"),
-        Chips::Plain => format!(" {body} "),
+        Chips::Flat | Chips::Plain => format!(" {body} "),
     }
-}
-
-/// A remote space's machine, as the rule opens with it.
-struct Machine<'a> {
-    /// The chip and the blank after it.
-    text: String,
-    /// The columns `text` takes.
-    lead: usize,
-    role: crate::theme::Role,
-    /// The space's name without the machine.
-    name: &'a str,
 }
 
 /// The machine a remote space's name says, and the name without it.
@@ -1274,21 +1246,6 @@ pub(crate) fn machine_of(name: &str) -> (&str, &str) {
     name.split_once(':')
         .filter(|(host, _)| !host.is_empty() && !host.contains(' '))
         .unwrap_or((name, name))
-}
-
-/// The chip a remote space opens with: the word `ssh`, in its link's colour.
-fn machine_chip(name: &str, link: LinkState, style: Chips) -> Option<Machine<'_>> {
-    let (host, bare) = machine_of(name);
-    if host.is_empty() {
-        return None;
-    }
-    let text = format!("{} ", chip(style, "ssh", 3));
-    Some(Machine {
-        lead: crate::width::width(&text),
-        text,
-        role: crate::theme::link_ink(link),
-        name: bare,
-    })
 }
 
 /// Whether a space has anything to fold away under its rule: an agent, or a sleeping
@@ -1345,16 +1302,14 @@ const BLOCK_W: usize = {
 /// left of the width once these are paid for.
 const BLOCK_TAIL: usize = NAME_AT + BLOCK_W + 1;
 
-/// The columns a name has once the slot beside it and the machine's chip before it
-/// (`lead`) are paid for, which is what decides whether the word `sleeping` fits, which
-/// part of the count stays, and whether the chip does.
+/// The columns a name has once the slot beside it is paid for, which is what decides
+/// whether the word `sleeping` fits and which part of the count stays.
 ///
 /// The same subtraction `rule` makes for the name's own room, so the two cannot disagree
 /// about what fits.
-fn room_for(width: usize, slot: &str, lead: usize) -> usize {
+fn room_for(width: usize, slot: &str) -> usize {
     width
         .saturating_sub(BLOCK_TAIL)
-        .saturating_sub(lead)
         .saturating_sub(crate::width::width(slot))
 }
 
@@ -2510,6 +2465,7 @@ fn fit_to(text: &str, cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qoro_runtime::control::LinkState;
 
     /// A wide column for the width sweeps: what half of a 120 column window drags to.
     const SIDEBAR_MAX: usize = 60;
@@ -7143,7 +7099,7 @@ mod tests {
         let row = rule_at(30, "qoro", 3, true, true);
         assert!(row.contains("qoro (3)"), "{row:?}");
         let row = rule_at(SIDEBAR_MIN, "qoro", 3, true, true);
-        assert!(row.starts_with("\u{25be}qo\u{2026}\u{2590}"), "{row:?}");
+        assert!(row.starts_with("\u{25be}qo\u{2026} + "), "{row:?}");
     }
 
     /// A space with tabs asleep beside awake ones says both while there is room, then the
@@ -7162,10 +7118,7 @@ mod tests {
         );
         assert!(at(30).contains("qoro (3) "), "{:?}", at(30));
         let narrow = at(SIDEBAR_MIN);
-        assert!(
-            narrow.starts_with("\u{25be}qo\u{2026}\u{2590}"),
-            "{narrow:?}"
-        );
+        assert!(narrow.starts_with("\u{25be}qo\u{2026} + "), "{narrow:?}");
         assert!(!narrow.contains('('), "{narrow:?}");
     }
 
@@ -7352,20 +7305,14 @@ mod tests {
         assert_eq!(mark(Shut::from([1, 2])), ['\u{25b8}', '\u{25b8}', ' ', ' ']);
     }
 
-    /// A space of another machine opens with an `ssh` chip, in the colour of its link,
-    /// and its name without the machine; with no room for both, the chip goes and the
-    /// name carries the machine again.
+    /// A space of another machine is drawn with its machine before its name and no chip,
+    /// whatever its link: the link is in the settings box.
     #[test]
-    fn a_remote_space_wears_its_machine_in_the_colour_of_its_link() {
-        use crate::theme::Role;
-        // `ssh` and its two ends.
-        const SSH_W: usize = 5;
-        for (link, name, ink) in [
-            (LinkState::Up, "ubox:webshop", Role::Done),
-            (LinkState::Parked, "ubox:webshop", Role::Faint),
-            (LinkState::Down, "ubox:webshop (connecting)", Role::Blocked),
-            // The machine that never answered: its row is named after it.
-            (LinkState::Down, "ubox (ssh: refused)", Role::Blocked),
+    fn a_remote_space_is_named_with_its_machine_and_no_chip() {
+        for (link, name) in [
+            (LinkState::Up, "ubox:webshop"),
+            (LinkState::Parked, "ubox:webshop"),
+            (LinkState::Down, "ubox:webshop (connecting)"),
         ] {
             let mut row = space(1, name);
             row.link = Some(link);
@@ -7373,32 +7320,12 @@ mod tests {
             let none = (Seen::new(), Unseen::new(), Shut::new());
             let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
             let rule = rule_styled(&c, 1, Chips::Flat);
-            let shown = name.strip_prefix("ubox:").unwrap_or(name);
+            assert!(rule.text.starts_with(&format!(" {name}")), "{rule:?}");
             assert!(
-                rule.text
-                    .starts_with(&format!(" {} {shown}", chip(Chips::Flat, "ssh", 3))),
+                rule.chips.iter().all(|&(at, _)| at > name.len()),
                 "{rule:?}"
             );
-            assert!(rule.runs.contains(&(NAME_AT, SSH_W, ink)), "{rule:?}");
-            assert!(rule.chips.contains(&(NAME_AT, SSH_W)), "{rule:?}");
-            assert_eq!(
-                rule.accent,
-                Some((NAME_AT + SSH_W + 1, shown.len(), crate::theme::space_of(1)))
-            );
-            let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MIN, &none);
-            let narrow = rule_styled(&c, 1, Chips::Flat);
-            assert!(narrow.text.starts_with(" md\u{2026}"), "{narrow:?}");
-            assert!(!narrow.chips.contains(&(NAME_AT, SSH_W)), "{narrow:?}");
         }
-        // A space of this machine says nothing about a link.
-        let spaces = vec![space(1, "local:name")];
-        let none = (Seen::new(), Unseen::new(), Shut::new());
-        let c = clicks(&spaces, &[], View::Tree, WIDTH, &none);
-        assert!(
-            rule_styled(&c, 1, Chips::Flat)
-                .text
-                .starts_with(" local:name")
-        );
     }
 
     /// Round, flat and plain draw a rule the same width with every control in the same
@@ -7427,7 +7354,7 @@ mod tests {
                         (chip.chars().next(), chip.chars().last())
                     };
                     assert_eq!(ends(round), (Some('\u{e0b6}'), Some('\u{e0b4}')));
-                    assert_eq!(ends(flat), (Some('\u{2590}'), Some('\u{258c}')));
+                    assert_eq!(ends(flat), (Some(' '), Some(' ')));
                 }
             }
         }
