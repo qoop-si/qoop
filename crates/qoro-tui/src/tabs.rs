@@ -374,6 +374,7 @@ mod tests {
             accent: None,
             indicator: None,
             runs: Vec::new(),
+            chips: Vec::new(),
         }
     }
 

@@ -1183,6 +1183,8 @@ impl State {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
             sidebar::Act::Sleep(space) => Some(Clicked::Sleep(space)),
+            sidebar::Act::Wake(space) => Some(Clicked::Wake(space)),
+            sidebar::Act::Settings(space) => Some(Clicked::Settings(space)),
             sidebar::Act::New(space) => Some(Clicked::New(space)),
             sidebar::Act::Close(space) => Some(Clicked::Close(space)),
             sidebar::Act::ConfirmClose(space) => Some(Clicked::ConfirmClose(space)),
@@ -2654,14 +2656,27 @@ fn sleep_toggle(state: &mut State, request: &mut u64) {
     }
 }
 
-/// The rule's own `z`: put every tab of that space to sleep. It never wakes: a sleeping tab
-/// wakes alone, by a click or a key on it.
+/// The rule's own `sleep`: put every tab of that space to sleep. It never wakes: the rule's
+/// `wake` does, and a sleeping tab wakes alone, by a click or a key on it.
 fn sleep_space(state: &mut State, space: i64, request: &mut u64) {
     *request += 1;
     state.message = Some(format!("putting {} to sleep", space_name(state, space)));
     state.modes.outbox.push(ControlRequest::SleepWorkspace {
         id: format!("sleep-{request}"),
         workspace: space,
+        terminal: None,
+    });
+}
+
+/// The rule's own `wake`: every sleeping tab of that space comes back. Not a tab click,
+/// which wakes only its tab, and not `+`, which opens a tab beside the sleeping ones: the
+/// word on the rule says this is the whole space.
+fn wake_space(state: &mut State, space: i64, request: &mut u64) {
+    *request += 1;
+    state.message = Some(format!("waking {}", space_name(state, space)));
+    state.modes.outbox.push(ControlRequest::WakeWorkspace {
+        id: format!("wake-{request}"),
+        workspace: Some(space),
         terminal: None,
     });
 }
@@ -3741,9 +3756,13 @@ enum Clicked {
     View,
     Collapse,
     Space(i64),
-    /// The rule's sleep toggle, on the space that rule is for rather than the one on
-    /// screen: a person clicking a row means that row.
+    /// The rule's `sleep`, on the space that rule is for rather than the one on screen:
+    /// a person clicking a row means that row.
     Sleep(i64),
+    /// The rule's `wake`: every sleeping tab of that space.
+    Wake(i64),
+    /// The rule's `⋯`: that space's settings.
+    Settings(i64),
     /// The rule's close, which only arms the question.
     Close(i64),
     /// `y` on an armed rule: the space and everything in it goes.
@@ -5074,7 +5093,7 @@ where
                                 // to match and would never be reached.
                                 // Asked before the flag is taken: `clicked` reads the
                                 // armed row's own columns through `act`, and taking the
-                                // flag first would answer `y` as the sleep toggle.
+                                // flag first would read `y` as the `x` under it and ask again.
                                 match clicked {
                                     // An agent's row in the column waits for the release:
                                     // let go where it went down it is a click, moved
@@ -5174,6 +5193,26 @@ where
                                             ));
                                         }
                                         sleep_space(&mut state, space, &mut request);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Wake(space)) => {
+                                        wake_space(&mut state, space, &mut request);
+                                        dirty = true;
+                                    }
+                                    // The settings box is the rename for now: the name is
+                                    // the one setting a space has.
+                                    Some(Clicked::Settings(space)) => {
+                                        let was = state
+                                            .spaces
+                                            .iter()
+                                            .find(|s| s.id == space)
+                                            .map(|s| s.name.clone())
+                                            .unwrap_or_default();
+                                        state.prompt = Some(Prompt {
+                                            what: Naming::RenameSpace(space),
+                                            text: String::new(),
+                                            was,
+                                        });
                                         dirty = true;
                                     }
                                     // The close is a two step, and the first step is this
@@ -9029,6 +9068,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }
     }
 
@@ -11777,6 +11817,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             ink: None,
+            link: None,
         }];
         state.space = Some(1);
         assert!(matches!(
@@ -13850,7 +13891,8 @@ mod tests {
 
     /// `ctrl-a Z` sleeps the tab the keyboard is in, alone, and on a sleeping tab the
     /// keyboard rests on wakes that tab and shows it once it is back. A refusal stays on
-    /// the hint row with the daemon's reason; the rule's `z` only ever sleeps.
+    /// the hint row with the daemon's reason; the rule's `sleep` only ever sleeps, and its
+    /// `wake` wakes the whole space.
     #[test]
     fn ctrl_a_z_sleeps_the_tab_and_wakes_a_sleeping_one() {
         let mut state = state();
@@ -13908,7 +13950,7 @@ mod tests {
             state.hint.as_deref(),
             Some("tab 2 (ssh) holds a connection")
         );
-        // The rule's `z` puts the whole space to sleep, and on a sleeping space asks
+        // The rule's `sleep` puts the whole space to sleep, and on a sleeping space asks
         // nothing to wake.
         sleep_space(&mut state, 1, &mut request);
         assert_eq!(
@@ -13916,6 +13958,16 @@ mod tests {
             Some(ControlRequest::SleepWorkspace {
                 id: "sleep-3".into(),
                 workspace: 1,
+                terminal: None,
+            })
+        );
+        // Its `wake` asks for every tab of the space, and names none.
+        wake_space(&mut state, 1, &mut request);
+        assert_eq!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::WakeWorkspace {
+                id: "wake-4".into(),
+                workspace: Some(1),
                 terminal: None,
             })
         );

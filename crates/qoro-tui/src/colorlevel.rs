@@ -78,6 +78,7 @@ pub fn apply() {
     let env = current_env();
     BRAILLE.store(braille_from(&env), Ordering::Relaxed);
     GRID.store(grid_from(&env), Ordering::Relaxed);
+    CHIPS.store(chips_from(&env) as u8, Ordering::Relaxed);
 }
 
 static BRAILLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -114,6 +115,59 @@ fn grid_from(env: &Env) -> bool {
     !(font || env.wt_session || env.font_braille)
 }
 
+/// How the ends of a chip are drawn: the controls on a space's rule, and a remote space's
+/// machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chips {
+    /// Powerline round caps (U+E0B6, U+E0B4), where the terminal draws them itself or
+    /// ships a font that has them.
+    Round,
+    /// Half blocks, which every terminal draws: square ends, the same width.
+    Flat,
+    /// Blank padding and no background: there is no colour to draw a chip in.
+    Plain,
+}
+
+static CHIPS: AtomicU8 = AtomicU8::new(Chips::Flat as u8);
+
+/// The chip ends in effect. Flat until [`apply`] runs, which every terminal draws.
+pub fn chips() -> Chips {
+    match CHIPS.load(Ordering::Relaxed) {
+        x if x == Chips::Round as u8 => Chips::Round,
+        x if x == Chips::Plain as u8 => Chips::Plain,
+        _ => Chips::Flat,
+    }
+}
+
+/// Round caps are private use glyphs: Ghostty and kitty draw them whatever the font, and
+/// iTerm2 draws them too; anywhere else they would be a box with a question mark in it,
+/// so the rest get half blocks. Inside tmux the terminal outside is not known, so flat.
+/// `QORO_CHIPS=round` or `flat` forces either, for a terminal with a Nerd Font this cannot
+/// see, and a mono session has no colour to draw a chip in at all.
+fn chips_from(env: &Env) -> Chips {
+    if detect_from(env) == Level::Mono {
+        return Chips::Plain;
+    }
+    match env.qoro_chips.as_deref().map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("round") => return Chips::Round,
+        Some(v) if v.eq_ignore_ascii_case("flat") => return Chips::Flat,
+        _ => {}
+    }
+    if env.tmux {
+        return Chips::Flat;
+    }
+    let program = matches!(env.term_program.as_deref(), Some("ghostty" | "iTerm.app"));
+    let term = env
+        .term
+        .as_deref()
+        .is_some_and(|term| term.contains("ghostty") || term.contains("kitty"));
+    if program || term {
+        Chips::Round
+    } else {
+        Chips::Flat
+    }
+}
+
 /// The environment that matters, as plain values so tests never touch the
 /// process environment.
 #[derive(Clone, Debug, Default)]
@@ -133,6 +187,8 @@ pub struct Env {
     /// `TERM_PROGRAM`: Alacritty (`ALACRITTY_WINDOW_ID`), a VTE terminal such as
     /// GNOME Terminal (`VTE_VERSION`), Konsole (`KONSOLE_VERSION`).
     pub font_braille: bool,
+    /// `QORO_CHIPS`: `round` or `flat` forces the chip ends, anything else is ignored.
+    pub qoro_chips: Option<String>,
 }
 
 /// Read the real environment into an [`Env`].
@@ -150,6 +206,7 @@ pub fn current_env() -> Env {
         font_braille: ["ALACRITTY_WINDOW_ID", "VTE_VERSION", "KONSOLE_VERSION"]
             .iter()
             .any(|name| std::env::var_os(name).is_some()),
+        qoro_chips: var("QORO_CHIPS"),
     }
 }
 
@@ -306,6 +363,48 @@ mod tests {
             font_braille: true,
             ..env()
         }));
+    }
+
+    /// Round where the terminal draws the caps, flat everywhere else and inside tmux, the
+    /// override above both, and nothing at all without colour.
+    #[test]
+    fn chips_are_round_only_where_the_caps_draw() {
+        let program = |name: &str| Env {
+            term_program: Some(name.to_string()),
+            ..env()
+        };
+        for name in ["ghostty", "iTerm.app"] {
+            assert_eq!(chips_from(&program(name)), Chips::Round, "{name}");
+        }
+        for name in ["Apple_Terminal", "WezTerm", "vscode"] {
+            assert_eq!(chips_from(&program(name)), Chips::Flat, "{name}");
+        }
+        for term in ["xterm-ghostty", "xterm-kitty"] {
+            let env = Env {
+                term: Some(term.to_string()),
+                ..Env::default()
+            };
+            assert_eq!(chips_from(&env), Chips::Round, "{term}");
+        }
+        assert_eq!(chips_from(&env()), Chips::Flat);
+        let tmux = Env {
+            tmux: true,
+            ..program("ghostty")
+        };
+        assert_eq!(chips_from(&tmux), Chips::Flat);
+        let forced = |value: &str, base: Env| Env {
+            qoro_chips: Some(value.to_string()),
+            ..base
+        };
+        assert_eq!(chips_from(&forced("round", tmux.clone())), Chips::Round);
+        assert_eq!(chips_from(&forced("ROUND", env())), Chips::Round);
+        assert_eq!(chips_from(&forced("flat", program("ghostty"))), Chips::Flat);
+        assert_eq!(chips_from(&forced("pill", env())), Chips::Flat);
+        let mono = Env {
+            qoro_color: Some("mono".to_string()),
+            ..forced("round", program("ghostty"))
+        };
+        assert_eq!(chips_from(&mono), Chips::Plain);
     }
 
     #[test]

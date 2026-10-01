@@ -24,7 +24,7 @@ use qoro_proto::{Channel, Frame, Reassembler};
 use qoro_remote::Remote;
 use qoro_runtime::client::{self, Connection, Incoming};
 use qoro_runtime::control::{
-    AgentRow, ControlRequest, ControlResponse, EventMessage, Pane, WorkspaceRow,
+    AgentRow, ControlRequest, ControlResponse, EventMessage, LinkState, Pane, WorkspaceRow,
 };
 use qoro_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -259,10 +259,14 @@ impl Link {
     }
 
     /// The space rows this link contributes to the merged list.
+    ///
+    /// A remote's rows say how its machine is reached, so the column can say it beside the
+    /// name; this machine's rows say nothing, which is what a daemon sends.
     fn listed_spaces(&self, link: usize) -> Vec<WorkspaceRow> {
         if self.name.is_empty() && !self.listed {
             return Vec::new();
         }
+        let state = |state| (!self.name.is_empty()).then_some(state);
         // A machine let go runs nothing: its spaces read as asleep, so an interface with
         // nothing else awake detaches rather than staying up, and this machine's daemon with
         // it, for a remote space that has no tab. Asking for one wakes the machine.
@@ -272,12 +276,20 @@ impl Link {
                 .iter()
                 .map(|row| WorkspaceRow {
                     asleep: true,
+                    link: state(LinkState::Parked),
                     ..row.clone()
                 })
                 .collect();
         }
         if self.listed && self.conn.is_some() {
-            return self.spaces.clone();
+            return self
+                .spaces
+                .iter()
+                .map(|row| WorkspaceRow {
+                    link: state(LinkState::Up),
+                    ..row.clone()
+                })
+                .collect();
         }
         if self.listed {
             return self
@@ -290,6 +302,7 @@ impl Link {
                     // what the far daemon would say about it is as stale as the rest of this
                     // row. No close, and no dead control drawn for one.
                     closable: false,
+                    link: state(LinkState::Down),
                     ..row.clone()
                 })
                 .collect();
@@ -302,6 +315,7 @@ impl Link {
             sleeping: Vec::new(),
             closable: false,
             ink: None,
+            link: state(LinkState::Down),
         }]
     }
 }
@@ -1997,6 +2011,43 @@ mod tests {
         );
     }
 
+    /// A remote's rows say how its machine is reached, in every state the link can be in,
+    /// and this machine's rows say nothing.
+    #[test]
+    fn a_remote_space_says_how_its_machine_is_reached() {
+        let links = |link: &Link| -> Vec<Option<LinkState>> {
+            link.listed_spaces(1).iter().map(|row| row.link).collect()
+        };
+        let row = WorkspaceRow {
+            id: 1 << WORKSPACE_SHIFT,
+            name: "devbox:api".into(),
+            terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+        };
+        let mut remote = Link::new("devbox".into(), None);
+        assert_eq!(links(&remote), [Some(LinkState::Down)], "never listed");
+        remote.listed = true;
+        remote.spaces = vec![row.clone()];
+        assert_eq!(
+            links(&remote),
+            [Some(LinkState::Down)],
+            "listed, not connected"
+        );
+        remote.conn = Some((1, mpsc::unbounded_channel().0));
+        assert_eq!(links(&remote), [Some(LinkState::Up)]);
+        remote.parked.send_replace(true);
+        assert_eq!(links(&remote), [Some(LinkState::Parked)]);
+        let mut home = Link::new(String::new(), None);
+        home.listed = true;
+        home.spaces = vec![row];
+        home.conn = Some((1, mpsc::unbounded_channel().0));
+        assert_eq!(links(&home), [None]);
+    }
+
     /// The ask to move to a newer qoro: kept while its link is down and sent when it is up
     /// again to a daemon still older than it. A pre-feature daemon's refusal of it is one
     /// actionable line, not a first list that failed, and a waiting reason is worded once.
@@ -2210,6 +2261,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         };
         mux.answer(
             0,

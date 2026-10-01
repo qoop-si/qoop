@@ -3294,6 +3294,7 @@ async fn handle_control(
                     // does not draw a close for a space that cannot be closed.
                     closable: row.id != workspace,
                     ink: row.ink,
+                    link: None,
                 });
             }
             ControlResponse::Workspaces { id, workspaces }

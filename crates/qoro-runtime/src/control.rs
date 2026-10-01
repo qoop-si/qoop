@@ -742,6 +742,23 @@ pub struct WorkspaceRow {
     /// its id gives it, which is also what an older daemon's row reads as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ink: Option<u8>,
+    /// How the machine a space lives on is reached, for a space of another machine. Set
+    /// only by the interface that merges the machines' lists; a daemon never sends it, so
+    /// a space of this machine has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkState>,
+}
+
+/// Whether the machine behind a space answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// Connected: what the row says is the machine's own answer.
+    Up,
+    /// Let go while nothing ran there: not connected, and not broken either.
+    Parked,
+    /// Connecting, or not answering.
+    Down,
 }
 
 /// A tab that stayed awake when its workspace was put to sleep, and why.
@@ -1508,6 +1525,16 @@ mod tests {
         );
         let text = serde_json::to_string(&old).expect("encode");
         assert!(!text.contains("ink"), "{text}");
+        assert!(!text.contains("link"), "{text}");
+        let linked = WorkspaceRow {
+            link: Some(LinkState::Parked),
+            ..old.clone()
+        };
+        let text = serde_json::to_string(&linked).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<WorkspaceRow>(&text).expect("decode"),
+            linked
+        );
 
         for ink in [Some(2), None] {
             let request = ControlRequest::SetWorkspaceInk {

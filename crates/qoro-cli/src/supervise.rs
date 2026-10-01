@@ -1992,6 +1992,7 @@ mod tests {
                 sleeping: Vec::new(),
                 closable: true,
                 ink: None,
+                link: None,
             },
             WorkspaceRow {
                 id: 2,
@@ -2001,6 +2002,7 @@ mod tests {
                 sleeping: Vec::new(),
                 closable: true,
                 ink: None,
+                link: None,
             },
         ];
         assert_eq!(pick_space(&spaces, "2").unwrap(), Some(2));
@@ -2015,6 +2017,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }];
         assert_eq!(
             pick_space(&named, "2024").unwrap(),

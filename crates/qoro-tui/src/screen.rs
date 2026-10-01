@@ -616,6 +616,34 @@ pub fn tab_of(terminal: u32, panes: &std::collections::BTreeMap<u32, u32>) -> u3
     panes.get(&terminal).copied().unwrap_or(terminal)
 }
 
+/// Columns `from..to` of a painted row, counting columns and not characters, so a wide
+/// character in a name cannot be split.
+fn cut(text: &str, from: usize, to: usize) -> String {
+    text.chars()
+        .scan(0usize, |col, c| {
+            let start = *col;
+            *col += width::columns(c);
+            Some((start, c))
+        })
+        .filter(|(start, _)| *start >= from && *start < to)
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// A chip of a row, `len` columns from `at`: its two ends drawn in the chip's background,
+/// which rounds or squares the chip off, and the cells between them on that background in
+/// `role`. The caller puts the row's own escape back after it.
+fn chip(text: &str, (at, len): (usize, usize), role: theme::Role, selected: bool) -> String {
+    let end = at + len.max(2) - 1;
+    let mut out = theme::chip_cap(selected);
+    out.push_str(&cut(text, at, at + 1));
+    out.push_str(&theme::chip_in(role));
+    out.push_str(&cut(text, at + 1, end));
+    out.push_str(&theme::chip_cap(selected));
+    out.push_str(&cut(text, end, end + 1));
+    out
+}
+
 /// The corners a row of the keyboard's agent wears, left and right: a curve opening its
 /// first row at the left and one closing its last row at the right, two of a viewfinder's
 /// four. The rows sit back to back, so all four would join down the sides into a bracket.
@@ -783,8 +811,19 @@ pub fn paint(frame: &Frame) -> String {
         // box, so raising the rule too paints one selection straddling the box
         // edge.
         if let Some((line, _)) = panel.get(row).filter(|_| spotlight) {
+            // Faded like the rest, but a chip keeps its shape: the box is what is read,
+            // and a rule whose controls turned to bare brackets would read as another row.
             out.push_str(&faded);
-            out.push_str(&line.text);
+            let mut pos = 0;
+            for &(at, len) in &line.chips {
+                out.push_str(&cut(&line.text, pos, at));
+                // Faint, not Unobserved: Unobserved is the chip's own ground, which would
+                // leave four empty pills.
+                out.push_str(&chip(&line.text, (at, len), theme::Role::Faint, false));
+                out.push_str(&faded);
+                pos = at + len;
+            }
+            out.push_str(&cut(&line.text, pos, width::width(&line.text)));
             out.push_str(theme::RESET);
         } else if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
@@ -834,18 +873,7 @@ pub fn paint(frame: &Frame) -> String {
             if runs.is_empty() {
                 out.push_str(&line.text);
             } else {
-                let cut = |from: usize, to: usize| {
-                    line.text
-                        .chars()
-                        .scan(0usize, |col, c| {
-                            let start = *col;
-                            *col += width::columns(c);
-                            Some((start, c))
-                        })
-                        .filter(|(start, _)| *start >= from && *start < to)
-                        .map(|(_, c)| c)
-                        .collect::<String>()
-                };
+                let cut = |from: usize, to: usize| cut(&line.text, from, to);
                 let escape = |role: theme::Role| {
                     if selected {
                         theme::selected_in(role)
@@ -863,8 +891,12 @@ pub fn paint(frame: &Frame) -> String {
                         continue;
                     }
                     out.push_str(&cut(pos, at));
-                    out.push_str(&escape(role));
-                    out.push_str(&cut(at, at + len));
+                    if line.chips.contains(&(at, len)) {
+                        out.push_str(&chip(&line.text, (at, len), role, selected));
+                    } else {
+                        out.push_str(&escape(role));
+                        out.push_str(&cut(at, at + len));
+                    }
                     out.push_str(&base);
                     pos = at + len;
                 }
@@ -3096,6 +3128,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }]
     }
 
@@ -4904,6 +4937,57 @@ mod tests {
         );
     }
 
+    /// The keyboard on a shell tab raises its space's rule, and the rule's chips keep their
+    /// own background there: a chip drawn in the raised colour would vanish into the row.
+    #[test]
+    fn a_selected_rule_keeps_its_chips_apart_from_its_background() {
+        let mut shell = row(1, "sh", "idle");
+        shell.agent = false;
+        let rows = [shell];
+        let painted = paint(&Frame {
+            armed: None,
+            rows: &rows,
+            spaces: &spaces(),
+            panes: std::collections::BTreeMap::new(),
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &sidebar::Seen::new(),
+            unseen: &sidebar::Unseen::new(),
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &crate::run::Behind {
+                terminal: 0,
+                from: 0,
+                lines: Vec::new(),
+                total: 0,
+            },
+            image_notice: None,
+            chrome: Default::default(),
+        });
+        let ink = theme::space_of(1);
+        assert!(painted.contains(&theme::selected()), "{painted:?}");
+        assert!(painted.contains(&theme::chip_in(ink)), "{painted:?}");
+        assert!(painted.contains(&theme::chip_cap(true)), "{painted:?}");
+        assert_ne!(theme::chip_in(ink), theme::selected_in(ink));
+    }
+
     /// Frame zero is still; past it the working row turns the spinner, and only that
     /// row changes. The status sentence keeps the word either way.
     #[test]
@@ -4988,6 +5072,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }];
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
@@ -5348,6 +5433,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }];
         let palette = Palette::open();
         let painted = paint(&Frame {
@@ -5755,6 +5841,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink: None,
+            link: None,
         }];
         let states = [
             "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",

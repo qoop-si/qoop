@@ -239,13 +239,13 @@ fn agents_panel(screen: &Screen) -> Vec<String> {
         .collect()
 }
 
-/// Whether `line` is a space's rule: one blank, then the name straight after it, where an
-/// agent's row has its braille mark. Two other rows also open with a blank and something
-/// that is neither: the foot's q, whose rows open with a dot (`●`), and its menu
-/// row, which opens with the version and ends in the menu's mark. Neither is a rule. There
-/// is no fold arrow: `ctrl-a f` folds, and so does a click on the blank before the name.
+/// Whether `line` is a space's rule: its fold column (`▾`, `▸`, or a blank on a space with
+/// nothing to fold), then the name straight after it, where an agent's row has its braille
+/// mark. Two other rows also open with a blank and something that is neither: the foot's
+/// q, whose rows open with a dot (`●`), and its menu row, which opens with the version and
+/// ends in the menu's mark. Neither is a rule.
 fn is_rule_line(line: &str) -> bool {
-    line.strip_prefix(' ')
+    line.strip_prefix([' ', '\u{25be}', '\u{25b8}'])
         .and_then(|rest| rest.chars().next())
         .is_some_and(|c| c != ' ' && c != '\u{25cf}' && !('\u{2800}'..='\u{28ff}').contains(&c))
         && !line.trim_end().ends_with('\u{ab}')
@@ -745,8 +745,8 @@ impl Interface {
 
     /// The screen row the nth space's rule is drawn on, counted down the tree from one.
     ///
-    /// Found by its shape rather than by arithmetic: a rule opens with a blank and the
-    /// space's name, and agents move the rules down as they come and go.
+    /// Found by its shape rather than by arithmetic: a rule opens with its fold column and
+    /// the space's name, and agents move the rules down as they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
         let first = agents_title_row(&self.screen)? + 1;
         let last = (ROWS as usize).saturating_sub(qoro_tui::screen::STATUS);
@@ -2340,11 +2340,12 @@ fn radar_dragging_the_divider_resizes_the_panel() {
         rule_at(&ui)
     );
 
-    // Pull left past the start: clamps at 18.
+    // Pull left past the start: clamps at the narrowest the column drags to.
+    let min = qoro_tui::sidebar::SIDEBAR_MIN;
     ui.drag(half as u16 + 1, 5, &[20, 10]);
     assert!(
-        wait_for_rule(&mut ui, 18),
-        "the panel did not clamp at 18: {:?}",
+        wait_for_rule(&mut ui, min),
+        "the panel did not clamp at {min}: {:?}",
         rule_at(&ui)
     );
 }
@@ -2492,6 +2493,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                             sleeping: Vec::new(),
                             closable: true,
                             ink: None,
+                            link: None,
                         }],
                     },
                     "ListAgents" => ControlResponse::Agents {

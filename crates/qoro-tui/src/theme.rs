@@ -359,11 +359,43 @@ pub fn tab_in_for(role: Role, level: crate::colorlevel::Level) -> String {
     }
 }
 
+/// A chip on a space's rule: what it says, in `role`, on the chip's own background.
+pub fn chip_in(role: Role) -> String {
+    chip_in_for(role, crate::colorlevel::level())
+}
+
+/// A chip at an explicit colour level. Pure, see [`fg_for`]. In monochrome there is no
+/// background to draw it on, and the rule draws its controls as plain characters.
+pub fn chip_in_for(role: Role, level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => RESET.to_string(),
+        _ => format!("\x1b[0;48;5;{};38;5;{}m", chip_bg(), ink(role)),
+    }
+}
+
+/// The end of a chip: the cap glyph in the chip's background, over the row's own
+/// background, which is the raised one on the row that has the keyboard.
+pub fn chip_cap(selected: bool) -> String {
+    chip_cap_for(selected, crate::colorlevel::level())
+}
+
+/// The end of a chip at an explicit colour level. Pure, see [`fg_for`].
+pub fn chip_cap_for(selected: bool, level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => RESET.to_string(),
+        _ if selected => format!("\x1b[0;48;5;{};38;5;{}m", raised().0, chip_bg()),
+        _ => format!("\x1b[0;38;5;{}m", chip_bg()),
+    }
+}
+
 /// Back to the terminal's own colours.
 pub const RESET: &str = "\x1b[0m";
 
 /// The raised background of a row that has the keyboard.
 const SELECTED_BG: u8 = 236;
+/// The background of a chip: a step above the selected row, so a chip still reads as one
+/// on the row that has the keyboard, and apart from the page everywhere else.
+const CHIP_BG: u8 = 238;
 /// The raised background of the status bar, a shade below the selected row so the two do
 /// not read as the same thing.
 const STATUS_BG: u8 = 233;
@@ -430,6 +462,10 @@ fn raised() -> (u8, u8) {
     }
 }
 
+fn chip_bg() -> u8 {
+    if light() { LIGHT_CHIP_BG } else { CHIP_BG }
+}
+
 fn tab_on_fg() -> u8 {
     if light() { LIGHT_TAB_ON_FG } else { TAB_ON_FG }
 }
@@ -492,6 +528,8 @@ const LIGHT_CALM_UNDER_TEXT: [usize; 2] = [1, 5];
 /// a shade lighter still, the same order of depth as the dark table.
 const LIGHT_SELECTED_BG: u8 = 254;
 const LIGHT_STATUS_BG: u8 = 255;
+/// A chip on white: two shades under the selected row, for the same reason as the dark one.
+const LIGHT_CHIP_BG: u8 = 252;
 
 /// The focused tab: a deep pink, still apart from failed's magenta and every pool.
 const LIGHT_TAB_ON_FG: u8 = 162;
@@ -552,7 +590,7 @@ mod tests {
         {
             assert!(ink(role) >= 16, "{role:?} uses a themed colour");
         }
-        for bg in [SELECTED_BG, STATUS_BG] {
+        for bg in [SELECTED_BG, STATUS_BG, CHIP_BG, LIGHT_CHIP_BG] {
             assert!(bg >= 16, "a background uses a themed colour");
         }
     }
@@ -569,6 +607,9 @@ mod tests {
             status_in(Role::Blocked),
             tab_on(),
             tab_in(Role::Blocked),
+            chip_in(Role::Space(0)),
+            chip_cap(false),
+            chip_cap(true),
         ];
         escapes.extend([Role::Title, Role::Text, Role::Rule].map(fg));
         for escape in escapes {
@@ -799,6 +840,7 @@ mod tests {
             sleeping: Vec::new(),
             closable: true,
             ink,
+            link: None,
         };
         let spaces = [row(1, Some(4)), row(2, None), row(3, Some(7))];
         assert_eq!(space_in(&spaces, 1), Role::Space(4));
@@ -952,6 +994,15 @@ mod tests {
             let ratio = contrast(light_ink(role), LIGHT_SELECTED_BG);
             assert!(ratio >= 3.0, "{role:?} on the selected row is {ratio:.2}:1");
         }
+        // A chip says a word or a glyph a person finds: every space ink and the sleeping one
+        // hold 3 to 1 on the chip's background.
+        for role in (0..LIGHT_SPACE_INKS.len())
+            .map(Role::Space)
+            .chain([Role::Sleeping])
+        {
+            let ratio = contrast(light_ink(role), LIGHT_CHIP_BG);
+            assert!(ratio >= 3.0, "{role:?} on a chip is {ratio:.2}:1");
+        }
     }
 
     /// The dark table, measured against black (16), the ground most dark terminals sit on:
@@ -1002,6 +1053,29 @@ mod tests {
             let ratio = contrast(dark_ink(role), BLACK);
             assert!(ratio >= 3.0, "{role:?} is {ratio:.2}:1 on black");
         }
+        // The same floor as the light table for what a chip says.
+        for role in (0..SPACE_INKS.len())
+            .map(Role::Space)
+            .chain([Role::Sleeping])
+        {
+            let ratio = contrast(dark_ink(role), CHIP_BG);
+            assert!(ratio >= 3.0, "{role:?} on a chip is {ratio:.2}:1");
+        }
+    }
+
+    /// A chip is its own background in both palettes: apart from the page, and apart from
+    /// the selected row, so a chip on the row that has the keyboard still reads as one.
+    #[test]
+    fn a_chip_stands_apart_from_the_selected_row() {
+        for (chip, selected) in [(CHIP_BG, SELECTED_BG), (LIGHT_CHIP_BG, LIGHT_SELECTED_BG)] {
+            assert_ne!(chip, selected);
+        }
+        let level = crate::colorlevel::Level::Palette;
+        assert!(chip_in_for(Role::Space(0), level).contains(&format!("48;5;{}", chip_bg())));
+        assert!(chip_cap_for(true, level).contains(&format!("48;5;{}", raised().0)));
+        let mono = crate::colorlevel::Level::Mono;
+        assert_eq!(chip_in_for(Role::Space(0), mono), RESET);
+        assert_eq!(chip_cap_for(true, mono), RESET);
     }
 
     /// The light table keeps the dark one's rules: nothing themed, the states that want a

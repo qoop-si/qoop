@@ -21,6 +21,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
         sleeping: Vec::new(),
         closable: true,
         ink: None,
+        link: None,
     }
 }
 
