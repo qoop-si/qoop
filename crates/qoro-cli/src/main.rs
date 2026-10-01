@@ -172,8 +172,8 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
                   \x20                 block until a terminal reaches a state, or TEXT is on\n\
                   \x20                 its live screen; exits 124 on timeout\n\
-                  \x20 qoro sleep <space>  end a space's tabs and keep them: nothing of it runs until it wakes\n\
-                  \x20 qoro wake [space]   bring a sleeping space back, or the one that slept last\n\
+                  \x20 qoro sleep <space> | --tab N  end a space's tabs, or one tab, and keep them: nothing of it runs until it wakes\n\
+                  \x20 qoro wake [space] | --tab N  bring a sleeping tab back, a space's, or the one that slept last\n\
                   \x20 qoro new [--name N] [--cwd DIR] [--space ID|NAME] [-- command...]  open a\n\
                   \x20                 terminal, print its number, type the command into it\n\
                   \x20 qoro worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
@@ -2484,34 +2484,39 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
         );
         return Ok(());
     };
-    let asleep: Vec<i64> = store
-        .asleep()
-        .map_err(std::io::Error::other)?
-        .into_iter()
-        .map(|(space, _)| space)
-        .collect();
+    let asleep = store.asleep().map_err(std::io::Error::other)?;
     let mut rows = Vec::new();
     for space in store.workspaces().map_err(std::io::Error::other)? {
         let tabs = store
             .open_terminals(space.id)
             .map_err(std::io::Error::other)?
             .len();
-        // With no daemon nothing runs: a space not marked asleep comes back awake on the
-        // next start, and is said as stopped until then.
-        let state = if asleep.contains(&space.id) {
-            "asleep"
+        let mut sleeping: Vec<i64> = asleep
+            .iter()
+            .filter(|(_, workspace, _)| *workspace == space.id)
+            .map(|(terminal, _, _)| *terminal)
+            .collect();
+        sleeping.sort_unstable();
+        // With no daemon nothing runs: a tab not marked asleep comes back awake on the next
+        // start, and is said as stopped until then.
+        let state = if tabs > 0 && sleeping.len() == tabs {
+            "asleep".to_string()
+        } else if !sleeping.is_empty() {
+            format!("{} of {tabs} asleep", sleeping.len())
         } else if running {
-            "awake"
+            "awake".to_string()
         } else {
-            "stopped"
+            "stopped".to_string()
         };
-        rows.push((space.id, space.name, state, tabs));
+        rows.push((space.id, space.name, state, tabs, sleeping));
     }
     if json {
         let list: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(id, name, state, tabs)| {
-                serde_json::json!({ "id": id, "name": name, "state": state, "tabs": tabs })
+            .map(|(id, name, state, tabs, sleeping)| {
+                serde_json::json!({
+                    "id": id, "name": name, "state": state, "tabs": tabs, "sleeping": sleeping
+                })
             })
             .collect();
         println!("{}", serde_json::Value::Array(list));
@@ -2520,12 +2525,18 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     if rows.is_empty() {
         println!("no spaces yet. `qoro` starts one.");
     }
-    for (id, name, state, tabs) in rows {
+    for (id, name, state, tabs, sleeping) in rows {
         let tabs = match tabs {
             1 => "1 tab".to_string(),
             n => format!("{n} tabs"),
         };
-        println!("{id:>3}  {name:<20} {state:<8} {tabs}");
+        let sleeping = if sleeping.is_empty() {
+            String::new()
+        } else {
+            let numbers: Vec<String> = sleeping.iter().map(|t| t.to_string()).collect();
+            format!("  asleep: {}", numbers.join(" "))
+        };
+        println!("{id:>3}  {name:<20} {state:<14} {tabs}{sleeping}");
     }
     Ok(())
 }

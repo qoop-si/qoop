@@ -265,6 +265,9 @@ pub fn apply_edge_vetoes(
 #[derive(Clone, Default, Debug)]
 pub struct WatchCounts {
     inner: std::sync::Arc<std::sync::Mutex<BTreeMap<u32, usize>>>,
+    /// When each terminal's last watcher left, unix seconds: a tab read until a moment ago
+    /// has been idle for that moment, not for as long as its agent has.
+    left: std::sync::Arc<std::sync::Mutex<BTreeMap<u32, i64>>>,
 }
 
 impl WatchCounts {
@@ -281,9 +284,18 @@ impl WatchCounts {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {
                 held.remove(&stream);
+                self.left
+                    .lock()
+                    .unwrap()
+                    .insert(stream, crate::agents::now_unix());
             }
             None => {}
         }
+    }
+
+    /// When the last watcher of this terminal left, if one ever did.
+    pub fn left_at(&self, stream: u32) -> Option<i64> {
+        self.left.lock().unwrap().get(&stream).copied()
     }
 
     /// Forget every subscription one connection held, on disconnect.
@@ -516,6 +528,10 @@ mod tests {
         assert!(counts.watched(1), "one watcher left");
         counts.unwatch(1);
         assert!(!counts.watched(1));
+        assert!(
+            counts.left_at(1).is_some(),
+            "the last watcher leaving is written down"
+        );
         // Unbalanced calls saturate rather than poison.
         counts.unwatch(1);
         assert!(!counts.watched(1));

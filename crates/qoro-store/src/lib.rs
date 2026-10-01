@@ -120,6 +120,27 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Turn each space a former daemon put to sleep whole into marks on its open terminals,
+/// once. Read before anything is written, so opening a store with nothing to turn (every
+/// store after the first open, and every `qoro ls`) never takes the write lock; the rows are
+/// read again under it, so two openers at once turn them once.
+fn mark_asleep_spaces(conn: &Connection) -> Result<(), StoreError> {
+    let pending: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM asleep)", [], |r| r.get(0))?;
+    if !pending {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO asleep_terminal (terminal, since) \
+         SELECT t.id, a.since FROM asleep a JOIN terminal t ON t.workspace = a.workspace \
+         WHERE t.closed_at IS NULL",
+        [],
+    )?;
+    tx.execute("DELETE FROM asleep", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     /// Open, creating and migrating as needed.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -185,6 +206,14 @@ impl Store {
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  since INTEGER NOT NULL
              );
+             -- The terminals that are asleep, which is what sleeps now: a tab, not a whole
+             -- space. The rows in `asleep` above are from before, and are turned into
+             -- these once (`mark_asleep_spaces`). New table, no version bump, for the
+             -- reason the ones above give.
+             CREATE TABLE IF NOT EXISTS asleep_terminal (
+                 terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE,
+                 since INTEGER NOT NULL
+             );
              -- What a mutating command with this key already produced, so a retry after an
              -- ambiguous failure returns the original answer instead of doing the work
              -- again. The same reasoning as split_tree and asleep: the table is new and the
@@ -207,6 +236,7 @@ impl Store {
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
+        mark_asleep_spaces(&conn)?;
         Ok(Self { conn })
     }
 
@@ -304,6 +334,10 @@ impl Store {
         tx.execute(
             "UPDATE terminal SET closed_at = ?2 WHERE id = ?1 AND closed_at IS NULL",
             params![id, now],
+        )?;
+        tx.execute(
+            "DELETE FROM asleep_terminal WHERE terminal = ?1",
+            params![id],
         )?;
         tx.execute(
             "DELETE FROM applied WHERE idempotency_key = ?1 AND outcome = ?2",
@@ -426,6 +460,11 @@ impl Store {
             "UPDATE terminal SET closed_at = ?2 WHERE id = ?1 AND closed_at IS NULL",
             params![id, now],
         )?;
+        // A closed tab is not asleep: nothing will ever wake it.
+        self.conn.execute(
+            "DELETE FROM asleep_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
         Ok(n == 1)
     }
 
@@ -489,6 +528,12 @@ impl Store {
             params![id, workspace],
         )?;
         if n == 1 {
+            // A tab moves awake: the daemon refuses to move a sleeping one, and a mark
+            // left here would hold its agent writes back in the new space.
+            tx.execute(
+                "DELETE FROM asleep_terminal WHERE terminal = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM layout WHERE terminal = ?1", params![id])?;
             tx.execute(
                 "INSERT INTO layout (workspace, terminal, ordinal) VALUES (?2, ?1, \
@@ -577,13 +622,13 @@ impl Store {
     /// table; the id can only come from the agent itself, through its own hook, and an id
     /// arriving must not overwrite a name the other writer knows better.
     pub fn set_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
-        // Never into a sleeping space: its rows say what to bring back, and a late write
+        // Never into a sleeping tab: its row says what to bring back, and a late write
         // from the teardown that put it to sleep would say something else. Checked here,
         // when the write runs, not when it was asked for, because a write whose caller
         // gave up waiting still runs.
         self.conn.execute(
             "UPDATE terminal SET agent_session = ?2 WHERE id = ?1 \
-             AND workspace NOT IN (SELECT workspace FROM asleep)",
+             AND id NOT IN (SELECT terminal FROM asleep_terminal)",
             params![id, session],
         )?;
         Ok(())
@@ -592,10 +637,10 @@ impl Store {
     /// Forget the id of a conversation whose agent has left the terminal, if the row still
     /// holds that one: an id the next agent wrote meanwhile is its own, and stays.
     pub fn forget_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
-        // Not in a sleeping space, like every write here: its rows say what to bring back.
+        // Not in a sleeping tab, like every write here: its row says what to bring back.
         self.conn.execute(
             "UPDATE terminal SET agent_session = NULL WHERE id = ?1 AND agent_session = ?2 \
-             AND workspace NOT IN (SELECT workspace FROM asleep)",
+             AND id NOT IN (SELECT terminal FROM asleep_terminal)",
             params![id, session],
         )?;
         Ok(())
@@ -618,20 +663,20 @@ impl Store {
         agent: Option<&str>,
         agent_session: Option<&str>,
     ) -> Result<(), StoreError> {
-        // Not into a sleeping space, for the reason `set_agent_session` gives: an agent
+        // Not into a sleeping tab, for the reason `set_agent_session` gives: an agent
         // ending under the sleep is announced as gone, and writing that down would bring
         // the tab back as a bare shell.
         self.conn.execute(
             "UPDATE terminal SET agent = ?2, agent_session = COALESCE(?3, agent_session) \
-             WHERE id = ?1 AND workspace NOT IN (SELECT workspace FROM asleep)",
+             WHERE id = ?1 AND id NOT IN (SELECT terminal FROM asleep_terminal)",
             params![id, agent, agent_session],
         )?;
         Ok(())
     }
 }
 
-/// What a sleeping terminal's row has to say when its space goes to sleep: which agent
-/// was in it and that agent's own id for the conversation.
+/// What a sleeping terminal's row has to say when it goes to sleep: which agent was in
+/// it and that agent's own id for the conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub terminal: i64,
@@ -640,23 +685,25 @@ pub struct Checkpoint {
 }
 
 impl Store {
-    /// Every workspace that is asleep, and since when, the latest first.
-    pub fn asleep(&self) -> Result<Vec<(i64, i64)>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT workspace, since FROM asleep ORDER BY since DESC, workspace DESC")?;
+    /// Every open terminal that is asleep, as `(terminal, workspace, since)`, the latest
+    /// first. The terminals of one tab share their `since`.
+    pub fn asleep(&self) -> Result<Vec<(i64, i64, i64)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.terminal, t.workspace, a.since FROM asleep_terminal a \
+             JOIN terminal t ON t.id = a.terminal WHERE t.closed_at IS NULL \
+             ORDER BY a.since DESC, a.terminal DESC",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Put a workspace to sleep: its terminals' agents written down, then the mark, in one
-    /// transaction. A failure leaves neither, so a space is never marked asleep with rows
-    /// that do not say what to bring back.
-    pub fn sleep_workspace(
+    /// Put terminals to sleep: their agents written down, then their marks, in one
+    /// transaction. A failure leaves neither, so a tab is never marked asleep with a row
+    /// that does not say what to bring back. A closed terminal is not marked.
+    pub fn sleep_terminals(
         &mut self,
-        workspace: i64,
         since: i64,
         checkpoints: &[Checkpoint],
     ) -> Result<(), StoreError> {
@@ -667,21 +714,28 @@ impl Store {
                  WHERE id = ?1",
                 params![c.terminal, c.agent, c.agent_session],
             )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO asleep_terminal (terminal, since) \
+                 SELECT id, ?2 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                params![c.terminal, since],
+            )?;
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO asleep (workspace, since) VALUES (?1, ?2)",
-            params![workspace, since],
-        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Take the sleep mark off a workspace. Answers whether it had one.
-    pub fn wake_workspace(&self, workspace: i64) -> Result<bool, StoreError> {
-        Ok(self.conn.execute(
-            "DELETE FROM asleep WHERE workspace = ?1",
-            params![workspace],
-        )? == 1)
+    /// Take the sleep marks off these terminals. Answers how many had one.
+    pub fn unmark(&mut self, terminals: &[i64]) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        for t in terminals {
+            n += tx.execute(
+                "DELETE FROM asleep_terminal WHERE terminal = ?1",
+                params![t],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 }
 
@@ -1247,14 +1301,22 @@ mod tests {
         );
     }
 
+    fn bare(terminal: i64) -> Checkpoint {
+        Checkpoint {
+            terminal,
+            agent: None,
+            agent_session: None,
+        }
+    }
+
     #[test]
-    fn a_workspace_sleeps_with_its_agents_written_down_and_wakes() {
+    fn a_tab_sleeps_with_its_agent_written_down_and_wakes_alone() {
         let mut s = store();
         let ws = s.create_workspace("w", 1).expect("ws");
         s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.create_terminal(8, ws, "/tmp", "/bin/sh", 1).expect("t");
         s.set_agent(7, Some("claude"), Some("abc")).expect("agent");
-        s.sleep_workspace(
-            ws,
+        s.sleep_terminals(
             10,
             &[Checkpoint {
                 terminal: 7,
@@ -1263,32 +1325,106 @@ mod tests {
             }],
         )
         .expect("sleep");
-        assert_eq!(s.asleep().expect("asleep"), vec![(ws, 10)]);
+        // One tab of the space, not the space.
+        assert_eq!(s.asleep().expect("asleep"), vec![(7, ws, 10)]);
         let row = &s.open_terminals(ws).expect("rows")[0];
         assert_eq!(row.agent.as_deref(), Some("claude"));
         // A checkpoint with no id keeps the one the hook reported.
         assert_eq!(row.agent_session.as_deref(), Some("abc"));
-        assert!(s.wake_workspace(ws).expect("wake"));
-        assert!(!s.wake_workspace(ws).expect("wake again"));
+        assert_eq!(s.unmark(&[7]).expect("wake"), 1);
+        assert_eq!(s.unmark(&[7]).expect("wake again"), 0);
         assert!(s.asleep().expect("asleep").is_empty());
     }
 
     #[test]
-    fn deleting_a_workspace_takes_its_sleep_mark_with_it() {
+    fn the_tab_that_slept_last_comes_first() {
         let mut s = store();
         let ws = s.create_workspace("w", 1).expect("ws");
-        s.sleep_workspace(ws, 5, &[]).expect("sleep");
+        for t in [1, 2, 3] {
+            s.create_terminal(t, ws, "/tmp", "/bin/sh", 1).expect("t");
+        }
+        s.sleep_terminals(5, &[bare(1), bare(2)])
+            .expect("one tab of two panes");
+        s.sleep_terminals(9, &[bare(3)]).expect("another tab");
+        assert_eq!(
+            s.asleep().expect("asleep"),
+            vec![(3, ws, 9), (2, ws, 5), (1, ws, 5)]
+        );
+    }
+
+    #[test]
+    fn a_closed_or_moved_tab_is_not_asleep() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        let other = s.create_workspace("o", 1).expect("ws");
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.sleep_terminals(5, &[bare(1), bare(2)]).expect("sleep");
+        s.close_terminal(1, 6).expect("close");
+        s.move_terminal(2, other).expect("move");
+        assert!(s.asleep().expect("asleep").is_empty());
+        // A closed row is never marked.
+        s.sleep_terminals(7, &[bare(1)])
+            .expect("sleep a closed one");
+        assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    #[test]
+    fn deleting_a_workspace_takes_its_sleep_marks_with_it() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.sleep_terminals(5, &[bare(1)]).expect("sleep");
         s.delete_workspace(ws).expect("delete");
         assert!(s.asleep().expect("asleep").is_empty());
     }
 
     #[test]
-    fn a_sleeping_space_refuses_late_agent_writes() {
+    fn a_space_slept_whole_by_an_older_daemon_becomes_marks_on_its_tabs_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("qoro.db");
+        let ws;
+        {
+            let mut s = Store::open(&path).expect("open");
+            ws = s.create_workspace("w", 1).expect("ws");
+            let awake = s.create_workspace("a", 1).expect("ws");
+            s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t");
+            s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t");
+            s.create_terminal(3, awake, "/tmp", "/bin/sh", 1)
+                .expect("t");
+            s.close_terminal(2, 2).expect("close");
+            // What an older daemon wrote when it put the space to sleep.
+            s.conn
+                .execute(
+                    "INSERT INTO asleep (workspace, since) VALUES (?1, 40)",
+                    params![ws],
+                )
+                .expect("old mark");
+        }
+        let reader = Store::open_existing(&path).expect("a reader turns it");
+        assert_eq!(reader.asleep().expect("asleep"), vec![(1, ws, 40)]);
+        drop(reader);
+        let again = Store::open(&path).expect("a second open finds nothing to turn");
+        assert_eq!(again.asleep().expect("asleep"), vec![(1, ws, 40)]);
+        let old: i64 = again
+            .conn
+            .query_row("SELECT COUNT(*) FROM asleep", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(old, 0);
+    }
+
+    #[test]
+    fn a_sleeping_tab_refuses_late_agent_writes() {
         let mut s = store();
         let ws = s.create_workspace("w", 1).expect("ws");
         s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t");
         s.set_agent(3, Some("claude"), Some("abc")).expect("agent");
-        s.sleep_workspace(ws, 2, &[]).expect("sleep");
+        let held = Checkpoint {
+            terminal: 3,
+            agent: Some("claude".into()),
+            agent_session: None,
+        };
+        s.sleep_terminals(2, &[held]).expect("sleep");
         s.set_agent(3, None, None).expect("a late write runs");
         s.set_agent_session(3, "other").expect("a late id runs");
         s.forget_agent_session(3, "abc")
@@ -1296,7 +1432,7 @@ mod tests {
         let row = &s.open_terminals(ws).expect("rows")[0];
         assert_eq!(row.agent.as_deref(), Some("claude"));
         assert_eq!(row.agent_session.as_deref(), Some("abc"));
-        s.wake_workspace(ws).expect("wake");
+        s.unmark(&[3]).expect("wake");
         s.set_agent(3, None, None).expect("an awake write");
         assert_eq!(s.open_terminals(ws).expect("rows")[0].agent, None);
     }

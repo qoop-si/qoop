@@ -58,6 +58,11 @@ async fn spaces(c: &mut TestClient) -> Vec<WorkspaceRow> {
 /// ask said. A fresh shell is refused while it starts, which is right and is not what these
 /// tests are about.
 async fn sleep(c: &mut TestClient, workspace: i64) -> ControlResponse {
+    Box::pin(sleep_tab(c, workspace, None)).await
+}
+
+/// The same, for one tab (`Some`) or every tab of the space (`None`).
+async fn sleep_tab(c: &mut TestClient, workspace: i64, terminal: Option<u32>) -> ControlResponse {
     let deadline = Instant::now() + PATIENCE;
     let mut n = 0;
     loop {
@@ -67,6 +72,7 @@ async fn sleep(c: &mut TestClient, workspace: i64) -> ControlResponse {
             ControlRequest::SleepWorkspace {
                 id: format!("sleep-{workspace}-{n}"),
                 workspace,
+                terminal,
             },
         )
         .await;
@@ -79,11 +85,16 @@ async fn sleep(c: &mut TestClient, workspace: i64) -> ControlResponse {
 }
 
 async fn wake(c: &mut TestClient, workspace: i64) -> ControlResponse {
+    Box::pin(wake_tab(c, workspace, None)).await
+}
+
+async fn wake_tab(c: &mut TestClient, workspace: i64, terminal: Option<u32>) -> ControlResponse {
     ask(
         c,
         ControlRequest::WakeWorkspace {
-            id: format!("wake-{workspace}"),
+            id: format!("wake-{workspace}-{terminal:?}"),
             workspace: Some(workspace),
+            terminal,
         },
     )
     .await
@@ -306,7 +317,7 @@ async fn a_sleeping_tab_closes_for_good_without_waking_its_space() {
 }
 
 #[tokio::test]
-async fn a_tab_made_in_a_sleeping_space_wakes_it_first() {
+async fn a_tab_made_in_a_sleeping_space_leaves_the_others_asleep() {
     let d = TestDaemon::start().await;
     let mut c = d.attach("maker").await;
     let space = new_space(&mut c, "made").await;
@@ -318,8 +329,8 @@ async fn a_tab_made_in_a_sleeping_space_wakes_it_first() {
     );
     let fresh = new_tab(&mut c, space, "t2").await;
     assert!(
-        d.terminals().get(old).is_some(),
-        "a tab made in a sleeping space left the others asleep"
+        d.terminals().get(old).is_none(),
+        "a tab made beside a sleeping one woke it"
     );
     assert!(d.terminals().get(fresh).is_some());
     let row = spaces(&mut c)
@@ -327,11 +338,210 @@ async fn a_tab_made_in_a_sleeping_space_wakes_it_first() {
         .into_iter()
         .find(|s| s.id == space)
         .expect("the space");
-    assert!(!row.asleep, "the space is half awake: {row:?}");
+    assert!(
+        !row.asleep,
+        "a space with an awake tab reads as asleep: {row:?}"
+    );
+    assert_eq!(
+        row.sleeping.iter().map(|t| t.terminal).collect::<Vec<_>>(),
+        vec![old],
+        "{row:?}"
+    );
+}
+
+/// The terminals an answer says changed.
+fn changed(answer: &ControlResponse) -> Vec<u32> {
+    match answer {
+        ControlResponse::WorkspaceAsleep { changed, .. }
+        | ControlResponse::WorkspaceAwake { changed, .. } => {
+            changed.clone().expect("this daemon says what changed")
+        }
+        other => panic!("not a sleep or a wake: {other:?}"),
+    }
+}
+
+fn split(first: u32, second: u32) -> Pane {
+    Pane::Split {
+        dir: SplitDir::V,
+        permille: 500,
+        first: Box::new(Pane::Leaf { terminal: first }),
+        second: Box::new(Pane::Leaf { terminal: second }),
+    }
 }
 
 #[tokio::test]
-async fn a_space_stays_asleep_across_a_restart_and_wakes_after_it() {
+async fn one_tab_sleeps_and_wakes_alone_beside_an_awake_one() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("alone").await;
+    let space = new_space(&mut c, "mixed").await;
+    let resting = new_tab(&mut c, space, "t1").await;
+    let busy = new_tab(&mut c, space, "t2").await;
+    let slept = sleep_tab(&mut c, space, Some(resting)).await;
+    assert_eq!(changed(&slept), vec![resting], "{slept:?}");
+    assert!(d.terminals().get(resting).is_none());
+    assert!(
+        d.terminals().get(busy).is_some(),
+        "the other tab went down too"
+    );
+    let row = spaces(&mut c)
+        .await
+        .into_iter()
+        .find(|s| s.id == space)
+        .expect("the space");
+    assert!(!row.asleep, "{row:?}");
+    assert_eq!(row.terminals, 1, "{row:?}");
+    assert_eq!(
+        row.sleeping
+            .iter()
+            .map(|t| (t.terminal, t.lead))
+            .collect::<Vec<_>>(),
+        vec![(resting, Some(resting))]
+    );
+    // Asking again is not an error and changes nothing.
+    let again = sleep_tab(&mut c, space, Some(resting)).await;
+    assert_eq!(changed(&again), Vec::<u32>::new(), "{again:?}");
+    let woke = wake_tab(&mut c, space, Some(resting)).await;
+    assert_eq!(changed(&woke), vec![resting], "{woke:?}");
+    assert!(
+        d.terminals().get(resting).is_some(),
+        "the tab did not come back"
+    );
+    let woke = wake_tab(&mut c, space, Some(resting)).await;
+    assert_eq!(
+        changed(&woke),
+        Vec::<u32>::new(),
+        "a second wake opened it twice"
+    );
+}
+
+#[tokio::test]
+async fn a_split_tab_sleeps_and_wakes_whole_and_takes_no_new_pane_asleep() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("split").await;
+    let space = new_space(&mut c, "panes").await;
+    let first = new_tab(&mut c, space, "t1").await;
+    let second = new_tab(&mut c, space, "t2").await;
+    let other = new_tab(&mut c, space, "t3").await;
+    let saved = ask(
+        &mut c,
+        ControlRequest::SetSplit {
+            id: "split".into(),
+            tree: split(first, second),
+        },
+    )
+    .await;
+    assert!(
+        matches!(saved, ControlResponse::SplitSaved { .. }),
+        "{saved:?}"
+    );
+    // Either pane names the tab.
+    let slept = sleep_tab(&mut c, space, Some(second)).await;
+    let mut ended = changed(&slept);
+    ended.sort_unstable();
+    assert_eq!(ended, vec![first, second], "{slept:?}");
+    assert!(d.terminals().get(other).is_some());
+    let row = spaces(&mut c)
+        .await
+        .into_iter()
+        .find(|s| s.id == space)
+        .expect("the space");
+    assert!(
+        row.sleeping.iter().all(|t| t.lead == Some(first)),
+        "the panes of one tab do not share it: {row:?}"
+    );
+    // A live tab cannot be split onto a sleeping one.
+    let joined = ask(
+        &mut c,
+        ControlRequest::SetSplit {
+            id: "join".into(),
+            tree: split(other, first),
+        },
+    )
+    .await;
+    assert!(
+        matches!(joined, ControlResponse::Failed { .. }),
+        "{joined:?}"
+    );
+    let woke = wake_tab(&mut c, space, Some(first)).await;
+    let mut back = changed(&woke);
+    back.sort_unstable();
+    assert_eq!(back, vec![first, second], "{woke:?}");
+    let listed = ask(
+        &mut c,
+        ControlRequest::ListAgents {
+            id: "agents".into(),
+        },
+    )
+    .await;
+    let ControlResponse::Agents { splits, .. } = listed else {
+        panic!("no index: {listed:?}");
+    };
+    assert!(
+        splits
+            .iter()
+            .any(|tree| tree.leaves() == vec![first, second]),
+        "the split did not come back with its panes: {splits:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_space_sleeps_what_it_can_and_says_what_stayed_awake() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("best").await;
+    let space = new_space(&mut c, "partly").await;
+    let idle = new_tab(&mut c, space, "t1").await;
+    let busy = new_tab(&mut c, space, "t2").await;
+    c.input_to(busy, b"sleep 100\n").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let answer = sleep(&mut c, space).await;
+    let ControlResponse::WorkspaceAsleep {
+        changed, stayed, ..
+    } = &answer
+    else {
+        panic!("nothing slept: {answer:?}");
+    };
+    assert_eq!(
+        changed.clone().unwrap_or_default(),
+        vec![idle],
+        "{answer:?}"
+    );
+    assert_eq!(
+        stayed.iter().map(|s| s.terminal).collect::<Vec<_>>(),
+        vec![busy],
+        "{answer:?}"
+    );
+    assert!(d.terminals().get(busy).is_some());
+}
+
+#[tokio::test]
+async fn a_wake_with_nothing_named_brings_back_the_tab_that_slept_last() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("last").await;
+    let space = new_space(&mut c, "order").await;
+    let early = new_tab(&mut c, space, "t1").await;
+    let late = new_tab(&mut c, space, "t2").await;
+    sleep_tab(&mut c, space, Some(early)).await;
+    // A second apart, so the order is the clock's and not the numbers'.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    sleep_tab(&mut c, space, Some(late)).await;
+    let woke = ask(
+        &mut c,
+        ControlRequest::WakeWorkspace {
+            id: "last".into(),
+            workspace: None,
+            terminal: None,
+        },
+    )
+    .await;
+    assert_eq!(changed(&woke), vec![late], "{woke:?}");
+    assert!(
+        d.terminals().get(early).is_none(),
+        "the earlier tab woke too"
+    );
+}
+
+#[tokio::test]
+async fn a_sleeping_tab_stays_asleep_across_a_restart_beside_an_awake_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(
         dir.path(),
@@ -369,6 +579,8 @@ async fn a_space_stays_asleep_across_a_restart_and_wakes_after_it() {
         let space = new_space(&mut c, "overnight").await;
         let tab = new_tab(&mut c, space, "t1").await;
         let pane = new_tab(&mut c, space, "t2").await;
+        // A third tab stays awake: the space is half asleep across the restart.
+        new_tab(&mut c, space, "t3").await;
         let saved = ask(
             &mut c,
             ControlRequest::SetSplit {
@@ -386,9 +598,12 @@ async fn a_space_stays_asleep_across_a_restart_and_wakes_after_it() {
             matches!(saved, ControlResponse::SplitSaved { .. }),
             "{saved:?}"
         );
-        let asleep = sleep(&mut c, space).await;
+        let asleep = sleep_tab(&mut c, space, Some(tab)).await;
         assert!(
-            matches!(asleep, ControlResponse::WorkspaceAsleep { .. }),
+            matches!(
+                asleep,
+                ControlResponse::WorkspaceAsleep { terminals: 2, .. }
+            ),
             "{asleep:?}"
         );
         drop(c);
@@ -401,7 +616,11 @@ async fn a_space_stays_asleep_across_a_restart_and_wakes_after_it() {
     let (mut c, serving, terminals) = serve(dir.path()).await;
     assert!(
         terminals.get(tab).is_none(),
-        "a sleeping space was woken by a restart"
+        "a sleeping tab was woken by a restart"
+    );
+    assert!(
+        terminals.get(tab + 2).is_some(),
+        "the awake tab beside it did not come back"
     );
     assert!(
         dir.path().join("history").join(tab.to_string()).exists(),
@@ -412,7 +631,8 @@ async fn a_space_stays_asleep_across_a_restart_and_wakes_after_it() {
         .into_iter()
         .find(|s| s.id == space)
         .expect("the space");
-    assert!(row.asleep, "{row:?}");
+    assert!(!row.asleep, "{row:?}");
+    assert_eq!(row.sleeping.len(), 2, "{row:?}");
     let woke = wake(&mut c, space).await;
     assert!(
         matches!(woke, ControlResponse::WorkspaceAwake { terminals: 2, .. }),
@@ -454,10 +674,12 @@ async fn two_wakes_at_once_bring_each_tab_back_once() {
     let w1 = ControlRequest::WakeWorkspace {
         id: "w1".into(),
         workspace: Some(space),
+        terminal: None,
     };
     let w2 = ControlRequest::WakeWorkspace {
         id: "w2".into(),
         workspace: Some(space),
+        terminal: None,
     };
     let (first, second) = tokio::join!(c.control(&w1, PATIENCE), other.control(&w2, PATIENCE));
     let opened: usize = [first, second]

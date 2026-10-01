@@ -190,24 +190,23 @@ impl StoreHandle {
         .await
     }
 
-    /// The workspaces asleep, the one that went to sleep last first.
-    pub async fn asleep(&self) -> Result<Vec<(i64, i64)>, HandleError> {
+    /// The terminals asleep, as `(terminal, workspace, since)`, the latest first.
+    pub async fn asleep(&self) -> Result<Vec<(i64, i64, i64)>, HandleError> {
         self.run(|s| s.asleep()).await
     }
 
-    /// Put a workspace to sleep with its agents written down; one transaction.
-    pub async fn sleep_workspace(
+    /// Put terminals to sleep with their agents written down; one transaction.
+    pub async fn sleep_terminals(
         &self,
-        workspace: i64,
         checkpoints: Vec<qoro_store::Checkpoint>,
     ) -> Result<(), HandleError> {
-        self.run(move |s| s.sleep_workspace(workspace, now(), &checkpoints))
+        self.run(move |s| s.sleep_terminals(now(), &checkpoints))
             .await
     }
 
-    /// Take the sleep mark off a workspace. Answers whether it had one.
-    pub async fn wake_workspace(&self, workspace: i64) -> Result<bool, HandleError> {
-        self.run(move |s| s.wake_workspace(workspace)).await
+    /// Take the sleep marks off terminals. Answers how many had one.
+    pub async fn unmark(&self, terminals: Vec<i64>) -> Result<usize, HandleError> {
+        self.run(move |s| s.unmark(&terminals)).await
     }
 
     /// Record an agent's own id for the conversation in a terminal.

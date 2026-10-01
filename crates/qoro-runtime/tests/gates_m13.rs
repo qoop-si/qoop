@@ -982,7 +982,7 @@ async fn a_restart_brings_a_split_tab_back_as_one_tree() {
             beside(leaf(panes[2]), leaf(panes[3])),
         );
         terminals
-            .set_split(tree.clone(), &store)
+            .set_split(tree.clone(), &store, |_| false)
             .await
             .expect("recorded");
         tree
@@ -1024,6 +1024,7 @@ async fn a_restart_cuts_a_pane_that_did_not_come_back_out_of_the_stored_tree() {
             .set_split(
                 beside(leaf(panes[0]), beside(leaf(panes[1]), leaf(panes[2]))),
                 &store,
+                |_| false,
             )
             .await
             .expect("recorded");

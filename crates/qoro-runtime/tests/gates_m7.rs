@@ -61,10 +61,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         ControlRequest::SleepWorkspace {
             id: "x10c".into(),
             workspace: 999,
+            terminal: None,
         },
         ControlRequest::WakeWorkspace {
             id: "x10d".into(),
             workspace: Some(999),
+            terminal: None,
         },
         // A forged token: refused, but answered. The report carries a state for
         // the index, never bytes for the child.

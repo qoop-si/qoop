@@ -116,6 +116,25 @@ impl Link {
         }
     }
 
+    /// The space an awake terminal is in, from the index.
+    async fn workspace_of(&mut self, terminal: u32) -> std::io::Result<Option<i64>> {
+        match self
+            .ask(&ControlRequest::ListAgents {
+                id: super::request_id("agents"),
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Agents { agents, .. } => Ok(agents
+                .iter()
+                .find(|row| row.terminal == terminal)
+                .map(|row| row.workspace)),
+            _ => Err(std::io::Error::other(
+                "unexpected answer to the agent listing",
+            )),
+        }
+    }
+
     /// A space by id or name, made when the name is new.
     ///
     /// The list and the create hold a lock in the session's directory, so two callers
@@ -1063,15 +1082,63 @@ fn resolve_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Result<i64> 
     }
 }
 
-/// `qoro sleep <space>`: end every tab in a space and keep them, so it costs nothing until
-/// it wakes. Refused, with each reason, when a tab could not come back as it is.
-pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro sleep <space> [--json]";
-    let json = args.iter().any(|a| a == "--json");
-    let wanted: Vec<&String> = args.iter().skip(2).filter(|a| *a != "--json").collect();
-    let [wanted] = wanted.as_slice() else {
-        return Err(super::usage(help));
+/// What `qoro sleep` and `qoro wake` are asked about: a space by id or name, or one tab
+/// by number (`--tab N`), plus `--json`.
+struct Target {
+    space: Option<String>,
+    tab: Option<u32>,
+    json: bool,
+}
+
+fn parse_target(args: &[String], help: &str) -> std::io::Result<Target> {
+    let mut target = Target {
+        space: None,
+        tab: None,
+        json: false,
     };
+    let mut rest = args.iter().skip(2);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => target.json = true,
+            "--tab" => {
+                let tab = rest.next().and_then(|t| t.parse().ok());
+                target.tab = Some(tab.ok_or_else(|| super::usage(help))?);
+            }
+            _ if target.space.is_none() && !arg.starts_with('-') => {
+                target.space = Some(arg.clone())
+            }
+            _ => return Err(super::usage(help)),
+        }
+    }
+    Ok(target)
+}
+
+/// The space a sleeping tab is in, from the space list.
+fn space_of_tab(spaces: &[WorkspaceRow], tab: u32) -> Option<i64> {
+    spaces
+        .iter()
+        .find(|s| s.sleeping.iter().any(|t| t.terminal == tab))
+        .map(|s| s.id)
+}
+
+/// An older daemon answers a request that named a tab without saying which terminals it
+/// changed, because it acted on the whole space whatever was asked.
+fn older_daemon(done: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "the running daemon is older: the whole space {done}; restart it (`qoro stop`) to \
+         act on one tab"
+    ))
+}
+
+/// `qoro sleep <space>`, or `qoro sleep --tab N`: end every tab of a space, or that one tab
+/// (every pane of its split), and keep them, so they cost nothing until they wake. A tab
+/// that could not come back as it is stays awake, and the answer says which and why.
+pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro sleep <space> | --tab <terminal> [--json]";
+    let target = parse_target(args, help)?;
+    if target.space.is_some() == target.tab.is_some() {
+        return Err(super::usage(help));
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // No daemon is nothing awake: there is nothing to put to sleep, and starting one to
@@ -1085,23 +1152,54 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
             Err(e) => return Err(e),
         };
         let spaces = link.spaces().await?;
-        let space = resolve_space(&spaces, wanted)?;
+        let space = match (&target.space, target.tab) {
+            (Some(wanted), _) => resolve_space(&spaces, wanted)?,
+            (None, Some(tab)) => link.workspace_of(tab).await?.ok_or_else(|| {
+                std::io::Error::other(format!("there is no tab {tab} awake"))
+            })?,
+            (None, None) => unreachable!("checked above"),
+        };
         match link
             .ask(&ControlRequest::SleepWorkspace {
                 id: super::request_id("sleep"),
                 workspace: space,
+                terminal: target.tab,
             })
             .await?
             .0
         {
-            ControlResponse::WorkspaceAsleep { terminals, .. } => {
-                if json {
+            ControlResponse::WorkspaceAsleep { changed: None, .. } if target.tab.is_some() => {
+                Err(older_daemon("slept"))
+            }
+            ControlResponse::WorkspaceAsleep {
+                terminals,
+                changed,
+                stayed,
+                ..
+            } => {
+                if target.json {
                     println!(
                         "{}",
-                        serde_json::json!({ "space": space, "asleep": true, "ended": terminals })
+                        serde_json::json!({
+                            "space": space,
+                            "asleep": true,
+                            "ended": terminals,
+                            "slept": changed.unwrap_or_default(),
+                            "stayed": stayed
+                                .iter()
+                                .map(|s| serde_json::json!({ "tab": s.terminal, "reason": s.reason }))
+                                .collect::<Vec<_>>(),
+                        })
                     );
                 } else {
-                    println!("space {wanted} is asleep: {terminals} tabs ended");
+                    let what = match target.tab {
+                        Some(tab) => format!("tab {tab}"),
+                        None => format!("space {}", target.space.as_deref().unwrap_or_default()),
+                    };
+                    println!("{what} is asleep: {terminals} tabs ended");
+                    for s in &stayed {
+                        println!("tab {} stays awake: {}", s.terminal, s.reason);
+                    }
                 }
                 Ok(())
             }
@@ -1111,13 +1209,13 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro wake [space]`: bring a sleeping space back, or the one that went to sleep last.
-/// Starts the daemon when none is running, since waking is asking for one.
+/// `qoro wake [space]`, or `qoro wake --tab N`: bring a sleeping tab back, every sleeping
+/// tab of a space, or with nothing named the tab that went to sleep last. Starts the
+/// daemon when none is running, since waking is asking for one.
 pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro wake [space] [--json]";
-    let json = args.iter().any(|a| a == "--json");
-    let wanted: Vec<&String> = args.iter().skip(2).filter(|a| *a != "--json").collect();
-    if wanted.len() > 1 {
+    let help = "usage: qoro wake [space] | --tab <terminal> [--json]";
+    let target = parse_target(args, help)?;
+    if target.space.is_some() && target.tab.is_some() {
         return Err(super::usage(help));
     }
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -1125,28 +1223,37 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let mut link = Link::open("qoro-wake").await?;
-        let workspace = match wanted.first() {
-            Some(wanted) => Some(resolve_space(&link.spaces().await?, wanted)?),
-            None => None,
+        let spaces = link.spaces().await?;
+        let workspace = match (&target.space, target.tab) {
+            (Some(wanted), _) => Some(resolve_space(&spaces, wanted)?),
+            (None, Some(tab)) => Some(
+                space_of_tab(&spaces, tab)
+                    .ok_or_else(|| std::io::Error::other(format!("there is no tab {tab} asleep")))?,
+            ),
+            (None, None) => None,
         };
         match link
             .ask(&ControlRequest::WakeWorkspace {
                 id: super::request_id("wake"),
                 workspace,
+                terminal: target.tab,
             })
             .await?
             .0
         {
+            ControlResponse::WorkspaceAwake { changed: None, .. } if target.tab.is_some() => {
+                Err(older_daemon("woke"))
+            }
             ControlResponse::WorkspaceAwake {
                 workspace,
                 terminals,
                 resumed,
                 ..
             } => {
-                if json {
+                if target.json {
                     println!("{}", serde_json::json!({ "space": workspace, "asleep": false, "tabs": terminals, "resumed": resumed }));
                 } else {
-                    println!("space {workspace} is awake: {terminals} tabs, {resumed} agents resumed");
+                    println!("space {workspace}: {terminals} tabs awake again, {resumed} agents resumed");
                 }
                 Ok(())
             }
@@ -1161,7 +1268,7 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
                     .0
                 {
                     ControlResponse::Terminals { terminals, .. } if !terminals.is_empty() => {
-                        if json {
+                        if target.json {
                             println!("{}", serde_json::json!({ "asleep": false, "tabs": terminals.len() }));
                         } else {
                             println!("nothing was asleep; {} tabs are awake", terminals.len());
@@ -1221,23 +1328,29 @@ pub(crate) fn ensure_awake() -> std::io::Result<()> {
         {
             return Ok(());
         }
-        // Nothing awake: the space that went to sleep last is the one that was left, so it
-        // is the one woken. Only with nothing asleep either is there a shell to open, or in
-        // a woken space that brought no tab back.
+        // Nothing awake: the tab that went to sleep last is the one that was left, so it is
+        // the one woken, alone. Only with nothing asleep either is there a shell to open, or
+        // in a woken space that brought no tab back.
         let woken = match link
             .ask(&ControlRequest::WakeWorkspace {
                 id: super::request_id("start"),
                 workspace: None,
+                terminal: None,
             })
             .await?
             .0
         {
             ControlResponse::WorkspaceAwake { terminals, .. } if terminals > 0 => return Ok(()),
             ControlResponse::WorkspaceAwake { workspace, .. } => Some(workspace),
-            // Refused while a space is still asleep: said, rather than a shell opened beside
-            // a space that did not come back.
+            // Refused while a tab is still asleep: said, rather than a shell opened beside a
+            // tab that did not come back.
             ControlResponse::Failed { reason, .. } => {
-                if link.spaces().await?.iter().any(|space| space.asleep) {
+                if link
+                    .spaces()
+                    .await?
+                    .iter()
+                    .any(|space| !space.sleeping.is_empty())
+                {
                     return Err(std::io::Error::other(reason));
                 }
                 None
@@ -1287,11 +1400,17 @@ pub(crate) fn open_space(wanted: &str) -> std::io::Result<i64> {
         let space = link.space(wanted).await?;
         let row = link.spaces().await?.into_iter().find(|s| s.id == space);
         let mut tabs = row.as_ref().map_or(0, |s| s.terminals);
-        if row.is_some_and(|s| s.asleep) {
+        // Nothing of it awake: one of its sleeping tabs is woken, not all of them, so an
+        // interface shown this space alone has something to show for the price of one.
+        let sleeping = row
+            .filter(|s| s.terminals == 0)
+            .and_then(|s| s.sleeping.first().map(|t| t.lead.unwrap_or(t.terminal)));
+        if let Some(tab) = sleeping {
             match link
                 .ask(&ControlRequest::WakeWorkspace {
                     id: super::request_id("space"),
                     workspace: Some(space),
+                    terminal: Some(tab),
                 })
                 .await?
                 .0

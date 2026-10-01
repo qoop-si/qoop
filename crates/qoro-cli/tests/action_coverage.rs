@@ -177,6 +177,7 @@ fn actions() -> Vec<Action> {
                 Method::Control(ControlRequest::SleepWorkspace {
                     id: "a".into(),
                     workspace: 2,
+                    terminal: None,
                 })
             },
         },
@@ -186,6 +187,7 @@ fn actions() -> Vec<Action> {
                 Method::Control(ControlRequest::WakeWorkspace {
                     id: "a".into(),
                     workspace: Some(2),
+                    terminal: None,
                 })
             },
         },
@@ -429,10 +431,12 @@ fn every_control_method_is_reachable_from_some_action() {
         ControlRequest::SleepWorkspace {
             id: String::new(),
             workspace: 0,
+            terminal: None,
         },
         ControlRequest::WakeWorkspace {
             id: String::new(),
             workspace: None,
+            terminal: None,
         },
         ControlRequest::Subscribe {
             id: String::new(),

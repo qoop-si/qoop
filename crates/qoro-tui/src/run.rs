@@ -1149,7 +1149,7 @@ impl State {
             // The bar starts where the pane starts, so the column it was clicked at is
             // counted from there and not from the edge of the screen.
             return match tabs::hit(
-                &self.tabs(),
+                &screen::bar_tabs(&self.rows, &self.panes(), self.space, &self.spaces),
                 self.focused_tab(),
                 pane_cols as usize,
                 (col as usize).saturating_sub(left + 1),
@@ -1292,11 +1292,11 @@ impl State {
         if tabs.is_empty() {
             return None;
         }
-        let at = tabs
-            .iter()
-            .position(|r| r.terminal == self.focused)
-            .unwrap_or(0);
         let n = tabs.len();
+        // From a sleeping tab the keyboard was on, the first tab or the last.
+        let Some(at) = tabs.iter().position(|r| r.terminal == self.focused) else {
+            return Some(tabs[if forward { 0 } else { n - 1 }].terminal);
+        };
         let next = if forward {
             (at + 1) % n
         } else {
@@ -1337,17 +1337,23 @@ impl State {
             .map(|(_, snapshot)| snapshot)
     }
 
-    /// Whether this space is listed asleep.
+    /// Whether this space is listed asleep: every tab of it.
     fn asleep(&self, space: i64) -> bool {
         self.spaces.iter().any(|w| w.id == space && w.asleep)
     }
 
-    /// The tabs a wake of the space on screen brings back, when it is asleep.
-    fn dim_tabs(&self) -> &[qoro_runtime::control::SleepingTab] {
+    /// The sleeping tabs of the space on screen, one per tab (its first pane), whether or
+    /// not anything else in it is awake.
+    fn dim_tabs(&self) -> Vec<&qoro_runtime::control::SleepingTab> {
         self.spaces
             .iter()
-            .find(|w| Some(w.id) == self.space && w.asleep)
-            .map_or(&[], |w| &w.sleeping)
+            .find(|w| Some(w.id) == self.space)
+            .map_or_else(Vec::new, |w| {
+                w.sleeping
+                    .iter()
+                    .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
+                    .collect()
+            })
     }
 
     /// The sleeping tab the keyboard rests on: the one `ctrl-a n/p` picked, else the first.
@@ -1363,11 +1369,11 @@ impl State {
             .map(|t| t.terminal)
     }
 
-    /// The sleeping space a tab belongs to, when it is one of a sleeping space's tabs.
+    /// The space a sleeping tab belongs to, when it is one.
     fn sleeping_space_of(&self, terminal: u32) -> Option<i64> {
         self.spaces
             .iter()
-            .find(|w| w.asleep && w.sleeping.iter().any(|t| t.terminal == terminal))
+            .find(|w| w.sleeping.iter().any(|t| t.terminal == terminal))
             .map(|w| w.id)
     }
 }
@@ -2610,67 +2616,48 @@ fn close_focused(state: &mut State, request: &mut u64) {
     }
 }
 
-/// `ctrl-a Z`: put the space on screen to sleep, or wake it when it is asleep. Sent through
-/// the outbox like a close; a refusal comes back on the hint row with the daemon's reason.
+/// `ctrl-a Z`: put the tab the keyboard is in to sleep, every pane of it, or wake the
+/// sleeping tab the keyboard rests on. Sent through the outbox like a close; a refusal comes
+/// back on the hint row with the daemon's reason.
 fn sleep_toggle(state: &mut State, request: &mut u64) {
     let Some(space) = state.space else {
-        state.message = Some("no space to put to sleep".to_string());
+        state.message = Some("no tab to put to sleep".to_string());
         return;
     };
-    sleep_space(state, space, request);
+    if state.focused != 0 {
+        *request += 1;
+        state.message = Some("putting this tab to sleep".to_string());
+        state.modes.outbox.push(ControlRequest::SleepWorkspace {
+            id: format!("sleep-tab-{request}"),
+            workspace: space,
+            terminal: Some(state.focused),
+        });
+    } else if let Some(tab) = state.dim_tab() {
+        wake(state, space, tab, request);
+    }
 }
 
-/// The same toggle, for a named space rather than the one on screen, which is what the
-/// rule's own `z` is: a person clicking a row means that row, not where they are.
+/// The rule's own `z`: put every tab of that space to sleep. It never wakes: a sleeping tab
+/// wakes alone, by a click or a key on it.
 fn sleep_space(state: &mut State, space: i64, request: &mut u64) {
-    if state.asleep(space) {
-        // A `z` on a space behind the column wakes it where it lies rather than moving the
-        // person into it: they clicked that row, not the one on screen. The other three
-        // callers of `wake` (the palette, a click on a sleeping tab, and `ctrl-a Z`) all
-        // mean to move, which is why the choice is here and not inside `wake`.
-        let shown = state.space == Some(space);
-        let to = if shown { state.dim_tab() } else { None };
-        wake_quiet(state, space, to, request);
-        return;
-    }
     *request += 1;
     state.message = Some(format!("putting {} to sleep", space_name(state, space)));
     state.modes.outbox.push(ControlRequest::SleepWorkspace {
         id: format!("sleep-{request}"),
         workspace: space,
+        terminal: None,
     });
 }
 
-/// Wake a sleeping space, and show `to` (else its first tab) once the index lists it.
-fn wake(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
-    let to = to.or_else(|| first_sleeping_tab(state, space));
-    wake_quiet(state, space, to, request);
-}
-
-/// The first tab a wake of this space brings back, which is the one the interface follows
-/// when nobody named another.
-fn first_sleeping_tab(state: &State, space: i64) -> Option<u32> {
-    state
-        .spaces
-        .iter()
-        .find(|w| w.id == space)
-        .and_then(|w| w.sleeping.first())
-        .map(|t| t.terminal)
-}
-
-/// A wake without asking the interface to follow it, for a space the person did not ask to
-/// be moved to. `to` is used exactly as given: a caller that means to move fills the
-/// fallback in itself, and a caller that does not leaves it `None`, so there is nothing to
-/// follow and the screen stays where it is.
-fn wake_quiet(state: &mut State, space: i64, to: Option<u32>, request: &mut u64) {
+/// Wake one sleeping tab, every pane of it, and show it once the index lists it.
+fn wake(state: &mut State, space: i64, tab: u32, request: &mut u64) {
     *request += 1;
-    // `to` is `None` for a wake the person did not ask to be moved by, so there is nothing
-    // to follow and the screen stays where it is.
-    state.waking = to.map(|to| (space, to));
-    state.message = Some(format!("waking {}", space_name(state, space)));
+    state.waking = Some((space, tab));
+    state.message = Some("waking this tab".to_string());
     state.modes.outbox.push(ControlRequest::WakeWorkspace {
-        id: format!("wake-{request}"),
+        id: format!("wake-tab-{request}"),
         workspace: Some(space),
+        terminal: Some(tab),
     });
 }
 
@@ -2680,12 +2667,8 @@ fn wake_quiet(state: &mut State, space: i64, to: Option<u32>, request: &mut u64)
 /// the space list again.
 fn slept_or_woken(spaces: &[qoro_runtime::control::WorkspaceRow], agents: &[AgentRow]) -> bool {
     spaces.iter().any(|space| {
-        let held = agents.iter().any(|r| r.workspace == space.id);
-        if space.asleep {
-            held
-        } else {
-            !held && space.terminals > 0
-        }
+        let held = agents.iter().filter(|r| r.workspace == space.id).count();
+        held != space.terminals
     })
 }
 
@@ -4488,7 +4471,7 @@ where
                             }
                             PaletteOutcome::Confirm(item) => {
                                 match item {
-                                    // A jump to a sleeping tab shows it; a sleeping space wakes.
+                                    // A jump to a sleeping tab shows it without waking it.
                                     palette::Item::Terminal(picked)
                                         if let Some(space) = state.sleeping_space_of(picked) =>
                                     {
@@ -4497,9 +4480,6 @@ where
                                         )? {
                                             wr.write_all(&out).await?;
                                         }
-                                    }
-                                    palette::Item::Space(space) if state.asleep(space) => {
-                                        wake(&mut state, space, None, &mut request);
                                     }
                                     palette::Item::Sleep => {
                                         sleep_toggle(&mut state, &mut request);
@@ -4927,14 +4907,14 @@ where
                                     dirty = true;
                                 }
                                 let focused = state.focused;
-                                // Enter on a sleeping tab wakes its space, the one key that
-                                // means "go" when there is nothing to type into.
+                                // Enter on a sleeping tab wakes it, the one key that means
+                                // "go" when there is nothing to type into.
                                 if focused == 0
                                     && bytes.contains(&b'\r')
                                     && let Some(to) = state.dim_tab()
                                     && let Some(space) = state.space
                                 {
-                                    wake(&mut state, space, Some(to), &mut request);
+                                    wake(&mut state, space, to, &mut request);
                                     dirty = true;
                                 }
                                 if focused != 0 {
@@ -5100,12 +5080,12 @@ where
                                             moved: false,
                                         });
                                     }
-                                    // A sleeping tab: a click wakes its space and follows
-                                    // that tab. The palette and ctrl-a n/p still only peek.
+                                    // A sleeping tab: a click wakes that tab alone and
+                                    // follows it. The palette and ctrl-a n/p only peek.
                                     Some(Clicked::Terminal(picked))
                                         if let Some(space) = state.sleeping_space_of(picked) =>
                                     {
-                                        wake(&mut state, space, Some(picked), &mut request);
+                                        wake(&mut state, space, picked, &mut request);
                                         dirty = true;
                                     }
                                     Some(Clicked::Terminal(picked)) => {
@@ -5123,11 +5103,8 @@ where
                                     // The tab bar's `+` is the space on screen's `+`.
                                     Some(Clicked::NewTerminal) => {
                                         match state.space {
-                                            // A sleeping space wakes first, as its
-                                            // column row has no `+` until then.
-                                            Some(space) if state.asleep(space) => {
-                                                wake(&mut state, space, None, &mut request);
-                                            }
+                                            // A new tab beside sleeping ones leaves them
+                                            // asleep.
                                             Some(space) => open_new(&mut state, space),
                                             None => {
                                                 state.prompt = Some(Prompt {
@@ -5321,7 +5298,7 @@ where
                                     } else if let Some(space) =
                                         state.sleeping_space_of(press.terminal)
                                     {
-                                        wake(&mut state, space, Some(press.terminal), &mut request);
+                                        wake(&mut state, space, press.terminal, &mut request);
                                     } else if press.name && press.terminal == state.focused {
                                         rename_from_row(&mut state, press.terminal);
                                     } else if let Some(bytes) = focus(
@@ -5532,10 +5509,11 @@ where
                                 state.shown_images.clear();
                                 dirty = true;
                             }
-                            // On a sleeping space the keys move between its tabs without
-                            // waking anything, so a tab can be picked to wake or discard.
+                            // With nothing awake in the space the keys move between its
+                            // sleeping tabs without waking anything, so one can be picked
+                            // to wake or discard. With a tab awake they go to the tabs.
                             Action::Next | Action::Previous
-                                if state.dim_tab().is_some() =>
+                                if state.dim_tab().is_some() && state.tabs().is_empty() =>
                             {
                                 let tabs: Vec<u32> =
                                     state.dim_tabs().iter().map(|t| t.terminal).collect();
@@ -7059,9 +7037,6 @@ fn drop_hint(state: &State, terminal: u32, drop: Option<RowDrop>) -> String {
         .map(|r| r.workspace);
     match drop {
         Some(RowDrop::Space(space)) if Some(space) == from => ANYWHERE.to_string(),
-        Some(RowDrop::Space(space)) if state.asleep(space) => {
-            format!("{} is asleep, wake it first", space_name(state, space))
-        }
         Some(RowDrop::Space(space)) => {
             format!("move {} to {}", name(terminal), space_name(state, space))
         }
@@ -7107,13 +7082,6 @@ fn drop_row(
         RowDrop::Pane(pane, _) if pane == terminal => return None,
         RowDrop::Pane(pane, side) => (state.space?, Some((pane, side))),
     };
-    if state.asleep(space) {
-        state.message = Some(format!(
-            "{} is asleep, wake it first",
-            space_name(state, space)
-        ));
-        return None;
-    }
     if let Some((pane, side)) = beside {
         // Tried on a copy: a drop with no room for the pane changes nothing.
         let mut tree = state.layouts.get(&space)?.clone();
@@ -7702,13 +7670,7 @@ fn enter_space(
         }
         Some(first) => focus(state, first, control_seq, seqs),
         // Asleep: the keyboard rests on its tabs, and waking is a key away.
-        None if state.asleep(space) => unfocus(
-            state,
-            &crate::keys::named(
-                "asleep: enter or ctrl-a Z wakes it, ctrl-a n/p picks a tab, ctrl-a x discards it",
-            ),
-            control_seq,
-        ),
+        None if state.asleep(space) => unfocus(state, &asleep_hint(), control_seq),
         None => unfocus(
             state,
             &format!(
@@ -7720,8 +7682,16 @@ fn enter_space(
     }
 }
 
-/// Put the keyboard on one tab of a sleeping space without waking it: its space comes on
-/// screen with that tab picked, and the wake stays a key away.
+/// What the hint row says while the keyboard rests on a sleeping tab.
+fn asleep_hint() -> String {
+    crate::keys::named(
+        "asleep: enter or ctrl-a Z wakes this tab, ctrl-a n/p picks a tab, ctrl-a x discards it",
+    )
+}
+
+/// Put the keyboard on a sleeping tab without waking it: its space comes on screen with
+/// that tab showing its last screen, and the wake stays a key away. In a space with tabs
+/// awake the keyboard is taken back out of the one entering put it in.
 fn peek(
     state: &mut State,
     space: i64,
@@ -7730,7 +7700,15 @@ fn peek(
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
     state.dim = tab;
-    enter_space(state, space, control_seq, seqs)
+    let mut out = enter_space(state, space, control_seq, seqs)?;
+    if state.focused != 0 {
+        state.dim = tab;
+        if let Some(more) = unfocus(state, &asleep_hint(), control_seq)? {
+            out.get_or_insert_with(BytesMut::new)
+                .extend_from_slice(&more);
+        }
+    }
+    Ok(out)
 }
 
 /// Take the keyboard out of every terminal, because this space has none to put it in.
@@ -7994,16 +7972,38 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             close_gate(state, request);
             *dirty = true;
         }
+        // A daemon older than this interface sleeps the whole space whatever was asked, and
+        // does not say which tabs changed: said, so the person knows why every tab went.
+        ControlResponse::WorkspaceAsleep {
+            id, changed: None, ..
+        } if id.starts_with("sleep-tab-") => {
+            state.message = None;
+            state.hint = Some(
+                "the running daemon is older: the whole space slept; restart it (qoro stop) \
+                 to sleep one tab"
+                    .to_string(),
+            );
+            *dirty = true;
+        }
         ControlResponse::WorkspaceAsleep {
             workspace,
             terminals,
+            stayed,
             ..
         } => {
             let tabs = if terminals == 1 { "tab" } else { "tabs" };
             state.message = Some(format!(
-                "{} is asleep, {terminals} {tabs} to wake",
+                "{terminals} {tabs} of {} asleep",
                 space_name(state, workspace)
             ));
+            // What stayed awake, and why, stays on the hint row like a refusal does.
+            if !stayed.is_empty() {
+                let why: Vec<String> = stayed
+                    .iter()
+                    .map(|s| format!("tab {}: {}", s.terminal, s.reason))
+                    .collect();
+                state.hint = Some(format!("stayed awake: {}", why.join("; ")));
+            }
             *dirty = true;
         }
         ControlResponse::WorkspaceAwake {
@@ -8013,7 +8013,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             ..
         } => {
             state.message = Some(format!(
-                "{} is awake: {terminals} tabs back, {resumed} agents resumed",
+                "{terminals} tabs of {} back, {resumed} agents resumed",
                 space_name(state, workspace)
             ));
             // The tab asked for goes on screen once the index lists it again.
@@ -13412,9 +13412,11 @@ mod tests {
     fn asleep(id: i64, name: &str, tabs: &[u32]) -> WorkspaceRow {
         WorkspaceRow {
             asleep: true,
+            terminals: 0,
             sleeping: tabs
                 .iter()
                 .map(|&terminal| qoro_runtime::control::SleepingTab {
+                    lead: None,
                     terminal,
                     session: None,
                     title: None,
@@ -13560,19 +13562,20 @@ mod tests {
         );
     }
 
-    /// `ctrl-a Z` sleeps the awake space on screen, and on a sleeping one wakes it and
-    /// shows the tab the keyboard rested on once it is back. A refusal stays on the hint
-    /// row with the daemon's reason.
+    /// `ctrl-a Z` sleeps the tab the keyboard is in, alone, and on a sleeping tab the
+    /// keyboard rests on wakes that tab and shows it once it is back. A refusal stays on
+    /// the hint row with the daemon's reason; the rule's `z` only ever sleeps.
     #[test]
-    fn ctrl_a_z_sleeps_an_awake_space_and_wakes_a_sleeping_one() {
+    fn ctrl_a_z_sleeps_the_tab_and_wakes_a_sleeping_one() {
         let mut state = state();
         let mut request = 0;
         sleep_toggle(&mut state, &mut request);
         assert_eq!(
             state.modes.outbox.pop(),
             Some(ControlRequest::SleepWorkspace {
-                id: "sleep-1".into(),
+                id: "sleep-tab-1".into(),
                 workspace: 2,
+                terminal: Some(2),
             })
         );
 
@@ -13584,8 +13587,9 @@ mod tests {
         assert_eq!(
             state.modes.outbox.pop(),
             Some(ControlRequest::WakeWorkspace {
-                id: "wake-2".into(),
+                id: "wake-tab-2".into(),
                 workspace: Some(1),
+                terminal: Some(8),
             })
         );
         assert_eq!(state.waking, Some((1, 8)));
@@ -13593,10 +13597,11 @@ mod tests {
         apply(
             &mut state,
             ControlResponse::WorkspaceAwake {
-                id: "wake-2".into(),
+                id: "wake-tab-2".into(),
                 workspace: 1,
-                terminals: 2,
-                resumed: 2,
+                terminals: 1,
+                resumed: 1,
+                changed: Some(vec![8]),
             },
             &mut 0,
             &mut dirty,
@@ -13617,6 +13622,68 @@ mod tests {
             state.hint.as_deref(),
             Some("tab 2 (ssh) holds a connection")
         );
+        // The rule's `z` puts the whole space to sleep, and on a sleeping space asks
+        // nothing to wake.
+        sleep_space(&mut state, 1, &mut request);
+        assert_eq!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SleepWorkspace {
+                id: "sleep-3".into(),
+                workspace: 1,
+                terminal: None,
+            })
+        );
+        // An older daemon sleeps the space whatever was asked, and that is said.
+        apply(
+            &mut state,
+            ControlResponse::WorkspaceAsleep {
+                id: "sleep-tab-4".into(),
+                workspace: 2,
+                terminals: 3,
+                changed: None,
+                stayed: Vec::new(),
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        assert!(
+            state
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("daemon is older")),
+            "{:?}",
+            state.hint
+        );
+    }
+
+    /// A space half asleep: its sleeping tabs sit on the bar after the awake ones, one per
+    /// tab however many panes it had, dim; the keyboard can rest on one without waking it,
+    /// and `ctrl-a n/p` from there go to the awake tabs.
+    #[test]
+    fn a_half_asleep_space_shows_its_sleeping_tabs_and_steps_off_a_peek() {
+        let mut state = state();
+        let mut half = asleep(2, "webshop", &[7, 8, 9]);
+        half.asleep = false;
+        half.terminals = 1;
+        // 7 and 8 are one tab, split; 9 is a tab of its own.
+        half.sleeping[0].lead = Some(7);
+        half.sleeping[1].lead = Some(7);
+        half.sleeping[2].lead = Some(9);
+        state.spaces[1] = half;
+        let bar = screen::bar_tabs(&state.rows, &state.panes(), state.space, &state.spaces);
+        assert_eq!(
+            bar.iter()
+                .map(|r| (r.terminal, r.state.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "working"), (7, "sleeping"), (9, "sleeping")]
+        );
+        assert_eq!(state.sleeping_space_of(8), Some(2));
+        // Resting on a sleeping tab: no terminal has the keyboard, and the dim one is it.
+        state.focused = 0;
+        state.dim = 9;
+        assert_eq!(state.dim_tab(), Some(9));
+        assert_eq!(state.neighbour(true), Some(2));
+        assert_eq!(state.neighbour(false), Some(2));
     }
 
     /// The keyboard on a sleeping tab: `ctrl-a x` discards that tab, not the space.

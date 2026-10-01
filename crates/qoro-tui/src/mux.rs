@@ -702,21 +702,37 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             }
             // To the machine the space is on, in its own numbering; a machine let go because
             // everything there slept is brought back by the wake itself.
-            R::SleepWorkspace { id, workspace } => {
+            // A tab, when one is named, goes with its space: the same machine.
+            R::SleepWorkspace {
+                id,
+                workspace,
+                terminal,
+            } => {
                 let (link, workspace) = workspace_in(workspace);
-                self.send_one(link, R::SleepWorkspace { id, workspace })
-                    .await
+                let terminal = terminal.map(|t| terminal_in(t).1);
+                self.send_one(
+                    link,
+                    R::SleepWorkspace {
+                        id,
+                        workspace,
+                        terminal,
+                    },
+                )
+                .await
             }
             R::WakeWorkspace {
                 id,
                 workspace: Some(workspace),
+                terminal,
             } => {
                 let (link, workspace) = workspace_in(workspace);
+                let terminal = terminal.map(|t| terminal_in(t).1);
                 self.send_one(
                     link,
                     R::WakeWorkspace {
                         id,
                         workspace: Some(workspace),
+                        terminal,
                     },
                 )
                 .await
@@ -1080,6 +1096,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                                 .into_iter()
                                 .filter_map(|mut tab| {
                                     tab.terminal = terminal_out(link, tab.terminal)?;
+                                    tab.lead = tab.lead.and_then(|t| terminal_out(link, t));
                                     Some(tab)
                                 })
                                 .collect(),
@@ -1161,13 +1178,31 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 id,
                 workspace,
                 terminals,
+                changed,
+                stayed,
             } => match workspace_out(link, workspace) {
                 Some(workspace) => {
                     self.touched(link);
+                    let changed = changed.map(|ts| {
+                        ts.into_iter()
+                            .filter_map(|t| terminal_out(link, t))
+                            .collect()
+                    });
+                    let stayed = stayed
+                        .into_iter()
+                        .filter_map(|s| {
+                            Some(qoro_runtime::control::Stayed {
+                                terminal: terminal_out(link, s.terminal)?,
+                                reason: s.reason,
+                            })
+                        })
+                        .collect();
                     self.respond(&C::WorkspaceAsleep {
                         id,
                         workspace,
                         terminals,
+                        changed,
+                        stayed,
                     })
                     .await
                 }
@@ -1178,14 +1213,21 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 workspace,
                 terminals,
                 resumed,
+                changed,
             } => match workspace_out(link, workspace) {
                 Some(workspace) => {
                     self.touched(link);
+                    let changed = changed.map(|ts| {
+                        ts.into_iter()
+                            .filter_map(|t| terminal_out(link, t))
+                            .collect()
+                    });
                     self.respond(&C::WorkspaceAwake {
                         id,
                         workspace,
                         terminals,
                         resumed,
+                        changed,
                     })
                     .await
                 }

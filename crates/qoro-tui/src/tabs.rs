@@ -241,6 +241,9 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
         |text: &str, to: usize| format!("{text}{}", " ".repeat(to - crate::width::width(text)));
     let (name_ink, mark_ink) = if focused {
         (Ink::Focused, Ink::FocusedMark)
+    } else if row.state == "sleeping" {
+        // Asleep: drawn in the folder's quiet ink, so it reads as there but not running.
+        (Ink::Sub, Ink::Curve)
     } else {
         (Ink::Other, Ink::Curve)
     };

@@ -460,6 +460,54 @@ pub fn in_space(rows: &[AgentRow], space: Option<i64>) -> Vec<AgentRow> {
         .collect()
 }
 
+/// The tabs on the bar: the live ones of the space, splits folded into their tab, then its
+/// sleeping tabs, one per tab, in the state `sleeping` so they paint dim. A sleeping shell
+/// has no other door: the column lists agents, and a click here is what wakes it.
+pub fn bar_tabs(
+    rows: &[AgentRow],
+    panes: &std::collections::BTreeMap<u32, u32>,
+    space: Option<i64>,
+    spaces: &[WorkspaceRow],
+) -> Vec<AgentRow> {
+    let mut tabs: Vec<AgentRow> = in_space(rows, space)
+        .into_iter()
+        .filter(|r| !panes.contains_key(&r.terminal))
+        .collect();
+    let sleeping = spaces
+        .iter()
+        .find(|w| Some(w.id) == space)
+        .map_or(&[][..], |w| &w.sleeping[..]);
+    for tab in sleeping
+        .iter()
+        .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
+    {
+        tabs.push(AgentRow {
+            news: false,
+            terminal: tab.terminal,
+            name: tab.title.clone(),
+            workspace: space.unwrap_or_default(),
+            agent: tab.agent.is_some(),
+            program: tab.agent.clone(),
+            behind: None,
+            state: "sleeping".to_string(),
+            generation: None,
+            readiness: "asleep".to_string(),
+            source: None,
+            rule: None,
+            manifest: None,
+            agent_session: None,
+            agent_title: tab.session.clone(),
+            last_active_at_unix: None,
+            cwd: Some(tab.cwd.clone()),
+            slept_at_unix: None,
+            activity: None,
+            pgid: None,
+            discards: None,
+        });
+    }
+    tabs
+}
+
 /// The escape sequence that puts the cursor at a one-based row and column.
 pub(crate) fn at(row: usize, col: usize) -> String {
     format!("\x1b[{row};{col}H")
@@ -637,10 +685,7 @@ pub fn paint(frame: &Frame) -> String {
 
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
-    let tabs: Vec<AgentRow> = in_space(frame.rows, frame.space)
-        .into_iter()
-        .filter(|r| !frame.panes.contains_key(&r.terminal))
-        .collect();
+    let tabs = bar_tabs(frame.rows, &frame.panes, frame.space, frame.spaces);
     // With the keyboard in a split, the tab it is a split of is the one that reads focused.
     let focused_tab = tab_of(frame.focused, &frame.panes);
     for (at_row, pieces) in tabs::painted(&tabs, focused_tab, pane_cols as usize)

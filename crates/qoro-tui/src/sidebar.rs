@@ -1088,16 +1088,12 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
     let mark = hot.unwrap_or(Role::Faint);
-    let held = if space.asleep {
-        space.sleeping.iter().filter(|t| t.agent.is_some()).count()
-    } else {
-        kids.len()
-    };
-    // A sleeping space draws the toggle whenever it has tabs to wake, because nothing of
-    // it is running and `z` is then the only way back with a mouse. An awake space draws
-    // it when it holds anything at all, which is the daemon's own test: `kids` is the
-    // live registry filtered by workspace, so an empty `kids` is a space nothing runs in
-    // and `SleepWorkspace` would refuse it.
+    let dozing = space.sleeping.iter().filter(|t| t.agent.is_some()).count();
+    let held = if space.asleep { dozing } else { kids.len() };
+    // `z` puts every tab of the space to sleep and never wakes one, so it is drawn while
+    // something in the space runs, which is the daemon's own test: `kids` is the live
+    // registry filtered by workspace, and an empty `kids` is a space `SleepWorkspace`
+    // would refuse. A sleeping tab wakes by a click on its own row.
     let block = if c.armed == Some(space.id) {
         // Armed: the row is a question, so the two controls become the two answers in the
         // same columns. A question is asked in the place it was asked from, and answered
@@ -1120,6 +1116,8 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         SLEEPING.to_string()
     } else if held == 0 {
         String::new()
+    } else if !space.asleep && dozing > 0 {
+        format!(" ({held}, {dozing} asleep)")
     } else {
         format!(" ({held})")
     };
@@ -1204,15 +1202,14 @@ fn room_for(width: usize, slot: &str) -> usize {
 /// The control block at the right of a space rule: the new tab, the sleep toggle and the
 /// close, in five columns that never change shape, laid out from the right edge inward.
 ///
-/// `+` at `width - 6`, `z` at `width - 4` and `x` at `width - 2`, whenever drawn. A sleeping
-/// space gets no `+`: it has to wake first, and `z` is right beside it. The block being fixed is the
-/// whole point: the slot beside the name grows a column at 10 tabs, and a control that
+/// `+` at `width - 6`, `z` at `width - 4` and `x` at `width - 2`, whenever drawn. A new tab
+/// beside sleeping ones leaves them asleep, so `+` is always there. The block being fixed is
+/// the whole point: the slot beside the name grows a column at 10 tabs, and a control that
 /// moved with it would be a control nobody could learn.
 ///
-/// A space with nothing running in it gets no `z`, because the daemon refuses to sleep an
-/// empty space and a control that cannot work is worse than no control. A space that is
-/// asleep always gets one, because `z` is then the only way back with a mouse: a sleeping
-/// space has no tab rows to press, so there is nothing else to click.
+/// A space with nothing running in it gets no `z`: `z` only puts to sleep, the daemon
+/// refuses to sleep what is not running, and a control that cannot work is worse than no
+/// control. Its sleeping tabs wake one at a time, by their own rows.
 struct Block {
     /// (zero-based column, width) of the new tab control, if it is drawn.
     new: Option<(usize, usize)>,
@@ -1265,8 +1262,8 @@ fn armed_block(width: usize) -> Block {
 /// The block of a rule that is not asking: `busy` is whether anything runs in the space.
 fn block(width: usize, space: &WorkspaceRow, busy: bool) -> Block {
     Block {
-        new: (!space.asleep).then_some((width.saturating_sub(6), 1)),
-        sleep: (space.asleep || busy).then_some((width.saturating_sub(4), 1)),
+        new: Some((width.saturating_sub(6), 1)),
+        sleep: busy.then_some((width.saturating_sub(4), 1)),
         close: space.closable.then_some((width.saturating_sub(2), 1)),
         answer: None,
     }
@@ -6590,6 +6587,7 @@ mod tests {
         asleep.asleep = true;
         asleep.sleeping = vec![
             SleepingTab {
+                lead: None,
                 terminal: 7,
                 session: None,
                 title: None,
@@ -6597,6 +6595,7 @@ mod tests {
                 cwd: "/src/api".into(),
             },
             SleepingTab {
+                lead: None,
                 terminal: 8,
                 session: None,
                 title: Some("logs".into()),
@@ -6613,7 +6612,8 @@ mod tests {
         assert!(!head.text.contains("api z"), "{:?}", head.text);
 
         assert_eq!(crate::width::width(&head.text), WIDTH);
-        // The name and the rule wear the sleeping colour, and the toggle keeps its column.
+        // The name and the rule wear the sleeping colour, and there is no `z`: it only puts
+        // to sleep, and a sleeping tab wakes by its own row.
         assert_eq!(
             head.accent.expect("the name's run").2,
             crate::theme::Role::Sleeping,
@@ -6621,8 +6621,7 @@ mod tests {
             head.runs
         );
         assert!(
-            head.runs
-                .contains(&(WIDTH - 4, 1, crate::theme::Role::Sleeping)),
+            !head.runs.iter().any(|run| run.0 == WIDTH - 4),
             "{:?}",
             head.runs
         );
@@ -6673,6 +6672,7 @@ mod tests {
             let mut asleep = space(2, "api");
             asleep.asleep = true;
             asleep.sleeping = vec![SleepingTab {
+                lead: None,
                 terminal: 7,
                 title: title.map(Into::into),
                 session: session.map(Into::into),
@@ -6715,6 +6715,7 @@ mod tests {
             sleeping: if asleep {
                 (0..held as u32)
                     .map(|terminal| SleepingTab {
+                        lead: None,
                         terminal,
                         session: None,
                         title: None,
@@ -6843,12 +6844,8 @@ mod tests {
                                 width,
                                 "not the column's width: {label} {row:?}"
                             );
-                            // The sleep toggle, when the space can take one.
-                            let sleep = if asleep || held > 0 {
-                                Some(width - 4)
-                            } else {
-                                None
-                            };
+                            // The sleep control, when something in the space runs.
+                            let sleep = (held > 0).then_some(width - 4);
                             assert_eq!(
                                 column_of(&row, 'z'),
                                 sleep,
@@ -7022,6 +7019,7 @@ mod tests {
             asleep: true,
             sleeping: (0..3)
                 .map(|terminal| SleepingTab {
+                    lead: None,
                     terminal,
                     session: None,
                     title: None,

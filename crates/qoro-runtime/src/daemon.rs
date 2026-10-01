@@ -772,6 +772,18 @@ impl TerminalRegistry {
             .collect()
     }
 
+    /// The terminals of the tab a terminal is in, in tree order: the leaves of its split
+    /// tree, or itself when it is in none. The first is the tab.
+    pub fn tab_of(&self, stream: u32) -> Vec<u32> {
+        self.splits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|tree| tree.leaves())
+            .find(|leaves| leaves.contains(&stream))
+            .unwrap_or_else(|| vec![stream])
+    }
+
     /// Replace every split tree at once.
     pub fn load_splits(&self, trees: Vec<crate::control::Pane>) {
         *self.splits.lock().unwrap() = trees;
@@ -781,22 +793,38 @@ impl TerminalRegistry {
     ///
     /// Every tree sharing a terminal with this one goes first: that is how a tree moves
     /// under a new first pane, and a single leaf clears the tree that held it.
+    ///
+    /// A tree with a pane that is asleep is refused (`Ok(false)`): a tab sleeps whole, and
+    /// a live pane joined to a sleeping one would be neither. Asked under the trees' own
+    /// lock, which a sleep reads its tab through after marking it, so the two cannot pass.
     pub async fn set_split(
         &self,
         tree: crate::control::Pane,
         store: &crate::store::StoreHandle,
-    ) -> Result<(), crate::store::HandleError> {
+        asleep: impl Fn(u32) -> bool,
+    ) -> Result<bool, crate::store::HandleError> {
         let _order = self.split_write.lock().await;
         let trees = {
             let mut splits = self.splits.lock().unwrap();
             let leaves = tree.leaves();
+            if leaves.len() > 1 && leaves.iter().any(|t| asleep(*t)) {
+                return Ok(false);
+            }
+            // Nor may it replace a tree that still holds a sleeping pane: that pane's tab
+            // would come back without it.
+            let displaced = splits
+                .iter()
+                .filter(|kept| kept.leaves().iter().any(|t| leaves.contains(t)));
+            if displaced.flat_map(|kept| kept.leaves()).any(&asleep) {
+                return Ok(false);
+            }
             splits.retain(|kept| !kept.leaves().iter().any(|t| leaves.contains(t)));
             if leaves.len() > 1 {
                 splits.push(tree);
             }
             splits.clone()
         };
-        store.set_splits(splits_json(&trees)).await
+        store.set_splits(splits_json(&trees)).await.map(|()| true)
     }
 
     pub fn len(&self) -> usize {
@@ -936,25 +964,25 @@ impl Daemon {
         scanner.refresh().await;
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let books = Bookkeeping::new(store.clone(), stopping.clone());
-        // Which spaces are asleep, read before anything is restored: their tabs stay down,
-        // and their rows must keep their place from the first teardown on.
+        // Which tabs are asleep, read before anything is restored: they stay down, and
+        // their rows must keep their place from the first teardown on.
         match store.asleep().await {
-            Ok(rows) => books
-                .asleep
-                .lock()
-                .unwrap()
-                .extend(rows.into_iter().map(|(workspace, _)| workspace)),
-            // Not known, so every space is taken as asleep: nothing is restored, nothing is
+            Ok(rows) => books.asleep.lock().unwrap().extend(
+                rows.into_iter()
+                    .map(|(terminal, workspace, _)| (terminal as u32, workspace)),
+            ),
+            // Not known, so every tab is taken as asleep: nothing is restored, nothing is
             // lost, and a wake brings each back. Restoring them all instead would bring back
-            // a sleeping space under its mark, where no agent write lands.
+            // a sleeping tab under its mark, where no agent write lands.
             Err(e) => {
-                eprintln!("qorod: which spaces are asleep could not be read: {e}");
-                if let Ok(spaces) = store.workspaces().await {
-                    books
-                        .asleep
-                        .lock()
-                        .unwrap()
-                        .extend(spaces.into_iter().map(|space| space.id));
+                eprintln!("qorod: which tabs are asleep could not be read: {e}");
+                for space in store.workspaces().await.unwrap_or_default() {
+                    let rows = store.open_terminals(space.id).await.unwrap_or_default();
+                    books.mark(
+                        space.id,
+                        &rows.iter().map(|row| row.id as u32).collect::<Vec<_>>(),
+                        true,
+                    );
                 }
             }
         }
@@ -2614,20 +2642,23 @@ async fn idle_sleep_loop(
     }
 }
 
-/// One pass: every space whose tabs have all been idle and unwatched past the timeout goes
-/// to sleep, through the same sleep a person asks for, which vets each tab again in full.
+/// One pass: every tab whose panes have all been idle and unwatched past the timeout goes
+/// to sleep, through the same sleep a person asks for, which vets each pane again in full.
 async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, timeout_secs: i64) {
     // Edges older than a day are over by definition; swept over all edges,
     // every pass, before anything evaluates.
     into.agents.sweep_expectations(crate::agents::now_unix());
-    for (space, all) in idle_spaces(into, watched, timeout_secs) {
-        // Asked again for this space alone, just before it sleeps: the spaces before it took
+    for ((space, tab), all) in idle_tabs(into, watched, timeout_secs) {
+        // Asked again for this tab alone, just before it sleeps: the tabs before it took
         // seconds each, and in them a person may have come back to this one.
-        if !all || idle_spaces(into, watched, timeout_secs).get(&space) != Some(&true) {
+        if !all || idle_tabs(into, watched, timeout_secs).get(&(space, tab)) != Some(&true) {
             continue;
         }
-        match sleep_space(into, space).await {
-            Ok(ended) => eprintln!("qorod: idle sleep: space {space} asleep, {ended} tabs ended"),
+        match sleep_space(into, space, Some(tab)).await {
+            Ok((ended, _)) => eprintln!(
+                "qorod: idle sleep: tab {tab} of space {space} asleep, {} panes ended",
+                ended.len()
+            ),
             // Said once per pass and tried again on the next: a refusal here is a tab that
             // is not what it looked like from its screen alone.
             Err(why) => eprintln!("qorod: idle sleep: {why}"),
@@ -2635,13 +2666,13 @@ async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, tim
     }
 }
 
-/// Every space with a live tab, and whether all of its tabs are idle past the timeout,
-/// unwatched and not held by a wait.
-fn idle_spaces(
+/// Every live tab, by its space and first pane, and whether all of its panes are idle past
+/// the timeout, unwatched and not held by a wait.
+fn idle_tabs(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
     timeout_secs: i64,
-) -> BTreeMap<i64, bool> {
+) -> BTreeMap<(i64, u32), bool> {
     let agents = &into.agents;
     let now = crate::agents::now_unix();
     let streams = agents.streams();
@@ -2664,6 +2695,8 @@ fn idle_spaces(
             eligible.insert(*stream, false);
             continue;
         };
+        // Idle since the agent went quiet or since a person last looked, whichever is later.
+        let since = since.max(watched.left_at(*stream).unwrap_or(since));
         let idle_secs = now.saturating_sub(since);
         let foreground = crate::idle::classify_program(snap.program.as_deref(), snap.agent);
         let verdict = crate::idle::eligible_for_reap(
@@ -2683,17 +2716,24 @@ fn idle_spaces(
         .filter(|(_, target)| !agents.is_closed(*target))
         .collect();
     let ready = crate::idle::apply_edge_vetoes(&eligible, &edges);
-    // A space sleeps whole or not at all: every one of its tabs has to be ready.
-    let mut spaces: BTreeMap<i64, bool> = BTreeMap::new();
+    // A tab sleeps whole or not at all: every one of its panes has to be ready.
+    let mut tabs: BTreeMap<(i64, u32), bool> = BTreeMap::new();
     for stream in &streams {
         let Some(space) = into.terminals.workspace_of(*stream) else {
             continue;
         };
+        // Named by its first pane still open, the one a sleep resolves the tab from.
+        let tab = into
+            .terminals
+            .tab_of(*stream)
+            .into_iter()
+            .find(|t| into.terminals.get(*t).is_some())
+            .unwrap_or(*stream);
         let this = ready.get(stream).copied().unwrap_or(false);
-        let all = spaces.entry(space).or_insert(true);
+        let all = tabs.entry((space, tab)).or_insert(true);
         *all = *all && this;
     }
-    spaces
+    tabs
 }
 
 /// Whether a `from_terminal` claim on an incoming Input binds to its
@@ -2738,7 +2778,7 @@ enum Dispatch {
 }
 
 /// A sleep or a wake always goes apart. A tab made or closed, or a space closed, stays on
-/// the read loop only when its space is awake and its lock is free this instant, and then
+/// the read loop only when its space's lock is free this instant, and then
 /// the lock is taken here and handed over: the read loop never waits on a space lock,
 /// because typing into every other tab on the connection waits with it.
 fn dispatch(
@@ -2747,14 +2787,9 @@ fn dispatch(
     terminals: &TerminalRegistry,
     default: i64,
 ) -> Dispatch {
-    let take = |workspace: i64| {
-        if books.is_asleep(workspace) {
-            return Dispatch::Apart;
-        }
-        match books.lock_of(workspace).try_lock_owned() {
-            Ok(guard) => Dispatch::Inline(Some(guard)),
-            Err(_) => Dispatch::Apart,
-        }
+    let take = |workspace: i64| match books.lock_of(workspace).try_lock_owned() {
+        Ok(guard) => Dispatch::Inline(Some(guard)),
+        Err(_) => Dispatch::Apart,
     };
     match request {
         ControlRequest::SleepWorkspace { .. } | ControlRequest::WakeWorkspace { .. } => {
@@ -2853,11 +2888,6 @@ async fn handle_control(
             // either started its shell and answered, or undone itself, by now.
             if let Ok(Some((ok, detail))) = store.applied(id.clone()).await {
                 return replayed_response(&id, ok, &detail, true);
-            }
-            if books.is_asleep(workspace)
-                && let Err(reason) = wake_locked(&restore(), workspace).await
-            {
-                return ControlResponse::Failed { id, reason };
             }
             // A requested working directory is validated here rather than trusted. It has
             // to be absolute, because a relative path would resolve against whatever
@@ -3062,12 +3092,10 @@ async fn handle_control(
                 Ok(dir) => dir,
                 // A tab of a sleeping space has no terminal but keeps its history, which
                 // is what a client shows of it before deciding to wake it.
-                Err(reason) => {
-                    match sleeping_history_of(books, history_dir.as_ref(), terminal).await {
-                        Some(dir) => dir,
-                        None => return ControlResponse::Failed { id, reason },
-                    }
-                }
+                Err(reason) => match sleeping_history_of(books, history_dir.as_ref(), terminal) {
+                    Some(dir) => dir,
+                    None => return ControlResponse::Failed { id, reason },
+                },
             };
             // Capped, because the count comes from a client and a client that asks for a
             // hundred million rows would be asking the daemon to allocate them.
@@ -3177,29 +3205,63 @@ async fn handle_control(
                     };
                 }
             };
+            // The order the tabs went to sleep in, the latest first, so a list's first
+            // sleeping tab is the one that slept last.
+            let order: Vec<u32> = if books.asleep.lock().unwrap().is_empty() {
+                Vec::new()
+            } else {
+                store
+                    .asleep()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(terminal, _, _)| terminal as u32)
+                    .collect()
+            };
             let mut workspaces = Vec::with_capacity(rows.len());
             for row in rows {
-                let asleep = books.is_asleep(row.id);
-                // A sleeping space's tabs come from its rows: nothing of it is running.
-                let sleeping = if asleep {
-                    store
-                        .open_terminals(row.id)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|tab| crate::control::SleepingTab {
-                            terminal: tab.id as u32,
-                            title: tab.title,
-                            session: terminals
-                                .session_title(tab.agent_session.as_deref())
-                                .or_else(|| agent_title(tab.agent_session.as_deref())),
-                            agent: tab.agent,
-                            cwd: tab.cwd,
-                        })
-                        .collect()
+                // Sleeping tabs come from their rows: nothing of them is running. Read only
+                // for a space that has one, so a listing of awake spaces reads no rows.
+                let open = if books.sleeps_in(row.id) {
+                    store.open_terminals(row.id).await.unwrap_or_default()
                 } else {
                     Vec::new()
                 };
+                let asleep =
+                    !open.is_empty() && open.iter().all(|tab| books.is_marked(tab.id as u32));
+                let sleeping = open
+                    .iter()
+                    .filter(|tab| books.is_marked(tab.id as u32))
+                    .filter_map(|tab| {
+                        let stream = tab.id as u32;
+                        let lead = terminals
+                            .tab_of(stream)
+                            .into_iter()
+                            .find(|t| open.iter().any(|o| o.id as u32 == *t))
+                            .unwrap_or(stream);
+                        // A tab half woken, its first pane running, shows as awake.
+                        if terminals.get(lead).is_some() {
+                            return None;
+                        }
+                        Some(crate::control::SleepingTab {
+                            terminal: stream,
+                            lead: Some(lead),
+                            title: tab.title.clone(),
+                            session: terminals
+                                .session_title(tab.agent_session.as_deref())
+                                .or_else(|| agent_title(tab.agent_session.as_deref())),
+                            agent: tab.agent.clone(),
+                            cwd: tab.cwd.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut sleeping = sleeping;
+                sleeping.sort_by_key(|tab| {
+                    order
+                        .iter()
+                        .position(|t| *t == tab.terminal)
+                        .unwrap_or(usize::MAX)
+                });
                 workspaces.push(crate::control::WorkspaceRow {
                     id: row.id,
                     name: row.name,
@@ -3311,10 +3373,10 @@ async fn handle_control(
                     reason: format!("there is no space {to}"),
                 };
             }
-            if books.is_asleep(from) || books.is_asleep(to) {
+            if books.is_marked(terminal) {
                 return ControlResponse::Failed {
                     id,
-                    reason: "a sleeping space cannot take or give a tab, wake it first".to_string(),
+                    reason: format!("tab {terminal} is asleep, wake it first"),
                 };
             }
             if agents.is_closed(terminal) {
@@ -3435,8 +3497,8 @@ async fn handle_control(
                     reason: format!("there is no workspace {target}"),
                 },
                 Ok(_) => {
-                    // Its sleep mark went with the row; the mirror follows.
-                    books.asleep.lock().unwrap().remove(&target);
+                    // Its tabs' sleep marks went with the rows; the mirror follows.
+                    books.asleep.lock().unwrap().retain(|_, w| *w != target);
                     ControlResponse::WorkspaceClosed {
                         id,
                         workspace: target,
@@ -3449,23 +3511,30 @@ async fn handle_control(
             }
         }
         ControlRequest::SleepWorkspace {
-            workspace: target, ..
-        } => match sleep_space(&restore(), target).await {
-            Ok(ended) => ControlResponse::WorkspaceAsleep {
+            workspace: target,
+            terminal: tab,
+            ..
+        } => match sleep_space(&restore(), target, tab).await {
+            Ok((ended, stayed)) => ControlResponse::WorkspaceAsleep {
                 id,
                 workspace: target,
-                terminals: ended,
+                terminals: ended.len(),
+                changed: Some(ended),
+                stayed,
             },
             Err(reason) => ControlResponse::Failed { id, reason },
         },
         ControlRequest::WakeWorkspace {
-            workspace: target, ..
-        } => match wake_space(&restore(), target).await {
+            workspace: target,
+            terminal: tab,
+            ..
+        } => match wake_space(&restore(), target, tab).await {
             Ok((woken, report)) => ControlResponse::WorkspaceAwake {
                 id,
                 workspace: woken,
                 terminals: report.brought_back,
                 resumed: report.agents_resumed,
+                changed: Some(report.opened),
             },
             Err(reason) => ControlResponse::Failed { id, reason },
         },
@@ -3629,16 +3698,12 @@ async fn handle_control(
                     }
                 })
                 .collect();
-            // A space still waking has only some of its tabs back: a tree cut to those would
-            // be taken as the whole split. Its trees come with the index after the wake.
+            // A tab still waking has only some of its panes back: a tree cut to those would
+            // be taken as the whole split. Its tree comes with the index after the wake.
             let settled: Vec<u32> = live
                 .iter()
                 .copied()
-                .filter(|t| {
-                    !terminals
-                        .workspace_of(*t)
-                        .is_some_and(|w| books.is_asleep(w))
-                })
+                .filter(|t| !books.is_marked(*t))
                 .collect();
             ControlResponse::Agents {
                 id,
@@ -3661,8 +3726,15 @@ async fn handle_control(
                 reason: "a split names one terminal twice".to_string(),
             }
         }
-        ControlRequest::SetSplit { tree, .. } => match terminals.set_split(tree, store).await {
-            Ok(()) => ControlResponse::SplitSaved { id },
+        ControlRequest::SetSplit { tree, .. } => match terminals
+            .set_split(tree, store, |t| books.is_marked(t))
+            .await
+        {
+            Ok(true) => ControlResponse::SplitSaved { id },
+            Ok(false) => ControlResponse::Failed {
+                id,
+                reason: "a split cannot hold a tab that is asleep".to_string(),
+            },
             Err(e) => ControlResponse::Failed {
                 id,
                 reason: format!("the split could not be recorded: {e}"),
@@ -4567,10 +4639,7 @@ pub fn open_terminal(
             // still be read: a daemon going, or a space going to sleep, keeps the row open
             // so the tab comes back. Anything else is a close, marked as under way until
             // the store has it, so a wake in between does not reopen it.
-            let keeps = !closed
-                && books
-                    .as_ref()
-                    .is_some_and(|b| b.keeps_row(registry.workspace_of(stream)));
+            let keeps = !closed && books.as_ref().is_some_and(|b| b.keeps_row(stream));
             if !keeps && let Some(books) = &books {
                 books.closing.lock().unwrap().insert(stream);
             }
@@ -4664,13 +4733,13 @@ async fn record_stream(
         return;
     }
     // A tab that has already left says nothing worth writing: closed, its row is closed
-    // anyway; asleep, the row must keep the agent it had. Nor does one whose space is
-    // going to sleep, for the same reason.
-    let Some(workspace) = terminals.workspace_of(stream) else {
+    // anyway; asleep, the row must keep the agent it had. Nor does one going to sleep, or
+    // still waking, for the same reason.
+    if terminals.workspace_of(stream).is_none() {
         written.remove(&stream);
         return;
-    };
-    if books.is_asleep(workspace) {
+    }
+    if books.is_marked(stream) {
         return;
     }
     let now = agent_program(agents, stream);
@@ -4884,10 +4953,11 @@ pub struct Bookkeeping {
     /// Set when the daemon is on its way out. A terminal that ends after this is not a tab
     /// a person closed: recording it as closed is exactly what would stop it coming back.
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
-    /// The workspaces asleep, as the store's `asleep` table says, held here because a
-    /// terminal's teardown decides whether its row stays open synchronously and cannot
-    /// wait on the store. Changed only under that workspace's lock, with the table.
-    pub asleep: Arc<std::sync::Mutex<BTreeSet<i64>>>,
+    /// The terminals asleep and the workspace of each, as the store's `asleep_terminal`
+    /// table says, held here because a terminal's teardown decides whether its row stays
+    /// open synchronously and cannot wait on the store. Changed only under the workspace's
+    /// lock, with the table.
+    pub asleep: Arc<std::sync::Mutex<BTreeMap<u32, i64>>>,
     /// Tabs closed for good whose close has not reached the store yet. A wake must not
     /// bring one back in the moment between the tab going and its row saying so.
     pub closing: Arc<std::sync::Mutex<BTreeSet<u32>>>,
@@ -4916,15 +4986,36 @@ impl Bookkeeping {
         }
     }
 
-    /// Whether a terminal ending now keeps its row open: the daemon is going, or its
-    /// workspace is going to sleep.
-    fn keeps_row(&self, workspace: Option<i64>) -> bool {
-        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
-            || workspace.is_some_and(|w| self.is_asleep(w))
+    /// Whether a terminal ending now keeps its row open: the daemon is going, or the tab
+    /// is going to sleep.
+    fn keeps_row(&self, stream: u32) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst) || self.is_marked(stream)
     }
 
-    pub fn is_asleep(&self, workspace: i64) -> bool {
-        self.asleep.lock().unwrap().contains(&workspace)
+    /// Whether a terminal is asleep, or going to sleep.
+    pub fn is_marked(&self, stream: u32) -> bool {
+        self.asleep.lock().unwrap().contains_key(&stream)
+    }
+
+    /// Whether any tab of a workspace is asleep.
+    pub fn sleeps_in(&self, workspace: i64) -> bool {
+        self.asleep
+            .lock()
+            .unwrap()
+            .values()
+            .any(|w| *w == workspace)
+    }
+
+    /// Mark terminals of a workspace asleep, or take the marks off.
+    fn mark(&self, workspace: i64, streams: &[u32], asleep: bool) {
+        let mut marks = self.asleep.lock().unwrap();
+        for stream in streams {
+            if asleep {
+                marks.insert(*stream, workspace);
+            } else {
+                marks.remove(stream);
+            }
+        }
     }
 
     /// The lock of one workspace.
@@ -4981,6 +5072,8 @@ pub struct RestoreReport {
     pub agents_shell_fallback: usize,
     /// Tabs with no agent recorded, restored as plain shells.
     pub plain_shells: usize,
+    /// The terminals reopened, by number: what a wake takes the sleep marks off.
+    pub opened: Vec<u32>,
 }
 
 impl RestoreReport {
@@ -5049,9 +5142,11 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
             // terminal takes the number of one already on screen, or of one asleep.
             into.terminals.mint_above(stream);
         }
-        if !into.books.is_asleep(space.id) {
-            listed.push((space.id, rows));
-        }
+        let awake: Vec<_> = rows
+            .into_iter()
+            .filter(|row| !into.books.is_marked(row.id as u32))
+            .collect();
+        listed.push((space.id, awake));
     }
     // A directory that is gone is not a reason to lose the tab. The shell starts where the
     // daemon is instead, which is visible and recoverable, unlike a tab that silently did
@@ -5116,6 +5211,7 @@ async fn restore_rows(
             continue;
         };
         report.brought_back += 1;
+        report.opened.push(stream);
         // A conversation the agent never wrote down cannot be carried on: the newest one
         // in the directory is asked for instead, rather than a resume that fails.
         let session = row
@@ -5265,9 +5361,24 @@ fn vet_for_sleep(
     })
 }
 
-/// Put one workspace to sleep. Answers how many tabs ended. See
+/// The open terminals of the tab `tab` is in, in tree order: the leaves of its split tree
+/// that are rows of the workspace, or `tab` alone. The first is the tab.
+fn members(into: &Restore, tab: u32, rows: &[qoro_store::TerminalRow]) -> Vec<u32> {
+    into.terminals
+        .tab_of(tab)
+        .into_iter()
+        .filter(|t| rows.iter().any(|row| row.id as u32 == *t))
+        .collect()
+}
+
+/// Put tabs of one workspace to sleep: the tab `tab` names, or every awake one. Answers the
+/// terminals that went to sleep, and each tab that stayed awake and why. See
 /// `ControlRequest::SleepWorkspace`.
-async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
+async fn sleep_space(
+    into: &Restore,
+    workspace: i64,
+    tab: Option<u32>,
+) -> Result<(Vec<u32>, Vec<crate::control::Stayed>), String> {
     let lock = into.books.lock_of(workspace);
     let _held = lock.lock().await;
     if into
@@ -5276,19 +5387,6 @@ async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
         .load(std::sync::atomic::Ordering::SeqCst)
     {
         return Err("qoro is stopping".into());
-    }
-    let live = |into: &Restore| -> Vec<u32> {
-        into.terminals
-            .streams()
-            .into_iter()
-            .filter(|s| into.terminals.workspace_of(*s) == Some(workspace))
-            .collect()
-    };
-    // Asleep already: nothing to vet, and whatever of it is still running is a sleep that
-    // did not finish, ended now.
-    if into.books.is_asleep(workspace) {
-        let streams = live(into);
-        return end_tabs(into, &streams).await.map(|()| 0);
     }
     let known = into
         .books
@@ -5299,9 +5397,84 @@ async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
     if !known.iter().any(|space| space.id == workspace) {
         return Err(format!("there is no space {workspace}"));
     }
-    let streams = live(into);
-    if streams.is_empty() {
-        return Err(format!("nothing in space {workspace} is running"));
+    let rows = into
+        .books
+        .store
+        .open_terminals(workspace)
+        .await
+        .map_err(|e| format!("the space's tabs could not be read: {e}"))?;
+    let tabs: Vec<u32> = match tab {
+        Some(tab) if rows.iter().any(|row| row.id as u32 == tab) => vec![tab],
+        Some(tab) => return Err(format!("there is no tab {tab} in space {workspace}")),
+        // One per tab that has anything running: its first pane names it.
+        None => {
+            let mut leads = Vec::new();
+            for row in &rows {
+                let stream = row.id as u32;
+                if into.terminals.get(stream).is_none() {
+                    continue;
+                }
+                let lead = members(into, stream, &rows)
+                    .first()
+                    .copied()
+                    .unwrap_or(stream);
+                if !leads.contains(&lead) {
+                    leads.push(lead);
+                }
+            }
+            if leads.is_empty() {
+                return Err(format!("nothing in space {workspace} is running"));
+            }
+            leads
+        }
+    };
+    let mut slept = Vec::new();
+    let mut stayed = Vec::new();
+    for tab in tabs {
+        match sleep_tab(into, workspace, tab, &rows).await {
+            Ok(ended) => slept.extend(ended),
+            Err(reason) => stayed.push(crate::control::Stayed {
+                terminal: tab,
+                reason,
+            }),
+        }
+    }
+    if slept.is_empty() && !stayed.is_empty() {
+        let why: Vec<String> = stayed.iter().map(|s| s.reason.clone()).collect();
+        return Err(match tab {
+            Some(tab) => format!("tab {tab} stays awake: {}", why.join("; ")),
+            None => format!("space {workspace} stays awake: {}", why.join("; ")),
+        });
+    }
+    Ok((slept, stayed))
+}
+
+/// Put one tab to sleep, every pane of it or none, with its workspace's lock held. Answers
+/// the terminals that ended.
+async fn sleep_tab(
+    into: &Restore,
+    workspace: i64,
+    tab: u32,
+    rows: &[qoro_store::TerminalRow],
+) -> Result<Vec<u32>, String> {
+    let running = |into: &Restore| -> Vec<u32> {
+        members(into, tab, rows)
+            .into_iter()
+            .filter(|t| into.terminals.get(*t).is_some())
+            .collect()
+    };
+    let live = running(into);
+    // A pane already marked and still running is a sleep that did not finish: it ends with
+    // the rest, unvetted, as it was vetted then. A pane marked and not running stays as it
+    // is: the tab is half woken, and sleeps again from what is awake of it.
+    let fresh: Vec<u32> = live
+        .iter()
+        .copied()
+        .filter(|t| !into.books.is_marked(*t))
+        .collect();
+    if fresh.is_empty() {
+        end_tabs(into, &live).await?;
+        return Ok(live);
     }
     // A tab waiting on another, or waited on by one, is part of a conversation between
     // agents that a sleep would cut in half, and the wait itself is not written anywhere.
@@ -5313,23 +5486,22 @@ async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
         .collect();
     if let Some((waiter, target)) = edges
         .iter()
-        .find(|(waiter, target)| streams.contains(waiter) || streams.contains(target))
+        .find(|(waiter, target)| fresh.contains(waiter) || fresh.contains(target))
     {
-        return Err(format!(
-            "space {workspace} stays awake: tab {waiter} is waiting on tab {target}"
-        ));
+        return Err(format!("tab {waiter} is waiting on tab {target}"));
     }
-    // Read now, not from the last scan: a job started a moment ago is exactly the one a
-    // sleep must not miss.
+    // Read now, for this tab, not from the last scan or the tab before it, whose end took
+    // seconds: a job started a moment ago is exactly the one a sleep must not miss.
     let table =
         crate::blocking::run_within(crate::store::STORE_DEADLINE, qoro_pty::sys::process_table)
             .await
             .map_err(|_| "the process table could not be read".to_string())?;
+    let table = &table;
     let vet = |into: &Restore| -> Result<Vec<qoro_store::Checkpoint>, String> {
         let mut checkpoints = Vec::new();
         let mut refused = Vec::new();
-        for stream in &streams {
-            match vet_for_sleep(into, *stream, &table) {
+        for stream in &fresh {
+            match vet_for_sleep(into, *stream, table) {
                 Ok(checkpoint) => checkpoints.push(checkpoint),
                 Err(why) => refused.push(format!("tab {stream}: {why}")),
             }
@@ -5337,35 +5509,49 @@ async fn sleep_space(into: &Restore, workspace: i64) -> Result<usize, String> {
         if refused.is_empty() {
             Ok(checkpoints)
         } else {
-            Err(format!(
-                "space {workspace} stays awake: {}",
-                refused.join("; ")
-            ))
+            Err(refused.join("; "))
         }
     };
     let checkpoints = vet(into)?;
-    let written = into
-        .books
-        .store
-        .sleep_workspace(workspace, checkpoints.clone())
-        .await;
-    // Looked at again after the write, the whole vet: a command typed, an agent that
-    // started working, a new conversation in a tab, in the moment the write took, would be
-    // put down mid-thought or brought back into the wrong conversation.
+    let written = into.books.store.sleep_terminals(checkpoints.clone()).await;
+    // Marked before it is looked at again: from here a split cannot take a pane of it
+    // (`set_split` asks the marks), so the panes read below are the tab that sleeps.
+    into.books.mark(workspace, &fresh, true);
+    // Looked at again after the write, the whole vet and the panes: a command typed, an
+    // agent that started working, a new conversation, a pane split off or on, in the moment
+    // the write took, would be put down mid-thought or brought back wrong.
     let still = vet(into);
-    if written.is_err() || still.as_ref() != Ok(&checkpoints) {
-        // A write that timed out still lands later; taking the mark off after it is what
-        // keeps the table and this daemon from disagreeing about an awake space.
-        let _ = into.books.store.wake_workspace(workspace).await;
+    if written.is_err() || still.as_ref() != Ok(&checkpoints) || running(into) != live {
+        // A write that timed out still lands later; taking the marks off after it is what
+        // keeps the table and this daemon from disagreeing about an awake tab.
+        into.books.mark(workspace, &fresh, false);
+        let _ = into
+            .books
+            .store
+            .unmark(fresh.iter().map(|t| *t as i64).collect())
+            .await;
+        // A pane that ended meanwhile kept its row open under the mark: closed now, as its
+        // own end would have.
+        // ponytail: a pane ending in the instant between its mark being read and it leaving
+        // the registry keeps an open row nothing runs; the next start brings it back as a
+        // shell. Waiting out ending panes here closes that if it is ever seen.
+        for stream in &fresh {
+            if into.terminals.get(*stream).is_none() {
+                let _ = into.books.store.close_terminal(*stream as i64).await;
+            }
+        }
         return Err(match (written, still) {
             (Err(e), _) => format!("the sleep could not be written down: {e}"),
             (_, Err(why)) => why,
-            _ => format!("space {workspace} stays awake: a tab changed while it was written down"),
+            _ => "a pane changed while it was written down".to_string(),
         });
     }
-    into.books.asleep.lock().unwrap().insert(workspace);
-    end_tabs(into, &streams).await?;
-    Ok(streams.len())
+    // Asleep from here, marks and all, whether or not every pane has ended yet: one still
+    // running is ended by the next sleep of this tab, or waited out by its wake.
+    if let Err(why) = end_tabs(into, &live).await {
+        eprintln!("qorod: sleep of tab {tab}: {why}");
+    }
+    Ok(live)
 }
 
 /// Ask each tab to end, and wait for it and its history to be gone, under one deadline for
@@ -5398,69 +5584,78 @@ async fn end_tabs(into: &Restore, streams: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
-/// Close a tab of a sleeping space for good: its row closed and its history removed, and
-/// the space left asleep. False when no sleeping space holds the tab.
+/// Close a sleeping tab for good: its row closed and its history removed. False when the
+/// terminal is not asleep.
 async fn close_sleeping_tab(
     books: &Bookkeeping,
     history_dir: Option<&Path>,
     terminal: u32,
 ) -> Result<bool, String> {
-    let asleep: Vec<i64> = books.asleep.lock().unwrap().iter().copied().collect();
-    for workspace in asleep {
-        let lock = books.lock_of(workspace);
-        let _held = lock.lock().await;
-        // Read under the lock: a wake that got there first has taken the tab back.
-        if !books.is_asleep(workspace) {
-            continue;
-        }
-        let rows = books
-            .store
-            .open_terminals(workspace)
-            .await
-            .map_err(|e| format!("the sleeping tabs could not be read: {e}"))?;
-        if !rows.iter().any(|row| row.id == terminal as i64) {
-            continue;
-        }
-        books
-            .store
-            .close_terminal(terminal as i64)
-            .await
-            .map_err(|e| format!("tab {terminal} could not be closed: {e}"))?;
-        if let Some(dir) = history_dir.map(|dir| dir.join(terminal.to_string())) {
-            let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
-        }
-        return Ok(true);
+    let Some(workspace) = books.asleep.lock().unwrap().get(&terminal).copied() else {
+        return Ok(false);
+    };
+    let lock = books.lock_of(workspace);
+    let _held = lock.lock().await;
+    // Asked again under the lock: a wake that got there first has taken the tab back.
+    if !books.is_marked(terminal) {
+        return Ok(false);
     }
-    Ok(false)
+    books
+        .store
+        .close_terminal(terminal as i64)
+        .await
+        .map_err(|e| format!("tab {terminal} could not be closed: {e}"))?;
+    books.mark(workspace, &[terminal], false);
+    if let Some(dir) = history_dir.map(|dir| dir.join(terminal.to_string())) {
+        let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
+    }
+    Ok(true)
 }
 
-/// Wake one workspace, or the one that went to sleep last. Answers which, and what came
-/// back. See `ControlRequest::WakeWorkspace`.
+/// Wake the tab `tab` names, every sleeping tab of `workspace`, or with neither the tab
+/// that went to sleep last. Answers the workspace, and what came back. See
+/// `ControlRequest::WakeWorkspace`.
 async fn wake_space(
     into: &Restore,
     workspace: Option<i64>,
+    tab: Option<u32>,
 ) -> Result<(i64, RestoreReport), String> {
-    let workspace = match workspace {
-        Some(workspace) => workspace,
-        None => into
-            .books
-            .store
-            .asleep()
-            .await
-            .map_err(|e| format!("the sleeping spaces could not be read: {e}"))?
-            .first()
-            .map(|(workspace, _)| *workspace)
-            .ok_or("nothing is asleep")?,
+    let (workspace, tab) = match (workspace, tab) {
+        (Some(workspace), tab) => (workspace, tab),
+        (None, Some(tab)) => {
+            let marked = into.books.asleep.lock().unwrap().get(&tab).copied();
+            let workspace = marked
+                .or_else(|| into.terminals.workspace_of(tab))
+                .ok_or(format!("there is no tab {tab}"))?;
+            (workspace, Some(tab))
+        }
+        (None, None) => {
+            let (terminal, workspace, _) = into
+                .books
+                .store
+                .asleep()
+                .await
+                .map_err(|e| format!("the sleeping tabs could not be read: {e}"))?
+                .first()
+                .copied()
+                .ok_or("nothing is asleep")?;
+            (workspace, Some(terminal as u32))
+        }
     };
     let lock = into.books.lock_of(workspace);
     let _held = lock.lock().await;
-    wake_locked(into, workspace)
+    wake_locked(into, workspace, tab)
         .await
         .map(|report| (workspace, report))
 }
 
-/// The wake itself, with the workspace's lock already held.
-async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, String> {
+/// The wake itself, with the workspace's lock already held: the tab `tab` names, else
+/// every sleeping tab of the workspace.
+async fn wake_locked(
+    into: &Restore,
+    workspace: i64,
+    tab: Option<u32>,
+) -> Result<RestoreReport, String> {
     if into
         .books
         .stopping
@@ -5468,20 +5663,40 @@ async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, St
     {
         return Err("qoro is stopping".into());
     }
-    if !into.books.is_asleep(workspace) {
+    let rows = into
+        .books
+        .store
+        .open_terminals(workspace)
+        .await
+        .map_err(|e| format!("the space's tabs could not be read: {e}"))?;
+    let wanted: Vec<u32> = match tab {
+        Some(tab) if rows.iter().any(|row| row.id as u32 == tab) => members(into, tab, &rows),
+        Some(tab) => return Err(format!("there is no tab {tab} in space {workspace}")),
+        None => rows.iter().map(|row| row.id as u32).collect(),
+    };
+    let marked: Vec<u32> = wanted
+        .iter()
+        .copied()
+        .filter(|t| into.books.is_marked(*t))
+        .collect();
+    if marked.is_empty() {
         // Awake here; the table is told so as well, which is what brings the two back
         // together after a sleep whose write timed out and landed late.
-        let _ = into.books.store.wake_workspace(workspace).await;
+        let _ = into
+            .books
+            .store
+            .unmark(wanted.iter().map(|t| *t as i64).collect())
+            .await;
         return Ok(RestoreReport::default());
     }
-    // A tab of a sleep that has not finished is still ending: waited out, because reopening
-    // its row now would race its teardown into closing it for good.
+    // A pane of a sleep that has not finished is still ending: waited out, because
+    // reopening its row now would race its teardown into closing it for good.
     let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
     let ending = || {
-        into.terminals
-            .streams()
-            .into_iter()
-            .find(|s| into.terminals.workspace_of(*s) == Some(workspace))
+        marked
+            .iter()
+            .copied()
+            .find(|t| into.terminals.get(*t).is_some())
     };
     while ending().is_some() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5491,19 +5706,13 @@ async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, St
             "tab {stuck} is still going to sleep; try again in a moment"
         ));
     }
-    let rows = into
-        .books
-        .store
-        .open_terminals(workspace)
-        .await
-        .map_err(|e| format!("the space's tabs could not be read: {e}"))?;
     // Read after the store answered: a close that landed meanwhile is already in the set.
     let closing = into.books.closing.lock().unwrap().clone();
     let rows: Vec<qoro_store::TerminalRow> = rows
         .into_iter()
         .filter(|row| {
             let stream = row.id as u32;
-            into.terminals.get(stream).is_none() && !closing.contains(&stream)
+            marked.contains(&stream) && !closing.contains(&stream)
         })
         .collect();
     for row in &rows {
@@ -5520,20 +5729,24 @@ async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, St
     }
     let dirs = existing_dirs(rows.iter().map(|row| PathBuf::from(&row.cwd))).await;
     let mut report = RestoreReport::default();
-    let streams: Vec<u32> = rows.iter().map(|row| row.id as u32).collect();
     restore_rows(into, workspace, rows, &dirs, &mut report).await;
-    // The mark comes off last: until then a late write about the tabs that slept still
-    // meets it, and the rows read above are what came back.
-    let unmarked = into.books.store.wake_workspace(workspace).await;
-    into.books.asleep.lock().unwrap().remove(&workspace);
-    // The index its splits were held out of is asked for again, now whole. Every tab, not
-    // one: the recorder skipped what they announced while the mark was on, and an agent
-    // that came up meanwhile is only now handed the conversation its resume named.
-    for stream in streams {
-        into.agents.announce(stream);
+    // The marks come off last, and only from what came back: until then a late write about
+    // the tabs that slept still meets them, and a pane that did not open stays asleep
+    // rather than an open row nothing runs or lists.
+    let opened = report.opened.clone();
+    let unmarked = into
+        .books
+        .store
+        .unmark(opened.iter().map(|t| *t as i64).collect())
+        .await;
+    into.books.mark(workspace, &opened, false);
+    // Announced now, every one: the recorder skipped what they announced while marked, and
+    // an agent that came up meanwhile is only now handed the conversation its resume named.
+    for stream in &opened {
+        into.agents.announce(*stream);
     }
     unmarked
-        .map_err(|e| format!("the space is up, but its sleep mark could not be taken off: {e}"))?;
+        .map_err(|e| format!("the tab is up, but its sleep mark could not be taken off: {e}"))?;
     Ok(report)
 }
 
@@ -5806,25 +6019,18 @@ async fn is_dir_probed(path: &Path) -> Result<bool, crate::blocking::BlockingErr
     .await
 }
 
-/// Where the history of a tab of a sleeping space lives, when this is one. Only a tab a
-/// sleeping space holds: opening a history creates its directory, so any other id would
-/// leave an empty one behind.
-async fn sleeping_history_of(
+/// Where the history of a sleeping tab lives, when this is one. Only a sleeping tab:
+/// opening a history creates its directory, so any other id would leave an empty one
+/// behind.
+fn sleeping_history_of(
     books: &Bookkeeping,
     history_dir: Option<&PathBuf>,
     terminal: u32,
 ) -> Option<PathBuf> {
-    let dir = history_dir?.join(terminal.to_string());
-    let asleep: Vec<i64> = books.asleep.lock().unwrap().iter().copied().collect();
-    for workspace in asleep {
-        let Ok(rows) = books.store.open_terminals(workspace).await else {
-            continue;
-        };
-        if rows.iter().any(|row| row.id == terminal as i64) {
-            return Some(dir);
-        }
-    }
-    None
+    books
+        .is_marked(terminal)
+        .then(|| history_dir.map(|dir| dir.join(terminal.to_string())))
+        .flatten()
 }
 
 /// Where a terminal's history lives, or why it cannot be read.
@@ -8090,6 +8296,7 @@ mod restore_report_tests {
             agents_resumed: 1,
             agents_shell_fallback: 1,
             plain_shells: 2,
+            opened: vec![1, 2, 3, 4],
         };
         assert_eq!(
             report.summary(),

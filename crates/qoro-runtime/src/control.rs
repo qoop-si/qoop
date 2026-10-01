@@ -146,23 +146,30 @@ pub enum ControlRequest {
         id: String,
         workspace: i64,
     },
-    /// Put a workspace to sleep: every tab in it ends, its rows stay, and nothing of it
-    /// runs until it wakes.
+    /// Put a tab to sleep, or every tab of a workspace: what sleeps ends, its rows stay,
+    /// and nothing of it runs until it wakes.
     ///
-    /// All or nothing. A tab that could not come back as it is (a command running, an
-    /// agent busy or not yet telling its conversation, a job in the background) refuses
-    /// the whole space, and the answer says which and why.
+    /// A tab sleeps whole, every pane of its split with it, or not at all: one that could
+    /// not come back as it is (a command running, an agent busy or not yet telling its
+    /// conversation, a job in the background) stays awake. With `terminal`, that tab (any
+    /// of its panes names it), which must be in `workspace`. Without, every awake tab of
+    /// the workspace, each on its own: the answer says which stayed awake and why, and a
+    /// `Failed` means none slept.
     SleepWorkspace {
         id: String,
         workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
     },
-    /// Bring a sleeping workspace back: the same tabs, numbers, names and directories,
-    /// and each agent resumed into its own conversation. `None` wakes the one that went
-    /// to sleep last.
+    /// Bring sleeping tabs back: the same numbers, names and directories, and each agent
+    /// resumed into its own conversation. With `terminal`, that tab; else every sleeping
+    /// tab of `workspace`; with neither, the tab that went to sleep last.
     WakeWorkspace {
         id: String,
         #[serde(default)]
         workspace: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
     },
     /// The index a client draws: one row per terminal, with who is in it.
     ///
@@ -426,19 +433,30 @@ pub enum ControlResponse {
         id: String,
         workspace: i64,
     },
-    /// A workspace is asleep: `terminals` tabs ended with their rows kept.
+    /// Tabs of a workspace are asleep: `terminals` terminals ended with their rows kept.
     WorkspaceAsleep {
         id: String,
         workspace: i64,
         terminals: usize,
+        /// Which terminals went to sleep. Always present from a daemon that sleeps one tab
+        /// at a time, empty when nothing needed to; absent (`None`) only from an older
+        /// daemon, which put the whole workspace to sleep whatever was asked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed: Option<Vec<TerminalStream>>,
+        /// The tabs that stayed awake, and why.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stayed: Vec<Stayed>,
     },
-    /// A workspace is awake again: `terminals` tabs reopened, `resumed` of them agents
+    /// Tabs of a workspace are awake again: `terminals` reopened, `resumed` of them agents
     /// typed back into their own conversations.
     WorkspaceAwake {
         id: String,
         workspace: i64,
         terminals: usize,
         resumed: usize,
+        /// Which terminals came back, as `WorkspaceAsleep::changed` says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed: Option<Vec<TerminalStream>>,
     },
     /// A terminal or a workspace now carries a different name.
     /// Rows of scrollback, and how many there are in total.
@@ -670,11 +688,11 @@ pub struct WorkspaceRow {
     /// How many terminals are open in it, so a client can show a workspace as busy or
     /// empty without asking about every terminal in it.
     pub terminals: usize,
-    /// Asleep: nothing in it runs, and `sleeping` is what waking it brings back. Defaulted
+    /// Asleep: it has tabs and every one of them sleeps, so nothing in it runs. Defaulted
     /// so an older daemon's answer reads as awake.
     #[serde(default)]
     pub asleep: bool,
-    /// The tabs a wake brings back, when `asleep`.
+    /// Its sleeping tabs, whether or not anything else in it is awake.
     #[serde(default)]
     pub sleeping: Vec<SleepingTab>,
     /// Whether this daemon will close this space when asked. False for the session's
@@ -688,11 +706,23 @@ pub struct WorkspaceRow {
     pub closable: bool,
 }
 
-/// A tab of a sleeping workspace, as its row in the store keeps it.
+/// A tab that stayed awake when its workspace was put to sleep, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stayed {
+    pub terminal: TerminalStream,
+    pub reason: String,
+}
+
+/// A sleeping terminal, as its row in the store keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SleepingTab {
     /// The number it comes back under.
     pub terminal: u32,
+    /// The tab it is a pane of, named by its first pane: the panes of one split share it,
+    /// and a list shows one row per tab. Defaulted to the terminal itself for an older
+    /// daemon, where every sleeping terminal is its own row.
+    #[serde(default)]
+    pub lead: Option<u32>,
     /// What a person called it, if anyone did.
     pub title: Option<String>,
     /// The agent that was in it, resumed into its own conversation on wake.

@@ -187,10 +187,11 @@ pub enum Action {
     PaneNext,
     /// ctrl-a z: zoom the focused pane, or go back.
     Zoom,
-    /// ctrl-a Z: put the space on screen to sleep, or wake it when it is asleep.
+    /// ctrl-a Z: put the tab the keyboard is in to sleep, or wake the sleeping tab it
+    /// rests on.
     ///
     /// Uppercase on purpose, like the space close: lowercase `z` is the zoom, pressed
-    /// often, and a slip of the shift key must not end every process in a space.
+    /// often, and a slip of the shift key must not end the processes of a tab.
     Sleep,
     /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
     /// alive as a tab. Lowercase `x` keeps killing the terminal.

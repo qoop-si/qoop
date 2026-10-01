@@ -27,7 +27,7 @@ pub enum Item {
     CopyMode,
     Resize,
     Equalize,
-    /// Put the space on screen to sleep, as `ctrl-a Z` does.
+    /// Put the tab the keyboard is in to sleep, as `ctrl-a Z` does.
     Sleep,
 }
 
@@ -211,10 +211,14 @@ impl Palette {
         }) {
             out.push(terminal_entry(agent, spaces, "idle"));
         }
-        // The tabs of sleeping spaces, below everything that runs: picking one shows what
-        // it last drew, and waking it is a separate key.
-        for space in spaces.iter().filter(|s| s.asleep) {
-            for tab in &space.sleeping {
+        // Sleeping tabs, one per tab, below everything that runs: picking one shows what it
+        // last drew, and waking it is a separate key.
+        for space in spaces {
+            for tab in space
+                .sleeping
+                .iter()
+                .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
+            {
                 let name = tab.label();
                 out.push(Entry {
                     item: Item::Terminal(tab.terminal),
@@ -247,7 +251,7 @@ impl Palette {
             (Item::Equalize, "equalize panes", "="),
             (Item::NewTerminal, "new terminal here", "c"),
             (Item::NewAgentAsk, "new agent terminal...", ""),
-            (Item::Sleep, "sleep this space", "Z"),
+            (Item::Sleep, "sleep this tab", "Z"),
             (Item::NewSpace, "new space", "w"),
         ] {
             // Under the agent filter the ask row leads the agents it offers, not a `do`
@@ -744,12 +748,13 @@ mod tests {
     }
 
     /// A sleeping space's tabs are listed once each, under their own name, so a jump can
-    /// wake them; the space's `sleep this space` row is there for the awake one.
+    /// wake them; the `sleep this tab` row is there for the awake one.
     #[test]
     fn a_sleeping_spaces_tabs_are_listed_under_sleeping() {
         let mut asleep = space(2, "api");
         asleep.asleep = true;
         asleep.sleeping = vec![qoro_runtime::control::SleepingTab {
+            lead: None,
             terminal: 7,
             session: None,
             title: None,
