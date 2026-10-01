@@ -1200,7 +1200,7 @@ impl State {
     fn column_hit(&self, row: u16) -> Option<(sidebar::Hit, bool)> {
         // The column, which starts at the top row and runs down to the status line.
         let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
-        let column_rows = (self.lines as usize).saturating_sub(screen::STATUS);
+        let column_rows = screen::column_rows(self.lines as usize);
         // The last painted frame's clock, and frame zero of the animation: tiers move
         // rows, the tick never does, and a click maps onto what the paint drew.
         let column = self.column(self.paint_now, 0);
@@ -2346,7 +2346,7 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     if state.collapsed || left == 0 || col as usize > left || (row as usize) < screen::SIDEBAR_TOP {
         return false;
     }
-    let column_rows = (state.lines as usize).saturating_sub(screen::STATUS);
+    let column_rows = screen::column_rows(state.lines as usize);
     let column = state.column(state.paint_now, 0);
     let at = sidebar::wheeled(
         &column,
@@ -9817,7 +9817,7 @@ mod tests {
         let column = s.column(s.paint_now, 0);
         let rows = sidebar::rows_folded(
             &column,
-            (s.lines as usize).saturating_sub(screen::STATUS),
+            screen::column_rows(s.lines as usize),
             sidebar::current_avatar().as_ref(),
         );
         let title = rows

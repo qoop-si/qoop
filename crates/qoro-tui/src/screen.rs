@@ -371,13 +371,20 @@ fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
 /// Rows the tab bar takes, at the top of the pane.
 pub const TABS: usize = tabs::ROWS;
 
-/// The screen row the left column starts on.
+/// The screen row the left column's content starts on.
 ///
-/// One, the very top. The tab bar sits over the pane and not over the whole width: the
-/// tabs belong to the space, the space is what the column on the left selects, and a bar
-/// spanning both puts the thing being selected under the thing selecting it. It also cost
-/// the column a row for no reason, since the bar has nothing to say about it.
-pub const SIDEBAR_TOP: usize = 1;
+/// Two: the column itself starts at the very top, where the rule beside it bends toward
+/// it, and its rows start one under that bend, so the line at the top sits inside the
+/// curve rather than level with it. The tab bar sits over the pane and not over the whole
+/// width: the tabs belong to the space, the space is what the column on the left selects,
+/// and a bar spanning both puts the thing being selected under the thing selecting it.
+pub const SIDEBAR_TOP: usize = 2;
+
+/// The rows the column's content has in a window `lines` tall: from [`SIDEBAR_TOP`] down
+/// to the status line.
+pub fn column_rows(lines: usize) -> usize {
+    lines.saturating_sub(STATUS + SIDEBAR_TOP - 1)
+}
 
 /// Rows the status lines take, at the bottom: the notice, then the keys.
 pub const STATUS: usize = 2;
@@ -710,9 +717,9 @@ pub fn paint(frame: &Frame) -> String {
         out.push_str(theme::RESET);
     }
 
-    // The column runs the whole height, from the top row to the status line. It is taller
-    // than the pane by the tab bar's row, which is the row the bar no longer takes from it.
-    let column_rows = (frame.lines as usize).saturating_sub(STATUS);
+    // The column runs the whole height, from the top row to the status line; its content
+    // starts one row under the top, beneath the rule's bend.
+    let column_rows = column_rows(frame.lines as usize);
     // The pet stands on the foot of the column. Read once per frame so the
     // reservation below and the overlay further down paint the same pet.
     let avatar = sidebar::current_avatar();
@@ -751,6 +758,14 @@ pub fn paint(frame: &Frame) -> String {
         })
         .map(|(at, _)| at)
         .collect();
+    // The top row: the column left blank, and the rule bending toward it in ember.
+    if wide_enough && SIDEBAR_TOP > 1 {
+        out.push_str(&at(1, 1));
+        out.push_str(&" ".repeat(left - 1));
+        out.push_str(&theme::fg(theme::Role::Brand));
+        out.push('\u{256e}');
+        out.push_str(theme::RESET);
+    }
     for row in 0..column_rows {
         out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -864,17 +879,18 @@ pub fn paint(frame: &Frame) -> String {
                 .get(row)
                 .is_some_and(|(line, _)| line.colour == Some(theme::Role::Rule));
             // Its ends bend toward the column, the only part of it in ember.
-            if row == 0 || row + 1 == column_rows {
+            if row + 1 == column_rows {
                 out.push_str(&theme::fg(theme::Role::Brand));
-                out.push(if row == 0 { '\u{256e}' } else { '\u{256f}' });
+                out.push('\u{256f}');
             } else {
                 out.push(if joins { '\u{2524}' } else { '\u{2502}' });
             }
             out.push_str(theme::RESET);
         }
-        // The pane starts under the tab bar, so the column's first row has the bar beside
-        // it and every row after that has a row of the terminal.
-        let Some(pane_row) = row.checked_sub(TABS) else {
+        // The pane starts under the tab bar, so the column's first rows have the bar beside
+        // them and every row after that has a row of the terminal. Counted on the screen,
+        // since the column's content starts under its top row.
+        let Some(pane_row) = (row + SIDEBAR_TOP - 1).checked_sub(TABS) else {
             continue;
         };
         if pane_row >= pane_rows as usize {
