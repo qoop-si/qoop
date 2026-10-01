@@ -1088,7 +1088,12 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
     let mark = hot.unwrap_or(Role::Faint);
-    let dozing = space.sleeping.iter().filter(|t| t.agent.is_some()).count();
+    // One per tab, however many panes it slept with.
+    let dozing = space
+        .sleeping
+        .iter()
+        .filter(|t| t.agent.is_some() && t.lead.is_none_or(|lead| lead == t.terminal))
+        .count();
     let held = if space.asleep { dozing } else { kids.len() };
     // `z` puts every tab of the space to sleep and never wakes one, so it is drawn while
     // something in the space runs, which is the daemon's own test: `kids` is the live

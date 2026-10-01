@@ -122,7 +122,7 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
 
 /// Turn each space a former daemon put to sleep whole into marks on its open terminals,
 /// once. Read before anything is written, so opening a store with nothing to turn (every
-/// store after the first open, and every `qoro ls`) never takes the write lock; the rows are
+/// store after the first open) never takes the write lock; the rows are
 /// read again under it, so two openers at once turn them once.
 fn mark_asleep_spaces(conn: &Connection) -> Result<(), StoreError> {
     let pending: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM asleep)", [], |r| r.get(0))?;
@@ -145,7 +145,11 @@ impl Store {
     /// Open, creating and migrating as needed.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        Self::prepare(conn)
+        let store = Self::prepare(conn)?;
+        // Turned by the opener that writes, the daemon, and never by a reader: a `qoro ls`
+        // beside an older daemon that still sleeps whole spaces must not take its marks.
+        mark_asleep_spaces(&store.conn)?;
+        Ok(store)
     }
 
     /// The same, for a file that must already exist: a reader that finds nothing gets an
@@ -236,7 +240,6 @@ impl Store {
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
-        mark_asleep_spaces(&conn)?;
         Ok(Self { conn })
     }
 
@@ -1401,9 +1404,12 @@ mod tests {
                 )
                 .expect("old mark");
         }
-        let reader = Store::open_existing(&path).expect("a reader turns it");
-        assert_eq!(reader.asleep().expect("asleep"), vec![(1, ws, 40)]);
+        let reader = Store::open_existing(&path).expect("a reader leaves it alone");
+        assert!(reader.asleep().expect("asleep").is_empty());
         drop(reader);
+        let opened = Store::open(&path).expect("the daemon's open turns it");
+        assert_eq!(opened.asleep().expect("asleep"), vec![(1, ws, 40)]);
+        drop(opened);
         let again = Store::open(&path).expect("a second open finds nothing to turn");
         assert_eq!(again.asleep().expect("asleep"), vec![(1, ws, 40)]);
         let old: i64 = again

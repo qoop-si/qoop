@@ -50,7 +50,7 @@ Each agent wears a small square of nine dots in its state's colour. While it wor
 centre breathes: its arms come in clockwise and go back out, each breath starting one arm
 further round. When it stops the dots settle into a picture: an empty ring when it wants
 you, an X when it failed, the full square when it finished, one dot in the middle when it
-is idle, a line across the middle while its space sleeps. The shape says it as well as the colour, so it reads without colour
+is idle, a line across the middle while it sleeps. The shape says it as well as the colour, so it reads without colour
 too. A split tab names each pane on its top edge and marks only the pane the keyboard is in,
 with an ember curve at each of its corners; the agent the keyboard is on wears the same
 corners in the column.
@@ -216,8 +216,8 @@ speak only to this machine's daemon.
 `qoro pair --hub wss://your-hub` prints a QR code; the qoro app scans it, shows the six
 digits you type back on the Mac, and from then on lists every agent on that Mac with the one
 waiting for you first. You can answer it, type into any terminal, open or close one, start an
-agent in a space, put a space to sleep or wake it, and start the Mac's qoro again once every
-space slept, and the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
+agent in a space, put a space to sleep or wake one of its tabs, and start the Mac's qoro again
+once everything slept, and the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
 end encrypted through a relay, `qoro-hub`, that sees neither the screens nor the keys, and a
 push carries a fixed sentence and four numbers, nothing from a screen. Setup, the hub and
 what it can see: [docs/mobile.md](docs/mobile.md).

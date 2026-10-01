@@ -1293,8 +1293,10 @@ impl State {
             return None;
         }
         let n = tabs.len();
-        // From a sleeping tab the keyboard was on, the first tab or the last.
-        let Some(at) = tabs.iter().position(|r| r.terminal == self.focused) else {
+        // From a sleeping tab the keyboard was on, the first tab or the last. From a pane
+        // of a split, its tab.
+        let focused = self.focused_tab();
+        let Some(at) = tabs.iter().position(|r| r.terminal == focused) else {
             return Some(tabs[if forward { 0 } else { n - 1 }].terminal);
         };
         let next = if forward {
@@ -2747,7 +2749,7 @@ fn tabs_to_close(state: &State, space: i64) -> Vec<u32> {
         state
             .spaces
             .iter()
-            .find(|w| w.id == space && w.asleep)
+            .find(|w| w.id == space)
             .map(|w| w.sleeping.iter().map(|t| t.terminal).collect::<Vec<_>>())
             .unwrap_or_default(),
     );
@@ -3015,7 +3017,7 @@ fn space_is_empty(state: &State, space: i64) -> bool {
             .spaces
             .iter()
             .find(|w| w.id == space)
-            .is_none_or(|w| !w.asleep || w.sleeping.is_empty())
+            .is_none_or(|w| w.sleeping.is_empty())
 }
 
 /// How many tabs a space still holds, counting the store's view and not the index's, so a
@@ -3026,7 +3028,6 @@ fn tabs_left(state: &State, space: i64) -> usize {
         .spaces
         .iter()
         .find(|w| w.id == space)
-        .filter(|w| w.asleep)
         .map_or(0, |w| w.sleeping.len());
     live + sleeping
 }
@@ -8245,7 +8246,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                             .find(|r| state.space.is_none_or(|s| r.workspace == s))
                             .map(|r| r.terminal)
                     });
-                if state.pending_focus.is_none() {
+                // Only sleeping tabs left is not empty: the space list says so next.
+                let dozing = state
+                    .space
+                    .and_then(|space| state.spaces.iter().find(|w| w.id == space))
+                    .is_some_and(|w| !w.sleeping.is_empty());
+                if state.pending_focus.is_none() && !dozing {
                     state.message = Some(format!(
                         "this space is empty, {} c starts a terminal",
                         crate::keys::prefix_name()
@@ -8276,9 +8282,13 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // remote space when its host reconnects, and a tab that appears in the empty
             // space a person is looking at is theirs to see. A sleeping row has no process
             // behind it to type into.
+            // Nor while the keyboard rests on a sleeping tab a person picked: that is where
+            // they are, with tabs awake beside it or not.
+            let peeking = state.dim != 0 && state.dim_tab() == Some(state.dim);
             if state.adopted
                 && state.focused == 0
                 && state.pending_focus.is_none()
+                && !peeking
                 && let Some(space) = state.space
             {
                 state.pending_focus = agents
@@ -13682,6 +13692,14 @@ mod tests {
         assert_eq!(state.dim_tab(), Some(9));
         assert_eq!(state.neighbour(true), Some(2));
         assert_eq!(state.neighbour(false), Some(2));
+        // The next index, with the awake tab in it, leaves the keyboard where it rests.
+        index(&mut state, vec![agent(2, 2, "claude", "working")]);
+        assert_eq!(state.focused, 0);
+        assert_eq!(state.pending_focus, None, "a peek was taken back");
+        // Closing the space counts its sleeping tabs as well as its awake one.
+        assert_eq!(tabs_left(&state, 2), 4);
+        assert_eq!(tabs_to_close(&state, 2), vec![2, 7, 8, 9]);
+        assert!(!space_is_empty(&state, 2));
     }
 
     /// The keyboard on a sleeping tab: `ctrl-a x` discards that tab, not the space.

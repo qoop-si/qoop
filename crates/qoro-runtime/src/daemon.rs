@@ -2878,8 +2878,7 @@ async fn handle_control(
             // which is what it already believed was happening.
             let workspace = wanted.unwrap_or(workspace);
             // Held for the whole create, so a sleep of this space waits for the new tab
-            // and then vets it, rather than missing it. A space asleep wakes first: a tab
-            // made in it must not leave it half awake.
+            // and then vets it, rather than missing it. Tabs asleep in it stay asleep.
             let _held = match held {
                 Some(guard) => guard,
                 None => books.lock_of(workspace).lock_owned().await,
@@ -3232,18 +3231,19 @@ async fn handle_control(
                 let sleeping = open
                     .iter()
                     .filter(|tab| books.is_marked(tab.id as u32))
-                    .filter_map(|tab| {
+                    .map(|tab| {
                         let stream = tab.id as u32;
+                        // Named by its first pane that is asleep: a tab half woken, a pane
+                        // of it running and one not, still lists the one to wake.
                         let lead = terminals
                             .tab_of(stream)
                             .into_iter()
-                            .find(|t| open.iter().any(|o| o.id as u32 == *t))
+                            .find(|t| {
+                                open.iter().any(|o| o.id as u32 == *t)
+                                    && terminals.get(*t).is_none()
+                            })
                             .unwrap_or(stream);
-                        // A tab half woken, its first pane running, shows as awake.
-                        if terminals.get(lead).is_some() {
-                            return None;
-                        }
-                        Some(crate::control::SleepingTab {
+                        crate::control::SleepingTab {
                             terminal: stream,
                             lead: Some(lead),
                             title: tab.title.clone(),
@@ -3252,7 +3252,7 @@ async fn handle_control(
                                 .or_else(|| agent_title(tab.agent_session.as_deref())),
                             agent: tab.agent.clone(),
                             cwd: tab.cwd.clone(),
-                        })
+                        }
                     })
                     .collect::<Vec<_>>();
                 let mut sleeping = sleeping;
@@ -5473,7 +5473,9 @@ async fn sleep_tab(
         .filter(|t| !into.books.is_marked(*t))
         .collect();
     if fresh.is_empty() {
-        end_tabs(into, &live).await?;
+        if let Err(why) = end_tabs(into, &live).await {
+            eprintln!("qorod: sleep of tab {tab}: {why}");
+        }
         return Ok(live);
     }
     // A tab waiting on another, or waited on by one, is part of a conversation between
@@ -5739,7 +5741,11 @@ async fn wake_locked(
         .store
         .unmark(opened.iter().map(|t| *t as i64).collect())
         .await;
-    into.books.mark(workspace, &opened, false);
+    // Only once the table agrees: a mark gone from here and kept there would let this
+    // daemon think a tab awake whose writes the table still holds back.
+    if unmarked.is_ok() {
+        into.books.mark(workspace, &opened, false);
+    }
     // Announced now, every one: the recorder skipped what they announced while marked, and
     // an agent that came up meanwhile is only now handed the conversation its resume named.
     for stream in &opened {
