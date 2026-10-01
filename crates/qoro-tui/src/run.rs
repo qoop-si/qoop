@@ -7509,6 +7509,8 @@ fn focus(
     if to == 0 || to == state.focused {
         return Ok(None);
     }
+    // The keyboard is in a live tab now, not resting on a sleeping one.
+    state.dim = 0;
     let from = state.focused;
     let from_wants = wants_focus_events(state.snapshot.as_ref());
     // The space follows the terminal, first of all: a click in the agents

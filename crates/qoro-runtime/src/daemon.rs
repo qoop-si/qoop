@@ -5736,16 +5736,16 @@ async fn wake_locked(
     // the tabs that slept still meets them, and a pane that did not open stays asleep
     // rather than an open row nothing runs or lists.
     let opened = report.opened.clone();
-    let unmarked = into
-        .books
-        .store
-        .unmark(opened.iter().map(|t| *t as i64).collect())
-        .await;
-    // Only once the table agrees: a mark gone from here and kept there would let this
-    // daemon think a tab awake whose writes the table still holds back.
-    if unmarked.is_ok() {
-        into.books.mark(workspace, &opened, false);
+    let ids: Vec<i64> = opened.iter().map(|t| *t as i64).collect();
+    let mut unmarked = into.books.store.unmark(ids.clone()).await;
+    // Asked once more: a mark the table keeps holds back this running tab's agent writes,
+    // and brings it back asleep on the next start (from where it wakes again).
+    if unmarked.is_err() {
+        unmarked = into.books.store.unmark(ids).await;
     }
+    // Off here either way: the tabs are running, and a mark here would leave them neither
+    // awake to a client nor able to wake again.
+    into.books.mark(workspace, &opened, false);
     // Announced now, every one: the recorder skipped what they announced while marked, and
     // an agent that came up meanwhile is only now handed the conversation its resume named.
     for stream in &opened {
