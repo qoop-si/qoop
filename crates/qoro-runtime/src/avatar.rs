@@ -149,6 +149,48 @@ pub fn art_cells(pet: &Avatar) -> [[Cell; ART_COLS]; ART_ROWS] {
     out
 }
 
+/// The pet as filled rects `(x, y, w, h, "#rrggbb")`, moved so its top left pixel is at 0, 0:
+/// how a phone's lock screen card draws it, which cannot read a file and gets only this.
+/// Runs of one colour in a row, merged with the same run in the rows below.
+pub fn rects(pet: &Avatar) -> Vec<(u8, u8, u8, u8, String)> {
+    let mut runs: Vec<(i32, i32, i32, i32, u8)> = Vec::new();
+    for y in 0..GRID_H {
+        let mut x = 0;
+        while x < GRID_W {
+            let Some(ink) = pixel(pet, x, y) else {
+                x += 1;
+                continue;
+            };
+            let start = x;
+            while x < GRID_W && pixel(pet, x, y) == Some(ink) {
+                x += 1;
+            }
+            // The same run one row up grows down instead of starting a rect of its own.
+            match runs
+                .iter_mut()
+                .find(|r| r.0 == start && r.2 == x - start && r.1 + r.3 == y && r.4 == ink)
+            {
+                Some(r) => r.3 += 1,
+                None => runs.push((start, y, x - start, 1, ink)),
+            }
+        }
+    }
+    let left = runs.iter().map(|r| r.0).min().unwrap_or(0);
+    let top = runs.iter().map(|r| r.1).min().unwrap_or(0);
+    let small = |v: i32| u8::try_from(v).unwrap_or(0);
+    runs.into_iter()
+        .map(|(x, y, w, h, ink)| {
+            (
+                small(x - left),
+                small(y - top),
+                small(w),
+                small(h),
+                ink_hex(ink),
+            )
+        })
+        .collect()
+}
+
 /// What `qoro avatar pick` writes and the sidebar reads.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Avatar {
@@ -249,6 +291,51 @@ mod tests {
             eyes: "big".into(),
             hair_ink: 212,
             body_ink: BODY_INK,
+        }
+    }
+
+    /// The rects paint exactly the pet's pixels, moved to the top left, for every pet the
+    /// picker can make; and they stay few, since every one rides in each lock screen push.
+    #[test]
+    fn rects_paint_the_pet_and_stay_small() {
+        for hair in HAIR_STYLES {
+            for eyes in EYE_STYLES {
+                for hair_ink in HAIR_INKS {
+                    let pet = Avatar {
+                        hair: hair.into(),
+                        eyes: eyes.into(),
+                        hair_ink,
+                        ..sample()
+                    };
+                    let rects = rects(&pet);
+                    assert!(rects.len() <= 24, "{hair} {eyes}: {} rects", rects.len());
+                    let mut painted = std::collections::HashMap::new();
+                    for (x, y, w, h, ink) in &rects {
+                        for dy in 0..*h {
+                            for dx in 0..*w {
+                                assert!(
+                                    painted.insert((x + dx, y + dy), ink.clone()).is_none(),
+                                    "overlap"
+                                );
+                            }
+                        }
+                    }
+                    let lit: Vec<(i32, i32)> = (0..GRID_H)
+                        .flat_map(|y| (0..GRID_W).map(move |x| (x, y)))
+                        .filter(|&(x, y)| pixel(&pet, x, y).is_some())
+                        .collect();
+                    let left = lit.iter().map(|p| p.0).min().unwrap();
+                    let top = lit.iter().map(|p| p.1).min().unwrap();
+                    assert_eq!(painted.len(), lit.len());
+                    for (x, y) in lit {
+                        let at = (
+                            u8::try_from(x - left).unwrap(),
+                            u8::try_from(y - top).unwrap(),
+                        );
+                        assert_eq!(painted.get(&at), Some(&ink_hex(pixel(&pet, x, y).unwrap())));
+                    }
+                }
+            }
         }
     }
 
