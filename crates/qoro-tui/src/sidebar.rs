@@ -153,7 +153,8 @@ fn dot_glyph(role: crate::theme::Role) -> char {
 /// cell's top three rows and three of its four columns: the fourth column stays empty and
 /// is the gap before the name that a single-cell dot needed a space for, so a row is as
 /// wide as it was. Without braille (the kernel console, a dumb terminal) it is a plain
-/// character and a space.
+/// character and a space. Where the font draws braille the grid would break across its
+/// two cells, so there the mark is [`one_cell_mark`].
 fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
     use crate::theme::Role;
     if !crate::colorlevel::braille() {
@@ -167,6 +168,9 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
             _ => '.',
         };
         return format!("{plain} ");
+    }
+    if !crate::colorlevel::braille_grid() {
+        return one_cell_mark(role, working, tick);
     }
     const RING: [(usize, usize); 8] = [
         (0, 0),
@@ -187,6 +191,39 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         _ => vec![(1, 1)],
     };
     braille_pair(&dots)
+}
+
+/// The state mark where a picture cannot span two cells (iTerm2, Terminal.app and the
+/// other terminals that draw braille from the font): a two by two grid on the middle dot
+/// rows of one braille cell, then a space, the same two columns as the grid.
+///
+/// ```text
+/// working  three dots, the gap running round clockwise
+/// wants    a diagonal /       failed   a diagonal \
+/// done     the full square    idle     the lower left dot
+/// asleep   the lower line
+/// ```
+///
+/// One glyph, so the font spaces every dot of it. No working frame is another state's
+/// picture.
+fn one_cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
+    use crate::theme::Role;
+    const TL: u32 = 0x02;
+    const TR: u32 = 0x10;
+    const BL: u32 = 0x04;
+    const BR: u32 = 0x20;
+    // One step every two ticks, as the grid's breath.
+    const TURN: [u32; 4] = [TL | TR | BL, TL | TR | BR, TR | BR | BL, TL | BR | BL];
+    let dots = match role {
+        Role::Working if working => TURN[(tick / 2 % 4) as usize],
+        Role::Working => TURN[0],
+        Role::Blocked => TR | BL,
+        Role::Failed => TL | BR,
+        Role::Done => TL | TR | BL | BR,
+        Role::Sleeping => BL | BR,
+        _ => BL,
+    };
+    format!("{} ", char::from_u32(0x2800 + dots).unwrap_or(' '))
 }
 
 /// A working agent's breath at animation frame `tick`: the centre, and the plus's arms
@@ -4331,6 +4368,43 @@ mod tests {
                 "tick {tick} painted another state's picture: {mark:?}"
             );
         }
+    }
+
+    /// The one-cell mark keeps the grid's promises: two columns, one braille glyph and a
+    /// space, a picture per state, and no working frame that is another state's picture.
+    #[test]
+    fn the_one_cell_mark_is_one_glyph_and_never_another_states_picture() {
+        use crate::theme::Role;
+        let calm: Vec<String> = [
+            Role::Idle,
+            Role::Sleeping,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+        ]
+        .iter()
+        .map(|&role| one_cell_mark(role, false, 0))
+        .collect();
+        let unique: std::collections::BTreeSet<_> = calm.iter().collect();
+        assert_eq!(
+            unique.len(),
+            calm.len(),
+            "two states share a picture: {calm:?}"
+        );
+        for tick in 0..=16u64 {
+            let mark = one_cell_mark(Role::Working, true, tick);
+            assert!(!calm.contains(&mark), "tick {tick}: {mark:?}");
+            assert_eq!(crate::width::width(&mark), 2, "{mark:?}");
+            assert!(
+                mark.ends_with(' ')
+                    && ('\u{2800}'..='\u{28ff}').contains(&mark.chars().next().unwrap())
+            );
+        }
+        assert_ne!(
+            one_cell_mark(Role::Working, true, 0),
+            one_cell_mark(Role::Working, true, 2),
+            "the working mark never turned"
+        );
     }
 
     /// A working ring never closes into the shape blocked wears: the two must read apart

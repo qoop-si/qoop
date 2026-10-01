@@ -2158,9 +2158,10 @@ fn radar_tree_order_holds_creation_order() {
         .expect("chmod");
     }
 
-    // A state row opens with a blank, then its two-cell braille mark straight into
-    // the program name, with no space between them; a place row (`└ claude · ...`)
-    // never does, so this pins the match to the state row alone.
+    // A state row opens with a blank, then its braille mark and the program name: two
+    // cells straight into the name, or, where the font draws braille (the run may sit
+    // in iTerm2), one cell and a space. A place row (`└ claude · ...`) never opens with
+    // braille, so this pins the match to the state row alone.
     fn is_state_row(line: &str, program: &str) -> bool {
         line.strip_prefix(' ').is_some_and(|rest| {
             rest.chars()
@@ -2168,6 +2169,7 @@ fn radar_tree_order_holds_creation_order() {
                 .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
                 && rest
                     .trim_start_matches(|c: char| ('\u{2800}'..='\u{28ff}').contains(&c))
+                    .trim_start_matches(' ')
                     .starts_with(program)
         })
     }

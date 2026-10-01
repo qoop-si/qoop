@@ -94,6 +94,20 @@ braille cells wide (the fourth dot column is the gap before the name):
 A working frame never draws another state's picture. Where braille cannot be drawn (the
 kernel console, a dumb terminal) the marks are `- \ | / ~ ? ! * . z`.
 
+The grid lines up only where the terminal draws braille itself (Ghostty, kitty, WezTerm, VS
+Code). A terminal that takes braille from the font (iTerm2, Terminal.app, Warp, Zed,
+Alacritty, Windows Terminal, GNOME Terminal, Konsole) spaces its two cells apart, so there
+each mark is a two by two picture in one cell and a space:
+
+| State | Picture |
+| --- | --- |
+| working | three dots, the gap running round clockwise |
+| wants | the rising diagonal |
+| failed | the falling diagonal |
+| done | the full square |
+| idle | the lower left dot |
+| asleep | the lower line |
+
 A space is its name in its colour, starting in the column the marks start in, with a line of
 dots in the same colour down its left edge from halfway down its own row to a foot beside its
 last row.

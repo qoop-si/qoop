@@ -75,7 +75,9 @@ fn set(level: Level) {
 /// startup, before the first frame is painted.
 pub fn apply() {
     set(detect());
-    BRAILLE.store(braille_from(&current_env()), Ordering::Relaxed);
+    let env = current_env();
+    BRAILLE.store(braille_from(&env), Ordering::Relaxed);
+    GRID.store(grid_from(&env), Ordering::Relaxed);
 }
 
 static BRAILLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -90,6 +92,26 @@ pub fn braille() -> bool {
 
 fn braille_from(env: &Env) -> bool {
     !matches!(env.term.as_deref(), Some("dumb") | Some("linux"))
+}
+
+static GRID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a picture may span braille cells: the dots of two neighbouring cells line up
+/// only where the terminal draws braille itself (Ghostty, kitty, WezTerm, VS Code, foot,
+/// Rio). A terminal that takes braille from the font spaces the dots inside a cell by
+/// the font and the cells by its own grid, and the two disagree (iTerm2 falls back to
+/// Apple Braille, which is wider than the cell), so a grid across two cells breaks
+/// apart. Those get pictures that fit one cell. An unknown terminal keeps the grid.
+pub fn braille_grid() -> bool {
+    GRID.load(Ordering::Relaxed)
+}
+
+fn grid_from(env: &Env) -> bool {
+    let font = matches!(
+        env.term_program.as_deref(),
+        Some("iTerm.app" | "Apple_Terminal" | "WarpTerminal" | "zed")
+    );
+    !(font || env.wt_session || env.font_braille)
 }
 
 /// The environment that matters, as plain values so tests never touch the
@@ -107,6 +129,10 @@ pub struct Env {
     pub windows: bool,
     pub no_color: bool,
     pub tmux: bool,
+    /// A terminal that takes braille from the font and names itself outside
+    /// `TERM_PROGRAM`: Alacritty (`ALACRITTY_WINDOW_ID`), a VTE terminal such as
+    /// GNOME Terminal (`VTE_VERSION`), Konsole (`KONSOLE_VERSION`).
+    pub font_braille: bool,
 }
 
 /// Read the real environment into an [`Env`].
@@ -121,6 +147,9 @@ pub fn current_env() -> Env {
         windows: std::env::var("OS").is_ok_and(|os| os == "Windows_NT"),
         no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
         tmux: std::env::var_os("TMUX").is_some(),
+        font_braille: ["ALACRITTY_WINDOW_ID", "VTE_VERSION", "KONSOLE_VERSION"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some()),
     }
 }
 
@@ -254,6 +283,31 @@ mod tests {
     }
 
     /// The kernel console and a dumb terminal cannot draw braille; every emulator can.
+    /// Only a terminal known to draw braille from the font loses the grid across cells;
+    /// Ghostty, kitty, WezTerm and an unknown terminal keep it.
+    #[test]
+    fn the_grid_is_off_only_where_the_font_draws_braille() {
+        let program = |name: &str| Env {
+            term_program: Some(name.to_string()),
+            ..env()
+        };
+        for name in ["iTerm.app", "Apple_Terminal", "WarpTerminal", "zed"] {
+            assert!(!grid_from(&program(name)), "{name}");
+        }
+        for name in ["ghostty", "WezTerm", "vscode", "tmux"] {
+            assert!(grid_from(&program(name)), "{name}");
+        }
+        assert!(grid_from(&env()));
+        assert!(!grid_from(&Env {
+            wt_session: true,
+            ..env()
+        }));
+        assert!(!grid_from(&Env {
+            font_braille: true,
+            ..env()
+        }));
+    }
+
     #[test]
     fn braille_is_off_only_where_nothing_draws_it() {
         let env = |term: &str| Env {
