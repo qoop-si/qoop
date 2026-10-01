@@ -761,12 +761,13 @@ pub struct SleepingTab {
 }
 
 impl SleepingTab {
-    /// What a list calls this tab: what a person called it, else the agent's own name for
-    /// the conversation, else the agent, else a shell.
+    /// What a list calls this tab, in the order an awake row is named: the conversation's
+    /// name (what a person called it here, else the agent's own), else the tab's, else the
+    /// agent, else a shell. A tab keeps the name it had awake when it falls asleep.
     pub fn label(&self) -> &str {
         [
+            self.session.as_deref().map(str::trim),
             self.title.as_deref().map(str::trim),
-            self.session.as_deref(),
             self.agent.as_deref(),
         ]
         .into_iter()

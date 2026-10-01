@@ -6695,7 +6695,9 @@ mod tests {
             unbox(&line.text)
         };
         assert!(named(None, Some("fix login")).contains("fix login"));
-        assert!(named(Some("mine"), Some("fix login")).contains("mine"));
+        // The conversation's name first, as the row had it awake.
+        assert!(named(Some("mine"), Some("fix login")).contains("fix login"));
+        assert!(named(Some("mine"), None).contains("mine"));
         assert!(named(None, None).contains("claude"));
     }
 
