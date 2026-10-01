@@ -461,6 +461,42 @@ impl Connection {
 /// Cloning one is how a connection subscribes, so a subscription costs a `watch::Receiver`
 /// and not a task. The runtime state (the pty, the engine, the write queue) is owned by the
 /// terminal task and is deliberately not reachable from here.
+/// Who vouches for the conversation id a terminal holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The agent program of this generation said it, through its hook, or is the one a
+    /// resume started.
+    By(String, u64),
+    /// A resume of this agent program, typed by qoro, names it, and no agent of that
+    /// program has appeared in the terminal since.
+    Resumed(String),
+}
+
+impl Said {
+    /// What this becomes with `agent` in the terminal now, its program and generation, or
+    /// `None` for anything that is not an agent: the agent a resume started once it
+    /// appears, nothing once the agent that had the id has left, else itself.
+    ///
+    /// The same program in a new generation keeps the claim as it was: it may be the same
+    /// agent after an `exec`, and it may be a new one, so the id stays on disk for a resume
+    /// and a sleep waits for the agent to say it again.
+    ///
+    // ponytail: a resume cancelled by hand, then the same program started fresh, takes
+    // the old id until its first report; an argv check of the agent closes that if it
+    // ever matters.
+    fn settle(&self, agent: Option<(&str, u64)>) -> Option<Said> {
+        match (self, agent) {
+            (Said::Resumed(program), Some((now, generation))) if program == now => {
+                Some(Said::By(program.clone(), generation))
+            }
+            (Said::By(program, _), Some((now, _))) if program == now => Some(self.clone()),
+            // The resumed agent has not started yet: a shell, or a wrapper in front of it.
+            (Said::Resumed(_), None) => Some(self.clone()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalHandle {
     /// The workspace this terminal was created in. Held here rather than looked up in the
@@ -477,10 +513,9 @@ pub struct TerminalHandle {
     /// Memory only, like the name: the store keeps a copy for resume, but
     /// the index reads this so every poll stays off the disk.
     pub session: Option<String>,
-    /// The agent generation whose own hook reported `session`. `None` when the id came
-    /// from the store on a restore: carried over, not yet said by the agent running now,
-    /// which may be a different one.
-    pub session_generation: Option<u64>,
+    /// Who vouches for `session`: the agent generation that said it, or a resume qoro
+    /// typed that names it and whose agent has not started yet.
+    pub session_said: Option<Said>,
     /// Where this terminal is, last known. Written by the terminal's own
     /// task whenever its throttled read sees a change, read by the index,
     /// so a repaint never waits on the store and never syscalls. Lags the
@@ -588,17 +623,36 @@ impl TerminalRegistry {
         }
     }
 
-    /// Remember a conversation id, and the agent generation that reported it (`None`
-    /// for one read back from the store). False when there is no such terminal.
-    fn set_session(&self, stream: u32, session: Option<String>, generation: Option<u64>) -> bool {
+    /// Remember a conversation id, and who vouches for it. False when there is no such
+    /// terminal.
+    fn set_session(&self, stream: u32, session: Option<String>, said: Option<Said>) -> bool {
         match self.inner.lock().unwrap().get_mut(&stream) {
             Some(handle) => {
                 handle.session = session;
-                handle.session_generation = generation;
+                handle.session_said = said;
                 true
             }
             None => false,
         }
+    }
+
+    /// Keep a conversation id only while the agent that has it is in the terminal (see
+    /// `Said::settle`): a conversation is not in a tab its agent left. An id reported from
+    /// a program qoro does not know as an agent has no agent to go with, and stays. The id
+    /// the disk holds for it, if one was forgotten, so the caller forgets that one there.
+    fn settle_session(&self, stream: u32, agent: Option<(&str, u64)>) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let handle = inner.get_mut(&stream)?;
+        handle.session_said = handle.session_said.as_ref()?.settle(agent);
+        if handle.session_said.is_some() {
+            return None;
+        }
+        let gone = handle.session.take()?;
+        // The disk holds the id last saved, which is not the one in memory when that one
+        // was never saved (`resumable` refused it). Taken under the terminal lock, so the
+        // next agent's id cannot be saved in between and taken for this one.
+        let saved = self.saved_sessions.lock().unwrap().remove(&stream);
+        Some(saved.unwrap_or(gone))
     }
 
     /// Put a terminal in another workspace. False when there is no such terminal.
@@ -3752,9 +3806,15 @@ async fn handle_control(
                     // spawned: a stop that lands between the answer and a background
                     // write would lose the conversation the tab was having.
                     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
-                        let generation = agents.agent(terminal).map(|a| a.belief.generation.0);
-                        terminals.set_session(terminal, Some(session.clone()), generation);
                         let program = agent_program(agents, terminal);
+                        let said = program
+                            .clone()
+                            .zip(agents.agent(terminal).map(|a| a.belief.generation.0));
+                        terminals.set_session(
+                            terminal,
+                            Some(session.clone()),
+                            said.map(|(program, generation)| Said::By(program, generation)),
+                        );
                         terminals
                             .save_session(terminal, session, program.as_deref(), store)
                             .await;
@@ -3797,8 +3857,14 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 };
             }
-            terminals.set_session(terminal, Some(session.clone()), Some(generation.0));
             let program = agent_program(agents, terminal);
+            terminals.set_session(
+                terminal,
+                Some(session.clone()),
+                program
+                    .clone()
+                    .map(|program| Said::By(program, generation.0)),
+            );
             terminals
                 .save_session(terminal, session, program.as_deref(), store)
                 .await;
@@ -4438,7 +4504,7 @@ pub fn open_terminal(
     let handle = TerminalHandle {
         name,
         session: None,
-        session_generation: None,
+        session_said: None,
         // Seeded with where the shell starts: what was asked for, or the
         // daemon's own directory. The task writes the registry only when its
         // throttled read sees a change from there, so an unseeded tab that
@@ -4608,6 +4674,15 @@ async fn record_stream(
         return;
     }
     let now = agent_program(agents, stream);
+    // Before the row check below: the same program in a new generation is a new agent,
+    // and the conversation of the one before is not its conversation.
+    let generation = agents.agent(stream).map(|a| a.belief.generation.0);
+    let here = now.as_deref().zip(generation);
+    if let Some(gone) = terminals.settle_session(stream, here) {
+        let _ = books.store.forget_agent_session(stream as i64, gone).await;
+        // The index carries the id, so its readers hear it is gone.
+        agents.announce(stream);
+    }
     if written.get(&stream).cloned().flatten() == now {
         return;
     }
@@ -5041,17 +5116,6 @@ async fn restore_rows(
             continue;
         };
         report.brought_back += 1;
-        // The DB row kept the conversation id (COALESCE preserves it),
-        // but `open_terminal` starts memory at `None`. Repopulate it so
-        // `agents --json` and `history` work right after a restart, before
-        // the next hook report. Fresh registry, no token to admit with,
-        // so this is a restore not a claim; first hook corrects staleness.
-        if let Some(session) = row.agent_session.as_deref()
-            && !session.trim().is_empty()
-        {
-            into.terminals
-                .set_session(stream, Some(session.to_string()), None);
-        }
         // A conversation the agent never wrote down cannot be carried on: the newest one
         // in the directory is asked for instead, rather than a resume that fails.
         let session = row
@@ -5062,6 +5126,17 @@ async fn restore_rows(
             .agent
             .as_deref()
             .and_then(|agent| qoro_detect::resume_argv(agent, session));
+        // The id the resume names is the conversation of the agent it starts, so it is
+        // held from now and handed to that agent when it appears: `agents --json`, the
+        // history and a sleep all have it before the agent says anything. Held before the
+        // line is typed, so the agent cannot appear first and find nothing to take.
+        if let (Some(agent), Some(session), Some(_)) = (&row.agent, session, &resume) {
+            into.terminals.set_session(
+                stream,
+                Some(session.to_string()),
+                Some(Said::Resumed(agent.clone())),
+            );
+        }
         // The resume command is typed into the shell, and the send is what does
         // it: a tab whose send failed holds a shell, not a resumed agent, and the
         // report says so rather than counting an intent as a recovery.
@@ -5077,6 +5152,10 @@ async fn restore_rows(
                 })
                 .await
                 .is_ok();
+        }
+        // Nothing was typed, so no agent is coming to take the id.
+        if !sent {
+            into.terminals.set_session(stream, None, None);
         }
         match (&row.agent, sent) {
             (Some(_), true) => {
@@ -5142,10 +5221,15 @@ fn vet_for_sleep(
                     return Err(format!("{name} is {state}"));
                 }
                 let handle = into.terminals.get(stream).ok_or("it has gone")?;
+                // Settled here as well as by the recorder, which may not have seen this
+                // agent yet: a sleep asked for the moment a wake ends finds it resumed.
+                let said = handle
+                    .session_said
+                    .and_then(|said| said.settle(Some((&name, snap.generation.0))));
                 let session = handle
                     .session
                     .clone()
-                    .filter(|_| handle.session_generation == Some(snap.generation.0))
+                    .filter(|_| said == Some(Said::By(name.clone(), snap.generation.0)))
                     .ok_or(format!(
                         "{name} has not said which conversation it is in (`qoro hooks install`)"
                     ))?;
@@ -5436,15 +5520,17 @@ async fn wake_locked(into: &Restore, workspace: i64) -> Result<RestoreReport, St
     }
     let dirs = existing_dirs(rows.iter().map(|row| PathBuf::from(&row.cwd))).await;
     let mut report = RestoreReport::default();
-    let first = rows.first().map(|row| row.id as u32);
+    let streams: Vec<u32> = rows.iter().map(|row| row.id as u32).collect();
     restore_rows(into, workspace, rows, &dirs, &mut report).await;
     // The mark comes off last: until then a late write about the tabs that slept still
     // meets it, and the rows read above are what came back.
     let unmarked = into.books.store.wake_workspace(workspace).await;
     into.books.asleep.lock().unwrap().remove(&workspace);
-    // The index its splits were held out of is asked for again, now whole.
-    if let Some(first) = first {
-        into.agents.announce(first);
+    // The index its splits were held out of is asked for again, now whole. Every tab, not
+    // one: the recorder skipped what they announced while the mark was on, and an agent
+    // that came up meanwhile is only now handed the conversation its resume named.
+    for stream in streams {
+        into.agents.announce(stream);
     }
     unmarked
         .map_err(|e| format!("the space is up, but its sleep mark could not be taken off: {e}"))?;
@@ -7798,6 +7884,38 @@ mod image_wire_tests {
         // again the cap in bytes.
         wire.data = "A".repeat(qoro_terminal::MAX_IMAGE_BYTES * 2);
         assert!(wire.decode().is_none());
+    }
+}
+
+#[cfg(test)]
+mod said_tests {
+    use super::Said;
+
+    fn by(generation: u64) -> Option<Said> {
+        Some(Said::By("opencode".into(), generation))
+    }
+
+    /// An id lives as long as the agent that has it: taken by the agent a resume started,
+    /// kept through a new generation of the same program, gone when the agent leaves.
+    #[test]
+    fn a_conversation_id_goes_with_its_agent() {
+        let resumed = Said::Resumed("opencode".into());
+        assert_eq!(
+            resumed.settle(None),
+            Some(resumed.clone()),
+            "still starting"
+        );
+        assert_eq!(resumed.settle(Some(("opencode", 7))), by(7), "taken");
+        assert_eq!(resumed.settle(Some(("claude", 7))), None, "another agent");
+        let said = Said::By("opencode".into(), 7);
+        assert_eq!(said.settle(Some(("opencode", 7))), by(7), "the same agent");
+        assert_eq!(
+            said.settle(Some(("opencode", 8))),
+            by(7),
+            "an exec or a restart"
+        );
+        assert_eq!(said.settle(Some(("claude", 8))), None, "another agent");
+        assert_eq!(said.settle(None), None, "the agent left");
     }
 }
 

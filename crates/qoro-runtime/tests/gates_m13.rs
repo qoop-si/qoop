@@ -381,13 +381,13 @@ async fn a_restart_reports_resumed_agents_shell_fallbacks_and_moved_directories(
     assert_eq!(report.cwd_fallback, 1, "{report:?}");
 }
 
-/// A restart repopulates the in-memory conversation id from the stored row.
+/// A restart carries a stored conversation id into memory only with a resume that names it.
 ///
-/// The DB keeps the id (COALESCE preserves it); `open_terminal` starts memory
-/// at `None`. Without repopulating, `agents --json` shows `agent_session: null`
-/// and `history` fails with `MissingId` until the next hook report.
+/// A Claude Code id with no transcript is resumed as the newest conversation instead, so
+/// the agent that comes back is not in that one, and the tab must not say it is. The id a
+/// resume does name is held for its agent (`Said::Resumed`), covered where `Said` is.
 #[tokio::test]
-async fn a_restart_repopulates_the_memory_conversation_id_from_the_stored_row() {
+async fn a_restart_carries_no_conversation_id_its_resume_does_not_name() {
     let dir = runtime_dir();
     with_daemon(dir.path(), |daemon| async move {
         let terminals = daemon.terminals();
@@ -417,22 +417,12 @@ async fn a_restart_repopulates_the_memory_conversation_id_from_the_stored_row() 
             terminals.streams().len(),
             terminals.streams()
         );
-        // The daemon opens one of its own; the restored tab is the other one.
-        let restored: Vec<u32> = terminals
-            .streams()
-            .into_iter()
-            .filter(|s| terminals.session_of(*s).is_some())
-            .collect();
-        assert_eq!(
-            restored.len(),
-            1,
-            "exactly the restored tab carries a session: {:?}",
-            terminals.streams()
-        );
-        assert_eq!(
-            terminals.session_of(restored[0]),
-            Some("ses_abc123".to_string()),
-            "memory lost the stored conversation id across the restart"
+        assert!(
+            terminals
+                .streams()
+                .into_iter()
+                .all(|s| terminals.session_of(s).is_none()),
+            "a tab says it is in a conversation its resume did not name"
         );
     })
     .await;

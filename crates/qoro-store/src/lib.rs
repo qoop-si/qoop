@@ -589,6 +589,18 @@ impl Store {
         Ok(())
     }
 
+    /// Forget the id of a conversation whose agent has left the terminal, if the row still
+    /// holds that one: an id the next agent wrote meanwhile is its own, and stays.
+    pub fn forget_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
+        // Not in a sleeping space, like every write here: its rows say what to bring back.
+        self.conn.execute(
+            "UPDATE terminal SET agent_session = NULL WHERE id = ?1 AND agent_session = ?2 \
+             AND workspace NOT IN (SELECT workspace FROM asleep)",
+            params![id, session],
+        )?;
+        Ok(())
+    }
+
     /// Record which agent is in a terminal, and its own id for the conversation when it
     /// gave us one.
     ///
@@ -596,9 +608,10 @@ impl Store {
     /// a person who left their agent left it, and a restart that started it again would be
     /// undoing something they did on purpose.
     ///
-    /// The session id is the other way round. It is only ever written, never cleared by a
-    /// `None`, because an agent that stops reporting its id has not ended the conversation,
-    /// and forgetting the id would turn an exact resume into a guess.
+    /// The session id is the other way round. It is never cleared by a `None` here, because
+    /// an agent that stops reporting its id has not ended the conversation, and forgetting
+    /// the id would turn an exact resume into a guess. It goes with the agent that had it,
+    /// through `forget_agent_session`.
     pub fn set_agent(
         &self,
         id: i64,
@@ -1278,11 +1291,34 @@ mod tests {
         s.sleep_workspace(ws, 2, &[]).expect("sleep");
         s.set_agent(3, None, None).expect("a late write runs");
         s.set_agent_session(3, "other").expect("a late id runs");
+        s.forget_agent_session(3, "abc")
+            .expect("a late forget runs");
         let row = &s.open_terminals(ws).expect("rows")[0];
         assert_eq!(row.agent.as_deref(), Some("claude"));
         assert_eq!(row.agent_session.as_deref(), Some("abc"));
         s.wake_workspace(ws).expect("wake");
         s.set_agent(3, None, None).expect("an awake write");
         assert_eq!(s.open_terminals(ws).expect("rows")[0].agent, None);
+    }
+
+    #[test]
+    fn a_forgotten_conversation_is_gone_from_the_row() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.set_agent(3, Some("opencode"), Some("ses_a"))
+            .expect("agent");
+        // The next agent's id landed first: forgetting the old one leaves it.
+        s.set_agent_session(3, "ses_b").expect("next id");
+        s.forget_agent_session(3, "ses_a")
+            .expect("forget a stale one");
+        let row = &s.open_terminals(ws).expect("rows")[0];
+        assert_eq!(row.agent_session.as_deref(), Some("ses_b"));
+        s.forget_agent_session(3, "ses_b").expect("forget");
+        let row = &s.open_terminals(ws).expect("rows")[0];
+        assert_eq!(row.agent_session, None);
+        // Forgotten, an agent coming back with no id cannot bring the old one back.
+        s.set_agent(3, Some("opencode"), None).expect("agent again");
+        assert_eq!(s.open_terminals(ws).expect("rows")[0].agent_session, None);
     }
 }

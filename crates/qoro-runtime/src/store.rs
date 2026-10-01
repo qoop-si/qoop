@@ -215,6 +215,12 @@ impl StoreHandle {
         self.run(move |s| s.set_agent_session(id, &session)).await
     }
 
+    /// Forget a conversation id whose agent is gone, if the row still holds it.
+    pub async fn forget_agent_session(&self, id: i64, session: String) -> Result<(), HandleError> {
+        self.run(move |s| s.forget_agent_session(id, &session))
+            .await
+    }
+
     /// Record where a terminal actually is, so a restart opens it there.
     pub async fn set_cwd(&self, id: i64, cwd: String) -> Result<(), HandleError> {
         self.run(move |s| s.set_cwd(id, &cwd)).await
