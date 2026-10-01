@@ -31,9 +31,9 @@ pub struct Frame<'a> {
     pub spaces: &'a [WorkspaceRow],
     /// The space whose tabs are on the bar. `None` before the daemon has answered.
     pub space: Option<i64>,
-    /// Split panes hidden from the top tab bar. Sub-terminals inside their
-    /// tab, still listed in the sidebar when an agent runs in them.
-    pub panes: std::collections::BTreeSet<u32>,
+    /// Split panes hidden from the top tab bar, each with the tab it sits in. Sub-terminals
+    /// inside their tab, still listed in the sidebar when an agent runs in them.
+    pub panes: std::collections::BTreeMap<u32, u32>,
     pub focused: u32,
     /// The focused terminal's last snapshot. `None` before the first one arrives, which is
     /// a real state: a terminal that has produced nothing yet has nothing to draw.
@@ -551,6 +551,11 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     }
 }
 
+/// The tab a terminal belongs on the bar as: itself, or for a split pane the tab it sits in.
+pub fn tab_of(terminal: u32, panes: &std::collections::BTreeMap<u32, u32>) -> u32 {
+    panes.get(&terminal).copied().unwrap_or(terminal)
+}
+
 /// Paint the whole screen.
 ///
 /// Whole, not incremental, so a frame is a pure function a test can read. What actually
@@ -581,9 +586,11 @@ pub fn paint(frame: &Frame) -> String {
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
     let tabs: Vec<AgentRow> = in_space(frame.rows, frame.space)
         .into_iter()
-        .filter(|r| !frame.panes.contains(&r.terminal))
+        .filter(|r| !frame.panes.contains_key(&r.terminal))
         .collect();
-    for (at_row, pieces) in tabs::painted(&tabs, frame.focused, pane_cols as usize)
+    // With the keyboard in a split, the tab it is a split of is the one that reads focused.
+    let focused_tab = tab_of(frame.focused, &frame.panes);
+    for (at_row, pieces) in tabs::painted(&tabs, focused_tab, pane_cols as usize)
         .into_iter()
         .enumerate()
     {
@@ -3293,7 +3300,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3451,7 +3458,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3499,7 +3506,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -3547,7 +3554,7 @@ mod tests {
     #[test]
     fn a_split_pane_is_not_a_top_tab_but_stays_in_the_sidebar() {
         let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
-        let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
+        let panes = std::collections::BTreeMap::from([(2, 1)]);
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
@@ -3608,7 +3615,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3655,11 +3662,11 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_pane_leaves_the_bar_without_a_bracket() {
-        // Panes are sub-terminals, never tabs: with the keyboard in one, no
-        // tab wears the bracket, and the tile border carries the focus alone.
+    fn a_focused_pane_marks_the_tab_it_sits_in() {
+        // Panes are sub-terminals, never tabs: with the keyboard in one, the tab it is a
+        // split of reads focused, so the bar still says where the keyboard is.
         let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
-        let panes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::from([2]);
+        let panes = std::collections::BTreeMap::from([(2, 1)]);
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
@@ -3703,7 +3710,14 @@ mod tests {
         let addr_end = painted[bar_start..].find('H').expect("no bar address") + 1;
         let bar = &painted[bar_start + addr_end..bar_start + bar_end];
         assert!(bar.contains("zsh"), "tab missing from bar: {bar:?}");
-        assert!(!bar.contains("[1 "), "no tab owns the keyboard: {bar:?}");
+        assert!(
+            bar.contains(&format!("{} 1 zsh", crate::theme::tab_on())),
+            "the tab holding the focused pane does not read focused: {bar:?}"
+        );
+        assert!(
+            bar.contains('\u{00d7}'),
+            "the holding tab has no close: {bar:?}"
+        );
     }
 
     #[test]
@@ -3713,7 +3727,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3822,7 +3836,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3868,7 +3882,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -3920,7 +3934,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -3974,7 +3988,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4040,7 +4054,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4105,7 +4119,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4158,7 +4172,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -4209,7 +4223,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -4261,7 +4275,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -4305,7 +4319,7 @@ mod tests {
         let rows = [row(1, "claude", "idle")];
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
         let behind = crate::run::Behind::default();
-        let panes = std::collections::BTreeSet::new();
+        let panes = std::collections::BTreeMap::new();
         let spaces = spaces();
         let frame = Frame {
             armed: None,
@@ -4426,7 +4440,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -4618,7 +4632,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -4673,7 +4687,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -4740,7 +4754,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -4799,7 +4813,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -4878,7 +4892,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &wide,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -4967,7 +4981,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -5055,7 +5069,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -5103,7 +5117,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -5148,7 +5162,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -5202,7 +5216,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &wide,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 0,
             snapshot: None,
@@ -5249,7 +5263,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -5333,7 +5347,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -5413,7 +5427,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 2,
                 snapshot: None,
@@ -5490,7 +5504,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: None,
@@ -5555,7 +5569,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 2,
             snapshot: Some(&snapshot),
@@ -5703,7 +5717,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -5767,7 +5781,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: Some(&snapshot),
@@ -5820,7 +5834,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -5883,7 +5897,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces(),
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snapshot),
@@ -6035,7 +6049,7 @@ mod tests {
             armed: None,
             rows,
             spaces,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused,
             snapshot: focused_snap,
@@ -6076,7 +6090,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -6108,7 +6122,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &spaces,
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: Some(&snap),
@@ -6158,7 +6172,7 @@ mod tests {
         let spaces = spaces();
         let snap = snapshot(&["hello from the shell"]);
         let behind = crate::run::Behind::default();
-        let panes = std::collections::BTreeSet::new();
+        let panes = std::collections::BTreeMap::new();
         let seen = sidebar::Seen::new();
         let unseen = sidebar::Unseen::new();
         let frame_of = |notice: Option<&'static str>| Frame {
@@ -6417,7 +6431,7 @@ mod tests {
                 armed: None,
                 rows: &rows,
                 spaces: &spaces(),
-                panes: std::collections::BTreeSet::new(),
+                panes: std::collections::BTreeMap::new(),
                 space: Some(1),
                 focused: 1,
                 snapshot: None,
@@ -6470,7 +6484,7 @@ mod tests {
             armed: None,
             rows: &rows,
             spaces: &[],
-            panes: std::collections::BTreeSet::new(),
+            panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
             snapshot: None,
@@ -6521,7 +6535,7 @@ mod tests {
     #[test]
     fn a_focused_sleeping_tab_names_how_to_dismiss_it() {
         let rows = [row(1, "claude", "working"), row(2, "claude", "sleeping")];
-        let (spaces, panes) = (spaces(), std::collections::BTreeSet::new());
+        let (spaces, panes) = (spaces(), std::collections::BTreeMap::new());
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
         let behind = crate::run::Behind {
             terminal: 0,

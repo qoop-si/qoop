@@ -854,15 +854,25 @@ impl State {
         let panes = self.panes();
         screen::in_space(&self.rows, self.space)
             .into_iter()
-            .filter(|r| !panes.contains(&r.terminal))
+            .filter(|r| !panes.contains_key(&r.terminal))
             .collect()
     }
 
-    /// Every terminal that is a pane inside somebody's tab. See `is_pane`.
-    fn panes(&self) -> std::collections::BTreeSet<u32> {
+    /// Every terminal that is a pane inside somebody's tab, with that tab: the first leaf
+    /// of its tree. See `is_pane`.
+    fn panes(&self) -> std::collections::BTreeMap<u32, u32> {
         self.trees()
-            .flat_map(|tree| tree.leaves().into_iter().skip(1))
+            .flat_map(|tree| {
+                let leaves = tree.leaves();
+                let tab = leaves.first().copied().unwrap_or_default();
+                leaves.into_iter().skip(1).map(move |pane| (pane, tab))
+            })
             .collect()
+    }
+
+    /// The tab the keyboard is in: the focused terminal, or the tab it is a split of.
+    fn focused_tab(&self) -> u32 {
+        screen::tab_of(self.focused, &self.panes())
     }
 
     /// Every tree this client holds, on screen and parked, in every space.
@@ -1135,7 +1145,7 @@ impl State {
             // counted from there and not from the edge of the screen.
             return match tabs::hit(
                 &self.tabs(),
-                self.focused,
+                self.focused_tab(),
                 pane_cols as usize,
                 (col as usize).saturating_sub(left + 1),
                 row as usize - 1,
@@ -11515,6 +11525,14 @@ mod tests {
         state.rows.push(agent(3, 1, "zsh", "idle"));
         assert!(!state.tabs().iter().any(|r| r.terminal == 3));
         assert!(state.rows.iter().any(|r| r.terminal == 3));
+        // The split belongs to its tree's first leaf, and with the keyboard in it that
+        // tab is the one the bar marks.
+        let tab = state.layouts.get(&1).unwrap().leaves()[0];
+        assert_eq!(state.panes().get(&3), Some(&tab));
+        state.focused = 3;
+        assert_eq!(state.focused_tab(), tab);
+        state.focused = tab;
+        assert_eq!(state.focused_tab(), tab);
     }
 
     #[test]
