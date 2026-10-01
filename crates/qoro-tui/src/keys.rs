@@ -131,13 +131,13 @@ pub enum Action {
     /// closing a tab is one keystroke each, and a bulk close behind one letter would end
     /// sessions somebody is still looking at.
     CloseSpace,
-    /// ctrl-a r, rename the tab; ctrl-a R, rename the space.
+    /// ctrl-a r, rename the tab; ctrl-a R, the space's settings, which rename it.
     ///
     /// A name given at creation is a guess: the terminal a person opened to "look at
     /// something" is the one they are still in an hour later, doing the thing it should
     /// have been called after.
     Rename,
-    RenameSpace,
+    SpaceSettings,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
@@ -409,7 +409,7 @@ impl Keys {
                     b'U' => Action::Update,
                     b'm' => Action::Menu,
                     b'?' => Action::Keybinds,
-                    b'R' => Action::RenameSpace,
+                    b'R' => Action::SpaceSettings,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
@@ -700,7 +700,7 @@ mod tests {
     fn the_rename_keys_are_separate_for_a_tab_and_for_a_space() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01r"), vec![Action::Rename]);
-        assert_eq!(keys.feed(b"\x01R"), vec![Action::RenameSpace]);
+        assert_eq!(keys.feed(b"\x01R"), vec![Action::SpaceSettings]);
     }
 
     #[test]

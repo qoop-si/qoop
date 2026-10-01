@@ -825,6 +825,24 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(link, R::RenameTerminal { id, terminal, name })
                     .await
             }
+            // What this machine calls a conversation lives with the agent's own daemon,
+            // which is the one that knows which conversation the terminal is in.
+            R::RenameSession {
+                id,
+                terminal,
+                title,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(
+                    link,
+                    R::RenameSession {
+                        id,
+                        terminal,
+                        title,
+                    },
+                )
+                .await
+            }
             // A tab lives on one daemon, so its tree does: sent to the daemon of its
             // first pane in that daemon's numbering. A tree reaching across daemons is
             // not one any daemon could bring back, and is refused.
@@ -2007,6 +2025,47 @@ mod tests {
                 id: "ink-1".into(),
                 workspace: 3,
                 ink: Some(4),
+            }
+        );
+    }
+
+    /// A conversation on a remote is named on that remote, in its own numbering: sent home,
+    /// the home daemon renamed whatever its own terminal of that number was, or nothing.
+    #[tokio::test]
+    async fn a_remote_sessions_name_goes_to_its_machine_in_its_own_numbering() {
+        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
+        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
+        let mut home = Link::new(String::new(), None);
+        home.conn = Some((1, home_tx));
+        let mut remote = Link::new("devbox".into(), None);
+        remote.conn = Some((1, remote_tx));
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![Some(home), Some(remote)],
+            home: 0,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 0,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        mux.control(ControlRequest::RenameSession {
+            id: "title-1".into(),
+            terminal: terminal_out(1, 5).expect("fits"),
+            title: Some("api".into()),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::RenameSession {
+                id: "title-1".into(),
+                terminal: 5,
+                title: Some("api".into()),
             }
         );
     }

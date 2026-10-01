@@ -388,6 +388,26 @@ pub fn chip_cap_for(selected: bool, level: crate::colorlevel::Level) -> String {
     }
 }
 
+/// A colour swatch in a space's settings: space ink `n` as the background, its number on
+/// it in black on the dark palette's inks and white on the light palette's, which are the
+/// darker ones.
+pub fn swatch(n: usize) -> String {
+    swatch_for(n, crate::colorlevel::level())
+}
+
+/// A swatch at an explicit colour level. Pure, see [`fg_for`]. In monochrome there is no
+/// colour to show, and the number and the pick's brackets say it all.
+pub fn swatch_for(n: usize, level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => RESET.to_string(),
+        _ => format!(
+            "\x1b[0;48;5;{};38;5;{}m",
+            ink(Role::Space(n)),
+            if light() { 231 } else { 16 }
+        ),
+    }
+}
+
 /// Back to the terminal's own colours.
 pub const RESET: &str = "\x1b[0m";
 
@@ -1003,6 +1023,19 @@ mod tests {
             let ratio = contrast(light_ink(role), LIGHT_CHIP_BG);
             assert!(ratio >= 3.0, "{role:?} on a chip is {ratio:.2}:1");
         }
+    }
+
+    /// A swatch's number reads on its ink: black on every dark space ink, white on every
+    /// light one, at least 3 to 1, a glyph a person finds.
+    #[test]
+    fn a_swatchs_number_reads_on_its_ink() {
+        for n in 0..6 {
+            let dark = contrast(16, SPACE_INKS[n]);
+            assert!(dark >= 3.0, "dark swatch {n} is {dark:.2}:1");
+            let light = contrast(231, LIGHT_SPACE_INKS[n]);
+            assert!(light >= 3.0, "light swatch {n} is {light:.2}:1");
+        }
+        assert_eq!(swatch_for(2, crate::colorlevel::Level::Mono), RESET);
     }
 
     /// The dark table, measured against black (16), the ground most dark terminals sit on:

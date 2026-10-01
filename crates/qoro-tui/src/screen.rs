@@ -235,7 +235,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("ctrl-a:", None, 0),
             ("g", Some("tree/priority"), 3),
             ("w", Some("new space"), 2),
-            ("R", Some("rename space"), 4),
+            ("R", Some("space settings"), 4),
             ("b", Some("hide column"), 5),
             ("d", Some("detach"), 0),
         ],
@@ -254,7 +254,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("=", Some("equalize"), 7),
             ("s", Some("space"), 3),
             ("w", Some("new space"), 5),
-            ("R", Some("rename space"), 6),
+            ("R", Some("space settings"), 6),
             ("W", Some("close space"), 7),
             ("Z", Some("sleep"), 7),
             ("space", Some("find"), 1),
@@ -1128,7 +1128,7 @@ pub fn paint(frame: &Frame) -> String {
     if let Some(prompt) = frame.prompt {
         // At the end of what has been typed, as much of it as the field shows, or at the
         // start of an empty field before the faint name it keeps.
-        if let Some(b) = PromptBox::at(frame.cols, frame.lines) {
+        if let Some(b) = PromptBox::at(frame.cols, frame.lines, prompt) {
             let shown = width::width(&field_tail(&prompt.text, b.span() - 1));
             out.push_str(&at(b.text_row() + 1, b.field_col() + shown + 1));
         }
@@ -1550,12 +1550,25 @@ pub(crate) struct PromptBox {
     /// With its blank rows and the label over the field, or squeezed into a short window
     /// without them.
     roomy: bool,
+    /// The rows a space's settings add under the name: a blank, the colour label, the
+    /// swatches and, on a space of another machine, that machine. None when the box is
+    /// not a space's or has no room for them, which leaves it the plain rename.
+    extra: usize,
 }
 
 /// Both edges and eight rows: blank, label, field, underline, note, blank, buttons, blank.
 const PROMPT_ROOMY: usize = 10;
+/// The swatch row: six swatches of three cells with a blank after each, then `[auto]`.
+const SWATCHES_W: usize = 6 * 4 + 6;
 /// Both edges and the three rows a short window keeps: field, note, buttons.
 const PROMPT_TIGHT: usize = 5;
+
+/// What a click on the naming box does: press a key, or pick a colour (`None` is auto).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxClick {
+    Key(u8),
+    Pick(Option<u8>),
+}
 
 /// One button of the naming box: zero based row and column, its label, and the key it
 /// stands for, which is what a click on it presses.
@@ -1577,22 +1590,50 @@ impl PromptButton {
 impl PromptBox {
     /// In the upper third of the pane, where the eye already is, or `None` on a window
     /// too small for even the tight box.
-    pub(crate) fn at(cols: u16, lines: u16) -> Option<Self> {
+    pub(crate) fn at(cols: u16, lines: u16, prompt: &crate::run::Prompt) -> Option<Self> {
         let (cols, lines) = (cols as usize, lines as usize);
         let room = lines.saturating_sub(TABS + STATUS);
+        let w = cols.min(66);
+        // A space's colours, only where the whole row of them fits: a pick nobody can see
+        // is not one.
+        let extra = if prompt.ink.is_some() {
+            3 + usize::from(prompt.machine.is_some())
+        } else {
+            0
+        };
+        let extra = if room >= PROMPT_ROOMY + extra && w >= SWATCHES_W + 6 {
+            extra
+        } else {
+            0
+        };
         let (roomy, h) = match room {
             _ if cols < 20 => return None,
-            r if r >= PROMPT_ROOMY => (true, PROMPT_ROOMY),
+            r if r >= PROMPT_ROOMY => (true, PROMPT_ROOMY + extra),
             r if r >= PROMPT_TIGHT => (false, PROMPT_TIGHT),
             _ => return None,
         };
-        let w = cols.min(66);
         Some(Self {
             left: (cols - w) / 2,
             top: TABS + (room - h) / 3,
             w,
             roomy,
+            extra,
         })
+    }
+
+    /// Zero based screen row of the swatches, when the box shows them.
+    fn swatch_row(&self) -> Option<usize> {
+        (self.extra > 0).then_some(self.top + BOX_FIRST_ROW + 7)
+    }
+
+    /// The pick a click at the zero based `col` of the swatch row makes, if it lands on one.
+    fn swatch_at(&self, col: usize) -> Option<Option<u8>> {
+        let at = col.checked_sub(self.field_col())?;
+        match at {
+            _ if at < 6 * 4 && at % 4 < 3 => Some(Some((at / 4) as u8)),
+            _ if (6 * 4..SWATCHES_W).contains(&at) => Some(None),
+            _ => None,
+        }
     }
 
     /// The blank columns inside each side rule.
@@ -1640,7 +1681,7 @@ impl PromptBox {
         if size(&left) + 2 + size(&right) > room {
             left.clear();
         }
-        let row = self.top + BOX_FIRST_ROW + if self.roomy { 6 } else { 2 };
+        let row = self.top + BOX_FIRST_ROW + if self.roomy { 6 + self.extra } else { 2 };
         let mut out = Vec::new();
         for (set, mut col) in [
             (left, self.field_col()),
@@ -1662,20 +1703,29 @@ impl PromptBox {
     }
 }
 
-/// The key a click at the zero based `row` and `col` presses in the naming box, when it
-/// lands on one of the box's buttons.
+/// What a click at the zero based `row` and `col` does in the naming box: the key of the
+/// button it lands on, or the colour of the swatch.
 pub(crate) fn prompt_click(
     cols: u16,
     lines: u16,
-    what: crate::run::Naming,
+    prompt: &crate::run::Prompt,
     row: usize,
     col: usize,
-) -> Option<u8> {
-    PromptBox::at(cols, lines)?
-        .buttons(what)
+) -> Option<BoxClick> {
+    let b = PromptBox::at(cols, lines, prompt)?;
+    if b.swatch_row() == Some(row) {
+        return b.swatch_at(col).map(BoxClick::Pick);
+    }
+    b.buttons(prompt.what)
         .into_iter()
         .find(|b| b.row == row && (b.col..b.col + b.width()).contains(&col))
-        .map(|b| b.key)
+        .map(|b| BoxClick::Key(b.key))
+}
+
+/// Whether the naming box shows a space's colours at this size, which is when the arrows
+/// pick one.
+pub(crate) fn prompt_colours(cols: u16, lines: u16, prompt: &crate::run::Prompt) -> bool {
+    PromptBox::at(cols, lines, prompt).is_some_and(|b| b.extra > 0)
 }
 
 /// The zero based row and column of the naming box's button for `key`, for a test to
@@ -1684,14 +1734,28 @@ pub(crate) fn prompt_click(
 pub(crate) fn prompt_button(
     cols: u16,
     lines: u16,
-    what: crate::run::Naming,
+    prompt: &crate::run::Prompt,
     key: u8,
 ) -> Option<(usize, usize)> {
-    PromptBox::at(cols, lines)?
-        .buttons(what)
+    PromptBox::at(cols, lines, prompt)?
+        .buttons(prompt.what)
         .into_iter()
         .find(|b| b.key == key)
         .map(|b| (b.row, b.col))
+}
+
+/// The zero based row and column of the swatch for `pick` (`None` is auto), for a test to
+/// click it.
+#[cfg(test)]
+pub(crate) fn prompt_swatch(
+    cols: u16,
+    lines: u16,
+    prompt: &crate::run::Prompt,
+    pick: Option<u8>,
+) -> Option<(usize, usize)> {
+    let b = PromptBox::at(cols, lines, prompt)?;
+    let at = pick.map_or(6 * 4, |n| usize::from(n) * 4);
+    Some((b.swatch_row()?, b.field_col() + at))
 }
 
 /// What fits of `text` in `room` columns: all of it, or its end behind a `…`, so the
@@ -1723,7 +1787,7 @@ fn field_tail(text: &str, room: usize) -> String {
 /// In the middle of the pane rather than in the column, because it is a question about
 /// something that is about to exist and has no row of its own to sit in yet.
 fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
-    let Some(b) = PromptBox::at(frame.cols, frame.lines) else {
+    let Some(b) = PromptBox::at(frame.cols, frame.lines, prompt) else {
         return;
     };
     let inner = b.w - 2;
@@ -1797,28 +1861,99 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
     buttons.push_str(&" ".repeat(inner - used));
     let blank = " ".repeat(inner);
     let body: Vec<String> = if b.roomy {
-        vec![
+        let mut body = vec![
             blank.clone(),
             row(prompt.what.label(), &theme::fg(theme::Role::Detail)),
             field,
             underline,
             note,
-            blank.clone(),
-            buttons,
-            blank,
-        ]
+        ];
+        if b.extra > 0 {
+            body.push(blank.clone());
+            body.push(row("colour", &theme::fg(theme::Role::Detail)));
+            body.push(swatches(prompt.ink.and_then(|pick| pick.now), &pad, inner));
+            if let Some((machine, link)) = &prompt.machine {
+                body.push(machine_line(machine, *link, &pad, span, inner));
+            }
+        }
+        body.extend([blank.clone(), buttons, blank]);
+        body
     } else {
         vec![field, note, buttons]
+    };
+    // A space's box with no room for its colours is the plain rename, and says so.
+    let asks = match prompt.what {
+        crate::run::Naming::SpaceSettings(_) if b.extra == 0 => "rename this space",
+        what => what.asks(),
     };
     let (rule, title) = spot_inks();
     paint_boxed(
         out,
         frame.lines as usize,
         (b.left, b.top, b.w),
-        prompt.what.asks(),
+        asks,
         (&rule, &title),
         &body,
     );
+}
+
+/// The swatch row: each space ink with its number on it, the pick in brackets, then
+/// `auto`, the colour the space's id gives it. `inner` columns wide.
+fn swatches(pick: Option<u8>, pad: &str, inner: usize) -> String {
+    let mut line = format!("{}{pad}", theme::RESET);
+    for n in 0..6u8 {
+        let (open, shut) = if pick == Some(n) {
+            ('[', ']')
+        } else {
+            (' ', ' ')
+        };
+        line.push_str(&format!(
+            "{}{open}{}{shut}{} ",
+            theme::swatch(usize::from(n)),
+            n + 1,
+            theme::RESET
+        ));
+    }
+    let (auto, ink) = if pick.is_none() {
+        ("[auto]", theme::Role::Text)
+    } else {
+        (" auto ", theme::Role::Faint)
+    };
+    line.push_str(&format!("{}{auto}{}", theme::fg(ink), theme::RESET));
+    line.push_str(&" ".repeat(inner - pad.len() - SWATCHES_W));
+    line
+}
+
+/// `machine  <name> · connected`: where a remote space lives and how it is reached, in the
+/// same inks as the rule's machine chip.
+fn machine_line(
+    machine: &str,
+    link: qoro_runtime::control::LinkState,
+    pad: &str,
+    span: usize,
+    inner: usize,
+) -> String {
+    use qoro_runtime::control::LinkState;
+    let (word, ink) = match link {
+        LinkState::Up => ("connected", theme::Role::Done),
+        LinkState::Parked => ("parked", theme::Role::Faint),
+        LinkState::Down => ("offline", theme::Role::Blocked),
+    };
+    let lead = "machine  ";
+    let tail = format!(" \u{b7} {word}");
+    let room = span.saturating_sub(lead.len() + width::width(&tail));
+    let name = width::text(machine, width::width(machine).min(room));
+    let used = lead.len() + width::width(&name) + width::width(&tail);
+    format!(
+        "{}{pad}{}{lead}{}{name}{} \u{b7} {}{word}{}{}",
+        theme::RESET,
+        theme::fg(theme::Role::Detail),
+        theme::fg(theme::Role::Text),
+        theme::fg(theme::Role::Faint),
+        theme::fg(ink),
+        theme::RESET,
+        " ".repeat(inner - pad.len() - used),
+    )
 }
 
 /// Where the centred menu box sits: left, top, width and height in cells.
@@ -2042,7 +2177,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("s/S", "next, prev"),
             ("w", "new space"),
             ("W", "close empty"),
-            ("R", "rename space"),
+            ("R", "settings"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree or rank"),
@@ -3468,15 +3603,15 @@ mod tests {
 
     fn prompt(what: crate::run::Naming, text: &str, was: &str) -> crate::run::Prompt {
         crate::run::Prompt {
-            what,
             text: text.to_string(),
-            was: was.to_string(),
+            ..crate::run::Prompt::new(what, was)
         }
     }
 
     /// The escape that puts the caret `shown` columns into the naming box's field.
     fn caret_in_field(cols: u16, lines: u16, shown: usize) -> String {
-        let b = PromptBox::at(cols, lines).expect("the box fits");
+        let b = PromptBox::at(cols, lines, &prompt(crate::run::Naming::Space, "", ""))
+            .expect("the box fits");
         at(b.text_row() + 1, b.field_col() + shown + 1)
     }
 
@@ -3511,7 +3646,7 @@ mod tests {
     fn a_name_wider_than_the_field_shows_its_end() {
         let long = format!("{}END", "x".repeat(80));
         let painted = painted_prompt(&prompt(crate::run::Naming::Remote, &long, ""), 70, 24);
-        let b = PromptBox::at(70, 24).expect("fits");
+        let b = PromptBox::at(70, 24, &prompt(crate::run::Naming::Remote, "", "")).expect("fits");
         assert!(painted.contains("\u{2026}"), "{painted:?}");
         assert!(painted.contains("xEND"), "{painted:?}");
         assert!(
@@ -3534,7 +3669,7 @@ mod tests {
         assert!(painted.contains("^r reset"), "{painted:?}");
         // A space has no default to go back to.
         let space = painted_prompt(
-            &prompt(crate::run::Naming::RenameSpace(1), "", "x"),
+            &prompt(crate::run::Naming::SpaceSettings(1), "", "x"),
             100,
             24,
         );
@@ -3545,7 +3680,8 @@ mod tests {
     #[test]
     fn the_buttons_are_where_a_click_lands() {
         let what = crate::run::Naming::RenameTerminal(1);
-        let b = PromptBox::at(100, 24).expect("fits");
+        let asked = prompt(what, "", "");
+        let b = PromptBox::at(100, 24, &asked).expect("fits");
         let buttons = b.buttons(what);
         let keys: Vec<u8> = buttons.iter().map(|b| b.key).collect();
         assert_eq!(keys, [0x15, 0x12, 0x1b, b'\r']);
@@ -3556,24 +3692,109 @@ mod tests {
                 "{painted:?}"
             );
             assert_eq!(
-                prompt_click(100, 24, what, button.row, button.col + 1),
-                Some(button.key)
+                prompt_click(100, 24, &asked, button.row, button.col + 1),
+                Some(BoxClick::Key(button.key))
             );
         }
-        assert_eq!(prompt_click(100, 24, what, buttons[0].row, 0), None);
+        assert_eq!(prompt_click(100, 24, &asked, buttons[0].row, 0), None);
         // A window too narrow for all of them keeps the answer.
-        let narrow = PromptBox::at(24, 24).expect("fits").buttons(what);
+        let narrow = PromptBox::at(24, 24, &asked).expect("fits").buttons(what);
         assert!(narrow.iter().any(|b| b.key == b'\r'), "{:?}", narrow.len());
+    }
+
+    /// A space's settings box: its colour as the pick of a row of six numbered swatches and
+    /// `auto`.
+    fn settings(
+        pick: Option<u8>,
+        machine: Option<qoro_runtime::control::LinkState>,
+    ) -> crate::run::Prompt {
+        crate::run::Prompt {
+            ink: Some(crate::run::InkPick {
+                was: None,
+                now: pick,
+            }),
+            machine: machine.map(|link| ("devbox".to_string(), link)),
+            ..prompt(crate::run::Naming::SpaceSettings(1), "", "devbox:api")
+        }
+    }
+
+    /// The settings box shows the name, the six swatches with the pick in brackets, and on
+    /// a remote space the machine and how it is reached; the buttons sit under all of it.
+    #[test]
+    fn the_settings_box_shows_the_colours_and_the_machine() {
+        use qoro_runtime::control::LinkState;
+        let painted = painted_prompt(&settings(Some(2), Some(LinkState::Up)), 100, 24);
+        assert!(painted.contains("space settings"), "{painted:?}");
+        assert!(painted.contains("colour"), "{painted:?}");
+        assert!(
+            painted.contains(&format!("{} 1 ", theme::swatch(0))),
+            "{painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("{}[3]", theme::swatch(2))),
+            "{painted:?}"
+        );
+        assert!(painted.contains(" auto "), "{painted:?}");
+        assert!(painted.contains("machine  "), "{painted:?}");
+        assert!(painted.contains("devbox"), "{painted:?}");
+        assert!(painted.contains("connected"), "{painted:?}");
+        assert!(painted.contains(" \u{21b5} save "), "{painted:?}");
+        let here = painted_prompt(&settings(None, None), 100, 24);
+        assert!(here.contains("[auto]"), "{here:?}");
+        assert!(!here.contains("machine  "), "{here:?}");
+        // The buttons move down past the extra rows, and a click finds them there.
+        let asked = settings(None, Some(LinkState::Down));
+        let (row, col) = prompt_button(100, 24, &asked, b'\r').expect("a save button");
+        let b = PromptBox::at(100, 24, &asked).expect("fits");
+        assert_eq!(row, b.top + BOX_FIRST_ROW + 6 + 4);
+        assert_eq!(
+            prompt_click(100, 24, &asked, row, col + 1),
+            Some(BoxClick::Key(b'\r'))
+        );
+    }
+
+    /// A click on a swatch picks its colour, on `auto` picks auto, and between two swatches
+    /// picks nothing.
+    #[test]
+    fn a_swatch_click_picks_its_colour() {
+        let asked = settings(Some(0), None);
+        for pick in [Some(0), Some(3), Some(5), None] {
+            let (row, col) = prompt_swatch(100, 24, &asked, pick).expect("swatches shown");
+            for c in col..col + 3 {
+                assert_eq!(
+                    prompt_click(100, 24, &asked, row, c),
+                    Some(BoxClick::Pick(pick))
+                );
+            }
+        }
+        let (row, col) = prompt_swatch(100, 24, &asked, Some(1)).expect("shown");
+        assert_eq!(prompt_click(100, 24, &asked, row, col + 3), None);
+    }
+
+    /// Too narrow or too short for the row of colours, the box is the plain rename: no
+    /// colour, nothing to pick, and the title says so.
+    #[test]
+    fn a_cramped_settings_box_is_the_plain_rename() {
+        let asked = settings(Some(1), None);
+        assert!(prompt_colours(100, 24, &asked));
+        for (cols, lines) in [(35, 24), (100, (TABS + STATUS + PROMPT_ROOMY + 2) as u16)] {
+            assert!(!prompt_colours(cols, lines, &asked), "{cols}x{lines}");
+            assert_eq!(prompt_swatch(cols, lines, &asked, Some(1)), None);
+            let painted = painted_prompt(&asked, cols, lines);
+            assert!(painted.contains("rename this space"), "{painted:?}");
+            assert!(!painted.contains("colour"), "{painted:?}");
+        }
     }
 
     /// A short window keeps the field, the note and the buttons, without the blank rows.
     #[test]
     fn a_short_window_gets_the_tight_box() {
         let lines = (TABS + STATUS + PROMPT_TIGHT) as u16;
-        let b = PromptBox::at(80, lines).expect("the tight box fits");
+        let asked = prompt(crate::run::Naming::Space, "ab", "");
+        let b = PromptBox::at(80, lines, &asked).expect("the tight box fits");
         assert!(!b.roomy);
-        assert!(PromptBox::at(80, lines - 1).is_none());
-        let painted = painted_prompt(&prompt(crate::run::Naming::Space, "ab", ""), 80, lines);
+        assert!(PromptBox::at(80, lines - 1, &asked).is_none());
+        let painted = painted_prompt(&asked, 80, lines);
         assert!(
             painted.contains(&caret_in_field(80, lines, 2)),
             "{painted:?}"
@@ -3900,7 +4121,7 @@ mod tests {
             "menu hides its key: {painted:?}"
         );
         assert!(painted.contains("split side by side"), "{painted:?}");
-        assert!(painted.contains("rename space"), "{painted:?}");
+        assert!(painted.contains("space settings"), "{painted:?}");
         assert!(painted.contains("close tab"), "{painted:?}");
         assert!(
             painted.contains("ctrl-a x"),
@@ -4650,7 +4871,7 @@ mod tests {
             Action::CreateSpace => (const { place(13) }, Some("ctrl-a w")),
             Action::CloseSpace => (const { place(14) }, Some("ctrl-a W")),
             Action::Rename => (const { place(15) }, Some("ctrl-a r")),
-            Action::RenameSpace => (const { place(16) }, Some("ctrl-a R")),
+            Action::SpaceSettings => (const { place(16) }, Some("ctrl-a R")),
             Action::Collapse => (const { place(17) }, Some("ctrl-a b")),
             Action::Update => (const { place(18) }, Some("ctrl-a U")),
             Action::Menu => (const { place(19) }, Some("ctrl-a m")),
@@ -4712,7 +4933,7 @@ mod tests {
             Action::CreateSpace,
             Action::CloseSpace,
             Action::Rename,
-            Action::RenameSpace,
+            Action::SpaceSettings,
             Action::Collapse,
             Action::Update,
             Action::Menu,

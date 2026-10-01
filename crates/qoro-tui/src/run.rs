@@ -415,6 +415,17 @@ struct State {
     /// is typed the way `qoro new -- <agent>` types it. Consumed by the
     /// `TerminalCreated`/`Failed` answer.
     pending_agents: std::collections::BTreeMap<String, String>,
+    /// Names given to agent tabs still on their way, by request id. Moved to
+    /// `session_titles` by the `TerminalCreated` answer, dropped by a `Failed` one.
+    pending_names: std::collections::BTreeMap<String, String>,
+    /// Names owed to the conversations of new agent tabs, by terminal: sent once, as a
+    /// session rename, the first time the index shows the agent in a conversation, so the
+    /// name follows it through a sleep the way a rename from the box does. Dropped when
+    /// the terminal closes first.
+    ///
+    /// ponytail: a client that quits before the agent reports its session leaves the name
+    /// on the tab only, and `/clear` starts a conversation that takes the agent's own title.
+    session_titles: std::collections::BTreeMap<u32, String>,
     /// Lines owed to new agent tabs, by terminal. Written at the top of the loop,
     /// where there is always a write in hand; the shell holds the line as
     /// typeahead, so it lands even before its first prompt is drawn.
@@ -1493,7 +1504,11 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("new tab", "c", "name it, then it opens"),
     ("new space", "w", "name it, then it opens"),
     ("rename tab", "r", "rename what is focused"),
-    ("rename space", "R", "rename what is on screen"),
+    (
+        "space settings",
+        "R",
+        "name and colour of what is on screen",
+    ),
     ("close tab", "x", "close what is focused"),
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
@@ -1508,6 +1523,10 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("toggle view", "g", "spaces as a tree or agents by urgency"),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "what this daemon is set to"),
+    // After "settings": a letter jumps to the first row it starts, and `s` has
+    // meant settings for longer than these two rows have existed.
+    ("sleep space", "", "every tab of it sleeps"),
+    ("wake space", "", "every sleeping tab of it wakes"),
     (
         "reload manifests",
         "",
@@ -1713,29 +1732,37 @@ fn agents_on(
 ///
 /// The daemon only starts a shell (ADR-015): the command is typed, never spawned,
 /// the same path `qoro new -- <agent>` takes. The tab takes the command's first
-/// word as its name, so it reads as the agent until renamed. Empty commands never
-/// reach here: the prompt treats them as a cancel. The caller owns the request
-/// number, incremented the same way every other prompt answer is.
+/// word as its name, so it reads as the agent until renamed, unless the person
+/// gave it one: that goes on the tab now and on its conversation once the agent
+/// says which one it is in. Empty commands never reach here: the prompt treats
+/// them as a cancel. The caller owns the request number, incremented the same way
+/// every other prompt answer is.
 fn start_agent_terminal(
     state: &mut State,
     id: u64,
     command: &str,
     space: Option<i64>,
+    given: Option<String>,
 ) -> ControlRequest {
     let id = format!("agent-{id}");
-    let name = command
-        .split_whitespace()
-        .next()
-        .map(|first| {
-            first
-                .rsplit('/')
-                .next()
-                .filter(|word| !word.is_empty())
-                .unwrap_or(first)
-                .to_string()
-        })
-        .filter(|word| !word.is_empty());
+    let name = given.clone().or_else(|| {
+        command
+            .split_whitespace()
+            .next()
+            .map(|first| {
+                first
+                    .rsplit('/')
+                    .next()
+                    .filter(|word| !word.is_empty())
+                    .unwrap_or(first)
+                    .to_string()
+            })
+            .filter(|word| !word.is_empty())
+    });
     state.pending_agents.insert(id.clone(), command.to_string());
+    if let Some(given) = given {
+        state.pending_names.insert(id.clone(), given);
+    }
     ControlRequest::CreateTerminal {
         id,
         // Like every other new tab: the agent starts where the
@@ -1758,11 +1785,29 @@ fn take_agent_command(state: &mut State, id: &str) -> Option<Vec<u8>> {
     if !id.starts_with("agent-") {
         return None;
     }
+    state.pending_names.remove(id);
     state.pending_agents.remove(id).map(|command| {
         let mut line = command.into_bytes();
         line.push(b'\r');
         line
     })
+}
+
+/// Send each name owed to a conversation whose agent has now said which one it is in,
+/// once: the owed name goes as it is sent.
+fn name_sessions(state: &mut State, request: &mut u64) {
+    for row in &state.rows {
+        if row.agent_session.is_some()
+            && let Some(title) = state.session_titles.remove(&row.terminal)
+        {
+            *request += 1;
+            state.modes.outbox.push(ControlRequest::RenameSession {
+                id: format!("title-{request}"),
+                terminal: row.terminal,
+                title: Some(title),
+            });
+        }
+    }
 }
 
 /// The numbered name a space gets when nobody names it.
@@ -1795,13 +1840,7 @@ fn next_space_name(state: &State) -> String {
 /// caller only sends the returned request. One function for the keyboard and
 /// the mouse, so the two cannot disagree about what a row does.
 fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuSend {
-    let ask = |what| {
-        Some(Prompt {
-            what,
-            text: String::new(),
-            was: String::new(),
-        })
-    };
+    let ask = |what| Some(Prompt::new(what, ""));
     match std::mem::take(&mut state.menu_kind) {
         MenuKind::Main => {}
         MenuKind::Plus => {
@@ -1833,14 +1872,11 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             return MenuSend::Control(follow_elsewhere(state, space, ask));
         }
         MenuKind::Agents { space, agents, .. } => {
-            let Some(agent) = agents.get(item) else {
-                state.prompt = ask(Naming::Agent(Some(space)));
-                return MenuSend::Nothing;
-            };
-            *request += 1;
-            state.message = Some(format!("starting {}", agent.name));
-            let ask = start_agent_terminal(state, *request, &agent.command, Some(space));
-            return MenuSend::Control(follow_elsewhere(state, space, ask));
+            state.prompt = Some(match agents.get(item) {
+                Some(agent) => agent_name(Some(space), agent.command.clone()),
+                None => Prompt::new(Naming::Agent(Some(space)), ""),
+            });
+            return MenuSend::Nothing;
         }
         MenuKind::Install { target, .. } => {
             if item != 0 {
@@ -1860,19 +1896,11 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Nothing
         }
         "new tab" => {
-            state.prompt = Some(Prompt {
-                what: Naming::Terminal,
-                text: String::new(),
-                was: String::new(),
-            });
+            state.prompt = ask(Naming::Terminal);
             MenuSend::Nothing
         }
         "new space" => {
-            state.prompt = Some(Prompt {
-                what: Naming::Space,
-                text: String::new(),
-                was: String::new(),
-            });
+            state.prompt = ask(Naming::Space);
             MenuSend::Nothing
         }
         "rename tab" => {
@@ -1883,11 +1911,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     .find(|r| r.terminal == state.focused)
                     .and_then(|r| r.name.clone())
                     .unwrap_or_default();
-                state.prompt = Some(Prompt {
-                    what: Naming::RenameTerminal(state.focused),
-                    text: String::new(),
-                    was: current,
-                });
+                state.prompt = Some(Prompt::new(Naming::RenameTerminal(state.focused), current));
             } else {
                 state.message = Some(format!(
                     "nothing to rename, {} c starts a terminal",
@@ -1896,21 +1920,19 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             }
             MenuSend::Nothing
         }
-        "rename space" => {
-            if let Some(space) = state.space {
-                let current = state
-                    .spaces
-                    .iter()
-                    .find(|s| s.id == space)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
-                state.prompt = Some(Prompt {
-                    what: Naming::RenameSpace(space),
-                    text: String::new(),
-                    was: current,
-                });
-            } else {
-                state.message = Some("nothing to rename yet".to_string());
+        "space settings" => {
+            match state.space {
+                Some(space) => state.prompt = Some(space_settings(state, space)),
+                None => state.message = Some("no space yet".to_string()),
+            }
+            MenuSend::Nothing
+        }
+        // The rule's `sleep` and `wake`, for a terminal with no mouse.
+        "sleep space" | "wake space" => {
+            match state.space {
+                Some(space) if MENU[item].0 == "sleep space" => sleep_space(state, space, request),
+                Some(space) => wake_space(state, space, request),
+                None => state.message = Some("no space yet".to_string()),
             }
             MenuSend::Nothing
         }
@@ -2057,6 +2079,85 @@ pub struct Prompt {
     /// rather than after rubbing the old one out, and a look that changes nothing leaves
     /// it as it was.
     pub was: String,
+    /// A space's colour, in its settings box and nowhere else.
+    pub ink: Option<InkPick>,
+    /// The machine a remote space lives on and how it is reached, for its settings box.
+    pub machine: Option<(String, qoro_runtime::control::LinkState)>,
+    /// The command an agent's name box starts. Held here so a cancel leaves nothing
+    /// behind: it goes with the box.
+    pub command: Option<String>,
+    /// The start of an arrow the last read ended inside, held for the next read.
+    pub(crate) held: Vec<u8>,
+}
+
+impl Prompt {
+    /// A box asking `what`, over the name the thing has (empty for a new one).
+    pub fn new(what: Naming, was: impl Into<String>) -> Self {
+        Self {
+            what,
+            text: String::new(),
+            was: was.into(),
+            ink: None,
+            machine: None,
+            command: None,
+            held: Vec::new(),
+        }
+    }
+}
+
+/// The colour a space had when its settings box opened, and the one picked since. `None`
+/// is auto: the colour its id gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InkPick {
+    pub was: Option<u8>,
+    pub now: Option<u8>,
+}
+
+impl InkPick {
+    /// The next pick along the row, 1 to 6 then auto, round again at either end.
+    fn step(self, right: bool) -> Self {
+        let at = self.now.map_or(SPACE_INKS, usize::from);
+        let next = (at + if right { 1 } else { SPACE_INKS }) % (SPACE_INKS + 1);
+        Self {
+            now: (next < SPACE_INKS).then_some(next as u8),
+            ..self
+        }
+    }
+}
+
+/// How many colours a space can be given: the six space inks.
+const SPACE_INKS: usize = 6;
+
+/// The settings box of `space`: its name, its colour and, for a space of another machine,
+/// that machine.
+fn space_settings(state: &State, space: i64) -> Prompt {
+    let row = state.spaces.iter().find(|s| s.id == space);
+    let name = row.map(|s| s.name.clone()).unwrap_or_default();
+    let ink = row
+        .and_then(|s| s.ink)
+        .filter(|n| usize::from(*n) < SPACE_INKS);
+    // The machine is the `host:` the interface put before the name, or the whole name on
+    // the row of a machine that never answered, the way the rule's chip reads it.
+    let machine = row.and_then(|s| s.link).map(|link| {
+        let host = name
+            .split_once(':')
+            .filter(|(host, _)| !host.is_empty() && !host.contains(' '))
+            .map_or(name.as_str(), |(host, _)| host);
+        (host.to_string(), link)
+    });
+    Prompt {
+        ink: Some(InkPick { was: ink, now: ink }),
+        machine,
+        ..Prompt::new(Naming::SpaceSettings(space), name)
+    }
+}
+
+/// The box that names a new agent tab before `command` starts in it.
+fn agent_name(space: Option<i64>, command: String) -> Prompt {
+    Prompt {
+        command: Some(command),
+        ..Prompt::new(Naming::AgentName(space), "")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2069,10 +2170,14 @@ pub enum Naming {
     /// an agent the table never heard of starts the same way a listed one does. The space
     /// it starts in, or `None` when none is on screen.
     Agent(Option<i64>),
-    /// Rename what already exists, which is the common case: a name given at creation is a
-    /// guess, and the terminal somebody opened to "look at something" is the one they are
-    /// still in an hour later doing the thing it should have been called after.
-    RenameSpace(i64),
+    /// What to call a new agent tab, asked once its command is chosen. The command rides
+    /// in the box; empty gives the tab the command's first word, as before.
+    AgentName(Option<i64>),
+    /// A space's settings: its name, which is a rename, and its colour. Rename what already
+    /// exists, which is the common case: a name given at creation is a guess, and the
+    /// terminal somebody opened to "look at something" is the one they are still in an
+    /// hour later doing the thing it should have been called after.
+    SpaceSettings(i64),
     RenameTerminal(u32),
     /// What this machine calls the conversation in a terminal, over the title its agent
     /// gave it. Opened by a click on the name of the agent already under the keyboard.
@@ -2088,7 +2193,8 @@ impl Naming {
             Naming::Space => "name the new space",
             Naming::Terminal => "name the new terminal",
             Naming::Agent(_) => "which agent to run",
-            Naming::RenameSpace(_) => "rename this space",
+            Naming::AgentName(_) => "name the new agent",
+            Naming::SpaceSettings(_) => "space settings",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::RenameSession(_) => "rename this session",
             Naming::Remote => "ssh address of the machine",
@@ -2119,11 +2225,10 @@ impl Naming {
     pub fn verb(self) -> &'static str {
         match self {
             Naming::Space | Naming::Terminal => "make",
-            Naming::Agent(_) => "start",
+            Naming::Agent(_) | Naming::AgentName(_) => "start",
             Naming::Remote => "connect",
-            Naming::RenameSpace(_) | Naming::RenameTerminal(_) | Naming::RenameSession(_) => {
-                "rename"
-            }
+            Naming::SpaceSettings(_) => "save",
+            Naming::RenameTerminal(_) | Naming::RenameSession(_) => "rename",
         }
     }
 
@@ -2138,13 +2243,15 @@ impl Naming {
     /// thing in every case, or the shape an answer takes. `was` is the name a rename keeps.
     pub fn note(self, was: &str) -> String {
         match self {
-            Naming::Space | Naming::Terminal => "empty gives it the default name".to_string(),
+            Naming::Space | Naming::Terminal | Naming::AgentName(_) => {
+                "empty gives it the default name".to_string()
+            }
             Naming::Agent(_) => "like claude".to_string(),
             Naming::Remote => "like admin@10.0.0.5".to_string(),
             _ if !was.is_empty() => format!("empty keeps \"{was}\""),
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
-            Naming::RenameSpace(_) => "empty is a cancel".to_string(),
+            Naming::SpaceSettings(_) => "empty is a cancel".to_string(),
             Naming::RenameTerminal(_) => "empty keeps the program name".to_string(),
             Naming::RenameSession(_) => "empty keeps its own title".to_string(),
         }
@@ -2163,9 +2270,140 @@ enum PromptOutcome {
     /// thing can land in the same one as the enter that closed this box. Dropped, those
     /// keystrokes vanished with nothing on screen to say so: measured, a second `ctrl-a w`
     /// typed straight after confirming the first never opened a box at all.
-    Confirm(Naming, Option<String>, Vec<u8>),
+    ///
+    /// The whole box comes back, taken off the screen: what it held besides the text (a
+    /// colour picked, the command an agent's name is for) is part of the answer.
+    Confirm(Box<Prompt>, Option<String>, Vec<u8>),
     /// Closed, and these bytes belong to the key decoder rather than to the box.
     Passthrough(Vec<u8>),
+}
+
+/// What a confirmed box asks of the daemon, in order, with the line saying so set. `name`
+/// is what was typed, `None` when nothing was.
+fn answer_prompt(
+    state: &mut State,
+    prompt: Prompt,
+    name: Option<String>,
+    request: &mut u64,
+) -> Vec<ControlRequest> {
+    *request += 1;
+    let request = *request;
+    let what = prompt.what;
+    let asks = match what {
+        // Empty gives the conversation back its agent's own title, as an empty tab name
+        // does its program's. Unchanged is a cancel: confirming the agent's own title
+        // would pin it, and its next rename would never show.
+        Naming::RenameSession(terminal)
+            if name.as_deref()
+                == state
+                    .rows
+                    .iter()
+                    .find(|r| r.terminal == terminal)
+                    .and_then(|r| r.agent_title.as_deref()) =>
+        {
+            Vec::new()
+        }
+        Naming::RenameSession(terminal) => vec![ControlRequest::RenameSession {
+            id: format!("rename-{request}"),
+            terminal,
+            title: name,
+        }],
+        Naming::RenameTerminal(terminal) => vec![ControlRequest::RenameTerminal {
+            id: format!("rename-{request}"),
+            terminal,
+            // Empty hands the tab back to its program's name, which is the only way to
+            // undo a name without inventing a second key for it.
+            name,
+        }],
+        // What changed and nothing else: a name typed over itself is not a rename, and a
+        // colour left where it was is not a pick. A space with no name is a space nobody
+        // can point at, so an empty name is no rename.
+        Naming::SpaceSettings(workspace) => {
+            let rename = name.filter(|name| *name != prompt.was).map(|name| {
+                ControlRequest::RenameWorkspace {
+                    id: format!("rename-{request}"),
+                    workspace,
+                    name,
+                }
+            });
+            let ink = prompt.ink.filter(|pick| pick.now != pick.was).map(|pick| {
+                ControlRequest::SetWorkspaceInk {
+                    id: format!("ink-{request}"),
+                    workspace,
+                    ink: pick.now,
+                }
+            });
+            rename.into_iter().chain(ink).collect()
+        }
+        Naming::Terminal => vec![ControlRequest::CreateTerminal {
+            id: format!("new-{request}"),
+            // The new tab follows the focused terminal's directory.
+            cwd: focused_cwd(state),
+            // The space the person is looking at.
+            workspace: state.space,
+            name,
+        }],
+        // A command line, not a name: empty is a cancel, as with a space's name, and
+        // anything else asks what to call the agent before it starts, listed or not.
+        Naming::Agent(space) => {
+            if let Some(command) = name {
+                state.prompt = Some(agent_name(space, command));
+            }
+            Vec::new()
+        }
+        Naming::AgentName(space) => prompt
+            .command
+            .map(|command| {
+                let ask = start_agent_terminal(state, request, &command, space, name);
+                match space {
+                    Some(space) => follow_elsewhere(state, space, ask),
+                    None => ask,
+                }
+            })
+            .into_iter()
+            .collect(),
+        Naming::Space => vec![ControlRequest::CreateWorkspace {
+            id: format!("space-{request}"),
+            // Empty means "you name it", which is the numbered name this counted before
+            // anybody was asked.
+            name: name.unwrap_or_else(|| next_space_name(state)),
+        }],
+        // An address is what the box is for: empty is a cancel, as with a space's name.
+        // Asked of the machine first, by the mux: one with no qoro answers with an offer
+        // to put it there.
+        Naming::Remote => name
+            .map(|target| {
+                let id = format!("probe-{request}");
+                state.probing = Some(id.clone());
+                state.connecting = Some(target.clone());
+                ControlRequest::ConnectRemote { id, target }
+            })
+            .into_iter()
+            .collect(),
+    };
+    let Some(first) = asks.first() else {
+        return asks;
+    };
+    if matches!(what, Naming::Space) {
+        state.creating += 1;
+    }
+    state.message = Some(match what {
+        Naming::Terminal => "starting a terminal".to_string(),
+        Naming::Agent(_) | Naming::AgentName(_) => match first {
+            ControlRequest::CreateTerminal {
+                name: Some(tab), ..
+            } => format!("starting {tab}"),
+            _ => "starting an agent".to_string(),
+        },
+        Naming::Space => "starting a space".to_string(),
+        Naming::SpaceSettings(_) => "saved".to_string(),
+        Naming::RenameTerminal(_) | Naming::RenameSession(_) => "renamed".to_string(),
+        Naming::Remote => format!(
+            "connecting to {}",
+            state.connecting.as_deref().unwrap_or_default()
+        ),
+    });
+    asks
 }
 
 /// Decide what one read of stdin meant while the naming box owns the keyboard.
@@ -2179,21 +2417,54 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
     let Some(prompt) = state.prompt.as_mut() else {
         return PromptOutcome::Passthrough(bytes.to_vec());
     };
+    let colours = crate::screen::prompt_colours(cols, lines, prompt);
+    let input = [std::mem::take(&mut prompt.held).as_slice(), bytes].concat();
+    let bytes = input.as_slice();
     let mut at = 0;
     while at < bytes.len() {
         let byte = &bytes[at];
+        // Left and right move a space's colour along its row, in both spellings a terminal
+        // sends them. Anywhere else, and in a box too small to show the row, they are
+        // nothing, as before.
+        if *byte == 0x1b {
+            let right = match bytes.get(at + 1..at + 3) {
+                Some(b"[C" | b"OC") => Some(true),
+                Some(b"[D" | b"OD") => Some(false),
+                _ => None,
+            };
+            if let Some(right) = right {
+                if colours && let Some(pick) = prompt.ink.as_mut() {
+                    *pick = pick.step(right);
+                }
+                at += 3;
+                continue;
+            }
+            // An arrow cut after its second byte, the way a mouse report can be: held for
+            // the next read, or its tail would be typed into the name.
+            if bytes.len() - at == 2 && bytes[at + 1] == b'O' {
+                prompt.held = bytes[at..].to_vec();
+                break;
+            }
+        }
         // An escape sequence, which here is never a name. A mouse report is the one that
         // matters: the box is opened by a click on the `+`, and the release of that very
         // click arrives a moment later. Read byte by byte its leading escape is a cancel,
         // so the box opened and shut again before anybody could type into it, which looked
         // like the button doing nothing at all.
         if *byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
-            match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
+            // Ended by any final byte, not only a letter: Delete, the page keys and the
+            // function keys end in `~`, and waiting for a letter after one would hold every
+            // key that followed, enter and esc included.
+            match bytes[at + 2..]
+                .iter()
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map(|end| end + 2)
+            {
                 Some(end) => {
-                    // A press on one of the box's buttons is its key, typed where the
-                    // report was, with whatever came after it still behind.
+                    // A press on the box: a button is its key, typed where the report was
+                    // with whatever came after it still behind, and a swatch is its colour.
                     let report = &bytes[at..at + end + 1];
-                    let key = report
+                    let hit = report
                         .starts_with(b"\x1b[<")
                         .then(|| crate::keys::mouse(report))
                         .flatten()
@@ -2203,28 +2474,44 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                                 crate::screen::prompt_click(
                                     cols,
                                     lines,
-                                    prompt.what,
+                                    prompt,
                                     usize::from(row).saturating_sub(1),
                                     usize::from(col).saturating_sub(1),
                                 )
                             }
                             _ => None,
                         });
-                    // Cancel closes here: typed ahead of what followed, an escape could
-                    // read as the start of a sequence.
-                    if key == Some(0x1b) {
-                        state.prompt = None;
-                        return PromptOutcome::Closed;
-                    }
-                    if let Some(key) = key {
-                        return prompt_key(state, &[&[key][..], &bytes[at + end + 1..]].concat());
+                    match hit {
+                        // Cancel closes here: typed ahead of what followed, an escape
+                        // could read as the start of a sequence.
+                        Some(crate::screen::BoxClick::Key(0x1b)) => {
+                            state.prompt = None;
+                            return PromptOutcome::Closed;
+                        }
+                        Some(crate::screen::BoxClick::Key(key)) => {
+                            return prompt_key(
+                                state,
+                                &[&[key][..], &bytes[at + end + 1..]].concat(),
+                            );
+                        }
+                        Some(crate::screen::BoxClick::Pick(now)) => {
+                            if let Some(pick) = prompt.ink.as_mut() {
+                                pick.now = now;
+                            }
+                        }
+                        None => {}
                     }
                     at += end + 1;
                     continue;
                 }
                 // Split across the read. Held rather than passed on, so half a report
-                // cannot land in a name.
-                None => break,
+                // cannot land in a name, and half an arrow still moves the colour.
+                None => {
+                    if bytes.len() - at <= 64 {
+                        prompt.held = bytes[at..].to_vec();
+                    }
+                    break;
+                }
             }
         }
         at += 1;
@@ -2232,23 +2519,31 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
         match byte {
             // Enter.
             b'\r' | b'\n' => {
-                let what = prompt.what;
                 let text = prompt.text.trim().to_string();
-                // Nothing typed over a name keeps it, the same as esc. The keys after the
-                // enter still run.
-                if text.is_empty() && !prompt.was.is_empty() {
+                // A pick the box is too small to show is not an answer anybody saw.
+                if !crate::screen::prompt_colours(cols, lines, prompt)
+                    && let Some(pick) = prompt.ink.as_mut()
+                {
+                    pick.now = pick.was;
+                }
+                let picked = prompt.ink.is_some_and(|pick| pick.now != pick.was);
+                // Nothing typed over a name keeps it, the same as esc, unless a colour was
+                // picked: that is still an answer. The keys after the enter still run.
+                if text.is_empty() && !prompt.was.is_empty() && !picked {
                     state.prompt = None;
                     return PromptOutcome::Passthrough(bytes[at + 1..].to_vec());
                 }
-                state.prompt = None;
+                let Some(taken) = state.prompt.take() else {
+                    return PromptOutcome::Closed;
+                };
                 return PromptOutcome::Confirm(
-                    what,
+                    Box::new(taken),
                     (!text.is_empty()).then_some(text),
                     bytes[at + 1..].to_vec(),
                 );
             }
-            // Escape, which here is a cancel and never the start of a sequence: the box
-            // holds no arrow keys, and waiting for a next read that may never come would
+            // Escape, which here is a cancel and never the start of a sequence: the arrows
+            // are read whole above, and waiting for a next read that may never come would
             // swallow the one key that closes it.
             0x1b => {
                 state.prompt = None;
@@ -2267,9 +2562,10 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
             0x15 => prompt.text.clear(),
             // ctrl-r, back to the default name, where the thing has one to go back to.
             0x12 if prompt.what.resets() => {
-                let what = prompt.what;
-                state.prompt = None;
-                return PromptOutcome::Confirm(what, None, bytes[at + 1..].to_vec());
+                let Some(taken) = state.prompt.take() else {
+                    return PromptOutcome::Closed;
+                };
+                return PromptOutcome::Confirm(Box::new(taken), None, bytes[at + 1..].to_vec());
             }
             byte if (byte.is_ascii_graphic() || *byte == b' ')
                 && crate::width::width(&prompt.text) < prompt.what.limit() =>
@@ -3925,6 +4221,8 @@ where
         resync: false,
         split_origin: std::collections::BTreeMap::new(),
         pending_agents: std::collections::BTreeMap::new(),
+        pending_names: std::collections::BTreeMap::new(),
+        session_titles: std::collections::BTreeMap::new(),
         agent_typing: Vec::new(),
         cols,
         lines,
@@ -4534,40 +4832,17 @@ where
                                         }
                                     }
                                     palette::Item::NewTerminal => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Terminal,
-                                            text: String::new(),
-                                            was: String::new(),
-                                        });
+                                        state.prompt = Some(Prompt::new(Naming::Terminal, ""));
                                     }
                                     palette::Item::NewAgentAsk => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Agent(state.space),
-                                            text: String::new(),
-                                            was: String::new(),
-                                        });
+                                        state.prompt =
+                                            Some(Prompt::new(Naming::Agent(state.space), ""));
                                     }
                                     palette::Item::NewAgent(program) => {
-                                        request += 1;
-                                        let space = state.space;
-                                        let ask = start_agent_terminal(
-                                            &mut state,
-                                            request,
-                                            &program,
-                                            space,
-                                        );
-                                        state.message = Some(format!("starting {program}"));
-                                        wr.write_all(&client::encode_control_seq(
-                                            &ask, &mut control_seq,
-                                        )?)
-                                        .await?;
+                                        state.prompt = Some(agent_name(state.space, program));
                                     }
                                     palette::Item::NewSpace => {
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::Space,
-                                            text: String::new(),
-                                            was: String::new(),
-                                        });
+                                        state.prompt = Some(Prompt::new(Naming::Space, ""));
                                     }
                                     palette::Item::CopyMode => enter_copy(&mut state),
                                     palette::Item::Resize => enter_resize(&mut state),
@@ -4680,118 +4955,19 @@ where
                         // and hands a prefix or a detach back for the same reason.
                         match prompt_key(&mut state, &bytes) {
                             PromptOutcome::Typing | PromptOutcome::Closed => dirty = true,
-                            PromptOutcome::Confirm(what, name, rest) => {
-                                if !rest.is_empty() {
+                            PromptOutcome::Confirm(prompt, name, rest) => {
+                                // A box that opened another (a command, then the agent's
+                                // name) owns what was typed after the enter.
+                                // ponytail: those keys are dropped, as the palette drops
+                                // its own; feed them to the new box if a paste ever needs it.
+                                let asks = answer_prompt(&mut state, *prompt, name, &mut request);
+                                if !rest.is_empty() && state.prompt.is_none() {
                                     feed = Some(rest);
                                 }
-                                request += 1;
-                                let ask = match what {
-                                    // Empty gives the conversation back its agent's
-                                    // own title, as an empty tab name does its program's.
-                                    // Unchanged is a cancel: confirming the agent's own
-                                    // title would pin it, and its next rename would never
-                                    // show.
-                                    Naming::RenameSession(terminal)
-                                        if name.as_deref()
-                                            == state
-                                                .rows
-                                                .iter()
-                                                .find(|r| r.terminal == terminal)
-                                                .and_then(|r| r.agent_title.as_deref()) =>
-                                    {
-                                        None
-                                    }
-                                    Naming::RenameSession(terminal) => {
-                                        Some(ControlRequest::RenameSession {
-                                            id: format!("rename-{request}"),
-                                            terminal,
-                                            title: name,
-                                        })
-                                    }
-                                    Naming::RenameTerminal(terminal) => {
-                                        Some(ControlRequest::RenameTerminal {
-                                            id: format!("rename-{request}"),
-                                            terminal,
-                                            // Empty hands the tab back to its program's
-                                            // name, which is the only way to undo a name
-                                            // without inventing a second key for it.
-                                            name,
-                                        })
-                                    }
-                                    // A space with no name is a space nobody can point
-                                    // at, so an empty answer is a cancel. Not a
-                                    // `continue`: that also dropped the keys typed after
-                                    // the enter, which are in `feed` and run below.
-                                    Naming::RenameSpace(workspace) => {
-                                        name.map(|name| ControlRequest::RenameWorkspace {
-                                            id: format!("rename-{request}"),
-                                            workspace,
-                                            name,
-                                        })
-                                    }
-                                    Naming::Terminal => Some(ControlRequest::CreateTerminal {
-                                        id: format!("new-{request}"),
-                                        // The new tab follows the
-                                        // focused terminal's directory.
-                                        cwd: focused_cwd(&state),
-                                        // The space the person is looking at.
-                                        workspace: state.space,
-                                        name,
-                                    }),
-                                    // A command line, not a name: empty is a cancel, as
-                                    // with a space's name, and anything else starts an
-                                    // agent tab, listed or not.
-                                    Naming::Agent(space) => name.map(|command| {
-                                        let ask = start_agent_terminal(
-                                            &mut state, request, &command, space,
-                                        );
-                                        match space {
-                                            Some(space) => follow_elsewhere(&mut state, space, ask),
-                                            None => ask,
-                                        }
-                                    }),
-                                    Naming::Space => Some(ControlRequest::CreateWorkspace {
-                                        id: format!("space-{request}"),
-                                        // Empty means "you name it", which is the numbered
-                                        // name this counted before anybody was asked.
-                                        name: name.unwrap_or_else(|| next_space_name(&state)),
-                                    }),
-                                    // An address is what the box is for: empty is a
-                                    // cancel, as with a space's name. Asked of the machine
-                                    // first, by the mux: one with no qoro answers with an
-                                    // offer to put it there.
-                                    Naming::Remote => name.map(|target| {
-                                        let id = format!("probe-{request}");
-                                        state.probing = Some(id.clone());
-                                        state.connecting = Some(target.clone());
-                                        ControlRequest::ConnectRemote { id, target }
-                                    }),
-                                };
-                                if let Some(ask) = ask {
-                                    if matches!(what, Naming::Space) {
-                                        state.creating += 1;
-                                    }
+                                for ask in asks {
                                     wr.write_all(&client::encode_control_seq(
                                         &ask, &mut control_seq,
                                     )?).await?;
-                                    state.message = Some(match what {
-                                        Naming::Terminal => "starting a terminal".to_string(),
-                                        Naming::Agent(_) => match &ask {
-                                            ControlRequest::CreateTerminal {
-                                                name: Some(tab),
-                                                ..
-                                            } => format!("starting {tab}"),
-                                            _ => "starting an agent".to_string(),
-                                        },
-                                        Naming::Space => "starting a space".to_string(),
-                                        Naming::RenameSpace(_)
-                                        | Naming::RenameTerminal(_)
-                                        | Naming::RenameSession(_) => "renamed".to_string(),
-                                        Naming::Remote => format!(
-                                            "connecting to {}",
-                                            state.connecting.as_deref().unwrap_or_default()
-                                        ),
-                                    });
                                 }
                                 dirty = true;
                             }
@@ -5142,11 +5318,7 @@ where
                                             // asleep.
                                             Some(space) => open_new(&mut state, space),
                                             None => {
-                                                state.prompt = Some(Prompt {
-                                                    what: Naming::Terminal,
-                                                    text: String::new(),
-                                                    was: String::new(),
-                                                });
+                                                state.prompt = Some(Prompt::new(Naming::Terminal, ""));
                                             }
                                         }
                                         dirty = true;
@@ -5199,20 +5371,8 @@ where
                                         wake_space(&mut state, space, &mut request);
                                         dirty = true;
                                     }
-                                    // The settings box is the rename for now: the name is
-                                    // the one setting a space has.
                                     Some(Clicked::Settings(space)) => {
-                                        let was = state
-                                            .spaces
-                                            .iter()
-                                            .find(|s| s.id == space)
-                                            .map(|s| s.name.clone())
-                                            .unwrap_or_default();
-                                        state.prompt = Some(Prompt {
-                                            what: Naming::RenameSpace(space),
-                                            text: String::new(),
-                                            was,
-                                        });
+                                        state.prompt = Some(space_settings(&state, space));
                                         dirty = true;
                                     }
                                     // The close is a two step, and the first step is this
@@ -5621,19 +5781,11 @@ where
                                 }
                             }
                             Action::Create => {
-                                state.prompt = Some(Prompt {
-                                    what: Naming::Terminal,
-                                    text: String::new(),
-                                    was: String::new(),
-                                });
+                                state.prompt = Some(Prompt::new(Naming::Terminal, ""));
                                 dirty = true;
                             }
                             Action::CreateSpace => {
-                                state.prompt = Some(Prompt {
-                                    what: Naming::Space,
-                                    text: String::new(),
-                                    was: String::new(),
-                                });
+                                state.prompt = Some(Prompt::new(Naming::Space, ""));
                                 dirty = true;
                             }
                             Action::CloseSpace => {
@@ -5678,11 +5830,7 @@ where
                                     .find(|r| r.terminal == state.focused)
                                     .and_then(|r| r.name.clone())
                                     .unwrap_or_default();
-                                state.prompt = Some(Prompt {
-                                    what: Naming::RenameTerminal(state.focused),
-                                    text: String::new(),
-                                    was: current,
-                                });
+                                state.prompt = Some(Prompt::new(Naming::RenameTerminal(state.focused), current));
                                 dirty = true;
                             }
                             Action::Rename => {}
@@ -5708,19 +5856,9 @@ where
                                 }
                                 dirty = true;
                             }
-                            Action::RenameSpace => {
+                            Action::SpaceSettings => {
                                 if let Some(space) = state.space {
-                                    let current = state
-                                        .spaces
-                                        .iter()
-                                        .find(|s| s.id == space)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_default();
-                                    state.prompt = Some(Prompt {
-                                        what: Naming::RenameSpace(space),
-                                        text: String::new(),
-                                        was: current,
-                                    });
+                                    state.prompt = Some(space_settings(&state, space));
                                     dirty = true;
                                 }
                             }
@@ -7211,17 +7349,15 @@ fn rename_from_row(state: &mut State, terminal: u32) {
         return;
     };
     state.prompt = Some(if row.agent_session.is_some() {
-        Prompt {
-            what: Naming::RenameSession(terminal),
-            text: String::new(),
-            was: row.agent_title.clone().unwrap_or_default(),
-        }
+        Prompt::new(
+            Naming::RenameSession(terminal),
+            row.agent_title.clone().unwrap_or_default(),
+        )
     } else {
-        Prompt {
-            what: Naming::RenameTerminal(terminal),
-            text: String::new(),
-            was: row.name.clone().unwrap_or_default(),
-        }
+        Prompt::new(
+            Naming::RenameTerminal(terminal),
+            row.name.clone().unwrap_or_default(),
+        )
     });
 }
 
@@ -8189,6 +8325,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             state.hint = Some(reason);
             *dirty = true;
         }
+        // A name given at start, put on the conversation unasked: nobody pressed anything,
+        // so a refusal (a remote too old to name a session) is not said. The tab keeps it.
+        ControlResponse::Failed { id, .. } if id.starts_with("title-") => {}
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -8463,6 +8602,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            name_sessions(state, request);
             // A space being closed waits for this: the daemon counts store rows and the
             // index reads the live registry, so the index showing a space empty is the
             // earliest the space can be asked to close, and asking earlier is a refusal
@@ -8642,13 +8782,18 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 state.pending_focus = Some(terminal);
             }
             // An agent tab's shell is up: queue its command line. The shell holds
-            // the line as typeahead, so it lands even before its first prompt.
+            // the line as typeahead, so it lands even before its first prompt. A name
+            // given to it waits for its conversation.
+            if let Some(name) = state.pending_names.get(&id).cloned() {
+                state.session_titles.insert(terminal, name);
+            }
             if let Some(line) = take_agent_command(state, &id) {
                 state.agent_typing.push((terminal, line));
             }
             *dirty = true;
         }
         ControlResponse::TerminalClosed { terminal, .. } => {
+            state.session_titles.remove(&terminal);
             // One answer, one next ask: a space being closed sends its tabs one at a
             // time, so the close of the space cannot be reordered ahead of them.
             if let Some(closing) = state.closing.clone()
@@ -10202,6 +10347,8 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
+            pending_names: std::collections::BTreeMap::new(),
+            session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             closing: None,
             armed: None,
@@ -10265,7 +10412,7 @@ mod tests {
     #[test]
     fn an_agent_tab_takes_the_commands_first_word_as_its_name() {
         let mut s = state();
-        let ask = start_agent_terminal(&mut s, 7, "claude", None);
+        let ask = start_agent_terminal(&mut s, 7, "claude", None, None);
         match ask {
             ControlRequest::CreateTerminal { id, name, .. } => {
                 assert_eq!(id, "agent-7");
@@ -10284,7 +10431,7 @@ mod tests {
     #[test]
     fn an_agent_command_with_flags_keeps_the_whole_line() {
         let mut s = state();
-        let ask = start_agent_terminal(&mut s, 7, "my-agent --resume", None);
+        let ask = start_agent_terminal(&mut s, 7, "my-agent --resume", None, None);
         match ask {
             ControlRequest::CreateTerminal { name, .. } => {
                 assert_eq!(name.as_deref(), Some("my-agent"));
@@ -10363,14 +10510,23 @@ mod tests {
                 ("other command".to_string(), String::new()),
             ]
         );
-        match apply_menu_choice(&mut s, 0, &mut request) {
-            MenuSend::Control(ControlRequest::CreateTerminal {
-                id, workspace, cwd, ..
-            }) => {
-                assert_eq!(workspace, Some(1));
+        // The agent is named first, then starts there.
+        assert!(matches!(
+            apply_menu_choice(&mut s, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        let named = s.prompt.take().expect("the agent's name box");
+        assert!(named.what == Naming::AgentName(Some(1)));
+        match answer_prompt(&mut s, named, None, &mut request).as_slice() {
+            [
+                ControlRequest::CreateTerminal {
+                    id, workspace, cwd, ..
+                },
+            ] => {
+                assert_eq!(*workspace, Some(1));
                 assert_eq!(cwd.as_deref(), Some(dir.as_str()));
                 assert_eq!(
-                    s.pending_agents.get(&id).map(String::as_str),
+                    s.pending_agents.get(id).map(String::as_str),
                     Some("claude --resume")
                 );
             }
@@ -10658,14 +10814,34 @@ mod tests {
     /// A rename opened over its name: enter with nothing typed keeps it and passes on what
     /// came after, ctrl-u starts the answer over, ctrl-r gives the default back, and a
     /// press on a button is its key.
+    /// A key whose sequence ends in `~` (Delete, the page keys, F5 and up) is read whole
+    /// and dropped, so the keys after it still answer the box.
+    #[test]
+    fn a_tilde_key_in_the_naming_box_never_holds_what_follows() {
+        let mut state = state();
+        state.prompt = Some(Prompt::new(Naming::RenameTerminal(1), String::new()));
+        assert!(matches!(
+            prompt_key(&mut state, b"a\x1b[3~b"),
+            PromptOutcome::Typing
+        ));
+        assert_eq!(state.prompt.as_ref().map(|p| p.text.as_str()), Some("ab"));
+        assert!(matches!(
+            prompt_key(&mut state, b"\x1b[6~"),
+            PromptOutcome::Typing
+        ));
+        match prompt_key(&mut state, b"\r") {
+            PromptOutcome::Confirm(_, Some(name), _) => assert_eq!(name, "ab"),
+            _ => panic!("enter after a page key did not answer the box"),
+        }
+    }
+
     #[test]
     fn the_naming_box_keeps_clears_resets_and_takes_clicks() {
         let open = |state: &mut State| {
-            state.prompt = Some(Prompt {
-                what: Naming::RenameTerminal(1),
-                text: String::new(),
-                was: "build logs".to_string(),
-            });
+            state.prompt = Some(Prompt::new(
+                Naming::RenameTerminal(1),
+                "build logs".to_string(),
+            ));
         };
         let mut state = state();
         open(&mut state);
@@ -10682,7 +10858,7 @@ mod tests {
         ));
         assert_eq!(state.prompt.as_ref().map(|p| p.text.as_str()), Some("d"));
         match prompt_key(&mut state, b"\r") {
-            PromptOutcome::Confirm(Naming::RenameTerminal(1), Some(name), _) => {
+            PromptOutcome::Confirm(p, Some(name), _) if p.what == Naming::RenameTerminal(1) => {
                 assert_eq!(name, "d");
             }
             _ => panic!("a typed name was not confirmed"),
@@ -10691,14 +10867,10 @@ mod tests {
         open(&mut state);
         assert!(matches!(
             prompt_key(&mut state, b"\x12"),
-            PromptOutcome::Confirm(Naming::RenameTerminal(1), None, _)
+            PromptOutcome::Confirm(p, None, _) if p.what == Naming::RenameTerminal(1)
         ));
         // A space has no default name, so ctrl-r is nothing there.
-        state.prompt = Some(Prompt {
-            what: Naming::RenameSpace(1),
-            text: String::new(),
-            was: "work".to_string(),
-        });
+        state.prompt = Some(Prompt::new(Naming::SpaceSettings(1), "work".to_string()));
         assert!(matches!(
             prompt_key(&mut state, b"\x12"),
             PromptOutcome::Typing
@@ -10707,13 +10879,351 @@ mod tests {
         (state.cols, state.lines) = (100, 24);
         open(&mut state);
         prompt_key(&mut state, b"ab");
-        let reset = crate::screen::prompt_button(100, 24, Naming::RenameTerminal(1), 0x12)
-            .expect("a reset button");
+        let reset =
+            crate::screen::prompt_button(100, 24, state.prompt.as_ref().expect("open"), 0x12)
+                .expect("a reset button");
         let click = format!("\x1b[<0;{};{}M", reset.1 + 1, reset.0 + 1);
         assert!(matches!(
             prompt_key(&mut state, click.as_bytes()),
-            PromptOutcome::Confirm(Naming::RenameTerminal(1), None, _)
+            PromptOutcome::Confirm(p, None, _) if p.what == Naming::RenameTerminal(1)
         ));
+    }
+
+    /// The pick in the settings box of space 1, if it is open.
+    fn pick(state: &State) -> Option<Option<u8>> {
+        state.prompt.as_ref()?.ink.map(|pick| pick.now)
+    }
+
+    /// The settings box opens from the rule's `⋯`, from `ctrl-a R` and from the menu, over
+    /// the space's name and the colour it has.
+    #[test]
+    fn the_settings_box_opens_from_the_rule_the_key_and_the_menu() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        s.spaces[0].ink = Some(4);
+        let space = (1..s.lines)
+            .flat_map(|row| (1..=crate::sidebar::WIDTH as u16).map(move |col| (row, col)))
+            .find_map(|(row, col)| match s.clicked(row, col) {
+                Some(Clicked::Settings(space)) => Some(space),
+                _ => None,
+            })
+            .expect("a settings chip on a rule");
+        assert_eq!(space, 1, "the first rule's chip is the first space's");
+        s.prompt = Some(space_settings(&s, space));
+        let open = s.prompt.as_ref().expect("open");
+        assert!(open.what == Naming::SpaceSettings(1));
+        assert_eq!(open.was, "app");
+        assert_eq!(pick(&s), Some(Some(4)));
+        assert_eq!(open.machine, None);
+
+        assert_eq!(
+            Keys::with_prefix(0x01).feed(b"\x01R"),
+            vec![Action::SpaceSettings]
+        );
+
+        s.prompt = None;
+        let row = MENU
+            .iter()
+            .position(|(name, ..)| *name == "space settings")
+            .expect("a menu row");
+        assert_eq!(MENU[row].1, "R");
+        assert!(matches!(
+            apply_menu_choice(&mut s, row, &mut 0),
+            MenuSend::Nothing
+        ));
+        assert!(
+            s.prompt
+                .as_ref()
+                .is_some_and(|p| p.what == Naming::SpaceSettings(2))
+        );
+    }
+
+    /// A remote space's box names its machine and how it is reached.
+    #[test]
+    fn a_remote_spaces_settings_name_its_machine() {
+        let mut s = state();
+        s.spaces[1].name = "devbox:api".to_string();
+        s.spaces[1].link = Some(qoro_runtime::control::LinkState::Parked);
+        let open = space_settings(&s, 2);
+        assert_eq!(
+            open.machine,
+            Some((
+                "devbox".to_string(),
+                qoro_runtime::control::LinkState::Parked
+            ))
+        );
+    }
+
+    /// Left and right walk the colours, 1 to 6 then auto and round, in both spellings and
+    /// split across reads; a bare esc still cancels.
+    #[test]
+    fn the_arrows_walk_the_colours_round_through_auto() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        s.prompt = Some(space_settings(&s, 1));
+        assert_eq!(pick(&s), Some(None));
+        prompt_key(&mut s, b"\x1b[C");
+        assert_eq!(pick(&s), Some(Some(0)));
+        prompt_key(&mut s, b"\x1bOC\x1bOC");
+        assert_eq!(pick(&s), Some(Some(2)));
+        prompt_key(&mut s, b"\x1b[D\x1bOD\x1b[D");
+        assert_eq!(pick(&s), Some(None), "left from 1 is auto");
+        prompt_key(&mut s, b"\x1b[D");
+        assert_eq!(pick(&s), Some(Some(5)), "left from auto is 6");
+        assert!(matches!(
+            prompt_key(&mut s, b"\x1bO"),
+            PromptOutcome::Typing
+        ));
+        assert!(s.prompt.is_some(), "half an arrow closed the box");
+        prompt_key(&mut s, b"C");
+        assert_eq!(
+            pick(&s),
+            Some(None),
+            "the held half and its tail are one arrow"
+        );
+        assert_eq!(s.prompt.as_ref().map(|p| p.text.as_str()), Some(""));
+        assert!(matches!(prompt_key(&mut s, b"\x1b"), PromptOutcome::Closed));
+        assert!(s.prompt.is_none());
+    }
+
+    /// A click on a swatch picks it, and on `auto` gives the id's colour back.
+    #[test]
+    fn a_swatch_click_picks_the_colour() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        s.prompt = Some(space_settings(&s, 1));
+        for want in [Some(3), None] {
+            let (row, col) =
+                crate::screen::prompt_swatch(100, 30, s.prompt.as_ref().expect("open"), want)
+                    .expect("swatches");
+            let click = format!("\x1b[<0;{};{}M", col + 2, row + 1);
+            assert!(matches!(
+                prompt_key(&mut s, click.as_bytes()),
+                PromptOutcome::Typing
+            ));
+            assert_eq!(pick(&s), Some(want));
+        }
+    }
+
+    /// Enter with only the colour changed sends the colour and nothing else; with only the
+    /// name changed, the rename; with nothing changed, nothing at all.
+    #[test]
+    fn saving_the_settings_sends_what_changed() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let mut request = 0;
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"\x1b[C\x1b[C");
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("a colour picked over an empty name was not saved");
+        };
+        let asks = answer_prompt(&mut s, *prompt, name, &mut request);
+        assert!(
+            matches!(
+                asks.as_slice(),
+                [ControlRequest::SetWorkspaceInk {
+                    workspace: 1,
+                    ink: Some(1),
+                    ..
+                }]
+            ),
+            "{asks:?}"
+        );
+
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"api");
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("a name was not saved");
+        };
+        let asks = answer_prompt(&mut s, *prompt, name, &mut request);
+        assert!(
+            matches!(asks.as_slice(), [ControlRequest::RenameWorkspace { workspace: 1, name, .. }] if name == "api"),
+            "{asks:?}"
+        );
+
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"\x1b[C\x1b[D");
+        assert!(matches!(
+            prompt_key(&mut s, b"\rx"),
+            PromptOutcome::Passthrough(rest) if rest == b"x"
+        ));
+    }
+
+    /// In a window too small for the colours the box is the plain rename, and the arrows
+    /// pick nothing nobody can see.
+    #[test]
+    fn a_cramped_settings_box_picks_no_colour() {
+        let mut s = state();
+        (s.cols, s.lines) = (34, 30);
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"\x1b[C");
+        assert_eq!(pick(&s), Some(None));
+    }
+
+    /// The menu sleeps and wakes the space on screen, for a terminal with no mouse.
+    #[test]
+    fn the_menu_sleeps_and_wakes_the_space_on_screen() {
+        let mut s = state();
+        let at = |name: &str| MENU.iter().position(|(n, ..)| *n == name).expect("a row");
+        apply_menu_choice(&mut s, at("sleep space"), &mut 0);
+        apply_menu_choice(&mut s, at("wake space"), &mut 0);
+        assert!(
+            matches!(
+                s.modes.outbox.as_slice(),
+                [
+                    ControlRequest::SleepWorkspace {
+                        workspace: 2,
+                        terminal: None,
+                        ..
+                    },
+                    ControlRequest::WakeWorkspace {
+                        workspace: Some(2),
+                        terminal: None,
+                        ..
+                    }
+                ]
+            ),
+            "{:?}",
+            s.modes.outbox
+        );
+    }
+
+    /// Every agent start asks its name: empty keeps the command's first word, a name goes
+    /// on the tab, and esc leaves no command behind.
+    #[test]
+    fn an_agent_is_named_before_it_starts() {
+        let mut s = state();
+        let mut request = 0;
+        s.prompt = Some(Prompt::new(Naming::Agent(Some(1)), ""));
+        prompt_key(&mut s, b"claude --resume");
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("the command was not taken");
+        };
+        assert!(answer_prompt(&mut s, *prompt, name, &mut request).is_empty());
+        let open = s.prompt.as_ref().expect("the name box");
+        assert!(open.what == Naming::AgentName(Some(1)));
+        assert_eq!(open.command.as_deref(), Some("claude --resume"));
+
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("an empty name did not start the agent");
+        };
+        let asks = answer_prompt(&mut s, *prompt, name, &mut request);
+        let [
+            ControlRequest::CreateTerminal {
+                id,
+                name,
+                workspace,
+                ..
+            },
+        ] = asks.as_slice()
+        else {
+            panic!("{asks:?}");
+        };
+        assert_eq!(name.as_deref(), Some("claude"));
+        assert_eq!(*workspace, Some(1));
+        assert_eq!(
+            s.pending_agents.get(id).map(String::as_str),
+            Some("claude --resume")
+        );
+        assert!(
+            s.pending_names.is_empty(),
+            "a default name is not owed to anyone"
+        );
+
+        s.prompt = Some(agent_name(None, "codex".to_string()));
+        prompt_key(&mut s, b"review");
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("a name did not start the agent");
+        };
+        let asks = answer_prompt(&mut s, *prompt, name, &mut request);
+        let [ControlRequest::CreateTerminal { id, name, .. }] = asks.as_slice() else {
+            panic!("{asks:?}");
+        };
+        assert_eq!(name.as_deref(), Some("review"));
+        assert_eq!(s.pending_names.get(id).map(String::as_str), Some("review"));
+
+        s.prompt = Some(agent_name(None, "codex".to_string()));
+        assert!(matches!(prompt_key(&mut s, b"\x1b"), PromptOutcome::Closed));
+        assert!(s.prompt.is_none());
+    }
+
+    /// A name given at start goes on the agent's conversation once, the first time the
+    /// index shows it in one; never again, and never for a tab that closed first.
+    #[test]
+    fn a_given_name_goes_on_the_conversation_once() {
+        let mut s = state();
+        let mut request = 10;
+        let mut dirty = false;
+        start_agent_terminal(&mut s, 3, "claude", Some(1), Some("api".to_string()));
+        start_agent_terminal(&mut s, 4, "codex", Some(1), Some("gone".to_string()));
+        for (id, terminal) in [("agent-3", 7), ("agent-4", 8)] {
+            apply(
+                &mut s,
+                ControlResponse::TerminalCreated {
+                    id: id.into(),
+                    terminal,
+                },
+                &mut request,
+                &mut dirty,
+            );
+        }
+        assert!(s.pending_names.is_empty());
+        apply(
+            &mut s,
+            ControlResponse::TerminalClosed {
+                id: String::new(),
+                terminal: 8,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        let index = |session: Option<&str>| {
+            let mut rows = vec![agent(7, 1, "claude", "idle"), agent(8, 1, "codex", "idle")];
+            for row in &mut rows {
+                row.agent_session = session.map(str::to_string);
+            }
+            ControlResponse::Agents {
+                id: "index-1".into(),
+                agents: rows,
+                splits: Vec::new(),
+            }
+        };
+        s.modes.outbox.clear();
+        apply(&mut s, index(None), &mut request, &mut dirty);
+        assert!(
+            s.modes.outbox.is_empty(),
+            "named before the agent said its session"
+        );
+        for _ in 0..2 {
+            apply(&mut s, index(Some("abc")), &mut request, &mut dirty);
+        }
+        let titles: Vec<_> = s
+            .modes
+            .outbox
+            .iter()
+            .filter_map(|ask| match ask {
+                ControlRequest::RenameSession {
+                    id,
+                    terminal,
+                    title,
+                } => Some((id.starts_with("title-"), *terminal, title.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, [(true, 7, Some("api".to_string()))]);
+        // A refusal of it is not said: nobody asked.
+        s.hint = None;
+        s.message = None;
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: "title-11".into(),
+                reason: "unknown variant `RenameSession`".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!((s.hint.as_deref(), s.message.as_deref()), (None, None));
     }
 
     /// With another prefix, every overlay hands that one back and treats ctrl-a as the
@@ -10736,11 +11246,7 @@ mod tests {
             MenuOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02c"),
             _ => panic!("the menu kept the prefix"),
         }
-        state.prompt = Some(Prompt {
-            what: Naming::Terminal,
-            text: String::new(),
-            was: String::new(),
-        });
+        state.prompt = Some(Prompt::new(Naming::Terminal, ""));
         match prompt_key(&mut state, b"\x02d") {
             PromptOutcome::Passthrough(rest) => assert_eq!(rest, b"\x02d"),
             _ => panic!("the naming box kept the prefix"),
@@ -10958,6 +11464,8 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
+            pending_names: std::collections::BTreeMap::new(),
+            session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             cols: 80,
             lines: 24,
@@ -11078,6 +11586,8 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
+            pending_names: std::collections::BTreeMap::new(),
+            session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             cols: 80,
             lines: 24,
@@ -11847,7 +12357,8 @@ mod tests {
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(12));
-        // Keyless rows answer to their first letter.
+        // Keyless rows answer to their first letter, the first such row from the top:
+        // `s` is still settings, ahead of sleep space.
         assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(13));
         // `x` jumps straight to close tab.
@@ -11878,7 +12389,7 @@ mod tests {
                 "new tab",
                 "new space",
                 "rename tab",
-                "rename space",
+                "space settings",
                 "close tab",
                 "split side by side",
                 "split stacked",
@@ -11889,6 +12400,8 @@ mod tests {
                 "toggle view",
                 "keybinds",
                 "settings",
+                "sleep space",
+                "wake space",
                 "reload manifests",
                 "connect a machine",
                 "detach",
@@ -13036,11 +13549,7 @@ mod tests {
         state.probing = Some("probe-2".into());
         apply(&mut state, answer("probe-1"), &mut 0, &mut dirty);
         assert_eq!(state.menu, None, "a stale answer opened the list");
-        state.prompt = Some(Prompt {
-            what: Naming::Space,
-            text: String::new(),
-            was: String::new(),
-        });
+        state.prompt = Some(Prompt::new(Naming::Space, ""));
         apply(&mut state, answer("probe-2"), &mut 0, &mut dirty);
         assert_eq!(state.menu, None, "the list opened over a box");
         assert!(state.message.is_some());
