@@ -652,14 +652,20 @@ fn chip(text: &str, (at, len): (usize, usize), role: theme::Role, selected: bool
     out
 }
 
-/// The corners a row of the keyboard's agent wears, left and right: a curve opening its
-/// first row at the left and one closing its last row at the right, two of a viewfinder's
-/// four. The rows sit back to back, so all four would join down the sides into a bracket.
+/// The mark a row of the keyboard's agent wears at its left end: a bracket down the left
+/// side, a curve opening its first row, a curve closing its last and a line between. The
+/// rows sit back to back, so the curves join into one shape instead of two loose hooks.
+/// One row alone is the line.
 fn corners_of(picked: &[usize], row: usize) -> Option<(Option<char>, Option<char>)> {
     let (first, last) = (picked.first()?, picked.last()?);
-    let left = (row == *first).then_some('\u{256d}');
-    let right = (row == *last).then_some('\u{256f}');
-    (left.is_some() || right.is_some()).then_some((left, right))
+    let left = match row {
+        _ if !picked.contains(&row) => return None,
+        _ if first == last => '\u{2502}',
+        _ if row == *first => '\u{256d}',
+        _ if row == *last => '\u{2570}',
+        _ => '\u{2502}',
+    };
+    Some((Some(left), None))
 }
 
 /// A column row with its first and last cell turned into ember corners, where those cells
@@ -5375,15 +5381,17 @@ mod tests {
         }
     }
 
-    /// The keyboard's agent is marked by two ember curves, its first row's left end and its
-    /// last row's right end, and never over a name's last cell.
+    /// The keyboard's agent is marked by an ember bracket down its left side: a curve on its
+    /// first row, a curve on its last, a line between, and never over a name's last cell.
     #[test]
-    fn the_keyboards_agent_wears_two_corners() {
+    fn the_keyboards_agent_wears_a_bracket_on_its_left() {
         use crate::theme::Role;
         let (tl, br) = ('\u{256d}', '\u{256f}');
+        let (bl, bar) = ('\u{2570}', '\u{2502}');
         assert_eq!(corners_of(&[4, 5], 4), Some((Some(tl), None)));
-        assert_eq!(corners_of(&[4, 5], 5), Some((None, Some(br))));
-        assert_eq!(corners_of(&[4], 4), Some((Some(tl), Some(br))));
+        assert_eq!(corners_of(&[4, 5], 5), Some((Some(bl), None)));
+        assert_eq!(corners_of(&[4, 5, 6], 5), Some((Some(bar), None)));
+        assert_eq!(corners_of(&[4], 4), Some((Some(bar), None)));
         assert_eq!(corners_of(&[4, 5], 6), None);
         assert_eq!(corners_of(&[], 4), None);
         let line = sidebar::Line {
