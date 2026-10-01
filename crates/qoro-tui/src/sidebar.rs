@@ -1068,9 +1068,9 @@ fn content(c: &Column) -> Vec<Row> {
 /// four controls in fixed columns at the right, each in a chip.
 ///
 /// ```text
-///  ▾ qoro (4)        ▐+▌ ▐sleep▌ ▐⋯▌ ▐x▌
-///  ▸ wend sleeping   ▐+▌ ▐wake ▌ ▐⋯▌ ▐x▌
-///  ▾ ▐m▌ webshop (2) ▐+▌ ▐sleep▌ ▐⋯▌ ▐x▌
+/// ▾qoro (4)         ▐+▌ ▐sleep▌ ▐⋯▌ ▐x▌
+/// ▸wend sleeping    ▐+▌ ▐wake ▌ ▐⋯▌ ▐x▌
+/// ▾▐m▌ webshop (2)  ▐+▌ ▐sleep▌ ▐⋯▌ ▐x▌
 /// ```
 ///
 /// No line or box marks the space out: the name wears the space's colour and so do the titles
@@ -1170,7 +1170,7 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
     let shown = machine.as_ref().map_or(space.name.as_str(), |m| m.name);
     let name = shorten_middle(shown, room_for(width, &slot, lead));
     let name_w = crate::width::width(&name);
-    let fold = if c.view == View::Tree && folds(c, space.id) {
+    let fold = if folds(c, space.id) {
         if open { "\u{25be}" } else { "\u{25b8}" }
     } else {
         " "
@@ -1263,27 +1263,27 @@ struct Machine<'a> {
     name: &'a str,
 }
 
-/// The chip a remote space opens with: its machine's first letter, in its link's colour.
+/// The machine a remote space's name says, and the name without it.
 ///
 /// The machine is the `host:` the interface put before the name. A machine that never
-/// answered has a row named after the machine itself, with no prefix, so its first letter
-/// is the machine's too. A prefix holding a space is not a machine but a reason in
-/// brackets that happens to hold a colon.
-fn machine_chip(name: &str, link: LinkState, style: Chips) -> Option<Machine<'_>> {
-    let (host, bare) = name
-        .split_once(':')
+/// answered has a row named after the machine itself, with no prefix, so the whole name is
+/// the machine. A prefix holding a space is not a machine but a reason in brackets that
+/// happens to hold a colon.
+pub(crate) fn machine_of(name: &str) -> (&str, &str) {
+    name.split_once(':')
         .filter(|(host, _)| !host.is_empty() && !host.contains(' '))
-        .unwrap_or((name, name));
+        .unwrap_or((name, name))
+}
+
+/// The chip a remote space opens with: its machine's first letter, in its link's colour.
+fn machine_chip(name: &str, link: LinkState, style: Chips) -> Option<Machine<'_>> {
+    let (host, bare) = machine_of(name);
     let letter = host.chars().next()?;
     let text = format!("{} ", chip(style, &letter.to_string(), 1));
     Some(Machine {
         lead: crate::width::width(&text),
         text,
-        role: match link {
-            LinkState::Up => crate::theme::Role::Done,
-            LinkState::Parked => crate::theme::Role::Faint,
-            LinkState::Down => crate::theme::Role::Blocked,
-        },
+        role: crate::theme::link_ink(link),
         name: bare,
     })
 }
@@ -1327,7 +1327,15 @@ const CHIP_W: usize = 3;
 const WORD_W: usize = 5;
 
 /// The columns the block takes: four chips with a blank between each.
-const BLOCK_W: usize = 3 * CHIP_W + (WORD_W + 2) + 3;
+const BLOCK_W: usize = {
+    let mut w = CHIP_WIDTHS.len() - 1;
+    let mut i = 0;
+    while i < CHIP_WIDTHS.len() {
+        w += CHIP_WIDTHS[i];
+        i += 1;
+    }
+    w
+};
 
 /// Everything on the row that is neither the name, the slot nor the fill: the fold
 /// column, the block, and the blank last column the block leaves. A name gets what is

@@ -19,6 +19,7 @@ use crate::keys::{Action, Keys};
 use crate::layout::{self, Layout};
 use crate::palette::{self, Palette};
 use crate::screen::{self, Frame};
+use crate::theme::SPACE_INK_COUNT;
 use crate::{present, sidebar, tabs};
 
 /// What to ask for, given where the person has scrolled to.
@@ -413,11 +414,9 @@ struct State {
     /// Agent commands waiting for their tab, by request id: the line to type once
     /// the shell is there. The daemon only starts a shell (ADR-015), so an agent
     /// is typed the way `qoro new -- <agent>` types it. Consumed by the
-    /// `TerminalCreated`/`Failed` answer.
-    pending_agents: std::collections::BTreeMap<String, String>,
-    /// Names given to agent tabs still on their way, by request id. Moved to
-    /// `session_titles` by the `TerminalCreated` answer, dropped by a `Failed` one.
-    pending_names: std::collections::BTreeMap<String, String>,
+    /// `TerminalCreated`/`Failed` answer, with the name the person gave the tab, if
+    /// any, which waits for its conversation.
+    pending_agents: std::collections::BTreeMap<String, (String, Option<String>)>,
     /// Names owed to the conversations of new agent tabs, by terminal: sent once, as a
     /// session rename, the first time the index shows the agent in a conversation, so the
     /// name follows it through a sleep the way a rename from the box does. Dropped when
@@ -1759,10 +1758,9 @@ fn start_agent_terminal(
             })
             .filter(|word| !word.is_empty())
     });
-    state.pending_agents.insert(id.clone(), command.to_string());
-    if let Some(given) = given {
-        state.pending_names.insert(id.clone(), given);
-    }
+    state
+        .pending_agents
+        .insert(id.clone(), (command.to_string(), given));
     ControlRequest::CreateTerminal {
         id,
         // Like every other new tab: the agent starts where the
@@ -1775,21 +1773,20 @@ fn start_agent_terminal(
     }
 }
 
-/// The line an agent tab is owed, from its `TerminalCreated` answer, or `None`
-/// when the answer carries no agent.
+/// The line an agent tab is owed, from its `TerminalCreated` answer, with the name
+/// given to it, or `None` when the answer carries no agent.
 ///
 /// The id prefix is the whole protocol: only `agent-` requests recorded a line
 /// in `pending_agents`. A `Failed` answer calls this too and drops the line, so
 /// a tab that never opened types nothing.
-fn take_agent_command(state: &mut State, id: &str) -> Option<Vec<u8>> {
+fn take_agent_command(state: &mut State, id: &str) -> Option<(Vec<u8>, Option<String>)> {
     if !id.starts_with("agent-") {
         return None;
     }
-    state.pending_names.remove(id);
-    state.pending_agents.remove(id).map(|command| {
+    state.pending_agents.remove(id).map(|(command, name)| {
         let mut line = command.into_bytes();
         line.push(b'\r');
-        line
+        (line, name)
     })
 }
 
@@ -1928,9 +1925,15 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Nothing
         }
         // The rule's `sleep` and `wake`, for a terminal with no mouse.
-        "sleep space" | "wake space" => {
+        "sleep space" => {
             match state.space {
-                Some(space) if MENU[item].0 == "sleep space" => sleep_space(state, space, request),
+                Some(space) => sleep_space(state, space, request),
+                None => state.message = Some("no space yet".to_string()),
+            }
+            MenuSend::Nothing
+        }
+        "wake space" => {
+            match state.space {
                 Some(space) => wake_space(state, space, request),
                 None => state.message = Some("no space yet".to_string()),
             }
@@ -2086,7 +2089,8 @@ pub struct Prompt {
     /// The command an agent's name box starts. Held here so a cancel leaves nothing
     /// behind: it goes with the box.
     pub command: Option<String>,
-    /// The start of an arrow the last read ended inside, held for the next read.
+    /// The start of a sequence the last read ended inside (an arrow, a mouse report), held
+    /// for the next read.
     pub(crate) held: Vec<u8>,
 }
 
@@ -2116,17 +2120,14 @@ pub struct InkPick {
 impl InkPick {
     /// The next pick along the row, 1 to 6 then auto, round again at either end.
     fn step(self, right: bool) -> Self {
-        let at = self.now.map_or(SPACE_INKS, usize::from);
-        let next = (at + if right { 1 } else { SPACE_INKS }) % (SPACE_INKS + 1);
+        let at = self.now.map_or(SPACE_INK_COUNT, usize::from);
+        let next = (at + if right { 1 } else { SPACE_INK_COUNT }) % (SPACE_INK_COUNT + 1);
         Self {
-            now: (next < SPACE_INKS).then_some(next as u8),
+            now: (next < SPACE_INK_COUNT).then_some(next as u8),
             ..self
         }
     }
 }
-
-/// How many colours a space can be given: the six space inks.
-const SPACE_INKS: usize = 6;
 
 /// The settings box of `space`: its name, its colour and, for a space of another machine,
 /// that machine.
@@ -2135,16 +2136,11 @@ fn space_settings(state: &State, space: i64) -> Prompt {
     let name = row.map(|s| s.name.clone()).unwrap_or_default();
     let ink = row
         .and_then(|s| s.ink)
-        .filter(|n| usize::from(*n) < SPACE_INKS);
-    // The machine is the `host:` the interface put before the name, or the whole name on
-    // the row of a machine that never answered, the way the rule's chip reads it.
-    let machine = row.and_then(|s| s.link).map(|link| {
-        let host = name
-            .split_once(':')
-            .filter(|(host, _)| !host.is_empty() && !host.contains(' '))
-            .map_or(name.as_str(), |(host, _)| host);
-        (host.to_string(), link)
-    });
+        .filter(|n| usize::from(*n) < SPACE_INK_COUNT);
+    // The machine the rule's chip reads from the name.
+    let machine = row
+        .and_then(|s| s.link)
+        .map(|link| (sidebar::machine_of(&name).0.to_string(), link));
     Prompt {
         ink: Some(InkPick { was: ink, now: ink }),
         machine,
@@ -2171,7 +2167,7 @@ pub enum Naming {
     /// it starts in, or `None` when none is on screen.
     Agent(Option<i64>),
     /// What to call a new agent tab, asked once its command is chosen. The command rides
-    /// in the box; empty gives the tab the command's first word, as before.
+    /// in the box; empty gives the tab the command's first word.
     AgentName(Option<i64>),
     /// A space's settings: its name, which is a rename, and its colour. Rename what already
     /// exists, which is the common case: a name given at creation is a guess, and the
@@ -2411,6 +2407,10 @@ fn answer_prompt(
 /// Typing goes into the name, `enter` confirms it, `esc` is out, and backspace rubs out.
 /// A prefix or a bare detach closes the box and hands the bytes on from there, so
 /// `ctrl-a d` still detaches out of it, which is the same rule the palette follows.
+/// The most a key sequence split across reads is held for: anything longer that has not
+/// ended is not one.
+const HELD_MAX: usize = 64;
+
 fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
     let prefix = state.config.prefix;
     let (cols, lines) = (state.cols, state.lines);
@@ -2423,64 +2423,48 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
     let mut at = 0;
     while at < bytes.len() {
         let byte = &bytes[at];
-        // Left and right move a space's colour along its row, in both spellings a terminal
-        // sends them. Anywhere else, and in a box too small to show the row, they are
-        // nothing, as before.
+        // An escape sequence, which here is never a name, read the way the modes read
+        // one. A mouse report is the one that matters: the box is opened by a click on the
+        // `+`, and the release of that very click arrives a moment later. Read byte by
+        // byte its leading escape is a cancel, so the box opened and shut again before
+        // anybody could type into it, which looked like the button doing nothing at all.
+        // A bare esc falls through to the cancel below.
         if *byte == 0x1b {
-            let right = match bytes.get(at + 1..at + 3) {
-                Some(b"[C" | b"OC") => Some(true),
-                Some(b"[D" | b"OD") => Some(false),
-                _ => None,
-            };
-            if let Some(right) = right {
-                if colours && let Some(pick) = prompt.ink.as_mut() {
-                    *pick = pick.step(right);
+            let (key, len) = mode_key(bytes, at);
+            match key {
+                ModeKey::Esc => {}
+                // Left and right move a space's colour along its row. Anywhere else, and
+                // in a box too small to show the row, they are nothing.
+                ModeKey::Left | ModeKey::Right => {
+                    if colours && let Some(pick) = prompt.ink.as_mut() {
+                        *pick = pick.step(key == ModeKey::Right);
+                    }
+                    at += len;
+                    continue;
                 }
-                at += 3;
-                continue;
-            }
-            // An arrow cut after its second byte, the way a mouse report can be: held for
-            // the next read, or its tail would be typed into the name.
-            if bytes.len() - at == 2 && bytes[at + 1] == b'O' {
-                prompt.held = bytes[at..].to_vec();
-                break;
-            }
-        }
-        // An escape sequence, which here is never a name. A mouse report is the one that
-        // matters: the box is opened by a click on the `+`, and the release of that very
-        // click arrives a moment later. Read byte by byte its leading escape is a cancel,
-        // so the box opened and shut again before anybody could type into it, which looked
-        // like the button doing nothing at all.
-        if *byte == 0x1b && bytes.get(at + 1) == Some(&b'[') {
-            // Ended by any final byte, not only a letter: Delete, the page keys and the
-            // function keys end in `~`, and waiting for a letter after one would hold every
-            // key that followed, enter and esc included.
-            match bytes[at + 2..]
-                .iter()
-                .position(|b| (0x40..=0x7e).contains(b))
-                .map(|end| end + 2)
-            {
-                Some(end) => {
-                    // A press on the box: a button is its key, typed where the report was
-                    // with whatever came after it still behind, and a swatch is its colour.
-                    let report = &bytes[at..at + end + 1];
-                    let hit = report
-                        .starts_with(b"\x1b[<")
-                        .then(|| crate::keys::mouse(report))
-                        .flatten()
-                        .flatten()
-                        .and_then(|action| match action {
-                            crate::keys::Action::Click { row, col, .. } => {
-                                crate::screen::prompt_click(
-                                    cols,
-                                    lines,
-                                    prompt,
-                                    usize::from(row).saturating_sub(1),
-                                    usize::from(col).saturating_sub(1),
-                                )
-                            }
-                            _ => None,
-                        });
+                // Split across the read. Held rather than passed on, so half a report
+                // cannot land in a name, and half an arrow still moves the colour.
+                ModeKey::Partial => {
+                    if bytes.len() - at <= HELD_MAX {
+                        prompt.held = bytes[at..].to_vec();
+                    }
+                    break;
+                }
+                // A press on the box: a button is its key, typed where the report was
+                // with whatever came after it still behind, and a swatch is its colour.
+                ModeKey::Press => {
+                    let hit = match crate::keys::mouse(&bytes[at..at + len]) {
+                        Some(Some(crate::keys::Action::Click { row, col, .. })) => {
+                            crate::screen::prompt_click(
+                                cols,
+                                lines,
+                                prompt,
+                                usize::from(row).saturating_sub(1),
+                                usize::from(col).saturating_sub(1),
+                            )
+                        }
+                        _ => None,
+                    };
                     match hit {
                         // Cancel closes here: typed ahead of what followed, an escape
                         // could read as the start of a sequence.
@@ -2489,10 +2473,7 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                             return PromptOutcome::Closed;
                         }
                         Some(crate::screen::BoxClick::Key(key)) => {
-                            return prompt_key(
-                                state,
-                                &[&[key][..], &bytes[at + end + 1..]].concat(),
-                            );
+                            return prompt_key(state, &[&[key][..], &bytes[at + len..]].concat());
                         }
                         Some(crate::screen::BoxClick::Pick(now)) => {
                             if let Some(pick) = prompt.ink.as_mut() {
@@ -2501,16 +2482,14 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                         }
                         None => {}
                     }
-                    at += end + 1;
+                    at += len;
                     continue;
                 }
-                // Split across the read. Held rather than passed on, so half a report
-                // cannot land in a name, and half an arrow still moves the colour.
-                None => {
-                    if bytes.len() - at <= 64 {
-                        prompt.held = bytes[at..].to_vec();
-                    }
-                    break;
+                // Anything else, a release, the wheel, Delete or a page key, is dropped
+                // whole, so the keys after it still answer the box.
+                _ => {
+                    at += len;
+                    continue;
                 }
             }
         }
@@ -2521,9 +2500,7 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
             b'\r' | b'\n' => {
                 let text = prompt.text.trim().to_string();
                 // A pick the box is too small to show is not an answer anybody saw.
-                if !crate::screen::prompt_colours(cols, lines, prompt)
-                    && let Some(pick) = prompt.ink.as_mut()
-                {
+                if !colours && let Some(pick) = prompt.ink.as_mut() {
                     pick.now = pick.was;
                 }
                 let picked = prompt.ink.is_some_and(|pick| pick.now != pick.was);
@@ -2883,7 +2860,7 @@ fn mode_input(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) ->
     };
     // Held for a mode that is still open, and never more than a sequence's worth: anything
     // longer that has not ended is not one.
-    if !state.modes.open() || state.modes.pending.len() > 64 {
+    if !state.modes.open() || state.modes.pending.len() > HELD_MAX {
         state.modes.pending.clear();
     }
     outcome
@@ -3137,7 +3114,7 @@ fn armed_key(state: &mut State, space: i64, bytes: &[u8], request: &mut u64) -> 
 /// Put a space's rule into the state where it asks whether it should close.
 ///
 /// Nothing is sent. The question is on the rule itself, one click from where the close was,
-/// and the answer is a second click on the same row: the rule repaints with `y` and `n` in
+/// and the answer is a second click on the same row: the rule repaints with `y` and `no` in
 /// the two columns its controls occupied.
 ///
 /// The notice row carries what the rule has no room for, which is the part a person reads
@@ -4221,7 +4198,6 @@ where
         resync: false,
         split_origin: std::collections::BTreeMap::new(),
         pending_agents: std::collections::BTreeMap::new(),
-        pending_names: std::collections::BTreeMap::new(),
         session_titles: std::collections::BTreeMap::new(),
         agent_typing: Vec::new(),
         cols,
@@ -8331,7 +8307,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
-            if id.starts_with("wake-") {
+            if id.starts_with("wake-tab-") {
                 state.waking = None;
             }
             state.message = None;
@@ -8784,10 +8760,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // An agent tab's shell is up: queue its command line. The shell holds
             // the line as typeahead, so it lands even before its first prompt. A name
             // given to it waits for its conversation.
-            if let Some(name) = state.pending_names.get(&id).cloned() {
-                state.session_titles.insert(terminal, name);
-            }
-            if let Some(line) = take_agent_command(state, &id) {
+            if let Some((line, name)) = take_agent_command(state, &id) {
+                if let Some(name) = name {
+                    state.session_titles.insert(terminal, name);
+                }
                 state.agent_typing.push((terminal, line));
             }
             *dirty = true;
@@ -10347,7 +10323,6 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
-            pending_names: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             closing: None,
@@ -10421,7 +10396,7 @@ mod tests {
             other => panic!("an agent tab is a create: {other:?}"),
         }
         assert_eq!(
-            s.pending_agents.get("agent-7").map(String::as_str),
+            s.pending_agents.get("agent-7").map(|(c, _)| c.as_str()),
             Some("claude")
         );
     }
@@ -10439,7 +10414,7 @@ mod tests {
             other => panic!("an agent tab is a create: {other:?}"),
         }
         assert_eq!(
-            s.pending_agents.get("agent-7").map(String::as_str),
+            s.pending_agents.get("agent-7").map(|(c, _)| c.as_str()),
             Some("my-agent --resume")
         );
     }
@@ -10526,7 +10501,7 @@ mod tests {
                 assert_eq!(*workspace, Some(1));
                 assert_eq!(cwd.as_deref(), Some(dir.as_str()));
                 assert_eq!(
-                    s.pending_agents.get(id).map(String::as_str),
+                    s.pending_agents.get(id).map(|(c, _)| c.as_str()),
                     Some("claude --resume")
                 );
             }
@@ -10580,15 +10555,15 @@ mod tests {
     fn a_terminal_answer_for_an_agent_queues_its_line() {
         let mut s = state();
         s.pending_agents
-            .insert("agent-7".to_string(), "claude".to_string());
+            .insert("agent-7".to_string(), ("claude".to_string(), None));
         assert_eq!(
             take_agent_command(&mut s, "agent-7"),
-            Some(b"claude\r".to_vec())
+            Some((b"claude\r".to_vec(), None))
         );
         assert!(s.pending_agents.is_empty(), "consumed, not kept");
         assert_eq!(take_agent_command(&mut s, "new-8"), None);
         s.pending_agents
-            .insert("agent-9".to_string(), "codex".to_string());
+            .insert("agent-9".to_string(), ("codex".to_string(), None));
         take_agent_command(&mut s, "agent-9");
         assert!(s.pending_agents.is_empty(), "a refusal drops the line");
     }
@@ -10811,9 +10786,6 @@ mod tests {
             .to_string()
     }
 
-    /// A rename opened over its name: enter with nothing typed keeps it and passes on what
-    /// came after, ctrl-u starts the answer over, ctrl-r gives the default back, and a
-    /// press on a button is its key.
     /// A key whose sequence ends in `~` (Delete, the page keys, F5 and up) is read whole
     /// and dropped, so the keys after it still answer the box.
     #[test]
@@ -10835,6 +10807,9 @@ mod tests {
         }
     }
 
+    /// A rename opened over its name: enter with nothing typed keeps it and passes on what
+    /// came after, ctrl-u starts the answer over, ctrl-r gives the default back, and a
+    /// press on a button is its key.
     #[test]
     fn the_naming_box_keeps_clears_resets_and_takes_clicks() {
         let open = |state: &mut State| {
@@ -11122,11 +11097,12 @@ mod tests {
         assert_eq!(name.as_deref(), Some("claude"));
         assert_eq!(*workspace, Some(1));
         assert_eq!(
-            s.pending_agents.get(id).map(String::as_str),
+            s.pending_agents.get(id).map(|(c, _)| c.as_str()),
             Some("claude --resume")
         );
-        assert!(
-            s.pending_names.is_empty(),
+        assert_eq!(
+            s.pending_agents.get(id).and_then(|(_, n)| n.as_deref()),
+            None,
             "a default name is not owed to anyone"
         );
 
@@ -11140,7 +11116,10 @@ mod tests {
             panic!("{asks:?}");
         };
         assert_eq!(name.as_deref(), Some("review"));
-        assert_eq!(s.pending_names.get(id).map(String::as_str), Some("review"));
+        assert_eq!(
+            s.pending_agents.get(id).and_then(|(_, n)| n.as_deref()),
+            Some("review")
+        );
 
         s.prompt = Some(agent_name(None, "codex".to_string()));
         assert!(matches!(prompt_key(&mut s, b"\x1b"), PromptOutcome::Closed));
@@ -11167,7 +11146,7 @@ mod tests {
                 &mut dirty,
             );
         }
-        assert!(s.pending_names.is_empty());
+        assert!(s.pending_agents.is_empty());
         apply(
             &mut s,
             ControlResponse::TerminalClosed {
@@ -11464,7 +11443,6 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
-            pending_names: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             cols: 80,
@@ -11586,7 +11564,6 @@ mod tests {
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             pending_agents: std::collections::BTreeMap::new(),
-            pending_names: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
             cols: 80,
@@ -14501,6 +14478,30 @@ mod tests {
             "{:?}",
             state.hint
         );
+    }
+
+    /// A refused space wake leaves a tab still waking alone; only the tab's own refusal
+    /// ends its wait.
+    #[test]
+    fn a_refused_space_wake_keeps_a_tab_waking() {
+        let mut state = state();
+        let mut dirty = false;
+        state.waking = Some((1, 8));
+        let refuse = |state: &mut State, id: &str, dirty: &mut bool| {
+            apply(
+                state,
+                ControlResponse::Failed {
+                    id: id.into(),
+                    reason: "no".into(),
+                },
+                &mut 0,
+                dirty,
+            );
+        };
+        refuse(&mut state, "wake-5", &mut dirty);
+        assert_eq!(state.waking, Some((1, 8)));
+        refuse(&mut state, "wake-tab-6", &mut dirty);
+        assert_eq!(state.waking, None);
     }
 
     /// A space half asleep: its sleeping tabs sit on the bar after the awake ones, one per

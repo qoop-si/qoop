@@ -1558,8 +1558,10 @@ pub(crate) struct PromptBox {
 
 /// Both edges and eight rows: blank, label, field, underline, note, blank, buttons, blank.
 const PROMPT_ROOMY: usize = 10;
-/// The swatch row: six swatches of three cells with a blank after each, then `[auto]`.
-const SWATCHES_W: usize = 6 * 4 + 6;
+/// One swatch: three cells and the blank after it.
+const SWATCH_W: usize = 4;
+/// The swatch row: a swatch for each space ink, then `[auto]`.
+const SWATCHES_W: usize = theme::SPACE_INK_COUNT * SWATCH_W + "[auto]".len();
 /// Both edges and the three rows a short window keeps: field, note, buttons.
 const PROMPT_TIGHT: usize = 5;
 
@@ -1630,8 +1632,10 @@ impl PromptBox {
     fn swatch_at(&self, col: usize) -> Option<Option<u8>> {
         let at = col.checked_sub(self.field_col())?;
         match at {
-            _ if at < 6 * 4 && at % 4 < 3 => Some(Some((at / 4) as u8)),
-            _ if (6 * 4..SWATCHES_W).contains(&at) => Some(None),
+            _ if at < theme::SPACE_INK_COUNT * SWATCH_W && at % SWATCH_W < SWATCH_W - 1 => {
+                Some(Some((at / SWATCH_W) as u8))
+            }
+            _ if (theme::SPACE_INK_COUNT * SWATCH_W..SWATCHES_W).contains(&at) => Some(None),
             _ => None,
         }
     }
@@ -1754,7 +1758,9 @@ pub(crate) fn prompt_swatch(
     pick: Option<u8>,
 ) -> Option<(usize, usize)> {
     let b = PromptBox::at(cols, lines, prompt)?;
-    let at = pick.map_or(6 * 4, |n| usize::from(n) * 4);
+    let at = pick.map_or(theme::SPACE_INK_COUNT * SWATCH_W, |n| {
+        usize::from(n) * SWATCH_W
+    });
     Some((b.swatch_row()?, b.field_col() + at))
 }
 
@@ -1901,7 +1907,7 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
 /// `auto`, the colour the space's id gives it. `inner` columns wide.
 fn swatches(pick: Option<u8>, pad: &str, inner: usize) -> String {
     let mut line = format!("{}{pad}", theme::RESET);
-    for n in 0..6u8 {
+    for n in 0..theme::SPACE_INK_COUNT as u8 {
         let (open, shut) = if pick == Some(n) {
             ('[', ']')
         } else {
@@ -1934,10 +1940,10 @@ fn machine_line(
     inner: usize,
 ) -> String {
     use qoro_runtime::control::LinkState;
-    let (word, ink) = match link {
-        LinkState::Up => ("connected", theme::Role::Done),
-        LinkState::Parked => ("parked", theme::Role::Faint),
-        LinkState::Down => ("offline", theme::Role::Blocked),
+    let word = match link {
+        LinkState::Up => "connected",
+        LinkState::Parked => "parked",
+        LinkState::Down => "offline",
     };
     let lead = "machine  ";
     let tail = format!(" \u{b7} {word}");
@@ -1950,7 +1956,7 @@ fn machine_line(
         theme::fg(theme::Role::Detail),
         theme::fg(theme::Role::Text),
         theme::fg(theme::Role::Faint),
-        theme::fg(ink),
+        theme::fg(theme::link_ink(link)),
         theme::RESET,
         " ".repeat(inner - pad.len() - used),
     )

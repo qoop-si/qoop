@@ -103,6 +103,17 @@ pub fn space_calm_in(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) ->
     picked(spaces, id).map_or_else(|| space_calm_of(id), Role::SpaceCalm)
 }
 
+/// The ink a remote machine wears for how it is reached: done's green while connected,
+/// blocked's orange while it connects or does not answer, faint while it is let go.
+pub fn link_ink(link: qoro_runtime::control::LinkState) -> Role {
+    use qoro_runtime::control::LinkState;
+    match link {
+        LinkState::Up => Role::Done,
+        LinkState::Parked => Role::Faint,
+        LinkState::Down => Role::Blocked,
+    }
+}
+
 /// The ink picked for space `id`, if one of the six was.
 fn picked(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) -> Option<usize> {
     spaces
@@ -125,6 +136,9 @@ fn picked(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) -> Option<usi
 /// asleep (24) and sky to working (27): a space ink sits on the name and on its agents' titles,
 /// a state on the agent's mark, so they never share a cell.
 const SPACE_INKS: [u8; 6] = [177, 191, 87, 218, 117, 228];
+
+/// How many colours a space can be given.
+pub const SPACE_INK_COUNT: usize = SPACE_INKS.len();
 
 /// The wheel one step quieter, slot for slot: each family at a lower lightness and
 /// saturation (violet 134, lime 107, cyan 73, pink 175, sky 67, yellow 143), every one still

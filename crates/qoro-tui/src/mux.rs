@@ -1923,20 +1923,22 @@ mod tests {
         serde_json::from_slice(&frame.body).expect("json")
     }
 
-    /// A history search on a remote space goes to that remote with its own number for the
-    /// terminal, and the answer comes back in the interface's numbering: sent home with
-    /// the encoded number, the home daemon said "there is no terminal", and an answer left
-    /// in the remote's numbering was dropped as another terminal's.
-    #[tokio::test]
-    async fn a_history_search_reaches_the_remote_that_holds_the_terminal_and_comes_back() {
-        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
-        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
+    /// This machine and one remote, `devbox`, both connected: the mux, what each daemon is
+    /// sent, and the events receiver, held so the mux's sender stays open.
+    fn two_links() -> (
+        Mux<Vec<u8>>,
+        mpsc::UnboundedReceiver<BytesMut>,
+        mpsc::UnboundedReceiver<BytesMut>,
+        mpsc::Receiver<FromLink>,
+    ) {
+        let (home_tx, home_rx) = mpsc::unbounded_channel();
+        let (remote_tx, remote_rx) = mpsc::unbounded_channel();
         let mut home = Link::new(String::new(), None);
         home.conn = Some((1, home_tx));
         let mut remote = Link::new("devbox".into(), None);
         remote.conn = Some((1, remote_tx));
-        let (events, _events) = mpsc::channel(1);
-        let mut mux = Mux {
+        let (events, held) = mpsc::channel(1);
+        let mux = Mux {
             links: vec![Some(home), Some(remote)],
             home: 0,
             down: Vec::new(),
@@ -1947,6 +1949,16 @@ mod tests {
             only: None,
             tried: BTreeSet::new(),
         };
+        (mux, home_rx, remote_rx, held)
+    }
+
+    /// A history search on a remote space goes to that remote with its own number for the
+    /// terminal, and the answer comes back in the interface's numbering: sent home with
+    /// the encoded number, the home daemon said "there is no terminal", and an answer left
+    /// in the remote's numbering was dropped as another terminal's.
+    #[tokio::test]
+    async fn a_history_search_reaches_the_remote_that_holds_the_terminal_and_comes_back() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         let there = terminal_out(1, 21).expect("fits");
         mux.control(ControlRequest::SearchScrollback {
             id: "search-1".into(),
@@ -1992,24 +2004,7 @@ mod tests {
     /// home with the encoded number, the home daemon would say there is no such space.
     #[tokio::test]
     async fn a_remote_spaces_colour_goes_to_its_machine_in_its_own_numbering() {
-        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
-        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
-        let mut home = Link::new(String::new(), None);
-        home.conn = Some((1, home_tx));
-        let mut remote = Link::new("devbox".into(), None);
-        remote.conn = Some((1, remote_tx));
-        let (events, _events) = mpsc::channel(1);
-        let mut mux = Mux {
-            links: vec![Some(home), Some(remote)],
-            home: 0,
-            down: Vec::new(),
-            down_seqs: BTreeMap::new(),
-            pushed_spaces: Vec::new(),
-            last_link: 0,
-            events,
-            only: None,
-            tried: BTreeSet::new(),
-        };
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         mux.control(ControlRequest::SetWorkspaceInk {
             id: "ink-1".into(),
             workspace: workspace_out(1, 3).expect("fits"),
@@ -2033,24 +2028,7 @@ mod tests {
     /// the home daemon renamed whatever its own terminal of that number was, or nothing.
     #[tokio::test]
     async fn a_remote_sessions_name_goes_to_its_machine_in_its_own_numbering() {
-        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
-        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
-        let mut home = Link::new(String::new(), None);
-        home.conn = Some((1, home_tx));
-        let mut remote = Link::new("devbox".into(), None);
-        remote.conn = Some((1, remote_tx));
-        let (events, _events) = mpsc::channel(1);
-        let mut mux = Mux {
-            links: vec![Some(home), Some(remote)],
-            home: 0,
-            down: Vec::new(),
-            down_seqs: BTreeMap::new(),
-            pushed_spaces: Vec::new(),
-            last_link: 0,
-            events,
-            only: None,
-            tried: BTreeSet::new(),
-        };
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         mux.control(ControlRequest::RenameSession {
             id: "title-1".into(),
             terminal: terminal_out(1, 5).expect("fits"),
