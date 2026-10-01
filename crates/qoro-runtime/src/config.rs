@@ -1,9 +1,9 @@
-//! The daemon's part of `config.toml`: when a space goes to sleep by itself, and whether
+//! The daemon's part of `config.toml`: when a tab goes to sleep by itself, and whether
 //! the daemon leaves once nothing is awake.
 //!
 //! ```toml
 //! [sleep]
-//! idle_minutes = 0          # 0 = a space never sleeps by itself
+//! idle_minutes = 0          # 0 = a tab never sleeps by itself
 //!
 //! [daemon]
 //! exit_when_asleep = true   # leave when nothing is awake and nobody is attached
@@ -20,7 +20,7 @@ use std::path::Path;
 /// What the daemon reads from the file, every default filled in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lifecycle {
-    /// Minutes a space is idle and unwatched before it sleeps by itself. `0` is never.
+    /// Minutes a tab is idle and unwatched before it sleeps by itself. `0` is never.
     pub idle_minutes: u64,
     /// Leave when nothing is awake and nobody is attached.
     pub exit_when_asleep: bool,

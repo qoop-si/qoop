@@ -487,7 +487,8 @@ pub fn bar_tabs(
             name: tab.title.clone(),
             workspace: space.unwrap_or_default(),
             agent: tab.agent.is_some(),
-            program: tab.agent.clone(),
+            // A shell keeps no program name through a sleep: called one, not a bare number.
+            program: Some(tab.agent.clone().unwrap_or_else(|| "shell".to_string())),
             behind: None,
             state: "sleeping".to_string(),
             generation: None,

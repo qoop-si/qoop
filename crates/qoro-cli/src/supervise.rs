@@ -1197,8 +1197,9 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
                         None => format!("space {}", target.space.as_deref().unwrap_or_default()),
                     };
                     println!("{what} is asleep: {terminals} tabs ended");
+                    // The reason names each pane of the tab and why.
                     for s in &stayed {
-                        println!("tab {} stays awake: {}", s.terminal, s.reason);
+                        println!("stays awake: {}", s.reason);
                     }
                 }
                 Ok(())

@@ -7998,10 +7998,8 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             ));
             // What stayed awake, and why, stays on the hint row like a refusal does.
             if !stayed.is_empty() {
-                let why: Vec<String> = stayed
-                    .iter()
-                    .map(|s| format!("tab {}: {}", s.terminal, s.reason))
-                    .collect();
+                // Each reason names the panes of its tab and why.
+                let why: Vec<String> = stayed.iter().map(|s| s.reason.clone()).collect();
                 state.hint = Some(format!("stayed awake: {}", why.join("; ")));
             }
             *dirty = true;

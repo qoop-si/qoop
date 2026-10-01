@@ -40,11 +40,11 @@ menu row, the last row of the column. A column too narrow for both falls back to
 braille.
 
 A space's own line ends in two controls, in the same three columns on every line whatever
-the name is: `z` sleeps the space or wakes it, and `x` asks whether to close it. The
+the name is: `z` puts every tab of the space to sleep, and `x` asks whether to close it. The
 question is drawn on the line itself, with `y` in the column `x` was in and `n` beside it,
 so a second click in the same place answers yes, and a `y` closes the space's tabs and then
 the space. Neither control has a key of its own: `ctrl-a Z`
-sleeps the space you are in and `ctrl-a x` closes the tab you are on.
+sleeps the tab you are in and `ctrl-a x` closes the tab you are on.
 
 Each agent wears a small square of nine dots in its state's colour. While it works the
 centre breathes: its arms come in clockwise and go back out, each breath starting one arm
@@ -132,25 +132,29 @@ skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro`
 private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
 `gh` login.
 
-A space you are not using can sleep: every tab in it ends, nothing of it takes CPU or
-memory, and waking it brings back the same tabs, numbers, names, splits, directories and
-scrollback, the last screen included, with each agent resumed into its own conversation.
-A sleeping tab keeps the name its conversation had. A click on it wakes its space and
-opens that tab. Reaching for it from the palette shows the last screen it drew, dimmed,
-without waking anything: Enter or `ctrl-a Z` wakes it once you have seen where it was. A
-program on the alternate screen leaves no last screen behind, and its tab says so.
+A tab you are not using can sleep: it ends, nothing of it takes CPU or memory, and waking
+it brings back the same number, name, split, directory and scrollback, the last screen
+included, with its agent resumed into its own conversation. The rest of its space is left
+as it is. A sleeping tab stays in its space, dimmed, on the bar and in the column, and keeps
+the name its conversation had. A click on it wakes that tab alone and opens it. Reaching
+for it from the palette shows the last screen it drew, dimmed, without waking anything:
+Enter or `ctrl-a Z` wakes it once you have seen where it was. A program on the alternate
+screen leaves no last screen behind, and its tab says so.
 
-A space sleeps whole or not at all: a command still running, an agent that is working or
-has not told its conversation yet, or a job left in the background keeps it awake, and the
-refusal says which tab and why. When nothing is awake and no interface is attached, the
-daemon itself leaves ten seconds later, so a machine with everything asleep runs nothing
-of qoro; the next `qoro` starts it and wakes the space that slept last.
+A tab sleeps whole, every pane of its split, or not at all: a command still running, an
+agent that is working or has not told its conversation yet, or a job left in the background
+keeps it awake, and the refusal says which pane and why. Putting a space to sleep sleeps
+each tab that can and says which stayed awake. When nothing is awake and no interface is
+attached, the daemon itself leaves ten seconds later, so a machine with everything asleep
+runs nothing of qoro; the next `qoro` starts it and wakes the tab that slept last.
 
 ```
-ctrl-a Z                sleep the space you are in, or wake the one you are on
-qoro sleep api          the same from a shell, by name or id
-qoro wake [api]         wake one, or the one that slept last
-qoro ls                 every space, awake, asleep or stopped, and its tabs
+ctrl-a Z                sleep the tab you are in, or wake the sleeping one you are on
+qoro sleep --tab 7      the same from a shell, by tab number
+qoro sleep api          every tab of a space, by name or id
+qoro wake --tab 7       wake one tab; `qoro wake api` every tab of a space
+qoro wake               wake the tab that slept last
+qoro ls                 every space, awake, asleep, partly asleep or stopped, and its tabs
 qoro --space api        the interface with that one space in it; `qoro` shows them all
 qoro stop               end everything now: what was awake comes back on the next open
 ```
@@ -166,7 +170,7 @@ theme = "auto"      # auto | dark | light
 desktop = true      # tell the desktop when an agent needs you and you are not looking
 sound = false
 [sleep]
-idle_minutes = 0    # 0 = never; else a space whose tabs are all idle this long sleeps
+idle_minutes = 0    # 0 = never; else a tab idle and unwatched this long sleeps
 [daemon]
 exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 ```

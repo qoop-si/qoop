@@ -25,8 +25,8 @@ a claim nobody has to keep.
 | `qoro daemon` | run the daemon in the foreground | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
-| `qoro ensure-awake` | wake the space that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |
-| `qoro --space <id\|name>` | the interface with that one space in it and no other: made when the name is new, woken when asleep, given a tab when empty; a new space is refused there, and `qoro` still shows them all | yes |
+| `qoro ensure-awake` | wake the tab that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |
+| `qoro --space <id\|name>` | the interface with that one space in it and no other: made when the name is new, its last slept tab woken when nothing of it is awake, given a tab when empty; a new space is refused there, and `qoro` still shows them all | yes |
 | `qoro --remote <remote>` | the interface for another machine's qoro alone, over ssh, by an added name or an ssh target; a dropped connection comes back on its own | yes |
 | `qoro remote add <name> <ssh-target>` | reach a machine over ssh in the foreground, check its qoro speaks this codec, offer to install this version there when it has none, and list its spaces in `qoro` as `<name>:<space>` beside this machine's | yes |
 | `qoro remote rm <name>` | stop listing a machine's spaces | no |
@@ -71,9 +71,9 @@ a claim nobody has to keep.
 | `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
 | `qoro notch status` | whether the notch is installed and running | no |
 | `qoro notch run` | write this build's notch app out when missing and run it against this binary | no |
-| `qoro ls [--json]` | every space: its id, name, whether it is awake, asleep or stopped, and how many tabs it holds; read from the record when qoro is not running | no |
-| `qoro sleep <space> [--json]` | put a space to sleep, by id or by a name only one space has: every tab in it ends, its tabs are kept, and nothing of it runs until it wakes. All or nothing: a command running, an agent working, blocked or not yet telling its conversation (`qoro hooks install`), a job in the background or a wait between tabs keeps the whole space awake, and the refusal names the tab and why. With qoro not running it says nothing is awake | no |
-| `qoro wake [space] [--json]` | bring a sleeping space back, or the one that slept last: the same tabs, numbers, names, splits, directories and scrollback, each agent resumed into its own conversation by its id; starts qoro when it is not running | no |
+| `qoro ls [--json]` | every space: its id, name, whether it is awake, asleep, partly asleep (`n of m asleep`) or stopped, how many tabs it holds and which are asleep; read from the record when qoro is not running | no |
+| `qoro sleep <space> \| --tab <terminal> [--json]` | put one tab to sleep, every pane of its split, or every tab of a space (by id or by a name only one space has): what sleeps ends, its rows are kept, and nothing of it runs until it wakes. A tab sleeps whole or not at all: a command running, an agent working, blocked or not yet telling its conversation (`qoro hooks install`), a job in the background or a wait between tabs keeps it awake, and the answer names the pane and why; a space sleeps each tab that can and lists the ones that stayed awake. With qoro not running it says nothing is awake | no |
+| `qoro wake [space] \| --tab <terminal> [--json]` | bring one sleeping tab back, every sleeping tab of a space, or with nothing named the tab that slept last: the same numbers, names, splits, directories and scrollback, each agent resumed into its own conversation by its id; starts qoro when it is not running | no |
 | `qoro stop` | end qoro now: every terminal ends and what was awake comes back on the next start; a space that was asleep stays asleep | no |
 | `qoro pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |
 | `qoro devices ls` | the phones paired with this machine, with their key fingerprints | no |
@@ -94,7 +94,7 @@ a claim nobody has to keep.
 write is refused unless the terminal still runs that generation, so an answer meant for one
 process never reaches the one that replaced it.
 
-How long an idle space waits before it sleeps by itself, and whether qoro leaves when
+How long an idle tab waits before it sleeps by itself, and whether qoro leaves when
 nothing is awake, are settings in `config.toml`, not options: [config.md](config.md).
 
 A word that is not a subcommand is an error naming it, not the interface: `qoro stauts`

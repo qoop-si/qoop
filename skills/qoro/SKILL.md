@@ -145,14 +145,17 @@ When you supervise for a person:
 ## Spaces and sleep
 
 ```bash
-qoro ls [--json]               # spaces: id, name, awake/asleep/stopped, tabs
-qoro sleep <space>             # end its tabs, keep them; refused with reasons
-qoro wake [space]              # bring one back, or the one that slept last
+qoro ls [--json]               # spaces: id, name, state, tabs, which sleep
+qoro sleep --tab <terminal>    # end one tab, keep it; refused with reasons
+qoro sleep <space>             # every tab of a space that can sleep
+qoro wake --tab <terminal>     # bring one tab back; `wake <space>` all of it
+qoro wake                      # the tab that slept last
 qoro stop                      # end qoro; what was awake comes back next open
 ```
 
-One qoro per machine; spaces are how tabs are grouped. A sleeping space
-runs nothing; its agents resume into their own conversations on wake. A
-sleep is refused while a tab runs a command, an agent is busy or has not
+One qoro per machine; spaces are how tabs are grouped. A tab sleeps and
+wakes on its own; a sleeping tab runs nothing, and its agent resumes into
+its own conversation on wake. A sleep is refused while a tab runs a
+command, an agent is busy or has not
 reported its conversation, or a job runs in the background. `qoro agents`
 lists only what is awake, and with nothing awake answers an empty list.
