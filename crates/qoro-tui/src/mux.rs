@@ -107,6 +107,9 @@ enum FromLink {
         link: usize,
         conn: u64,
         writer: mpsc::UnboundedSender<BytesMut>,
+        /// The version the daemon there is running, from its welcome. Empty for this
+        /// machine's own daemon, which is never updated from here.
+        server_version: String,
     },
     Said {
         link: usize,
@@ -125,11 +128,28 @@ enum FromLink {
     Probed { id: String, target: String },
     /// The time a remote with nothing awake is given before its link is let go.
     ParkCheck { link: usize, conn: u64 },
+    /// A newer qoro is on the disk of this remote, `version`: its daemon is asked to move to
+    /// it once nothing there is working.
+    Arm { link: usize, version: String },
 }
 
 /// How long a remote with nothing awake keeps its link before the link is let go, so its
 /// daemon, held by nothing else, can leave the way this machine's does.
 const PARK_AFTER: Duration = Duration::from_secs(10);
+
+/// The id of the mux's own ask that a remote's daemon move to the newer qoro on its disk.
+const RESTART_ID: &str = "mux-restart";
+
+/// The id of a status line the mux says about putting a newer qoro on a remote. Nobody
+/// asked for it, and the interface shows a refusal it cannot place as a line, like any other.
+pub(crate) const UPDATE_NOTICE: &str = "remote-update";
+
+fn restart_when_safe(version: String) -> ControlRequest {
+    ControlRequest::RestartWhenSafe {
+        id: RESTART_ID.into(),
+        version,
+    }
+}
 
 /// One daemon as the mux keeps it.
 struct Link {
@@ -148,6 +168,14 @@ struct Link {
     /// Requests for a parked link, sent once it is up again: the ask that wakes a machine
     /// is the one it should answer.
     pending: Vec<ControlRequest>,
+    /// The version a newer qoro on this remote's disk says it is, while its daemon has not
+    /// been asked to move to it yet: the link was down when the push finished. Asked on the
+    /// next connection, unless that daemon already runs it.
+    arm: Option<String>,
+    /// The version the daemon on the connection now up runs, from its welcome. Only a qoro
+    /// newer than this is asked for: a daemon already on it, moved there by another window
+    /// or another Mac, would otherwise end and resume every tab a second time.
+    server_version: String,
     /// The connection now up, if any, and its number, so a message from a connection that
     /// has since been replaced is recognised and dropped.
     conn: Option<(u64, mpsc::UnboundedSender<BytesMut>)>,
@@ -190,6 +218,8 @@ impl Link {
             wake: Arc::new(Notify::new()),
             parked: Arc::new(tokio::sync::watch::channel(false).0),
             pending: Vec::new(),
+            arm: None,
+            server_version: String::new(),
             conn: None,
             control_seq: 0,
             seqs: BTreeMap::new(),
@@ -294,6 +324,10 @@ struct Mux<W> {
     /// `qoro --space`: the one local space this interface shows. Every other space, and
     /// every tab in one, is left out of the lists it is given.
     only: Option<i64>,
+    /// The remotes, by target, a push of a version was started for, with that version. A
+    /// link let go after a quiet moment comes back on every ask, and each coming back is not
+    /// a new download: one try per remote and version for the life of this interface.
+    tried: BTreeSet<(String, String)>,
 }
 
 impl<W: AsyncWrite + Unpin> Mux<W> {
@@ -429,6 +463,37 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         }
     }
 
+    /// A remote just came up running `server_version`: when this qoro is newer, put it on
+    /// that machine's disk in the background and ask its daemon to move to it, once per
+    /// remote and version. Whatever goes wrong is one line on the status bar, never a retry.
+    fn update_remote(&mut self, link: usize, server_version: &str) {
+        let here = env!("CARGO_PKG_VERSION");
+        let Some(Some(l)) = self.links.get(link) else {
+            return;
+        };
+        let Some(remote) = &l.remote else {
+            return;
+        };
+        if !qoro_runtime::paths::is_newer_version(here, server_version)
+            || !self.tried.insert((remote.target.clone(), here.to_string()))
+        {
+            return;
+        }
+        let (name, target) = (l.name.clone(), remote.target.clone());
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let message = match crate::link::update(&target).await {
+                Ok(crate::link::Update::OnDisk(version)) => FromLink::Arm { link, version },
+                Ok(crate::link::Update::NoRelease) => return,
+                Err(e) => FromLink::Reply(ControlResponse::Failed {
+                    id: UPDATE_NOTICE.into(),
+                    reason: format!("qoro {here} could not be put on {name}: {e}"),
+                }),
+            };
+            let _ = events.send(message).await;
+        });
+    }
+
     /// Add the machine at `target` from the interface, keep it in the list of remotes,
     /// and say under what name it will appear. A machine already kept is taken there; a
     /// new one is asked first whether it has a qoro, in a task, since ssh can take seconds.
@@ -455,7 +520,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         let events = self.events.clone();
         tokio::spawn(async move {
             let message = match crate::link::probe(&target).await {
-                Ok(crate::link::Probe::Ready) => FromLink::Probed { id, target },
+                Ok(crate::link::Probe::Ready { .. }) => FromLink::Probed { id, target },
                 Ok(crate::link::Probe::Missing(platform)) => {
                     FromLink::Reply(ControlResponse::RemoteMissing {
                         id,
@@ -844,11 +909,23 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 
     async fn on_link(&mut self, message: FromLink) -> io::Result<()> {
         match message {
-            FromLink::Up { link, conn, writer } => {
+            FromLink::Up {
+                link,
+                conn,
+                writer,
+                server_version,
+            } => {
+                self.update_remote(link, &server_version);
                 let Some(l) = self.link(link) else {
                     return Ok(());
                 };
+                // Back on a newer qoro than before, which is the move a waiting line said
+                // would come: that line is replaced by this one.
+                let moved = (!l.server_version.is_empty()
+                    && qoro_runtime::paths::is_newer_version(&server_version, &l.server_version))
+                .then(|| format!("{} now runs qoro {server_version}", l.name));
                 l.conn = Some((conn, writer));
+                l.server_version = server_version;
                 l.control_seq = 0;
                 l.seqs.clear();
                 l.hidden.clear();
@@ -865,6 +942,32 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.send(&ControlRequest::ListAgents {
                     id: "mux-agents".into(),
                 });
+                if let Some(version) = l.arm.take()
+                    && qoro_runtime::paths::is_newer_version(&version, &l.server_version)
+                {
+                    l.send(&restart_when_safe(version));
+                }
+                if let Some(line) = moved {
+                    self.respond(&ControlResponse::RestartArmed {
+                        id: UPDATE_NOTICE.into(),
+                        waiting_on: Some(line),
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+            FromLink::Arm { link, version } => {
+                let Some(l) = self.link(link) else {
+                    return Ok(());
+                };
+                // Down, or going down with its pump gone before the mux has heard: asked on
+                // the next connection, if its daemon is still older then.
+                let unsent = l.conn.is_none()
+                    || (qoro_runtime::paths::is_newer_version(&version, &l.server_version)
+                        && !l.send(&restart_when_safe(version.clone())));
+                if unsent {
+                    l.arm = Some(version);
+                }
                 Ok(())
             }
             FromLink::Down { link, conn, reason } => {
@@ -1116,6 +1219,37 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 self.push_lists(&id).await
             }
+            // The answer to the ask to move to the newer qoro, ahead of the first lists' arm
+            // below: a refusal of it is not a list that failed. Said once, as one line.
+            C::RestartArmed { waiting_on, .. } if id == RESTART_ID => {
+                let line = match waiting_on {
+                    Some(reason) => format!(
+                        "{name} moves to the new qoro once nothing there is working; now \
+                         waiting on {reason}"
+                    ),
+                    None => format!("{name} moves to the new qoro once nothing there is working"),
+                };
+                self.respond(&C::RestartArmed {
+                    id: UPDATE_NOTICE.into(),
+                    waiting_on: Some(line),
+                })
+                .await
+            }
+            // A daemon from before the ask existed. One too old to name the request in its
+            // refusal answers with no id, but still names the ask it did not know.
+            C::Failed { reason, .. }
+                if id == RESTART_ID || (id.is_empty() && reason.contains("`RestartWhenSafe`")) =>
+            {
+                let line = if reason.contains("unknown variant") {
+                    format!(
+                        "{name} runs a qoro from before updates moved on their own: the new one \
+                         is on disk there and takes over when {name} next restarts its qoro"
+                    )
+                } else {
+                    format!("{name} keeps its qoro for now: {reason}")
+                };
+                self.failed(UPDATE_NOTICE.into(), line).await
+            }
             // Its own first lists refused, by a store that was busy for instance: the merged
             // lists stop waiting for them rather than waiting for the next change, and the
             // interface's own next question fills them in.
@@ -1161,16 +1295,14 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 None => Ok(()),
             },
             // A machine running a qoro from before an ask existed says so in its own words,
-            // which name a fix for itself; over ssh the fix is on that machine.
+            // which name a fix for itself. Over ssh that fix is on the other machine, and a
+            // newer qoro there may be on its way from here already: said as it is, no more.
             C::Failed { id, reason }
                 if !name.is_empty() && reason.contains("older than the client") =>
             {
                 self.failed(
                     id,
-                    format!(
-                        "{name} runs an older qoro: detach, then on {name} run `qoro stop` and \
-                         `qoro update`"
-                    ),
+                    format!("{name} runs an older qoro that cannot do this yet"),
                 )
                 .await
             }
@@ -1398,6 +1530,7 @@ async fn pump<S>(
     conn: u64,
     stream: S,
     leftover: BytesMut,
+    server_version: String,
     events: &mpsc::Sender<FromLink>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -1418,6 +1551,7 @@ async fn pump<S>(
             link,
             conn,
             writer: tx.clone(),
+            server_version,
         })
         .await
         .is_err()
@@ -1492,13 +1626,14 @@ async fn supervise(
                     leftover,
                     child,
                     said,
+                    server_version,
                 } = opened;
                 let started = Instant::now();
                 // Pumped until the connection ends or the mux lets it go; the child is
                 // dropped either way, and with it the ssh.
                 let mut parking = parked.subscribe();
                 tokio::select! {
-                    _ = pump(link, conn, stream, leftover, &events) => {}
+                    _ = pump(link, conn, stream, leftover, server_version, &events) => {}
                     _ = parking.wait_for(|parked| *parked) => {}
                 }
                 drop(child);
@@ -1573,7 +1708,7 @@ pub async fn serve<D>(
         links[0] = Some(Link::new(String::new(), None));
         let events = link_tx.clone();
         tokio::spawn(async move {
-            pump(0, 1, stream, leftover, &events).await;
+            pump(0, 1, stream, leftover, String::new(), &events).await;
             let _ = events
                 .send(FromLink::Down {
                     link: 0,
@@ -1594,6 +1729,7 @@ pub async fn serve<D>(
         last_link: home,
         events: link_tx,
         only,
+        tried: BTreeSet::new(),
     };
     for remote in remotes {
         mux.add_remote(remote);
@@ -1775,6 +1911,7 @@ mod tests {
             last_link: 0,
             events,
             only: None,
+            tried: BTreeSet::new(),
         };
         let there = terminal_out(1, 21).expect("fits");
         mux.control(ControlRequest::SearchScrollback {
@@ -1817,6 +1954,192 @@ mod tests {
         );
     }
 
+    /// The ask to move to a newer qoro: kept while its link is down and sent when it is up
+    /// again to a daemon still older than it. A pre-feature daemon's refusal of it is one
+    /// actionable line, not a first list that failed, and a waiting reason is worded once.
+    #[tokio::test]
+    async fn the_ask_to_move_waits_for_its_link_and_its_answers_are_one_line() {
+        let remote = Link::new("devbox".into(), None);
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![None, Some(remote)],
+            home: 1,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 1,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "9.0.0".into(),
+        })
+        .await
+        .expect("kept");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mux.on_link(FromLink::Up {
+            link: 1,
+            conn: 1,
+            writer: tx,
+            server_version: "8.0.0".into(),
+        })
+        .await
+        .expect("up");
+        let mut asked = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            asked.push(body_of::<ControlRequest>(&bytes));
+        }
+        assert!(
+            asked.contains(&ControlRequest::RestartWhenSafe {
+                id: RESTART_ID.into(),
+                version: "9.0.0".into(),
+            }),
+            "{asked:?}"
+        );
+
+        mux.answer(
+            1,
+            ControlResponse::Failed {
+                id: RESTART_ID.into(),
+                reason: "this daemon is older than the client that called it: unknown variant \
+                         `RestartWhenSafe`"
+                    .into(),
+            },
+        )
+        .await
+        .expect("answered");
+        let said: ControlResponse = body_of(&std::mem::take(&mut mux.down));
+        assert!(
+            matches!(&said, ControlResponse::Failed { id, reason }
+                if id == UPDATE_NOTICE && reason.contains("next restarts its qoro")),
+            "{said:?}"
+        );
+        assert!(
+            !mux.links[1].as_ref().expect("link").listed,
+            "the refusal was read as a failed first list"
+        );
+
+        mux.answer(
+            1,
+            ControlResponse::RestartArmed {
+                id: RESTART_ID.into(),
+                waiting_on: Some("tab 3: sleep is running in it".into()),
+            },
+        )
+        .await
+        .expect("answered");
+        let said: ControlResponse = body_of(&mux.down);
+        assert!(
+            matches!(&said, ControlResponse::RestartArmed { waiting_on: Some(line), .. }
+                if line.starts_with("devbox ") && line.contains("tab 3")),
+            "{said:?}"
+        );
+    }
+
+    /// Two windows, one remote on 0.5.0. A moves it to 0.6.0 while B's push is under way;
+    /// B's swap finds 0.6.0 already there and comes back with that, by which time B's link
+    /// is up again to the daemon A moved. B asks nothing: asked, the daemon would end and
+    /// resume every tab a second time. Nor is a version that does not parse ever asked for.
+    #[tokio::test]
+    async fn a_daemon_already_on_the_version_is_not_asked_to_move_to_it() {
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![None, Some(Link::new("devbox".into(), None))],
+            home: 1,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 1,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        let restarts = |rx: &mut mpsc::UnboundedReceiver<BytesMut>| {
+            let mut asked = 0;
+            while let Ok(bytes) = rx.try_recv() {
+                if let ControlRequest::RestartWhenSafe { .. } = body_of::<ControlRequest>(&bytes) {
+                    asked += 1;
+                }
+            }
+            asked
+        };
+        let up = |conn, writer, version: &str| FromLink::Up {
+            link: 1,
+            conn,
+            writer,
+            server_version: version.into(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        mux.on_link(up(1, tx, "0.5.0")).await.expect("up");
+        mux.on_link(FromLink::Down {
+            link: 1,
+            conn: 1,
+            reason: String::new(),
+        })
+        .await
+        .expect("down");
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        mux.on_link(up(2, tx2, "0.6.0")).await.expect("up again");
+        // The move is news: the line that said it would come is replaced.
+        let mut down = BytesMut::from(&std::mem::take(&mut mux.down)[..]);
+        let mut said = Vec::new();
+        while let Ok(Some(frame)) = Frame::decode(&mut down) {
+            if let Ok(response) = serde_json::from_slice::<ControlResponse>(&frame.body) {
+                said.push(response);
+            }
+        }
+        assert!(
+            said.contains(&ControlResponse::RestartArmed {
+                id: UPDATE_NOTICE.into(),
+                waiting_on: Some("devbox now runs qoro 0.6.0".into()),
+            }),
+            "{said:?}"
+        );
+        for version in ["0.6.0", "not a version"] {
+            mux.on_link(FromLink::Arm {
+                link: 1,
+                version: version.into(),
+            })
+            .await
+            .expect("arm");
+        }
+        assert_eq!(
+            restarts(&mut rx2),
+            0,
+            "a daemon on 0.6.0 was asked to move to it"
+        );
+        assert_eq!(mux.links[1].as_ref().expect("link").arm, None);
+
+        // A connection whose pump is gone, the mux not yet told: kept for the next one.
+        let (dead, gone) = mpsc::unbounded_channel();
+        drop(gone);
+        mux.links[1].as_mut().expect("link").conn = Some((3, dead));
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "0.7.0".into(),
+        })
+        .await
+        .expect("arm");
+        assert_eq!(
+            mux.links[1].as_ref().expect("link").arm.as_deref(),
+            Some("0.7.0")
+        );
+        mux.links[1].as_mut().expect("link").arm = None;
+        let (tx3, mut rx3) = mpsc::unbounded_channel();
+        mux.links[1].as_mut().expect("link").conn = Some((2, tx3));
+
+        // A newer one than it runs still is.
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "0.7.0".into(),
+        })
+        .await
+        .expect("arm");
+        assert_eq!(restarts(&mut rx3), 1);
+    }
+
     /// `qoro --space`: the interface is given the one space and its tabs, and a tab asked
     /// for with no space named is made in that space rather than the daemon's default.
     #[tokio::test]
@@ -1834,6 +2157,7 @@ mod tests {
             last_link: 0,
             events,
             only: Some(2),
+            tried: BTreeSet::new(),
         };
         let space = |id: i64, name: &str| WorkspaceRow {
             id,

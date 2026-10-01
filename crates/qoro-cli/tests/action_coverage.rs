@@ -343,6 +343,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "move a machine onto the newer qoro put there",
+            method: || {
+                Method::Control(ControlRequest::RestartWhenSafe {
+                    id: "a".into(),
+                    version: "0.0.0".into(),
+                })
+            },
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -536,6 +545,10 @@ fn every_control_method_is_reachable_from_some_action() {
             ext: String::new(),
             data: String::new(),
         },
+        ControlRequest::RestartWhenSafe {
+            id: String::new(),
+            version: String::new(),
+        },
     ];
     for request in &all {
         match request {
@@ -565,6 +578,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::HostColors { .. }
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
+            | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

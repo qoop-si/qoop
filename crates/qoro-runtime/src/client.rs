@@ -161,7 +161,8 @@ async fn connect_as(
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
         let stream = UnixStream::connect(socket).await.map_err(not_running)?;
-        handshake_as(stream, client_id, observer).await
+        let (stream, leftover, _) = handshake_as(stream, client_id, observer).await?;
+        Ok((stream, leftover))
     })
     .await
     .map_err(|_| {
@@ -187,7 +188,13 @@ fn not_running(e: io::Error) -> io::Error {
 /// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`
 /// running `qoro relay` on another machine. The relay does not change the protocol, so
 /// nothing after this point needs to know which one it is.
-pub async fn handshake<S>(stream: S, client_id: &str) -> io::Result<(S, BytesMut)>
+///
+/// The welcome comes back with the stream: it names the version the daemon is running, which
+/// over a relay can be older than the qoro on that machine's disk.
+pub async fn handshake<S>(
+    stream: S,
+    client_id: &str,
+) -> io::Result<(S, BytesMut, qoro_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -198,7 +205,7 @@ async fn handshake_as<S>(
     mut stream: S,
     client_id: &str,
     observer: bool,
-) -> io::Result<(S, BytesMut)>
+) -> io::Result<(S, BytesMut, qoro_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -226,8 +233,8 @@ where
         {
             // A refusal is a refusal: it names the category that failed, and proceeding
             // with a partially negotiated codec set would be worse than not connecting.
-            if serde_json::from_slice::<qoro_proto::ServerWelcome>(&frame.body).is_ok() {
-                return Ok((stream, inbuf));
+            if let Ok(welcome) = serde_json::from_slice::<qoro_proto::ServerWelcome>(&frame.body) {
+                return Ok((stream, inbuf, welcome));
             }
             let refuse: qoro_proto::ServerRefuse = serde_json::from_slice(&frame.body)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

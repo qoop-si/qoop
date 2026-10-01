@@ -242,6 +242,10 @@ fn run() -> std::io::Result<()> {
 }
 
 fn run_daemon() -> std::io::Result<()> {
+    // Where this binary is, read first and resolved through any link, before an update
+    // can rename a new file over it: on Linux the running path then reads
+    // `<path> (deleted)`. It is the file an update replaces and what the daemon becomes.
+    let exe = std::env::current_exe().map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
     qoro_runtime::daemon::close_inherited_fds();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     // Held across the whole sequence: stale-socket check, unlink, bind, listen, initialise.
@@ -263,7 +267,13 @@ fn run_daemon() -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let daemon = match Daemon::bind_in(&dir, &state, &shell()).await {
-            Ok(d) => d.leaving_when_idle(),
+            Ok(d) => match exe {
+                Ok(exe) => d.leaving_when_idle().restarting_into(exe),
+                Err(e) => {
+                    eprintln!("qorod: where this binary is could not be read: {e}");
+                    d.leaving_when_idle()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Another daemon won the race and is already serving. This is the expected
                 // outcome for the loser, not a failure.
@@ -1036,7 +1046,12 @@ fn run_relay() -> std::io::Result<()> {
             break;
         }
     }
-    let _ = up.join();
+    // Not joined. Once the daemon side is closed nothing needs the stdin thread, and
+    // waiting on it kept a dead relay up until the far side happened to send something,
+    // with the link above still taking it for alive. When stdin ended first, that thread
+    // already finished and half closed before the daemon's close reached us, so nothing
+    // is lost by returning.
+    drop(up);
     Ok(())
 }
 

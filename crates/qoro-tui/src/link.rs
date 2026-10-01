@@ -31,6 +31,9 @@ pub struct Link {
     /// The last line ssh wrote to stderr, which is the best account there is of why a
     /// connection ended. Empty when stderr goes to the terminal instead.
     pub said: Arc<Mutex<String>>,
+    /// The version the daemon over there is running, from its welcome. Not the qoro on its
+    /// disk, which a push can have replaced while this daemon keeps running the old file.
+    pub server_version: String,
 }
 
 /// A private directory for ssh's control sockets, and the path pattern inside it.
@@ -127,11 +130,12 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
         }
     };
     match connected {
-        Ok(Ok((stream, leftover))) => Ok(Link {
+        Ok(Ok((stream, leftover, welcome))) => Ok(Link {
             stream,
             leftover,
             child,
             said,
+            server_version: welcome.server_version,
         }),
         Ok(Err(e)) => Err(failure(e).await),
         Err(_) => Err(failure(io::Error::new(
@@ -145,8 +149,8 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
 /// What a machine said when asked whether qoro is there.
 #[derive(Debug)]
 pub enum Probe {
-    /// A qoro this build can talk to.
-    Ready,
+    /// A qoro this build can talk to, and the version the binary on its disk says it is.
+    Ready { version: String },
     /// No qoro there, on a machine qoro is built for.
     Missing(Platform),
 }
@@ -166,8 +170,8 @@ impl Platform {
     }
 }
 
-/// Whether the machine at `target` has a qoro this build can talk to, or which machine
-/// it is when it has none.
+/// Whether the machine at `target` has a qoro this build can talk to, and which version
+/// that binary says it is; or which machine it is when it has none.
 ///
 /// Asked from inside the interface, where nobody can answer a prompt: it never asks, and
 /// it takes a host key it has not seen before, since the person just typed that address.
@@ -184,7 +188,9 @@ pub async fn probe(target: &str) -> io::Result<Probe> {
     let hello: qoro_remote::RemoteHello = serde_json::from_str(&hello.answer()?)
         .map_err(|_| io::Error::other(format!("{target} answered something that is not qoro")))?;
     qoro_remote::compatibility(&hello).map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(Probe::Ready)
+    Ok(Probe::Ready {
+        version: hello.version,
+    })
 }
 
 /// Which platform the machine at `target` is, refusing one no build of qoro runs on.
@@ -307,6 +313,153 @@ fn guarded(step: &str, path: &str) -> String {
          case ${{1#\"$d\"/.qoro-install.}} in ''|*/*) echo 'not a staged install' >&2; exit 2;; esac\n{step}"
     );
     format!("sh -c {} qoro {}", shell_quote(&script), shell_quote(path))
+}
+
+/// What putting this version of qoro on a machine came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Update {
+    /// The version the qoro on its disk says it is now, which its daemon is asked to move
+    /// to: this one after a swap, or whatever was there when it was already as new.
+    OnDisk(String),
+    /// No release of this version could be read, which a build from source between
+    /// releases is: nothing was sent, and there is nothing to tell anybody.
+    NoRelease,
+}
+
+/// Put the release of this version in place of the older qoro at `target`, for its daemon
+/// to move onto when nothing there is working.
+///
+/// Only a tagged release goes, never the running binary: a same-platform Mac would
+/// otherwise be handed whatever was built here last. The qoro replaced is the one
+/// `remote_command` runs, swapped atomically beside itself, and only while it still says it
+/// is the version this asked about; one that changed meanwhile (another window or another
+/// Mac swapped first) counts as done. A qoro there as new as this one, or newer, is left
+/// alone: nothing is ever moved backwards.
+pub async fn update(target: &str) -> io::Result<Update> {
+    let here = env!("CARGO_PKG_VERSION");
+    let Probe::Ready { version: disk } = probe(target).await? else {
+        return Err(io::Error::other("no qoro is there any more"));
+    };
+    if !qoro_runtime::paths::is_newer_version(here, &disk) {
+        return Ok(Update::OnDisk(disk));
+    }
+    let platform = platform_of(target).await?;
+    let asset = qoro_runtime::release::asset_for(platform.os, platform.arch)
+        .ok_or_else(|| io::Error::other("no qoro is built for that machine"))?;
+    let release =
+        tokio::task::spawn_blocking(move || qoro_runtime::release::fetch_tagged(here, asset))
+            .await
+            .map_err(io::Error::other)?;
+    let release = match release {
+        Ok(release) => release,
+        Err(e) => {
+            let github = std::env::var(qoro_runtime::release::RELEASE_BASE_ENV)
+                .unwrap_or_default()
+                .is_empty();
+            let anonymous = github
+                && tokio::task::spawn_blocking(qoro_runtime::release::github_token)
+                    .await
+                    .map_err(io::Error::other)?
+                    .is_none();
+            return no_release(e, anonymous);
+        }
+    };
+    // A release that is there but fails its checksum, or has none, is said: it is not the
+    // quiet case of a build that has no release at all.
+    let binary = tokio::task::spawn_blocking(move || qoro_runtime::release::fetch_binary(&release))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+    let swapped = run(
+        target,
+        &swap_command(&disk, here, binary.len()),
+        Some(binary),
+    )
+    .await?;
+    // Another window or another Mac swapped first, maybe to another version than this one:
+    // what is on disk now is asked again, and that is what its daemon moves to.
+    if swapped.status == Some(SWAPPED_MEANWHILE) {
+        let Probe::Ready { version } = probe(target).await? else {
+            return Err(io::Error::other("no qoro is there any more"));
+        };
+        return Ok(Update::OnDisk(version));
+    }
+    swapped.answer()?;
+    Ok(Update::OnDisk(here.to_string()))
+}
+
+/// What a release of this version that could not be read comes to. Only a release that
+/// is not there is the quiet case: the tag answers 404, or the release has no binary for
+/// that machine. Anything else (no network, a limit reached, an answer that is not the
+/// API's) is said, and so is a 404 asked without a token, since the releases are private
+/// and without one nothing is found at all.
+fn no_release(error: String, anonymous: bool) -> io::Result<Update> {
+    if error.contains("the release carries no") {
+        return Ok(Update::NoRelease);
+    }
+    if error.contains("returned error: 404") {
+        if anonymous {
+            return Err(io::Error::other(format!(
+                "{error}; the releases are private, so this Mac needs a GitHub token: run \
+                 `gh auth login` or set GH_TOKEN"
+            )));
+        }
+        return Ok(Update::NoRelease);
+    }
+    Err(io::Error::other(error))
+}
+
+/// The exit status `SWAP` gives when the qoro there is no longer the one asked about.
+const SWAPPED_MEANWHILE: i32 = 6;
+
+/// Swap: find the qoro `remote_command` runs, as the real file behind any link; stage stdin
+/// beside it, so the rename is on one filesystem; check the size against `$3` and that the
+/// copy says it is `$2`; then rename it over the original, but only while the original
+/// still says it is `$1`. The check and the rename hold a lock beside the file, a
+/// directory made or not in one step, so two swaps never both pass the check. Exits 3
+/// when the place is not this user's to write, 4 when the file there is not qoro at all,
+/// 5 when the copy is wrong, 6 only when another version of qoro is there now, 7 when
+/// another swap holds the lock (said, not quiet: a lock left by a swap that was killed
+/// would otherwise hide every update), and leaves nothing staged and no lock of its own
+/// behind. A lock older than half an hour is from a swap that was killed, and is swept.
+const SWAP: &str = r#"set -eu
+trap 'exit 1' HUP INT TERM PIPE
+umask 022
+r=
+for q in qoro "$HOME/.local/bin/qoro" "$HOME/.cargo/bin/qoro"; do
+  p=$(command -v "$q") && { r=$(readlink -f "$p") || { echo "cannot resolve $p" >&2; exit 3; }; break; }
+done
+[ -n "$r" ] && [ -f "$r" ] || { echo "no qoro file to replace" >&2; exit 3; }
+d=$(dirname "$r")
+[ -O "$d" ] && [ -w "$d" ] || { echo "$d is not this user's to write" >&2; exit 3; }
+l="$d/.qoro-swap.lock"
+find "$d" -maxdepth 1 -name .qoro-swap.lock -mmin +30 -exec rmdir {} + 2>/dev/null || true
+t=
+h=
+trap '[ -z "$t" ] || rm -f "$t"; [ -z "$h" ] || rmdir "$l"' EXIT
+mkdir "$l" 2>/dev/null || { echo "another update of qoro is in progress there; try again later" >&2; exit 7; }
+h=1
+v=$("$r" --version 2>/dev/null) || v=
+case $v in "qoro $1") ;; "qoro "*) echo "qoro changed meanwhile" >&2; exit 6;; *) echo "$r is not qoro" >&2; exit 4;; esac
+t=$(mktemp "$d/.qoro-install.XXXXXX")
+cat > "$t"
+[ "$(wc -c < "$t" | tr -d ' ')" = "$3" ] || { echo "the copy arrived incomplete" >&2; exit 5; }
+chmod 755 "$t"
+[ "$("$t" --version 2>/dev/null)" = "qoro $2" ] || { echo "the copy is not qoro $2" >&2; exit 5; }
+mv -f "$t" "$r"
+t=
+printf '%s\n' MARKER
+"#;
+
+/// The ssh command for `SWAP`, from the version on disk to `new`, `size` bytes on stdin.
+fn swap_command(disk: &str, new: &str, size: usize) -> String {
+    format!(
+        "sh -c {} qoro {} {} {}",
+        shell_quote(&SWAP.replace("MARKER", RELAY_MARKER)),
+        shell_quote(disk),
+        shell_quote(new),
+        shell_quote(&size.to_string())
+    )
 }
 
 /// The binary to send: this one when it is the same platform and it is macOS, where one
@@ -676,6 +829,242 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/qoro", bin.join("qoro")).expect("link");
         let out = stage(home.path(), FAKE, FAKE.len());
         assert!(String::from_utf8_lossy(&out.stderr).contains("link to nothing"));
+    }
+
+    /// A qoro that says it is `version`, as a script.
+    fn says(version: &str) -> Vec<u8> {
+        format!("#!/bin/sh\necho 'qoro {version}'\n").into_bytes()
+    }
+
+    /// Run `SWAP` from `disk` to `new` with `binary` on stdin, in a home of its own and on a
+    /// PATH with no qoro on it: the one found is the home's, never one of this machine's.
+    fn swap(home: &std::path::Path, disk: &str, new: &str, binary: &[u8]) -> std::process::Output {
+        use std::io::Write;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(swap_command(disk, new, binary.len()))
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        // A refusal before the copy closes stdin early: the broken pipe is expected.
+        let _ = child.stdin.take().expect("stdin").write_all(binary);
+        child.wait_with_output().expect("output")
+    }
+
+    fn installed(home: &std::path::Path, what: &[u8]) -> std::path::PathBuf {
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let qoro = bin.join("qoro");
+        std::fs::write(&qoro, what).expect("qoro");
+        std::fs::set_permissions(&qoro, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        qoro
+    }
+
+    /// An older qoro is replaced by the new one, in place, with nothing else left there.
+    #[test]
+    fn swap_replaces_an_older_qoro() {
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+    }
+
+    /// A qoro that is a link has the file behind it replaced, and stays a link.
+    #[test]
+    fn swap_follows_a_link_and_keeps_it_a_link() {
+        let home = tempfile::tempdir().expect("home");
+        let real = home.path().join("opt");
+        std::fs::create_dir_all(&real).expect("opt");
+        let target = real.join("qoro");
+        std::fs::write(&target, says("0.0.1")).expect("qoro");
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::os::unix::fs::symlink(&target, bin.join("qoro")).expect("link");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(bin.join("qoro"))
+                .expect("link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).expect("qoro"), says("0.0.2"));
+        let left: Vec<_> = std::fs::read_dir(&real).expect("opt").flatten().collect();
+        assert_eq!(left.len(), 1, "something was left staged beside the file");
+    }
+
+    /// Whatever it refuses, the file there is untouched and nothing is left staged: another
+    /// program (an error, never read as a swap done elsewhere), a qoro of another version
+    /// than asked about (which another swap put there meanwhile), a link to nothing, a place
+    /// this user cannot write, and a copy that is not the version it claims.
+    #[test]
+    fn swap_refuses_and_leaves_nothing() {
+        let check = |home: &std::path::Path, out: std::process::Output, code: i32| {
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
+            let left = leftovers(home);
+            assert!(
+                left.iter().all(|name| !name.starts_with(".qoro-")),
+                "{left:?}"
+            );
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let other = b"#!/bin/sh\necho hello\n";
+        let qoro = installed(home.path(), other);
+        check(
+            home.path(),
+            swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2")),
+            4,
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), other);
+
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        check(
+            home.path(),
+            swap(home.path(), "0.0.0", "0.0.2", &says("0.0.2")),
+            SWAPPED_MEANWHILE,
+        );
+        check(
+            home.path(),
+            swap(home.path(), "0.0.1", "0.0.2", &says("0.0.3")),
+            5,
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+
+        let home = tempfile::tempdir().expect("home");
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::os::unix::fs::symlink("/nonexistent/qoro", bin.join("qoro")).expect("link");
+        check(
+            home.path(),
+            swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2")),
+            3,
+        );
+
+        // Owned by another user cannot be made here without root; a directory this user
+        // may not write is refused by the same line.
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        let bin = home.path().join(".local/bin");
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .expect("chmod");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        check(home.path(), out, 3);
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+
+        // Another swap holds the lock: refused as one under way, and its lock is its own.
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        let lock = home.path().join(".local/bin/.qoro-swap.lock");
+        std::fs::create_dir(&lock).expect("lock");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert_eq!(out.status.code(), Some(7));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
+        assert!(lock.is_dir(), "another swap's lock was taken away");
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+        // One left by a swap killed long ago is swept, and the swap goes ahead.
+        let touched = std::process::Command::new("touch")
+            .args(["-t", "200001010000"])
+            .arg(&lock)
+            .status()
+            .expect("touch");
+        assert!(touched.success());
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+    }
+
+    /// Only a release that is not there is the quiet case; a 404 asked without a token says
+    /// how to get one, and every other failure is said as it is.
+    #[test]
+    fn only_a_missing_release_is_quiet() {
+        let missing = "no release of qoro 9.9.9 could be read: curl: (22) The requested URL \
+                       returned error: 404";
+        assert_eq!(
+            no_release(missing.into(), false).expect("quiet"),
+            Update::NoRelease
+        );
+        assert_eq!(
+            no_release("the release carries no qoro-x.tar.gz".into(), true).expect("quiet"),
+            Update::NoRelease
+        );
+        let said = no_release(missing.into(), true)
+            .expect_err("said")
+            .to_string();
+        assert!(
+            said.contains("gh auth login") && said.contains("GH_TOKEN"),
+            "{said}"
+        );
+        for other in [
+            "no release of qoro 9.9.9 could be read: curl: (6) Could not resolve host",
+            "no release of qoro 9.9.9 could be read: curl: (22) The requested URL returned \
+             error: 403",
+            "the releases API answered what is not JSON: expected value",
+        ] {
+            for anonymous in [false, true] {
+                let said = no_release(other.into(), anonymous).expect_err("said");
+                assert!(said.to_string().starts_with(other), "{said}");
+            }
+        }
+    }
+
+    /// Two swaps racing at one qoro leave one valid new binary: exactly one swaps, the other
+    /// is refused as another swap in progress (7) or done (6), and nothing is left staged
+    /// or locked.
+    #[test]
+    fn two_swaps_at_once_leave_one_valid_qoro() {
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        let path = home.path().to_path_buf();
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let home = path.clone();
+                std::thread::spawn(move || swap(&home, "0.0.1", "0.0.2", &says("0.0.2")))
+            })
+            .collect();
+        let mut codes: Vec<Option<i32>> = racers
+            .into_iter()
+            .map(|racer| racer.join().expect("racer").status.code())
+            .collect();
+        codes.sort();
+        assert!(
+            matches!(codes.as_slice(), [Some(0), Some(SWAPPED_MEANWHILE | 7)]),
+            "{codes:?}"
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
     }
 
     /// Commit and abort act only on a stage's own names, and a qoro that appeared between

@@ -6,7 +6,7 @@
 //! daemon, the handshake, and the mux in between. What the script leaves out, the network
 //! and a remote login shell, is covered in `qoro-remote` and by hand against a real sshd.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,7 +53,10 @@ fn stop(runtime: &Path) {
 
 /// A fake `ssh` on a PATH of its own: runs the last argument through `sh` with the remote's
 /// runtime directory, and puts the qoro under test where the remote command looks for it.
-fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path) -> PathBuf {
+///
+/// `old.example` is a machine whose qoro is older than this one, in a home of its own like
+/// `bare.example`; every swap of a qoro run on any host is written to `swaps` by host.
+fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path, old: &Path, swaps: &Path) -> PathBuf {
     std::fs::create_dir_all(bin).expect("bin");
     std::os::unix::fs::symlink(qoro(), bin.join("qoro")).expect("link qoro");
     // `bare.example` is a machine with no qoro: a home of its own, a PATH without it, and
@@ -75,11 +78,17 @@ fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path) -> PathBuf {
         &script,
         format!(
             "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QORO_SESSION\n\
+             case \"$last\" in *'qoro changed meanwhile'*) echo \"$host\" >> {};; esac\n\
              if [ \"$host\" = bare.example ]; then HOME={} PATH={}:/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
+             if [ \"$host\" = old.example ]; then HOME={} PATH={}:/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
              QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            swaps.display(),
             bare.display(),
             shim.display(),
             run.display(),
+            old.display(),
+            shim.display(),
+            old.join("run").display(),
             remote_runtime.display()
         ),
     )
@@ -133,6 +142,11 @@ struct Tui {
     wr: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     connection: Connection,
     inbuf: BytesMut,
+    /// Messages decoded and not looked at yet. Kept across waits: one read can carry the
+    /// message a wait is for and the next one after it, and a list dropped there is a wait
+    /// that never ends (an "offline" list and the "back" one 50 ms later, read together
+    /// once the test thread came back from a blocking `qoro stop`).
+    unread: std::collections::VecDeque<Incoming>,
     control_seq: u32,
     seqs: std::collections::BTreeMap<u32, u32>,
     spaces: Vec<WorkspaceRow>,
@@ -154,7 +168,9 @@ impl Tui {
     async fn until<T>(&mut self, what: &str, mut want: impl FnMut(&Incoming) -> Option<T>) -> T {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            for incoming in self.connection.drain(&mut self.inbuf).expect("decode") {
+            let fresh = self.connection.drain(&mut self.inbuf).expect("decode");
+            self.unread.extend(fresh);
+            while let Some(incoming) = self.unread.pop_front() {
                 if let Incoming::Control(ControlResponse::Workspaces { workspaces, .. }) = &incoming
                 {
                     self.spaces = workspaces.clone();
@@ -175,6 +191,30 @@ impl Tui {
                 Ok(Ok(n)) => self.inbuf.extend_from_slice(&read[..n]),
                 Ok(Err(e)) => panic!("read: {e}"),
                 Err(_) => panic!("timed out waiting for {what}; spaces {:?}", self.spaces),
+            }
+        }
+    }
+
+    /// Read everything that arrives for `long`, each through `look`.
+    async fn quiet_for(&mut self, long: Duration, mut look: impl FnMut(&Incoming)) {
+        let deadline = Instant::now() + long;
+        loop {
+            let fresh = self.connection.drain(&mut self.inbuf).expect("decode");
+            self.unread.extend(fresh);
+            while let Some(incoming) = self.unread.pop_front() {
+                if let Incoming::Control(ControlResponse::Workspaces { workspaces, .. }) = &incoming
+                {
+                    self.spaces = workspaces.clone();
+                }
+                look(&incoming);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut read = [0u8; 64 * 1024];
+            match tokio::time::timeout(left, self.rd.read(&mut read)).await {
+                Ok(Ok(0)) => panic!("the mux closed"),
+                Ok(Ok(n)) => self.inbuf.extend_from_slice(&read[..n]),
+                Ok(Err(e)) => panic!("read: {e}"),
+                Err(_) => return,
             }
         }
     }
@@ -223,7 +263,15 @@ fn scenario() {
     let remote = private_dir();
     let home = private_dir();
     let bare = private_dir();
-    let ssh = fake_ssh(&home.path().join("bin"), remote.path(), bare.path());
+    let old = private_dir();
+    let swaps = home.path().join("swaps");
+    let ssh = fake_ssh(
+        &home.path().join("bin"),
+        remote.path(),
+        bare.path(),
+        old.path(),
+        &swaps,
+    );
     let releases = fake_release(&home.path().join("releases"));
     // One process-wide change, in a test binary of its own: the mux spawns `ssh` by name, and
     // its control sockets go under the cache directory, which must not be the real one.
@@ -280,6 +328,7 @@ fn scenario() {
                 wr,
                 connection: Connection::new(),
                 inbuf: BytesMut::new(),
+                unread: Default::default(),
                 control_seq: 0,
                 seqs: Default::default(),
                 spaces: Vec::new(),
@@ -504,6 +553,7 @@ fn scenario() {
             stop_session(remote.path(), "work");
 
             Box::pin(install_onto_a_bare_machine(&mut tui, bare.path())).await;
+            Box::pin(push_onto_an_older_machine(&mut tui, old.path(), &swaps)).await;
 
             // The local daemon going away ends the interface, as it does without a mux: the
             // stream closes rather than going quiet.
@@ -527,6 +577,7 @@ fn scenario() {
     // `run`, and nothing else ends it. Left alone it outlives the test and its deleted
     // directory, one orphan per run.
     stop(&bare.path().join("run"));
+    stop(&old.path().join("run"));
     let _ = daemon.kill();
     let _ = daemon.wait();
     if let Err(panic) = outcome {
@@ -636,4 +687,245 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
         },
     )
     .await;
+}
+
+/// A machine whose qoro is older than this one, running a daemon from before
+/// `RestartWhenSafe`: the release of this version is put on its disk once, in place of the
+/// old file, and the ask to move is refused and said once. The link coming back after that
+/// pushes nothing and asks nothing again, and the machine of the same version never had
+/// anything pushed at all.
+async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The old qoro: a script that says it is 0.0.1 and relays with the qoro under test.
+    let bin = old.join(".local/bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *--version*) echo 'qoro 0.0.1' ;;\n\
+         *--hello*) echo '{{\"version\":\"0.0.1\",\"codec_generation\":{},\"platform\":\"linux\"}}' ;;\n\
+         *) exec {} \"$@\" ;;\nesac\n",
+        qoro_proto::CODEC_GENERATION,
+        qoro()
+    );
+    std::fs::write(bin.join("qoro"), script).expect("old qoro");
+    std::fs::set_permissions(bin.join("qoro"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let sessions = old.join("run/sessions/default");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&sessions)
+        .expect("sessions");
+    for dir in [old.join("run"), old.join("run/sessions")] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    let asked = Arc::new(AtomicUsize::new(0));
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(pre_feature_daemon(
+        sessions.join("qorod.sock"),
+        asked.clone(),
+        welcomed.clone(),
+    ));
+
+    tui.ask(ControlRequest::ConnectRemote {
+        id: "connect-old".into(),
+        target: "old.example".into(),
+    })
+    .await;
+    let said = tui
+        .until(
+            "the older machine to be updated",
+            |incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id, reason })
+                    if id == "connect-old" =>
+                {
+                    panic!("the older machine was not added: {reason}")
+                }
+                Incoming::Control(ControlResponse::Failed { id, reason })
+                    if id == "remote-update" =>
+                {
+                    Some(reason.clone())
+                }
+                _ => None,
+            },
+        )
+        .await;
+    assert!(
+        said.starts_with("old.example ") && said.contains("next restarts its qoro"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(bin.join("qoro")).expect("swapped"),
+        std::fs::read(qoro()).expect("qoro"),
+        "the release was not put in place of the old qoro"
+    );
+    let left: Vec<String> = std::fs::read_dir(&bin)
+        .expect("bin")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["qoro".to_string()], "a staged copy was left");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    // Still connected, more traffic to that machine: its refusals are its own, and the ask
+    // to move is neither repeated nor said again.
+    let space = tui
+        .spaces
+        .iter()
+        .find(|w| w.name.starts_with("old.example:"))
+        .map(|w| w.id)
+        .expect("the older machine's space is listed");
+    tui.ask(ControlRequest::CreateTerminal {
+        id: "new-old".into(),
+        cwd: None,
+        workspace: Some(space),
+        name: None,
+    })
+    .await;
+    let refused = tui
+        .until(
+            "the older machine to refuse a new tab",
+            |incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id, reason }) if id == "new-old" => {
+                    Some(reason.clone())
+                }
+                Incoming::Control(ControlResponse::Failed { id, reason })
+                    if id == "remote-update" =>
+                {
+                    panic!("said again: {reason}")
+                }
+                _ => None,
+            },
+        )
+        .await;
+    assert_eq!(
+        refused,
+        "old.example runs an older qoro that cannot do this yet"
+    );
+    assert_eq!(welcomed.load(Ordering::SeqCst), 1, "the link dropped");
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked to move again");
+
+    // The daemon goes away and the link comes back to one still on 0.0.1: nothing is
+    // pushed or asked again.
+    let old_tab = qoro_tui::mux::REMOTE_TERMINAL | ((space >> 40) as u32) << 24 | 1;
+    tui.ask(ControlRequest::CloseTerminal {
+        id: "close-old".into(),
+        terminal: old_tab,
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while welcomed.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "the link never came back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tui.quiet_for(Duration::from_secs(2), |incoming| {
+        if let Incoming::Control(ControlResponse::Failed { id, reason }) = incoming {
+            assert_ne!(id, "remote-update", "said again: {reason}");
+        }
+    })
+    .await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked to move again");
+    let swapped = std::fs::read_to_string(swaps).unwrap_or_default();
+    assert_eq!(
+        swapped.lines().collect::<Vec<_>>(),
+        vec!["old.example"],
+        "pushed other than once to the older machine alone"
+    );
+}
+
+/// A daemon from before `RestartWhenSafe`, at `socket`: it welcomes as `0.0.1`, lists one
+/// space with a tab in it (so its link is never let go), and refuses the ask to move the way
+/// an old daemon refuses any ask it does not know: under the ask's own id, staying
+/// connected. A `CloseTerminal` is refused the same way and then the connection ends, as a
+/// daemon going away would, so the link can be seen to come back without asking again.
+async fn pre_feature_daemon(
+    socket: PathBuf,
+    asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    welcomed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use qoro_proto::{Channel, Frame, HandshakeOutcome, ServerCapabilities};
+    use std::sync::atomic::Ordering;
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let (asked, welcomed) = (asked.clone(), welcomed.clone());
+        tokio::spawn(async move {
+            let mut inbuf = BytesMut::new();
+            let mut read = [0u8; 8192];
+            let mut shaken = false;
+            loop {
+                match stream.read(&mut read).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => inbuf.extend_from_slice(&read[..n]),
+                }
+                while let Ok(Some(frame)) = Frame::decode(&mut inbuf) {
+                    let mut hang_up = false;
+                    let (channel, body) = if !shaken {
+                        let Ok(hello) = serde_json::from_slice(&frame.body) else {
+                            return;
+                        };
+                        let caps = ServerCapabilities {
+                            version: "0.0.1".into(),
+                            ..ServerCapabilities::first_generation()
+                        };
+                        let HandshakeOutcome::Welcome(welcome) =
+                            qoro_proto::negotiate(&hello, &caps)
+                        else {
+                            return;
+                        };
+                        shaken = true;
+                        welcomed.fetch_add(1, Ordering::SeqCst);
+                        (Channel::Handshake, serde_json::to_vec(&welcome))
+                    } else if frame.channel == Channel::Control {
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&frame.body).unwrap_or_default();
+                        let id = request["id"].as_str().unwrap_or_default().to_string();
+                        let op = request["op"].as_str().unwrap_or_default();
+                        let answer = match op {
+                            "ListWorkspaces" => ControlResponse::Workspaces {
+                                id,
+                                workspaces: vec![WorkspaceRow {
+                                    id: 1,
+                                    name: "work".into(),
+                                    terminals: 1,
+                                    asleep: false,
+                                    sleeping: Vec::new(),
+                                    closable: true,
+                                }],
+                            },
+                            "ListAgents" => ControlResponse::Agents {
+                                id,
+                                agents: Vec::new(),
+                                splits: Vec::new(),
+                            },
+                            _ => {
+                                if op == "RestartWhenSafe" {
+                                    asked.fetch_add(1, Ordering::SeqCst);
+                                }
+                                hang_up = op == "CloseTerminal";
+                                ControlResponse::Failed {
+                                    id,
+                                    reason: format!(
+                                        "this daemon is older than the client that called it: \
+                                         it does not know the method that was asked for \
+                                         (unknown variant `{op}`)"
+                                    ),
+                                }
+                            }
+                        };
+                        (Channel::Control, serde_json::to_vec(&answer))
+                    } else {
+                        continue;
+                    };
+                    let mut out = BytesMut::new();
+                    Frame::new(channel, 0, bytes::Bytes::from(body.expect("json")))
+                        .encode(&mut out)
+                        .expect("encode");
+                    if stream.write_all(&out).await.is_err() || hang_up {
+                        return;
+                    }
+                }
+            }
+        });
+    }
 }

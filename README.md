@@ -207,9 +207,19 @@ qoro leaves as this one would, its spaces read as asleep rather than offline, an
 one connects again.
 A machine with no qoro is offered one: this version, for its platform, put in its
 `~/.local/bin` over the same ssh and run once there before it is kept. A release downloaded
-for another platform is checked against its checksum first. A qoro already there is never
-replaced. `qoro agents`, `send` and `read` still
+for another platform is checked against its checksum first. Connecting never replaces a
+qoro already there. `qoro agents`, `send` and `read` still
 speak only to this machine's daemon.
+
+A machine whose qoro is older than this one follows it on its own. When a release of this
+version exists for that machine's platform, the interface puts that release's binary in place
+of the old one over the same ssh, in the background, and the daemon over there moves onto it
+at the first moment nothing there is working: a running command, a busy agent or a
+background job holds it, and the interface says once what it is waiting on. Tabs keep their
+numbers and agents come back in their own conversations. A build from main between releases
+is never sent anywhere, a private release needs `gh auth login` or `GH_TOKEN` on this Mac,
+and a machine whose qoro is from before this needs one update by hand there (`qoro stop`,
+then the install script or `qoro update`) and follows on its own after that.
 
 ### Your phone
 

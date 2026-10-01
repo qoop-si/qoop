@@ -712,11 +712,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         for c in checkpoints {
-            tx.execute(
-                "UPDATE terminal SET agent = ?2, agent_session = COALESCE(?3, agent_session) \
-                 WHERE id = ?1",
-                params![c.terminal, c.agent, c.agent_session],
-            )?;
+            write_checkpoint(&tx, c)?;
             tx.execute(
                 "INSERT OR REPLACE INTO asleep_terminal (terminal, since) \
                  SELECT id, ?2 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
@@ -740,6 +736,28 @@ impl Store {
         tx.commit()?;
         Ok(n)
     }
+
+    /// Write the terminals' agents down as a sleep does, in one transaction, without
+    /// marking or unmarking any terminal asleep: what a daemon moving onto a new binary
+    /// leaves for the one after it, whose restore brings every awake row back from them.
+    pub fn checkpoint(&mut self, checkpoints: &[Checkpoint]) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        for c in checkpoints {
+            write_checkpoint(&tx, c)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// A checkpoint into its terminal's row. A session left unsaid keeps the one written.
+fn write_checkpoint(tx: &rusqlite::Transaction<'_>, c: &Checkpoint) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE terminal SET agent = ?2, agent_session = COALESCE(?3, agent_session) \
+             WHERE id = ?1",
+        params![c.terminal, c.agent, c.agent_session],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

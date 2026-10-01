@@ -350,6 +350,19 @@ pub enum ControlRequest {
         id: String,
         tree: Pane,
     },
+    /// Move onto the qoro now on disk, `version`, at the first moment nothing here is
+    /// working: every awake tab is one a sleep would take (a shell at its prompt, or an
+    /// agent idle in a conversation it has named), and no agent waits on another.
+    ///
+    /// Refused when the binary this daemon started from does not say it is `version`.
+    /// Otherwise the daemon waits, as long as it takes, and the awake tabs come back on the
+    /// new binary with the same numbers, each agent resumed into its own conversation; a tab
+    /// asleep stays asleep. Asking again while it waits is answered with what it is waiting
+    /// on.
+    RestartWhenSafe {
+        id: String,
+        version: String,
+    },
 }
 
 impl ControlRequest {
@@ -382,6 +395,7 @@ impl ControlRequest {
             | Self::HostColors { id, .. }
             | Self::SaveUpload { id, .. }
             | Self::SetSplit { id, .. }
+            | Self::RestartWhenSafe { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -535,6 +549,17 @@ pub enum ControlResponse {
     /// A `SetSplit` is on disk.
     SplitSaved {
         id: String,
+    },
+    /// A `RestartWhenSafe` was taken: the daemon moves once nothing is working. Not sent
+    /// when the first look found nothing in the way, because then the daemon is already
+    /// going and its connections close.
+    RestartArmed {
+        id: String,
+        /// What the last look found still working, as a person would be told it ("tab 3:
+        /// sleep is running in it"). `None` when no look has finished yet, and when this
+        /// daemon already runs that version or a newer one, so there is nothing to move to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting_on: Option<String>,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -980,6 +1005,7 @@ impl ControlResponse {
             | Self::Uploaded { id, .. }
             | Self::NewsNoted { id }
             | Self::SplitSaved { id }
+            | Self::RestartArmed { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }

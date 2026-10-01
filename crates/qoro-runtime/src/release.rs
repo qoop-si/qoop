@@ -276,7 +276,7 @@ fn curl_result(out: std::process::Output) -> Result<Vec<u8>, String> {
 /// `gh` users already have one: it keeps exactly these variables, and `gh auth token`
 /// prints the one it logged in with. Checked at request time rather than at startup,
 /// so a failure never depends on when the process began.
-fn github_token() -> Option<String> {
+pub fn github_token() -> Option<String> {
     ["GH_TOKEN", "GITHUB_TOKEN"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())

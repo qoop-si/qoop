@@ -167,6 +167,16 @@ const MOTION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
 /// build, seldom enough that the percent is a real average and not noise.
 const USAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a terminal asked for ahead of the index that lists it is waited for: a launcher
+/// that opens one and shows it gets there first, and one that never comes is forgotten.
+const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the terminal under the keyboard is waited for after it went from the index. A
+/// remote daemon moving onto a newer qoro ends its tabs and brings them back with the same
+/// numbers a few seconds later, and the keyboard goes back to the same one rather than to
+/// the first tab of the space.
+const FOCUS_RETURN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Whether the person asked to see what agents cost: `QORO_USAGE=1`, and nothing else.
 fn usage_on() -> bool {
     std::env::var("QORO_USAGE").is_ok_and(|v| v.trim() == "1")
@@ -416,10 +426,15 @@ struct State {
     pending_focus: Option<u32>,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
-    /// A terminal `qoro focus` named before this interface listed it: a launcher that
-    /// opens one and shows it at once gets there first. Shown once an index has it; a
-    /// few seconds on, a terminal that never came is forgotten rather than jumped to.
-    show_when_listed: Option<(u32, std::time::Instant)>,
+    /// A terminal to show once an index lists it, and until when: one `qoro focus` named
+    /// before this interface listed it (a launcher that opens one and shows it at once gets
+    /// there first), or the focused one that went from the index and may come back. Past
+    /// its deadline, a terminal that never came is forgotten rather than jumped to.
+    ///
+    /// The flag is set for the focused one that went: that wait is forgotten the moment the
+    /// person puts the keyboard anywhere themselves, so a tab coming back never takes it
+    /// from where they went.
+    show_when_listed: Option<(u32, std::time::Instant, bool)>,
     /// The id of a create asked for in a space that is not on screen, from a space's `+`.
     /// Its tab is shown once an index lists it, because only the row says which space to
     /// bring on screen with it.
@@ -6091,7 +6106,7 @@ where
                             Incoming::Event(EventMessage::Focus { terminal }) => {
                                 if !state.rows.iter().any(|r| r.terminal == terminal) {
                                     state.show_when_listed =
-                                        Some((terminal, std::time::Instant::now()));
+                                        Some((terminal, std::time::Instant::now() + SHOW_WAIT, false));
                                     refresh = true;
                                 } else {
                                     // The newest ask wins over one still waiting.
@@ -7096,6 +7111,9 @@ fn drop_row(
             return None;
         }
         if space == from {
+            // The person moved it: a focused tab that went away no longer takes the
+            // keyboard back. Here and not in `place`, which a daemon's answer shares.
+            forget_return(state);
             place(state, space, terminal, tree);
             return None;
         }
@@ -7300,7 +7318,7 @@ async fn drain_pending_focus(
     dirty: &mut bool,
 ) -> std::io::Result<()> {
     if let Some(next) = state.pending_focus.take()
-        && let Some(bytes) = focus(state, next, control_seq, seqs)?
+        && let Some(bytes) = move_focus(state, next, control_seq, seqs)?
     {
         wr.write_all(&bytes).await?;
         *dirty = true;
@@ -7506,6 +7524,26 @@ fn focus(
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
+    forget_return(state);
+    move_focus(state, to, control_seq, seqs)
+}
+
+/// The person put the keyboard somewhere themselves: a focused tab that went away is no
+/// longer waited for. Only that wait: one for a terminal asked for by name stays.
+fn forget_return(state: &mut State) {
+    if matches!(state.show_when_listed, Some((_, _, true))) {
+        state.show_when_listed = None;
+    }
+}
+
+/// Move the keyboard to `to`, for whoever chose it: `focus` for the person, a deferred
+/// focus for what the interface picked on its own.
+fn move_focus(
+    state: &mut State,
+    to: u32,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
     if to == 0 || to == state.focused {
         return Ok(None);
     }
@@ -7642,6 +7680,7 @@ fn enter_space(
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
+    forget_return(state);
     state.space = Some(space);
     ensure_layout(state);
     // The layout's visible terminals first, so a tiled space comes back as it
@@ -8022,7 +8061,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 && space == workspace
             {
                 state.waking = None;
-                state.show_when_listed = Some((to, std::time::Instant::now()));
+                state.show_when_listed = Some((to, std::time::Instant::now() + SHOW_WAIT, false));
             }
             *dirty = true;
         }
@@ -8105,6 +8144,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         }
         // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
         // on the hint row until the person does something, rather than one frame.
+        // What came of putting a newer qoro on a remote, said by the mux unasked: the same
+        // row as its waiting line, for the same reason.
+        ControlResponse::Failed { id, reason } if id == crate::mux::UPDATE_NOTICE => {
+            state.hint = Some(reason);
+            *dirty = true;
+        }
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -8234,6 +8279,18 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // sized again, and an equal cached size would send it nothing.
             state.sized.retain(|t, _| live.contains(t));
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
+                // Kept for a while in case it comes back under the same number, which a
+                // remote daemon moving onto a newer qoro does. One that is gone for good is
+                // never listed again and is forgotten. A terminal asked for by name is an
+                // ask of the person's own, and stays the one waited for; an earlier tab of
+                // theirs that went (one they closed) gives way to this one.
+                if !matches!(state.show_when_listed, Some((_, _, false))) {
+                    state.show_when_listed = Some((
+                        state.focused,
+                        std::time::Instant::now() + FOCUS_RETURN,
+                        true,
+                    ));
+                }
                 state.focused = 0;
                 state.snapshot = None;
                 // The tree already picked the neighbour; fall back to the tab list
@@ -8273,6 +8330,8 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                             .any(|w| w.id == r.workspace && w.name.starts_with(&prefix))
                 });
                 if let Some(row) = arrived {
+                    // The machine the person just connected: where they asked to go.
+                    forget_return(state);
                     state.joining = None;
                     state.space = Some(row.workspace);
                     state.pending_focus = Some(row.terminal);
@@ -8376,13 +8435,15 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // is the client that goes. A remote that is connecting or offline is still
             // somewhere to be: its space is listed, and it comes back on its own.
             state.done = nothing_awake(state);
-            if let Some((terminal, asked)) = state.show_when_listed.take()
-                && asked.elapsed() < std::time::Duration::from_secs(5)
+            // After the first-tab fallback above, and over it: a focused tab that comes back
+            // takes the keyboard back from the first tab of its space.
+            if let Some((terminal, until, returning)) = state.show_when_listed.take()
+                && std::time::Instant::now() < until
             {
                 if state.rows.iter().any(|r| r.terminal == terminal) {
                     state.pending_focus = Some(terminal);
                 } else {
-                    state.show_when_listed = Some((terminal, asked));
+                    state.show_when_listed = Some((terminal, until, returning));
                 }
             }
             // A slept tab never renders, so the first render that clears
@@ -8533,8 +8594,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 bound && matches!(home, Some((space, None)) if state.space == Some(space));
             if state.elsewhere.as_deref() == Some(id.as_str()) {
                 state.elsewhere = None;
-                state.show_when_listed = Some((terminal, std::time::Instant::now()));
+                state.show_when_listed =
+                    Some((terminal, std::time::Instant::now() + SHOW_WAIT, false));
             } else if on_screen || !is_split {
+                // A tab the person opened, and the keyboard goes to it: a focused tab that
+                // went away no longer takes it back.
+                forget_return(state);
                 state.pending_focus = Some(terminal);
             }
             // An agent tab's shell is up: queue its command line. The shell holds
@@ -8728,6 +8793,18 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 state.installing = None;
                 state.reprobe = Some(target);
             }
+            *dirty = true;
+        }
+        // A remote that will move onto a newer qoro once nothing there is working, and what
+        // it waits on, or that it has moved: the mux words it, and says it once. On the
+        // hint row, which stays until the person does something: the notice row is
+        // cleared by the next render of the tab in front of them, which a working agent
+        // sends many times a second, so a line said there was painted once and never read.
+        ControlResponse::RestartArmed {
+            waiting_on: Some(line),
+            ..
+        } => {
+            state.hint = Some(line);
             *dirty = true;
         }
         ControlResponse::RemoteAdded { name, .. } => {
@@ -10218,7 +10295,7 @@ mod tests {
         );
         assert_eq!(s.elsewhere, None);
         assert_eq!(s.pending_focus, None);
-        assert_eq!(s.show_when_listed.map(|(t, _)| t), Some(9));
+        assert_eq!(s.show_when_listed.map(|(t, _, _)| t), Some(9));
 
         open_new(&mut s, 1);
         assert!(matches!(
@@ -12246,7 +12323,7 @@ mod tests {
         state.adopted = true;
         state.focused = 1;
         state.rows = vec![agent(1, 1, "zsh", "working")];
-        state.show_when_listed = Some((9, std::time::Instant::now()));
+        state.show_when_listed = Some((9, std::time::Instant::now() + SHOW_WAIT, false));
         let mut dirty = false;
         // An index from before the new terminal: still waiting.
         apply(
@@ -12277,6 +12354,7 @@ mod tests {
         state.show_when_listed = Some((
             9,
             std::time::Instant::now() - std::time::Duration::from_secs(6),
+            false,
         ));
         apply(
             &mut state,
@@ -12637,6 +12715,202 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(state.pending_focus, None);
+    }
+
+    /// A remote daemon moving onto a newer qoro ends its tabs and brings them back with the
+    /// same numbers. The keyboard goes back to the tab it was on, not to the first tab of
+    /// the space, and an interface showing only that remote (`qoro --remote`) stays open
+    /// across the gap rather than ending with nothing listed.
+    #[test]
+    fn the_focused_tab_takes_the_keyboard_back_after_its_remote_restarts() {
+        let first = crate::mux::REMOTE_TERMINAL | 1 << 24 | 2;
+        let second = crate::mux::REMOTE_TERMINAL | 1 << 24 | 3;
+        let index = |agents| ControlResponse::Agents {
+            id: "mux".into(),
+            splits: Vec::new(),
+            agents,
+        };
+        let both = || {
+            vec![
+                agent(first, R1 | 1, "zsh", "idle"),
+                agent(second, R1 | 1, "claude", "idle"),
+            ]
+        };
+        let mut state = state();
+        state.adopted = true;
+        state.space = Some(R1 | 1);
+        state.spaces = vec![space(R1 | 1, "devbox:work")];
+        state.rows = both();
+        state.focused = second;
+        let mut dirty = false;
+
+        // The link drops while the daemon there execs: its space is listed offline and its
+        // tabs are gone from the index.
+        state.spaces = vec![space(R1 | 1, "devbox:work (offline)")];
+        apply(&mut state, index(Vec::new()), &mut 0, &mut dirty);
+        assert_eq!(state.focused, 0);
+        assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(second));
+        assert!(
+            !state.done,
+            "the interface ended while its remote restarted"
+        );
+
+        // Back, same numbers: the second tab, though the first is the space's first.
+        state.spaces = vec![space(R1 | 1, "devbox:work")];
+        apply(&mut state, index(both()), &mut 0, &mut dirty);
+        assert_eq!(state.pending_focus, Some(second));
+        assert_eq!(state.show_when_listed, None);
+
+        // One gone for good is not waited for past its time.
+        state.focused = second;
+        state.pending_focus = None;
+        apply(
+            &mut state,
+            index(vec![agent(first, R1 | 1, "zsh", "idle")]),
+            &mut 0,
+            &mut dirty,
+        );
+        let asked = std::time::Instant::now();
+        let (_, until, returning) = state.show_when_listed.expect("waited for");
+        assert!(returning);
+        assert!(
+            until > asked + FOCUS_RETURN - std::time::Duration::from_secs(1)
+                && until <= asked + FOCUS_RETURN,
+            "waited for {:?}, not about {FOCUS_RETURN:?}",
+            until.saturating_duration_since(asked)
+        );
+        // The same wait, its time up: forgotten without a trace, not jumped to.
+        state.show_when_listed = Some((second, until - FOCUS_RETURN, returning));
+        state.pending_focus = None;
+        apply(&mut state, index(both()), &mut 0, &mut dirty);
+        assert_eq!(
+            state.pending_focus,
+            Some(first),
+            "a stale wait took the keyboard"
+        );
+        assert_eq!(state.show_when_listed, None);
+
+        // A tab of the person's own that went first (they closed it) does not hold the
+        // place: the one the restart takes is waited for instead.
+        let mut state = self::state();
+        state.adopted = true;
+        state.space = Some(R1 | 1);
+        state.rows = both();
+        state.focused = second;
+        state.show_when_listed = Some((77, std::time::Instant::now() + FOCUS_RETURN, true));
+        apply(&mut state, index(Vec::new()), &mut 0, &mut dirty);
+        assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(second));
+    }
+
+    /// A person who moved the keyboard themselves while a remote restarted keeps it where
+    /// they put it: the tab coming back does not take it, whether they picked a tab or a
+    /// space.
+    #[test]
+    fn a_tab_coming_back_does_not_take_the_keyboard_from_where_the_person_went() {
+        let remote = crate::mux::REMOTE_TERMINAL | 1 << 24 | 3;
+        let index = |agents| ControlResponse::Agents {
+            id: "mux".into(),
+            splits: Vec::new(),
+            agents,
+        };
+        let both = || {
+            vec![
+                agent(1, 1, "zsh", "idle"),
+                agent(remote, R1 | 1, "claude", "idle"),
+            ]
+        };
+        for by_space in [false, true] {
+            let mut state = state();
+            state.adopted = true;
+            state.space = Some(R1 | 1);
+            state.spaces = vec![space(1, "space 1"), space(R1 | 1, "devbox:work")];
+            state.rows = both();
+            state.focused = remote;
+            let (mut dirty, mut control_seq, mut seqs) = (false, 0, Default::default());
+            apply(
+                &mut state,
+                index(vec![agent(1, 1, "zsh", "idle")]),
+                &mut 0,
+                &mut dirty,
+            );
+            assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(remote));
+
+            if by_space {
+                enter_space(&mut state, 1, &mut control_seq, &mut seqs).unwrap();
+            } else {
+                focus(&mut state, 1, &mut control_seq, &mut seqs).unwrap();
+            }
+            assert_eq!(state.focused, 1);
+            assert_eq!(state.show_when_listed, None);
+
+            state.pending_focus = None;
+            apply(&mut state, index(both()), &mut 0, &mut dirty);
+            assert_eq!(
+                state.pending_focus, None,
+                "the tab coming back took the keyboard"
+            );
+            assert_eq!(state.focused, 1);
+        }
+
+        // A machine the person connected meanwhile: its first tab, not the one coming back,
+        // though both arrive in the same index.
+        let mut state = state();
+        state.adopted = true;
+        state.space = Some(R1 | 1);
+        state.rows = both();
+        state.focused = remote;
+        let mut dirty = false;
+        apply(
+            &mut state,
+            index(vec![agent(1, 1, "zsh", "idle")]),
+            &mut 0,
+            &mut dirty,
+        );
+        state.joining = Some("box".into());
+        state.spaces = vec![
+            space(1, "space 1"),
+            space(R1 | 1, "devbox:work"),
+            space(2 << 40 | 1, "box:work"),
+        ];
+        state.pending_focus = None;
+        let mut joined = both();
+        joined.push(agent(7, 2 << 40 | 1, "zsh", "idle"));
+        apply(&mut state, index(joined), &mut 0, &mut dirty);
+        assert_eq!(
+            state.pending_focus,
+            Some(7),
+            "the tab coming back took the keyboard"
+        );
+        assert_eq!(state.show_when_listed, None);
+
+        // A deferred focus the interface picked on its own is not the person's choice: the
+        // wait stays, and a terminal asked for by name is never dropped by a move.
+        let mut state = self::state();
+        state.rows = both();
+        state.show_when_listed = Some((9, std::time::Instant::now() + SHOW_WAIT, false));
+        focus(&mut state, 1, &mut 0, &mut Default::default()).unwrap();
+        assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(9));
+    }
+
+    /// The answer to the ask that a remote move to a newer qoro is one line on the bar.
+    #[test]
+    fn a_remote_waiting_to_move_says_why_once() {
+        let mut state = state();
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::RestartArmed {
+                id: crate::mux::UPDATE_NOTICE.into(),
+                waiting_on: Some("devbox moves to the new qoro once nothing there is working; now waiting on tab 3".into()),
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        assert!(
+            state.hint.as_deref().is_some_and(|m| m.contains("tab 3")),
+            "{:?}",
+            state.hint
+        );
     }
 
     /// An unnamed space is counted among the spaces of the machine on screen and, on a
@@ -13617,7 +13891,7 @@ mod tests {
             &mut dirty,
         );
         assert_eq!(state.waking, None);
-        assert_eq!(state.show_when_listed.map(|(t, _)| t), Some(8));
+        assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(8));
 
         apply(
             &mut state,

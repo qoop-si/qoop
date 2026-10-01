@@ -1062,6 +1062,14 @@ impl Daemon {
         self
     }
 
+    /// The binary this daemon runs as `qoro daemon`, read by the caller at its very start.
+    /// What `ControlRequest::RestartWhenSafe` checks the version of and becomes; without
+    /// it the request is refused.
+    pub fn restarting_into(self, exe: PathBuf) -> Self {
+        let _ = self.books.restart.exe.set(exe);
+        self
+    }
+
     /// Open one terminal in the default workspace, where the daemon is, before serving.
     ///
     /// A bind no longer opens one by itself: a daemon with nothing awake is one that is
@@ -2806,6 +2814,8 @@ fn dispatch(
         // Seconds of disk for a large picture: never on the read loop, where it would hold
         // up this connection's typing.
         ControlRequest::SaveUpload { .. } => Dispatch::Apart,
+        // Runs the binary on disk and waits for a first look across every space.
+        ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
         _ => Dispatch::Inline(None),
     }
 }
@@ -2887,6 +2897,14 @@ async fn handle_control(
             // either started its shell and answered, or undone itself, by now.
             if let Ok(Some((ok, detail))) = store.applied(id.clone()).await {
                 return replayed_response(&id, ok, &detail, true);
+            }
+            // Asked under the lock, so a move onto a new binary either finished its look
+            // before this or sees this tab; never one ended without being looked at.
+            if books.restart.gated() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "qoro is moving onto a new version; try again in a moment".into(),
+                };
             }
             // A requested working directory is validated here rather than trusted. It has
             // to be absolute, because a relative path would resolve against whatever
@@ -3439,6 +3457,12 @@ async fn handle_control(
                 },
             }
         }
+        ControlRequest::CreateWorkspace { .. } if books.restart.gated() => {
+            ControlResponse::Failed {
+                id,
+                reason: "qoro is moving onto a new version; try again in a moment".into(),
+            }
+        }
         ControlRequest::CreateWorkspace { name, .. } => match store.create_workspace(name).await {
             Ok(workspace) => ControlResponse::WorkspaceCreated { id, workspace },
             Err(e) => ControlResponse::Failed {
@@ -3963,6 +3987,58 @@ async fn handle_control(
                 terminal,
                 events: all[from..].to_vec(),
             }
+        }
+        // Not newer than what runs here (or not a version at all): already there, and a
+        // second window asking after the first moved it must not move it again.
+        ControlRequest::RestartWhenSafe { version, .. }
+            if !crate::paths::is_newer_version(&version, env!("CARGO_PKG_VERSION")) =>
+        {
+            ControlResponse::RestartArmed {
+                id,
+                waiting_on: None,
+            }
+        }
+        ControlRequest::RestartWhenSafe { version, .. } => {
+            let restart = &books.restart;
+            let Some(exe) = restart.exe.get().cloned() else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "this daemon was not started as `qoro daemon` and cannot move".into(),
+                };
+            };
+            // Asked of the file every time: a move is only ever onto the version the asker
+            // put there, never onto whatever happens to be on disk later.
+            let wanted = format!("qoro {version}");
+            match version_on_disk(&exe).await {
+                Ok(found) if found == wanted => {}
+                Ok(found) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("{} says {found:?}, not {wanted:?}", exe.display()),
+                    };
+                }
+                Err(reason) => return ControlResponse::Failed { id, reason },
+            }
+            let mut waiting = restart.waiting.subscribe();
+            // Under the lock, so a task calling the move off for an older request either
+            // sees this one and carries on, or has let go of `armed` and one starts here.
+            let start = {
+                let mut arms = restart.wanted.lock().unwrap();
+                arms.0 += 1;
+                arms.1 = wanted.clone();
+                !restart
+                    .armed
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            };
+            if start {
+                eprintln!("qorod: {wanted} is on disk; moving onto it once nothing is working");
+                tokio::spawn(restart_when_safe(restore(), exe));
+                // The first look's answer, so the asker hears what is in the way. A look
+                // that found nothing ends this daemon, and with it this connection.
+                let _ = tokio::time::timeout(FIRST_LOOK_PATIENCE, waiting.changed()).await;
+            }
+            let waiting_on = waiting.borrow().clone();
+            ControlResponse::RestartArmed { id, waiting_on }
         }
         // Another machine is the interface's business, not this daemon's. Reaching here
         // means a client sent it straight to a daemon, and that is said rather than ignored.
@@ -4969,6 +5045,52 @@ pub struct Bookkeeping {
     /// wake, a tab made or closed in it, the workspace closing. It and `writers` keep an
     /// entry for every id they were asked about: a few bytes each, for the daemon's life.
     locks: Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The move onto a newer binary, once one is asked for.
+    pub restart: Arc<Restart>,
+}
+
+/// What `ControlRequest::RestartWhenSafe` needs, shared by every connection.
+pub struct Restart {
+    /// The binary this daemon started from, resolved before anything could replace it: on
+    /// Linux the running path reads `<path> (deleted)` once a new file is renamed over it.
+    /// Unset for a daemon embedded in something else, which has no `qoro daemon` to become.
+    exe: std::sync::OnceLock<PathBuf>,
+    /// Whether the task that waits for the safe moment runs. It starts once and runs until
+    /// the daemon goes, so a daemon never asked costs nothing.
+    armed: std::sync::atomic::AtomicBool,
+    /// Set by a look that found nothing working, from its checkpoints until it either ends
+    /// every tab or backs out. A tab made, a space made or a tab woken in that window is
+    /// refused: a new one would be ended by the move without having been looked at.
+    /// Separate from `stopping`, which is one way, and which a sleep and a terminal's
+    /// teardown read as "the daemon is going".
+    gate: std::sync::atomic::AtomicBool,
+    /// What the last look found still working.
+    waiting: watch::Sender<Option<String>>,
+    /// The `--version` line the move is onto, as the last accepted request said it, and
+    /// how many requests have been accepted. Asked of the file again as the move commits: a
+    /// binary replaced after the request is not one anybody vetted, and the move is called
+    /// off until somebody asks again, which the count tells apart from a request that
+    /// came in meanwhile.
+    wanted: std::sync::Mutex<(u64, String)>,
+}
+
+impl Default for Restart {
+    fn default() -> Self {
+        Self {
+            exe: std::sync::OnceLock::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            gate: std::sync::atomic::AtomicBool::new(false),
+            waiting: watch::channel(None).0,
+            wanted: std::sync::Mutex::default(),
+        }
+    }
+}
+
+impl Restart {
+    /// Whether a move onto a new binary is ending things right now.
+    fn gated(&self) -> bool {
+        self.gate.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Bookkeeping {
@@ -4983,6 +5105,7 @@ impl Bookkeeping {
             closing: Arc::default(),
             writers: Arc::default(),
             locks: Arc::default(),
+            restart: Arc::default(),
         }
     }
 
@@ -5361,6 +5484,49 @@ fn vet_for_sleep(
     })
 }
 
+/// Every tab of `streams` through `vet_for_sleep`: the checkpoints in their order, or each
+/// refusal by tab.
+fn vet_tabs(
+    into: &Restore,
+    streams: &[u32],
+    table: &[qoro_pty::sys::ProcRow],
+) -> Result<Vec<qoro_store::Checkpoint>, String> {
+    let mut checkpoints = Vec::new();
+    let mut refused = Vec::new();
+    for stream in streams {
+        match vet_for_sleep(into, *stream, table) {
+            Ok(checkpoint) => checkpoints.push(checkpoint),
+            Err(why) => refused.push(format!("tab {stream}: {why}")),
+        }
+    }
+    if refused.is_empty() {
+        Ok(checkpoints)
+    } else {
+        Err(refused.join("; "))
+    }
+}
+
+/// A tab of `streams` waiting on another, or waited on by one, said as a person reads it.
+///
+/// Such a tab is part of a conversation between agents that ending it would cut in half,
+/// and the wait itself is not written anywhere.
+fn waiting_between(into: &Restore, streams: &[u32]) -> Option<String> {
+    into.agents
+        .expectation_edges()
+        .into_iter()
+        .filter(|(_, target)| !into.agents.is_closed(*target))
+        .find(|(waiter, target)| streams.contains(waiter) || streams.contains(target))
+        .map(|(waiter, target)| format!("tab {waiter} is waiting on tab {target}"))
+}
+
+/// The process table, read now and not taken from the last scan: a job started a moment
+/// ago is exactly the one a sleep must not miss.
+async fn fresh_process_table() -> Result<Vec<qoro_pty::sys::ProcRow>, String> {
+    crate::blocking::run_within(crate::store::STORE_DEADLINE, qoro_pty::sys::process_table)
+        .await
+        .map_err(|_| "the process table could not be read".to_string())
+}
+
 /// The open terminals of the tab `tab` is in, in tree order: the leaves of its split tree
 /// that are rows of the workspace, or `tab` alone. The first is the tab.
 fn members(into: &Restore, tab: u32, rows: &[qoro_store::TerminalRow]) -> Vec<u32> {
@@ -5478,42 +5644,14 @@ async fn sleep_tab(
         }
         return Ok(live);
     }
-    // A tab waiting on another, or waited on by one, is part of a conversation between
-    // agents that a sleep would cut in half, and the wait itself is not written anywhere.
-    let edges: Vec<(u32, u32)> = into
-        .agents
-        .expectation_edges()
-        .into_iter()
-        .filter(|(_, target)| !into.agents.is_closed(*target))
-        .collect();
-    if let Some((waiter, target)) = edges
-        .iter()
-        .find(|(waiter, target)| fresh.contains(waiter) || fresh.contains(target))
-    {
-        return Err(format!("tab {waiter} is waiting on tab {target}"));
+    if let Some(why) = waiting_between(into, &fresh) {
+        return Err(why);
     }
     // Read now, for this tab, not from the last scan or the tab before it, whose end took
     // seconds: a job started a moment ago is exactly the one a sleep must not miss.
-    let table =
-        crate::blocking::run_within(crate::store::STORE_DEADLINE, qoro_pty::sys::process_table)
-            .await
-            .map_err(|_| "the process table could not be read".to_string())?;
+    let table = fresh_process_table().await?;
     let table = &table;
-    let vet = |into: &Restore| -> Result<Vec<qoro_store::Checkpoint>, String> {
-        let mut checkpoints = Vec::new();
-        let mut refused = Vec::new();
-        for stream in &fresh {
-            match vet_for_sleep(into, *stream, table) {
-                Ok(checkpoint) => checkpoints.push(checkpoint),
-                Err(why) => refused.push(format!("tab {stream}: {why}")),
-            }
-        }
-        if refused.is_empty() {
-            Ok(checkpoints)
-        } else {
-            Err(refused.join("; "))
-        }
-    };
+    let vet = |into: &Restore| vet_tabs(into, &fresh, table);
     let checkpoints = vet(into)?;
     let written = into.books.store.sleep_terminals(checkpoints.clone()).await;
     // Marked before it is looked at again: from here a split cannot take a pane of it
@@ -5664,6 +5802,11 @@ async fn wake_locked(
         .load(std::sync::atomic::Ordering::SeqCst)
     {
         return Err("qoro is stopping".into());
+    }
+    // Under the lock, as for a tab made: a tab that came back during a move's look would
+    // be ended by it without having been looked at.
+    if into.books.restart.gated() {
+        return Err("qoro is moving onto a new version; try again in a moment".into());
     }
     let rows = into
         .books
@@ -5884,6 +6027,259 @@ async fn leave(watch: &Leaving) -> bool {
     eprintln!("qorod: nothing is awake and nobody is attached; leaving");
     // The lock goes with the process, and with it the next daemon may bind.
     std::process::exit(0);
+}
+
+/// How long the asker of a `RestartWhenSafe` waits for the first look's answer.
+const FIRST_LOOK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long an armed daemon goes without looking again when nothing woke it: a job in the
+/// background ends without any tab or connection saying so.
+const LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The least time between two looks of an armed daemon.
+const LOOK_SPACING: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the binary on disk has to say its version.
+const VERSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the binary at `exe` says it is: its `--version` line.
+async fn version_on_disk(exe: &Path) -> Result<String, String> {
+    let exe = exe.to_path_buf();
+    let shown = exe.display().to_string();
+    let asked = shown.clone();
+    crate::blocking::run_on(crate::blocking::Pool::Lifecycle, move || {
+        use std::io::Read;
+        let mut child = std::process::Command::new(&exe)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{asked} could not be run: {e}"))?;
+        // Polled rather than waited on, so a binary that never answers is killed at the
+        // deadline instead of holding a lifecycle thread for good.
+        let deadline = std::time::Instant::now() + VERSION_PATIENCE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{asked} did not say its version"));
+                }
+            }
+        }
+        let mut out = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_string(&mut out);
+        }
+        Ok(out.trim().to_string())
+    })
+    .await
+    .map_err(|e| format!("{shown} could not be run: {e}"))?
+}
+
+/// Wait for the first moment nothing is working, then become the binary on disk.
+///
+/// Looks again when an agent's row changes (a command ending, an agent going idle, a tab
+/// coming or going), and every `LOOK_AGAIN_AFTER` for the background jobs nothing announces.
+/// Never sooner than `LOOK_SPACING` after the last look, with whatever piled up meanwhile
+/// taken as one: a working agent's row changes many times a second, and each look reads
+/// the whole process table. A connection coming or going is not a reason: it changes
+/// nothing a look reads. A daemon already on its way out is left to go: the next start is
+/// the new binary either way.
+async fn restart_when_safe(into: Restore, exe: PathBuf) {
+    let mut changes = into.agents.subscribe();
+    loop {
+        let looked = tokio::time::Instant::now();
+        if !into
+            .books
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let mut replaced = None;
+            match restart_look(&into, &exe, &mut replaced).await {
+                Ok(_held) => exec_daemon(&exe),
+                Err(why) => {
+                    let before = into.books.restart.waiting.send_replace(Some(why.clone()));
+                    if let Some(asked) = replaced
+                        && call_off(&into.books.restart, asked)
+                    {
+                        eprintln!("qorod: the move onto the new version is called off: {why}");
+                        return;
+                    }
+                    if before.as_ref() != Some(&why) {
+                        eprintln!("qorod: the move onto the new version waits: {why}");
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            changed = changes.recv() => {
+                if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(LOOK_AGAIN_AFTER) => {}
+        }
+        tokio::time::sleep_until(looked + LOOK_SPACING).await;
+        while matches!(
+            changes.try_recv(),
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ) {}
+    }
+}
+
+/// Stop waiting to move, unless a request came after request `asked`: its version is the
+/// one to look for now, and the task carries on for it.
+fn call_off(restart: &Restart, asked: u64) -> bool {
+    let arms = restart.wanted.lock().unwrap();
+    if arms.0 != asked {
+        return false;
+    }
+    restart
+        .armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    true
+}
+
+/// One look across every space, the way a sleep looks at one, that ends with every tab
+/// ended and every row written down for the next daemon to bring back. Answers the space
+/// locks, still held, for the move to happen under; or what is still working, with nothing
+/// ended.
+///
+/// Left open, as it is for a sleep: a key landing between the second look and the end.
+///
+/// `replaced` is set to the request whose binary is no longer on disk, when that is why.
+async fn restart_look(
+    into: &Restore,
+    exe: &Path,
+    replaced: &mut Option<u64>,
+) -> Result<BTreeMap<i64, tokio::sync::OwnedMutexGuard<()>>, String> {
+    let books = &into.books;
+    let mut held = BTreeMap::new();
+    lock_spaces(books, &mut held).await?;
+    // Only what is awake is looked at and written down. A tab marked asleep is not running,
+    // or is a sleep that has not finished, whose row was written down when it was vetted:
+    // the move ends it like the rest, its mark is left as it is, and the next daemon
+    // brings it back asleep.
+    let awake = || -> Vec<u32> {
+        into.terminals
+            .streams()
+            .into_iter()
+            .filter(|s| !books.is_marked(*s))
+            .collect()
+    };
+    let streams = awake();
+    if let Some(why) = waiting_between(into, &streams) {
+        return Err(why);
+    }
+    let table = fresh_process_table().await?;
+    let checkpoints = vet_tabs(into, &streams, &table)?;
+    books
+        .store
+        .checkpoint(checkpoints.clone())
+        .await
+        .map_err(|e| format!("the tabs could not be written down: {e}"))?;
+    // The binary is asked again before the gate goes up rather than under it: the exec
+    // opens the path later anyway, and up to `VERSION_PATIENCE` of refused creates and
+    // wakes, with the move's end pushed toward the link's patience, buys nothing.
+    let (asked, wanted) = books.restart.wanted.lock().unwrap().clone();
+    let found = version_on_disk(exe).await?;
+    if found != wanted {
+        *replaced = Some(asked);
+        return Err(format!(
+            "{} says {found:?} now, not {wanted:?}; ask again to move onto it",
+            exe.display()
+        ));
+    }
+    books
+        .restart
+        .gate
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // A space made before the gate went up has a lock nobody here holds yet; a tab made in
+    // it either finished before the gate, and is in the list below, or is refused.
+    let settled: Result<(), String> = async {
+        lock_spaces(books, &mut held).await?;
+        if awake() != streams {
+            return Err("a tab came or went while the tabs were written down".into());
+        }
+        // Read again: a job started while the tabs were written down is the one to catch.
+        let table = fresh_process_table().await?;
+        if vet_tabs(into, &streams, &table)? != checkpoints {
+            return Err("a tab changed while the tabs were written down".into());
+        }
+        // A `qoro stop` that landed during the look wins: it stops rather than moves.
+        if books
+            .stopping
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("qoro is stopping".into());
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(why) = settled {
+        // Before the locks go, so a create or a wake waiting on one is not refused for a
+        // move that is not happening.
+        books
+            .restart
+            .gate
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(why);
+    }
+    // No way back from here: `stopping` is set, so every tab ending now keeps its row
+    // open, as at a stop.
+    if let Err(e) = end_tabs(into, &into.terminals.streams()).await {
+        // Its pty is closed by the exec, which hangs its shell up.
+        eprintln!("qorod: {e}; moving anyway");
+    }
+    crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
+    Ok(held)
+}
+
+/// Take the lock of every space not in `held` yet, the lowest id first. `MoveTerminal`
+/// takes the lower of its two first as well, so neither ever waits on the other.
+async fn lock_spaces(
+    books: &Bookkeeping,
+    held: &mut BTreeMap<i64, tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<(), String> {
+    let mut ids: Vec<i64> = books
+        .store
+        .workspaces()
+        .await
+        .map_err(|e| format!("the spaces could not be read: {e}"))?
+        .into_iter()
+        .map(|space| space.id)
+        .collect();
+    ids.sort_unstable();
+    for id in ids {
+        if let std::collections::btree_map::Entry::Vacant(slot) = held.entry(id) {
+            slot.insert(books.lock_of(id).lock_owned().await);
+        }
+    }
+    Ok(())
+}
+
+/// Become `exe` as `qoro daemon`, in this process.
+///
+/// Rather than leaving for a client to start the next one: after an exit every tab stays
+/// down until a client comes, which may be never while the machine that would come sleeps.
+/// Every descriptor here is close-on-exec, the socket's and the state lock's included, and
+/// the new daemon closes anything inherited past stderr before it opens anything, then
+/// takes the startup lock and binds over the socket left behind.
+fn exec_daemon(exe: &Path) -> ! {
+    use std::os::unix::process::CommandExt;
+    eprintln!("qorod: moving onto {}", exe.display());
+    let e = std::process::Command::new(exe).arg("daemon").exec();
+    eprintln!(
+        "qorod: {} could not be started: {e}; leaving, and the next start brings the tabs back",
+        exe.display()
+    );
+    std::process::exit(1);
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.

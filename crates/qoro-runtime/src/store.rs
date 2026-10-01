@@ -209,6 +209,14 @@ impl StoreHandle {
         self.run(move |s| s.unmark(&terminals)).await
     }
 
+    /// Write the terminals' agents down as a sleep does, marking nothing asleep.
+    pub async fn checkpoint(
+        &self,
+        checkpoints: Vec<qoro_store::Checkpoint>,
+    ) -> Result<(), HandleError> {
+        self.run(move |s| s.checkpoint(&checkpoints)).await
+    }
+
     /// Record an agent's own id for the conversation in a terminal.
     pub async fn set_agent_session(&self, id: i64, session: String) -> Result<(), HandleError> {
         self.run(move |s| s.set_agent_session(id, &session)).await

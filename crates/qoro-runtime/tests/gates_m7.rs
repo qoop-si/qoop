@@ -169,6 +169,13 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal,
             workspace: 999,
         },
+        // 0.0.0 is no newer than this build, so it is answered as already there and nothing
+        // is armed. A newer one would, at most, end every tab to become the binary on
+        // disk: nothing is typed either way.
+        ControlRequest::RestartWhenSafe {
+            id: "x27".into(),
+            version: "0.0.0".into(),
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -199,6 +206,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::HostColors { .. }
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
+            | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

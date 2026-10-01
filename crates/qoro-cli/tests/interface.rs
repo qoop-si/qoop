@@ -325,8 +325,20 @@ impl Interface {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .expect("chmod");
+        Self::start_from(dir, backgrounded, cols, rows, &[])
+    }
+
+    /// An interface in `dir`, which the caller may have filled first (a `remotes.json`),
+    /// with `env` added to the interface's own environment.
+    fn start_from(
+        dir: tempfile::TempDir,
+        backgrounded: bool,
+        cols: u16,
+        rows: u16,
+        env: &[(&str, std::ffi::OsString)],
+    ) -> Self {
         let runtime = dir.path().to_path_buf();
-        let (child, daemon, master) = Self::start_in(dir.path(), backgrounded, cols, rows);
+        let (child, daemon, master) = Self::start_in(dir.path(), backgrounded, cols, rows, env);
         Self {
             child,
             daemon,
@@ -353,7 +365,7 @@ impl Interface {
     /// adopts and sizes. Drop this before the interface that owns the
     /// directory.
     fn attach_sized(dir: &std::path::Path, cols: u16, rows: u16) -> Self {
-        let (child, daemon, master) = Self::start_in(dir, false, cols, rows);
+        let (child, daemon, master) = Self::start_in(dir, false, cols, rows, &[]);
         Self {
             child,
             daemon,
@@ -372,6 +384,7 @@ impl Interface {
         backgrounded: bool,
         cols: u16,
         rows: u16,
+        env: &[(&str, std::ffi::OsString)],
     ) -> (Child, Child, OwnedFd) {
         let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_qoro"));
         daemon_cmd
@@ -424,7 +437,8 @@ impl Interface {
             // Pinned for the same reason the scale gates pin it: an interactive shell
             // with a configured prompt is somebody's machine, not this program.
             .env("SHELL", "/bin/sh")
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            .envs(env.iter().map(|(k, v)| (*k, v)));
         // SAFETY: the only unsafe part is `pre_exec` below, whose closure runs post fork
         // and calls two async signal safe syscalls with no allocation.
         let child = unsafe {
@@ -2333,4 +2347,177 @@ fn radar_dragging_the_divider_resizes_the_panel() {
         "the panel did not clamp at 18: {:?}",
         rule_at(&ui)
     );
+}
+
+/// A daemon on another machine waiting to move onto a newer qoro: the line saying what it
+/// waits on stays on screen while the terminal in front of the person keeps drawing. Said
+/// where a render clears it, it was painted for one frame and never seen.
+///
+/// The machine is reached the way the product reaches it: `ssh` here is a script running
+/// the remote command through `sh` in a home of its own, whose qoro already says it is this
+/// version (so nothing is downloaded) and relays to a daemon this test plays, one that
+/// welcomes as an older version and answers the ask to move with what it waits on.
+#[test]
+fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let old = dir.path().join("old");
+    let bin = old.join(".local/bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    std::fs::write(
+        bin.join("qoro"),
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n\
+             *--hello*) echo '{{\"version\":\"{}\",\"codec_generation\":{},\"platform\":\"linux\"}}' ;;\n\
+             *) exec {} \"$@\" ;;\nesac\n",
+            env!("CARGO_PKG_VERSION"),
+            qoro_proto::CODEC_GENERATION,
+            env!("CARGO_BIN_EXE_qoro")
+        ),
+    )
+    .expect("old qoro");
+    std::fs::set_permissions(bin.join("qoro"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let run = old.join("run");
+    let sessions = run.join("sessions/default");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&sessions)
+        .expect("sessions");
+    for d in [run.clone(), run.join("sessions")] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    let listener =
+        std::os::unix::net::UnixListener::bind(sessions.join("qorod.sock")).expect("bind");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || waiting_daemon(stream));
+        }
+    });
+    let ssh_bin = dir.path().join("ssh-bin");
+    std::fs::create_dir_all(&ssh_bin).expect("ssh bin");
+    std::fs::write(
+        ssh_bin.join("ssh"),
+        format!(
+            "#!/bin/sh\nfor a; do last=$a; done\nunset QORO_SESSION\n\
+             HOME={} PATH=/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            old.display(),
+            run.display()
+        ),
+    )
+    .expect("ssh");
+    std::fs::set_permissions(ssh_bin.join("ssh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::fs::write(
+        dir.path().join("remotes.json"),
+        r#"[{"name":"old","target":"old.example"}]"#,
+    )
+    .expect("remotes");
+    let path = format!("{}:/usr/bin:/bin", ssh_bin.display());
+    let cache = dir.path().join("cache");
+    let mut ui = Interface::start_from(
+        dir,
+        false,
+        200,
+        ROWS,
+        &[("PATH", path.into()), ("XDG_CACHE_HOME", cache.into())],
+    );
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    // A terminal in front of the person that draws all the time, as an agent at work does.
+    ui.type_in(b"i=0; while :; do i=$((i+1)); echo tick$i; sleep 0.1; done\n");
+    let waiting = "waiting on tab 9: sleep is running in it";
+    assert!(
+        ui.wait_for(waiting, Duration::from_secs(40)).is_some(),
+        "the line never painted: {}\n{}",
+        ui.daemon_log(),
+        ui.screen
+    );
+    // Three seconds of the terminal drawing over and over: the line is still there.
+    ui.painted.clear();
+    let _ = ui.wait_for("never painted by anything", Duration::from_secs(3));
+    assert!(
+        ui.saw("tick"),
+        "the terminal did not keep drawing:\n{}",
+        ui.screen
+    );
+    assert!(
+        ui.screen.to_string().contains(waiting),
+        "the line went with the next render:\n{}",
+        ui.screen
+    );
+}
+
+/// The daemon the test above plays: welcomes as 0.0.1, lists one space with a tab, and
+/// answers the ask to move with what it waits on.
+fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
+    use qoro_proto::{Channel, Frame, HandshakeOutcome, ServerCapabilities};
+    use qoro_runtime::control::{ControlResponse, WorkspaceRow};
+    let mut inbuf = bytes::BytesMut::new();
+    let mut read = [0u8; 8192];
+    let mut shaken = false;
+    loop {
+        match stream.read(&mut read) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => inbuf.extend_from_slice(&read[..n]),
+        }
+        while let Ok(Some(frame)) = Frame::decode(&mut inbuf) {
+            let (channel, body) = if !shaken {
+                let Ok(hello) = serde_json::from_slice(&frame.body) else {
+                    return;
+                };
+                let caps = ServerCapabilities {
+                    version: "0.0.1".into(),
+                    ..ServerCapabilities::first_generation()
+                };
+                let HandshakeOutcome::Welcome(welcome) = qoro_proto::negotiate(&hello, &caps)
+                else {
+                    return;
+                };
+                shaken = true;
+                (Channel::Handshake, serde_json::to_vec(&welcome))
+            } else if frame.channel == Channel::Control {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&frame.body).unwrap_or_default();
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                let answer = match request["op"].as_str().unwrap_or_default() {
+                    "ListWorkspaces" => ControlResponse::Workspaces {
+                        id,
+                        workspaces: vec![WorkspaceRow {
+                            id: 1,
+                            name: "work".into(),
+                            terminals: 1,
+                            asleep: false,
+                            sleeping: Vec::new(),
+                            closable: true,
+                        }],
+                    },
+                    "ListAgents" => ControlResponse::Agents {
+                        id,
+                        agents: Vec::new(),
+                        splits: Vec::new(),
+                    },
+                    "RestartWhenSafe" => ControlResponse::RestartArmed {
+                        id,
+                        waiting_on: Some("tab 9: sleep is running in it".into()),
+                    },
+                    op => ControlResponse::Failed {
+                        id,
+                        reason: format!("not played here: {op}"),
+                    },
+                };
+                (Channel::Control, serde_json::to_vec(&answer))
+            } else {
+                continue;
+            };
+            let mut out = bytes::BytesMut::new();
+            Frame::new(channel, 0, bytes::Bytes::from(body.expect("json")))
+                .encode(&mut out)
+                .expect("encode");
+            if stream.write_all(&out).is_err() {
+                return;
+            }
+        }
+    }
 }

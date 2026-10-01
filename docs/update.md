@@ -88,3 +88,25 @@ check saw something newer it signs where this build stands
 waiting and that installing it means detaching, stopping the sessions, and
 running `qoro update` outside. There is no background check and no prompt to
 restart: eight terminals open and nobody typing still costs nothing.
+
+## Other machines follow this one
+
+A remote machine needs no hand update once its qoro knows how to move. When the interface
+connects to a machine whose daemon runs an older version than this Mac's qoro, and a release
+of this Mac's version exists for that machine's platform, it fetches that release here
+(checksum verified, the same token rules as above, so a private release needs `gh auth login`
+or `GH_TOKEN` on this Mac), puts the binary in place of the qoro there in the background with
+one atomic rename beside the real file, and asks the daemon over there to move onto it. That
+daemon moves at the first moment nothing on it is working: a running command, a busy agent,
+an agent that has not named its conversation, or a background job holds it, and the
+interface says once, on its hint row, what it is waiting on. When it moves, every tab comes
+back with the same number and every agent in its own conversation. A build from main between
+releases is never pushed, a qoro there that is as new or newer is never touched, and a swap
+another window or another Mac is making at the same time is said rather than raced. A machine
+whose qoro is from before this needs one update by hand there (`qoro stop`, then the install
+script or `qoro update`), and follows on its own from then on.
+
+The same check that holds a move also holds `qoro sleep` and the sleep an idle space falls
+into: a single command that prints nothing while it leads its own foreground group (`vim`,
+`less`, an `ssh` in front) now counts as running, so a space with one of those open stays
+awake rather than being slept under it.
