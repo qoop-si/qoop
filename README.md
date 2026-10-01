@@ -48,7 +48,7 @@ question is drawn on the line itself, with `y` in the chip `x` was in and `no` b
 so a second click in the same place answers yes, and a `y` closes the space's tabs and then
 the space. The chips have round caps where the terminal draws them and half blocks
 elsewhere; `QORO_CHIPS=round` or `QORO_CHIPS=flat` forces one. A space on another machine
-opens with that machine's first letter in a chip, green while it is connected. `ctrl-a R`
+opens with an `ssh` chip, green while it is connected. `ctrl-a R`
 opens the settings too, `ctrl-a Z` sleeps the tab you are in and `ctrl-a x` closes the tab
 you are on.
 

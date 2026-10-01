@@ -1082,13 +1082,14 @@ fn content(c: &Column) -> Vec<Row> {
 ///
 /// The name and the count beside it share one slot: the count while the space is awake,
 /// the word `sleeping` while it is not, and the word gives way before the name does,
-/// because a name is identity and a state is not. A sleeping space wears `Role::Sleeping`
-/// on its name and its rule, so the state is in the colour as well as the word.
+/// because a name is identity and a state is not. A sleeping space keeps its own colour,
+/// one step quieter, the way a calm agent does: the word `sleeping` and the `wake` chip
+/// carry the state, and the space is still told apart from the others asleep beside it.
 ///
-/// A space of another machine opens with that machine's first letter in a chip, in the
-/// colour of its link: done's green while connected, blocked's orange while it connects or
-/// does not answer, faint while it is let go. The name is then drawn without the machine,
-/// which the chip already says.
+/// A space of another machine opens with an `ssh` chip, in the colour of its link: done's
+/// green while connected, blocked's orange while it connects or does not answer, faint
+/// while it is let go. The name is then drawn without the machine, which the settings box
+/// names in full.
 ///
 /// The controls are [`Block`], in fixed columns at the right. Folded, the count and the
 /// controls take the colour of the most urgent agent under them when that agent wants a
@@ -1104,7 +1105,7 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
     use crate::theme::Role;
     let width = c.width;
     let ink = if space.asleep {
-        Role::Sleeping
+        crate::theme::space_calm_in(c.spaces, space.id)
     } else {
         crate::theme::space_in(c.spaces, space.id)
     };
@@ -1275,11 +1276,11 @@ pub(crate) fn machine_of(name: &str) -> (&str, &str) {
         .unwrap_or((name, name))
 }
 
-/// The chip a remote space opens with: its machine's first letter, in its link's colour.
+/// The chip a remote space opens with: the word `ssh`, in its link's colour.
 fn machine_chip(name: &str, link: LinkState, style: Chips) -> Option<Machine<'_>> {
     let (host, bare) = machine_of(name);
-    let letter = host.chars().next()?;
-    let text = format!("{} ", chip(style, &letter.to_string(), 1));
+    host.chars().next()?;
+    let text = format!("{} ", chip(style, "ssh", 3));
     Some(Machine {
         lead: crate::width::width(&text),
         text,
@@ -1845,8 +1846,8 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     }
 }
 
-/// A tab of a sleeping space: faint like a shell's row, with the sleeping mark and no
-/// other dot, since nothing runs in it. What a person called it, else the agent that
+/// A tab of a sleeping space: its space's quieter colour, like a calm agent's title, with
+/// the sleeping mark and no other dot, since nothing runs in it. What a person called it, else the agent that
 /// comes back in it, else a shell (a sleep refuses any other program), and where.
 fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
     let name = tab.label().to_string();
@@ -1858,7 +1859,7 @@ fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
     let room = c.width.saturating_sub(crate::width::width(&lead));
     Line {
         text: fit(&format!("{lead}{}", shorten_middle(&text, room)), c.width),
-        colour: Some(crate::theme::Role::Faint),
+        colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
         indicator: Some((0, 2, crate::theme::Role::Sleeping)),
         ..Line::default()
     }
@@ -6857,11 +6858,11 @@ mod tests {
         assert!(!head.text.contains("api z"), "{:?}", head.text);
 
         assert_eq!(crate::width::width(&head.text), WIDTH);
-        // The name and the rule wear the sleeping colour, and so does the `wake` in the
-        // chip `sleep` is in on an awake space.
+        // The name keeps its space's colour one step quieter, and the `wake` in the chip
+        // `sleep` is in on an awake space wears the sleeping colour.
         assert_eq!(
             head.accent.expect("the name's run").2,
-            crate::theme::Role::Sleeping,
+            crate::theme::space_calm_of(2),
             "{:?}",
             head.runs
         );
@@ -6891,7 +6892,7 @@ mod tests {
                 .0
         };
         let dim = line(7);
-        assert_eq!(dim.colour, Some(crate::theme::Role::Faint));
+        assert_eq!(dim.colour, Some(crate::theme::space_calm_of(2)));
         assert_eq!(
             dim.indicator,
             Some((BOX_LEAD, 2, crate::theme::Role::Sleeping)),
@@ -7348,12 +7349,14 @@ mod tests {
         assert_eq!(mark(Shut::from([1, 2])), ['\u{25b8}', '\u{25b8}', ' ', ' ']);
     }
 
-    /// A space of another machine opens with that machine's first letter in a chip, in
-    /// the colour of its link, and its name without the machine; with no room for both,
-    /// the chip goes and the name carries the machine again.
+    /// A space of another machine opens with an `ssh` chip, in the colour of its link,
+    /// and its name without the machine; with no room for both, the chip goes and the
+    /// name carries the machine again.
     #[test]
     fn a_remote_space_wears_its_machine_in_the_colour_of_its_link() {
         use crate::theme::Role;
+        // `ssh` and its two ends.
+        const SSH_W: usize = 5;
         for (link, name, ink) in [
             (LinkState::Up, "ubox:webshop", Role::Done),
             (LinkState::Parked, "ubox:webshop", Role::Faint),
@@ -7369,19 +7372,20 @@ mod tests {
             let rule = rule_styled(&c, 1, Chips::Flat);
             let shown = name.strip_prefix("ubox:").unwrap_or(name);
             assert!(
-                rule.text.starts_with(&format!(" {} {shown}", flat("m"))),
+                rule.text
+                    .starts_with(&format!(" {} {shown}", chip(Chips::Flat, "ssh", 3))),
                 "{rule:?}"
             );
-            assert!(rule.runs.contains(&(NAME_AT, CHIP_W, ink)), "{rule:?}");
-            assert!(rule.chips.contains(&(NAME_AT, CHIP_W)), "{rule:?}");
+            assert!(rule.runs.contains(&(NAME_AT, SSH_W, ink)), "{rule:?}");
+            assert!(rule.chips.contains(&(NAME_AT, SSH_W)), "{rule:?}");
             assert_eq!(
                 rule.accent,
-                Some((NAME_AT + CHIP_W + 1, shown.len(), crate::theme::space_of(1)))
+                Some((NAME_AT + SSH_W + 1, shown.len(), crate::theme::space_of(1)))
             );
             let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MIN, &none);
             let narrow = rule_styled(&c, 1, Chips::Flat);
             assert!(narrow.text.starts_with(" md\u{2026}"), "{narrow:?}");
-            assert!(!narrow.chips.contains(&(NAME_AT, CHIP_W)), "{narrow:?}");
+            assert!(!narrow.chips.contains(&(NAME_AT, SSH_W)), "{narrow:?}");
         }
         // A space of this machine says nothing about a link.
         let spaces = vec![space(1, "local:name")];
@@ -7447,10 +7451,10 @@ mod tests {
         );
     }
 
-    /// The sleeping state is a colour as well as a word, so the rule says it twice and a
-    /// narrow column that has to drop one of them still says it.
+    /// A sleeping space keeps its own colour one step quieter, so spaces asleep side by side
+    /// are still told apart; the word and the `wake` chip say the state.
     #[test]
-    fn a_sleeping_rule_wears_the_sleeping_colour() {
+    fn a_sleeping_rule_keeps_its_space_colour_one_step_quieter() {
         let spaces = vec![WorkspaceRow {
             id: 1,
             name: "qoro".into(),
@@ -7490,6 +7494,6 @@ mod tests {
             .find(|(_, h)| matches!(h, Some(Hit::Space(_))))
             .expect("the rule");
         let accent = rule.1.and(rule.0.accent).expect("the name's run");
-        assert_eq!(accent.2, crate::theme::Role::Sleeping, "{:?}", rule.0);
+        assert_eq!(accent.2, crate::theme::space_calm_of(1), "{:?}", rule.0);
     }
 }

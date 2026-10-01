@@ -140,8 +140,9 @@ pub fn chips() -> Chips {
 }
 
 /// Round caps are private use glyphs: Ghostty and kitty draw them whatever the font, and
-/// iTerm2 draws them too; anywhere else they would be a box with a question mark in it,
-/// so the rest get half blocks. Inside tmux the terminal outside is not known, so flat.
+/// they meet the chip cleanly there. iTerm2 draws them with a notch where the cap meets
+/// the chip, and anywhere else they would be a box with a question mark in it, so the rest
+/// get half blocks. Inside tmux the terminal outside is not known, so flat.
 /// `QORO_CHIPS=round` or `flat` forces either, for a terminal with a Nerd Font this cannot
 /// see, and a mono session has no colour to draw a chip in at all.
 fn chips_from(env: &Env) -> Chips {
@@ -156,7 +157,7 @@ fn chips_from(env: &Env) -> Chips {
     if env.tmux {
         return Chips::Flat;
     }
-    let program = matches!(env.term_program.as_deref(), Some("ghostty" | "iTerm.app"));
+    let program = env.term_program.as_deref() == Some("ghostty");
     let term = env
         .term
         .as_deref()
@@ -373,10 +374,8 @@ mod tests {
             term_program: Some(name.to_string()),
             ..env()
         };
-        for name in ["ghostty", "iTerm.app"] {
-            assert_eq!(chips_from(&program(name)), Chips::Round, "{name}");
-        }
-        for name in ["Apple_Terminal", "WezTerm", "vscode"] {
+        assert_eq!(chips_from(&program("ghostty")), Chips::Round);
+        for name in ["iTerm.app", "Apple_Terminal", "WezTerm", "vscode"] {
             assert_eq!(chips_from(&program(name)), Chips::Flat, "{name}");
         }
         for term in ["xterm-ghostty", "xterm-kitty"] {
