@@ -114,24 +114,29 @@ pub fn eligible_for_reap(
 }
 
 /// Whether the terminal's foreground group holds a task the snapshot cannot
-/// see: a `cargo`, `sleep` or `python` child under a shell leader, which
-/// `program_of` alone reports as the shell.
+/// see: a `cargo`, `sleep` or `python` in front, which a snapshot taken before
+/// it started, or one a silent command never refreshed, still reports as the
+/// shell.
+///
+/// Every process of the group is judged the same way, its leader included. A
+/// shell with job control (every tab's, started `-i`) gives each command it
+/// runs a group of its own, so `sleep 75` typed at the prompt is that group's
+/// leader and its only member: skipping the leader read it as nothing.
+/// Measured on a Linux remote, where the snapshot stayed `bash, idle` and a
+/// move went ahead under a running `sleep`. A shell at its prompt leads the
+/// foreground group itself and reads as no task, and so does a known agent.
 ///
 /// Runs only on reap candidates once per reap tick, never on the hot path.
-/// `true` means veto. Fail closed: an unreadable member vetoes (it only
+/// `true` means veto. Fail closed: an unreadable process vetoes (it only
 /// skips one round; the next tick retries), while no foreground group at
-/// all means nothing to protect. Shell and known-agent members are fine;
-/// backgrounded (`&`) jobs outside the foreground group are NOT seen here,
-/// which is a stated residual of v1.
+/// all means nothing to protect. Backgrounded (`&`) jobs outside the
+/// foreground group are NOT seen here, which is a stated residual of v1.
 pub fn group_holds_task(master: std::os::fd::RawFd) -> bool {
     let Some(leader) = qoro_pty::sys::foreground_leader(master) else {
         return false;
     };
     let members = qoro_pty::sys::group_members(qoro_pty::Pgid(leader.0));
     for member in members {
-        if member.0 == leader.0 {
-            continue;
-        }
         let program_path: Option<String> = qoro_pty::sys::program_of(member);
         let Some(path) = program_path else {
             return true;
@@ -617,5 +622,113 @@ mod tests {
             sleep_blockers(&t, 10, Some(20), 5),
             vec!["muxd".to_string()]
         );
+    }
+
+    /// The foreground of a real job-control shell, step by step: at its prompt, running a
+    /// silent `sleep` that leads a group of its own and is its only member, and running a
+    /// known agent. Only the `sleep` is a task.
+    #[test]
+    fn a_command_leading_its_own_foreground_group_is_a_task() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+
+        let pty = qoro_pty::sys::open_pty(80, 24).expect("pty");
+        let master = pty.master.as_raw_fd();
+        let slave = pty.slave.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/sh");
+        // Interactive, as every tab's shell is started, so it gives each command a group.
+        command.arg("-i").env("PS1", "$ ").env_remove("ENV");
+        // SAFETY: post-fork, only async-signal-safe calls and no allocation: the session
+        // setup the daemon performs for a tab.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for target in 0..3 {
+                    if libc::dup2(slave, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().expect("spawn");
+        drop(pty.slave);
+        qoro_pty::sys::set_nonblocking(master).expect("nonblocking");
+        let shell_pid = shell.id() as i32;
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        let agent = agent_dir.path().join("droid");
+        std::fs::write(&agent, "#!/bin/sh\nread line\n").expect("agent");
+        std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+
+        // Drains what the shell prints while waiting for the foreground to be `program`.
+        let front_is = |program: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut sink = [0u8; 4096];
+            loop {
+                // SAFETY: master is open and sink is a writable buffer of its length.
+                let _ = unsafe {
+                    libc::read(master, sink.as_mut_ptr() as *mut libc::c_void, sink.len())
+                };
+                let leader = qoro_pty::sys::foreground_leader(master);
+                let name = leader.and_then(qoro_pty::sys::program_of).map(|path| {
+                    let argv = qoro_pty::sys::argv_of(leader.expect("leader"));
+                    qoro_domain::program::identify(&path, &argv).name
+                });
+                let at_prompt = program == "shell" && leader.map(|p| p.0) == Some(shell_pid);
+                if at_prompt || (program != "shell" && name.as_deref() == Some(program)) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{program} never came to the front: {name:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let type_in = |line: &str| {
+            // SAFETY: master is open and the buffer is the line's bytes.
+            unsafe { libc::write(master, line.as_ptr() as *const libc::c_void, line.len()) };
+        };
+
+        front_is("shell");
+        assert!(!group_holds_task(master), "a shell at its prompt is a task");
+
+        type_in("sleep 30\n");
+        front_is("sleep");
+        let group = qoro_pty::sys::foreground_leader(master).expect("a foreground group");
+        assert_ne!(
+            group.0, shell_pid,
+            "the shell ran the command without job control"
+        );
+        assert_eq!(
+            qoro_pty::sys::group_members(qoro_pty::Pgid(group.0)),
+            vec![group],
+            "the command is not alone in its group, so this is not the case under test"
+        );
+        assert!(
+            group_holds_task(master),
+            "a lone sleep leading its group was missed"
+        );
+
+        // SAFETY: a signal to the group this test's shell started.
+        unsafe { libc::kill(-group.0, libc::SIGKILL) };
+        front_is("shell");
+        type_in(&format!("{}\n", agent.display()));
+        front_is("droid");
+        assert!(!group_holds_task(master), "an agent in front is a task");
+
+        if let Some(group) = qoro_pty::sys::foreground_leader(master) {
+            // SAFETY: as above.
+            unsafe { libc::kill(-group.0, libc::SIGKILL) };
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
     }
 }
