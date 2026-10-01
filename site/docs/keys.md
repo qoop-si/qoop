@@ -16,7 +16,7 @@ program.
 | `ctrl-a x` | close the tab; asks first when an agent in it is working, starting or blocked (`Y` closes, any other key keeps it) |
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
-| `ctrl-a R` | rename the space |
+| `ctrl-a R` | the space's settings: its name and colour |
 | `ctrl-a W` | close the space when it is empty |
 
 ## Panes
@@ -58,7 +58,8 @@ program.
 | click | focus a tab, a pane, a space or an agent |
 | drag | select, and copy when you let go |
 | drag a divider | resize the panes on either side |
-| click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory |
+| click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
+| click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |
 | wheel | scroll back through the history |

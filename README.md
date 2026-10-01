@@ -12,21 +12,22 @@ no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you 
 the same one, on the terminal you left: the same space, the same tab, the same pane of a split.
 
 ```
- ⠯⠇claude                 12s │ 1 zsh  2 claude  +
- agents                 tree +│~/my-project $ cargo test
- my-project (1)           z x │
- ⠯⠇claude                     │
-   └ claude · my-project      │
-                              │
- notes                        │
+ ⠯⠇claude                         12s │ 1 zsh  2 claude  +
+ agents                         tree +│~/my-project $ cargo test
+▾my-project (1)   ▐+▌ ▐sleep▌ ▐⋯▌ ▐x▌ │
+ ⠯⠇claude                             │
+   └ claude · my-project              │
+                                      │
+ notes            ▐+▌         ▐⋯▌ ▐x▌ │
 terminal 2 is blocked
 ```
 
 The index says which space each agent is in and what it is doing: every space is its name
 with its agents under it (only agents: every tab is on the bar above the terminal). The name
 and the agents' titles wear the space's colour, calm agents a quieter step of it, so a space
-reads as one block and the ones working or waiting stand out of it. `ctrl-a f` folds one
-away. An agent waiting for an answer is named in the one row at the
+reads as one block and the ones working or waiting stand out of it. The mark before a
+space's name says it is open (`▾`) or folded (`▸`); a click on the line or `ctrl-a f` folds
+it. An agent waiting for an answer is named in the one row at the
 top, with a mark for each one waiting after it, and `ctrl-a tab`
 goes to it: wants first, then failed, then finished. It also lights its row and rings the
 bell, so you find out without looking, even when its space is folded. The name is the one
@@ -34,17 +35,22 @@ you would say, not the runtime underneath it: an agent installed as a node packa
 itself, not as `node`.
 
 The column opens thirty eight columns wide, and a drag on its edge pulls it anywhere from
-eighteen to half the window. Its foot signs it with the word in thick dots, one `●` a cell,
+twenty four to half the window. Its foot signs it with the word in thick dots, one `●` a cell,
 the q's tail and the r's first dot in ember, and your picked pet standing beside it on the
 menu row, the last row of the column. A column too narrow for both falls back to the word in
 braille.
 
-A space's own line ends in two controls, in the same three columns on every line whatever
-the name is: `z` puts every tab of the space to sleep, and `x` asks whether to close it. The
-question is drawn on the line itself, with `y` in the column `x` was in and `n` beside it,
+A space's own line ends in four chips, in the same columns on every line whatever the name
+is: `+` starts a terminal or an agent in the space (an agent asks for its name first),
+`sleep` puts every tab of the space to sleep and `wake` brings every sleeping tab of it back, `⋯` opens
+the space's settings, its name and its colour, and `x` asks whether to close it. The
+question is drawn on the line itself, with `y` in the chip `x` was in and `no` beside it,
 so a second click in the same place answers yes, and a `y` closes the space's tabs and then
-the space. Neither control has a key of its own: `ctrl-a Z`
-sleeps the tab you are in and `ctrl-a x` closes the tab you are on.
+the space. The chips have round caps where the terminal draws them and half blocks
+elsewhere; `QORO_CHIPS=round` or `QORO_CHIPS=flat` forces one. A space on another machine
+opens with that machine's first letter in a chip, green while it is connected. `ctrl-a R`
+opens the settings too, `ctrl-a Z` sleeps the tab you are in and `ctrl-a x` closes the tab
+you are on.
 
 Each agent wears a small square of nine dots in its state's colour. While it works the
 centre breathes: its arms come in clockwise and go back out, each breath starting one arm
