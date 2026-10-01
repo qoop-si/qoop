@@ -1357,6 +1357,55 @@ async fn an_empty_workspace_closes_and_a_live_default_or_unknown_one_does_not() 
     );
 }
 
+/// A space keeps the colour a person picked for it, and a number past the six inks is
+/// refused rather than stored: the list is what every client draws from.
+#[tokio::test]
+async fn a_space_colour_is_one_of_six_and_comes_back_in_the_list() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("inks").await;
+    let mut ask = async |request: ControlRequest| {
+        c.control(&request, PATIENCE)
+            .await
+            .expect("an answer to the request")
+    };
+    let ink = |id: &str, workspace, ink| ControlRequest::SetWorkspaceInk {
+        id: id.into(),
+        workspace,
+        ink,
+    };
+    let listed = |answer: ControlResponse| match answer {
+        ControlResponse::Workspaces { workspaces, .. } => workspaces[0].clone(),
+        other => panic!("expected a workspace list, got {other:?}"),
+    };
+
+    let space = listed(ask(ControlRequest::ListWorkspaces { id: "w0".into() }).await);
+    assert_eq!(space.ink, None);
+    let answer = ask(ink("i0", space.id, Some(6))).await;
+    assert!(
+        matches!(answer, ControlResponse::Failed { .. }),
+        "{answer:?}"
+    );
+    let answer = ask(ink("i1", 999_999, Some(1))).await;
+    assert!(
+        matches!(answer, ControlResponse::Failed { .. }),
+        "{answer:?}"
+    );
+    let answer = ask(ink("i2", space.id, Some(5))).await;
+    assert!(
+        matches!(answer, ControlResponse::Renamed { .. }),
+        "{answer:?}"
+    );
+    let space = listed(ask(ControlRequest::ListWorkspaces { id: "w1".into() }).await);
+    assert_eq!(space.ink, Some(5));
+    let answer = ask(ink("i3", space.id, None)).await;
+    assert!(
+        matches!(answer, ControlResponse::Renamed { .. }),
+        "{answer:?}"
+    );
+    let space = listed(ask(ControlRequest::ListWorkspaces { id: "w2".into() }).await);
+    assert_eq!(space.ink, None);
+}
+
 /// G2.17: a screen that never stops changing is still read.
 ///
 /// The settle that makes a burst one evaluation works because bursts end. An agent holding

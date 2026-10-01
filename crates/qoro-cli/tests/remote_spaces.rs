@@ -891,6 +891,7 @@ async fn pre_feature_daemon(
                                     asleep: false,
                                     sleeping: Vec::new(),
                                     closable: true,
+                                    ink: None,
                                 }],
                             },
                             "ListAgents" => ControlResponse::Agents {

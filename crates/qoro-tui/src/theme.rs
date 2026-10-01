@@ -88,6 +88,31 @@ pub fn space_calm_of(id: i64) -> Role {
     Role::SpaceCalm(id.unsigned_abs() as usize % SPACE_CALM_INKS.len())
 }
 
+/// The colour a space wears: the one a person picked for it, when its row in `spaces`
+/// names one of the six, else [`space_of`]. A space not in the list, or an ink past the
+/// six (a newer daemon's, say), is auto rather than a guess.
+///
+/// Read from the rows the caller holds rather than from a table kept here, so two
+/// machines whose space ids collide never share a pick, and a test cannot race another.
+pub fn space_in(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) -> Role {
+    picked(spaces, id).map_or_else(|| space_of(id), Role::Space)
+}
+
+/// The quieter step of [`space_in`], for a calm agent's title in that space.
+pub fn space_calm_in(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) -> Role {
+    picked(spaces, id).map_or_else(|| space_calm_of(id), Role::SpaceCalm)
+}
+
+/// The ink picked for space `id`, if one of the six was.
+fn picked(spaces: &[qoro_runtime::control::WorkspaceRow], id: i64) -> Option<usize> {
+    spaces
+        .iter()
+        .find(|row| row.id == id)
+        .and_then(|row| row.ink)
+        .map(usize::from)
+        .filter(|ink| *ink < SPACE_INKS.len())
+}
+
 /// The identity palette. Six, because a seventh distinct hue that is neither a state nor
 /// the greys the chrome is built from does not exist in a 256 colour terminal, and a wheel
 /// that comes round is better than one that lies.
@@ -759,6 +784,28 @@ mod tests {
         assert_eq!(space_of(3), space_of(3));
         for id in 1..6i64 {
             assert_ne!(space_of(id), space_of(id + 1), "spaces {id} and {}", id + 1);
+        }
+    }
+
+    /// A picked colour wins over the one the id gives, and no pick, a space not in the
+    /// list, or an ink past the six all fall back to it.
+    #[test]
+    fn a_picked_colour_wins_and_anything_else_is_auto() {
+        let row = |id, ink| qoro_runtime::control::WorkspaceRow {
+            id,
+            name: String::new(),
+            terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink,
+        };
+        let spaces = [row(1, Some(4)), row(2, None), row(3, Some(7))];
+        assert_eq!(space_in(&spaces, 1), Role::Space(4));
+        assert_eq!(space_calm_in(&spaces, 1), Role::SpaceCalm(4));
+        for id in [2, 3, 9] {
+            assert_eq!(space_in(&spaces, id), space_of(id), "space {id}");
+            assert_eq!(space_calm_in(&spaces, id), space_calm_of(id), "space {id}");
         }
     }
 

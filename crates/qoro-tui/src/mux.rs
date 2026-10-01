@@ -284,15 +284,13 @@ impl Link {
                 .spaces
                 .iter()
                 .map(|row| WorkspaceRow {
-                    id: row.id,
                     name: format!("{} ({})", row.name, self.reason),
                     terminals: 0,
-                    asleep: row.asleep,
-                    sleeping: row.sleeping.clone(),
                     // A link that is not answering cannot be asked to close anything, and
                     // what the far daemon would say about it is as stale as the rest of this
                     // row. No close, and no dead control drawn for one.
                     closable: false,
+                    ..row.clone()
                 })
                 .collect();
         }
@@ -303,6 +301,7 @@ impl Link {
             asleep: false,
             sleeping: Vec::new(),
             closable: false,
+            ink: None,
         }]
     }
 }
@@ -760,6 +759,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
+            R::SetWorkspaceInk { id, workspace, ink } => {
+                let (link, workspace) = workspace_in(workspace);
+                self.send_one(link, R::SetWorkspaceInk { id, workspace, ink })
+                    .await
+            }
             R::CloseWorkspace { id, workspace } => {
                 let (link, workspace) = workspace_in(workspace);
                 self.send_one(link, R::CloseWorkspace { id, workspace })
@@ -1190,8 +1194,6 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         Some(WorkspaceRow {
                             id: workspace_out(link, row.id)?,
                             name: space_name(&name, &row.name),
-                            terminals: row.terminals,
-                            asleep: row.asleep,
                             // The tabs of a sleeping space carry the machine's numbers,
                             // moved into this link's range like every other terminal.
                             sleeping: row
@@ -1203,10 +1205,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                                     Some(tab)
                                 })
                                 .collect(),
-                            // The far daemon's own answer, carried across: a remote space
-                            // carries its rules with it, and `CloseWorkspace` is routed
-                            // back to the link that owns it.
-                            closable: row.closable,
+                            // Everything else is the far daemon's own answer, carried
+                            // across: a remote space carries its rules with it, and
+                            // `CloseWorkspace` is routed back to the link that owns it.
+                            ..row
                         })
                     })
                     .collect();
@@ -1954,6 +1956,47 @@ mod tests {
         );
     }
 
+    /// A colour picked for a remote space goes to that remote in its own numbering: sent
+    /// home with the encoded number, the home daemon would say there is no such space.
+    #[tokio::test]
+    async fn a_remote_spaces_colour_goes_to_its_machine_in_its_own_numbering() {
+        let (home_tx, mut home_rx) = mpsc::unbounded_channel();
+        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
+        let mut home = Link::new(String::new(), None);
+        home.conn = Some((1, home_tx));
+        let mut remote = Link::new("devbox".into(), None);
+        remote.conn = Some((1, remote_tx));
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![Some(home), Some(remote)],
+            home: 0,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 0,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        mux.control(ControlRequest::SetWorkspaceInk {
+            id: "ink-1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            ink: Some(4),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::SetWorkspaceInk {
+                id: "ink-1".into(),
+                workspace: 3,
+                ink: Some(4),
+            }
+        );
+    }
+
     /// The ask to move to a newer qoro: kept while its link is down and sent when it is up
     /// again to a daemon still older than it. A pre-feature daemon's refusal of it is one
     /// actionable line, not a first list that failed, and a waiting reason is worded once.
@@ -2166,6 +2209,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         };
         mux.answer(
             0,

@@ -154,6 +154,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "colour a workspace",
+            method: || {
+                Method::Control(ControlRequest::SetWorkspaceInk {
+                    id: "a".into(),
+                    workspace: 1,
+                    ink: Some(2),
+                })
+            },
+        },
+        Action {
             name: "start a workspace",
             method: || {
                 Method::Control(ControlRequest::CreateWorkspace {
@@ -508,6 +518,11 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             name: String::new(),
         },
+        ControlRequest::SetWorkspaceInk {
+            id: String::new(),
+            workspace: 0,
+            ink: None,
+        },
         ControlRequest::RenameSession {
             id: String::new(),
             terminal: 0,
@@ -567,6 +582,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::RenameSession { .. }
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
+            | ControlRequest::SetWorkspaceInk { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

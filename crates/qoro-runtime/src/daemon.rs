@@ -3293,6 +3293,7 @@ async fn handle_control(
                     // `CloseWorkspace` refuses it (below), so a client that is told so
                     // does not draw a close for a space that cannot be closed.
                     closable: row.id != workspace,
+                    ink: row.ink,
                 });
             }
             ControlResponse::Workspaces { id, workspaces }
@@ -3454,6 +3455,27 @@ async fn handle_control(
                 Err(e) => ControlResponse::Failed {
                     id,
                     reason: format!("the workspace could not be renamed: {e}"),
+                },
+            }
+        }
+        // Six inks and auto, no more: every client has six space inks, and a number past
+        // them is refused here rather than stored and read as auto everywhere.
+        ControlRequest::SetWorkspaceInk { workspace, ink, .. } => {
+            if ink.is_some_and(|ink| ink >= 6) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "a space colour is one of six".to_string(),
+                };
+            }
+            match store.set_workspace_ink(workspace, ink).await {
+                Ok(false) => ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no workspace {workspace}"),
+                },
+                Ok(true) => ControlResponse::Renamed { id },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the workspace colour could not be saved: {e}"),
                 },
             }
         }

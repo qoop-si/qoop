@@ -102,6 +102,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             workspace: 1,
             name: "webshop".into(),
         },
+        ControlRequest::SetWorkspaceInk {
+            id: "x14b".into(),
+            workspace: 1,
+            ink: Some(2),
+        },
         ControlRequest::Shutdown { id: "x15".into() },
         ControlRequest::Scrollback {
             id: "x16".into(),
@@ -195,6 +200,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::RenameSession { .. }
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
+            | ControlRequest::SetWorkspaceInk { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

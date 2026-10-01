@@ -63,6 +63,9 @@ pub struct WorkspaceRow {
     pub id: i64,
     pub name: String,
     pub created_at: i64,
+    /// The colour a person picked for it, one of the six space inks. `None` is the
+    /// colour its id gives it.
+    pub ink: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +239,14 @@ impl Store {
              CREATE TABLE IF NOT EXISTS session_title (
                  session TEXT PRIMARY KEY,
                  title TEXT NOT NULL
+             );
+             -- The colour a person picked for a space. Only a picked one has a row; the
+             -- rest take the colour their id gives them. Cascaded with the space, because
+             -- ids are reused and a new space must not inherit an old one's colour. New
+             -- table, no version bump, for the reason the ones above give.
+             CREATE TABLE IF NOT EXISTS workspace_ink (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+                 ink INTEGER NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -262,6 +273,37 @@ impl Store {
         )?)
     }
 
+    /// Pick a workspace's colour, or with `None` give it back the one its id gives it.
+    ///
+    /// Answers false when there is no such workspace, like a rename that touched nothing.
+    pub fn set_workspace_ink(&self, id: i64, ink: Option<u8>) -> Result<bool, StoreError> {
+        match ink {
+            // Through a select on the space, so a missing one inserts nothing rather than
+            // failing on the foreign key.
+            Some(ink) => Ok(self.conn.execute(
+                "INSERT OR REPLACE INTO workspace_ink (workspace, ink) \
+                 SELECT id, ?2 FROM workspace WHERE id = ?1",
+                params![id, ink],
+            )? > 0),
+            None => {
+                let exists = self
+                    .conn
+                    .query_row("SELECT 1 FROM workspace WHERE id = ?1", params![id], |_| {
+                        Ok(())
+                    })
+                    .optional()?
+                    .is_some();
+                if exists {
+                    self.conn.execute(
+                        "DELETE FROM workspace_ink WHERE workspace = ?1",
+                        params![id],
+                    )?;
+                }
+                Ok(exists)
+            }
+        }
+    }
+
     /// Drop a workspace row.
     ///
     /// Answers how many rows it touched, like the rename above. Terminal and layout rows
@@ -275,15 +317,20 @@ impl Store {
     }
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, created_at FROM workspace ORDER BY id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT w.id, w.name, w.created_at, i.ink FROM workspace w \
+                 LEFT JOIN workspace_ink i ON i.workspace = w.id ORDER BY w.id",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(WorkspaceRow {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     created_at: r.get(2)?,
+                    // A value no byte can hold is auto rather than a list that fails.
+                    ink: r
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|ink| u8::try_from(ink).ok()),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1398,6 +1445,30 @@ mod tests {
         s.sleep_terminals(5, &[bare(1)]).expect("sleep");
         s.delete_workspace(ws).expect("delete");
         assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    #[test]
+    fn a_picked_colour_round_trips_and_goes_with_its_space() {
+        let s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        assert_eq!(s.workspaces().expect("list")[0].ink, None);
+        // Back to auto on a space that never had a colour is still a yes.
+        assert!(s.set_workspace_ink(ws, None).expect("none"));
+        assert!(s.set_workspace_ink(ws, Some(3)).expect("set"));
+        assert!(s.set_workspace_ink(ws, Some(4)).expect("again"));
+        assert_eq!(s.workspaces().expect("list")[0].ink, Some(4));
+        assert!(s.set_workspace_ink(ws, None).expect("auto"));
+        assert_eq!(s.workspaces().expect("list")[0].ink, None);
+        // No such space, either way: nothing written.
+        assert!(!s.set_workspace_ink(ws + 1, Some(1)).expect("missing"));
+        assert!(!s.set_workspace_ink(ws + 1, None).expect("missing"));
+
+        // Ids are reused, so the next space under this id starts on auto.
+        assert!(s.set_workspace_ink(ws, Some(2)).expect("set"));
+        s.delete_workspace(ws).expect("delete");
+        let again = s.create_workspace("v", 2).expect("ws");
+        assert_eq!(again, ws);
+        assert_eq!(s.workspaces().expect("list")[0].ink, None);
     }
 
     #[test]

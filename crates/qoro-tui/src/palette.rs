@@ -386,6 +386,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }
     }
 

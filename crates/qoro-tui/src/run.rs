@@ -9028,6 +9028,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }
     }
 
@@ -11775,6 +11776,7 @@ mod tests {
             terminals: 0,
             asleep: false,
             sleeping: Vec::new(),
+            ink: None,
         }];
         state.space = Some(1);
         assert!(matches!(

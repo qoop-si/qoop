@@ -147,6 +147,10 @@ impl StoreHandle {
         self.run(move |s| s.rename_workspace(id, &name)).await
     }
 
+    pub async fn set_workspace_ink(&self, id: i64, ink: Option<u8>) -> Result<bool, HandleError> {
+        self.run(move |s| s.set_workspace_ink(id, ink)).await
+    }
+
     pub async fn delete_workspace(&self, id: i64) -> Result<usize, HandleError> {
         self.run(move |s| s.delete_workspace(id)).await
     }

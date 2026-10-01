@@ -1083,7 +1083,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let ink = if space.asleep {
         Role::Sleeping
     } else {
-        crate::theme::space_of(space.id)
+        crate::theme::space_in(c.spaces, space.id)
     };
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
@@ -1629,9 +1629,9 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         && !matches!(agent.state.as_str(), "working" | "starting")
         && !needs_person(agent, c.focused_terminal, c.seen, c.unseen);
     let ink = if calm {
-        crate::theme::space_calm_of(agent.workspace)
+        crate::theme::space_calm_in(c.spaces, agent.workspace)
     } else {
-        crate::theme::space_of(agent.workspace)
+        crate::theme::space_in(c.spaces, agent.workspace)
     };
     let mut runs = Vec::new();
     if !stale {
@@ -1693,7 +1693,11 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
         let at = crate::width::width(&left) + 1;
         (
             fit(&format!("{left} {space} "), c.width),
-            Some((at, space_w, crate::theme::space_of(agent.workspace))),
+            Some((
+                at,
+                space_w,
+                crate::theme::space_in(c.spaces, agent.workspace),
+            )),
         )
     };
     Line {
@@ -1868,7 +1872,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
                 // The space mark sits on the first pad cell, never on the glyph: the glyph
                 // column keeps the state colour, so the strip carries state and space side
                 // by side instead of painting one over the other.
-                accent: Some((2, 1, crate::theme::space_of(agent.workspace))),
+                accent: Some((2, 1, crate::theme::space_in(c.spaces, agent.workspace))),
                 ..Line::default()
             },
             Some(Hit::Terminal(agent.terminal)),
@@ -1897,7 +1901,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
         content.push((
             Line {
                 text,
-                accent: Some((1, number.len(), crate::theme::space_of(space.id))),
+                accent: Some((1, number.len(), crate::theme::space_in(c.spaces, space.id))),
                 indicator,
                 ..Line::default()
             },
@@ -2605,6 +2609,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }
     }
 
@@ -3026,6 +3031,33 @@ mod tests {
         assert_eq!(title(7), None, "stale dims as a whole");
         assert_eq!(tree_row(&rows, 7).colour, Some(crate::theme::Role::Faint));
         assert_eq!(title(8), Some(space_of(1)), "an unread finish is news");
+    }
+
+    /// A colour picked for a space reaches its rule and its agents' titles: the column
+    /// reads it from its own rows, so nothing else has to be told.
+    #[test]
+    fn a_picked_colour_reaches_the_rule_and_the_titles() {
+        use crate::theme::Role;
+        let mut spaces = vec![space(1, "app")];
+        spaces[0].ink = Some(4);
+        let agents = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "claude", "idle"),
+        ];
+        let rows = tree_rows(&spaces, &agents, 1, 40, &Seen::new(), &Shut::new());
+        assert_eq!(
+            rule_row(&rows, 1).accent,
+            Some((NAME_AT, 3, Role::Space(4)))
+        );
+        let title = |terminal: u32| {
+            tree_row(&rows, terminal)
+                .runs
+                .iter()
+                .find(|(at, _, _)| *at == BOX_LEAD + 2)
+                .map(|run| run.2)
+        };
+        assert_eq!(title(1), Some(Role::Space(4)));
+        assert_eq!(title(2), Some(Role::SpaceCalm(4)));
     }
 
     /// Every space is one rule: a blank, the name, what it holds beside the name, and
@@ -6734,6 +6766,7 @@ mod tests {
                 Vec::new()
             },
             closable,
+            ink: None,
         };
         let spaces = vec![space];
         let agents: Vec<AgentRow> = (1..=held as u32)
@@ -7035,6 +7068,7 @@ mod tests {
                 })
                 .collect(),
             closable: true,
+            ink: None,
         }];
         let agents: Vec<AgentRow> = (1..=3).map(|n| agent(n, 1, "claude", "idle")).collect();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());

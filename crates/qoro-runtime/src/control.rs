@@ -116,6 +116,14 @@ pub enum ControlRequest {
         workspace: i64,
         name: String,
     },
+    /// Pick a workspace's colour: one of the six space inks, or `None` for the one its id
+    /// gives it. Answered `Renamed`, like the rename beside it, and announced to nobody
+    /// either: another client sees it on its next list.
+    SetWorkspaceInk {
+        id: String,
+        workspace: i64,
+        ink: Option<u8>,
+    },
     /// End a terminal and everything it contains, per ADR-014.
     CloseTerminal {
         id: String,
@@ -373,6 +381,7 @@ impl ControlRequest {
             | Self::RenameSession { id, .. }
             | Self::MoveTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
+            | Self::SetWorkspaceInk { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
             | Self::SearchScrollback { id, .. }
@@ -729,6 +738,10 @@ pub struct WorkspaceRow {
     /// cost of missing is one control that is not drawn.
     #[serde(default)]
     pub closable: bool,
+    /// The colour a person picked for it, one of the six space inks. Absent is the colour
+    /// its id gives it, which is also what an older daemon's row reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ink: Option<u8>,
 }
 
 /// A tab that stayed awake when its workspace was put to sleep, and why.
@@ -1475,6 +1488,40 @@ mod tests {
         let encoded = serde_json::to_vec(&response).expect("encode");
         let decoded: ControlResponse = serde_json::from_slice(&encoded).expect("decode");
         assert_eq!(response, decoded);
+    }
+
+    /// A picked colour crosses the wire; a row from an older daemon reads as auto, and a
+    /// row with no pick says nothing about it, so an older client sees the row it knew.
+    #[test]
+    fn a_space_colour_crosses_the_wire_and_its_absence_is_auto() {
+        let old: WorkspaceRow =
+            serde_json::from_str(r#"{"id":1,"name":"w","terminals":0}"#).expect("decode");
+        assert_eq!(old.ink, None);
+        let picked = WorkspaceRow {
+            ink: Some(4),
+            ..old.clone()
+        };
+        let text = serde_json::to_string(&picked).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<WorkspaceRow>(&text).expect("decode"),
+            picked
+        );
+        let text = serde_json::to_string(&old).expect("encode");
+        assert!(!text.contains("ink"), "{text}");
+
+        for ink in [Some(2), None] {
+            let request = ControlRequest::SetWorkspaceInk {
+                id: "ink-1".into(),
+                workspace: 3,
+                ink,
+            };
+            let encoded = serde_json::to_vec(&request).expect("encode");
+            assert_eq!(
+                serde_json::from_slice::<ControlRequest>(&encoded).expect("decode"),
+                request
+            );
+            assert_eq!(request.request_id(), "ink-1");
+        }
     }
 
     #[test]

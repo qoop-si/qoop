@@ -708,7 +708,10 @@ pub fn paint(frame: &Frame) -> String {
                 tabs::Ink::FocusedMark => theme::fg(theme::Role::Brand),
                 // The bar shows one space's terminals, so one space colour lands on
                 // all of them: identity, not confetti. Focus keeps the pink name.
-                tabs::Ink::Other => theme::tab_in(theme::space_of(frame.space.unwrap_or_default())),
+                tabs::Ink::Other => theme::tab_in(theme::space_in(
+                    frame.spaces,
+                    frame.space.unwrap_or_default(),
+                )),
                 tabs::Ink::Curve => theme::fg(theme::Role::Rule),
                 tabs::Ink::Sub | tabs::Ink::Quiet => theme::fg(theme::Role::Faint),
             });
@@ -1353,7 +1356,7 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                     theme::fg(theme::Role::Text)
                 };
                 let state_ink = entry.state.as_deref().map(theme::of);
-                let space_ink = entry.space.map(theme::space_of);
+                let space_ink = entry.space.map(|id| theme::space_in(frame.spaces, id));
                 // Cut to the box: on the narrowest windows a state word alone is wider
                 // than the room beside its two spaces, and the row ran off the screen.
                 let sub = width::text(
@@ -2392,7 +2395,7 @@ fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
         format!(
             "{} {}{space}{} / {}{program} is {}{}{}",
             theme::fg(theme::Role::Text),
-            theme::fg(theme::space_of(row.workspace)),
+            theme::fg(theme::space_in(frame.spaces, row.workspace)),
             theme::fg(theme::Role::Faint),
             theme::fg(theme::Role::Text),
             theme::fg(theme::of(&row.state)),
@@ -3092,6 +3095,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }]
     }
 
@@ -3702,13 +3706,16 @@ mod tests {
     #[test]
     fn unfocused_tabs_wear_the_focused_space_while_focus_keeps_the_pill() {
         // The bar shows one space's terminals: every unfocused tab wears that
-        // space's ink, and only the focused tab wears the pink pill.
+        // space's ink, the one picked for it rather than the one its id gives, and only
+        // the focused tab wears the pink pill.
         let rows = [row(1, "zsh", "idle"), row(3, "sh", "idle")];
+        let mut picked = spaces();
+        picked[0].ink = Some(4);
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
             rows: &rows,
-            spaces: &spaces(),
+            spaces: &picked,
             panes: std::collections::BTreeMap::new(),
             space: Some(1),
             focused: 1,
@@ -3746,7 +3753,7 @@ mod tests {
         let bar_end = painted[bar_start..].find("\x1b[0m").expect("no bar reset");
         let bar = &painted[bar_start..bar_start + bar_end];
         assert!(
-            bar.contains(&crate::theme::tab_in(crate::theme::space_of(1))),
+            bar.contains(&crate::theme::tab_in(crate::theme::Role::Space(4))),
             "unfocused tab lost its space colour: {bar:?}"
         );
         assert!(
@@ -4980,6 +4987,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }];
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
@@ -5339,6 +5347,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }];
         let palette = Palette::open();
         let painted = paint(&Frame {
@@ -5745,6 +5754,7 @@ mod tests {
             asleep: false,
             sleeping: Vec::new(),
             closable: true,
+            ink: None,
         }];
         let states = [
             "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",

@@ -2491,6 +2491,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                             asleep: false,
                             sleeping: Vec::new(),
                             closable: true,
+                            ink: None,
                         }],
                     },
                     "ListAgents" => ControlResponse::Agents {
