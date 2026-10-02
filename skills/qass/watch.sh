@@ -3,7 +3,7 @@
 #
 # Reads `qoro agents --watch --json` (the whole row array on every change) and
 # prints a line only when an agent reaches a state that waits on somebody
-# (idle, blocked, failed, done, sleeping), or closes. A row also changes on
+# (idle, blocked, failed, done, sleeping), or sleeps, or closes. A row also changes on
 # every tool call (activity, cwd), so only terminal, generation and state are
 # compared. Its own terminal is skipped.
 #
@@ -43,7 +43,8 @@ diff="$defs"'
      elif $o.state != $r.state and ($r.state | waits) then line($r; $o.state)
      else empty end),
   ($old | to_entries[] | select($new[.key] == null) | .value
-   | "T\(.terminal) g\(.generation) \(.program // "-" | clean) \(.state)->closed")
+   | . as $r | ($sleeping | index($r.terminal)) as $asleep
+   | line($r + {state: (if $asleep != null then "sleeping" else "closed" end)}; $r.state))
 '
 
 # $b is a row array and $due terminal numbers; prints those that still wait.
@@ -101,7 +102,11 @@ while IFS= read -r snap; do
         continue
     fi
     if [ "$gone" = 0 ]; then
-        out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" "$diff")"
+        # A tab that slept leaves the agent rows too; `qoro ls` still names it.
+        sleeping="$(qoro ls --json 2>/dev/null | jq -c '[.[].sleeping[]?]' 2>/dev/null | head -1 || true)"
+        case "$sleeping" in \[*\]) ;; *) sleeping='[]' ;; esac
+        out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
+            --argjson sleeping "${sleeping:-[]}" "$diff")"
         if [ -n "$out" ]; then
             printf '%s\n' "$out"
             touch "$dir/last-wake"

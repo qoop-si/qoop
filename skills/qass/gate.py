@@ -226,7 +226,16 @@ def check_write(kind, terminal, generation, text=None, keys=None):
     live = rows()
     relay = False
 
-    if kind == "spawn":
+    if kind == "wake":
+        if terminal == me:
+            raise Deny("never write to the qass tab")
+        asleep = {str(t) for sp in json.loads(run(["qoro", "ls", "--json"]))
+                  for t in sp.get("sleeping") or []}
+        if terminal not in asleep:
+            raise Deny(f"terminal {terminal} is not asleep")
+        # Waking it to pass on his answer to its card needs no further ok.
+        relay = any(w[0] == terminal for w in relays(history).values()) and "wake"
+    elif kind == "spawn":
         if mode != "auto":
             raise Deny("spawning needs mode auto")
         alive = {(r["terminal"], r["generation"]) for r in live}
@@ -280,7 +289,7 @@ def check_write(kind, terminal, generation, text=None, keys=None):
                     raise Deny(f"policy grants no {', '.join(sorted(missing))} for {root}")
 
     if relay:
-        pass  # one per escalation he answered, counted in relays()
+        pass  # bound to an escalation he answered (relays())
     elif mode == "propose":
         if not approvals(history, now):
             raise Deny("mode propose: waiting for the owner's ok to a P<n>")
@@ -296,7 +305,9 @@ def check_write(kind, terminal, generation, text=None, keys=None):
             raise Deny(f"{PER_HOUR} writes in the last hour")
 
     append({"write": kind, "terminal": terminal, "generation": generation,
-            "spent": mode == "propose" and not relay, "relay": relay,
+            # Waking spends no ok: the message it wakes the tab for spends it.
+            "spent": mode == "propose" and not relay and kind != "wake",
+            "relay": relay if relay != "wake" else False,
             "text": text if text is not None else " ".join(keys or [])})
 
 
@@ -304,6 +315,9 @@ def check_bash(command, subagent):
     w = words(command)
     if w[0] == "qoro" and len(w) >= 2:
         sub, rest = w[1], w[2:]
+        if sub == "ls":
+            flags(rest, {"--json": None})
+            return
         if sub == "agents":
             flags(rest, {"--json": None})
             return
@@ -318,6 +332,11 @@ def check_bash(command, subagent):
             return
         if subagent:
             raise Deny("subagents only read")
+        if sub == "wake":
+            if len(w) != 4 or w[2] != "--tab" or not is_num(w[3]):
+                raise Deny("wake must be: qoro wake --tab <n>")
+            check_write("wake", w[3], "-")
+            return
         if sub == "prompt":
             if len(w) != 7 or not is_num(w[2]) or w[3] != "--generation" or not is_num(w[4]) or w[5] != "--":
                 raise Deny("prompt must be: qoro prompt <n> --generation G -- '<text>'")
@@ -332,6 +351,12 @@ def check_bash(command, subagent):
             check_write("send", w[2], w[-1], keys=keys[1::2])
             return
         raise Deny(f"qoro {sub} is not allowed")
+    if w[:2] == ["wend", "show"] and len(w) >= 3:
+        # A closed agent's last words, by the session id kept in goals.md.
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", w[2]):
+            raise Deny("wend show takes a session id")
+        flags(w[3:], {"--tail": is_num})
+        return
     if w[:2] == ["wend", "search"] and len(w) > 2:
         if w[2].startswith("-"):
             raise Deny("the query comes first")

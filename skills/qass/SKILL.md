@@ -19,8 +19,11 @@ around it.
 
 ## Start
 
-1. `qoro agents --json`, then read `~/.qass/goals.md` and `~/.qass/policy`
-   (create `goals.md` if missing, with the sections below).
+1. `qoro agents --json` and `qoro ls --json` (each space's `sleeping` tabs), then read
+   `~/.qass/goals.md` and `~/.qass/policy` (create `goals.md` if missing, with the
+   sections below). For each worker in `goals.md` that now sleeps or is gone, read where
+   it stopped (below, "Asleep or gone") and write a card for one that left a question or
+   unfinished work.
 2. Load the Monitor tool (ToolSearch `select:Monitor`) and start
    `Monitor(command: "<this skill's dir>/watch.sh", timeout_ms: 1800000,
    description: "qass fleet")`. When it expires, start it again at once.
@@ -30,7 +33,8 @@ around it.
 
 ## On every event line
 
-A line looks like `T52 g3 claude working->idle "title" /path`.
+A line looks like `T52 g3 claude working->idle "title" /path`. `->sleeping` and
+`->closed` go to "Asleep or gone" below instead.
 
 1. `qoro context 52 --last 1 --lines 40`. If the generation is no longer 3,
    drop the event.
@@ -52,13 +56,32 @@ A line looks like `T52 g3 claude working->idle "title" /path`.
      "continue", or the same in his language) or starts a skill that runs to
      the end on its own, do not nudge. Escalate only a question or a failure;
      a plain finish is silent.
-3. Classify: finished, asks a question, blocked on a menu, failed, sleeping,
-   closed. Sleeping and closed are notes in `goals.md`, never "finished".
+3. Classify: finished, asks a question, blocked on a menu, failed.
 4. Before you write anything to the worker, know where it stands (below).
 5. Decide with the table. Apply his standards; never predict a yes or no he
    did not give.
 6. Act, or write it down, or escalate (below). Then stay quiet until the next
    event. No polling, no progress messages.
+
+## Asleep or gone
+
+A tab that sleeps or closes keeps its conversation; you do not need it awake to read it.
+
+- **Asleep** (`->sleeping`, or in `qoro ls --json` `sleeping`): its last words are still
+  there: `qoro history <n> --role assistant --last 1` and `qoro read <n>` (its last screen).
+- **Gone** (`->closed`): by the session id on its `goals.md` line,
+  `wend show <session id> --tail 3`.
+
+If it stopped on a question or with work half done, write a card for later; for one asleep
+the options say what waking it would do ("A: wake it and say yes"); for one gone, the Did
+line names how he can reopen it (`claude --resume <session id>` in its directory). A clean
+finish is a note on its `goals.md` line, no card. Never call either "finished" unless its
+last words show the work done.
+
+To pass his answer to a sleeping agent: `qoro wake --tab <n>` alone, end your turn; it comes
+back in its own conversation and shows up as an event (`new` or `restarted`); then relay with
+its new generation. The gate lets you wake a tab only when it sleeps and only when he
+answered its card (or, in `mode propose`, said ok to it). A gone agent cannot be woken.
 
 ## Where a worker stands
 

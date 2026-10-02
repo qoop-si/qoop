@@ -27,6 +27,7 @@ cat > "$tmp/snapshots" <<EOF
 EOF
 cat > "$tmp/bin/qoro" <<EOF
 #!/bin/sh
+[ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 cat "$tmp/snapshots"
 EOF
 chmod +x "$tmp/bin/qoro"
@@ -37,7 +38,7 @@ T6 g2 claude restarted->idle "task" /w
 T7 g1 claude working->blocked "say hi rm -rf " /w
 daemon-gone
 T5 g1 claude working->failed "task" /w
-T7 g1 claude blocked->closed'
+T7 g1 claude blocked->closed "task" /w'
 
 got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$root/skills/qass/watch.sh")"
 if [ "$got" != "$expected" ]; then
@@ -66,10 +67,25 @@ printf -- '- T5 g1 x: task; hands off until %s\n- T6 g1 y: task; hands off until
     $((now + 3)) $((now - 1)) $((now + 999)) > "$tmp/home/.qass/goals.md"
 cat > "$tmp/bin/qoro" <<EOF
 #!/bin/sh
+[ "\$1" = ls ] && { echo '[]'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 22 2>/dev/null
 EOF
 got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$root/skills/qass/watch.sh" || true)"
 [ "$got" = 'T5 g1 claude hands-off->idle "task" /w' ] || { echo "hands-off printed: $got"; exit 1; }
+
+# A tab that slept is not a tab that closed.
+printf '%s\n' "[$(row 5 1 idle)]" "[$(row 6 1 working)]" > "$tmp/snapshots"
+echo '[{"name":"a","sleeping":[5]}]' > "$tmp/ls"
+cat > "$tmp/bin/qoro" <<EOF
+#!/bin/sh
+[ "\$1" = ls ] && { cat "$tmp/ls"; exit 0; }
+cat "$tmp/snapshots"
+EOF
+rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/goals.md"
+got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$root/skills/qass/watch.sh")"
+[ "$got" = 'T5 g1 claude new->idle "task" /w
+T5 g1 claude idle->sleeping "task" /w' ] || { echo "sleep printed: $got"; exit 1; }
+rm -f "$tmp/ls"
 
 echo "qass watch: ok"
 
@@ -81,6 +97,7 @@ git -C "$home/coding/app" init -q
 cat > "$tmp/bin/qoro" <<EOF
 #!/bin/sh
 [ -f "$tmp/hang" ] && sleep 10
+[ "\$1" = ls ] && { echo '[{"name":"s","sleeping":[11]}]'; exit 0; }
 echo '[{"terminal":5,"generation":3,"agent":true,"state":"idle","cwd":"$home/coding/app"},{"terminal":6,"generation":1,"agent":false,"state":"unknown"},{"terminal":7,"generation":1,"agent":true,"state":"idle","cwd":"$home/coding/app"},{"terminal":8,"generation":1,"agent":true,"state":"idle","cwd":"$home/coding/app"}]'
 EOF
 fence="Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first."
@@ -293,6 +310,29 @@ owner_ "temizle"
 case_ allow "$(lesson_ '')" "an empty write after the owner spoke"
 case_ deny "$(lesson_ '')" "a second empty write before he speaks again"
 case_ deny "$(tool_ Write file_path "$home/.qass/other.md")" "another file in .qass"
+
+# Sleeping and closed agents: read by session id, woken only on the owner's word.
+case_ allow "$(bash_ 'qoro ls --json')" "the list of sleeping tabs"
+case_ allow "$(bash_ 'qoro ls --json' sub1)" "a subagent lists sleeping tabs"
+case_ allow "$(bash_ 'wend show 0d8f3e1a-8464-405f --tail 3')" "a closed agent's last words"
+case_ deny "$(bash_ 'wend show ../../x --tail 3')" "wend show with a path"
+case_ deny "$(bash_ 'wend show 0d8f3e1a-8464 --head 2')" "wend show with another flag"
+printf 'mode propose\n' > "$home/.qass/policy"
+case_ deny "$(bash_ 'qoro wake --tab 11')" "propose: waking without his word"
+case_ deny "$(bash_ 'qoro wake 11')" "waking a space, not a tab"
+case_ allow "$(bash_ "$esc E30 11 later 'A: wake it and say yes' 'B: let it sleep'")" "a card about sleeping 11"
+owner_ "E30 A"
+case_ deny "$(bash_ 'qoro wake --tab 11' sub1)" "a subagent waking"
+case_ allow "$(bash_ 'qoro wake --tab 11')" "waking 11 to pass on his answer"
+case_ deny "$(bash_ 'qoro wake --tab 5')" "waking a tab that is awake"
+owner_ "ok P40"
+case_ allow "$(bash_ 'qoro wake --tab 11')" "propose: waking for an ok"
+case_ allow "$(bash_ "$(prompt_ 5 3 "Do P40. $fence")")" "propose: the ok still pays the message"
+case_ deny "$(bash_ "$(prompt_ 5 3 "More. $fence")")" "propose: and only that one"
+printf 'mode auto\n' > "$home/.qass/policy"
+owner_ "devam"
+case_ allow "$(bash_ 'qoro wake --tab 11')" "auto: waking within the caps"
+printf 'mode propose\n' > "$home/.qass/policy"
 
 # A plan is readable only where a live worker works, worktrees included.
 mkdir -p "$home/coding/other/plans" "$home/coding/app-wt"
