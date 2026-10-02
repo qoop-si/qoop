@@ -652,58 +652,42 @@ fn chip(text: &str, (at, len): (usize, usize), role: theme::Role, selected: bool
     out
 }
 
-/// The mark a row of the keyboard's agent wears at its right end: a bracket down the right
-/// side, a curve opening its first row, a curve closing its last and a line between. On the
-/// right, away from the state mark that animates at the left, and the rows sit back to back,
-/// so the curves join into one shape instead of two loose hooks. One row alone is the line.
-fn corners_of(picked: &[usize], row: usize) -> Option<(Option<char>, Option<char>)> {
-    let (first, last) = (picked.first()?, picked.last()?);
-    let right = match row {
-        _ if !picked.contains(&row) => return None,
-        _ if first == last => '\u{2502}',
-        _ if row == *first => '\u{256e}',
-        _ if row == *last => '\u{256f}',
-        _ => '\u{2502}',
-    };
-    Some((None, Some(right)))
-}
-
-/// A column row with its first and last cell turned into ember corners, where those cells
-/// are blank and no coloured run covers them, so a long name is never cut by its mark.
-fn with_corners(
-    line: &sidebar::Line,
-    (left, right): (Option<char>, Option<char>),
-) -> sidebar::Line {
+/// A row of the keyboard's agent with its tree connector (`└`) in ember: the one mark the
+/// selection needs, made of a cell the row already draws, so nothing new sits beside the
+/// state mark that animates or against the column's rule. The connector's own one-cell run
+/// (its quiet grey) is recoloured; a wider run over it is left as it is.
+fn with_connector(line: &sidebar::Line) -> sidebar::Line {
     let mut line = line.clone();
-    let wide = width::width(&line.text);
-    let covered = |col: usize| {
-        line.runs
-            .iter()
-            .chain(line.accent.iter())
-            .chain(line.indicator.iter())
-            .any(|(at, len, _)| col >= *at && col < at + len)
+    let Some(at) = line
+        .text
+        .chars()
+        .scan(0usize, |col, c| {
+            let start = *col;
+            *col += width::columns(c);
+            Some((start, c))
+        })
+        .find(|(_, c)| *c == '\u{2514}')
+        .map(|(start, _)| start)
+    else {
+        return line;
     };
-    let mut chars: Vec<char> = line.text.chars().collect();
-    let mut marks = Vec::new();
-    if let Some(left) = left
-        && wide > 1
-        && chars.first() == Some(&' ')
-        && !covered(0)
+    if let Some(own) = line
+        .runs
+        .iter_mut()
+        .find(|(from, len, _)| *from == at && *len == 1)
     {
-        chars[0] = left;
-        marks.push(0);
+        own.2 = theme::Role::Brand;
+        return line;
     }
-    if let Some(right) = right
-        && wide > 1
-        && chars.last() == Some(&' ')
-        && !covered(wide - 1)
-    {
-        *chars.last_mut().expect("not empty") = right;
-        marks.push(wide - 1);
+    let covered = line
+        .runs
+        .iter()
+        .chain(line.accent.iter())
+        .chain(line.indicator.iter())
+        .any(|(from, len, _)| at >= *from && at < from + len);
+    if !covered {
+        line.runs.push((at, 1, theme::Role::Brand));
     }
-    line.text = chars.into_iter().collect();
-    line.runs
-        .extend(marks.into_iter().map(|at| (at, 1, theme::Role::Brand)));
     line
 }
 
@@ -793,8 +777,8 @@ pub fn paint(frame: &Frame) -> String {
         .iter()
         .find(|r| r.terminal == column.focused_terminal && !r.agent)
         .map(|r| r.workspace);
-    // The keyboard's agent wears the focused pane's corners: an ember curve at each end of
-    // its first and last row, in place of a raised background.
+    // The rows of the keyboard's agent: its tree connector turns ember, in place of a
+    // raised background.
     let picked: Vec<usize> = panel
         .iter()
         .enumerate()
@@ -844,18 +828,17 @@ pub fn paint(frame: &Frame) -> String {
                 // A tab with no agent has no row in the column, so the keyboard on one is
                 // shown on its space's rule instead: the column always says where it is.
                 Some(sidebar::Hit::Space(space)) => shell_space == Some(*space),
-                // The keyboard's agent is marked by its corners below, not a background.
+                // The keyboard's agent is marked by its ember connector, not a background.
                 Some(sidebar::Hit::Terminal(_))
                 | Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Next(_))
                 | None => false,
             };
-            let cornered;
-            let line = match corners_of(&picked, row) {
-                Some(ends) => {
-                    cornered = with_corners(line, ends);
-                    &cornered
-                }
-                None => line,
+            let marked;
+            let line = if picked.contains(&row) {
+                marked = with_connector(line);
+                &marked
+            } else {
+                line
             };
             // The next row sits on the status bar's band: the one container on the column,
             // so it reads as the place to look, not as another row of the list.
@@ -5381,40 +5364,35 @@ mod tests {
         }
     }
 
-    /// The keyboard's agent is marked by an ember bracket down its right side: a curve on its
-    /// first row, a curve on its last, a line between, and never over a name's last cell.
+    /// The keyboard's agent is marked by its tree connector in ember and nothing else; a row
+    /// with no connector, or one a wider run already covers, is left as it is.
     #[test]
-    fn the_keyboards_agent_wears_a_bracket_on_its_right() {
+    fn the_keyboards_agent_wears_an_ember_connector() {
         use crate::theme::Role;
-        let (tl, br) = ('\u{256d}', '\u{256f}');
-        let (tr, bar) = ('\u{256e}', '\u{2502}');
-        assert_eq!(corners_of(&[4, 5], 4), Some((None, Some(tr))));
-        assert_eq!(corners_of(&[4, 5], 5), Some((None, Some(br))));
-        assert_eq!(corners_of(&[4, 5, 6], 5), Some((None, Some(bar))));
-        assert_eq!(corners_of(&[4], 4), Some((None, Some(bar))));
-        assert_eq!(corners_of(&[4, 5], 6), None);
-        assert_eq!(corners_of(&[], 4), None);
-        let line = sidebar::Line {
+        let sub = sidebar::Line {
+            text: "   \u{2514} claude   ".to_string(),
+            ..Default::default()
+        };
+        let marked = with_connector(&sub);
+        assert_eq!(marked.text, sub.text);
+        assert!(marked.runs.contains(&(3, 1, Role::Brand)), "{marked:?}");
+        let title = sidebar::Line {
             text: " \u{2818}\u{2802}claude   ".to_string(),
             indicator: Some((1, 2, Role::Working)),
             ..Default::default()
         };
-        let top = with_corners(&line, (Some(tl), None));
-        assert_eq!(top.text, "\u{256d}\u{2818}\u{2802}claude   ");
-        assert!(top.runs.contains(&(0, 1, Role::Brand)), "{top:?}");
-        let bottom = with_corners(&line, (None, Some(br)));
-        assert_eq!(bottom.text, " \u{2818}\u{2802}claude  \u{256f}");
-        assert!(bottom.runs.contains(&(11, 1, Role::Brand)), "{bottom:?}");
-        assert_eq!(width::width(&bottom.text), width::width(&line.text));
-        // A name that runs to the edge keeps its last cell.
-        let full = sidebar::Line {
-            text: " claudeclaude".to_string(),
-            ..Default::default()
+        assert_eq!(with_connector(&title), title);
+        let covered = sidebar::Line {
+            runs: vec![(3, 2, Role::Faint)],
+            ..sub.clone()
         };
-        assert_eq!(
-            with_corners(&full, (Some(tl), Some(br))).text,
-            "\u{256d}claudeclaude"
-        );
+        assert_eq!(with_connector(&covered).runs, covered.runs);
+        // The connector's own quiet run, as the second row draws it, turns ember.
+        let quiet = sidebar::Line {
+            runs: vec![(3, 1, Role::Rule)],
+            ..sub.clone()
+        };
+        assert_eq!(with_connector(&quiet).runs, vec![(3, 1, Role::Brand)]);
     }
 
     /// Escapes out, so a test can measure what a terminal would show.

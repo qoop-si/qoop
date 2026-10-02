@@ -757,23 +757,23 @@ impl Interface {
 
     /// Whether one index row carries the keyboard, read out of the raw bytes.
     ///
-    /// The keyboard's agent opens its first row with an ember bracket at the column's right
-    /// edge (`38;5;202`, `╮`, or `│` for an agent of one row); a space rule that holds the
-    /// keyboard for a tab with no agent carries the selected background (`48;5;236`) from
-    /// its first cell. The stripped text cannot answer this: stripping takes the colour out.
+    /// The keyboard's agent is marked by its tree connector in ember (`38;5;202`, `└`) on
+    /// the row under its first; a space rule that holds the keyboard for a tab with no agent
+    /// carries the selected background (`48;5;236`) from its first cell. The stripped text
+    /// cannot answer this: stripping takes the colour out.
     fn panel_selected(&self, row: usize) -> bool {
-        let Some(cells) = self.screen.cells(row) else {
-            return false;
-        };
-        let raised = cells
-            .first()
+        let raised = self
+            .screen
+            .cells(row)
+            .and_then(|cells| cells.first())
             .is_some_and(|(_, style)| style.contains("48;5;236"));
-        let bracket = cells
-            .get(qoro_tui::sidebar::WIDTH - 1)
-            .is_some_and(|(c, style)| {
-                style.contains("38;5;202") && "\u{256e}\u{2502}".contains(*c)
-            });
-        raised || bracket
+        let connector = self.screen.cells(row + 1).is_some_and(|cells| {
+            cells
+                .iter()
+                .take(qoro_tui::sidebar::WIDTH)
+                .any(|(c, style)| *c == '\u{2514}' && style.contains("38;5;202"))
+        });
+        raised || connector
     }
 
     /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
