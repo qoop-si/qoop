@@ -82,9 +82,12 @@ step".
 4. **Repo rules:** `AGENTS.md`, `CLAUDE.md` and `.claude/rules/` in the
    worker's repo. What they pre-authorize still needs a `policy` grant.
 5. **His standards for this moment:** `wend search '<two or three key
-   words>' --role user`, what he himself wrote around those words before.
-   Skip pasted logs among the hits. These are the criteria he applies, never
-   his answer.
+   words>' --role user --limit 5`, what he himself wrote around those words
+   before. It matches words, not meaning, so search three wordings of the
+   same moment: in his language, in English, and with a near synonym (for
+   example `delete worktree`, `remove worktree`, `clean up branch`); each
+   finds different moments. Skip pasted logs among the hits. These are the
+   criteria he applies, never his answer.
 
 Write `plan:` and `stage:` into the worker's `goals.md` line, and update
 `stage:` when it moves.
