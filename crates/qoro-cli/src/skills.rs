@@ -28,6 +28,11 @@ const FILE: &str = "SKILL.md";
 /// sit beside each other because the scripts find one another by their own directory.
 const QASS_DIR: &str = ".claude/skills/qass";
 
+/// qass's own working folder's settings: the gate and its permission mode, loaded by any
+/// Claude started there, by hand, restored or woken (a restore types a bare `claude --resume`,
+/// so flags given at launch do not come back; this file does).
+const QASS_FOLDER_SETTINGS: &str = ".qass/.claude/settings.json";
+
 /// Name, body, and whether it is a program.
 const QASS: &[(&str, &str, bool)] = &[
     (
@@ -203,7 +208,21 @@ fn install_qass(home: &Path) -> std::io::Result<bool> {
         }
         changed = true;
     }
+    let folder = home.join(QASS_FOLDER_SETTINGS);
+    if !std::fs::read_to_string(&folder).is_ok_and(|on_disk| on_disk == qass_settings()) {
+        if let Some(parent) = folder.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&folder, qass_settings())?;
+        changed = true;
+    }
     Ok(changed)
+}
+
+fn qass_settings() -> &'static str {
+    QASS.iter()
+        .find(|(name, _, _)| *name == "settings.json")
+        .map_or("", |(_, body, _)| body)
 }
 
 /// Remove exactly qass's files, and its directory only when left empty.
@@ -212,6 +231,13 @@ fn remove_qass(home: &Path) -> std::io::Result<bool> {
     let mut removed = false;
     for (name, _, _) in QASS {
         removed |= std::fs::remove_file(dir.join(name)).is_ok();
+    }
+    let folder = home.join(QASS_FOLDER_SETTINGS);
+    removed |= std::fs::remove_file(&folder).is_ok();
+    if let Some(parent) = folder.parent()
+        && std::fs::read_dir(parent).is_ok_and(|mut e| e.next().is_none())
+    {
+        let _ = std::fs::remove_dir(parent);
     }
     if std::fs::read_dir(&dir).is_ok_and(|mut e| e.next().is_none()) {
         let _ = std::fs::remove_dir(&dir);
@@ -223,6 +249,8 @@ fn qass_current(home: &Path) -> bool {
     let dir = home.join(QASS_DIR);
     QASS.iter()
         .all(|(name, body, _)| std::fs::read_to_string(dir.join(name)).is_ok_and(|b| b == *body))
+        && std::fs::read_to_string(home.join(QASS_FOLDER_SETTINGS))
+            .is_ok_and(|b| b == qass_settings())
 }
 
 /// Remove one agent's skill, answering whether anything changed.
@@ -369,6 +397,13 @@ mod tests {
         let home = home_dir();
         assert!(install_qass(home.path()).expect("install"));
         assert!(qass_current(home.path()));
+        // Its folder carries the gate too, so a restored or woken qass is gated.
+        let folder = home.path().join(QASS_FOLDER_SETTINGS);
+        assert!(
+            std::fs::read_to_string(&folder)
+                .expect("folder settings")
+                .contains("gate.sh")
+        );
         let gate = home.path().join(QASS_DIR).join("gate.sh");
         let mode = std::fs::metadata(&gate).expect("gate").permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "gate.sh is not runnable");
@@ -383,6 +418,7 @@ mod tests {
         std::fs::remove_file(&theirs).expect("rm");
         assert!(!remove_qass(home.path()).expect("uninstall again"));
         assert!(!home.path().join(QASS_DIR).exists());
+        assert!(!home.path().join(QASS_FOLDER_SETTINGS).exists());
     }
 
     /// Uninstalling twice is not an error.
