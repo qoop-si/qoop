@@ -8138,12 +8138,25 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     state.adopted_resize = true;
                 }
             }
-            // Sleep leaves the fold alone: a sleeping space stays open or folded as a
-            // person left it, and its rule folds it like any other.
-            let slept_here = state.space.is_some_and(|here| {
-                workspaces.iter().any(|w| w.id == here && w.asleep)
-                    && state.spaces.iter().any(|w| w.id == here && !w.asleep)
-            });
+            // A space folds the moment it falls asleep, or first shows up asleep, and opens
+            // when it wakes: only the edge moves the fold, so a sleeping space a person
+            // opened again stays open.
+            let was = |id: i64| state.spaces.iter().find(|w| w.id == id).map(|w| w.asleep);
+            for space in &workspaces {
+                match (was(space.id), space.asleep) {
+                    (None | Some(false), true) => {
+                        state.shut.insert(space.id);
+                    }
+                    (Some(true), false) => {
+                        state.shut.remove(&space.id);
+                    }
+                    _ => {}
+                }
+            }
+            let slept_here = state.space.is_some_and(|here| was(here) == Some(false))
+                && workspaces
+                    .iter()
+                    .any(|w| Some(w.id) == state.space && w.asleep);
             state.spaces = workspaces;
             // A fold outlives nothing it folded: a space that went away takes its fold
             // with it, so a later space reusing the id does not start folded.
@@ -14590,7 +14603,7 @@ mod tests {
         );
         assert_eq!(state.space, Some(1));
         assert_eq!(state.pending_focus, Some(1));
-        assert!(!state.shut.contains(&2), "sleep does not fold a space");
+        assert!(state.shut.contains(&2), "a space falling asleep folds");
         assert!(!state.done);
 
         // `qoro sleep app` from a shell: the index loses its tabs first, the space list
@@ -14613,6 +14626,33 @@ mod tests {
         assert!(
             state.done,
             "a sleeping remote space kept the interface open"
+        );
+    }
+
+    /// Sleep folds a space and the fold holds while it sleeps: the index losing its tabs
+    /// and every later space list leave it shut. A person opening it again is kept, and a
+    /// wake opens it.
+    #[test]
+    fn a_space_stays_folded_while_it_sleeps() {
+        let mut state = state();
+        spaces(&mut state, vec![space(1, "app"), asleep(2, "api", &[2])]);
+        assert!(state.shut.contains(&2), "sleep folds the space");
+        index(&mut state, vec![agent(1, 1, "claude", "idle")]);
+        spaces(&mut state, vec![space(1, "app"), asleep(2, "api", &[2])]);
+        assert!(state.shut.contains(&2), "a later space list opened it");
+        state.shut.remove(&2);
+        spaces(&mut state, vec![space(1, "app"), asleep(2, "api", &[2])]);
+        assert!(!state.shut.contains(&2), "a person's unfold was undone");
+        state.shut.insert(2);
+        spaces(&mut state, vec![space(1, "app"), space(2, "api")]);
+        assert!(!state.shut.contains(&2), "a wake leaves it folded");
+
+        let mut fresh = self::state();
+        fresh.spaces.clear();
+        spaces(&mut fresh, vec![space(1, "app"), asleep(2, "api", &[2])]);
+        assert!(
+            fresh.shut.contains(&2),
+            "a space first seen asleep was not folded"
         );
     }
 
