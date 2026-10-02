@@ -60,6 +60,7 @@ const QASS: &[(&str, &str, bool)] = &[
         include_str!("../../../skills/qass/spawn.sh"),
         true,
     ),
+    ("on.sh", include_str!("../../../skills/qass/on.sh"), true),
     (
         "settings.json",
         include_str!("../../../skills/qass/settings.json"),

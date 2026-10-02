@@ -87,6 +87,26 @@ got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$root/skills/qas
 T5 g1 claude idle->sleeping "task" /w' ] || { echo "sleep printed: $got"; exit 1; }
 rm -f "$tmp/ls"
 
+# A remote's stream comes in beside this Mac's, its lines named after the remote.
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+printf '%s\n' "[$(row 2 3 working)]" "[$(row 2 3 idle)]" > "$tmp/remote-snapshots"
+cat > "$tmp/bin/qoro" <<EOF
+#!/bin/sh
+[ "\$1" = remote ] && { echo "ubox  fake-host"; exit 0; }
+[ "\$1" = ls ] && { echo '[]'; exit 0; }
+sleep 2; cat "$tmp/snapshots"
+EOF
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in *watch*) cat "$tmp/remote-snapshots" ;; *) echo '[]' ;; esac
+EOF
+chmod +x "$tmp/bin/ssh"
+rm -f "$tmp/home/.qass/"*.json "$tmp/home/.qass/goals.md"
+got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$root/skills/qass/watch.sh" 2>/dev/null | sort)"
+want="$(printf '%s\n' 'T5 g1 claude new->idle "task" /w' 'ubox/T2 g3 claude working->idle "task" /w' 'ubox/link-down' | sort)"
+[ "$got" = "$want" ] || { echo "remote printed: $got"; exit 1; }
+rm -f "$tmp/bin/ssh"
+
 echo "qass watch: ok"
 
 # ---- gate.sh: every row is a real hook payload, allowed (0) or denied (2).
@@ -98,6 +118,7 @@ cat > "$tmp/bin/qoro" <<EOF
 #!/bin/sh
 [ -f "$tmp/hang" ] && sleep 10
 [ "\$1" = ls ] && { echo '[{"name":"s","sleeping":[11]}]'; exit 0; }
+[ "\$1" = remote ] && { echo "ubox  fake-host"; exit 0; }
 echo '[{"terminal":5,"generation":3,"agent":true,"state":"idle","cwd":"$home/coding/app"},{"terminal":6,"generation":1,"agent":false,"state":"unknown"},{"terminal":7,"generation":1,"agent":true,"state":"idle","cwd":"$home/coding/app"},{"terminal":8,"generation":1,"agent":true,"state":"idle","cwd":"$home/coding/app"}]'
 EOF
 fence="Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first."
@@ -332,6 +353,40 @@ case_ deny "$(bash_ "$(prompt_ 5 3 "More. $fence")")" "propose: and only that on
 printf 'mode auto\n' > "$home/.qass/policy"
 owner_ "devam"
 case_ allow "$(bash_ 'qoro wake --tab 11')" "auto: waking within the caps"
+printf 'mode propose\n' > "$home/.qass/policy"
+
+# Remotes: the same commands through on.sh, checked against that machine's own rows.
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in
+  *"'agents'"*) echo '[{"terminal":2,"generation":3,"agent":true,"state":"idle","cwd":"/home/x/app"},{"terminal":3,"generation":1,"agent":false,"state":"unknown"}]' ;;
+  *"'ls'"*) echo '[{"name":"r","sleeping":[4]}]' ;;
+esac
+EOF
+chmod +x "$tmp/bin/ssh"
+on="$root/skills/qass/on.sh"
+: > "$home/.qass/gate.jsonl"   # a fresh hour: the writes above would hit the cap
+remote_() { printf "%s ubox prompt %s --generation %s -- '%s'" "$on" "$1" "$2" "$3"; }
+printf 'mode auto\n' > "$home/.qass/policy"
+for v in commit push-branch open-pr; do echo "grant $home/coding/app $v" >> "$home/.qass/policy"; done
+owner_ "devam"
+case_ allow "$(bash_ "$on ubox context 2 --last 1 --lines 40")" "a remote's context"
+case_ allow "$(bash_ "$on ubox read 2" sub1)" "a subagent reads a remote screen"
+case_ deny "$(bash_ "$on nope context 2")" "a remote that is not in qoro remote ls"
+case_ deny "$(bash_ "$on ubox worktree new x")" "a remote command not allowed here either"
+case_ deny "$(bash_ "$on ubox context x")" "a remote context without a terminal number"
+case_ allow "$(bash_ "$(remote_ 2 3 "go on. $fence")")" "a fenced prompt to a remote agent"
+case_ deny "$(bash_ "$(remote_ 3 1 "go on. $fence")")" "a remote terminal that is not an agent"
+case_ deny "$(bash_ "$(remote_ 2 2 "go on. $fence")")" "a stale remote generation"
+case_ deny "$(bash_ "$(remote_ 2 3 "ship it. $ship")")" "a grant never reaches a remote"
+case_ deny "$(bash_ "$(remote_ 2 3 "go on. $fence")" sub1)" "a subagent's remote prompt"
+case_ allow "$(bash_ "$esc E50 ubox/2 later 'A: yes' 'B: no'")" "a card about ubox/2"
+owner_ "E50 A"
+case_ deny "$(bash_ "$(prompt_ 2 3 "The owner answered E50: \"E50 A\". He chose A: yes. $relay")")" "relaying a remote card to the local terminal 2"
+case_ allow "$(bash_ "$(remote_ 2 3 "The owner answered E50: \"E50 A\". He chose A: yes. $relay")")" "relaying a remote card to ubox/2"
+case_ allow "$(bash_ "$on ubox wake --tab 4")" "waking a remote tab the remote says sleeps"
+case_ deny "$(bash_ "$on ubox wake --tab 2")" "waking a remote tab that is awake"
+rm -f "$tmp/bin/ssh"
 printf 'mode propose\n' > "$home/.qass/policy"
 
 # A plan is readable only where a live worker works, worktrees included.

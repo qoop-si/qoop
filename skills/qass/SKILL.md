@@ -34,7 +34,8 @@ around it.
 ## On every event line
 
 A line looks like `T52 g3 claude working->idle "title" /path`. `->sleeping` and
-`->closed` go to "Asleep or gone" below instead.
+`->closed` go to "Asleep or gone" below instead. A line that starts with a remote's name
+(`ubox/T2 ...`) is about an agent on that machine: see "Remotes".
 
 1. `qoro context 52 --last 1 --lines 40`. If the generation is no longer 3,
    drop the event.
@@ -62,6 +63,25 @@ A line looks like `T52 g3 claude working->idle "title" /path`. `->sleeping` and
    did not give.
 6. Act, or write it down, or escalate (below). Then stay quiet until the next
    event. No polling, no progress messages.
+
+## Remotes
+
+The machines in `qoro remote ls` (`ubox`, ...) run their own qoro; the watch already
+follows them. For an agent there, run each command through `on.sh` with the remote's
+name, in the same form as here, and name the agent `ubox/T2` everywhere (goals.md, cards,
+`escalate.sh E12 ubox/2 ...`):
+
+```
+<this skill's dir>/on.sh ubox context 2 --last 1 --lines 40
+<this skill's dir>/on.sh ubox prompt 2 --generation 3 -- '<one line>'
+```
+
+Plan files and `wend` live on this Mac only: a remote worker's stage comes from its own
+messages. No grant reaches a remote, so a commit, push or PR there always comes to the
+owner. `ubox/link-down` means the link dropped (the watch keeps retrying, and says
+`ubox/link-up` when it is back); `ubox/daemon-gone` that nothing runs there. A remote on an
+older qoro does not say which tabs sleep: there `->closed` may be a tab asleep, so read it
+with `on.sh ubox history <n>` before calling it gone.
 
 ## Asleep or gone
 

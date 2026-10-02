@@ -126,8 +126,25 @@ def run(args):
     return subprocess.run(args, capture_output=True, text=True, timeout=4, check=True).stdout
 
 
-def rows():
-    return json.loads(run(["qoro", "agents", "--json"]))
+def remotes():
+    """The names in `qoro remote ls`."""
+    return {line.split()[0] for line in run(["qoro", "remote", "ls"]).splitlines()
+            if line.split() and re.fullmatch(r"[A-Za-z0-9_-]+", line.split()[0])}
+
+
+def qoro(machine, *args):
+    """argv for a qoro command on this Mac (machine None) or on a remote, through on.sh."""
+    return [str(HERE / "on.sh"), machine, *args] if machine else ["qoro", *args]
+
+
+def rows(machine=None):
+    return json.loads(run(qoro(machine, "agents", "--json")))
+
+
+def sleeping(machine=None):
+    """The tabs asleep on a machine, as strings. A remote too old to say has none."""
+    return {str(t) for sp in json.loads(run(qoro(machine, "ls", "--json")))
+            for t in sp.get("sleeping") or []}
 
 
 def log_rows():
@@ -214,8 +231,10 @@ def relays(history):
     return waiting
 
 
-def check_write(kind, terminal, generation, text=None, keys=None):
-    """The bounds on anything that types into a worker or starts one."""
+def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
+    """The bounds on anything that types into a worker or starts one, on this Mac or on a
+    remote (machine): there a worker is `ubox/2` for caps, cards and relays, its rows come
+    from that machine, and no grant reaches it."""
     me = os.environ.get("QORO_TERMINAL", "")
     if not me:
         raise Deny("qass must run inside a qoro terminal")
@@ -223,15 +242,14 @@ def check_write(kind, terminal, generation, text=None, keys=None):
     history = log_rows()
     now = time.time()
     last_owner = max((i for i, r in enumerate(history) if r.get("owner")), default=-1)
-    live = rows()
+    live = rows(machine) if kind != "spawn" else rows()
     relay = False
+    number, terminal = terminal, (f"{machine}/{terminal}" if machine else terminal)
 
     if kind == "wake":
         if terminal == me:
             raise Deny("never write to the qass tab")
-        asleep = {str(t) for sp in json.loads(run(["qoro", "ls", "--json"]))
-                  for t in sp.get("sleeping") or []}
-        if terminal not in asleep:
+        if number not in sleeping(machine):
             raise Deny(f"terminal {terminal} is not asleep")
         # Waking it to pass on his answer to its card needs no further ok.
         relay = any(w[0] == terminal for w in relays(history).values()) and "wake"
@@ -245,7 +263,7 @@ def check_write(kind, terminal, generation, text=None, keys=None):
     else:
         if terminal == me:
             raise Deny("never write to the qass tab")
-        row = next((r for r in live if str(r["terminal"]) == terminal), None)
+        row = next((r for r in live if str(r["terminal"]) == number), None)
         if row is None or not row.get("agent"):
             raise Deny(f"terminal {terminal} is not an agent")
         if str(row["generation"]) != generation:
@@ -282,6 +300,8 @@ def check_write(kind, terminal, generation, text=None, keys=None):
                 if fence is None:
                     raise Deny("a prompt must end with the fence line")
                 need = FENCE_GRANTS[fence]
+            if need and machine:
+                raise Deny("no grant reaches a remote: commit, push and PRs there are the owner's")
             if need:
                 root = repo_root(row.get("cwd") or "/")
                 missing = [v for v in need if (root, v) not in grants]
@@ -311,46 +331,55 @@ def check_write(kind, terminal, generation, text=None, keys=None):
             "text": text if text is not None else " ".join(keys or [])})
 
 
+def check_qoro(sub, rest, subagent, machine=None):
+    """One qoro command, on this Mac or (machine) on a remote: the same forms either way."""
+    if sub == "ls" or sub == "agents":
+        flags(rest, {"--json": None})
+        return
+    if sub in ("context", "history", "read"):
+        if not rest or not is_num(rest[0]):
+            raise Deny("a terminal number is required")
+        allowed = {"--lines": is_num} if sub == "read" else {
+            "--last": is_num, "--lines": is_num, "--json": None,
+            "--role": lambda v: v in ("user", "assistant"),
+        }
+        flags(rest[1:], allowed)
+        return
+    if subagent:
+        raise Deny("subagents only read")
+    if sub == "wake":
+        if len(rest) != 2 or rest[0] != "--tab" or not is_num(rest[1]):
+            raise Deny("wake must be: qoro wake --tab <n>")
+        check_write("wake", rest[1], "-", machine=machine)
+        return
+    if sub == "prompt":
+        if len(rest) != 5 or not is_num(rest[0]) or rest[1] != "--generation" \
+                or not is_num(rest[2]) or rest[3] != "--":
+            raise Deny("prompt must be: qoro prompt <n> --generation G -- '<text>'")
+        check_write("prompt", rest[0], rest[2], text=rest[4], machine=machine)
+        return
+    if sub == "send":
+        if len(rest) < 5 or not is_num(rest[0]) or rest[-2] != "--generation" or not is_num(rest[-1]):
+            raise Deny("send must be: qoro send <n> --key K ... --generation G")
+        keys = rest[1:-2]
+        if len(keys) % 2 or any(keys[i] != "--key" or keys[i + 1] not in KEYS for i in range(0, len(keys), 2)):
+            raise Deny(f"send takes only --key with one of {sorted(KEYS)}")
+        check_write("send", rest[0], rest[-1], keys=keys[1::2], machine=machine)
+        return
+    raise Deny(f"qoro {sub} is not allowed")
+
+
 def check_bash(command, subagent):
     w = words(command)
     if w[0] == "qoro" and len(w) >= 2:
-        sub, rest = w[1], w[2:]
-        if sub == "ls":
-            flags(rest, {"--json": None})
-            return
-        if sub == "agents":
-            flags(rest, {"--json": None})
-            return
-        if sub in ("context", "history", "read"):
-            if not rest or not is_num(rest[0]):
-                raise Deny("a terminal number is required")
-            allowed = {"--lines": is_num} if sub == "read" else {
-                "--last": is_num, "--lines": is_num, "--json": None,
-                "--role": lambda v: v in ("user", "assistant"),
-            }
-            flags(rest[1:], allowed)
-            return
-        if subagent:
-            raise Deny("subagents only read")
-        if sub == "wake":
-            if len(w) != 4 or w[2] != "--tab" or not is_num(w[3]):
-                raise Deny("wake must be: qoro wake --tab <n>")
-            check_write("wake", w[3], "-")
-            return
-        if sub == "prompt":
-            if len(w) != 7 or not is_num(w[2]) or w[3] != "--generation" or not is_num(w[4]) or w[5] != "--":
-                raise Deny("prompt must be: qoro prompt <n> --generation G -- '<text>'")
-            check_write("prompt", w[2], w[4], text=w[6])
-            return
-        if sub == "send":
-            if len(w) < 7 or not is_num(w[2]) or w[-2] != "--generation" or not is_num(w[-1]):
-                raise Deny("send must be: qoro send <n> --key K ... --generation G")
-            keys = w[3:-2]
-            if len(keys) % 2 or any(keys[i] != "--key" or keys[i + 1] not in KEYS for i in range(0, len(keys), 2)):
-                raise Deny(f"send takes only --key with one of {sorted(KEYS)}")
-            check_write("send", w[2], w[-1], keys=keys[1::2])
-            return
-        raise Deny(f"qoro {sub} is not allowed")
+        check_qoro(w[1], w[2:], subagent)
+        return
+    if w[0] == str(HERE / "on.sh"):
+        # The same commands on a remote this Mac's qoro links to, and only those.
+        if len(w) < 3 or w[1] not in remotes():
+            raise Deny("on.sh <remote from qoro remote ls> <qoro command>")
+        check_qoro(w[2], w[3:], subagent, machine=w[1])
+        return
     if w[:2] == ["wend", "show"] and len(w) >= 3:
         # A closed agent's last words, by the session id kept in goals.md.
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", w[2]):
@@ -370,7 +399,8 @@ def check_bash(command, subagent):
     if w[0] == str(HERE / "escalate.sh"):
         # escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to D]
         opts = w[4:]
-        if len(w) < 4 or not E_ITEM.fullmatch(w[1]) or not (w[2] == "-" or is_num(w[2])) \
+        if len(w) < 4 or not E_ITEM.fullmatch(w[1]) \
+                or not re.fullmatch(r"-|[0-9]{1,6}|[A-Za-z0-9_-]+/[0-9]{1,6}", w[2]) \
                 or w[3] not in ("now", "later") or len(opts) > 4 \
                 or [o[:1] for o in opts] != list("ABCD"[:len(opts)]) \
                 or not all(OPTION.fullmatch(o) for o in opts):
