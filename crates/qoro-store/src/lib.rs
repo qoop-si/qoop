@@ -749,6 +749,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// The agent an open, sleeping terminal holds, as `(agent, its conversation id)`: what a
+    /// reader needs to find the conversation while no daemon row stands for the tab.
+    pub fn sleeping_agent(
+        &self,
+        terminal: i64,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT t.agent, t.agent_session FROM asleep_terminal a \
+                 JOIN terminal t ON t.id = a.terminal \
+                 WHERE a.terminal = ?1 AND t.closed_at IS NULL AND t.agent IS NOT NULL",
+                params![terminal],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Put terminals to sleep: their agents written down, then their marks, in one
     /// transaction. A failure leaves neither, so a tab is never marked asleep with a row
     /// that does not say what to bring back. A closed terminal is not marked.
@@ -1418,6 +1437,40 @@ mod tests {
             s.asleep().expect("asleep"),
             vec![(3, ws, 9), (2, ws, 5), (1, ws, 5)]
         );
+    }
+
+    /// A sleeping tab still says whose conversation it holds; an awake one, or one with no
+    /// agent, says nothing.
+    #[test]
+    fn a_sleeping_tab_names_its_agent_and_conversation() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.create_terminal(8, ws, "/tmp", "/bin/sh", 1).expect("t");
+        s.set_agent(7, Some("claude"), Some("abc")).expect("agent");
+        assert_eq!(s.sleeping_agent(7).expect("query"), None, "awake");
+        s.sleep_terminals(
+            10,
+            &[
+                Checkpoint {
+                    terminal: 7,
+                    agent: Some("claude".into()),
+                    agent_session: Some("abc".into()),
+                },
+                Checkpoint {
+                    terminal: 8,
+                    agent: None,
+                    agent_session: None,
+                },
+            ],
+        )
+        .expect("sleep");
+        assert_eq!(
+            s.sleeping_agent(7).expect("query"),
+            Some(("claude".into(), Some("abc".into())))
+        );
+        assert_eq!(s.sleeping_agent(8).expect("query"), None, "no agent");
+        assert_eq!(s.sleeping_agent(9).expect("query"), None, "no such tab");
     }
 
     #[test]

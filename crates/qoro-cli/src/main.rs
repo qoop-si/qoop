@@ -1776,18 +1776,18 @@ fn run_history(args: &[String]) -> std::io::Result<()> {
         // The listing is the only reader of the registry, so history filters
         // it rather than asking a second question: two answers to "what is
         // there" would be two answers.
-        let row = resolve_target(&agents, &opts.target).map_err(std::io::Error::other)?;
-        let program = row.program.clone().unwrap_or_default();
+        let (program, session) = match resolve_target(&agents, &opts.target) {
+            Ok(row) => (
+                row.program.clone().unwrap_or_default(),
+                row.agent_session.clone(),
+            ),
+            Err(why) => sleeping_agent(&opts.target).ok_or_else(|| std::io::Error::other(why))?,
+        };
         let base = qoro_history::BaseDirs::from_home()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let window = qoro_history::history(
-            &program,
-            row.agent_session.as_deref(),
-            &base,
-            opts.last,
-            opts.role,
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let window =
+            qoro_history::history(&program, session.as_deref(), &base, opts.last, opts.role)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         if opts.json {
             println!(
                 "{}",
@@ -2467,6 +2467,28 @@ fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
     Ok(())
 }
 
+/// The store as it is on disk: where the daemon keeps it, or beside the socket when no
+/// daemon of this build has started yet to move it. Never created, so a reader never leaves
+/// an empty database behind for the next daemon to take as the real one; a file gone
+/// between the look and the open is an error to report.
+fn existing_store(dir: &std::path::Path) -> std::io::Result<Option<qoro_store::Store>> {
+    [paths::state_location(dir), dir.to_path_buf()]
+        .into_iter()
+        .map(|d| d.join("qoro.db"))
+        .find(|db| db.exists())
+        .map(|db| qoro_store::Store::open_existing(&db).map_err(std::io::Error::other))
+        .transpose()
+}
+
+/// The agent a sleeping tab holds, `(program, its conversation id)`, from the store: a
+/// tab that slept under an earlier daemon has no row in the live listing, yet its
+/// conversation can still be read.
+fn sleeping_agent(target: &str) -> Option<(String, Option<String>)> {
+    let terminal: i64 = target.parse().ok()?;
+    let dir = paths::runtime_dir().ok()?;
+    existing_store(&dir).ok()??.sleeping_agent(terminal).ok()?
+}
+
 /// `qoro ls`: this machine's spaces, and which of them are asleep.
 ///
 /// Read off the store rather than from a daemon when none is running, which is when the
@@ -2476,19 +2498,7 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let running = std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok();
-    // Where the daemon keeps it, or beside the socket when no daemon of this build has
-    // started yet to move it. Never created, so a listing never leaves an empty database
-    // behind for the next daemon to take as the real one.
-    let db = [paths::state_location(&dir), dir.clone()]
-        .into_iter()
-        .map(|d| d.join("qoro.db"))
-        .find(|db| db.exists());
-    // Opened without create: a file gone between the look and the open is an error to
-    // report, not an empty database to leave in its place.
-    let store = db
-        .map(|db| qoro_store::Store::open_existing(&db).map_err(std::io::Error::other))
-        .transpose()?;
-    let Some(store) = store else {
+    let Some(store) = existing_store(&dir)? else {
         println!(
             "{}",
             if json {
