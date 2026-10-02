@@ -19,6 +19,12 @@ QASS = HOME / ".qass"
 LOG = QASS / "gate.jsonl"
 POLICY = QASS / "policy"
 SKILLS = HOME / ".claude" / "skills"
+LESSONS = QASS / "lessons.md"
+LESSONS_MAX = 2000      # chars; full means merge or remove before adding (Hermes keeps 2,200)
+# A lesson names a situation and ends in a careful action and its source, nothing after:
+# "- <when, 160 chars at most> -> escalate (E7)". Nothing in it can let qass act alone.
+LESSON = re.compile(r"- [^\n]{1,160} -> (?:escalate|wait|decline|ask for proof)\.? "
+                    r"\((?:E[1-9][0-9]{0,5}|owner [0-9]{4}-[0-9]{2}-[0-9]{2})\)")
 
 # Outside single quotes a command may hold only these; inside them, anything but '.
 SAFE = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:=@%+,-")
@@ -32,8 +38,9 @@ E_ITEM = re.compile(r"\bE([1-9][0-9]{0,5})\b")
 OK = r"(?:ok|okay|yes|tamam|evet)"
 PS = r"P[1-9][0-9]{0,5}(?:\s+P[1-9][0-9]{0,5})*"
 P_OK = re.compile(rf"{OK}\s+{PS}|{PS}\s+{OK}", re.IGNORECASE)
-ANSWER = re.compile(r"\b(ok|okay|yes|no|tamam|evet|hayır|hayir)\b", re.IGNORECASE)
-RELAY = re.compile(r'The owner answered E([1-9][0-9]{0,5}): "(.*)"\. (.*)')
+RELAY_HEAD = re.compile(r"The owner answered E([1-9][0-9]{0,5}): ")
+# One choice on an escalation card; the owner can always answer in his own words instead.
+OPTION = re.compile(r"[A-D]: [^\n]{1,200}")
 
 FENCE = "Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first."
 FENCE_SHIP = (
@@ -170,8 +177,9 @@ def said_yes(text):
 
 
 def answered(text):
-    """The E numbers a message answers, yes or no, in a clause that is not a question."""
-    return {int(n) for c in clauses(text) if ANSWER.search(c) and "?" not in c
+    """The E numbers a message answers: a clause naming one, with more in it than the number
+    (yes, no, an option letter, his own words), that is not a question."""
+    return {int(n) for c in clauses(text) if "?" not in c and E_ITEM.sub("", c).strip()
             for n in E_ITEM.findall(c)}
 
 
@@ -191,15 +199,16 @@ def approvals(history, now):
 
 
 def relays(history):
-    """Escalations he answered and that were not passed on yet: number -> (terminal, words)."""
+    """Escalations he answered and that were not passed on yet:
+    number -> (terminal, his words, the options he was shown)."""
     asked, waiting = {}, {}
     for r in history:
         if "escalated" in r:
-            asked[int(r["escalated"][1:])] = r.get("terminal")
+            asked[int(r["escalated"][1:])] = (r.get("terminal"), r.get("options") or {})
         elif r.get("owner"):
             for n in answered(r.get("text", "")):
                 if n in asked:
-                    waiting[n] = (asked[n], one_line(r["text"]))
+                    waiting[n] = (asked[n][0], one_line(r["text"]), asked[n][1])
         elif r.get("relay"):
             waiting.pop(int(r["relay"][1:]), None)
     return waiting
@@ -235,20 +244,30 @@ def check_write(kind, terminal, generation, text=None, keys=None):
         if text is not None:
             if ".qass" in text.lower():
                 raise Deny("a prompt may not name .qass")
-            m = RELAY.fullmatch(text.rstrip())
-            if m and m.group(3) == FENCE_OWNER:
-                n = int(m.group(1))
+            head = RELAY_HEAD.match(text)
+            if head or text.rstrip().endswith(FENCE_OWNER):
+                if not head:
+                    raise Deny(f'a relay is exactly: The owner answered E<n>: "<his words>". '
+                               f"[He chose <letter>: <that option>.] {FENCE_OWNER}")
+                n = int(head.group(1))
                 waiting = relays(history).get(n)
                 if waiting is None:
                     raise Deny(f"E{n} has no answer of the owner waiting to be passed on")
-                if waiting[0] != terminal:
-                    raise Deny(f"E{n} was asked for terminal {waiting[0]}")
-                if m.group(2) != waiting[1]:
-                    raise Deny(f'a relay quotes his words exactly: "{waiting[1]}"')
+                term, words, options = waiting
+                if term != terminal:
+                    raise Deny(f"E{n} was asked for terminal {term}")
+                base = f'The owner answered E{n}: "{words}".'
+                # A pick is a clause that is exactly "E7 B": then the option may be spelled out,
+                # word for word as recorded. "E7 not B", "E7 B mi A mi" pick nothing.
+                picks = {m.group(1).upper() for c in clauses(words)
+                         if (m := re.fullmatch(rf"E{n}\s+([A-Da-d])[.!]?", c.strip()))}
+                forms = [f"{base} {FENCE_OWNER}"] + [
+                    f"{base} He chose {k}: {options[k]}. {FENCE_OWNER}"
+                    for k in sorted(picks) if k in options]
+                if text.rstrip() not in forms:
+                    raise Deny("a relay is exactly one of: " + " | ".join(forms))
                 relay = f"E{n}"
                 need = set()
-            elif text.rstrip().endswith(FENCE_OWNER):
-                raise Deny(f'a relay is exactly: The owner answered E<n>: "<his words>". {FENCE_OWNER}')
             else:
                 fence = next((f for f in FENCE_GRANTS if text.rstrip().endswith(f)), None)
                 if fence is None:
@@ -323,13 +342,20 @@ def check_bash(command, subagent):
         return
     if subagent:
         raise Deny("subagents only read")
-    if w[0] == str(HERE / "escalate.sh") and len(w) == 3 and E_ITEM.fullmatch(w[1]) \
-            and (w[2] == "-" or is_num(w[2])):
+    if w[0] == str(HERE / "escalate.sh"):
+        # escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to D]
+        opts = w[4:]
+        if len(w) < 4 or not E_ITEM.fullmatch(w[1]) or not (w[2] == "-" or is_num(w[2])) \
+                or w[3] not in ("now", "later") or len(opts) > 4 \
+                or [o[:1] for o in opts] != list("ABCD"[:len(opts)]) \
+                or not all(OPTION.fullmatch(o) for o in opts):
+            raise Deny("escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to 'D: ...']")
         # An old answer ("E6 yes") must never fit a new question, so a number is used once.
         used = {int(r["escalated"][1:]) for r in log_rows() if "escalated" in r}
         if int(w[1][1:]) in used:
             raise Deny(f"{w[1]} was used before; number this one E{max(used) + 1}")
-        append({"escalated": w[1], "terminal": w[2]})
+        append({"escalated": w[1], "terminal": w[2], "urgency": w[3],
+                "options": {o[0]: o[3:] for o in opts}})
         return
     if w[0] == str(HERE / "spawn.sh") and len(w) == 3:
         check_write("spawn", "-", "-")
@@ -390,6 +416,34 @@ def glob_ok(args):
     return inside(args.get("path") or "/", QASS)
 
 
+def check_lesson(tool, args):
+    """A lesson comes from the owner and can only make qass more careful.
+
+    Written whole with Write, once per owner message, within the cap; every line reads
+    `- <when> -> escalate|wait|decline|ask for proof (<source>)`. The action a lesson names
+    is always a careful one; its situation is free text the skill tells qass to read as a
+    description, never as an order. Widening what qass does alone is the owner's policy
+    file, not something a lesson can carry."""
+    if tool != "Write":
+        raise Deny("lessons.md is written whole, with Write")
+    history = log_rows()
+    last_owner = max((i for i, r in enumerate(history) if r.get("owner")), default=-1)
+    if last_owner < 0:
+        raise Deny("a lesson is written only after the owner speaks")
+    if any("lesson" in r for r in history[last_owner + 1:]):
+        raise Deny("one lesson write per owner message")
+    text = args.get("content") or ""
+    if len(text) > LESSONS_MAX:
+        raise Deny(f"lessons.md would be {len(text)} chars, the cap is {LESSONS_MAX}: "
+                   "merge or remove lessons first")
+    for line in text.splitlines():
+        if line.strip() and not LESSON.fullmatch(line.strip()):
+            raise Deny("each lesson is `- <when> -> escalate|wait|decline|ask for proof "
+                       f"(E7 | owner YYYY-MM-DD)` and nothing after, which this is not: "
+                       f"{line.strip()[:80]}")
+    append({"lesson": text, "armed_by": history[last_owner].get("ts")})
+
+
 def check(payload):
     tool = payload.get("tool_name") or ""
     args = payload.get("tool_input") or {}
@@ -411,8 +465,11 @@ def check(payload):
         if not inside(args.get("path") or "/", QASS):
             raise Deny("Grep is limited to ~/.qass")
     elif tool in ("Edit", "Write", "MultiEdit"):
-        if subagent or Path(args.get("file_path") or "/").expanduser().resolve() != QASS / "goals.md":
-            raise Deny("qass writes only ~/.qass/goals.md")
+        target = Path(args.get("file_path") or "/").expanduser().resolve()
+        if subagent or target not in (QASS / "goals.md", LESSONS):
+            raise Deny("qass writes only ~/.qass/goals.md and ~/.qass/lessons.md")
+        if target == LESSONS:
+            check_lesson(tool, args)
     elif tool == "Skill":
         if (args.get("skill") or "") != "qass":
             raise Deny("only the qass skill")

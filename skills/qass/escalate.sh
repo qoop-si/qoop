@@ -9,12 +9,21 @@
 # so a second escalation first waits the window out. Run it alone in its
 # message: a parallel tool call would report `working` over it.
 #
-#   escalate.sh E<n> <terminal it is about, or ->
+#   escalate.sh E<n> <terminal it is about, or -> now|later ['A: ...' ...]
 set -eu
 
-id="${1:?usage: escalate.sh E<n> <terminal or ->}"
+id="${1:?usage: escalate.sh E<n> <terminal or -> now|later [options]}"
+urgency="${3:-now}"
 dir="$HOME/.qass"
 mkdir -p "$dir"
+# A card for later is only written down; the gate keeps its options. Only now rings.
+# The options exactly as the gate recorded them, so the owner sees what a letter will send.
+shift 3 2>/dev/null || true
+for o in "$@"; do echo "  $o"; done
+if [ "${urgency:-now}" = later ]; then
+    echo "noted $id"
+    exit 0
+fi
 last="$(cat "$dir/last-escalation" 2>/dev/null || echo 0)"
 wait=$((last + 31 - $(date +%s)))
 [ "$wait" -le 0 ] || sleep "$wait"

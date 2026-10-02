@@ -9,7 +9,8 @@
       "Bash(qoro send *)",
       "Bash(wend search *)",
       "Read(~/.qass/**)",
-      "Edit(~/.qass/goals.md)"
+      "Edit(~/.qass/goals.md)",
+      "Edit(~/.qass/lessons.md)"
     ],
     "deny": [
       "Edit(~/.qass/policy)",
@@ -24,6 +25,9 @@
     ],
     "UserPromptSubmit": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" owner" }] }
+    ],
+    "SessionStart": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"$HOME/.qass/lessons.md\"; if [ -s \"$f\" ]; then echo 'Lessons from the owner (~/.qass/lessons.md):'; cat \"$f\"; fi; true" }] }
     ]
   }
 }
