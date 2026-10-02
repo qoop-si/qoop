@@ -126,6 +126,7 @@ fn run() -> std::io::Result<()> {
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
         Some("config") => config::run(&args),
+        Some("sound") => config::run_sound(&args),
         Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
@@ -206,6 +207,7 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro avatar options|set ...  the parts a pet may have, or set some\n\
                   \x20 qoro config [--json]  the settings in config.toml and where it is\n\
                   \x20 qoro config set <key> <value>  change one, keeping the rest of the file\n\
+                  \x20 qoro sound      hear the notification sounds and keep one each\n\
                   \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
                  \x20 qoro stop       end the daemon and every tab; `qoro` brings them back\n\

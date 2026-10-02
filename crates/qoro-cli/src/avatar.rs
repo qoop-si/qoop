@@ -179,7 +179,7 @@ fn pick() -> std::io::Result<()> {
 }
 
 /// A line of stdin, without the newline. `None` on EOF.
-fn read_line(input: &mut impl Read) -> std::io::Result<Option<String>> {
+pub(crate) fn read_line(input: &mut impl Read) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {

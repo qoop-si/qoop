@@ -41,6 +41,11 @@ you and `Glass` when one finished (through `afplay`); Linux plays the freedeskto
 `dialog-warning` or `complete` sound through `paplay` or `pw-play` when both are there. No
 sound is played from a qoro running over ssh.
 
+To hear them and choose, run `qoro sound` (macOS): a number or a name plays one, enter
+keeps it, first for a finished agent, then for one that waits on you. Keeping one turns
+`sound` on, `off` turns it off. A running qoro takes the change the next time its settings
+open (prefix, space, `settings`).
+
 ## Turning it off
 
 ```toml
