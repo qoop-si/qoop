@@ -1727,7 +1727,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     let tail = cost
         .as_ref()
         .map_or(0, |text| crate::width::width(text) + 2);
-    let room = c.width.saturating_sub(lead + tail);
+    let room = c.width.saturating_sub(lead + tail + CLOSE_W);
     let name = shorten_middle(&session_name(agent), room);
     let mut text = format!("{}{name}", mark_of(c, agent, role));
     let focused = agent.terminal == c.focused_terminal;
@@ -1744,17 +1744,46 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         runs.push((lead, crate::width::width(&name), ink));
     }
     if let Some(cost) = cost {
-        let at = c.width - crate::width::width(&cost) - 1;
-        text = format!("{}{cost} ", fit_to(&text, at));
+        let at = c.width - crate::width::width(&cost) - CLOSE_W;
+        text = format!("{}{cost}", fit_to(&text, at));
         runs.push((at, crate::width::width(&cost), crate::theme::Role::Faint));
     }
+    let (text, close) = with_close(&text, c.width);
+    runs.push(close);
     Line {
-        text: fit(&text, c.width),
+        text,
         colour: stale.then_some(crate::theme::Role::Faint),
         accent: None,
         indicator: Some((0, 2, role)),
         runs,
     }
+}
+
+/// The columns the close at the end of an agent's row takes: a blank and the `x`.
+const CLOSE_W: usize = 2;
+
+/// An agent's first row, laid out for a space's inside, with its close `x` in the last
+/// column: once boxed, the column the space's own `x` is in. In the controls' grey.
+fn with_close(text: &str, width: usize) -> (String, (usize, usize, crate::theme::Role)) {
+    let at = width.saturating_sub(1);
+    (
+        format!("{}x", fit_to(text, at)),
+        (at, 1, crate::theme::Role::Faint),
+    )
+}
+
+/// Whether a click at `col` (counted from one) on the first row of `terminal` lands on the
+/// agent's close. Only the tree draws it, and only under a space it knows.
+pub fn on_agent_close(col: usize, terminal: u32, c: &Column) -> bool {
+    c.view == View::Tree
+        && col + 1 == c.width
+        && (c.agents.iter().any(|a| {
+            a.terminal == terminal && a.agent && c.spaces.iter().any(|s| s.id == a.workspace)
+        }) || c.spaces.iter().any(|s| {
+            s.sleeping
+                .iter()
+                .any(|t| t.terminal == terminal && t.agent.is_some())
+        }))
 }
 
 /// A tab of a sleeping space: its space's quieter colour, like a calm agent's title, with
@@ -1768,11 +1797,13 @@ fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
         None => name,
     };
     let lead = cell_mark(crate::theme::Role::Sleeping, false, 0);
-    let room = c.width.saturating_sub(crate::width::width(&lead));
+    let room = c.width.saturating_sub(crate::width::width(&lead) + CLOSE_W);
+    let (text, close) = with_close(&format!("{lead}{}", shorten_middle(&text, room)), c.width);
     Line {
-        text: fit(&format!("{lead}{}", shorten_middle(&text, room)), c.width),
+        text,
         colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
         indicator: Some((0, 2, crate::theme::Role::Sleeping)),
+        runs: vec![close],
         ..Line::default()
     }
 }
@@ -2816,13 +2847,27 @@ mod tests {
     /// A row inside a box with its sides blanked, so what it holds reads at the columns
     /// it is drawn at: ` │ ● claude    │` is `   ● claude`. Any other row as it is.
     fn unbox(text: &str) -> String {
-        let text = text.trim_end();
+        let text = without_close(text);
         match text
             .strip_prefix(" \u{2502} ")
             .and_then(|t| t.strip_suffix('\u{2502}'))
         {
             Some(inside) => format!("   {}", inside.trim_end()),
             None => text.to_string(),
+        }
+    }
+
+    /// An agent's first row without the close `x` at its end: a row whose mark is a braille
+    /// dot. A space's rule keeps its own `x`.
+    fn without_close(text: &str) -> &str {
+        let text = text.trim_end();
+        let agent = text
+            .chars()
+            .nth(1)
+            .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+        match text.strip_suffix(" x") {
+            Some(rest) if agent => rest.trim_end(),
+            _ => text,
         }
     }
 
@@ -5667,14 +5712,14 @@ mod tests {
         };
         let wide = at(30);
         let row = tree_row(&wide, 1);
-        assert!(row.text.ends_with(" 4% 212M  "), "{:?}", row.text);
+        assert!(row.text.ends_with(" 4% 212M x "), "{:?}", row.text);
         assert!(
             row.runs
                 .iter()
                 .any(|(_, _, r)| *r == crate::theme::Role::Faint)
         );
         assert!(
-            tree_row(&wide, 2).text.ends_with(" 3.0G  "),
+            tree_row(&wide, 2).text.ends_with(" 3.0G x "),
             "{:?}",
             tree_row(&wide, 2).text
         );
@@ -7203,6 +7248,31 @@ mod tests {
         let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
         c.armed = Some(1);
         assert!(first_rule(&c).text.starts_with("\u{25be}app close?"));
+    }
+
+    /// An agent's first row ends in a grey `x`, in the column the space's own `x` is in, and
+    /// a click there, and only there, is that agent's close.
+    #[test]
+    fn an_agent_row_carries_its_close_under_the_space_close() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        let rows = rows_folded(&c, 20, None);
+        let row = tree_row(&rows, 1);
+        let close = chip_places(WIDTH)[3].0;
+        assert_eq!(row.text.chars().nth(close), Some('x'), "{:?}", row.text);
+        assert!(
+            row.runs.contains(&(close, 1, crate::theme::Role::Faint)),
+            "{:?}",
+            row.runs
+        );
+        assert!(on_agent_close(close + 1, 1, &c));
+        assert!(!on_agent_close(close, 1, &c));
+        let flat = clicks(&spaces, &agents, View::Priority, WIDTH, &none);
+        assert!(
+            !on_agent_close(close + 1, 1, &flat),
+            "the priority view draws none"
+        );
     }
 
     /// A sleeping space keeps a way back on its rule: `wake`, in the chip `sleep` is in on

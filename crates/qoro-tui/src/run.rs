@@ -1186,8 +1186,15 @@ impl State {
                 None => None,
             };
         }
-        let (hit, _) = self.column_hit(row)?;
+        let (hit, first) = self.column_hit(row)?;
         let column = self.column(now_unix, 0);
+        if let sidebar::Hit::Terminal(terminal) = hit
+            && first
+            && !self.collapsed
+            && sidebar::on_agent_close(col as usize, terminal, &column)
+        {
+            return Some(Clicked::CloseAgent(terminal));
+        }
         // A row that does two things answers with the row; the column decides which.
         match sidebar::act(hit, col as usize, &column, self.collapsed)? {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
@@ -1943,7 +1950,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             if state.focused == 0 {
                 state.message = Some("nothing to close".to_string());
                 MenuSend::Nothing
-            } else if let Some(question) = close_question(state) {
+            } else if let Some(question) = close_question(state, state.focused) {
                 state.modes.confirm_close = Some((state.focused, question));
                 MenuSend::Nothing
             } else {
@@ -2868,8 +2875,8 @@ fn mode_input(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) ->
 
 /// The question to ask before closing the focused terminal, when closing it would end an
 /// agent in the middle of something. Shells and resting agents close at once.
-fn close_question(state: &State) -> Option<String> {
-    let row = state.rows.iter().find(|r| r.terminal == state.focused)?;
+fn close_question(state: &State, terminal: u32) -> Option<String> {
+    let row = state.rows.iter().find(|r| r.terminal == terminal)?;
     (row.agent && matches!(row.state.as_str(), "working" | "blocked" | "starting")).then(|| {
         // A capital Y: a blocked agent is usually waiting for a lowercase y of its own, and
         // a stray prefix and x followed by the answer meant for it must not end it.
@@ -2896,13 +2903,20 @@ fn close_focused(state: &mut State, request: &mut u64) {
         }
         return;
     }
-    match close_question(state) {
-        Some(question) => state.modes.confirm_close = Some((state.focused, question)),
+    close_terminal(state, state.focused, request);
+}
+
+/// Close one terminal, a pane and only that pane, or ask first when an agent in it is busy.
+/// The last pane of a tab takes the tab with it; in a split the other panes stay. A sleeping
+/// tab has nothing running to ask about, and the daemon discards it without waking it.
+fn close_terminal(state: &mut State, terminal: u32, request: &mut u64) {
+    match close_question(state, terminal) {
+        Some(question) => state.modes.confirm_close = Some((terminal, question)),
         None => {
             *request += 1;
             state.modes.outbox.push(ControlRequest::CloseTerminal {
                 id: format!("close-{request}"),
-                terminal: state.focused,
+                terminal,
             });
         }
     }
@@ -4046,6 +4060,9 @@ enum Clicked {
     /// The close on the focused tab: the same as `ctrl-a x`, a question first when an agent
     /// in it is busy.
     CloseFocused,
+    /// The `x` on an agent's row in the column: that agent's pane, a question first when
+    /// it is busy.
+    CloseAgent(u32),
     NewTerminal,
     /// A space's `+`: a terminal or an agent in that space.
     New(i64),
@@ -5285,6 +5302,10 @@ where
                                     }
                                     Some(Clicked::CloseFocused) => {
                                         close_focused(&mut state, &mut request);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::CloseAgent(terminal)) => {
+                                        close_terminal(&mut state, terminal, &mut request);
                                         dirty = true;
                                     }
                                     // The tab bar's `+` is the space on screen's `+`.
@@ -13786,6 +13807,33 @@ mod tests {
             state.modes.outbox.pop(),
             Some(ControlRequest::CloseTerminal { terminal: 2, .. })
         ));
+    }
+
+    /// The `x` on an agent's row closes that agent's pane and nothing else: in a split the
+    /// pane the keyboard is in stays, and a busy agent is asked about first.
+    #[test]
+    fn an_agent_row_close_ends_its_own_pane_of_a_split() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        assert_eq!(state.focused, 1);
+        close_terminal(&mut state, 2, &mut request);
+        assert!(
+            state.modes.outbox.is_empty(),
+            "a working claude is asked about"
+        );
+        assert_eq!(
+            state.mode_line(),
+            Some("close claude (working)? Y closes it, any other key keeps it")
+        );
+        assert_eq!(
+            confirm_key(&mut state, b"Y", &mut request),
+            ModeOutcome::Stay
+        );
+        assert!(matches!(
+            state.modes.outbox.as_slice(),
+            [ControlRequest::CloseTerminal { terminal: 2, .. }]
+        ));
+        assert_eq!(state.focused, 1, "the other pane keeps the keyboard");
     }
 
     /// Found in review: a sequence cut at the end of a read had its tail typed into the
