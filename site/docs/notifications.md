@@ -43,9 +43,10 @@ sound is played from a qoro running over ssh. A name from the other system (a Ma
 on Linux) plays that default.
 
 To hear them and choose, run `qoro sound`: macOS lists its own sounds, Linux the
-freedesktop ones installed. A number or a name plays one, enter
-keeps it, first for a finished agent, then for one that waits on you. Keeping one turns
-`sound` on, `off` turns it off. A running qoro takes the change the next time its settings
+freedesktop ones installed. The arrows move through them and play each one, space plays it
+again, enter keeps it, first for a finished agent, then for one that waits on you. Piped,
+it reads lines instead: a number or a name plays one, an empty line keeps it. Keeping one turns
+`sound` on, `o` (`off` piped) turns it off. A running qoro takes the change the next time its settings
 open (prefix, space, `settings`).
 
 ## Turning it off

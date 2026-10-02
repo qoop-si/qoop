@@ -24,6 +24,7 @@ mod mobile;
 mod notch;
 mod remote;
 mod skills;
+mod sound;
 mod supervise;
 mod update;
 mod worktree;
@@ -126,7 +127,7 @@ fn run() -> std::io::Result<()> {
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
         Some("config") => config::run(&args),
-        Some("sound") => config::run_sound(&args),
+        Some("sound") => sound::run(&args),
         Some("skills") => skills::run(&args),
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
