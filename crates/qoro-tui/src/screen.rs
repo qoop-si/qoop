@@ -303,12 +303,11 @@ fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
         })
         .collect()
 }
-/// The columns one entry takes: `  key action`, or `  label` for the prefix. The first on
-/// the row takes one space less, at the edge.
+/// The columns one entry takes: ` [key→action]`, or ` label` for the prefix.
 fn hint_width(hint: &Hint) -> usize {
     match hint.1 {
-        Some(action) => 3 + width::width(hint.0) + width::width(action),
-        None => 2 + width::width(hint.0),
+        Some(action) => 4 + width::width(hint.0) + width::width(action),
+        None => 1 + width::width(hint.0),
     }
 }
 
@@ -335,15 +334,15 @@ fn fitted(context: KeyContext, place: Place, cols: usize) -> Vec<Hint> {
     kept
 }
 
-/// The key row, `key action` two spaces apart, in the status colours, exactly `cols` wide.
+/// The key row in brackets, `[key→action]`, in the status colours, exactly `cols` wide.
 ///
-/// The key bright and the action quiet, as every box's footer says them.
+/// The key wears the brand orange so the eye finds the letters first; the arrow and
+/// brackets are quiet, the action is detail.
 fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for hint in fitted(context, place, cols) {
-        let lead = if used == 0 { " " } else { "  " };
-        let wide = hint_width(&hint) + lead.len() - 2;
+        let wide = hint_width(&hint);
         if used + wide > cols {
             break;
         }
@@ -351,23 +350,26 @@ fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
         match hint.1 {
             None => {
                 out.push_str(&theme::status_in(theme::Role::Faint));
-                out.push_str(lead);
+                out.push(' ');
                 out.push_str(hint.0);
             }
             Some(action) => {
-                out.push_str(&theme::status());
-                out.push_str(lead);
-                out.push_str(&theme::status_key());
+                out.push_str(&theme::status_in(theme::Role::Rule));
+                out.push_str(" [");
+                out.push_str(&theme::status_in(theme::Role::Brand));
                 out.push_str(hint.0);
-                out.push_str(&theme::status());
-                out.push(' ');
+                out.push_str(&theme::status_in(theme::Role::Faint));
+                out.push('\u{2192}');
+                out.push_str(&theme::status_in(theme::Role::Detail));
                 out.push_str(action);
+                out.push_str(&theme::status_in(theme::Role::Rule));
+                out.push(']');
             }
         }
     }
     out.push_str(&theme::status());
     if used == 0 {
-        // Narrower than one entry: the way out, plainly, cut to what fits.
+        // Narrower than one bracketed entry: the way out, plainly, cut to what fits.
         let plain = width::fit(" d detach", cols);
         used = width::width(&plain);
         out.push_str(&plain);
@@ -3802,7 +3804,7 @@ mod tests {
         // Once on the tab and once in the column: the bar says what is open in this
         // space and the panel says what it is doing.
         assert!(painted.matches("claude").count() >= 2, "{painted:?}");
-        assert!(strip(&painted).contains("d detach"));
+        assert!(strip(&painted).contains("[d\u{2192}detach]"));
         assert!(painted.contains("agents"), "no agents panel: {painted:?}");
         assert!(
             painted.contains("app"),
@@ -4669,23 +4671,24 @@ mod tests {
         };
         let plain = |context, cols| strip(&key_row(context, open, cols));
         let pane = plain(KeyContext::Pane, 200);
-        assert!(pane.starts_with(" ctrl-a:  space find"), "{pane:?}");
+        assert!(pane.starts_with(" ctrl-a: [space\u{2192}find]"), "{pane:?}");
         let column = plain(KeyContext::Sidebar, 200);
-        assert!(column.contains("click open"), "{column:?}");
-        assert!(column.contains("g tree/priority"), "{column:?}");
+        assert!(column.contains("[click\u{2192}open]"), "{column:?}");
+        assert!(column.contains("[g\u{2192}tree/priority]"), "{column:?}");
         let prefix = plain(KeyContext::Prefix, 200);
         assert!(
             !prefix.contains("ctrl-a:"),
             "the prefix is already down: {prefix:?}"
         );
-        assert!(prefix.contains("z zoom"), "{prefix:?}");
+        assert!(prefix.contains("[z\u{2192}zoom]"), "{prefix:?}");
         for context in [KeyContext::Pane, KeyContext::Sidebar, KeyContext::Prefix] {
             for cols in [5usize, 10, 11, 18, 20, 40, 80, 120, 200] {
                 let row = plain(context, cols);
                 assert_eq!(width::width(&row), cols, "{context:?} at {cols}: {row:?}");
-                // Under one entry the way out is said plainly, cut to fit.
+                // Under one bracketed entry the way out is said plainly, cut to fit.
+                // The narrowest entry is `[d→detach]`, eleven columns with its gap.
                 assert!(
-                    row.contains("d detach") || (cols < 10 && row.starts_with(" d")),
+                    row.contains("[d\u{2192}detach]") || (cols < 11 && row.starts_with(" d")),
                     "{context:?} at {cols}: {row:?}"
                 );
             }
@@ -4694,7 +4697,7 @@ mod tests {
         // columns fold, focus and split go and the rest stay in order.
         assert_eq!(
             plain(KeyContext::Pane, 80).trim_end(),
-            " ctrl-a:  space find  c new tab  n next  m menu  v split  ? keys  d detach"
+            " ctrl-a: [space\u{2192}find] [c\u{2192}new tab] [n\u{2192}next] [m\u{2192}menu] [?\u{2192}keys] [d\u{2192}detach]"
         );
         // Where nothing folds the row offers no fold, and the strip has no edge to drag.
         let strip_place = Place {
@@ -4704,7 +4707,10 @@ mod tests {
         let strip_row = strip(&key_row(KeyContext::Sidebar, strip_place, 200));
         assert!(!strip_row.contains("fold"), "{strip_row:?}");
         assert!(!strip_row.contains("drag edge"), "{strip_row:?}");
-        assert!(strip_row.contains("b show column"), "{strip_row:?}");
+        assert!(
+            strip_row.contains("[b\u{2192}show column]"),
+            "{strip_row:?}"
+        );
     }
     /// The way out is the one key a person stuck in here has to be able to read, so it is
     /// never the one the cut takes.
@@ -4747,7 +4753,7 @@ mod tests {
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
             assert!(
-                keys.contains("d detach"),
+                keys.contains("[d\u{2192}detach]"),
                 "{cols} columns: no way out on the key row: {keys:?}"
             );
             assert!(
@@ -5465,7 +5471,7 @@ mod tests {
             image_notice: None,
             chrome: Default::default(),
         });
-        assert!(strip(&painted).contains("d detach"), "{painted:?}");
+        assert!(strip(&painted).contains("[d\u{2192}detach]"), "{painted:?}");
         assert!(!painted.contains("next:"), "{painted:?}");
     }
 
