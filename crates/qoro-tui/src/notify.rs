@@ -407,10 +407,11 @@ pub fn sound(urgent: bool, macos: bool, done: &str, alert: &str) -> Option<Call>
         let file = format!("/System/Library/Sounds/{name}.aiff");
         return on_path("afplay").map(|_| play("afplay", &file));
     }
-    let file = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
-    if !Path::new(&file).is_file() {
-        return None;
-    }
+    // A theme without the picked file still has the default's, which plays instead.
+    let file = [name, playable("", urgent, false)]
+        .map(|n| format!("/usr/share/sounds/freedesktop/stereo/{n}.oga"))
+        .into_iter()
+        .find(|file| Path::new(file).is_file())?;
     ["paplay", "pw-play"]
         .into_iter()
         .find(|player| on_path(player).is_some())

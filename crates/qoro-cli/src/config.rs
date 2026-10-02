@@ -134,15 +134,21 @@ pub fn run_sound(args: &[String]) -> std::io::Result<()> {
             true,
         ),
     ] {
-        let mut heard = qoro_tui::notify::playable(now, urgent, macos);
-        println!("\n{what}, now {heard}");
+        // Kept as written: a Mac name in a file shared with Linux stays when enter keeps it,
+        // and only what plays here is shown.
+        let mut heard = now;
+        let shown = |name| qoro_tui::notify::playable(name, urgent, macos);
+        println!("\n{what}, now {}", shown(heard));
         for (i, name) in list.iter().enumerate() {
             print!("{:>3} {name:<width$}", i + 1);
             if i % per_row == per_row - 1 || i + 1 == list.len() {
                 println!();
             }
         }
-        print!("a number plays it, enter keeps {heard}, off for silence, q quits");
+        print!(
+            "a number plays it, enter keeps {}, off for silence, q quits",
+            shown(heard)
+        );
         loop {
             print!("\n> ");
             std::io::stdout().flush()?;
@@ -169,8 +175,9 @@ pub fn run_sound(args: &[String]) -> std::io::Result<()> {
                     return Ok(());
                 }
                 Sound::Invalid => print!(
-                    "1 to {} or a name plays one, enter keeps {heard}",
-                    list.len()
+                    "1 to {} or a name plays one, enter keeps {}",
+                    list.len(),
+                    shown(heard)
                 ),
             }
         }
