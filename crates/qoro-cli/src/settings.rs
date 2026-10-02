@@ -149,6 +149,13 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         "when everything sleeps",
         Kind::Toggle("daemon.exit_when_asleep"),
     ));
+    out.push(row(
+        "qass",
+        "qass model",
+        c.qass_model.to_string(),
+        "what `qoro qass` starts qass with",
+        Kind::Choice("qass.model", config::QASS_MODELS.map(String::from).to_vec()),
+    ));
     for agent in &read.agents {
         out.push(row(
             "agents",
@@ -223,6 +230,7 @@ fn filtered(all: &[Row], query: &str, chip: usize) -> Vec<Row> {
         .filter(|r| match CHIPS[chip] {
             "all" => true,
             "look" => matches!(r.group, "look" | "keys"),
+            "agents" => matches!(r.group, "agents" | "qass"),
             chip => r.group == chip,
         })
         .filter(|r| {

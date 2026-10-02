@@ -137,14 +137,16 @@ needs your word. You answer it in its own tab, and it passes your answer on. Sta
 its own space:
 
 ```
-qoro new --space qass --name qass --cwd "$(qoro paths qass-data)" -- claude --model sonnet
+qoro qass
 ```
 
-then type `/qass` there. A hook on every tool call bounds what it may do, whatever it
-decides; it lives in that folder's `.claude/settings.json`, so qass is bound the same way when a
+It opens qass in its own space on the model `qoro settings` names (sonnet by default),
+already running, or shows or wakes the one you have. Close it with the `x` on its row.
+A hook on every tool call bounds what it may do, whatever it decides; it lives in
+`$(qoro paths qass-data)/.claude/settings.json`, so qass is bound the same way when a
 restore or a wake brings it back with nothing but `claude --resume`. Your file
 `$(qoro paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
-your "ok P3") or `mode auto`, and per repository grants such as
+your "ok <name>") or `mode auto`, and per repository grants such as
 `grant /path/to/repo commit`. When you correct it, it keeps the rule in
 `$(qoro paths qass-config)/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
 make it more careful, never let it act alone where it would have asked you. `qoro paths`

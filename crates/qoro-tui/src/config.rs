@@ -14,6 +14,8 @@
 //! idle_minutes = 0
 //! [daemon]
 //! exit_when_asleep = true
+//! [qass]
+//! model = "sonnet"    # sonnet | opus | haiku: the model `qoro qass` starts it with
 //! [agents]            # a name for a new agent, and the line typed to start it
 //! claudec = "claude --dangerously-skip-permissions"
 //! lm = "opencode"
@@ -85,7 +87,12 @@ pub struct Config {
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
     pub lifecycle: qoro_runtime::config::Lifecycle,
+    /// The model `qoro qass` starts qass with, one of [`QASS_MODELS`].
+    pub qass_model: &'static str,
 }
+
+/// The Claude models qass may run on, by the names `claude --model` takes.
+pub const QASS_MODELS: [&str; 3] = ["sonnet", "opus", "haiku"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -99,6 +106,7 @@ impl Default for Config {
             alert_sound: "Funk",
             notch: true,
             lifecycle: qoro_runtime::config::Lifecycle::default(),
+            qass_model: "sonnet",
         }
     }
 }
@@ -370,6 +378,8 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
         daemon: Spans,
         #[serde(default)]
         agents: Spans,
+        #[serde(default)]
+        qass: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
@@ -474,6 +484,26 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 }
             }
             ("notch", _) => refuse(line, "notch is a table: [notch] then enabled = true".into()),
+            ("qass", toml::Value::Table(qass)) => {
+                for (key, value) in qass {
+                    let line = line_of(&nested.qass, key);
+                    let model = value
+                        .as_str()
+                        .and_then(|v| QASS_MODELS.iter().find(|m| **m == v));
+                    match (key.as_str(), model) {
+                        ("model", Some(model)) => config.qass_model = model,
+                        ("model", None) => refuse(
+                            line,
+                            format!("model = {value} is not one of {}", QASS_MODELS.join(", ")),
+                        ),
+                        _ => refuse(line, format!("there is no setting qass.{key}")),
+                    }
+                }
+            }
+            ("qass", _) => refuse(
+                line,
+                "qass is a table: [qass] then model = \"sonnet\"".into(),
+            ),
             ("sleep" | "daemon", _) => {}
             ("agents", toml::Value::Table(table)) => {
                 for (name, value) in table {
@@ -560,7 +590,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 10] = [
+pub const KEYS: [&str; 11] = [
     "prefix",
     "theme",
     "icons",
@@ -571,6 +601,7 @@ pub const KEYS: [&str; 10] = [
     "notch.enabled",
     "sleep.idle_minutes",
     "daemon.exit_when_asleep",
+    "qass.model",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -589,6 +620,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
         },
+        "qass.model" if QASS_MODELS.contains(&value) => toml_edit::value(value),
+        "qass.model" => return Err(format!("{key} is one of {}", QASS_MODELS.join(", "))),
         "sleep.idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
@@ -660,6 +693,22 @@ fn prefix_byte(name: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qass_model_is_read_and_checked() {
+        let (config, _, problems) = parse_all("[qass]\nmodel = \"opus\"\n");
+        assert_eq!(config.qass_model, "opus");
+        assert!(problems.is_empty(), "{problems:?}");
+        let (config, _, problems) = parse_all("[qass]\nmodel = \"gpt\"\n");
+        assert_eq!(config.qass_model, "sonnet");
+        assert_eq!(problems.len(), 1);
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        set(&path, "qass.model", "haiku").expect("set");
+        assert!(set(&path, "qass.model", "gpt").is_err());
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(parse_all(&text).0.qass_model, "haiku");
+    }
 
     /// The agents come in the order the file lists them, not sorted by name, and each is
     /// the command a person wrote, trimmed.

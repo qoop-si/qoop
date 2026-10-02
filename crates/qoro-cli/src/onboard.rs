@@ -25,7 +25,7 @@ struct Step {
     groups: &'static [&'static str],
 }
 
-const STEPS: [Step; 6] = [
+const STEPS: [Step; 7] = [
     Step {
         name: "pet",
         title: "your pet",
@@ -61,6 +61,12 @@ const STEPS: [Step; 6] = [
         title: "sleep",
         what: "when idle tabs sleep to give back memory",
         groups: &["sleep"],
+    },
+    Step {
+        name: "qass",
+        title: "qass",
+        what: "the assistant over your agents: `qoro qass` opens it on this model",
+        groups: &["qass"],
     },
 ];
 

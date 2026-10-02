@@ -25,6 +25,7 @@ mod notch;
 mod onboard;
 mod page;
 mod places;
+mod qass;
 mod remote;
 mod settings;
 mod skills;
@@ -136,6 +137,7 @@ fn run() -> std::io::Result<()> {
         Some("onboard") => onboard::run(&args),
         Some("skills") => skills::run(&args),
         Some("paths") => places::run(&args[2..]),
+        Some("qass") => qass::run_qass(&args),
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
         Some("devices") => mobile::run_devices(&args),
@@ -217,7 +219,8 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro config [--json]  the settings in config.toml and where it is\n\
                   \x20 qoro config set <key> <value>  change one, keeping the rest of the file\n\
                   \x20 qoro settings   every setting on one page, with your pet\n\
-                  \x20 qoro onboard    the first start: pet, sounds, look, keys, sleep\n\
+                  \x20 qoro onboard    the first start: pet, sounds, look, keys, sleep, qass\n\
+                  \x20 qoro qass       open qass, the assistant over your agents\n\
                   \x20 qoro sound      hear the notification sounds and keep one each\n\
                   \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
