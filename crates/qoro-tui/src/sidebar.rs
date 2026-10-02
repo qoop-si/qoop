@@ -1577,7 +1577,9 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         let mut slots = Vec::new();
         if held > 0 {
             if !space.asleep && dozing > 0 {
-                slots.push(format!(" ({held}, {dozing} asleep)"));
+                // The zzz an asleep tab wears, or a `z` where icons are not drawn.
+                let zzz = if c.icons { crate::icons::ASLEEP } else { 'z' };
+                slots.push(format!(" ({held}, {dozing}{zzz})"));
             }
             slots.push(format!(" ({held})"));
         }
@@ -8047,21 +8049,22 @@ mod tests {
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let at = |width| first_rule(&clicks(&spaces, &agents, View::Tree, width, &none)).text;
         assert!(
-            at(SIDEBAR_MAX).contains("qoro-mobile (3, 2 asleep)"),
+            at(SIDEBAR_MAX).contains("qoro-mobile (3, 2z)"),
             "{:?}",
             at(60)
         );
         // With the drawer closed the narrowest column still holds the whole slot, the
         // name cut short for it; with it open, the slot gives up its sleeping part first.
+        let mut drawn = clicks(&spaces, &agents, View::Tree, SIDEBAR_MAX, &none);
+        drawn.icons = true;
+        let zzz = format!("(3, 2{})", crate::icons::ASLEEP);
+        assert!(first_rule(&drawn).text.contains(&zzz), "{zzz:?}");
         let narrow = at(SIDEBAR_MIN);
-        assert!(narrow.contains("\u{2026} (3, 2 asleep)"), "{narrow:?}");
+        assert!(narrow.contains("\u{2026} (3, 2z)"), "{narrow:?}");
         let mut c = clicks(&spaces, &agents, View::Tree, 30, &none);
         c.drawer = Some((1, DRAWER));
         let open = first_rule(&c).text;
-        assert!(
-            open.contains(" (3) ") && !open.contains("asleep"),
-            "{open:?}"
-        );
+        assert!(open.contains(" (3) ") && !open.contains("2z"), "{open:?}");
     }
 
     /// The session's own default carries no close, because the daemon refuses to close it
