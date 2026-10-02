@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(qoro agents*)",
+      "Bash(qoro context *)",
+      "Bash(qoro read *)",
+      "Bash(qoro history *)",
+      "Bash(qoro prompt *)",
+      "Bash(qoro send *)",
+      "Bash(wend search *)",
+      "Bash(wend recall *)",
+      "Read(~/.qass/**)",
+      "Edit(~/.qass/goals.md)"
+    ],
+    "deny": [
+      "Edit(~/.qass/policy)",
+      "Edit(~/.qass/gate.jsonl)",
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" tool", "timeout": 20 }] }
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" owner" }] }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git push -f*)",
+      "Bash(git push --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git push *--force*)",
+      "Bash(git push * main*)",
+      "Bash(git push * master*)",
+      "Bash(git push *:main*)",
+      "Bash(git push *:master*)",
+      "Bash(gh pr merge*)",
+      "Bash(gh release*)",
+      "Bash(git tag*)",
+      "Bash(npm publish*)",
+      "Bash(qoro prompt*)",
+      "Bash(qoro send*)",
+      "Bash(*.qass*)",
+      "Edit(~/.qass/**)"
+    ]
+  }
+}

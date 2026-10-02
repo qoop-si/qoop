@@ -23,6 +23,55 @@ const BODY: &str = include_str!("../../../skills/qoro/SKILL.md");
 /// The file name every agent reads.
 const FILE: &str = "SKILL.md";
 
+/// qass, the assistant over every other agent. Claude only: it stands on Claude Code's
+/// Monitor tool, hooks and dontAsk mode. Installed with Claude's qoro skill, as files that
+/// sit beside each other because the scripts find one another by their own directory.
+const QASS_DIR: &str = ".claude/skills/qass";
+
+/// Name, body, and whether it is a program.
+const QASS: &[(&str, &str, bool)] = &[
+    (
+        "SKILL.md",
+        include_str!("../../../skills/qass/SKILL.md"),
+        false,
+    ),
+    (
+        "watch.sh",
+        include_str!("../../../skills/qass/watch.sh"),
+        true,
+    ),
+    (
+        "gate.sh",
+        include_str!("../../../skills/qass/gate.sh"),
+        true,
+    ),
+    (
+        "gate.py",
+        include_str!("../../../skills/qass/gate.py"),
+        false,
+    ),
+    (
+        "escalate.sh",
+        include_str!("../../../skills/qass/escalate.sh"),
+        true,
+    ),
+    (
+        "spawn.sh",
+        include_str!("../../../skills/qass/spawn.sh"),
+        true,
+    ),
+    (
+        "settings.json",
+        include_str!("../../../skills/qass/settings.json"),
+        false,
+    ),
+    (
+        "worker.json",
+        include_str!("../../../skills/qass/worker.json"),
+        false,
+    ),
+];
+
 /// One agent's skills directory, and whether it is proven to be read.
 struct Target {
     /// What a person calls the agent, and what they type to install it.
@@ -136,6 +185,45 @@ fn install_into(home: &Path, target: &Target) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Write qass's files, answering whether anything changed.
+fn install_qass(home: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home.join(QASS_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let mut changed = false;
+    for (name, body, program) in QASS {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == *body) {
+            continue;
+        }
+        std::fs::write(&path, body)?;
+        if *program {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Remove exactly qass's files, and its directory only when left empty.
+fn remove_qass(home: &Path) -> std::io::Result<bool> {
+    let dir = home.join(QASS_DIR);
+    let mut removed = false;
+    for (name, _, _) in QASS {
+        removed |= std::fs::remove_file(dir.join(name)).is_ok();
+    }
+    if std::fs::read_dir(&dir).is_ok_and(|mut e| e.next().is_none()) {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(removed)
+}
+
+fn qass_current(home: &Path) -> bool {
+    let dir = home.join(QASS_DIR);
+    QASS.iter()
+        .all(|(name, body, _)| std::fs::read_to_string(dir.join(name)).is_ok_and(|b| b == *body))
+}
+
 /// Remove one agent's skill, answering whether anything changed.
 ///
 /// The directory goes only when left empty; a directory holding somebody
@@ -162,6 +250,12 @@ fn status() -> std::io::Result<()> {
     for target in targets() {
         println!("  {:<10} {}", target.agent, status_of(&home, &target));
     }
+    let qass = match (home.join(QASS_DIR).exists(), qass_current(&home)) {
+        (false, _) => "not installed",
+        (true, false) => "installed, and older than this build: run install again",
+        (true, true) => "installed (with claude)",
+    };
+    println!("  {:<10} {qass}", "qass");
     println!(
         "\n  qoro skills install [agent...]    add the skill, beside whatever is already there"
     );
@@ -174,6 +268,9 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
+        if target.agent == "claude" && install_qass(&home)? {
+            println!("  {:<10} installed into {QASS_DIR}", "qass");
+        }
         if !install_into(&home, &target)? {
             println!("  {:<10} already installed", target.agent);
             continue;
@@ -195,6 +292,9 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to uninstall from"));
     };
     for target in wanted(args)? {
+        if target.agent == "claude" && remove_qass(&home)? {
+            println!("  {:<10} removed from {QASS_DIR}", "qass");
+        }
         match remove_from(&home, &target)? {
             true => println!("  {:<10} removed from {}", target.agent, target.dir),
             false => println!("  {:<10} was not there", target.agent),
@@ -258,6 +358,30 @@ mod tests {
         // Our directory is gone when left empty; theirs stays.
         assert!(!home.path().join(".claude/skills/qoro").exists());
         assert!(neighbour.exists());
+    }
+
+    /// qass installs whole, its programs runnable, changes nothing the second time,
+    /// and uninstalls to nothing while a neighbour's file stays.
+    #[test]
+    fn qass_installs_whole_and_leaves_neighbours() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home_dir();
+        assert!(install_qass(home.path()).expect("install"));
+        assert!(qass_current(home.path()));
+        let gate = home.path().join(QASS_DIR).join("gate.sh");
+        let mode = std::fs::metadata(&gate).expect("gate").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "gate.sh is not runnable");
+        assert!(
+            !install_qass(home.path()).expect("reinstall"),
+            "the second install changed something"
+        );
+        let theirs = home.path().join(QASS_DIR).join("notes.txt");
+        std::fs::write(&theirs, "theirs").expect("write");
+        assert!(remove_qass(home.path()).expect("uninstall"));
+        assert_eq!(std::fs::read_to_string(&theirs).expect("read"), "theirs");
+        std::fs::remove_file(&theirs).expect("rm");
+        assert!(!remove_qass(home.path()).expect("uninstall again"));
+        assert!(!home.path().join(QASS_DIR).exists());
     }
 
     /// Uninstalling twice is not an error.

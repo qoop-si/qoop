@@ -131,6 +131,21 @@ How a screen is read, and how to override a misreading, is in
 [docs/manifests.md](docs/manifests.md); what each hook installs is in
 [docs/hooks.md](docs/hooks.md).
 
+For Claude Code the skill install also brings qass, an assistant that sits above every
+other agent: it is told when one stops, reads where that work stands (its task, its plan
+file, the repo's rules), answers what it can the way you would, and sends you only what
+needs your word. You answer it in its own tab, and it passes your answer on. Start it in
+its own space:
+
+```
+qoro new --space qass --name qass -- claude --model sonnet --permission-mode dontAsk --settings ~/.claude/skills/qass/settings.json
+```
+
+then type `/qass` there. A hook on every tool call bounds what it may do, whatever it
+decides. Your file `~/.qass/policy` holds `mode propose` (it writes to an agent only after
+your "ok P3") or `mode auto`, and per repository grants such as
+`grant /path/to/repo commit`.
+
 On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
 skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro` (or
 `QORO_DEST`), and it says so if that directory is not on your PATH. The releases are
