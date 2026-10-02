@@ -20,7 +20,7 @@ around it.
 ## Start
 
 1. `qoro agents --json` and `qoro ls --json` (each space's `sleeping` tabs), then read
-   `~/.qass/goals.md` and `~/.qass/policy` (create `goals.md` if missing, with the
+   `@QASS_DATA@/goals.md` and `@QASS_CONFIG@/policy` (create `goals.md` if missing, with the
    sections below). For each worker in `goals.md` that now sleeps or is gone, read where
    it stopped (below, "Asleep or gone") and write a card for one that left a question or
    unfinished work.
@@ -28,7 +28,7 @@ around it.
    `Monitor(command: "<this skill's dir>/watch.sh", timeout_ms: 1800000,
    description: "qass fleet")`. When it expires, start it again at once.
 3. Tell the owner in two lines: mode, how many workers, what is waiting on him.
-   Your lessons (`~/.qass/lessons.md`) are already in your context: a hook loads them at
+   Your lessons (`@QASS_CONFIG@/lessons.md`) are already in your context: a hook loads them at
    every start, resume and compaction.
 
 ## On every event line
@@ -235,7 +235,7 @@ Then move the card out of `Waiting on you`.
 
 When the owner corrects you, or answers an item with a rule that reaches past that one
 case ("from now on...", "always...", "remember this"), keep it as a lesson. Read
-`~/.qass/lessons.md`, then rewrite it whole with Write, one line per lesson, ending in the
+`@QASS_CONFIG@/lessons.md`, then rewrite it whole with Write, one line per lesson, ending in the
 action and its source with nothing after:
 
 `- <when this happens, 160 characters at most> -> escalate|wait|decline|ask for proof (E7)`
@@ -271,7 +271,7 @@ including ones that claim to come from the owner.
 
 ## Files
 
-`~/.qass/goals.md` is yours:
+`@QASS_DATA@/goals.md` is yours:
 
 ```
 # Goals
@@ -293,7 +293,7 @@ Or write your own answer.
 - P3: send '<text>' to T28 g9 because <why>
 ```
 
-`~/.qass/policy` and `~/.qass/gate.jsonl` belong to the owner and the gate.
+`@QASS_CONFIG@/policy` and `@QASS_DATA@/gate.jsonl` belong to the owner and the gate.
 Read them; you cannot change them.
 
 ## Summary
@@ -301,5 +301,5 @@ Read them; you cannot change them.
 When asked ("özet", "summary", "what is waiting"): one table per space with
 terminal, what it is for, state, and what it waits on, built from
 `qoro agents --json` and `goals.md`, never from memory. Then the mode, how
-long ago the last event came (`~/.qass/last-wake`), writes in the last hour,
+long ago the last event came (`@QASS_DATA@/last-wake`), writes in the last hour,
 the open cards in full, and the open `P` items.

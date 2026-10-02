@@ -28,10 +28,34 @@ const FILE: &str = "SKILL.md";
 /// sit beside each other because the scripts find one another by their own directory.
 const QASS_DIR: &str = ".claude/skills/qass";
 
-/// qass's own working folder's settings: the gate and its permission mode, loaded by any
-/// Claude started there, by hand, restored or woken (a restore types a bare `claude --resume`,
-/// so flags given at launch do not come back; this file does).
-const QASS_FOLDER_SETTINGS: &str = ".qass/.claude/settings.json";
+/// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
+/// `qoro paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
+/// filled in here at install. The working folder's `.claude/settings.json` holds the gate
+/// and its permission mode, loaded by any Claude started there, by hand, restored or woken
+/// (a restore types a bare `claude --resume`, so flags given at launch do not come back).
+struct QassDirs {
+    data: PathBuf,
+    owner: PathBuf,
+}
+
+impl QassDirs {
+    fn here() -> std::io::Result<Self> {
+        Ok(Self {
+            data: qoro_runtime::paths::qass_data_dir()
+                .ok_or_else(|| std::io::Error::other("no HOME to keep qass's files under"))?,
+            owner: qoro_runtime::paths::qass_config_dir(),
+        })
+    }
+
+    fn render(&self, body: &str) -> String {
+        body.replace("@QASS_DATA@", &self.data.display().to_string())
+            .replace("@QASS_CONFIG@", &self.owner.display().to_string())
+    }
+
+    fn folder_settings(&self) -> PathBuf {
+        self.data.join(".claude/settings.json")
+    }
+}
 
 /// Name, body, and whether it is a program.
 const QASS: &[(&str, &str, bool)] = &[
@@ -192,31 +216,68 @@ fn install_into(home: &Path, target: &Target) -> std::io::Result<bool> {
 }
 
 /// Write qass's files, answering whether anything changed.
-fn install_qass(home: &Path) -> std::io::Result<bool> {
+fn install_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     let dir = home.join(QASS_DIR);
     std::fs::create_dir_all(&dir)?;
-    let mut changed = false;
+    let mut changed = migrate_old_qass(home, dirs)?;
     for (name, body, program) in QASS {
         let path = dir.join(name);
-        if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == *body) {
+        let body = dirs.render(body);
+        if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == body) {
             continue;
         }
-        std::fs::write(&path, body)?;
+        std::fs::write(&path, &body)?;
         if *program {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
         changed = true;
     }
-    let folder = home.join(QASS_FOLDER_SETTINGS);
-    if !std::fs::read_to_string(&folder).is_ok_and(|on_disk| on_disk == qass_settings()) {
-        if let Some(parent) = folder.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&folder, qass_settings())?;
+    for private in [&dirs.data, &dirs.owner] {
+        std::fs::create_dir_all(private)?;
+        std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let folder = dirs.folder_settings();
+    let settings = dirs.render(qass_settings());
+    if !std::fs::read_to_string(&folder).is_ok_and(|on_disk| on_disk == settings) {
+        std::fs::create_dir_all(folder.parent().expect("has a parent"))?;
+        std::fs::write(&folder, settings)?;
         changed = true;
     }
     Ok(changed)
+}
+
+/// Move what an older qass kept in `~/.qass` to its two folders, once: the owner's `policy`
+/// and `lessons.md` beside his settings, the rest beside qoro's data. Nothing already at the
+/// new place is overwritten. The old folder goes when only what is made again is left in it
+/// (its `.claude` settings and `ssh` sockets).
+fn migrate_old_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
+    let old = home.join(".qass");
+    let Ok(entries) = std::fs::read_dir(&old) else {
+        return Ok(false);
+    };
+    std::fs::create_dir_all(&dirs.data)?;
+    std::fs::create_dir_all(&dirs.owner)?;
+    let mut moved = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let to = match name.to_str() {
+            Some(".claude" | "ssh") => continue,
+            Some("policy" | "lessons.md") => dirs.owner.join(&name),
+            _ => dirs.data.join(&name),
+        };
+        if !to.exists() {
+            std::fs::rename(entry.path(), to)?;
+            moved = true;
+        }
+    }
+    let left = std::fs::read_dir(&old)?
+        .flatten()
+        .any(|e| !matches!(e.file_name().to_str(), Some(".claude" | "ssh")));
+    if !left {
+        std::fs::remove_dir_all(&old)?;
+    }
+    Ok(moved)
 }
 
 fn qass_settings() -> &'static str {
@@ -225,32 +286,30 @@ fn qass_settings() -> &'static str {
         .map_or("", |(_, body, _)| body)
 }
 
-/// Remove exactly qass's files, and its directory only when left empty.
-fn remove_qass(home: &Path) -> std::io::Result<bool> {
+/// Remove exactly qass's files, and its directories only when left empty. Its state and the
+/// owner's policy and lessons stay.
+fn remove_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     let dir = home.join(QASS_DIR);
     let mut removed = false;
     for (name, _, _) in QASS {
         removed |= std::fs::remove_file(dir.join(name)).is_ok();
     }
-    let folder = home.join(QASS_FOLDER_SETTINGS);
+    let folder = dirs.folder_settings();
     removed |= std::fs::remove_file(&folder).is_ok();
-    if let Some(parent) = folder.parent()
-        && std::fs::read_dir(parent).is_ok_and(|mut e| e.next().is_none())
-    {
-        let _ = std::fs::remove_dir(parent);
-    }
-    if std::fs::read_dir(&dir).is_ok_and(|mut e| e.next().is_none()) {
-        let _ = std::fs::remove_dir(&dir);
+    for empty in [folder.parent().expect("has a parent"), dir.as_path()] {
+        if std::fs::read_dir(empty).is_ok_and(|mut e| e.next().is_none()) {
+            let _ = std::fs::remove_dir(empty);
+        }
     }
     Ok(removed)
 }
 
-fn qass_current(home: &Path) -> bool {
+fn qass_current(home: &Path, dirs: &QassDirs) -> bool {
     let dir = home.join(QASS_DIR);
-    QASS.iter()
-        .all(|(name, body, _)| std::fs::read_to_string(dir.join(name)).is_ok_and(|b| b == *body))
-        && std::fs::read_to_string(home.join(QASS_FOLDER_SETTINGS))
-            .is_ok_and(|b| b == qass_settings())
+    QASS.iter().all(|(name, body, _)| {
+        std::fs::read_to_string(dir.join(name)).is_ok_and(|b| b == dirs.render(body))
+    }) && std::fs::read_to_string(dirs.folder_settings())
+        .is_ok_and(|b| b == dirs.render(qass_settings()))
 }
 
 /// Remove one agent's skill, answering whether anything changed.
@@ -279,7 +338,8 @@ fn status() -> std::io::Result<()> {
     for target in targets() {
         println!("  {:<10} {}", target.agent, status_of(&home, &target));
     }
-    let qass = match (home.join(QASS_DIR).exists(), qass_current(&home)) {
+    let dirs = QassDirs::here()?;
+    let qass = match (home.join(QASS_DIR).exists(), qass_current(&home, &dirs)) {
         (false, _) => "not installed",
         (true, false) => "installed, and older than this build: run install again",
         (true, true) => "installed (with claude)",
@@ -297,7 +357,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
-        if target.agent == "claude" && install_qass(&home)? {
+        if target.agent == "claude" && install_qass(&home, &QassDirs::here()?)? {
             println!("  {:<10} installed into {QASS_DIR}", "qass");
         }
         if !install_into(&home, &target)? {
@@ -321,7 +381,7 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to uninstall from"));
     };
     for target in wanted(args)? {
-        if target.agent == "claude" && remove_qass(&home)? {
+        if target.agent == "claude" && remove_qass(&home, &QassDirs::here()?)? {
             println!("  {:<10} removed from {QASS_DIR}", "qass");
         }
         match remove_from(&home, &target)? {
@@ -395,30 +455,76 @@ mod tests {
     fn qass_installs_whole_and_leaves_neighbours() {
         use std::os::unix::fs::PermissionsExt;
         let home = home_dir();
-        assert!(install_qass(home.path()).expect("install"));
-        assert!(qass_current(home.path()));
+        let dirs = QassDirs {
+            data: home.path().join("data/qass"),
+            owner: home.path().join("config/qass"),
+        };
+        assert!(install_qass(home.path(), &dirs).expect("install"));
+        assert!(qass_current(home.path(), &dirs));
+        // Every place name is filled in.
+        for (name, _, _) in QASS {
+            let body =
+                std::fs::read_to_string(home.path().join(QASS_DIR).join(name)).expect("file");
+            assert!(!body.contains("@QASS_"), "{name} still names a placeholder");
+        }
         // Its folder carries the gate too, so a restored or woken qass is gated.
-        let folder = home.path().join(QASS_FOLDER_SETTINGS);
-        assert!(
-            std::fs::read_to_string(&folder)
-                .expect("folder settings")
-                .contains("gate.sh")
-        );
+        let folder = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
+        assert!(folder.contains("gate.sh") && folder.contains(&dirs.owner.display().to_string()));
         let gate = home.path().join(QASS_DIR).join("gate.sh");
         let mode = std::fs::metadata(&gate).expect("gate").permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "gate.sh is not runnable");
         assert!(
-            !install_qass(home.path()).expect("reinstall"),
+            !install_qass(home.path(), &dirs).expect("reinstall"),
             "the second install changed something"
         );
         let theirs = home.path().join(QASS_DIR).join("notes.txt");
         std::fs::write(&theirs, "theirs").expect("write");
-        assert!(remove_qass(home.path()).expect("uninstall"));
+        assert!(remove_qass(home.path(), &dirs).expect("uninstall"));
         assert_eq!(std::fs::read_to_string(&theirs).expect("read"), "theirs");
         std::fs::remove_file(&theirs).expect("rm");
-        assert!(!remove_qass(home.path()).expect("uninstall again"));
+        assert!(!remove_qass(home.path(), &dirs).expect("uninstall again"));
         assert!(!home.path().join(QASS_DIR).exists());
-        assert!(!home.path().join(QASS_FOLDER_SETTINGS).exists());
+        assert!(!dirs.folder_settings().exists());
+    }
+
+    /// An older qass's `~/.qass` moves across once: the owner's files beside his settings,
+    /// the rest beside qoro's data, nothing overwritten, and the old folder gone once only
+    /// what is made again is left in it.
+    #[test]
+    fn an_old_qass_folder_moves_once() {
+        let home = home_dir();
+        let old = home.path().join(".qass");
+        std::fs::create_dir_all(old.join(".claude")).expect("old");
+        std::fs::create_dir_all(old.join("ssh")).expect("ssh");
+        for (name, body) in [
+            ("policy", "mode auto"),
+            ("lessons.md", "- x -> escalate (E1)"),
+            ("goals.md", "# Goals"),
+            ("gate.jsonl", "{}"),
+        ] {
+            std::fs::write(old.join(name), body).expect("write");
+        }
+        let dirs = QassDirs {
+            data: home.path().join("data/qass"),
+            owner: home.path().join("config/qass"),
+        };
+        std::fs::create_dir_all(&dirs.data).expect("data");
+        std::fs::write(dirs.data.join("gate.jsonl"), "newer").expect("newer");
+        install_qass(home.path(), &dirs).expect("install");
+        let read = |p: PathBuf| std::fs::read_to_string(p).expect("read");
+        assert_eq!(read(dirs.owner.join("policy")), "mode auto");
+        assert_eq!(read(dirs.owner.join("lessons.md")), "- x -> escalate (E1)");
+        assert_eq!(read(dirs.data.join("goals.md")), "# Goals");
+        assert_eq!(
+            read(dirs.data.join("gate.jsonl")),
+            "newer",
+            "nothing overwritten"
+        );
+        // gate.jsonl stayed behind (its new place was taken), so the old folder stays too.
+        assert!(old.join("gate.jsonl").exists());
+        std::fs::remove_file(old.join("gate.jsonl")).expect("rm");
+        install_qass(home.path(), &dirs).expect("again");
+        assert!(!old.exists(), "only what is made again was left");
     }
 
     /// Uninstalling twice is not an error.

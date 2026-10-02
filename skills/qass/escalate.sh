@@ -14,7 +14,7 @@ set -eu
 
 id="${1:?usage: escalate.sh E<n> <terminal or -> now|later [options]}"
 urgency="${3:-now}"
-dir="$HOME/.qass"
+dir="@QASS_DATA@"
 mkdir -p "$dir"
 # A card for later is only written down; the gate keeps its options. Only now rings.
 # The options exactly as the gate recorded them, so the owner sees what a letter will send.

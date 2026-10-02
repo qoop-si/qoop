@@ -155,6 +155,46 @@ pub fn data_dir() -> Option<PathBuf> {
     })
 }
 
+/// `$XDG_CACHE_HOME/qoro`, else `~/Library/Caches/qoro` on macOS and `~/.cache/qoro`
+/// elsewhere: what qoro can build again (the notch app), so backups may skip it.
+pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(xdg) = absolute_env("XDG_CACHE_HOME") {
+        return Some(xdg.join("qoro"));
+    }
+    let home = absolute_env("HOME")?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/qoro")
+    } else {
+        home.join(".cache/qoro")
+    })
+}
+
+/// Where qoro's own services write their logs: `~/Library/Logs/qoro` on macOS, where
+/// Console finds them; elsewhere `$XDG_STATE_HOME/qoro/log`, else `~/.local/state/qoro/log`.
+pub fn logs_dir() -> Option<PathBuf> {
+    let home = absolute_env("HOME")?;
+    if cfg!(target_os = "macos") {
+        return Some(home.join("Library/Logs/qoro"));
+    }
+    Some(
+        absolute_env("XDG_STATE_HOME")
+            .unwrap_or_else(|| home.join(".local/state"))
+            .join("qoro/log"),
+    )
+}
+
+/// qass, the assistant over the other agents: the files its owner writes (its `policy`,
+/// the `lessons` it keeps from him), beside the rest of his qoro settings.
+pub fn qass_config_dir() -> PathBuf {
+    config_dir().join("qass")
+}
+
+/// qass's own state (its goals, the gate's log, what the watcher saw) and its working
+/// folder, whose `.claude/settings.json` gates any Claude started there.
+pub fn qass_data_dir() -> Option<PathBuf> {
+    Some(data_dir()?.join("qass"))
+}
+
 /// Where the daemon keeps what has to outlive a reboot: its database and its history.
 ///
 /// Not the runtime directory. On macOS that is `$TMPDIR`, which the system clears at boot

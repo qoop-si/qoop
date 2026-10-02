@@ -24,6 +24,7 @@ mod mobile;
 mod notch;
 mod onboard;
 mod page;
+mod places;
 mod remote;
 mod settings;
 mod skills;
@@ -134,6 +135,7 @@ fn run() -> std::io::Result<()> {
         Some("settings") => settings::run(&args),
         Some("onboard") => onboard::run(&args),
         Some("skills") => skills::run(&args),
+        Some("paths") => places::run(&args[2..]),
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
         Some("devices") => mobile::run_devices(&args),
@@ -208,6 +210,7 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro skills ...  teach an agent what qoro is for, so it looks\n\
                   \x20                 before it writes\n\
                   \x20 qoro ls [--json]  list the spaces and say which are asleep\n\
+                  \x20 qoro paths [name] [--json]  where qoro keeps each kind of file, and how big\n\
                   \x20 qoro avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoro avatar show [--json]  print the picked pet\n\
                   \x20 qoro avatar options|set ...  the parts a pet may have, or set some\n\

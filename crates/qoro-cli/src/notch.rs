@@ -94,7 +94,7 @@ mod mac {
     }
 
     fn cache_dir() -> std::io::Result<PathBuf> {
-        Ok(home()?.join("Library/Caches/qoro"))
+        qoro_runtime::paths::cache_dir().ok_or_else(|| std::io::Error::other("no HOME"))
     }
 
     /// Write the app out when this build's copy is not there yet, and become it.

@@ -10,10 +10,10 @@
 # The owner's user allow list (git, gh, cp, ...) merges into the qass session;
 # this gate is what keeps it from mattering.
 #
-# State lives in ~/.qass: `policy` (owner only: `mode propose|auto`, `grant
+# State lives in qass's two folders (`qoro paths`): `policy` (owner only: `mode propose|auto`, `grant
 # <repo root> <verb>`) and `gate.jsonl` (this gate and the owner hook only: one
 # row per write qass made, one per owner message). qass itself can edit only
-# ~/.qass/goals.md.
+# goals.md and lessons.md.
 
 mode="${1:-}"
 here="$(cd "$(dirname "$0")" && pwd -P)"

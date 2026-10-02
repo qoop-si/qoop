@@ -28,7 +28,8 @@ for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
     cmd="$cmd '$a'"
 done
-sock="$HOME/.qass/ssh"
+# Short and private: a socket path past 104 bytes is refused on macOS.
+sock="/tmp/qoro-$(id -u)-ssh"
 mkdir -p "$sock"
 chmod 700 "$sock"
 exec ssh -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 \

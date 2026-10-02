@@ -137,16 +137,18 @@ needs your word. You answer it in its own tab, and it passes your answer on. Sta
 its own space:
 
 ```
-qoro new --space qass --name qass --cwd ~/.qass -- claude --model sonnet
+qoro new --space qass --name qass --cwd "$(qoro paths qass-data)" -- claude --model sonnet
 ```
 
 then type `/qass` there. A hook on every tool call bounds what it may do, whatever it
-decides; it lives in `~/.qass/.claude/settings.json`, so qass is bound the same way when a
-restore or a wake brings it back with nothing but `claude --resume`. Your file `~/.qass/policy` holds `mode propose` (it writes to an agent only after
+decides; it lives in that folder's `.claude/settings.json`, so qass is bound the same way when a
+restore or a wake brings it back with nothing but `claude --resume`. Your file
+`$(qoro paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
 your "ok P3") or `mode auto`, and per repository grants such as
 `grant /path/to/repo commit`. When you correct it, it keeps the rule in
-`~/.qass/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
-make it more careful, never let it act alone where it would have asked you.
+`$(qoro paths qass-config)/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
+make it more careful, never let it act alone where it would have asked you. `qoro paths`
+lists every folder qoro writes to and how big each is.
 
 On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
 skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro` (or

@@ -16,7 +16,9 @@
       "Bash(qoro prompt*)",
       "Bash(qoro send*)",
       "Bash(*.qass*)",
-      "Edit(~/.qass/**)"
+      "Bash(*qoro/qass*)",
+      "Edit(/@QASS_DATA@/**)",
+      "Edit(/@QASS_CONFIG@/**)"
     ]
   }
 }

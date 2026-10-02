@@ -15,11 +15,15 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
-QASS = HOME / ".qass"
+# Filled in by `qoro skills install` (see `qoro paths`): qass's own state and working folder,
+# and the owner's files.
+QASS = Path("@QASS_DATA@").resolve()
+OWNER = Path("@QASS_CONFIG@").resolve()
 LOG = QASS / "gate.jsonl"
-POLICY = QASS / "policy"
+GOALS = QASS / "goals.md"
+POLICY = OWNER / "policy"
 SKILLS = HOME / ".claude" / "skills"
-LESSONS = QASS / "lessons.md"
+LESSONS = OWNER / "lessons.md"
 LESSONS_MAX = 2000      # chars; full means merge or remove before adding (Hermes keeps 2,200)
 # A lesson names a situation and ends in a careful action and its source, nothing after:
 # "- <when, 160 chars at most> -> escalate (E7)". Nothing in it can let qass act alone.
@@ -116,6 +120,14 @@ def flags(rest, allowed):
         if i + 1 >= len(rest) or not check(rest[i + 1]):
             raise Deny(f"bad value for {name}")
         i += 2
+
+
+def is_script(word, name):
+    """Whether a word names one of this skill's scripts, by whatever path reaches it."""
+    try:
+        return Path(word).resolve() == HERE / name
+    except (OSError, ValueError):
+        return False
 
 
 def is_num(v):
@@ -269,8 +281,8 @@ def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
         if str(row["generation"]) != generation:
             raise Deny(f"terminal {terminal} is now generation {row['generation']}")
         if text is not None:
-            if ".qass" in text.lower():
-                raise Deny("a prompt may not name .qass")
+            if ".qass" in text.lower() or "qoro/qass" in text.lower():
+                raise Deny("a prompt may not name qass's own files")
             head = RELAY_HEAD.match(text)
             if head or text.rstrip().endswith(FENCE_OWNER):
                 if not head:
@@ -374,7 +386,7 @@ def check_bash(command, subagent):
     if w[0] == "qoro" and len(w) >= 2:
         check_qoro(w[1], w[2:], subagent)
         return
-    if w[0] == str(HERE / "on.sh"):
+    if is_script(w[0], "on.sh"):
         # The same commands on a remote this Mac's qoro links to, and only those.
         if len(w) < 3 or w[1] not in remotes():
             raise Deny("on.sh <remote from qoro remote ls> <qoro command>")
@@ -396,7 +408,7 @@ def check_bash(command, subagent):
         return
     if subagent:
         raise Deny("subagents only read")
-    if w[0] == str(HERE / "escalate.sh"):
+    if is_script(w[0], "escalate.sh"):
         # escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to D]
         opts = w[4:]
         if len(w) < 4 or not E_ITEM.fullmatch(w[1]) \
@@ -412,7 +424,7 @@ def check_bash(command, subagent):
         append({"escalated": w[1], "terminal": w[2], "urgency": w[3],
                 "options": {o[0]: o[3:] for o in opts}})
         return
-    if w[0] == str(HERE / "spawn.sh") and len(w) == 3:
+    if is_script(w[0], "spawn.sh") and len(w) == 3:
         check_write("spawn", "-", "-")
         return
     raise Deny(f"{w[0]} is not allowed")
@@ -464,11 +476,11 @@ def guide_file(path):
 
 
 def glob_ok(args):
-    """A Glob in ~/.qass, with a pattern that stays there."""
+    """A Glob in qass's own folders, with a pattern that stays there."""
     pattern = args.get("pattern") or ""
     if not pattern or pattern.startswith(("/", "~")) or ".." in pattern:
         return False
-    return inside(args.get("path") or "/", QASS)
+    return inside(args.get("path") or "/", QASS) or inside(args.get("path") or "/", OWNER)
 
 
 def check_lesson(tool, args):
@@ -506,23 +518,23 @@ def check(payload):
     if tool == "Bash":
         check_bash(args.get("command") or "", subagent)
     elif tool == "Monitor":
-        if subagent or "ws" in args or (args.get("command") or "").strip() != str(HERE / "watch.sh"):
+        if subagent or "ws" in args or not is_script((args.get("command") or "").strip(), "watch.sh"):
             raise Deny("Monitor runs only watch.sh")
     elif tool == "Read":
         path = args.get("file_path") or ""
-        if not (inside(path, QASS) or guide_file(path)):
-            raise Deny("Read is limited to ~/.qass, AGENTS.md / CLAUDE.md / .claude/rules, "
+        if not (inside(path, QASS) or inside(path, OWNER) or guide_file(path)):
+            raise Deny("Read is limited to qass's folders, AGENTS.md / CLAUDE.md / .claude/rules, "
                        "plans/*.md and skills' SKILL.md")
     elif tool == "Glob":
         if not glob_ok(args):
-            raise Deny("Glob is limited to ~/.qass")
+            raise Deny("Glob is limited to qass's folders")
     elif tool == "Grep":
-        if not inside(args.get("path") or "/", QASS):
-            raise Deny("Grep is limited to ~/.qass")
+        if not (inside(args.get("path") or "/", QASS) or inside(args.get("path") or "/", OWNER)):
+            raise Deny("Grep is limited to qass's folders")
     elif tool in ("Edit", "Write", "MultiEdit"):
         target = Path(args.get("file_path") or "/").expanduser().resolve()
-        if subagent or target not in (QASS / "goals.md", LESSONS):
-            raise Deny("qass writes only ~/.qass/goals.md and ~/.qass/lessons.md")
+        if subagent or target not in (GOALS, LESSONS):
+            raise Deny(f"qass writes only {GOALS} and {LESSONS}")
         if target == LESSONS:
             check_lesson(tool, args)
     elif tool == "Skill":

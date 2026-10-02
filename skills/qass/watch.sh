@@ -7,13 +7,13 @@
 # closes. A row also changes on every tool call (activity, cwd), so only terminal,
 # generation and state are compared. Its own terminal is skipped.
 #
-# The last snapshot of each machine is kept in ~/.qass/last.json (this Mac) or
-# ~/.qass/last-<remote>.json and diffed against on start, so a restart does not lose what
+# The last snapshot of each machine is kept in last.json (this Mac) or last-<remote>.json
+# in qass's data folder and diffed against on start, so a restart does not lose what
 # changed while nothing was watching. No saved snapshot means an empty one: every agent
 # already waiting is printed once.
 #
 # A worker qass left alone because the owner had just typed there carries
-# `hands off until <unix time>` on its ~/.qass/goals.md line. Once that time passes and
+# `hands off until <unix time>` on its goals.md line. Once that time passes and
 # it still waits, it is printed once more, as `hands-off->idle`.
 #
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
-dir="$HOME/.qass"
+dir="@QASS_DATA@"   # filled in by `qoro skills install`
 mkdir -p "$dir"
 self="${QORO_TERMINAL:-0}"
 

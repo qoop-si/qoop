@@ -9,13 +9,14 @@
       "Bash(qoro prompt *)",
       "Bash(qoro send *)",
       "Bash(wend search *)",
-      "Read(~/.qass/**)",
-      "Edit(~/.qass/goals.md)",
-      "Edit(~/.qass/lessons.md)"
+      "Read(/@QASS_DATA@/**)",
+      "Read(/@QASS_CONFIG@/**)",
+      "Edit(/@QASS_DATA@/goals.md)",
+      "Edit(/@QASS_CONFIG@/lessons.md)"
     ],
     "deny": [
-      "Edit(~/.qass/policy)",
-      "Edit(~/.qass/gate.jsonl)",
+      "Edit(/@QASS_CONFIG@/policy)",
+      "Edit(/@QASS_DATA@/gate.jsonl)",
       "WebFetch",
       "WebSearch"
     ]
@@ -28,7 +29,7 @@
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" owner" }] }
     ],
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"$HOME/.qass/lessons.md\"; if [ -s \"$f\" ]; then echo 'Lessons from the owner (~/.qass/lessons.md):'; cat \"$f\"; fi; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; true" }] }
     ]
   }
 }

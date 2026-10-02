@@ -19,7 +19,7 @@ case "$repo" in "$home"/*) ;; *) echo "spawn: $repo is not under $home" >&2; exi
 git -C "$repo" rev-parse --git-dir >/dev/null
 git check-ref-format --branch "$branch" >/dev/null
 
-mkdir -p "$HOME/.qass"
+mkdir -p "@QASS_DATA@"
 cd "$repo"
 # Prints `worktree=<path> branch=<name>`, then `terminal=<n>`.
 t="$(qoro worktree new "$branch" -- claude --settings "$here/worker.json" | sed -n 's/^terminal=//p')"
@@ -52,7 +52,7 @@ for _ in $(seq 180); do
         elif [ "$state" != blocked ] && printf '%s' "$screen" | grep -q "❯"; then
             seen=$((seen + 1))
             if [ "$seen" -ge 2 ]; then
-                printf '{"ts":%s,"spawned":%s,"gen":%s}\n' "$(date +%s)" "$t" "$g" >> "$HOME/.qass/gate.jsonl"
+                printf '{"ts":%s,"spawned":%s,"gen":%s}\n' "$(date +%s)" "$t" "$g" >> "@QASS_DATA@/gate.jsonl"
                 echo "$t $g"
                 exit 0
             fi
