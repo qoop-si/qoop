@@ -151,6 +151,31 @@ impl StoreHandle {
         self.run(move |s| s.set_workspace_ink(id, ink)).await
     }
 
+    pub async fn set_keep_awake(
+        &self,
+        workspace: i64,
+        terminal: Option<u32>,
+        on: bool,
+    ) -> Result<bool, HandleError> {
+        self.run(move |s| match terminal {
+            Some(t) => s.set_keep_awake_terminal(i64::from(t), on),
+            None => s.set_keep_awake_workspace(workspace, on),
+        })
+        .await
+    }
+
+    pub async fn kept_awake(
+        &self,
+    ) -> Result<
+        (
+            std::collections::BTreeSet<i64>,
+            std::collections::BTreeSet<i64>,
+        ),
+        HandleError,
+    > {
+        self.run(|s| s.kept_awake()).await
+    }
+
     pub async fn delete_workspace(&self, id: i64) -> Result<usize, HandleError> {
         self.run(move |s| s.delete_workspace(id)).await
     }

@@ -431,6 +431,16 @@ impl Interface {
             .env_remove("QORO_SESSION")
             .env_remove("QORO_TERMINAL")
             .env_remove("QORO_TOKEN")
+            // Not the terminal running the tests: in iTerm2 or Terminal the interface would
+            // install its icon font into the developer's own font folder, and the markers of
+            // the others would turn icons on for the first frames of a pty that never answers.
+            .env_remove("TERM_PROGRAM")
+            .env_remove("GHOSTTY_RESOURCES_DIR")
+            .env_remove("KITTY_WINDOW_ID")
+            .env_remove("WEZTERM_PANE")
+            .env_remove("ALACRITTY_WINDOW_ID")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_TTY")
             // No remote from the machine running the tests: a real one would put ssh
             // connections under every gate here.
             .env("QORO_REMOTES", dir.join("remotes.json"))
@@ -2488,6 +2498,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                     "ListWorkspaces" => ControlResponse::Workspaces {
                         id,
                         workspaces: vec![WorkspaceRow {
+                            keep_awake: false,
                             id: 1,
                             name: "work".into(),
                             terminals: 1,

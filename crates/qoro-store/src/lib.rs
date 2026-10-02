@@ -14,6 +14,7 @@
 
 pub mod history;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use history::History;
@@ -247,6 +248,16 @@ impl Store {
              CREATE TABLE IF NOT EXISTS workspace_ink (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  ink INTEGER NOT NULL
+             );
+             -- The spaces and the panes a person asked to keep awake: idle sleep passes
+             -- them by. Cascaded like the rest, because ids are reused. New tables, no
+             -- version bump, for the reason the ones above give: an older binary ignores
+             -- them and sleeps an idle tab, which loses nothing.
+             CREATE TABLE IF NOT EXISTS awake_workspace (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS awake_terminal (
+                 terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -302,6 +313,64 @@ impl Store {
                 Ok(exists)
             }
         }
+    }
+
+    /// Keep a space awake, or let idle sleep take its tabs again. Answers false when there
+    /// is no such space.
+    pub fn set_keep_awake_workspace(&self, id: i64, on: bool) -> Result<bool, StoreError> {
+        let exists = self
+            .conn
+            .query_row("SELECT 1 FROM workspace WHERE id = ?1", params![id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if exists {
+            let sql = if on {
+                "INSERT OR IGNORE INTO awake_workspace (workspace) VALUES (?1)"
+            } else {
+                "DELETE FROM awake_workspace WHERE workspace = ?1"
+            };
+            self.conn.execute(sql, params![id])?;
+        }
+        Ok(exists)
+    }
+
+    /// The same for one pane. Answers false when there is no such open terminal.
+    pub fn set_keep_awake_terminal(&self, id: i64, on: bool) -> Result<bool, StoreError> {
+        let open = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if open {
+            let sql = if on {
+                "INSERT OR IGNORE INTO awake_terminal (terminal) VALUES (?1)"
+            } else {
+                "DELETE FROM awake_terminal WHERE terminal = ?1"
+            };
+            self.conn.execute(sql, params![id])?;
+        }
+        Ok(open)
+    }
+
+    /// Every space and every pane kept awake.
+    pub fn kept_awake(&self) -> Result<(BTreeSet<i64>, BTreeSet<i64>), StoreError> {
+        let read = |sql: &str| -> Result<BTreeSet<i64>, StoreError> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let ids = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<BTreeSet<i64>, _>>()?;
+            Ok(ids)
+        };
+        Ok((
+            read("SELECT workspace FROM awake_workspace")?,
+            read("SELECT terminal FROM awake_terminal")?,
+        ))
     }
 
     /// Drop a workspace row.
@@ -510,9 +579,13 @@ impl Store {
             "UPDATE terminal SET closed_at = ?2 WHERE id = ?1 AND closed_at IS NULL",
             params![id, now],
         )?;
-        // A closed tab is not asleep: nothing will ever wake it.
+        // A closed tab is not asleep: nothing will ever wake it, nor keep it awake.
         self.conn.execute(
             "DELETE FROM asleep_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM awake_terminal WHERE terminal = ?1",
             params![id],
         )?;
         Ok(n == 1)
@@ -1498,6 +1571,35 @@ mod tests {
         s.sleep_terminals(5, &[bare(1)]).expect("sleep");
         s.delete_workspace(ws).expect("delete");
         assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    /// Keep awake is kept for a space and a pane, taken back on request, and never outlives
+    /// the space or the pane: a leftover row would block the space's delete on its key.
+    #[test]
+    fn keep_awake_round_trips_and_goes_with_its_space_and_pane() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t1");
+        s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t2");
+        assert!(s.set_keep_awake_workspace(ws, true).expect("space"));
+        assert!(s.set_keep_awake_workspace(ws, true).expect("twice is fine"));
+        assert!(s.set_keep_awake_terminal(1, true).expect("pane"));
+        assert!(s.set_keep_awake_terminal(2, true).expect("pane 2"));
+        assert!(!s.set_keep_awake_workspace(99, true).expect("no space"));
+        assert!(!s.set_keep_awake_terminal(99, true).expect("no pane"));
+        let (spaces, panes) = s.kept_awake().expect("read");
+        assert_eq!((spaces.len(), panes.len()), (1, 2));
+        assert!(s.set_keep_awake_terminal(2, false).expect("off"));
+        s.close_terminal(1, 2).expect("close");
+        assert!(!s.set_keep_awake_terminal(1, true).expect("closed"));
+        assert_eq!(s.kept_awake().expect("read").1, BTreeSet::new());
+        s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t3");
+        assert!(s.set_keep_awake_terminal(3, true).expect("pane 3"));
+        s.delete_workspace(ws).expect("delete with rows kept awake");
+        assert_eq!(
+            s.kept_awake().expect("read"),
+            (BTreeSet::new(), BTreeSet::new())
+        );
     }
 
     #[test]

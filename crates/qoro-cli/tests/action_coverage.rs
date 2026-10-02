@@ -164,6 +164,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "keep a space or a pane awake",
+            method: || {
+                Method::Control(ControlRequest::SetKeepAwake {
+                    id: "a".into(),
+                    workspace: 1,
+                    terminal: Some(2),
+                    on: true,
+                })
+            },
+        },
+        Action {
             name: "start a workspace",
             method: || {
                 Method::Control(ControlRequest::CreateWorkspace {
@@ -523,6 +534,12 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             ink: None,
         },
+        ControlRequest::SetKeepAwake {
+            id: String::new(),
+            workspace: 0,
+            terminal: None,
+            on: false,
+        },
         ControlRequest::RenameSession {
             id: String::new(),
             terminal: 0,
@@ -583,6 +600,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

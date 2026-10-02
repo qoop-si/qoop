@@ -964,6 +964,16 @@ impl Daemon {
         scanner.refresh().await;
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let books = Bookkeeping::new(store.clone(), stopping.clone());
+        // What a person asked to keep awake. Unreadable is empty: idle sleep then treats
+        // every tab as it did before the feature, and the next set writes it again.
+        match store.kept_awake().await {
+            Ok((spaces, panes)) => {
+                let mut awake = books.awake.lock().unwrap();
+                awake.spaces = spaces;
+                awake.panes = panes.into_iter().map(|t| t as u32).collect();
+            }
+            Err(e) => eprintln!("qorod: what is kept awake could not be read: {e}"),
+        }
         // Which tabs are asleep, read before anything is restored: they stay down, and
         // their rows must keep their place from the first teardown on.
         match store.asleep().await {
@@ -2724,7 +2734,10 @@ fn idle_tabs(
         .filter(|(_, target)| !agents.is_closed(*target))
         .collect();
     let ready = crate::idle::apply_edge_vetoes(&eligible, &edges);
-    // A tab sleeps whole or not at all: every one of its panes has to be ready.
+    // A tab sleeps whole or not at all: every one of its panes has to be ready, and none of
+    // them, nor their space, kept awake by a person. Read here, so the recheck before each
+    // sleep sees a cup filled while the pass worked on the tabs before it.
+    let awake = into.books.awake.lock().unwrap();
     let mut tabs: BTreeMap<(i64, u32), bool> = BTreeMap::new();
     for stream in &streams {
         let Some(space) = into.terminals.workspace_of(*stream) else {
@@ -2737,7 +2750,7 @@ fn idle_tabs(
             .into_iter()
             .find(|t| into.terminals.get(*t).is_some())
             .unwrap_or(*stream);
-        let this = ready.get(stream).copied().unwrap_or(false);
+        let this = ready.get(stream).copied().unwrap_or(false) && !awake.holds(space, &[*stream]);
         let all = tabs.entry((space, tab)).or_insert(true);
         *all = *all && this;
     }
@@ -2809,6 +2822,9 @@ fn dispatch(
             None => Dispatch::Apart,
         },
         ControlRequest::CloseWorkspace { workspace, .. } => take(*workspace),
+        // Under the space's lock, so a close of that space cannot fall between the store's
+        // write and the mirror's, and leave a reused id kept awake.
+        ControlRequest::SetKeepAwake { workspace, .. } => take(*workspace),
         // Two spaces' locks, taken in order off the read loop.
         ControlRequest::MoveTerminal { .. } => Dispatch::Apart,
         // Seconds of disk for a large picture: never on the read loop, where it would hold
@@ -3068,6 +3084,8 @@ async fn handle_control(
                     return match handle.commands.try_send(ClientCommand::Close) {
                         Ok(()) => {
                             record_close(store, &id, terminal).await;
+                            books.awake.lock().unwrap().panes.remove(&terminal);
+                            books.awake.lock().unwrap().panes.remove(&terminal);
                             ControlResponse::TerminalClosed { id, terminal }
                         }
                         Err(e) => {
@@ -3280,7 +3298,10 @@ async fn handle_control(
                         .position(|t| *t == tab.terminal)
                         .unwrap_or(usize::MAX)
                 });
+                // Read into a local, so the lock is not held through the literal.
+                let keep_awake = books.awake.lock().unwrap().spaces.contains(&row.id);
                 workspaces.push(crate::control::WorkspaceRow {
+                    keep_awake,
                     id: row.id,
                     name: row.name,
                     terminals: live
@@ -3480,6 +3501,46 @@ async fn handle_control(
                 },
             }
         }
+        ControlRequest::SetKeepAwake {
+            workspace,
+            terminal,
+            on,
+            ..
+        } => {
+            let _held = match held {
+                Some(guard) => guard,
+                None => books.lock_of(workspace).lock_owned().await,
+            };
+            match store.set_keep_awake(workspace, terminal, on).await {
+                Ok(false) => ControlResponse::Failed {
+                    id,
+                    reason: match terminal {
+                        Some(t) => format!("there is no open terminal {t}"),
+                        None => format!("there is no workspace {workspace}"),
+                    },
+                },
+                Ok(true) => {
+                    let mut awake = books.awake.lock().unwrap();
+                    match (terminal, on) {
+                        (Some(t), true) => awake.panes.insert(t),
+                        (Some(t), false) => awake.panes.remove(&t),
+                        (None, true) => awake.spaces.insert(workspace),
+                        (None, false) => awake.spaces.remove(&workspace),
+                    };
+                    drop(awake);
+                    // A pane's cup is on its agent row, which every client and the phone redraw
+                    // when the row is announced; a space's is seen on the next list.
+                    if let Some(t) = terminal {
+                        agents.announce(t);
+                    }
+                    ControlResponse::Renamed { id }
+                }
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("keep awake could not be saved: {e}"),
+                },
+            }
+        }
         ControlRequest::CreateWorkspace { .. } if books.restart.gated() => {
             ControlResponse::Failed {
                 id,
@@ -3544,8 +3605,10 @@ async fn handle_control(
                     reason: format!("there is no workspace {target}"),
                 },
                 Ok(_) => {
-                    // Its tabs' sleep marks went with the rows; the mirror follows.
+                    // Its tabs' sleep marks went with the rows; the mirror follows. So does
+                    // keeping it awake, since the id may be given to a new space.
                     books.asleep.lock().unwrap().retain(|_, w| *w != target);
+                    books.awake.lock().unwrap().spaces.remove(&target);
                     ControlResponse::WorkspaceClosed {
                         id,
                         workspace: target,
@@ -3689,8 +3752,10 @@ async fn handle_control(
                         agent.as_ref().is_some_and(|a| a.setup_gate),
                     )
                     .to_string();
+                    let keep_awake = books.awake.lock().unwrap().panes.contains(&terminal);
                     crate::control::AgentRow {
                         news: news.contains(&terminal),
+                        keep_awake,
                         terminal,
                         name: terminals.name_of(terminal),
                         workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
@@ -5070,6 +5135,24 @@ pub struct Bookkeeping {
     locks: Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>,
     /// The move onto a newer binary, once one is asked for.
     pub restart: Arc<Restart>,
+    /// The spaces and panes a person asked to keep awake, as the store's `awake_*` tables
+    /// say, held here so idle sleep and the lists read them without a store round trip.
+    /// Written after the store, so a failed write changes neither.
+    pub awake: Arc<std::sync::Mutex<KeptAwake>>,
+}
+
+/// What [`Bookkeeping::awake`] holds.
+#[derive(Debug, Default)]
+pub struct KeptAwake {
+    pub spaces: BTreeSet<i64>,
+    pub panes: BTreeSet<u32>,
+}
+
+impl KeptAwake {
+    /// Whether idle sleep must pass a tab by: its space is kept awake, or one of its panes.
+    pub fn holds(&self, space: i64, panes: &[u32]) -> bool {
+        self.spaces.contains(&space) || panes.iter().any(|p| self.panes.contains(p))
+    }
 }
 
 /// What `ControlRequest::RestartWhenSafe` needs, shared by every connection.
@@ -5129,6 +5212,7 @@ impl Bookkeeping {
             writers: Arc::default(),
             locks: Arc::default(),
             restart: Arc::default(),
+            awake: Arc::default(),
         }
     }
 
@@ -9125,5 +9209,24 @@ mod search_tests {
             scan_history(&h, "needle", 59_999, true, long, u64::MAX, || true).unwrap();
         assert_eq!(found, None);
         assert!(resume.is_some());
+    }
+}
+
+#[cfg(test)]
+mod keep_awake_tests {
+    use super::KeptAwake;
+
+    /// Idle sleep passes a tab by when its space is kept awake or any one of its panes is.
+    #[test]
+    fn a_tab_is_held_by_its_space_or_any_pane() {
+        let mut awake = KeptAwake::default();
+        assert!(!awake.holds(1, &[3, 4]));
+        awake.panes.insert(4);
+        assert!(awake.holds(1, &[3, 4]), "one pane of the split");
+        assert!(!awake.holds(1, &[3]));
+        awake.panes.clear();
+        awake.spaces.insert(1);
+        assert!(awake.holds(1, &[3]));
+        assert!(!awake.holds(2, &[3]), "another space");
     }
 }

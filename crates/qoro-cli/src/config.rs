@@ -49,6 +49,7 @@ fn show(json: bool) -> std::io::Result<()> {
             "settings": {
                 "prefix": prefix,
                 "theme": c.theme.name(),
+                "icons": c.icons.name(),
                 "notify.desktop": c.desktop,
                 "notify.sound": c.sound,
                 "notify.done_sound": c.done_sound,
@@ -61,6 +62,7 @@ fn show(json: bool) -> std::io::Result<()> {
             "choices": {
                 "prefix": config::prefixes(),
                 "theme": ["auto", "dark", "light"],
+                "icons": ["auto", "on", "off"],
                 "notify.done_sound": config::sounds_here(),
                 "notify.alert_sound": config::sounds_here(),
             },

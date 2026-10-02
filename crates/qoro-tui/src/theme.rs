@@ -31,6 +31,9 @@ pub enum Role {
     /// The product's own mark: the logo orange, one steady wearer on the screen.
     /// An accent spent twice is an accent that points at nothing.
     Brand,
+    /// The brand one step quieter: a keep awake cup that is full because its whole space is
+    /// kept awake rather than this pane.
+    BrandCalm,
     /// An agent's state.
     Working,
     Blocked,
@@ -199,6 +202,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Faint => 243,
         Role::Rule => 237,
         Role::Brand => 202,
+        Role::BrandCalm => 130,
         Role::Working => 39,
         Role::Blocked => 208,
         Role::Done => 35,
@@ -503,6 +507,7 @@ const fn light_ink(role: Role) -> u8 {
         Role::Faint => 243,
         Role::Rule => 250,
         Role::Brand => 202,
+        Role::BrandCalm => 173,
         Role::Working => 32,
         Role::Blocked => 130,
         Role::Done => 28,
@@ -844,6 +849,7 @@ mod tests {
     #[test]
     fn a_picked_colour_wins_and_anything_else_is_auto() {
         let row = |id, ink| qoro_runtime::control::WorkspaceRow {
+            keep_awake: false,
             id,
             name: String::new(),
             terminals: 0,

@@ -14,6 +14,7 @@ use qoro_tui::{sidebar, theme};
 
 fn space(id: i64, name: &str) -> WorkspaceRow {
     WorkspaceRow {
+        keep_awake: false,
         id,
         name: name.to_string(),
         terminals: 4,
@@ -27,6 +28,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
 
 fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
     AgentRow {
+        keep_awake: false,
         news: false,
         terminal,
         name: None,
@@ -71,6 +73,7 @@ fn main() {
         panes: std::collections::BTreeMap::new(),
         focused: 1,
         armed: None,
+        drawer: None,
         snapshot: None,
         cols: 60,
         lines: 16,

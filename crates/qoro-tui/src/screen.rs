@@ -42,6 +42,8 @@ pub struct Frame<'a> {
     pub lines: u16,
     /// The space whose rule is asking whether it should close, or `None` while no rule is.
     pub armed: Option<i64>,
+    /// The space whose drawer of controls is out, and how many places of it.
+    pub drawer: Option<(i64, usize)>,
     /// Shown instead of the key list, when there is something to say.
     pub message: Option<&'a str>,
     /// Something worth saying while nothing else is happening, said until the person does
@@ -186,6 +188,7 @@ impl Frame<'_> {
                 self.chrome.dim
             },
             armed: self.armed,
+            drawer: self.drawer,
             tick: self.tick,
             view: self.view,
             seen: self.seen,
@@ -196,6 +199,7 @@ impl Frame<'_> {
             usage: Some(self.chrome.usage),
             scroll: self.chrome.list_scroll,
             inbox: self.chrome.inbox,
+            icons: crate::icons::on(),
         }
     }
 }
@@ -493,6 +497,7 @@ pub fn bar_tabs(
         .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
     {
         tabs.push(AgentRow {
+            keep_awake: false,
             news: false,
             terminal: tab.terminal,
             name: tab.title.clone(),
@@ -3153,6 +3158,7 @@ mod tests {
 
     fn spaces() -> Vec<WorkspaceRow> {
         vec![WorkspaceRow {
+            keep_awake: false,
             id: 1,
             name: "app".to_string(),
             terminals: 1,
@@ -3166,6 +3172,7 @@ mod tests {
 
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,
@@ -3461,6 +3468,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -3705,6 +3713,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -3753,6 +3762,7 @@ mod tests {
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -3807,6 +3817,7 @@ mod tests {
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes,
@@ -3865,6 +3876,7 @@ mod tests {
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &picked,
             panes: std::collections::BTreeMap::new(),
@@ -3922,6 +3934,7 @@ mod tests {
         let snapshot = snapshot(&["hello from the shell"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: panes.clone(),
@@ -3977,6 +3990,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4086,6 +4100,7 @@ mod tests {
         let snapshot = snapshot(&[&long]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4132,6 +4147,7 @@ mod tests {
         let rows = [row(1, "zsh", "starting")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4184,6 +4200,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4238,6 +4255,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4304,6 +4322,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4369,6 +4388,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4422,6 +4442,7 @@ mod tests {
         let rows = [row(1, "sh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4473,6 +4494,7 @@ mod tests {
         for cols in [1u16, 5, 10, 20, 23, 24, 25, 40] {
             let painted = paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -4525,6 +4547,7 @@ mod tests {
         let rows = [row(1, "sh", "starting")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -4575,6 +4598,7 @@ mod tests {
         let spaces = spaces();
         let frame = Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes,
@@ -4690,6 +4714,7 @@ mod tests {
         for cols in [40u16, 60, 80, 100, 200] {
             let painted = paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -4882,6 +4907,7 @@ mod tests {
         for (cols, lines) in [(80u16, 24u16), (120, 40), (160, 50)] {
             let painted = paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -4937,6 +4963,7 @@ mod tests {
         for lines in [3u16, 4, 5] {
             let painted = paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -5004,6 +5031,7 @@ mod tests {
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5063,6 +5091,7 @@ mod tests {
         let paint_at = |tick: u64| {
             paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -5132,6 +5161,7 @@ mod tests {
     #[test]
     fn an_accented_row_is_still_exactly_the_column_wide() {
         let wide = vec![WorkspaceRow {
+            keep_awake: false,
             id: 1,
             name: "\u{4e2d}\u{6587}".to_string(),
             terminals: 1,
@@ -5144,6 +5174,7 @@ mod tests {
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &wide,
             panes: std::collections::BTreeMap::new(),
@@ -5259,6 +5290,7 @@ mod tests {
         let rows = [row(1, "zsh", "idle")];
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5299,6 +5331,7 @@ mod tests {
 
     fn blocked_row(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,
@@ -5347,6 +5380,7 @@ mod tests {
         let snapshot = snapshot(&["waiting"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5395,6 +5429,7 @@ mod tests {
         let snapshot = snapshot(&["quiet"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5440,6 +5475,7 @@ mod tests {
         let snapshot = snapshot(&["waiting"]);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5484,6 +5520,7 @@ mod tests {
     fn a_wide_space_name_in_the_palette_loses_nothing() {
         let rows = [blocked_row(1, "codex")];
         let wide = vec![WorkspaceRow {
+            keep_awake: false,
             id: 1,
             name: "中文ab".to_string(),
             terminals: 1,
@@ -5496,6 +5533,7 @@ mod tests {
         let palette = Palette::open();
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &wide,
             panes: std::collections::BTreeMap::new(),
@@ -5543,6 +5581,7 @@ mod tests {
         let palette = Palette::open();
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5627,6 +5666,7 @@ mod tests {
         let palette = Palette::open();
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5707,6 +5747,7 @@ mod tests {
         for cols in 10..=13u16 {
             let painted = paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -5784,6 +5825,7 @@ mod tests {
         };
         let frame_of = |tiles: Vec<Tile<'static>>| Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeMap::new(),
@@ -5849,6 +5891,7 @@ mod tests {
         }
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -5892,6 +5935,7 @@ mod tests {
     #[test]
     fn a_tree_fits_nine_agents_without_scrolling() {
         let spaces = vec![WorkspaceRow {
+            keep_awake: false,
             id: 1,
             name: "app".to_string(),
             terminals: 9,
@@ -5908,6 +5952,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, state)| AgentRow {
+                keep_awake: false,
                 news: false,
                 terminal: i as u32 + 1,
                 name: None,
@@ -5939,6 +5984,7 @@ mod tests {
             &sidebar::Column {
                 inbox: sidebar::Inbox::default(),
                 armed: None,
+                drawer: None,
                 spaces: &spaces,
                 agents: &rows,
                 focused_space: 1,
@@ -5952,6 +5998,7 @@ mod tests {
                 shut: &shut,
                 usage: None,
                 scroll: None,
+                icons: false,
             },
             44,
         );
@@ -6001,6 +6048,7 @@ mod tests {
         selection.extend(0, 8);
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -6065,6 +6113,7 @@ mod tests {
         let build = |selection| {
             paint(&Frame {
                 armed: None,
+                drawer: None,
                 rows: &rows,
                 spaces: &spaces(),
                 panes: std::collections::BTreeMap::new(),
@@ -6118,6 +6167,7 @@ mod tests {
         };
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -6181,6 +6231,7 @@ mod tests {
         };
         let painted = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces(),
             panes: std::collections::BTreeMap::new(),
@@ -6333,6 +6384,7 @@ mod tests {
             .collect();
         paint(&Frame {
             armed: None,
+            drawer: None,
             rows,
             spaces,
             panes: std::collections::BTreeMap::new(),
@@ -6374,6 +6426,7 @@ mod tests {
         let (pane_cols, pane_rows) = pane_size(80, 24);
         let legacy = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeMap::new(),
@@ -6406,6 +6459,7 @@ mod tests {
         });
         let tiled = paint(&Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes: std::collections::BTreeMap::new(),
@@ -6463,6 +6517,7 @@ mod tests {
         let unseen = sidebar::Unseen::new();
         let frame_of = |notice: Option<&'static str>| Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes: panes.clone(),
@@ -6723,6 +6778,7 @@ mod tests {
         let behind = crate::run::Behind::default();
         let frame = |cols, lines, closing, reading| Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &[],
             panes: std::collections::BTreeMap::new(),
@@ -6786,6 +6842,7 @@ mod tests {
         };
         let frame = |focused| Frame {
             armed: None,
+            drawer: None,
             rows: &rows,
             spaces: &spaces,
             panes: panes.clone(),

@@ -15,7 +15,8 @@
 //! the Esc key, which has to close an overlay at once, so it is never held. `ESC [` and
 //! `ESC ]` are held, and given back as typed input if nothing follows within
 //! [`HOLD`], because Alt with `[` or `]` sends exactly those two bytes and the person is
-//! still owed their key. What remains is a report split right after its escape byte, which
+//! still owed their key. `ESC P`, which starts the terminal's name, is held the same way
+//! for Alt with `P`, and anything but `ESC P > |` after it is typed as it came. What remains is a report split right after its escape byte, which
 //! terminals do not do in practice: they write a report in one go.
 
 use std::time::{Duration, Instant};
@@ -31,6 +32,10 @@ pub const HOLD: Duration = Duration::from_millis(10);
 /// longer that has not ended is not one of these and is handed on as typed.
 const MAX_REPORT: usize = 96;
 
+/// The most of a terminal's name that is read: `WezTerm 20240203-110809-5046fc22` is the
+/// longest seen. The answer is still read to its end, up to [`MAX_REPORT`].
+const MAX_NAME: usize = 64;
+
 /// Something the terminal said about itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Report {
@@ -40,6 +45,11 @@ pub enum Report {
     Color { background: bool, rgb: [u8; 3] },
     /// The terminal's scheme changed or was asked for (`CSI ? 997 ; 1 n` dark, `; 2 n` light).
     Scheme { light: bool },
+    /// Its name, the answer to XTVERSION (`CSI > 0 q`): `DCS > | name ST`.
+    Terminal(crate::icons::Answer),
+    /// Its primary device attributes (`CSI ? ... c`), the answer to `CSI c`. Every terminal
+    /// gives one, so one arriving before a name means the terminal has no name to give.
+    Attributes,
 }
 
 /// The filter. One per client, like the key decoder.
@@ -128,13 +138,13 @@ fn classify(bytes: &[u8]) -> Found {
     match kind {
         b'[' => csi(bytes),
         b']' => osc(bytes),
+        b'P' => dcs(bytes),
         _ => Found::No,
     }
 }
 
-/// `CSI I`, `CSI O` and `CSI ? 997 ; n n`.
+/// `CSI I`, `CSI O`, `CSI ? 997 ; n n` and the device attributes `CSI ? ... c`.
 fn csi(bytes: &[u8]) -> Found {
-    const SCHEME: &[u8] = b"\x1b[?997;";
     match bytes.get(2) {
         None => return Found::Partial,
         Some(b'I') => return Found::Report(3, Some(Report::Focus(true))),
@@ -142,22 +152,50 @@ fn csi(bytes: &[u8]) -> Found {
         Some(b'?') => {}
         Some(_) => return Found::No,
     }
-    let shared = bytes.len().min(SCHEME.len());
-    if bytes[..shared] != SCHEME[..shared] {
-        return Found::No;
-    }
-    if bytes.len() < SCHEME.len() + 2 {
-        return Found::Partial;
-    }
-    let light = match bytes[SCHEME.len()] {
-        b'1' => false,
-        b'2' => true,
+    // Digits and semicolons, then the letter that says what it was.
+    let Some(len) = bytes[3..]
+        .iter()
+        .position(|byte| !(byte.is_ascii_digit() || *byte == b';'))
+    else {
+        return if bytes.len() < MAX_REPORT {
+            Found::Partial
+        } else {
+            Found::No
+        };
+    };
+    let end = 3 + len;
+    let report = match (bytes[end], &bytes[3..end]) {
+        (b'c', params) if !params.is_empty() => Report::Attributes,
+        (b'n', b"997;1") => Report::Scheme { light: false },
+        (b'n', b"997;2") => Report::Scheme { light: true },
         _ => return Found::No,
     };
-    if bytes[SCHEME.len() + 1] != b'n' {
+    Found::Report(end + 1, Some(report))
+}
+
+/// `DCS > | name ST`, the terminal's name, ended by `ESC \`.
+fn dcs(bytes: &[u8]) -> Found {
+    const START: &[u8] = b"\x1bP>|";
+    let shared = bytes.len().min(START.len());
+    if bytes[..shared] != START[..shared] {
         return Found::No;
     }
-    Found::Report(SCHEME.len() + 2, Some(Report::Scheme { light }))
+    if bytes.len() <= START.len() {
+        return Found::Partial;
+    }
+    let body = &bytes[START.len()..];
+    let Some(at) = body.windows(2).position(|pair| pair == b"\x1b\\") else {
+        return if bytes.len() < MAX_REPORT {
+            Found::Partial
+        } else {
+            Found::No
+        };
+    };
+    let name = String::from_utf8_lossy(&body[..at.min(MAX_NAME)]);
+    Found::Report(
+        START.len() + at + 2,
+        Some(Report::Terminal(crate::icons::answer_of(&name))),
+    )
 }
 
 /// `OSC 10 ; rgb:... ST` and `OSC 11 ; rgb:... ST`, ended by `BEL` or `ESC \`.
@@ -360,6 +398,58 @@ mod tests {
         filter.expire();
         let (out, _) = filter.strip(b"k");
         assert_eq!(out, b"\x1b]k", "released first, then what the read brought");
+    }
+
+    /// The answers to XTVERSION and DA1, as the measured terminals sent them, are taken out;
+    /// what they say is the terminal's kind, nothing of them is typed.
+    #[test]
+    fn a_terminals_name_and_attributes_are_reports_not_keys() {
+        use crate::icons::Answer;
+        let (out, reports) = strip(b"a\x1bP>|ghostty 1.3.1\x1b\\b");
+        assert_eq!(out, b"ab");
+        assert_eq!(reports, [Report::Terminal(Answer::FromFont)]);
+        let (_, reports) = strip(b"\x1bP>|iTerm2 3.7.3\x1b\\\x1b[?62;4c");
+        assert_eq!(
+            reports,
+            [Report::Terminal(Answer::FromFont), Report::Attributes]
+        );
+        let (_, reports) = strip(b"\x1bP>|WezTerm 20240203-110809-5046fc22\x1b\\");
+        assert_eq!(reports, [Report::Terminal(Answer::Other)]);
+        let (out, reports) = strip(b"\x1bP>|tmux 3.5a\x1b\\");
+        assert!(out.is_empty());
+        assert_eq!(reports, [Report::Terminal(Answer::Other)]);
+        // Terminal answers DA1 alone.
+        let (out, reports) = strip(b"\x1b[?1;2c");
+        assert!(out.is_empty());
+        assert_eq!(reports, [Report::Attributes]);
+        // A name split by the read is put back together.
+        let mut filter = Reports::default();
+        let (out, reports) = filter.strip(b"\x1bP>|kitty(0.4");
+        assert!(out.is_empty() && reports.is_empty());
+        let (out, reports) = filter.strip(b"9.2)\x1b\\");
+        assert!(out.is_empty());
+        assert_eq!(reports, [Report::Terminal(Answer::FromFont)]);
+    }
+
+    /// Alt with `P` sends `ESC P`: held for the length of a report, then typed, and any
+    /// other byte after it is typed at once.
+    #[test]
+    fn alt_p_is_still_a_key() {
+        let mut filter = Reports::default();
+        let (out, _) = filter.strip(b"\x1bP");
+        assert!(out.is_empty());
+        filter.expire();
+        let (out, _) = filter.strip(b"");
+        assert_eq!(out, b"\x1bP");
+        let (out, reports) = strip(b"\x1bPx");
+        assert_eq!(out, b"\x1bPx");
+        assert!(reports.is_empty());
+        // A name that never ends is not one, and is given back rather than eaten.
+        let mut long = b"\x1bP>|".to_vec();
+        long.extend(std::iter::repeat_n(b'a', 200));
+        let (out, reports) = strip(&long);
+        assert_eq!(out, long);
+        assert!(reports.is_empty());
     }
 
     #[test]

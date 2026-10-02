@@ -133,11 +133,21 @@ pub struct Env {
     /// `TERM_PROGRAM`: Alacritty (`ALACRITTY_WINDOW_ID`), a VTE terminal such as
     /// GNOME Terminal (`VTE_VERSION`), Konsole (`KONSOLE_VERSION`).
     pub font_braille: bool,
+    /// Alacritty by its own variables: it never draws a glyph its font lacks.
+    pub alacritty: bool,
+    /// Terminals that carry the Nerd symbols themselves, by the variables each sets for
+    /// its own children (`GHOSTTY_RESOURCES_DIR`, `KITTY_WINDOW_ID`, `WEZTERM_PANE`).
+    pub ghostty: bool,
+    pub kitty: bool,
+    pub wezterm: bool,
+    /// The interface runs on another machine than the terminal, whose fonts it cannot see.
+    pub ssh: bool,
 }
 
 /// Read the real environment into an [`Env`].
 pub fn current_env() -> Env {
     let var = |name: &str| std::env::var(name).ok();
+    let set = |name: &str| std::env::var_os(name).is_some();
     Env {
         qoro_color: var("QORO_COLOR"),
         term: var("TERM"),
@@ -150,6 +160,11 @@ pub fn current_env() -> Env {
         font_braille: ["ALACRITTY_WINDOW_ID", "VTE_VERSION", "KONSOLE_VERSION"]
             .iter()
             .any(|name| std::env::var_os(name).is_some()),
+        alacritty: set("ALACRITTY_WINDOW_ID") || set("ALACRITTY_SOCKET"),
+        ghostty: set("GHOSTTY_RESOURCES_DIR"),
+        kitty: set("KITTY_WINDOW_ID"),
+        wezterm: set("WEZTERM_PANE"),
+        ssh: set("SSH_CONNECTION") || set("SSH_TTY"),
     }
 }
 

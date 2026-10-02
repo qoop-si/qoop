@@ -96,6 +96,13 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
             ),
         ),
         row(
+            "look",
+            "icons",
+            c.icons.name().to_string(),
+            "auto draws them where the terminal can",
+            Kind::Choice("icons", ["auto", "on", "off"].map(String::from).to_vec()),
+        ),
+        row(
             "keys",
             "prefix",
             format!("ctrl-{}", char::from(b'a' + c.prefix - 1)),

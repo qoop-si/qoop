@@ -107,6 +107,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             workspace: 1,
             ink: Some(2),
         },
+        ControlRequest::SetKeepAwake {
+            id: "x28".into(),
+            workspace: 1,
+            terminal: None,
+            on: true,
+        },
         ControlRequest::Shutdown { id: "x15".into() },
         ControlRequest::Scrollback {
             id: "x16".into(),
@@ -201,6 +207,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

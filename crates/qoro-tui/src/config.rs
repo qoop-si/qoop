@@ -4,6 +4,7 @@
 //! ```toml
 //! prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
 //! theme = "auto"      # auto | dark | light
+//! icons = "auto"      # auto | on | off: the icon font, where it was seen to draw
 //! [notify]
 //! desktop = true
 //! sound = false
@@ -70,6 +71,8 @@ pub struct Config {
     /// The byte that starts a command.
     pub prefix: u8,
     pub theme: Theme,
+    /// Icons from the bundled font, or the plain glyphs. See [`crate::icons`].
+    pub icons: crate::icons::Setting,
     /// Tell the desktop when an agent needs a person who is not looking.
     pub desktop: bool,
     /// And play a sound when it does.
@@ -89,6 +92,7 @@ impl Default for Config {
         Config {
             prefix: crate::keys::PREFIX,
             theme: Theme::Auto,
+            icons: crate::icons::Setting::Auto,
             desktop: true,
             sound: false,
             done_sound: "Glass",
@@ -401,6 +405,19 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             ("theme", toml::Value::String(name)) if name == "light" => {
                 config.theme = Theme::Light;
             }
+            ("icons", toml::Value::String(name)) if name == "auto" => {
+                config.icons = crate::icons::Setting::Auto;
+            }
+            ("icons", toml::Value::String(name)) if name == "on" => {
+                config.icons = crate::icons::Setting::On;
+            }
+            ("icons", toml::Value::String(name)) if name == "off" => {
+                config.icons = crate::icons::Setting::Off;
+            }
+            ("icons", _) => refuse(
+                line,
+                format!("icons = {value} is not \"auto\", \"on\" or \"off\""),
+            ),
             ("prefix", _) => refuse(line, format!("prefix = {value} is not {PREFIX_SAID}")),
             ("theme", _) => refuse(
                 line,
@@ -543,9 +560,10 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 10] = [
     "prefix",
     "theme",
+    "icons",
     "notify.desktop",
     "notify.sound",
     "notify.done_sound",
@@ -565,6 +583,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "prefix" => return Err(format!("prefix is {PREFIX_SAID}")),
         "theme" if matches!(value, "auto" | "dark" | "light") => toml_edit::value(value),
         "theme" => return Err("theme is auto, dark or light".to_string()),
+        "icons" if matches!(value, "auto" | "on" | "off") => toml_edit::value(value),
+        "icons" => return Err("icons is auto, on or off".to_string()),
         "notify.done_sound" | "notify.alert_sound" => match sound_named(value) {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),

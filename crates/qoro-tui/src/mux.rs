@@ -308,6 +308,7 @@ impl Link {
                 .collect();
         }
         vec![WorkspaceRow {
+            keep_awake: false,
             id: (link as i64) << WORKSPACE_SHIFT,
             name: format!("{} ({})", self.name, self.reason),
             terminals: 0,
@@ -782,6 +783,26 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 let (link, workspace) = workspace_in(workspace);
                 self.send_one(link, R::CloseWorkspace { id, workspace })
                     .await
+            }
+            // The machine whose idle sleep it is: the space's, a pane going with its space.
+            R::SetKeepAwake {
+                id,
+                workspace,
+                terminal,
+                on,
+            } => {
+                let (link, workspace) = workspace_in(workspace);
+                let terminal = terminal.map(|t| terminal_in(t).1);
+                self.send_one(
+                    link,
+                    R::SetKeepAwake {
+                        id,
+                        workspace,
+                        terminal,
+                        on,
+                    },
+                )
+                .await
             }
             // To the machine the space is on, in its own numbering; a machine let go because
             // everything there slept is brought back by the wake itself.
@@ -2024,6 +2045,32 @@ mod tests {
         );
     }
 
+    /// A cup filled on a remote space or one of its panes reaches that machine's idle sleep,
+    /// in its own numbering: sent home, the home daemon would keep the wrong thing awake.
+    #[tokio::test]
+    async fn a_remote_cup_goes_to_its_machine_in_its_own_numbering() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::SetKeepAwake {
+            id: "cup-1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            terminal: Some(terminal_out(1, 7).expect("fits")),
+            on: true,
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::SetKeepAwake {
+                id: "cup-1".into(),
+                workspace: 3,
+                terminal: Some(7),
+                on: true,
+            }
+        );
+    }
+
     /// A conversation on a remote is named on that remote, in its own numbering: sent home,
     /// the home daemon renamed whatever its own terminal of that number was, or nothing.
     #[tokio::test]
@@ -2056,6 +2103,7 @@ mod tests {
             link.listed_spaces(1).iter().map(|row| row.link).collect()
         };
         let row = WorkspaceRow {
+            keep_awake: false,
             id: 1 << WORKSPACE_SHIFT,
             name: "devbox:api".into(),
             terminals: 0,
@@ -2291,6 +2339,7 @@ mod tests {
             tried: BTreeSet::new(),
         };
         let space = |id: i64, name: &str| WorkspaceRow {
+            keep_awake: false,
             id,
             name: name.into(),
             terminals: 1,

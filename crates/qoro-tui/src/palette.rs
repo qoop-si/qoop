@@ -380,6 +380,7 @@ mod tests {
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
+            keep_awake: false,
             id,
             name: name.to_string(),
             terminals: 1,
@@ -393,6 +394,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,
@@ -419,6 +421,7 @@ mod tests {
 
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,

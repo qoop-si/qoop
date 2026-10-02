@@ -1862,6 +1862,7 @@ mod tests {
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             workspace: 1,
@@ -1985,6 +1986,7 @@ mod tests {
     fn a_space_is_found_by_id_then_name_and_an_unknown_id_is_refused() {
         let spaces = vec![
             WorkspaceRow {
+                keep_awake: false,
                 id: 1,
                 name: "default".into(),
                 terminals: 1,
@@ -1995,6 +1997,7 @@ mod tests {
                 link: None,
             },
             WorkspaceRow {
+                keep_awake: false,
                 id: 2,
                 name: "work".into(),
                 terminals: 0,
@@ -2010,6 +2013,7 @@ mod tests {
         assert_eq!(pick_space(&spaces, "fresh").unwrap(), None);
         assert!(pick_space(&spaces, "7").is_err());
         let named = vec![WorkspaceRow {
+            keep_awake: false,
             id: 3,
             name: "2024".into(),
             terminals: 0,

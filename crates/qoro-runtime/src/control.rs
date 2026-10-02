@@ -124,6 +124,16 @@ pub enum ControlRequest {
         workspace: i64,
         ink: Option<u8>,
     },
+    /// Keep a space awake, or with `terminal` one pane of it: idle sleep passes it by. A
+    /// sleep a person asks for still sleeps it. Answered `Renamed`, like the colour; a pane's
+    /// change is announced, so every client redraws its row.
+    SetKeepAwake {
+        id: String,
+        workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<u32>,
+        on: bool,
+    },
     /// End a terminal and everything it contains, per ADR-014.
     CloseTerminal {
         id: String,
@@ -382,6 +392,7 @@ impl ControlRequest {
             | Self::MoveTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
             | Self::SetWorkspaceInk { id, .. }
+            | Self::SetKeepAwake { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
             | Self::SearchScrollback { id, .. }
@@ -747,6 +758,10 @@ pub struct WorkspaceRow {
     /// a space of this machine has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkState>,
+    /// A person asked to keep it awake: idle sleep passes its tabs by. Written only when
+    /// true, and false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_awake: bool,
 }
 
 /// Whether the machine behind a space answers.
@@ -970,6 +985,10 @@ pub struct AgentRow {
     /// shows as done. Written only when true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub news: bool,
+    /// A person asked to keep this pane awake. Only the pane's own flag: its space's is on
+    /// the space's row. Written only when true, and false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_awake: bool,
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -1313,6 +1332,7 @@ mod tests {
         // Skipped on the wire when absent: live rows say nothing new.
         let live = AgentRow {
             news: false,
+            keep_awake: false,
             terminal: 3,
             workspace: 1,
             name: None,

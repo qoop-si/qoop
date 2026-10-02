@@ -11,6 +11,7 @@ pub mod config;
 pub mod copy;
 pub mod graphics;
 pub mod hyperlink;
+pub mod icons;
 pub mod input;
 pub mod keys;
 pub mod layout;

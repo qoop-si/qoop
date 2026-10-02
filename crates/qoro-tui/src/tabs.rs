@@ -380,6 +380,7 @@ mod tests {
 
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,
@@ -406,6 +407,7 @@ mod tests {
 
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,

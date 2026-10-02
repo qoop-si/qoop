@@ -612,6 +612,8 @@ struct State {
     /// the same two columns. `None` is the ordinary case, and a row that is mid question
     /// answers nothing else: it does not fold, does not navigate and does not sleep.
     armed: Option<i64>,
+    /// The space rule whose drawer of controls is out or on its way, one place a frame.
+    drawer: Option<Drawer>,
     /// Where the wheel moved the column's list: the terminal the keyboard was on, and the
     /// first list row. A move of the keyboard to another terminal lets the list follow it
     /// again, so a scroll never hides where the keys went.
@@ -660,6 +662,10 @@ struct State {
     host_colors: [Option<[u8; 3]>; 2],
     /// Whether the outer terminal last said its scheme is light (`CSI ? 997 ; 2 n`).
     host_light: Option<bool>,
+    /// What the outer terminal said to XTVERSION, for [`crate::icons::decide`].
+    icon_reply: crate::icons::Reply,
+    /// Whether this machine has the icon font where iTerm2 and Terminal look.
+    icon_font: bool,
     /// The colours last told to the daemon, so an unchanged answer is not sent again.
     host_sent: Option<([u8; 3], [u8; 3])>,
     /// The daemon predates `HostColors` and said so: not asked again this session.
@@ -817,6 +823,7 @@ impl State {
             panes: self.panes(),
             focused: self.focused,
             armed: self.armed,
+            drawer: self.drawer_view(),
             snapshot: self.peek_view().or(self.snapshot.as_ref()),
             cols: self.cols,
             lines: self.lines,
@@ -1201,9 +1208,13 @@ impl State {
         if let sidebar::Hit::Terminal(terminal) = hit
             && first
             && !self.collapsed
-            && sidebar::on_agent_close(col as usize, terminal, &column)
         {
-            return Some(Clicked::CloseAgent(terminal));
+            if sidebar::on_agent_close(col as usize, terminal, &column) {
+                return Some(Clicked::CloseAgent(terminal));
+            }
+            if sidebar::on_agent_cup(col as usize, terminal, &column) {
+                return Some(Clicked::KeepAwakeAgent(terminal));
+            }
         }
         // A row that does two things answers with the row; the column decides which.
         match sidebar::act(hit, col as usize, &column, self.collapsed)? {
@@ -1212,6 +1223,8 @@ impl State {
             sidebar::Act::Sleep(space) => Some(Clicked::Sleep(space)),
             sidebar::Act::Wake(space) => Some(Clicked::Wake(space)),
             sidebar::Act::Settings(space) => Some(Clicked::Settings(space)),
+            sidebar::Act::KeepAwake(space) => Some(Clicked::KeepAwake(space)),
+            sidebar::Act::Drawer(space) => Some(Clicked::Drawer(space)),
             sidebar::Act::New(space) => Some(Clicked::New(space)),
             sidebar::Act::Close(space) => Some(Clicked::Close(space)),
             sidebar::Act::ConfirmClose(space) => Some(Clicked::ConfirmClose(space)),
@@ -1332,9 +1345,11 @@ impl State {
             width: self.sidebar_width,
             shut: &self.shut,
             armed: self.armed,
+            drawer: self.drawer_view(),
             usage: Some(&self.usage),
             scroll: self.list_scroll(),
             inbox: self.inbox,
+            icons: crate::icons::on(),
         }
     }
 
@@ -2954,6 +2969,87 @@ fn close_focused(state: &mut State, request: &mut u64) {
     close_terminal(state, state.focused, request);
 }
 
+/// A space rule's drawer of controls: which space, how many places are out, and whether it
+/// is opening or going back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Drawer {
+    space: i64,
+    shown: usize,
+    open: bool,
+}
+
+impl State {
+    /// What the column draws of the drawer: the space and how many places are out.
+    fn drawer_view(&self) -> Option<(i64, usize)> {
+        self.drawer.map(|d| (d.space, d.shown))
+    }
+
+    /// Whether the drawer still has a place to move, so the animation clock keeps running.
+    fn drawer_moving(&self) -> bool {
+        self.drawer.is_some_and(|d| {
+            if d.open {
+                d.shown < sidebar::DRAWER
+            } else {
+                true
+            }
+        })
+    }
+
+    /// The toggle on a rule: open that rule's drawer, closing any other at once, or send
+    /// an open one back.
+    fn toggle_drawer(&mut self, space: i64) {
+        self.drawer = match self.drawer {
+            Some(d) if d.space == space && d.open => Some(Drawer { open: false, ..d }),
+            Some(d) if d.space == space => Some(Drawer { open: true, ..d }),
+            _ => Some(Drawer {
+                space,
+                shown: 0,
+                open: true,
+            }),
+        };
+    }
+
+    /// One animation frame: one place more out, or one back, until it is open or gone.
+    fn step_drawer(&mut self) {
+        self.drawer = match self.drawer {
+            Some(d) if d.open => Some(Drawer {
+                shown: (d.shown + 1).min(sidebar::DRAWER),
+                ..d
+            }),
+            Some(d) if d.shown > 1 => Some(Drawer {
+                shown: d.shown - 1,
+                ..d
+            }),
+            _ => None,
+        };
+    }
+
+    /// Where the drawer is going, at once: for `QORO_MOTION=0`, which has no frames.
+    fn settle_drawer(&mut self) {
+        self.drawer = self.drawer.filter(|d| d.open).map(|d| Drawer {
+            shown: sidebar::DRAWER,
+            ..d
+        });
+    }
+}
+
+/// Turn keeping awake over for a space, or with `terminal` one pane of it: on when it was
+/// off, off when it was on, as the last list said. Sent with the value rather than as a
+/// toggle, so two quick clicks on a stale list cannot cancel out on the daemon.
+fn keep_awake(state: &mut State, space: i64, terminal: Option<u32>, request: &mut u64) {
+    let was = match terminal {
+        Some(t) => state.rows.iter().any(|r| r.terminal == t && r.keep_awake),
+        None => state.spaces.iter().any(|s| s.id == space && s.keep_awake),
+    };
+    *request += 1;
+    state.modes.outbox.push(ControlRequest::SetKeepAwake {
+        id: format!("awake-{request}"),
+        workspace: space,
+        terminal,
+        on: !was,
+    });
+}
+
 /// Close one terminal, a pane and only that pane, or ask first when an agent in it is busy.
 /// The last pane of a tab takes the tab with it; in a split the other panes stay. A sleeping
 /// tab has nothing running to ask about, and the daemon discards it without waking it.
@@ -4102,6 +4198,12 @@ enum Clicked {
     Wake(i64),
     /// The rule's `⋯`: that space's settings.
     Settings(i64),
+    /// The rule's cup: keep that space awake, or let idle sleep take it again.
+    KeepAwake(i64),
+    /// The rule's toggle: open its drawer of controls, or put it back.
+    Drawer(i64),
+    /// The cup on an agent's row: the same for that agent's pane.
+    KeepAwakeAgent(u32),
     /// The rule's close, which only arms the question.
     Close(i64),
     /// `y` on an armed rule: the space and everything in it goes.
@@ -4245,6 +4347,7 @@ where
     let (cols, lines) = client::outer_size();
     let mut state = State {
         armed: None,
+        drawer: None,
         list_scroll: None,
         closing: None,
         close_begun: false,
@@ -4346,6 +4449,8 @@ where
         outer_focus: None,
         host_colors: [None, None],
         host_light: None,
+        icon_reply: crate::icons::Reply::Silent,
+        icon_font: false,
         host_sent: None,
         host_refused: false,
         news_sent: None,
@@ -4465,7 +4570,18 @@ where
         let tmux = std::env::var_os("TMUX").is_some();
         out.write_all(&crate::colorlevel::tmux_wrapped(ASK_COLORS, tmux))?;
         out.write_all(&crate::colorlevel::tmux_wrapped(ASK_SCHEME, tmux))?;
+        // Its name, once and never through tmux, which would swallow or forward it; icons
+        // are off under tmux anyway. See `crate::icons`.
+        if !tmux {
+            out.write_all(ASK_VERSION)?;
+            state.icon_reply = crate::icons::Reply::Waiting;
+        }
     }
+    // The font first, so a terminal that draws from installed fonts finds it on the first
+    // frame, then the first guess, which the terminal's answer may still correct.
+    state.icon_font = state.config.icons != crate::icons::Setting::Off
+        && crate::icons::install(&crate::colorlevel::current_env());
+    reicon(&state);
     out.flush()?;
     // The pet and the update notice, read once so the first frame has them; the
     // acknowledgement tick below re-reads them, with no wakeup of their own.
@@ -4713,7 +4829,7 @@ where
             // working disarms it, and the column stops on whatever frame it was on.
             let moving = motion
                 && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0
-                && sidebar::moves(&state.column(0, 0));
+                && (sidebar::moves(&state.column(0, 0)) || state.drawer_moving());
             if !moving {
                 motion_at = None;
             } else if motion_at.is_none() {
@@ -5371,6 +5487,28 @@ where
                                     }
                                     Some(Clicked::CloseAgent(terminal)) => {
                                         close_terminal(&mut state, terminal, &mut request);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Drawer(space)) => {
+                                        state.toggle_drawer(space);
+                                        if !motion {
+                                            state.settle_drawer();
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::KeepAwake(space)) => {
+                                        keep_awake(&mut state, space, None, &mut request);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::KeepAwakeAgent(terminal)) => {
+                                        if let Some(space) = state
+                                            .rows
+                                            .iter()
+                                            .find(|r| r.terminal == terminal)
+                                            .map(|r| r.workspace)
+                                        {
+                                            keep_awake(&mut state, space, Some(terminal), &mut request);
+                                        }
                                         dirty = true;
                                     }
                                     // The tab bar's `+` is the space on screen's `+`.
@@ -6632,6 +6770,7 @@ where
                     }
                 } => {
                     state.tick = state.tick.wrapping_add(1).max(1);
+                    state.step_drawer();
                     motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
                     dirty = true;
                 }
@@ -6776,6 +6915,23 @@ fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
     retheme(state);
+    // Icons turned back on in a running session get their font now, not at the next start.
+    if !state.icon_font && state.config.icons != crate::icons::Setting::Off {
+        state.icon_font = crate::icons::install(&crate::colorlevel::current_env());
+    }
+    reicon(state);
+}
+
+/// Decide again whether the painters draw icons, from the config, what the terminal said
+/// and whether the font is in place. True when that changed, so the column repaints.
+fn reicon(state: &State) -> bool {
+    crate::icons::set(crate::icons::decide(
+        state.config.icons,
+        &crate::colorlevel::current_env(),
+        &state.icon_reply,
+        state.icon_font,
+        crate::colorlevel::level() == crate::colorlevel::Level::Mono,
+    ))
 }
 
 /// Keep what the terminal said about itself.
@@ -6794,6 +6950,20 @@ fn note_report(state: &mut State, report: crate::input::Report) -> bool {
             state.host_colors[usize::from(background)] = Some(rgb);
             false
         }
+        Report::Terminal(answer) => {
+            state.icon_reply = crate::icons::Reply::Named(answer);
+            reicon(state);
+            false
+        }
+        // Every terminal answers DA1, and after XTVERSION when it has a name to give: an
+        // answer to DA1 with none before it is a terminal that has none.
+        Report::Attributes => {
+            if state.icon_reply == crate::icons::Reply::Waiting {
+                state.icon_reply = crate::icons::Reply::Silent;
+                reicon(state);
+            }
+            false
+        }
         Report::Scheme { light } => {
             let switched = state.host_light.is_some_and(|was| was != light);
             state.host_light = Some(light);
@@ -6808,6 +6978,9 @@ fn note_report(state: &mut State, report: crate::input::Report) -> bool {
 /// out of it. Terminals that know none of these ignore them.
 const ASK_COLORS: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
 const ASK_SCHEME: &[u8] = b"\x1b[?2031h\x1b[?996n";
+/// Its name (XTVERSION, `CSI > 0 q`) and then its device attributes (`CSI c`), which every
+/// terminal answers: the second answer arriving says the first one is not coming.
+const ASK_VERSION: &[u8] = b"\x1b[>0q\x1b[c";
 
 /// Whether the terminal may be asked at all. The Linux console answers none of these and
 /// has been seen to print the question instead; a `dumb` terminal is a pipe, and asking
@@ -8491,6 +8664,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             if state.armed == Some(workspace) {
                 state.armed = None;
             }
+            // Its drawer too: ids are given again, and a new space must not open with it out.
+            if state.drawer.is_some_and(|d| d.space == workspace) {
+                state.drawer = None;
+            }
             // Its tree goes with it: a layout for a space that no longer exists would
             // reseed nothing and leak the entry. The space itself moves to whatever the
             // next list answers: `None` reads as "pick the first" on that path.
@@ -9329,6 +9506,7 @@ mod tests {
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
+            keep_awake: false,
             id,
             name: name.to_string(),
             terminals: 1,
@@ -9342,6 +9520,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            keep_awake: false,
             news: false,
             terminal,
             name: None,
@@ -10449,6 +10628,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            icon_reply: crate::icons::Reply::Silent,
+            icon_font: false,
             host_sent: None,
             host_refused: false,
             news_sent: None,
@@ -10477,6 +10658,7 @@ mod tests {
             agent_typing: Vec::new(),
             closing: None,
             armed: None,
+            drawer: None,
             list_scroll: None,
         }
     }
@@ -11026,6 +11208,12 @@ mod tests {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         s.spaces[0].ink = Some(4);
+        // Settings is in the rule's drawer: out, it answers where it is painted.
+        s.drawer = Some(Drawer {
+            space: 1,
+            shown: crate::sidebar::DRAWER,
+            open: true,
+        });
         let space = (1..s.lines)
             .flat_map(|row| (1..=crate::sidebar::WIDTH as u16).map(move |col| (row, col)))
             .find_map(|(row, col)| match s.clicked(row, col) {
@@ -11665,6 +11853,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            icon_reply: crate::icons::Reply::Silent,
+            icon_font: false,
             host_sent: None,
             host_refused: false,
             news_sent: None,
@@ -11676,6 +11866,7 @@ mod tests {
             config: crate::config::Config::default(),
             closing: None,
             armed: None,
+            drawer: None,
             list_scroll: None,
         }
     }
@@ -11697,6 +11888,7 @@ mod tests {
         // Space 1 with two terminals side by side, 1 focused, both watched.
         let mut state = State {
             armed: None,
+            drawer: None,
             list_scroll: None,
             closing: None,
             close_begun: false,
@@ -11789,6 +11981,8 @@ mod tests {
             outer_focus: None,
             host_colors: [None, None],
             host_light: None,
+            icon_reply: crate::icons::Reply::Silent,
+            icon_font: false,
             host_sent: None,
             host_refused: false,
             news_sent: None,
@@ -12453,6 +12647,7 @@ mod tests {
         state.cols = 100;
         state.lines = 30;
         state.spaces = vec![qoro_runtime::control::WorkspaceRow {
+            keep_awake: false,
             closable: true,
             id: 1,
             name: "default".to_string(),
@@ -13931,6 +14126,80 @@ mod tests {
         assert!(matches!(
             state.modes.outbox.pop(),
             Some(ControlRequest::CloseTerminal { terminal: 2, .. })
+        ));
+    }
+
+    /// The drawer slides out a place a frame and back the same way; another rule's toggle
+    /// opens that one instead, and without motion it is where it is going at once.
+    #[test]
+    fn a_rules_drawer_slides_out_and_back_a_place_a_frame() {
+        let mut s = state();
+        assert!(!s.drawer_moving());
+        s.toggle_drawer(1);
+        assert_eq!(s.drawer_view(), Some((1, 0)));
+        for shown in 1..=crate::sidebar::DRAWER {
+            assert!(s.drawer_moving());
+            s.step_drawer();
+            assert_eq!(s.drawer_view(), Some((1, shown)));
+        }
+        assert!(!s.drawer_moving(), "all out, the clock may stop");
+        s.toggle_drawer(1);
+        for shown in (1..crate::sidebar::DRAWER).rev() {
+            s.step_drawer();
+            assert_eq!(s.drawer_view(), Some((1, shown)));
+        }
+        s.step_drawer();
+        assert_eq!(s.drawer_view(), None, "back in, gone");
+        // Another rule's toggle: that one opens, from nothing.
+        s.toggle_drawer(1);
+        s.step_drawer();
+        s.toggle_drawer(2);
+        assert_eq!(s.drawer_view(), Some((2, 0)));
+        // No motion: open at once, and closed at once.
+        s.settle_drawer();
+        assert_eq!(s.drawer_view(), Some((2, crate::sidebar::DRAWER)));
+        s.toggle_drawer(2);
+        s.settle_drawer();
+        assert_eq!(s.drawer_view(), None);
+    }
+
+    /// A cup click sends the opposite of what the last list said, as a value, so a stale
+    /// double click cannot toggle it back on the daemon.
+    #[test]
+    fn a_cup_click_asks_for_the_opposite_of_what_the_list_said() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        keep_awake(&mut state, 1, Some(2), &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetKeepAwake {
+                workspace: 1,
+                terminal: Some(2),
+                on: true,
+                ..
+            })
+        ));
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.keep_awake = true;
+        }
+        keep_awake(&mut state, 1, Some(2), &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetKeepAwake {
+                terminal: Some(2),
+                on: false,
+                ..
+            })
+        ));
+        keep_awake(&mut state, 1, None, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetKeepAwake {
+                workspace: 1,
+                terminal: None,
+                on: true,
+                ..
+            })
         ));
     }
 

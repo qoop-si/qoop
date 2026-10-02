@@ -172,6 +172,13 @@ each tab that can and says which stayed awake. When nothing is awake and no inte
 attached, the daemon itself leaves ten seconds later, so a machine with everything asleep
 runs nothing of qoro; the next `qoro` starts it and wakes the tab that slept last.
 
+A space's row shows `+` and `⋯`; the `⋯` slides out the rest of its controls (sleep or
+wake, keep awake, settings, close) and turns into `›` to put them back. With `[sleep]
+idle_minutes` set, the cup on an agent's row or in a space's drawer keeps it out of idle
+sleep: click it and it fills, click again and idle sleep may take it. A full cup or a
+sleeping space's moon stays beside `+` while the drawer is closed. A sleep you ask for still
+sleeps it.
+
 ```
 ctrl-a Z                sleep the tab you are in, or wake the sleeping one you are on
 qoro sleep --tab 7      the same from a shell, by tab number
@@ -190,6 +197,7 @@ when it starts, and again within two seconds of any change to it (`qoro settings
 ```toml
 prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
 theme = "auto"      # auto | dark | light
+icons = "auto"      # auto | on | off: icons where they were seen to draw, plain elsewhere
 [notify]
 desktop = true      # tell the desktop when an agent needs you and you are not looking
 sound = false
