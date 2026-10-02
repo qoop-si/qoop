@@ -5529,16 +5529,18 @@ fn vet_tabs(
     }
 }
 
-/// A tab of `streams` waiting on another, or waited on by one, said as a person reads it.
-///
-/// Such a tab is part of a conversation between agents that ending it would cut in half,
-/// and the wait itself is not written anywhere.
+/// A tab of `streams` waiting on one that stays awake, said as a person reads it: putting the
+/// waiter to sleep would cut a conversation between agents in half, and the wait itself is
+/// not written anywhere. The tab waited on is never held (it can be woken again), so an
+/// assistant that wrote to an agent does not keep that agent awake for a day.
 fn waiting_between(into: &Restore, streams: &[u32]) -> Option<String> {
-    into.agents
+    let edges: Vec<(u32, u32)> = into
+        .agents
         .expectation_edges()
         .into_iter()
         .filter(|(_, target)| !into.agents.is_closed(*target))
-        .find(|(waiter, target)| streams.contains(waiter) || streams.contains(target))
+        .collect();
+    crate::idle::holding_wait(&edges, streams, |t| into.books.is_marked(t))
         .map(|(waiter, target)| format!("tab {waiter} is waiting on tab {target}"))
 }
 

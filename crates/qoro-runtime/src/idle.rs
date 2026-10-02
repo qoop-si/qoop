@@ -255,6 +255,20 @@ pub fn apply_edge_vetoes(
     }
 }
 
+/// The wait that keeps a person's sleep of `sleeping` from going ahead, if any: a tab in
+/// that set waiting on one that stays awake. The same rule as [`apply_edge_vetoes`]: only
+/// the waiter is held, never the tab it waits on, which can be slept and woken again; and a
+/// waiter sleeping together with its target, or after it, cuts nothing.
+pub fn holding_wait(
+    edges: &[(u32, u32)],
+    sleeping: &[u32],
+    asleep: impl Fn(u32) -> bool,
+) -> Option<(u32, u32)> {
+    edges.iter().copied().find(|(waiter, target)| {
+        sleeping.contains(waiter) && !sleeping.contains(target) && !asleep(*target)
+    })
+}
+
 /// Per-terminal watcher refcounts: how many live connections hold a render
 /// subscription on each terminal.
 ///
@@ -492,6 +506,34 @@ mod tests {
         for live in ["c1", "", "qoro-restore2", "QORO-RESTORE"] {
             assert!(is_live_input(live), "{live:?} is live");
         }
+    }
+
+    #[test]
+    fn a_sleep_is_held_only_by_a_waiter_whose_target_stays_awake() {
+        // 1 waits on 2.
+        let edges = [(1, 2)];
+        let awake = |_| false;
+        assert_eq!(
+            holding_wait(&edges, &[2], awake),
+            None,
+            "the tab waited on sleeps"
+        );
+        assert_eq!(
+            holding_wait(&edges, &[1], awake),
+            Some((1, 2)),
+            "the waiter is held"
+        );
+        assert_eq!(
+            holding_wait(&edges, &[1, 2], awake),
+            None,
+            "both sleep together"
+        );
+        assert_eq!(
+            holding_wait(&edges, &[1], |t| t == 2),
+            None,
+            "its target already sleeps"
+        );
+        assert_eq!(holding_wait(&edges, &[3], awake), None, "an unrelated tab");
     }
 
     #[test]
