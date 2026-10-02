@@ -42,12 +42,15 @@ fn route(obj: &Value) -> Option<Message> {
             if text.is_empty() {
                 return None;
             }
+            // Tool output rides on `user` lines; nobody typed it.
+            let typed = role == "user"
+                && !content.and_then(Value::as_array).is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                });
             Some(Message {
-                role: if role == "user" {
-                    Role::User
-                } else {
-                    Role::Assistant
-                },
+                role: if typed { Role::User } else { Role::Assistant },
                 text,
                 ts: obj
                     .get("timestamp")
@@ -173,6 +176,21 @@ mod tests {
         assert!(msgs[0].text.contains("the fix"));
         assert!(msgs[0].text.contains("Bash"));
         assert!(!msgs[0].text.contains("hmm"));
+    }
+
+    /// A tool's output comes back on a `user` line, but nobody typed it: it is the
+    /// agent's side of the turn, so `--role user` keeps only what a person wrote.
+    #[test]
+    fn tool_output_is_not_the_person() {
+        let (msgs, _) = parse_lines(&lines(vec![
+            json!({"type":"user","message":{"role":"user","content":"run the tests"}}),
+            json!({"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"3 passed"}]}}),
+        ]));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(msgs[1].text, "3 passed");
     }
 
     #[test]
