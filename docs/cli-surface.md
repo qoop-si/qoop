@@ -67,7 +67,7 @@ a claim nobody has to keep.
 | `qoro avatar set [--hair H] [--hair-ink N] [--eyes E]` | change those parts of the pet and keep the rest; only parts the picker offers are taken | no |
 | `qoro config [--json]` | the settings in `config.toml` (prefix, theme, notifications, the notch), each from the file or its default, where the file is, and what in it could not be used | no |
 | `qoro config set <key> <value>` | write one setting, checked first, keeping every other line of the file; `notch.enabled` is read by the notch when it starts or from its settings window | no |
-| `qoro sound` | hear the notification sounds (macOS) and keep one for a finished agent and one for an agent that waits; a number or a name plays one, enter keeps it, `off` turns sound off, `q` or EOF stops | no |
+| `qoro sound` | hear the notification sounds (macOS its own, Linux the freedesktop ones installed) and keep one for a finished agent and one for an agent that waits; a number or a name plays one, enter keeps it, `off` turns sound off, `q` or EOF stops | no |
 | `qoro notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoro notch run` at login: the agents of every running session in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
 | `qoro notch uninstall` | take the LaunchAgent and the written app out | no |
 | `qoro notch status` | whether the notch is installed and running | no |

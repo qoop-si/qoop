@@ -37,11 +37,13 @@ cannot run anything.
 ## Sound
 
 Off by default. With `sound = true` in `[notify]`, macOS plays `Funk` when an agent needs
-you and `Glass` when one finished (through `afplay`); Linux plays the freedesktop
-`dialog-warning` or `complete` sound through `paplay` or `pw-play` when both are there. No
-sound is played from a qoro running over ssh.
+you and `Glass` when one finished (through `afplay`); Linux plays freedesktop sounds,
+`dialog-warning` and `complete` by default, through `paplay` or `pw-play` when both are there. No
+sound is played from a qoro running over ssh. A name from the other system (a Mac name read
+on Linux) plays that default.
 
-To hear them and choose, run `qoro sound` (macOS): a number or a name plays one, enter
+To hear them and choose, run `qoro sound`: macOS lists its own sounds, Linux the
+freedesktop ones installed. A number or a name plays one, enter
 keeps it, first for a finished agent, then for one that waits on you. Keeping one turns
 `sound` on, `off` turns it off. A running qoro takes the change the next time its settings
 open (prefix, space, `settings`).

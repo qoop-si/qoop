@@ -36,8 +36,8 @@ exit_when_asleep = true
 | `theme` | `"auto"` | `auto` asks the terminal for its background; `dark` or `light` say it |
 | `notify.desktop` | `true` | tell the desktop when an agent needs you and you are not looking |
 | `notify.sound` | `false` | and play a sound when it does; the install asks |
-| `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink` |
-| `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list |
+| `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink`, or on Linux a freedesktop name (`complete`, `bell`, `message`, ...; Linux default `complete`); `qoro sound` plays them to choose |
+| `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list (Linux default `dialog-warning`) |
 | `sleep.idle_minutes` | `0` | a tab idle this many minutes, and unwatched for as long, sleeps by itself, the same way `ctrl-a Z` puts it to sleep, refusals included; the rest of its space is left as it is. `0` is never, and then nothing runs for it at all |
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached, so a machine with everything asleep runs nothing of qoro; the next `qoro` starts it again. `false` keeps it up |
 

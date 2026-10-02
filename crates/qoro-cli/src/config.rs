@@ -61,8 +61,8 @@ fn show(json: bool) -> std::io::Result<()> {
             "choices": {
                 "prefix": config::prefixes(),
                 "theme": ["auto", "dark", "light"],
-                "notify.done_sound": config::SOUNDS,
-                "notify.alert_sound": config::SOUNDS,
+                "notify.done_sound": config::sounds_here(),
+                "notify.alert_sound": config::sounds_here(),
             },
             "problems": read.problems.iter().map(|p| p.short()).collect::<Vec<_>>(),
         });
@@ -97,30 +97,51 @@ fn show(json: bool) -> std::io::Result<()> {
 /// `qoro sound`: hear each sound and keep one for a finished agent, then one for an agent
 /// that waits on you. A number or a name plays it, enter keeps the last one heard, `off`
 /// turns sounds off, `q` or EOF stops with nothing more written. Each pick is written as
-/// it is kept, so stopping after the first keeps the first.
+/// it is kept, so stopping after the first keeps the first. macOS offers its own sounds,
+/// Linux the freedesktop ones this machine has.
 pub fn run_sound(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
         return Err(std::io::Error::other("usage: qoro sound"));
     }
-    if !cfg!(target_os = "macos") {
-        println!("sounds are picked on macOS only; Linux plays the desktop's own two");
+    let macos = cfg!(target_os = "macos");
+    let list: Vec<&'static str> = config::sounds_here()
+        .iter()
+        .copied()
+        .filter(|name| macos || qoro_tui::notify::sound(false, false, name, name).is_some())
+        .collect();
+    if list.is_empty() {
+        println!(
+            "no sound to play here: install the freedesktop sound theme and paplay or pw-play"
+        );
         return Ok(());
     }
     let path = config::path();
     let c = config::read().config;
+    let width = list.iter().map(|s| s.len()).max().unwrap_or(0) + 2;
+    let per_row = (90 / (width + 4)).max(1);
     let mut input = std::io::stdin().lock();
-    for (key, what, now) in [
-        ("notify.done_sound", "an agent finished", c.done_sound),
-        ("notify.alert_sound", "an agent waits on you", c.alert_sound),
+    for (key, what, now, urgent) in [
+        (
+            "notify.done_sound",
+            "an agent finished",
+            c.done_sound,
+            false,
+        ),
+        (
+            "notify.alert_sound",
+            "an agent waits on you",
+            c.alert_sound,
+            true,
+        ),
     ] {
-        println!("\n{what}, now {now}");
-        for (i, name) in config::SOUNDS.iter().enumerate() {
-            print!("{:>3} {name:<10}", i + 1);
-            if i % 7 == 6 {
+        let mut heard = qoro_tui::notify::playable(now, urgent, macos);
+        println!("\n{what}, now {heard}");
+        for (i, name) in list.iter().enumerate() {
+            print!("{:>3} {name:<width$}", i + 1);
+            if i % per_row == per_row - 1 || i + 1 == list.len() {
                 println!();
             }
         }
-        let mut heard = now;
         print!("a number plays it, enter keeps {heard}, off for silence, q quits");
         loop {
             print!("\n> ");
@@ -129,10 +150,10 @@ pub fn run_sound(args: &[String]) -> std::io::Result<()> {
                 println!();
                 return Ok(());
             };
-            match parse_sound(&line) {
+            match parse_sound(&line, &list) {
                 Sound::Play(name) => {
                     heard = name;
-                    if let Some(play) = qoro_tui::notify::sound(false, true, name, name) {
+                    if let Some(play) = qoro_tui::notify::sound(false, macos, name, name) {
                         qoro_tui::notify::spawn(&play);
                     }
                     print!("{name}, enter keeps it");
@@ -147,7 +168,10 @@ pub fn run_sound(args: &[String]) -> std::io::Result<()> {
                     println!();
                     return Ok(());
                 }
-                Sound::Invalid => print!("1 to 14 or a name plays one, enter keeps {heard}"),
+                Sound::Invalid => print!(
+                    "1 to {} or a name plays one, enter keeps {heard}",
+                    list.len()
+                ),
             }
         }
         config::set(&path, key, heard).map_err(std::io::Error::other)?;
@@ -167,8 +191,8 @@ enum Sound {
     Invalid,
 }
 
-/// A number (1 to 14) or a sound's name in any case plays it, an empty line keeps.
-fn parse_sound(line: &str) -> Sound {
+/// A number in `list` or a sound's name from it in any case plays it, an empty line keeps.
+fn parse_sound(line: &str, list: &[&'static str]) -> Sound {
     let line = line.trim();
     match line.to_lowercase().as_str() {
         "" => Sound::Keep,
@@ -178,8 +202,8 @@ fn parse_sound(line: &str) -> Sound {
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_sub(1))
-            .and_then(|i| config::SOUNDS.get(i))
-            .or_else(|| config::SOUNDS.iter().find(|s| s.eq_ignore_ascii_case(line)))
+            .and_then(|i| list.get(i))
+            .or_else(|| list.iter().find(|s| s.eq_ignore_ascii_case(line)))
             .map_or(Sound::Invalid, |s| Sound::Play(s)),
     }
 }
@@ -190,14 +214,22 @@ mod tests {
 
     #[test]
     fn a_line_plays_keeps_or_stops() {
-        assert_eq!(parse_sound("1"), Sound::Play("Basso"));
-        assert_eq!(parse_sound("14"), Sound::Play("Tink"));
-        assert_eq!(parse_sound(" tink "), Sound::Play("Tink"));
-        assert_eq!(parse_sound(""), Sound::Keep);
-        assert_eq!(parse_sound("OFF"), Sound::Off);
-        assert_eq!(parse_sound("q"), Sound::Quit);
-        for bad in ["0", "15", "-1", "glas"] {
-            assert_eq!(parse_sound(bad), Sound::Invalid, "{bad}");
+        let mac = &config::SOUNDS;
+        assert_eq!(parse_sound("1", mac), Sound::Play("Basso"));
+        assert_eq!(parse_sound("14", mac), Sound::Play("Tink"));
+        assert_eq!(parse_sound(" tink ", mac), Sound::Play("Tink"));
+        assert_eq!(parse_sound("", mac), Sound::Keep);
+        assert_eq!(parse_sound("OFF", mac), Sound::Off);
+        assert_eq!(parse_sound("q", mac), Sound::Quit);
+        for bad in ["0", "15", "-1", "glas", "bell"] {
+            assert_eq!(parse_sound(bad, mac), Sound::Invalid, "{bad}");
         }
+        let linux = &config::FREEDESKTOP_SOUNDS;
+        assert_eq!(parse_sound("3", linux), Sound::Play("bell"));
+        assert_eq!(
+            parse_sound("Window-Question", linux),
+            Sound::Play("window-question")
+        );
+        assert_eq!(parse_sound("glass", linux), Sound::Invalid);
     }
 }

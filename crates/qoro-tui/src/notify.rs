@@ -373,35 +373,48 @@ pub fn call(program: Program, body: &str) -> Call {
     }
 }
 
-/// The sound for a note: `alert` (one of `config::SOUNDS`) for something that is waiting
-/// on a person or failed, `done` otherwise; on Linux the desktop's own two. Off by default,
-/// so this is only reached when `sound = true`. `None` when this machine has no player or
-/// no sound file to give it.
+/// The name a sound plays as on this system: `name` when it is one of the system's own
+/// (`config::SOUNDS` on macOS, `config::FREEDESKTOP_SOUNDS` elsewhere), else the default for
+/// its kind, so a Mac name read on Linux still plays something, and the other way round.
+pub fn playable(name: &str, urgent: bool, macos: bool) -> &str {
+    let (own, calm, alarm): (&[&str], _, _) = if macos {
+        (&crate::config::SOUNDS, "Glass", "Funk")
+    } else {
+        (
+            &crate::config::FREEDESKTOP_SOUNDS,
+            "complete",
+            "dialog-warning",
+        )
+    };
+    match (own.contains(&name), urgent) {
+        (true, _) => name,
+        (false, true) => alarm,
+        (false, false) => calm,
+    }
+}
+
+/// The sound for a note: `alert` for something that is waiting on a person or failed,
+/// `done` otherwise, each through [`playable`]. Off by default, so this is only reached when
+/// `sound = true`. `None` when this machine has no player or no sound file to give it.
 pub fn sound(urgent: bool, macos: bool, done: &str, alert: &str) -> Option<Call> {
     let play = |program: &'static str, file: &str| Call {
         program,
         args: vec![file.to_string()],
         stdin: None,
     };
+    let name = playable(if urgent { alert } else { done }, urgent, macos);
     if macos {
-        let file = format!(
-            "/System/Library/Sounds/{}.aiff",
-            if urgent { alert } else { done }
-        );
+        let file = format!("/System/Library/Sounds/{name}.aiff");
         return on_path("afplay").map(|_| play("afplay", &file));
     }
-    let file = if urgent {
-        "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
-    } else {
-        "/usr/share/sounds/freedesktop/stereo/complete.oga"
-    };
-    if !Path::new(file).is_file() {
+    let file = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
+    if !Path::new(&file).is_file() {
         return None;
     }
     ["paplay", "pw-play"]
         .into_iter()
         .find(|player| on_path(player).is_some())
-        .map(|player| play(player, file))
+        .map(|player| play(player, &file))
 }
 
 /// Start a program by name from `PATH`, with nothing attached to it but what it is given to
@@ -678,5 +691,15 @@ mod tests {
         if let Some(play) = sound(true, true, "Glass", "Hero") {
             assert_eq!(play.args[0], "/System/Library/Sounds/Hero.aiff");
         }
+    }
+
+    #[test]
+    fn a_sound_from_the_other_system_plays_the_default() {
+        assert_eq!(playable("Hero", true, true), "Hero");
+        assert_eq!(playable("bell", false, true), "Glass");
+        assert_eq!(playable("bell", true, true), "Funk");
+        assert_eq!(playable("bell", false, false), "bell");
+        assert_eq!(playable("Glass", false, false), "complete");
+        assert_eq!(playable("Funk", true, false), "dialog-warning");
     }
 }

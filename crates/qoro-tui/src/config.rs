@@ -74,9 +74,9 @@ pub struct Config {
     pub desktop: bool,
     /// And play a sound when it does.
     pub sound: bool,
-    /// The sound for an agent that finished, one of [`SOUNDS`] (macOS).
+    /// The sound for an agent that finished, one of [`sounds_here`].
     pub done_sound: &'static str,
-    /// The sound for one that waits on a person or failed, one of [`SOUNDS`] (macOS).
+    /// The sound for one that waits on a person or failed, one of [`sounds_here`].
     pub alert_sound: &'static str,
     /// Show the agents in the macOS notch. Read by the notch app, through `qoro config`.
     pub notch: bool,
@@ -117,10 +117,52 @@ pub const SOUNDS: [&str; 14] = [
     "Tink",
 ];
 
-/// A sound named as the file is, in any case: `hero` is `Hero`.
+/// The freedesktop sound theme's event sounds, in `/usr/share/sounds/freedesktop/stereo` as
+/// `<name>.oga`: what Linux picks from. The speaker-test channels are left out.
+pub const FREEDESKTOP_SOUNDS: [&str; 26] = [
+    "alarm-clock-elapsed",
+    "audio-volume-change",
+    "bell",
+    "camera-shutter",
+    "complete",
+    "device-added",
+    "device-removed",
+    "dialog-error",
+    "dialog-information",
+    "dialog-warning",
+    "message",
+    "message-new-instant",
+    "network-connectivity-established",
+    "network-connectivity-lost",
+    "phone-incoming-call",
+    "phone-outgoing-busy",
+    "phone-outgoing-calling",
+    "power-plug",
+    "power-unplug",
+    "screen-capture",
+    "service-login",
+    "service-logout",
+    "suspend-error",
+    "trash-empty",
+    "window-attention",
+    "window-question",
+];
+
+/// The sounds this machine picks from: macOS's own, or the freedesktop ones elsewhere.
+pub fn sounds_here() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &SOUNDS
+    } else {
+        &FREEDESKTOP_SOUNDS
+    }
+}
+
+/// A sound named as the file is, in any case: `hero` is `Hero`. Either list is taken, so
+/// one `config.toml` reads on a Mac and on Linux; each plays only its own names.
 fn sound_named(name: &str) -> Option<&'static str> {
     SOUNDS
         .iter()
+        .chain(FREEDESKTOP_SOUNDS.iter())
         .copied()
         .find(|s| s.eq_ignore_ascii_case(name))
 }
@@ -376,7 +418,10 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                             Some(name) => *slot = name,
                             None => refuse(
                                 line,
-                                format!("{key} = {value} is not one of {}", SOUNDS.join(", ")),
+                                format!(
+                                    "{key} = {value} is not one of {}",
+                                    sounds_here().join(", ")
+                                ),
                             ),
                         }
                         continue;
@@ -520,7 +565,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "theme" => return Err("theme is auto, dark or light".to_string()),
         "notify.done_sound" | "notify.alert_sound" => match sound_named(value) {
             Some(name) => toml_edit::value(name),
-            None => return Err(format!("{key} is one of {}", SOUNDS.join(", "))),
+            None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
         },
         "notify.desktop" | "notify.sound" | "notch.enabled" => match value {
             "true" => toml_edit::value(true),
@@ -638,7 +683,7 @@ pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
         row(format!("sound = {}", config.sound), "true | false"),
         row(
             format!("done_sound = \"{}\"", config.done_sound),
-            "a finished agent, macOS",
+            "a finished agent, qoro sound to hear them",
         ),
         row(
             format!("alert_sound = \"{}\"", config.alert_sound),
@@ -852,7 +897,10 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
-        assert_eq!(rows[6], " done_sound = \"Glass\" a finished agent, macOS");
+        assert_eq!(
+            rows[6],
+            " done_sound = \"Glass\" a finished agent, qoro sound to hear them"
+        );
         assert!(rows[7].starts_with(" alert_sound = \"Funk\" "), "{rows:?}");
         assert_eq!(rows[8], " [notch]");
         assert!(rows[9].starts_with(" enabled = true"), "{rows:?}");
@@ -940,10 +988,12 @@ mod tests {
         );
         // A sound is written as its file is named, whatever case it was typed in.
         set(&file, "notify.alert_sound", "hero").unwrap();
+        // A Linux name is taken too, so one file reads on both.
+        set(&file, "notify.done_sound", "Bell").unwrap();
         let written = std::fs::read_to_string(&file).unwrap();
         assert!(written.contains("alert_sound = \"Hero\""), "{written}");
         let (config, problems) = parse(&written);
-        assert_eq!((config.done_sound, config.alert_sound), ("Glass", "Hero"));
+        assert_eq!((config.done_sound, config.alert_sound), ("bell", "Hero"));
         assert!(
             !problems.iter().any(|p| p.what.contains("sound")),
             "{problems:?}"
