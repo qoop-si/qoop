@@ -369,6 +369,7 @@ mod tests {
     fn render(terminals: &[AgentRow], focused: u32, cols: usize) -> Line {
         let [top, _] = rows_of(terminals, focused, cols);
         Line {
+            fill: None,
             text: top,
             colour: None,
             accent: None,

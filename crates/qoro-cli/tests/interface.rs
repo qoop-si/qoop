@@ -202,11 +202,12 @@ impl Drop for Interface {
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// The screen row the column's title is drawn on: under the one next row, which is there
-/// whether or not anybody waits. Taken from the interface rather than written as `2`, so this
-/// test cannot disagree with the layout the next time the layout changes. The tab bar is over
-/// the pane, not over this column, so the column starts at the very top.
-const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + 1;
+/// The screen row the column's title is drawn on: under the inbox's tab row and its list
+/// rows, which are there whether or not anybody waits. Taken from the interface rather than
+/// written as a number, so this test cannot disagree with the layout the next time the layout
+/// changes. The tab bar is over the pane, not over this column, so the column starts at the
+/// very top.
+const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + 1 + qoro_tui::sidebar::INBOX_ROWS;
 
 /// The screen row the tab names are on, one based: the bar's top row. The folders run on
 /// the row under it.

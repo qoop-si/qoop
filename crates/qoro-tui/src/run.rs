@@ -526,6 +526,12 @@ struct State {
     creating: usize,
     /// How the column orders its agents: the tree of spaces, or flat by urgency.
     view: sidebar::View,
+    /// The inbox at the top of the column: its list, its height, folded or not. Client-local
+    /// like `view`.
+    inbox: sidebar::Inbox,
+    /// The title row held by the mouse to drag the inbox's edge: the screen row the press
+    /// landed on and the list rows the inbox had then.
+    inbox_drag: Option<(u16, usize)>,
     /// The spaces folded away under their rule. Client-local like `view`: the daemon
     /// never knows, and a space that goes away leaves this set with the next index.
     shut: sidebar::Shut,
@@ -843,6 +849,7 @@ impl State {
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
                 list_scroll: self.list_scroll(),
+                inbox: self.inbox,
                 keys_query: self.keys_query.as_deref(),
                 closing: self
                     .modes
@@ -1211,6 +1218,8 @@ impl State {
             sidebar::Act::Menu => Some(Clicked::Menu),
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
+            sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
+            sidebar::Act::InboxFold => Some(Clicked::InboxFold),
         }
     }
 
@@ -1296,6 +1305,15 @@ impl State {
             .map(|(_, at)| at)
     }
 
+    /// The most list rows the inbox's edge may be dragged to in this window.
+    fn inbox_room(&self) -> usize {
+        sidebar::inbox_room(
+            &self.column(self.paint_now, 0),
+            screen::column_rows(self.lines as usize),
+            sidebar::current_avatar().as_ref(),
+        )
+    }
+
     /// The pieces the left column is drawn from, at a given clock and animation frame.
     fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
         sidebar::Column {
@@ -1313,6 +1331,7 @@ impl State {
             armed: self.armed,
             usage: Some(&self.usage),
             scroll: self.list_scroll(),
+            inbox: self.inbox,
         }
     }
 
@@ -2630,6 +2649,26 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     }
     let column_rows = screen::column_rows(state.lines as usize);
     let column = state.column(state.paint_now, 0);
+    // Over the inbox the wheel is the inbox's: its list scrolls, its tab row walks the tabs.
+    match state.column_hit(row).map(|(hit, _)| hit) {
+        Some(sidebar::Hit::Next(_)) => {
+            let at = sidebar::inbox_wheeled(
+                &column,
+                column_rows,
+                sidebar::current_avatar().as_ref(),
+                up,
+            );
+            let moved = at != state.inbox.scroll;
+            state.inbox.scroll = at;
+            return moved;
+        }
+        Some(sidebar::Hit::Tabs) if !state.inbox.folded => {
+            state.inbox.tab = state.inbox.tab.step(up);
+            state.inbox.scroll = 0;
+            return true;
+        }
+        _ => {}
+    }
     let at = sidebar::wheeled(
         &column,
         column_rows,
@@ -4039,6 +4078,10 @@ fn copy_cursor(state: &State) -> Option<(usize, usize)> {
 #[derive(Clone, Copy, Debug)]
 enum Clicked {
     Menu,
+    /// A tab of the inbox, or a count on its folded row.
+    InboxTab(sidebar::InboxTab),
+    /// The inbox's caret.
+    InboxFold,
     Fold(i64),
     View,
     Collapse,
@@ -4249,6 +4292,8 @@ where
         done: false,
 
         view: sidebar::View::default(),
+        inbox: sidebar::Inbox::default(),
+        inbox_drag: None,
 
         shut: sidebar::Shut::new(),
 
@@ -5171,6 +5216,7 @@ where
                                 // drag) must not leave the program owed one.
                                 state.forwarded_press = false;
                                 state.row_press = None;
+                                state.inbox_drag = None;
                                 // A click lands on the live pane, never on the
                                 // list: the list closes under it and the press
                                 // itself runs the ordinary path below.
@@ -5416,7 +5462,32 @@ where
                                         }
                                         dirty = true;
                                     }
-                                    None => {}
+                                    Some(Clicked::InboxTab(tab)) => {
+                                        state.inbox.tab = tab;
+                                        state.inbox.scroll = 0;
+                                        state.inbox.folded = false;
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::InboxFold) => {
+                                        state.inbox.folded = !state.inbox.folded;
+                                        dirty = true;
+                                    }
+                                    // The title away from its words is the inbox's edge:
+                                    // held, it drags the inbox taller or shorter.
+                                    None => {
+                                        if in_column
+                                            && !state.collapsed
+                                            && !state.inbox.folded
+                                            && state.inbox_room() > 0
+                                            && matches!(
+                                                state.column_hit(row),
+                                                Some((sidebar::Hit::Title, _))
+                                            )
+                                        {
+                                            let rows = state.inbox.rows.min(state.inbox_room());
+                                            state.inbox_drag = Some((row, rows));
+                                        }
+                                    }
                                 }
                             }
                             Action::Drag { row, col, shift } => {
@@ -5439,6 +5510,17 @@ where
                                             state.message = Some(hint);
                                             dirty = true;
                                         }
+                                    }
+                                    continue;
+                                }
+                                // The held title moves the inbox's edge with the pointer.
+                                if let Some((from, rows)) = state.inbox_drag {
+                                    let want = (rows as i64 + i64::from(row) - i64::from(from))
+                                        .clamp(1, state.inbox_room().max(1) as i64)
+                                        as usize;
+                                    if want != state.inbox.rows {
+                                        state.inbox.rows = want;
+                                        dirty = true;
                                     }
                                     continue;
                                 }
@@ -5486,6 +5568,10 @@ where
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
+                                }
+                                // The inbox's edge is let go where it is.
+                                if state.inbox_drag.take().is_some() {
+                                    continue;
                                 }
                                 // A held agent row comes up: a drop where it went, or the
                                 // click it was. A click on the name of the agent already
@@ -10296,6 +10382,8 @@ mod tests {
             done: false,
 
             view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
 
@@ -11508,6 +11596,8 @@ mod tests {
             creating: 0,
 
             view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
 
@@ -11629,6 +11719,8 @@ mod tests {
             reading: None,
 
             view: sidebar::View::default(),
+            inbox: sidebar::Inbox::default(),
+            inbox_drag: None,
 
             shut: sidebar::Shut::new(),
 
@@ -12324,7 +12416,7 @@ mod tests {
 
     /// Only the `+` corner of the spaces title makes a space: the word
     /// itself is a no-op, so a click aimed at the title never makes a space
-    /// nobody asked for. The title sits under the next row.
+    /// nobody asked for. The title sits under the inbox.
     #[test]
     fn only_the_plus_corner_of_the_spaces_title_makes_a_space() {
         let mut state = bare_state();
@@ -12343,14 +12435,17 @@ mod tests {
         state.space = Some(1);
         assert!(matches!(
             state.clicked(
-                (crate::screen::SIDEBAR_TOP + 1) as u16,
+                (crate::screen::SIDEBAR_TOP + 1 + crate::sidebar::INBOX_ROWS) as u16,
                 crate::sidebar::WIDTH as u16
             ),
             Some(Clicked::NewSpace)
         ));
         assert!(
             state
-                .clicked((crate::screen::SIDEBAR_TOP + 1) as u16, 5)
+                .clicked(
+                    (crate::screen::SIDEBAR_TOP + 1 + crate::sidebar::INBOX_ROWS) as u16,
+                    5
+                )
                 .is_none()
         );
     }

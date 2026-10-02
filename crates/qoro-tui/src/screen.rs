@@ -133,6 +133,8 @@ pub struct Chrome<'a> {
     pub mode: Option<(&'static str, &'static [(&'static str, &'static str)])>,
     /// The first column row the wheel moved the list to, `None` while it follows the keys.
     pub list_scroll: Option<usize>,
+    /// The inbox at the top of the column, as this client left it.
+    pub inbox: sidebar::Inbox,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
@@ -151,6 +153,7 @@ impl Default for Chrome<'_> {
             closing: None,
             mode: None,
             list_scroll: None,
+            inbox: sidebar::Inbox::default(),
         }
     }
 }
@@ -192,6 +195,7 @@ impl Frame<'_> {
             shut: self.chrome.shut,
             usage: Some(self.chrome.usage),
             scroll: self.chrome.list_scroll,
+            inbox: self.chrome.inbox,
         }
     }
 }
@@ -555,6 +559,27 @@ pub(crate) fn avatar_overlay_paint(
     out
 }
 
+/// The pet stamped in an empty inbox: its lit rows from the first list row down, two cells
+/// in from the column's edge, where the inbox's rows left room for it.
+pub(crate) fn inbox_pet_paint(
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+    lit: usize,
+    colour: bool,
+) -> String {
+    let Some(pet) = avatar else {
+        return String::new();
+    };
+    let (_, art) = sidebar::avatar_overlay(pet, colour);
+    let skip = art.len().saturating_sub(lit);
+    let mut out = String::new();
+    for (i, row) in art.iter().skip(skip).enumerate() {
+        // The tab row is the inbox's first; the list starts under it.
+        out.push_str(&at(SIDEBAR_TOP + 1 + i, 3));
+        out.push_str(row);
+    }
+    out
+}
+
 /// Where a real picture's top-left cell goes: the focused pane's first row, one based.
 /// Pictures draw downward, so anchored anywhere lower they cover the status rows.
 pub(crate) fn picture_cell(frame: &Frame) -> Option<(usize, usize)> {
@@ -778,7 +803,12 @@ pub fn paint(frame: &Frame) -> String {
                 Some(sidebar::Hit::Space(space)) => shell_space == Some(*space),
                 // The keyboard's agent is marked by its ember line, not a background.
                 Some(sidebar::Hit::Terminal(_))
-                | Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Next(_))
+                | Some(
+                    sidebar::Hit::Title
+                    | sidebar::Hit::Foot
+                    | sidebar::Hit::Next(_)
+                    | sidebar::Hit::Tabs,
+                )
                 | None => false,
             };
             let marked;
@@ -788,16 +818,11 @@ pub fn paint(frame: &Frame) -> String {
             } else {
                 line
             };
-            // The next row sits on the status bar's band: the one container on the column,
-            // so it reads as the place to look, not as another row of the list.
-            let band = matches!(hit, Some(sidebar::Hit::Next(_)));
-            let base = match (selected, band, line.colour) {
-                (true, _, Some(role)) => theme::selected_in(role),
-                (true, _, None) => theme::selected(),
-                (false, true, Some(role)) => theme::status_in(role),
-                (false, true, None) => theme::status(),
-                (false, false, Some(role)) => theme::fg(role),
-                (false, false, None) => theme::fg(theme::Role::Text),
+            let base = match (selected, line.colour) {
+                (true, Some(role)) => theme::selected_in(role),
+                (true, None) => theme::selected(),
+                (false, Some(role)) => theme::fg(role),
+                (false, None) => theme::fg(theme::Role::Text),
             };
             out.push_str(&base);
             // The coloured runs inside the row: the space's name, the opening sign, and
@@ -813,19 +838,22 @@ pub fn paint(frame: &Frame) -> String {
             if let Some(run) = line.indicator {
                 runs.push(run);
             }
+            if let Some(run) = line.fill {
+                runs.push(run);
+            }
             runs.retain(|(at, len, _)| *len > 0 && at + len <= width::width(&line.text));
             runs.sort_by_key(|(at, _, _)| *at);
             if runs.is_empty() {
                 out.push_str(&line.text);
             } else {
                 let cut = |from: usize, to: usize| cut(&line.text, from, to);
-                let escape = |role: theme::Role| {
-                    if selected {
-                        theme::selected_in(role)
-                    } else if band {
-                        theme::status_in(role)
+                let escape = |run: (usize, usize, theme::Role)| {
+                    if line.fill == Some(run) {
+                        theme::filled(run.2)
+                    } else if selected {
+                        theme::selected_in(run.2)
                     } else {
-                        theme::fg(role)
+                        theme::fg(run.2)
                     }
                 };
                 let mut pos = 0;
@@ -836,7 +864,7 @@ pub fn paint(frame: &Frame) -> String {
                         continue;
                     }
                     out.push_str(&cut(pos, at));
-                    out.push_str(&escape(role));
+                    out.push_str(&escape((at, len, role)));
                     out.push_str(&cut(at, at + len));
                     out.push_str(&base);
                     pos = at + len;
@@ -1033,16 +1061,21 @@ pub fn paint(frame: &Frame) -> String {
     // floating overlays, so an open palette covers it the way it covers
     // terminal text.
     // Only where the column gave the pet its rows: the list comes first.
-    if wide_enough && !frame.collapsed && sidebar::pet_shown(&column, column_rows, avatar.is_some())
-    {
-        out.push_str(&avatar_overlay_paint(
-            column_rows,
-            frame.sidebar_width,
-            frame.collapsed,
-            wide_enough,
-            avatar.as_ref(),
-            crate::colorlevel::level() != crate::colorlevel::Level::Mono && !spotlight,
-        ));
+    // With nothing waiting it stands in the inbox instead, whether or not the foot had room.
+    if wide_enough && !frame.collapsed {
+        let colour = crate::colorlevel::level() != crate::colorlevel::Level::Mono && !spotlight;
+        if let Some((_, lit)) = sidebar::pet_in_inbox(&column, column_rows, avatar.as_ref()) {
+            out.push_str(&inbox_pet_paint(avatar.as_ref(), lit, colour));
+        } else if sidebar::pet_shown(&column, column_rows, avatar.is_some()) {
+            out.push_str(&avatar_overlay_paint(
+                column_rows,
+                frame.sidebar_width,
+                frame.collapsed,
+                wide_enough,
+                avatar.as_ref(),
+                colour,
+            ));
+        }
     }
 
     // The palette floats over the terminal, so it is painted last: every row it takes
@@ -5987,6 +6020,7 @@ mod tests {
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
         let lines = sidebar::render_folded(
             &sidebar::Column {
+                inbox: sidebar::Inbox::default(),
                 armed: None,
                 spaces: &spaces,
                 agents: &rows,

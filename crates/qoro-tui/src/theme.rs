@@ -321,6 +321,24 @@ pub fn status_key_for(level: crate::colorlevel::Level) -> String {
     }
 }
 
+/// A word filled with its role's ink, the dark of the page written on it: the inbox's chosen
+/// tab. In monochrome it is reversed, the one fill there is.
+pub fn filled(role: Role) -> String {
+    filled_for(role, crate::colorlevel::level())
+}
+
+/// A filled word at an explicit colour level. Pure, see [`fg_for`].
+pub fn filled_for(role: Role, level: crate::colorlevel::Level) -> String {
+    match level {
+        crate::colorlevel::Level::Mono => "\x1b[0;7m".to_string(),
+        _ => format!(
+            "\x1b[0;1;48;5;{};38;5;{}m",
+            ink(role),
+            if light() { 231 } else { 16 }
+        ),
+    }
+}
+
 /// Something in the status bar that wants a person, which is the one thing there allowed
 /// to be loud.
 pub fn status_in(role: Role) -> String {
