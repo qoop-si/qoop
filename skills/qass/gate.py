@@ -279,14 +279,23 @@ def cards_state(history):
     """Open cards (asked, not passed on yet) and the ones he answered:
     (number -> card, number -> (terminal, his words, the options he was shown, his pick)).
     By its number he can still answer a card already passed on, to correct himself."""
-    asked, cards, waiting = {}, {}, {}
+    asked, cards, waiting, shown = {}, {}, {}, None
     for r in history:
-        if "escalated" in r:
+        if "shown" in r:
+            shown = r["shown"]
+        elif "escalated" in r:
             asked[int(r["escalated"][1:])] = cards[int(r["escalated"][1:])] = {
                 "terminal": r.get("terminal"), "options": r.get("options") or {},
                 "handle": r.get("handle"), "ts": r.get("ts", 0)}
         elif r.get("owner"):
-            found = answered(r.get("text", ""), asked, r.get("ts", 0))
+            text = r.get("text", "")
+            found = answered(text, asked, r.get("ts", 0))
+            # Right after qass showed him one card, his reply is to it, in his own words,
+            # unless it asks something or names a card itself.
+            if not found and shown in cards and "?" not in text and text.strip():
+                letter = text.strip().rstrip(".!")
+                found = {shown: letter.upper() if re.fullmatch(r"[A-Da-d]", letter) else None}
+            shown = None
             for n, pick in found.items():
                 by_number = any(n in map(int, E_ITEM.findall(c)) for c in clauses(r["text"]))
                 if n in cards or (n in asked and by_number):
@@ -504,8 +513,15 @@ def check_escalate(w):
     """escalate.sh E<n> <terminal|-> now|later <handle> ['A: ...' up to 'D: ...'] for a card,
     escalate.sh P<n> <terminal|-> later <handle> for a proposal. The handle is what the owner
     types instead of the number: unique among open cards, so his answer finds one card."""
-    usage = ("escalate.sh E<n> <terminal|-> now|later <handle> ['A: ...' up to 'D: ...'] "
-             "or escalate.sh P<n> <terminal|-> later <handle>")
+    usage = ("escalate.sh E<n> <terminal|-> now|later <handle> ['A: ...' up to 'D: ...'], "
+             "escalate.sh P<n> <terminal|-> later <handle>, or escalate.sh show E<n>")
+    if w[:1] == ["show"]:
+        if len(w) != 2 or not E_ITEM.fullmatch(w[1]):
+            raise Deny(usage)
+        if int(w[1][1:]) not in cards_state(log_rows())[0]:
+            raise Deny(f"{w[1]} is no open card")
+        append({"shown": int(w[1][1:])})
+        return
     if len(w) < 4 or not re.fullmatch(r"-|[0-9]{1,6}|[A-Za-z0-9_-]+/[0-9]{1,6}", w[1]) \
             or w[2] not in ("now", "later"):
         raise Deny(usage)

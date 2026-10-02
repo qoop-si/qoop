@@ -11,11 +11,16 @@
 #
 #   escalate.sh E<n> <terminal it is about, or -> now|later <handle> ['A: ...' ...]
 #   escalate.sh P<n> <terminal it is about, or -> later <handle>
+#   escalate.sh show E<n>    the card qass is showing him now: his next message answers it
 #
 # The handle is the word of the agent's sidebar name the owner types to answer.
 set -eu
 
 id="${1:?usage: escalate.sh E<n> <terminal or -> now|later <handle> [options]}"
+if [ "$id" = show ]; then
+    echo "showing ${2:-}"
+    exit 0
+fi
 urgency="${3:-now}"
 handle="${4:-$id}"
 dir="@QASS_DATA@"

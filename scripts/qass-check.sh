@@ -491,6 +491,24 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 case_ deny "$(bash_ "$skill_g/spawn.sh $home/coding/app feat/y")" "spawning past the hourly cap"
 
+# A reply right after qass showed one card answers it, in his own words.
+: > "$home/.qass/gate.jsonl"
+case_ allow "$(bash_ "$esc E80 5 later korea 'A: commit and open a PR' 'B: wait'")" "a card to show"
+case_ allow "$(bash_ "$esc E81 7 later cv 'A: send' 'B: hold'")" "a second card"
+case_ deny "$(bash_ "$esc show E99")" "showing a card that is not open"
+case_ allow "$(bash_ "$esc show E80")" "showing one card"
+owner_ "wend a ne demek?"
+case_ deny "$(bash_ "$(relay_ 5 3 80 "wend a ne demek?")")" "a question after the card is no answer"
+case_ allow "$(bash_ "$esc show E80")" "showing it again"
+owner_ "o denemisse ve oksa go for it"
+case_ deny "$(bash_ "$(relay_ 7 1 80 "o denemisse ve oksa go for it")")" "the reply to the shown card, sent elsewhere"
+case_ allow "$(bash_ "$(relay_ 5 3 80 "o denemisse ve oksa go for it")")" "his words, the reply to the shown card"
+owner_ "tamam sagol"
+case_ deny "$(bash_ "$(relay_ 7 1 81 "tamam sagol")")" "with nothing shown, a reply answers no card"
+case_ allow "$(bash_ "$esc show E81")" "showing the other card"
+owner_ "B"
+case_ allow "$(bash_ "$(prompt_ 7 1 "The owner answered E81: \"B\". He chose B: hold. $relay")")" "a lone letter for the shown card, spelled out"
+
 # An ok older than an hour opens nothing.
 HOME="$home" python3 -B -c "
 import sys, time; sys.path.insert(0, '$skill_g'); import gate

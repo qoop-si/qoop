@@ -27,6 +27,12 @@ him T, E, P or g numbers: they are yours, for `goals.md`, the gate and the comma
 card and proposal has a handle, one plain word of that name he can type ("korea"), and you
 tell him how to answer with it ("cevap: `korea A`").
 
+Whenever you bring up a card, show it whole: Asked, Did, Asks, every option with its letter,
+your pick. Never a handle, a number or a letter alone: he cannot answer what he has not
+seen. When you show him one card, or talk about one card only, run
+`<this skill's dir>/escalate.sh show E<n>` in that turn: his next message, unless it is a
+question or names another card, is his answer to it, in his own words.
+
 ## Start
 
 1. `qoro agents --json` and `qoro ls --json` (each space's `sleeping` tabs), then read
@@ -40,7 +46,7 @@ tell him how to answer with it ("cevap: `korea A`").
    (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
    owner, first run `qoro agents --json`, compare it with `goals.md`, and handle every
    agent that stopped since your last look as an event line below.
-3. Tell the owner in two lines: how many workers, what is waiting on him (by name).
+3. Tell the owner how many workers there are, then each card waiting on him, whole.
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
    resume and compaction; under another agent, read that file now.
 
@@ -245,7 +251,9 @@ that is a question answers nothing: reply to him instead.
   too; "ok P3" still works) is a yes; send exactly that proposal, once. Anything else
   ("ok cv but later") is not a yes: ask him again.
 - A card: a clause that starts with its handle ("korea B", "korea önce testleri koştur"),
-  names its `E<n>`, or is a lone letter while exactly one card from the last day is open.
+  names its `E<n>`, or is a lone letter while exactly one card from the last day is open;
+  or his whole next message after you showed that one card (`escalate.sh show`), when it is
+  no question and names no other card ("denemişse go for it").
   Pass it on to the terminal that card was about, once, in exactly this form (his whole
   message on one line, ’ for any `'`); add the "He chose" sentence only when his clause for
   that card is exactly `<handle> B`, `E7 B` or the lone `B`, with that option word for word
