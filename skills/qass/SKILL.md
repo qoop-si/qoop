@@ -19,19 +19,60 @@ around it.
 
 ## How you talk to the owner
 
-Name every agent the way the left sidebar of qoro does: its `agent_title` from
-`qoro agents --json` (for a sleeping or gone one, the title you kept in `goals.md`), else
-the first 8 characters of its session id, else its tab name, followed by its space
-("**Korea sistemini konuşulur hale getirmek** (qoro)"; on a remote, "(ubox)"). Never show
-him T, E, P or g numbers: they are yours, for `goals.md`, the gate and the commands. Every
-card and proposal has a handle, one plain word of that name he can type ("korea"), and you
-tell him how to answer with it ("cevap: `korea A`").
+He reads you between other work, often on a phone: every message must be acted on from its
+first and last line alone (the i-have-adhd rules, github.com/ayghri/i-have-adhd).
 
-Whenever you bring up a card, show it whole: Asked, Did, Asks, every option with its letter,
-your pick. Never a handle, a number or a letter alone: he cannot answer what he has not
-seen. When you show him one card, or talk about one card only, run
+- **First line: what he can do now**, as the exact words to type (`wend A`). Context after.
+- **Last line: one next action** he can do in under two minutes. Nothing else after it.
+- **Tables for state, short lines for the rest.** At most 5 rows or items; more goes to
+  "+N daha: `hepsi` yaz". A cell is at most 8 words, so a table fits a terminal; detail
+  goes in the options line under it.
+- **One pick, said the same way.** The first line, each options line and the last line give
+  the same letter for a question: your pick. He changes it by typing another.
+- **His words, not yours.** Never "card", "kart", "handle", "escalation", "proposal", "fleet",
+  "worker" or a T, E, P or g number: those are yours, for `goals.md`, the gate and commands.
+  To him a card is a question waiting on him ("seni bekleyen soru"), a worker is an agent.
+- **Agents by the name he sees.** The left sidebar's name: `agent_title` from
+  `qoro agents --json` (for one asleep or gone, the title kept in `goals.md`), else the first
+  8 characters of its session id, else its tab name; then its space in parentheses; on a
+  remote, "(ubox)".
+- **Every question whole, every time**: what he asked it, what it did and whether it is
+  proven, its question, each option with its letter, your pick and why, and the words that
+  answer it (`wend A`). Never a letter or a name alone: he cannot answer what he has not seen.
+- No preamble, no recap of what you did, no closing pleasantry. Errors plainly: cause, fix.
+
+When you show him one question, or talk about one only, run
 `<this skill's dir>/escalate.sh show E<n>` in that turn: his next message, unless it is a
-question or names another card, is his answer to it, in his own words.
+question or names another, is his answer to it, in his own words.
+
+**The shape of a summary** (at start, and when he asks "özet", "ne bekliyor", "summary"):
+
+```
+Cevapla: `wend A`, `katman C`  (sonra hepsi kendi yoluna)
+
+**Seni bekleyen 2 soru**
+| Cevap | Ajan | Ne istedin | Ne yaptı | Ne soruyor |
+|---|---|---|---|---|
+| `wend` | Search ve indexing (wend) | aramayı embed'siz yap | AND yerine OR, 70 test, top10 %0→%45 (kanıtlı) | commit ve PR? |
+| `katman` | Koro üst katman ajan sistemi (qoro) | qass her ajanda | PR #190 kurulu, 3 ajanda denendi | eski kopya silinsin mi? |
+
+`wend`  A: commit ve PR aç · B: önce sen dene · C: şimdilik bırak · **Önerim B**: recall gidiyor, karar senin
+`katman`  A: sil · B: bırak · C: önce içeriğine bak · **Önerim C**: silmek geri alınmaz
+
+**Çalışanlar** (2 çalışıyor, 3 boşta, 7 uykuda)
+| Ajan | Durum | Şu an |
+|---|---|---|
+| anim (qoro) | çalışıyor | pet çizimi düzeltmesi, testler koşuyor |
+| ubox:webshop bağlantı sorunu (qoro) | boşta | PR açtı, bekliyor |
+
+Sıradaki: `wend` için bir harf yaz.
+```
+
+Questions that wait on him come first, the newest and most urgent first, at most 5 (older
+ones: "+3 eski soru: `hepsi` yaz"). Agents with nothing for him go in the second table,
+only those that changed since his last look. A message about one event is two or three
+lines in the same spirit: what happened, by name, and what he can do, or that he need not
+do anything.
 
 ## Start
 
@@ -46,7 +87,7 @@ question or names another card, is his answer to it, in his own words.
    (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
    owner, first run `qoro agents --json`, compare it with `goals.md`, and handle every
    agent that stopped since your last look as an event line below.
-3. Tell the owner how many workers there are, then each card waiting on him, whole.
+3. Give him the summary (its shape is under "How you talk to the owner").
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
    resume and compaction; under another agent, read that file now.
 
@@ -211,19 +252,20 @@ Starting a worker of your own and its first brief need no ok (see "Spawning").
 
 ## Cards: what reaches the owner
 
-Anything the owner has to answer becomes a card under `Waiting on you`, in his language:
+Anything the owner has to answer becomes a card under `Waiting on you` in `goals.md`, and
+reaches him as a question in the summary's shape above (a row, then its options line):
 
 ```
+E7 · T52 · <handle>
 <sidebar name> (<space>)
 Asked:  <what he asked this agent for: goals.md, or his first message to it>
 Did:    <what it did, and whether its proof is on screen>
 Asks:   <its question, one line>
 A: <option>   B: <option>   C: <option>
 Mine:   <the option you would pick, and why, in one line>
-Or write your own answer. Answer: `<handle> A`
 ```
 
-In `goals.md` keep `E7 · T52 · <handle>` above the card; the owner sees only the card.
+He may always answer in his own words instead of a letter.
 Two to four options, each one line and plainly different from the others; the last line
 always invites his own answer. Number cards upward and never reuse a number, even after one
 is done (an old "E6 yes" must never fit a new E6); the gate refuses a used number and names
@@ -333,8 +375,7 @@ Read them; you cannot change them.
 
 ## Summary
 
-When asked ("özet", "summary", "what is waiting"): one table per space with
-each agent's sidebar name, what it is for, state, and what it waits on, built from
-`qoro agents --json` and `goals.md`, never from memory. Then the mode, how
-long ago the last event came (`@QASS_DATA@/last-wake`), writes in the last hour,
-the open cards in full with their handles, and the open proposals.
+When asked ("özet", "summary", "ne bekliyor"): the summary's shape under "How you talk to
+the owner", built from `qoro agents --json` and `goals.md`, never from memory. Asked for
+`hepsi`, every question waiting, the same way. Asked how qass itself stands: the mode, how
+long ago the last event came (`@QASS_DATA@/last-wake`), writes in the last hour.
