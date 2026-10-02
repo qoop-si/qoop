@@ -1127,11 +1127,11 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
     } else {
         block(c, space)
     };
-    // One slot after the name, and only one: the count while awake, the word while asleep,
-    // because they are the same fact and never both true. The slot carries its own leading
-    // space, so the name and the slot never touch. Each holds only while the name keeps
-    // its columns, longest first: the word, then the count with the sleeping part, then the
-    // bare count, then nothing.
+    // One slot after the name, and only one: the count. A sleeping space says it sleeps
+    // through its `wake` control and its colour, so the slot carries no word for it. The
+    // slot carries its own leading space, so the name and the slot never touch. Each holds
+    // only while the name keeps its columns, longest first: the count with the sleeping
+    // part, then the bare count, then nothing.
     let slots: Vec<String> = if armed {
         // The question, in the slot the count and the word would have used, and never
         // dropped: the name is what gives way to it, because a rule that is asking is the
@@ -1139,9 +1139,6 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
         vec![QUESTION.to_string()]
     } else {
         let mut slots = Vec::new();
-        if space.asleep {
-            slots.push(SLEEPING.to_string());
-        }
         if held > 0 {
             if !space.asleep && dozing > 0 {
                 slots.push(format!(" ({held}, {dozing} asleep)"));
@@ -1266,9 +1263,6 @@ fn busy(c: &Column, space: &WorkspaceRow) -> bool {
             .iter()
             .any(|a| a.workspace == space.id && a.state != "sleeping")
 }
-
-/// The word a sleeping space wears beside its name, when the column has room for it.
-const SLEEPING: &str = " sleeping";
 
 /// What an armed rule says instead of its name's count: the question, and nothing else.
 /// The space it is about is on the row, and the notice row carries the count and the
@@ -6808,12 +6802,9 @@ mod tests {
         let agents = vec![agent(1, 1, "claude", "idle")];
         let folded = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::from([2]));
         let head = rule_row(&folded, 2);
-        // Folded, asleep, and saying so in the slot rather than in a mark after the name.
-        assert!(
-            head.text.starts_with("\u{25b8}api sleeping"),
-            "{:?}",
-            head.text
-        );
+        // Folded and asleep: no word for it, the wake control and the colour say so.
+        assert!(head.text.starts_with("\u{25b8}api"), "{:?}", head.text);
+        assert!(!head.text.contains("sleeping"), "{:?}", head.text);
         assert!(!head.text.contains("api z"), "{:?}", head.text);
 
         assert_eq!(crate::width::width(&head.text), WIDTH);
@@ -7083,17 +7074,16 @@ mod tests {
         }
     }
 
-    /// The count sits beside the name it counts, and a sleeping space says so in words
-    /// rather than in a mark after the name.
+    /// The count sits beside the name it counts, asleep or awake; a sleeping space wears
+    /// no word for it, since its wake control already says so.
     #[test]
     fn a_rule_says_what_it_holds_beside_its_name() {
         let row = rule_at(WIDTH, "qoro", 4, false, true);
         assert!(row.contains("qoro (4)"), "{row:?}");
-        // Asleep, the word replaces the count: they are the same fact, and the count of a
-        // sleeping space is in the notice row anyway.
+        // Asleep, the same count and no word.
         let row = rule_at(WIDTH, "qoro", 3, true, true);
-        assert!(row.contains("qoro sleeping"), "{row:?}");
-        assert!(!row.contains("(3)"), "{row:?}");
+        assert!(row.contains("qoro (3)"), "{row:?}");
+        assert!(!row.contains("sleeping"), "{row:?}");
         // Narrower, where the word no longer fits, the count stays, so the name never
         // starves for a state; narrower still, the name keeps its columns alone.
         let row = rule_at(30, "qoro", 3, true, true);
