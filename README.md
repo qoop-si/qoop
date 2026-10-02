@@ -40,14 +40,13 @@ the q's tail and the r's first dot in ember, and your picked pet standing beside
 menu row, the last row of the column. A column too narrow for both falls back to the word in
 braille.
 
-A space's own line ends in four chips, in the same columns on every line whatever the name
+A space's own line ends in four controls, plain words in the same columns on every line whatever the name
 is: `+` starts a terminal or an agent in the space (an agent asks for its name first),
 `sleep` puts every tab of the space to sleep and `wake` brings every sleeping tab of it back, `⋯` opens
 the space's settings, its name and its colour, and `x` asks whether to close it. The
-question is drawn on the line itself, with `y` in the chip `x` was in and `no` beside it,
+question is drawn on the line itself, with `y` in the place `x` was in and `no` beside it,
 so a second click in the same place answers yes, and a `y` closes the space's tabs and then
-the space. The chips have round caps in Ghostty and kitty and are plain squares
-elsewhere; `QORO_CHIPS=round` or `QORO_CHIPS=flat` forces one. `ctrl-a R`
+the space. `ctrl-a R`
 opens the settings too, `ctrl-a Z` sleeps the tab you are in and `ctrl-a x` closes the tab
 you are on.
 

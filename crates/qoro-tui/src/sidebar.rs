@@ -14,7 +14,6 @@
 //! marks selection. At frame zero, which is what a test, a pipe and `QORO_MOTION=0` get,
 //! the rows are the same static text every time.
 
-use crate::colorlevel::Chips;
 use qoro_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
 
 /// One painted row of the chrome: its text, and the colour its state gives it.
@@ -41,11 +40,6 @@ pub struct Line {
     /// five colours is a row a person parses rather than reads, so every run here is
     /// quieter than the row's own text or the same state colour the dot already wears.
     pub runs: Vec<(usize, usize, crate::theme::Role)>,
-    /// The runs drawn as chips: the column each starts at and how many columns it covers,
-    /// its two ends included. Each is also a run, which gives what it says its colour; the
-    /// painter puts the cells between the ends on the chip's background and draws the ends
-    /// in that background, so they round or square the chip off.
-    pub chips: Vec<(usize, usize)>,
 }
 
 /// The colour a state earns.
@@ -1095,11 +1089,6 @@ fn content(c: &Column) -> Vec<Row> {
 /// the controls wear the space's colour: the agents are right there, wearing their own
 /// marks. Only agents colour them: a shell never wants a person.
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
-    rule_in(c, space, kids, open, crate::colorlevel::chips())
-}
-
-/// [`rule`] with its chip ends given, so every style is tested without the global.
-fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, style: Chips) -> Line {
     use crate::theme::Role;
     let width = c.width;
     let ink = if space.asleep {
@@ -1163,7 +1152,6 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
         " "
     };
     let mut runs = Vec::new();
-    let mut chips = Vec::new();
     if fold != " " {
         runs.push((0, 1, Role::Faint));
     }
@@ -1182,7 +1170,6 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
     };
     runs = runs.into_iter().filter_map(clip).collect();
     let accent = clip((NAME_AT, name_w, ink));
-    chips.retain(|&(at, w)| at + w <= left_w);
     let left = fit(&format!("{fold}{name}{slot}"), left_w);
     // The cells of the block, coloured by what they say rather than by which field holds
     // them. The sleeping ink means a space is asleep, so it cannot also be the affirmative
@@ -1204,33 +1191,26 @@ fn rule_in(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool, sty
             None => role,
         };
         runs.push((cell.0, cell.1, role));
-        chips.push(cell);
     }
-    // Without colour a chip is its padding and nothing else: there is no background to
-    // draw it on, so there is no chip to paint.
-    if style == Chips::Plain {
-        chips.clear();
-    }
-    let text = format!("{left}{} ", block.text(style));
+    let text = format!("{left}{} ", block.text());
     Line {
         text: fit(&text, width),
         colour: None,
         accent,
         indicator: None,
         runs,
-        chips,
     }
 }
 
-/// A chip around `word`, `inner` columns inside its ends: the word centred, the extra
-/// column after it.
-fn chip(style: Chips, word: &str, inner: usize) -> String {
+/// A control's cell around `word`, `inner` columns inside its blank ends: the word centred,
+/// the extra column after it. Text only, nothing drawn round it.
+fn chip(word: &str, inner: usize) -> String {
     let pad = inner.saturating_sub(crate::width::width(word));
-    let body = format!("{}{word}{}", " ".repeat(pad / 2), " ".repeat(pad - pad / 2));
-    match style {
-        Chips::Round => format!("\u{e0b6}{body}\u{e0b4}"),
-        Chips::Flat | Chips::Plain => format!(" {body} "),
-    }
+    format!(
+        " {}{word}{} ",
+        " ".repeat(pad / 2),
+        " ".repeat(pad - pad / 2)
+    )
 }
 
 /// The machine a remote space's name says, and the name without it.
@@ -1339,7 +1319,7 @@ struct Block {
 impl Block {
     /// The nineteen columns, in the order they are drawn. A control that is not drawn is a
     /// blank, so the block keeps its shape and the other controls keep their columns.
-    fn text(&self, style: Chips) -> String {
+    fn text(&self) -> String {
         let armed = self.answer.is_some();
         let word = if armed {
             "no"
@@ -1359,7 +1339,7 @@ impl Block {
             .iter()
             .zip(CHIP_WIDTHS)
             .map(|(&(cell, word), w)| match cell {
-                Some(_) => chip(style, word, w - 2),
+                Some(_) => chip(word, w - 2),
                 None => " ".repeat(w),
             })
             .collect::<Vec<_>>()
@@ -1426,11 +1406,6 @@ fn boxed(line: Line, width: usize) -> Line {
         accent: line.accent.map(shift),
         indicator: line.indicator.map(shift),
         runs,
-        chips: line
-            .chips
-            .iter()
-            .map(|(at, w)| (at + BOX_LEAD, *w))
-            .collect(),
     }
 }
 
@@ -1793,7 +1768,6 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         accent: None,
         indicator: Some((0, 2, role)),
         runs,
-        chips: Vec::new(),
     }
 }
 
@@ -1853,7 +1827,6 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
         accent,
         indicator: Some((DOT_AT, 2, role)),
         runs: Vec::new(),
-        chips: Vec::new(),
     }
 }
 
@@ -2439,7 +2412,6 @@ fn blank(width: usize) -> (Line, Option<Hit>) {
             accent: None,
             indicator: None,
             runs: Vec::new(),
-            chips: Vec::new(),
         },
         None,
     )
@@ -3239,7 +3211,6 @@ mod tests {
                 .chain(chips.map(|(at, w)| (at, w, ink)))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(app.chips, chips);
         // An empty space has nothing to fold, nothing to count and nothing running, so it
         // draws no fold mark, no slot and no sleep chip.
         let dub = rule_row(&rows, 3);
@@ -6956,25 +6927,20 @@ mod tests {
         first_rule(&clicks(&spaces, &agents, View::Tree, width, &none)).text
     }
 
-    /// A rule of `c` drawn with the chip ends given, the way the painter gets it.
-    fn rule_styled(c: &Column, id: i64, style: Chips) -> Line {
+    /// A rule of `c`, the way the painter gets it.
+    fn rule_styled(c: &Column, id: i64) -> Line {
         let space = c.spaces.iter().find(|s| s.id == id).expect("the space");
         let kids: Vec<&AgentRow> = c
             .agents
             .iter()
             .filter(|a| a.workspace == id && a.agent)
             .collect();
-        rule_in(c, space, &kids, !c.shut.contains(&id), style)
+        rule(c, space, &kids, !c.shut.contains(&id))
     }
 
-    /// A chip as the tests' column draws it: flat, the ends a terminal gets before anything
-    /// is detected, around one glyph or in the sleep chip's width.
+    /// A control as the column draws it: around one glyph or in the sleep control's width.
     fn flat(word: &str) -> String {
-        chip(
-            Chips::Flat,
-            word,
-            if word.chars().count() > 1 { WORD_W } else { 1 },
-        )
+        chip(word, if word.chars().count() > 1 { WORD_W } else { 1 })
     }
 
     /// What a rule draws in each of its four chips' places, left to right: new, sleep,
@@ -7284,7 +7250,7 @@ mod tests {
             let none = (Seen::new(), Unseen::new(), shut);
             let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
             [1, 2, 3, 4].map(|id| {
-                let rule = rule_styled(&c, id, Chips::Flat);
+                let rule = rule_styled(&c, id);
                 let first = rule.text.chars().next().unwrap_or_default();
                 let faint = rule.runs.first() == Some(&(0, 1, Role::Faint));
                 assert_eq!(faint, first != ' ', "{rule:?}");
@@ -7309,56 +7275,19 @@ mod tests {
             let spaces = vec![row];
             let none = (Seen::new(), Unseen::new(), Shut::new());
             let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
-            let rule = rule_styled(&c, 1, Chips::Flat);
+            let rule = rule_styled(&c, 1);
             assert!(rule.text.starts_with(&format!(" {name}")), "{rule:?}");
-            assert!(
-                rule.chips.iter().all(|&(at, _)| at > name.len()),
-                "{rule:?}"
-            );
         }
     }
 
-    /// Round, flat and plain draw a rule the same width with every control in the same
-    /// columns: the ends are drawn differently, never sized differently.
+    /// A control is its word and the blanks around it, in every terminal: no cap glyph a
+    /// terminal might not draw, and nothing drawn round it.
     #[test]
-    fn every_chip_style_draws_the_same_columns() {
-        let (mut spaces, agents) = sample();
-        spaces[1].link = Some(LinkState::Up);
-        spaces[1].name = "ubox:personal".into();
-        let none = (Seen::new(), Unseen::new(), Shut::new());
-        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            let c = clicks(&spaces, &agents, View::Tree, width, &none);
-            for id in [1, 2, 3] {
-                let lines = [Chips::Round, Chips::Flat, Chips::Plain].map(|style| {
-                    let line = rule_styled(&c, id, style);
-                    assert_eq!(crate::width::width(&line.text), width, "{line:?}");
-                    line
-                });
-                let [round, flat, plain] = &lines;
-                assert_eq!(round.runs, flat.runs);
-                assert_eq!(round.runs, plain.runs);
-                assert_eq!(round.chips, flat.chips);
-                for (at, w) in &flat.chips {
-                    let ends = |line: &Line| {
-                        let chip = columns_from(&line.text, *at, *w);
-                        (chip.chars().next(), chip.chars().last())
-                    };
-                    assert_eq!(ends(round), (Some('\u{e0b6}'), Some('\u{e0b4}')));
-                    assert_eq!(ends(flat), (Some(' '), Some(' ')));
-                }
-            }
-        }
-    }
-
-    /// Without colour a chip is its word and the blanks around it: no cap glyph a terminal
-    /// might not draw, and nothing for the painter to put a background behind.
-    #[test]
-    fn a_plain_rule_paints_no_caps_and_no_background() {
+    fn a_rule_paints_its_controls_as_bare_words() {
         let (spaces, agents) = sample();
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
-        let line = rule_styled(&c, 1, Chips::Plain);
-        assert!(line.chips.is_empty(), "{line:?}");
+        let line = rule_styled(&c, 1);
         assert!(
             !line
                 .text

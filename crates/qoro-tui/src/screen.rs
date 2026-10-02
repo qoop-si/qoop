@@ -630,28 +630,6 @@ fn cut(text: &str, from: usize, to: usize) -> String {
         .collect()
 }
 
-/// A chip of a row, `len` columns from `at`, on the chip's background in `role`. A round
-/// end is a glyph drawn in that background, which rounds the chip off; a blank end is
-/// simply more of the background, which squares it. The caller puts the row's own escape
-/// back after it.
-fn chip(text: &str, (at, len): (usize, usize), role: theme::Role, selected: bool) -> String {
-    let end = at + len.max(2) - 1;
-    let cap = |from: usize| {
-        let cell = cut(text, from, from + 1);
-        let ink = if cell == " " {
-            theme::chip_in(role)
-        } else {
-            theme::chip_cap(selected)
-        };
-        format!("{ink}{cell}")
-    };
-    let mut out = cap(at);
-    out.push_str(&theme::chip_in(role));
-    out.push_str(&cut(text, at + 1, end));
-    out.push_str(&cap(end));
-    out
-}
-
 /// A row of the keyboard's agent with its tree connector (`└`) in ember: the one mark the
 /// selection needs, made of a cell the row already draws, so nothing new sits beside the
 /// state mark that animates or against the column's rule. The connector's own one-cell run
@@ -809,19 +787,8 @@ pub fn paint(frame: &Frame) -> String {
         // box, so raising the rule too paints one selection straddling the box
         // edge.
         if let Some((line, _)) = panel.get(row).filter(|_| spotlight) {
-            // Faded like the rest, but a chip keeps its shape: the box is what is read,
-            // and a rule whose controls turned to bare brackets would read as another row.
             out.push_str(&faded);
-            let mut pos = 0;
-            for &(at, len) in &line.chips {
-                out.push_str(&cut(&line.text, pos, at));
-                // Faint, not Unobserved: Unobserved is the chip's own ground, which would
-                // leave four empty pills.
-                out.push_str(&chip(&line.text, (at, len), theme::Role::Faint, false));
-                out.push_str(&faded);
-                pos = at + len;
-            }
-            out.push_str(&cut(&line.text, pos, width::width(&line.text)));
+            out.push_str(&line.text);
             out.push_str(theme::RESET);
         } else if let Some((line, hit)) = panel.get(row) {
             let selected = match hit {
@@ -888,12 +855,8 @@ pub fn paint(frame: &Frame) -> String {
                         continue;
                     }
                     out.push_str(&cut(pos, at));
-                    if line.chips.contains(&(at, len)) {
-                        out.push_str(&chip(&line.text, (at, len), role, selected));
-                    } else {
-                        out.push_str(&escape(role));
-                        out.push_str(&cut(at, at + len));
-                    }
+                    out.push_str(&escape(role));
+                    out.push_str(&cut(at, at + len));
                     out.push_str(&base);
                     pos = at + len;
                 }
@@ -5159,56 +5122,6 @@ mod tests {
                 || painted.contains(&theme::selected_in(theme::Role::Working)),
             "the state lost its colour to the space: {painted:?}"
         );
-    }
-
-    /// The keyboard on a shell tab raises its space's rule, and the rule's chips keep their
-    /// own background there: a chip drawn in the raised colour would vanish into the row.
-    #[test]
-    fn a_selected_rule_keeps_its_chips_apart_from_its_background() {
-        let mut shell = row(1, "sh", "idle");
-        shell.agent = false;
-        let rows = [shell];
-        let painted = paint(&Frame {
-            armed: None,
-            rows: &rows,
-            spaces: &spaces(),
-            panes: std::collections::BTreeMap::new(),
-            space: Some(1),
-            focused: 1,
-            snapshot: None,
-            cols: 80,
-            lines: 24,
-            message: None,
-            hint: None,
-            palette: None,
-            prompt: None,
-            menu: None,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            tick: 0,
-            now_unix: TEST_NOW,
-            sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Tree,
-            seen: &sidebar::Seen::new(),
-            unseen: &sidebar::Unseen::new(),
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            behind: &crate::run::Behind {
-                terminal: 0,
-                from: 0,
-                lines: Vec::new(),
-                total: 0,
-            },
-            image_notice: None,
-            chrome: Default::default(),
-        });
-        let ink = theme::space_of(1);
-        assert!(painted.contains(&theme::selected()), "{painted:?}");
-        assert!(painted.contains(&theme::chip_in(ink)), "{painted:?}");
-        assert_ne!(theme::chip_in(ink), theme::selected_in(ink));
     }
 
     /// Frame zero is still; past it the working row turns the spinner, and only that
