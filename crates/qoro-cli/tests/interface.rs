@@ -757,17 +757,23 @@ impl Interface {
 
     /// Whether one index row carries the keyboard, read out of the raw bytes.
     ///
-    /// The keyboard's agent opens its first row with an ember corner (`38;5;202`); a space
-    /// rule that holds the keyboard for a tab with no agent carries the selected
-    /// background (`48;5;236`). Either is the row's first cell, so the first cell decides.
-    /// The stripped text cannot answer this: stripping takes the colour out.
+    /// The keyboard's agent opens its first row with an ember bracket at the column's right
+    /// edge (`38;5;202`, `╮`, or `│` for an agent of one row); a space rule that holds the
+    /// keyboard for a tab with no agent carries the selected background (`48;5;236`) from
+    /// its first cell. The stripped text cannot answer this: stripping takes the colour out.
     fn panel_selected(&self, row: usize) -> bool {
-        self.screen
-            .cells(row)
-            .and_then(|cells| cells.first())
+        let Some(cells) = self.screen.cells(row) else {
+            return false;
+        };
+        let raised = cells
+            .first()
+            .is_some_and(|(_, style)| style.contains("48;5;236"));
+        let bracket = cells
+            .get(qoro_tui::sidebar::WIDTH - 1)
             .is_some_and(|(c, style)| {
-                style.contains("48;5;236") || (style.contains("38;5;202") && *c == '\u{256d}')
-            })
+                style.contains("38;5;202") && "\u{256e}\u{2502}".contains(*c)
+            });
+        raised || bracket
     }
 
     /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
