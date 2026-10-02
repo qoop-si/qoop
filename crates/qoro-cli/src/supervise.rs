@@ -1027,6 +1027,9 @@ pub(crate) struct NewOpts {
     /// A space id, or a name, which is made when nobody has used it yet.
     pub(crate) space: Option<String>,
     pub(crate) command: Vec<String>,
+    /// A command line typed as written, ahead of `command`'s quoted words: a person's own
+    /// launcher line from `[agents]`, which may hold quotes or an assignment.
+    pub(crate) typed: Option<String>,
 }
 
 const NEW_USAGE: &str =
@@ -1476,7 +1479,7 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
             _ => return Err(std::io::Error::other("unexpected answer to a create")),
         };
         announce(terminal);
-        if opts.command.is_empty() {
+        if opts.command.is_empty() && opts.typed.is_none() {
             return Ok(());
         }
         // Typed once the shell has drawn something and gone quiet: a process
@@ -1496,7 +1499,12 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
                 )));
             }
         }
-        let line: Vec<String> = opts.command.iter().map(|w| shell_quote(w)).collect();
+        let line: Vec<String> = opts
+            .typed
+            .iter()
+            .cloned()
+            .chain(opts.command.iter().map(|w| shell_quote(w)))
+            .collect();
         link.input(terminal, format!("{}\r", line.join(" ")).into_bytes())
             .await
     })

@@ -65,7 +65,7 @@ const STEPS: [Step; 7] = [
     Step {
         name: "qass",
         title: "qass",
-        what: "the assistant over your agents: `qoro qass` opens it on this model",
+        what: "the assistant over your agents: the agent `qoro qass` opens it in",
         groups: &["qass"],
     },
 ];

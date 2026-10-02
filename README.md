@@ -130,7 +130,7 @@ How a screen is read, and how to override a misreading, is in
 [docs/manifests.md](docs/manifests.md); what each hook installs is in
 [docs/hooks.md](docs/hooks.md).
 
-For Claude Code the skill install also brings qass, an assistant that sits above every
+The skill install also brings qass, for every agent above, an assistant that sits above every
 other agent: it is told when one stops, reads where that work stands (its task, its plan
 file, the repo's rules), answers what it can the way you would, and sends you only what
 needs your word. You answer it in its own tab, and it passes your answer on. Start it in
@@ -140,11 +140,14 @@ its own space:
 qoro qass
 ```
 
-It opens qass in its own space on the model `qoro settings` names (sonnet by default),
-already running, or shows or wakes the one you have. Close it with the `x` on its row.
-A hook on every tool call bounds what it may do, whatever it decides; it lives in
+It opens qass in its own space on the agent `qoro settings` names (`qass runs on`: claude by
+default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
+`claudes = "claude --model sonnet"`), or shows or wakes the one you have. Close it with the
+`x` on its row.
+Under Claude Code a hook on every tool call bounds what it may do, whatever it decides; it lives in
 `$(qoro paths qass-data)/.claude/settings.json`, so qass is bound the same way when a
-restore or a wake brings it back with nothing but `claude --resume`. Your file
+restore or a wake brings it back with nothing but `claude --resume`. Under Codex, Gemini
+or opencode that hook does not bind it: qass runs with that agent's own permissions. Your file
 `$(qoro paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
 your "ok <name>") or `mode auto`, and per repository grants such as
 `grant /path/to/repo commit`. When you correct it, it keeps the rule in

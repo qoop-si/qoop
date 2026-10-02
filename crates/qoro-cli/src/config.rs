@@ -57,7 +57,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notch.enabled": c.notch,
                 "sleep.idle_minutes": c.lifecycle.idle_minutes,
                 "daemon.exit_when_asleep": c.lifecycle.exit_when_asleep,
-                "qass.model": c.qass_model,
+                "qass.agent": read.qass_agent,
             },
             "agents": read.agents.iter().map(|a| serde_json::json!({ "name": a.name, "command": a.command })).collect::<Vec<_>>(),
             "choices": {
@@ -66,7 +66,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "icons": ["auto", "on", "off"],
                 "notify.done_sound": config::sounds_here(),
                 "notify.alert_sound": config::sounds_here(),
-                "qass.model": config::QASS_MODELS,
+                "qass.agent": crate::settings::qass_agents(&read),
             },
             "problems": read.problems.iter().map(|p| p.short()).collect::<Vec<_>>(),
         });
@@ -91,7 +91,7 @@ fn show(json: bool) -> std::io::Result<()> {
     println!("notch.enabled = {}", c.notch);
     println!("sleep.idle_minutes = {}", c.lifecycle.idle_minutes);
     println!("daemon.exit_when_asleep = {}", c.lifecycle.exit_when_asleep);
-    println!("qass.model = \"{}\"", c.qass_model);
+    println!("qass.agent = \"{}\"", read.qass_agent);
     for a in &read.agents {
         println!("agents.{} = {:?}", a.name, a.command);
     }

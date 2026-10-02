@@ -151,10 +151,10 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
     ));
     out.push(row(
         "qass",
-        "qass model",
-        c.qass_model.to_string(),
-        "what `qoro qass` starts qass with",
-        Kind::Choice("qass.model", config::QASS_MODELS.map(String::from).to_vec()),
+        "qass runs on",
+        read.qass_agent.clone(),
+        "the agent `qoro qass` opens: yours from [agents] too",
+        Kind::Choice("qass.agent", qass_agents(&read)),
     ));
     for agent in &read.agents {
         out.push(row(
@@ -166,6 +166,21 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         ));
     }
     out.extend(lists.iter().cloned());
+    out
+}
+
+/// What qass may run on here: the agents its skill installs beside that are on `PATH`, the
+/// `[agents]` names, and whatever the file names now.
+pub(crate) fn qass_agents(read: &config::Read) -> Vec<String> {
+    let mut out: Vec<String> = config::QASS_AGENTS
+        .iter()
+        .filter(|a| crate::hooks::on_path(a))
+        .map(|a| a.to_string())
+        .chain(read.agents.iter().map(|a| a.name.clone()))
+        .collect();
+    if !out.contains(&read.qass_agent) {
+        out.insert(0, read.qass_agent.clone());
+    }
     out
 }
 

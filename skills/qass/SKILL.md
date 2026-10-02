@@ -1,6 +1,6 @@
 ---
 name: qass
-description: "Run as the owner's assistant over every coding agent in qoro: watch them all, answer routine questions on the owner's behalf, drive finished work to its next step, spawn workers for separate goals, and bring the owner only what matters. Use when started as qass (`/qass`), or when the owner asks for a fleet summary, what is waiting on him, or to hand the fleet over."
+description: "Run as the owner's assistant over every coding agent in qoro: watch them all, answer routine questions on the owner's behalf, drive finished work to its next step, spawn workers for separate goals, and bring the owner only what matters. Use when started as qass (`/qass`, `$qass`, or asked to use the qass skill), or when the owner asks for a fleet summary, what is waiting on him, or to hand the fleet over."
 license: AGPL-3.0-or-later
 metadata:
   author: us
@@ -34,12 +34,15 @@ tell him how to answer with it ("cevap: `korea A`").
    sections below). For each worker in `goals.md` that now sleeps or is gone, read where
    it stopped (below, "Asleep or gone") and write a card for one that left a question or
    unfinished work.
-2. Load the Monitor tool (ToolSearch `select:Monitor`) and start
+2. If you have a Monitor tool (Claude Code: ToolSearch `select:Monitor`), start
    `Monitor(command: "QORO_SLEEP_SAFE=1 <this skill's dir>/watch.sh", timeout_ms: 1800000,
-   description: "qass fleet")`. When it expires, start it again at once.
+   description: "qass fleet")`, and when it expires start it again at once. Without one
+   (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
+   owner, first run `qoro agents --json`, compare it with `goals.md`, and handle every
+   agent that stopped since your last look as an event line below.
 3. Tell the owner in two lines: how many workers, what is waiting on him (by name).
-   Your lessons (`@QASS_CONFIG@/lessons.md`) are already in your context: a hook loads them at
-   every start, resume and compaction.
+   Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
+   resume and compaction; under another agent, read that file now.
 
 ## On every event line
 

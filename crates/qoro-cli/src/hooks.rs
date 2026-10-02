@@ -368,7 +368,7 @@ fn registered(target: &Target, dir: &Path, home: &Path) -> bool {
 ///
 /// Read from `PATH` directly rather than by running anything: asking six agents to start is
 /// six processes on every first start, and what is wanted is whether the file is there.
-fn on_path(agent: &str) -> bool {
+pub(crate) fn on_path(agent: &str) -> bool {
     match std::env::var("PATH") {
         Ok(path) => on_path_in(agent, &path),
         Err(_) => false,

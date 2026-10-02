@@ -15,7 +15,7 @@
 //! [daemon]
 //! exit_when_asleep = true
 //! [qass]
-//! model = "sonnet"    # sonnet | opus | haiku: the model `qoro qass` starts it with
+//! agent = "claude"    # claude | codex | gemini | opencode, or a name from [agents]
 //! [agents]            # a name for a new agent, and the line typed to start it
 //! claudec = "claude --dangerously-skip-permissions"
 //! lm = "opencode"
@@ -87,12 +87,10 @@ pub struct Config {
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
     pub lifecycle: qoro_runtime::config::Lifecycle,
-    /// The model `qoro qass` starts qass with, one of [`QASS_MODELS`].
-    pub qass_model: &'static str,
 }
 
-/// The Claude models qass may run on, by the names `claude --model` takes.
-pub const QASS_MODELS: [&str; 3] = ["sonnet", "opus", "haiku"];
+/// The agents qass's skill installs beside, and so the ones `qoro qass` can start by name.
+pub const QASS_AGENTS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -106,7 +104,6 @@ impl Default for Config {
             alert_sound: "Funk",
             notch: true,
             lifecycle: qoro_runtime::config::Lifecycle::default(),
-            qass_model: "sonnet",
         }
     }
 }
@@ -210,6 +207,8 @@ pub struct Read {
     pub config: Config,
     /// `[agents]`, in the order the file lists them.
     pub agents: Vec<Launcher>,
+    /// `[qass] agent`: what `qoro qass` starts, one of [`QASS_AGENTS`] or an `[agents]` name.
+    pub qass_agent: String,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
@@ -232,6 +231,22 @@ impl Read {
     }
 }
 
+/// A name an agent may have: one word, as `[agents]` keys are written.
+fn agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `[qass] agent` as the file says it, when it is a name an agent may have.
+fn qass_agent_in(text: &str) -> Option<String> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    let agent = table.get("qass")?.get("agent")?.as_str()?;
+    agent_name(agent).then(|| agent.to_string())
+}
+
 /// Where the file is.
 pub fn path() -> PathBuf {
     qoro_runtime::paths::config_dir().join("config.toml")
@@ -249,9 +264,13 @@ pub fn agents() -> Vec<Launcher> {
 
 /// Read a file by its path, so a test never touches a home directory.
 pub fn read_from(path: &Path) -> Read {
+    let mut qass_agent = "claude".to_string();
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
             let (config, agents, problems) = parse_all(&text);
+            if let Some(agent) = qass_agent_in(&text) {
+                qass_agent = agent;
+            }
             (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -267,6 +286,7 @@ pub fn read_from(path: &Path) -> Read {
     Read {
         config,
         agents,
+        qass_agent,
         problems,
         path: path.to_path_buf(),
         exists,
@@ -487,14 +507,14 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             ("qass", toml::Value::Table(qass)) => {
                 for (key, value) in qass {
                     let line = line_of(&nested.qass, key);
-                    let model = value
-                        .as_str()
-                        .and_then(|v| QASS_MODELS.iter().find(|m| **m == v));
-                    match (key.as_str(), model) {
-                        ("model", Some(model)) => config.qass_model = model,
-                        ("model", None) => refuse(
+                    match (key.as_str(), value.as_str()) {
+                        ("agent", Some(name)) if agent_name(name) => {}
+                        ("agent", _) => refuse(
                             line,
-                            format!("model = {value} is not one of {}", QASS_MODELS.join(", ")),
+                            format!(
+                                "agent = {value} is not one of {} or a name from [agents]",
+                                QASS_AGENTS.join(", ")
+                            ),
                         ),
                         _ => refuse(line, format!("there is no setting qass.{key}")),
                     }
@@ -502,7 +522,7 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             }
             ("qass", _) => refuse(
                 line,
-                "qass is a table: [qass] then model = \"sonnet\"".into(),
+                "qass is a table: [qass] then agent = \"claude\"".into(),
             ),
             ("sleep" | "daemon", _) => {}
             ("agents", toml::Value::Table(table)) => {
@@ -601,7 +621,7 @@ pub const KEYS: [&str; 11] = [
     "notch.enabled",
     "sleep.idle_minutes",
     "daemon.exit_when_asleep",
-    "qass.model",
+    "qass.agent",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -620,8 +640,13 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
         },
-        "qass.model" if QASS_MODELS.contains(&value) => toml_edit::value(value),
-        "qass.model" => return Err(format!("{key} is one of {}", QASS_MODELS.join(", "))),
+        "qass.agent" if agent_name(value) => toml_edit::value(value),
+        "qass.agent" => {
+            return Err(format!(
+                "{key} is one of {} or a name from [agents]",
+                QASS_AGENTS.join(", ")
+            ));
+        }
         "sleep.idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
@@ -695,19 +720,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qass_model_is_read_and_checked() {
-        let (config, _, problems) = parse_all("[qass]\nmodel = \"opus\"\n");
-        assert_eq!(config.qass_model, "opus");
-        assert!(problems.is_empty(), "{problems:?}");
-        let (config, _, problems) = parse_all("[qass]\nmodel = \"gpt\"\n");
-        assert_eq!(config.qass_model, "sonnet");
-        assert_eq!(problems.len(), 1);
+    fn qass_agent_is_read_and_checked() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
-        set(&path, "qass.model", "haiku").expect("set");
-        assert!(set(&path, "qass.model", "gpt").is_err());
-        let text = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(parse_all(&text).0.qass_model, "haiku");
+        assert_eq!(read_from(&path).qass_agent, "claude");
+        set(&path, "qass.agent", "codex").expect("set");
+        assert!(set(&path, "qass.agent", "two words").is_err());
+        let read = read_from(&path);
+        assert_eq!(read.qass_agent, "codex");
+        assert!(read.problems.is_empty(), "{:?}", read.problems);
+        std::fs::write(&path, "[qass]\nagent = \"a b\"\n").expect("write");
+        let read = read_from(&path);
+        assert_eq!(read.qass_agent, "claude");
+        assert_eq!(read.problems.len(), 1);
     }
 
     /// The agents come in the order the file lists them, not sorted by name, and each is

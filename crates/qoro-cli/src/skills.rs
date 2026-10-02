@@ -23,10 +23,14 @@ const BODY: &str = include_str!("../../../skills/qoro/SKILL.md");
 /// The file name every agent reads.
 const FILE: &str = "SKILL.md";
 
-/// qass, the assistant over every other agent. Claude only: it stands on Claude Code's
-/// Monitor tool, hooks and dontAsk mode. Installed with Claude's qoro skill, as files that
-/// sit beside each other because the scripts find one another by their own directory.
-const QASS_DIR: &str = ".claude/skills/qass";
+/// qass, the assistant over every other agent: installed beside each agent's qoro skill
+/// (`.claude/skills/qass`, `.codex/skills/qass`, ...), as files that sit beside each other
+/// because the scripts find one another by their own directory. The gate is Claude Code's
+/// (a PreToolUse hook in the working folder's settings); under another agent qass runs with
+/// that agent's own permissions.
+fn qass_dir(target: &Target) -> PathBuf {
+    Path::new(target.dir).with_file_name("qass")
+}
 
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
 /// `qoro paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
@@ -140,9 +144,20 @@ fn targets() -> Vec<Target> {
         Target {
             agent: "opencode",
             dir: ".config/opencode/skills/qoro",
-            experimental: true,
+            // Seen read on 2026-10-03 (opencode 1.18.34): `opencode run` loaded a skill
+            // placed there.
+            experimental: false,
         },
     ]
+}
+
+/// Whether qass's skill sits where this agent reads skills.
+pub(crate) fn qass_installed_for(agent: &str) -> bool {
+    let (Some(home), Some(target)) = (home(), targets().into_iter().find(|t| t.agent == agent))
+    else {
+        return false;
+    };
+    home.join(qass_dir(&target)).join(FILE).exists()
 }
 
 fn home() -> Option<PathBuf> {
@@ -221,9 +236,9 @@ fn install_into(home: &Path, target: &Target) -> std::io::Result<bool> {
 }
 
 /// Write qass's files, answering whether anything changed.
-fn install_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
+fn install_qass(home: &Path, dirs: &QassDirs, target: &Target) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
-    let dir = home.join(QASS_DIR);
+    let dir = home.join(qass_dir(target));
     std::fs::create_dir_all(&dir)?;
     let mut changed = migrate_old_qass(home, dirs)?;
     for (name, body, program) in QASS {
@@ -292,15 +307,17 @@ fn qass_settings() -> &'static str {
 }
 
 /// Remove exactly qass's files, and its directories only when left empty. Its state and the
-/// owner's policy and lessons stay.
-fn remove_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
-    let dir = home.join(QASS_DIR);
+/// owner's policy and lessons stay; the working folder's Claude settings go with Claude's.
+fn remove_qass(home: &Path, dirs: &QassDirs, target: &Target) -> std::io::Result<bool> {
+    let dir = home.join(qass_dir(target));
     let mut removed = false;
     for (name, _, _) in QASS {
         removed |= std::fs::remove_file(dir.join(name)).is_ok();
     }
     let folder = dirs.folder_settings();
-    removed |= std::fs::remove_file(&folder).is_ok();
+    if target.agent == "claude" {
+        removed |= std::fs::remove_file(&folder).is_ok();
+    }
     for empty in [folder.parent().expect("has a parent"), dir.as_path()] {
         if std::fs::read_dir(empty).is_ok_and(|mut e| e.next().is_none()) {
             let _ = std::fs::remove_dir(empty);
@@ -309,8 +326,8 @@ fn remove_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     Ok(removed)
 }
 
-fn qass_current(home: &Path, dirs: &QassDirs) -> bool {
-    let dir = home.join(QASS_DIR);
+fn qass_current(home: &Path, dirs: &QassDirs, target: &Target) -> bool {
+    let dir = home.join(qass_dir(target));
     QASS.iter().all(|(name, body, _)| {
         std::fs::read_to_string(dir.join(name)).is_ok_and(|b| b == dirs.render(body))
     }) && std::fs::read_to_string(dirs.folder_settings())
@@ -340,16 +357,22 @@ fn status() -> std::io::Result<()> {
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to inspect"));
     };
-    for target in targets() {
-        println!("  {:<10} {}", target.agent, status_of(&home, &target));
-    }
     let dirs = QassDirs::here()?;
-    let qass = match (home.join(QASS_DIR).exists(), qass_current(&home, &dirs)) {
-        (false, _) => "not installed",
-        (true, false) => "installed, and older than this build: run install again",
-        (true, true) => "installed (with claude)",
-    };
-    println!("  {:<10} {qass}", "qass");
+    for target in targets() {
+        let qass = match (
+            home.join(qass_dir(&target)).exists(),
+            qass_current(&home, &dirs, &target),
+        ) {
+            (false, _) => "no qass",
+            (true, false) => "qass older than this build: run install again",
+            (true, true) => "with qass",
+        };
+        println!(
+            "  {:<10} {}; {qass}",
+            target.agent,
+            status_of(&home, &target)
+        );
+    }
     println!(
         "\n  qoro skills install [agent...]    add the skill, beside whatever is already there"
     );
@@ -362,8 +385,12 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
-        if target.agent == "claude" && install_qass(&home, &QassDirs::here()?)? {
-            println!("  {:<10} installed into {QASS_DIR}", "qass");
+        if install_qass(&home, &QassDirs::here()?, &target)? {
+            println!(
+                "  {:<10} qass installed into {}",
+                target.agent,
+                qass_dir(&target).display()
+            );
         }
         if !install_into(&home, &target)? {
             println!("  {:<10} already installed", target.agent);
@@ -386,8 +413,12 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to uninstall from"));
     };
     for target in wanted(args)? {
-        if target.agent == "claude" && remove_qass(&home, &QassDirs::here()?)? {
-            println!("  {:<10} removed from {QASS_DIR}", "qass");
+        if remove_qass(&home, &QassDirs::here()?, &target)? {
+            println!(
+                "  {:<10} qass removed from {}",
+                target.agent,
+                qass_dir(&target).display()
+            );
         }
         match remove_from(&home, &target)? {
             true => println!("  {:<10} removed from {}", target.agent, target.dir),
@@ -464,32 +495,67 @@ mod tests {
             data: home.path().join("data/qass"),
             owner: home.path().join("config/qass"),
         };
-        assert!(install_qass(home.path(), &dirs).expect("install"));
-        assert!(qass_current(home.path(), &dirs));
+        assert!(install_qass(home.path(), &dirs, &target("claude")).expect("install"));
+        assert!(qass_current(home.path(), &dirs, &target("claude")));
         // Every place name is filled in.
         for (name, _, _) in QASS {
             let body =
-                std::fs::read_to_string(home.path().join(QASS_DIR).join(name)).expect("file");
+                std::fs::read_to_string(home.path().join(qass_dir(&target("claude"))).join(name))
+                    .expect("file");
             assert!(!body.contains("@QASS_"), "{name} still names a placeholder");
         }
         // Its folder carries the gate too, so a restored or woken qass is gated.
         let folder = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
         assert!(folder.contains("gate.sh") && folder.contains(&dirs.owner.display().to_string()));
-        let gate = home.path().join(QASS_DIR).join("gate.sh");
+        let gate = home
+            .path()
+            .join(qass_dir(&target("claude")))
+            .join("gate.sh");
         let mode = std::fs::metadata(&gate).expect("gate").permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "gate.sh is not runnable");
         assert!(
-            !install_qass(home.path(), &dirs).expect("reinstall"),
+            !install_qass(home.path(), &dirs, &target("claude")).expect("reinstall"),
             "the second install changed something"
         );
-        let theirs = home.path().join(QASS_DIR).join("notes.txt");
+        let theirs = home
+            .path()
+            .join(qass_dir(&target("claude")))
+            .join("notes.txt");
         std::fs::write(&theirs, "theirs").expect("write");
-        assert!(remove_qass(home.path(), &dirs).expect("uninstall"));
+        assert!(remove_qass(home.path(), &dirs, &target("claude")).expect("uninstall"));
         assert_eq!(std::fs::read_to_string(&theirs).expect("read"), "theirs");
         std::fs::remove_file(&theirs).expect("rm");
-        assert!(!remove_qass(home.path(), &dirs).expect("uninstall again"));
-        assert!(!home.path().join(QASS_DIR).exists());
+        assert!(!remove_qass(home.path(), &dirs, &target("claude")).expect("uninstall again"));
+        assert!(!home.path().join(qass_dir(&target("claude"))).exists());
         assert!(!dirs.folder_settings().exists());
+    }
+
+    /// Every agent gets qass beside its qoro skill; taking it from one leaves the others
+    /// and Claude's working-folder settings.
+    #[test]
+    fn qass_installs_beside_every_agent() {
+        let home = home_dir();
+        let dirs = QassDirs {
+            data: home.path().join("data/qass"),
+            owner: home.path().join("config/qass"),
+        };
+        for agent in ["claude", "codex", "gemini", "opencode"] {
+            install_qass(home.path(), &dirs, &target(agent)).expect("install");
+            assert!(qass_current(home.path(), &dirs, &target(agent)), "{agent}");
+        }
+        assert!(home.path().join(".codex/skills/qass/SKILL.md").exists());
+        assert!(
+            home.path()
+                .join(".config/opencode/skills/qass/SKILL.md")
+                .exists()
+        );
+        assert!(remove_qass(home.path(), &dirs, &target("codex")).expect("uninstall"));
+        assert!(!home.path().join(".codex/skills/qass").exists());
+        assert!(
+            dirs.folder_settings().exists(),
+            "claude's settings went with codex"
+        );
+        assert!(qass_current(home.path(), &dirs, &target("claude")));
     }
 
     /// An older qass's `~/.qass` moves across once: the owner's files beside his settings,
@@ -515,7 +581,7 @@ mod tests {
         };
         std::fs::create_dir_all(&dirs.data).expect("data");
         std::fs::write(dirs.data.join("gate.jsonl"), "newer").expect("newer");
-        install_qass(home.path(), &dirs).expect("install");
+        install_qass(home.path(), &dirs, &target("claude")).expect("install");
         let read = |p: PathBuf| std::fs::read_to_string(p).expect("read");
         assert_eq!(read(dirs.owner.join("policy")), "mode auto");
         assert_eq!(read(dirs.owner.join("lessons.md")), "- x -> escalate (E1)");
@@ -528,7 +594,7 @@ mod tests {
         // gate.jsonl stayed behind (its new place was taken), so the old folder stays too.
         assert!(old.join("gate.jsonl").exists());
         std::fs::remove_file(old.join("gate.jsonl")).expect("rm");
-        install_qass(home.path(), &dirs).expect("again");
+        install_qass(home.path(), &dirs, &target("claude")).expect("again");
         assert!(!old.exists(), "only what is made again was left");
     }
 
@@ -543,19 +609,15 @@ mod tests {
         assert!(!remove_from(home.path(), &codex).expect("uninstall again"));
     }
 
-    /// Experimental targets stay out of the default set.
+    /// Every agent here is seen to read its directory, so all install by default; a name
+    /// that is no target is refused.
     #[test]
-    fn experimental_targets_install_only_when_named() {
-        let all: Vec<String> = wanted(&[])
-            .unwrap()
-            .iter()
-            .map(|t| t.agent.into())
-            .collect();
-        assert!(all.contains(&"claude".to_string()));
-        assert!(!all.contains(&"opencode".to_string()));
+    fn every_proven_target_installs_by_default() {
+        let all: Vec<&str> = wanted(&[]).unwrap().iter().map(|t| t.agent).collect();
+        assert_eq!(all, ["claude", "codex", "gemini", "opencode"]);
         let named = wanted(&["opencode".to_string()]).unwrap();
         assert_eq!(named.len(), 1);
-        assert!(named[0].experimental);
+        assert!(!named[0].experimental);
         assert!(wanted(&["cursor".to_string()]).is_err());
     }
 
@@ -576,7 +638,11 @@ mod tests {
     fn status_names_every_state_including_experimental() {
         let home = home_dir();
         let claude = target("claude");
-        let opencode = target("opencode");
+        let unproven = Target {
+            agent: "unproven",
+            dir: ".unproven/skills/qoro",
+            experimental: true,
+        };
         assert_eq!(status_of(home.path(), &claude), "not installed");
         install_into(home.path(), &claude).expect("install");
         assert_eq!(status_of(home.path(), &claude), "installed");
@@ -586,9 +652,9 @@ mod tests {
             "a stale file reads as older"
         );
         // Present on disk yet never installed: nothing proves it is read.
-        install_into(home.path(), &opencode).expect("install");
+        install_into(home.path(), &unproven).expect("install");
         assert!(
-            status_of(home.path(), &opencode).contains("experimental, unverified"),
+            status_of(home.path(), &unproven).contains("experimental, unverified"),
             "an experimental file must not read as installed"
         );
     }
