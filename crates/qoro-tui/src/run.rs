@@ -1232,6 +1232,7 @@ impl State {
             sidebar::Act::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
             sidebar::Act::NewSpace => Some(Clicked::NewSpace),
             sidebar::Act::Menu => Some(Clicked::Menu),
+            sidebar::Act::SettingsPage => Some(Clicked::SettingsPage),
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
@@ -4183,6 +4184,8 @@ fn copy_cursor(state: &State) -> Option<(usize, usize)> {
 #[derive(Clone, Copy, Debug)]
 enum Clicked {
     Menu,
+    /// The foot's `settings`: the settings page, in a tab.
+    SettingsPage,
     /// A tab of the inbox, or a count on its folded row.
     InboxTab(sidebar::InboxTab),
     /// The inbox's caret.
@@ -5546,6 +5549,23 @@ where
                                     Some(Clicked::Menu) => {
                                         state.menu_kind = MenuKind::Main;
                                         state.menu = Some(0);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::SettingsPage) => {
+                                        // The menu's own settings row, so the two never differ.
+                                        let item = MENU
+                                            .iter()
+                                            .position(|(name, _, _)| *name == "settings")
+                                            .unwrap_or(0);
+                                        if let MenuSend::Control(ask) =
+                                            apply_menu_choice(&mut state, item, &mut request)
+                                        {
+                                            wr.write_all(&client::encode_control_seq(
+                                                &ask,
+                                                &mut control_seq,
+                                            )?)
+                                            .await?;
+                                        }
                                         dirty = true;
                                     }
                                     Some(Clicked::Fold(space)) => {

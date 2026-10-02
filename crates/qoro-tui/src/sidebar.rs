@@ -333,6 +333,8 @@ pub enum Act {
     View,
     /// Everything that is not a space, a tab or an agent.
     Menu,
+    /// The foot's `settings`: every setting on one page, as the menu's settings row opens it.
+    SettingsPage,
     /// Fold the whole column away to its strip, and back.
     Collapse,
     /// A tab of the inbox: its list, from the top, and the inbox open again if it was folded.
@@ -2516,11 +2518,16 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             if collapsed {
                 return Some(Act::Collapse);
             }
-            // `menu « ` closes the row: the word, a space, the mark and a space.
+            // `menu « ` closes the row: the word, a space, the mark and a space. Where the
+            // column has room, `settings` and two spaces come before it.
             let end = c.width.saturating_sub(FOOT_TAIL - MENU_LABEL.len());
             let start = end.saturating_sub(MENU_LABEL.len());
+            let settings_start = c.width.saturating_sub(FOOT_TAIL + 2 + SETTINGS_LABEL.len());
+            let settings_end = settings_start + SETTINGS_LABEL.len();
             Some(if col > start && col <= end {
                 Act::Menu
+            } else if c.width >= SETTINGS_FROM && col > settings_start && col <= settings_end {
+                Act::SettingsPage
             } else {
                 Act::Collapse
             })
@@ -2532,6 +2539,20 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
 const FOOT_TAIL: usize = 7;
 
 const MENU_LABEL: &str = "menu";
+
+const SETTINGS_LABEL: &str = "settings";
+
+/// The narrowest column the foot names `settings` in: the version still fits beside it.
+const SETTINGS_FROM: usize = 24;
+
+/// What closes the foot's last row: `settings` when there is room, then `menu « `.
+fn foot_tail(width: usize) -> String {
+    if width >= SETTINGS_FROM {
+        format!("{SETTINGS_LABEL}  {MENU_LABEL} \u{ab} ")
+    } else {
+        format!("{MENU_LABEL} \u{ab} ")
+    }
+}
 
 /// The column folded away to a strip: a space's number, then its agents' marks under it.
 ///
@@ -2868,7 +2889,7 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 ///  ●   ●        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///      ●        ▀▀▀▀▀▀
-///  0.5.0        menu «
+///  0.5.0  settings  menu «
 /// ```
 ///
 /// A dot is a plain `●`, which every terminal draws. Whatever the pet, the words sit in the
@@ -2877,8 +2898,8 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// rows are text and answer nothing.
 fn foot_rows(width: usize, pet: bool, update: Option<&str>) -> Vec<Row> {
     use crate::theme::Role;
-    let tail = format!("{MENU_LABEL} \u{ab} ");
-    // The menu closes the last row: `menu « ` flush right, the version before it.
+    let tail = foot_tail(width);
+    // The menu closes the last row: `menu « ` flush right, `settings` and the version before it.
     let lead = version_text(width, crate::width::width(&tail), update);
     let gap = width.saturating_sub(crate::width::width(&lead) + crate::width::width(&tail));
     let menu_row = Line {
@@ -5653,6 +5674,16 @@ mod tests {
                     .filter_map(|col| foot.chars().nth(col - 1))
                     .collect();
                 assert_eq!(menu, MENU_LABEL, "width {width}: {foot:?}");
+                let settings: String = (1..=width)
+                    .filter(|col| act(Hit::Foot, *col, &c, false) == Some(Act::SettingsPage))
+                    .filter_map(|col| foot.chars().nth(col - 1))
+                    .collect();
+                let named = if width >= SETTINGS_FROM {
+                    SETTINGS_LABEL
+                } else {
+                    ""
+                };
+                assert_eq!(settings, named, "width {width}: {foot:?}");
                 for col in [1, width - 1, width] {
                     assert_eq!(
                         act(Hit::Foot, col, &c, false),
