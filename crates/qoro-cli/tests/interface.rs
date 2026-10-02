@@ -757,23 +757,18 @@ impl Interface {
 
     /// Whether one index row carries the keyboard, read out of the raw bytes.
     ///
-    /// The keyboard's agent is marked by its tree connector in ember (`38;5;202`, `└`) on
-    /// the row under its first; a space rule that holds the keyboard for a tab with no agent
-    /// carries the selected background (`48;5;236`) from its first cell. The stripped text
-    /// cannot answer this: stripping takes the colour out.
+    /// The keyboard's agent is marked by an ember line (`38;5;202`, `│`) in the first column
+    /// of its rows; a space rule that holds the keyboard for a tab with no agent carries the
+    /// selected background (`48;5;236`) from its first cell. Either is the row's first cell,
+    /// so the first cell decides. The stripped text cannot answer this: stripping takes the
+    /// colour out.
     fn panel_selected(&self, row: usize) -> bool {
-        let raised = self
-            .screen
+        self.screen
             .cells(row)
             .and_then(|cells| cells.first())
-            .is_some_and(|(_, style)| style.contains("48;5;236"));
-        let connector = self.screen.cells(row + 1).is_some_and(|cells| {
-            cells
-                .iter()
-                .take(qoro_tui::sidebar::WIDTH)
-                .any(|(c, style)| *c == '\u{2514}' && style.contains("38;5;202"))
-        });
-        raised || connector
+            .is_some_and(|(c, style)| {
+                style.contains("48;5;236") || (style.contains("38;5;202") && *c == '\u{2502}')
+            })
     }
 
     /// Whether the space whose rule is drawn on `rule` holds the keyboard: a row inside its
@@ -2231,8 +2226,8 @@ fn radar_tree_order_holds_creation_order() {
     // in iTerm2), one cell and a space. A place row (`└ claude · ...`) never opens with
     // braille, so this pins the match to the state row alone.
     fn is_state_row(line: &str, program: &str) -> bool {
-        // The keyboard's agent opens with its corner where every other row has a blank.
-        line.strip_prefix([' ', '\u{256d}']).is_some_and(|rest| {
+        // The keyboard's agent opens with its line where every other row has a blank.
+        line.strip_prefix([' ', '\u{2502}']).is_some_and(|rest| {
             rest.chars()
                 .next()
                 .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))

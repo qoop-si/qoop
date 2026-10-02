@@ -630,42 +630,23 @@ fn cut(text: &str, from: usize, to: usize) -> String {
         .collect()
 }
 
-/// A row of the keyboard's agent with its tree connector (`└`) in ember: the one mark the
-/// selection needs, made of a cell the row already draws, so nothing new sits beside the
-/// state mark that animates or against the column's rule. The connector's own one-cell run
-/// (its quiet grey) is recoloured; a wider run over it is left as it is.
-fn with_connector(line: &sidebar::Line) -> sidebar::Line {
+/// A row of the keyboard's agent with an ember line in its first column: one straight line
+/// down every row of the agent, and nothing else. A box-drawing line, which the terminal
+/// draws itself across the whole cell, so the rows' lines meet with no gap between them.
+/// A first cell that is not blank, or that a coloured run covers, is left as it is.
+fn with_bar(line: &sidebar::Line) -> sidebar::Line {
     let mut line = line.clone();
-    let Some(at) = line
-        .text
-        .chars()
-        .scan(0usize, |col, c| {
-            let start = *col;
-            *col += width::columns(c);
-            Some((start, c))
-        })
-        .find(|(_, c)| *c == '\u{2514}')
-        .map(|(start, _)| start)
-    else {
-        return line;
-    };
-    if let Some(own) = line
-        .runs
-        .iter_mut()
-        .find(|(from, len, _)| *from == at && *len == 1)
-    {
-        own.2 = theme::Role::Brand;
-        return line;
-    }
     let covered = line
         .runs
         .iter()
         .chain(line.accent.iter())
         .chain(line.indicator.iter())
-        .any(|(from, len, _)| at >= *from && at < from + len);
-    if !covered {
-        line.runs.push((at, 1, theme::Role::Brand));
+        .any(|(from, len, _)| *from == 0 && *len > 0);
+    if covered || !line.text.starts_with(' ') {
+        return line;
     }
+    line.text.replace_range(0..1, "\u{2502}");
+    line.runs.push((0, 1, theme::Role::Brand));
     line
 }
 
@@ -755,8 +736,8 @@ pub fn paint(frame: &Frame) -> String {
         .iter()
         .find(|r| r.terminal == column.focused_terminal && !r.agent)
         .map(|r| r.workspace);
-    // The rows of the keyboard's agent: its tree connector turns ember, in place of a
-    // raised background.
+    // The rows of the keyboard's agent: an ember line down their first column, in place of
+    // a raised background.
     let picked: Vec<usize> = panel
         .iter()
         .enumerate()
@@ -795,14 +776,14 @@ pub fn paint(frame: &Frame) -> String {
                 // A tab with no agent has no row in the column, so the keyboard on one is
                 // shown on its space's rule instead: the column always says where it is.
                 Some(sidebar::Hit::Space(space)) => shell_space == Some(*space),
-                // The keyboard's agent is marked by its ember connector, not a background.
+                // The keyboard's agent is marked by its ember line, not a background.
                 Some(sidebar::Hit::Terminal(_))
                 | Some(sidebar::Hit::Title | sidebar::Hit::Foot | sidebar::Hit::Next(_))
                 | None => false,
             };
             let marked;
             let line = if picked.contains(&row) {
-                marked = with_connector(line);
+                marked = with_bar(line);
                 &marked
             } else {
                 line
@@ -5277,35 +5258,29 @@ mod tests {
         }
     }
 
-    /// The keyboard's agent is marked by its tree connector in ember and nothing else; a row
-    /// with no connector, or one a wider run already covers, is left as it is.
+    /// The keyboard's agent is marked by an ember line in the first column of each of its
+    /// rows and nothing else; a first cell that holds something is left as it is.
     #[test]
-    fn the_keyboards_agent_wears_an_ember_connector() {
+    fn the_keyboards_agent_wears_an_ember_line() {
         use crate::theme::Role;
         let sub = sidebar::Line {
             text: "   \u{2514} claude   ".to_string(),
-            ..Default::default()
-        };
-        let marked = with_connector(&sub);
-        assert_eq!(marked.text, sub.text);
-        assert!(marked.runs.contains(&(3, 1, Role::Brand)), "{marked:?}");
-        let title = sidebar::Line {
-            text: " \u{2818}\u{2802}claude   ".to_string(),
-            indicator: Some((1, 2, Role::Working)),
-            ..Default::default()
-        };
-        assert_eq!(with_connector(&title), title);
-        let covered = sidebar::Line {
-            runs: vec![(3, 2, Role::Faint)],
-            ..sub.clone()
-        };
-        assert_eq!(with_connector(&covered).runs, covered.runs);
-        // The connector's own quiet run, as the second row draws it, turns ember.
-        let quiet = sidebar::Line {
             runs: vec![(3, 1, Role::Rule)],
-            ..sub.clone()
+            ..Default::default()
         };
-        assert_eq!(with_connector(&quiet).runs, vec![(3, 1, Role::Brand)]);
+        let marked = with_bar(&sub);
+        assert_eq!(marked.text, "\u{2502}  \u{2514} claude   ");
+        assert!(marked.runs.contains(&(0, 1, Role::Brand)), "{marked:?}");
+        assert!(
+            marked.runs.contains(&(3, 1, Role::Rule)),
+            "the connector stays quiet"
+        );
+        assert_eq!(width::width(&marked.text), width::width(&sub.text));
+        let full = sidebar::Line {
+            text: "claude".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(with_bar(&full), full);
     }
 
     /// Escapes out, so a test can measure what a terminal would show.
