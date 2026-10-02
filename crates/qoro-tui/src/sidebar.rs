@@ -373,7 +373,7 @@ impl InboxTab {
     /// The word the chosen tab is spelled with.
     fn word(self) -> &'static str {
         match self {
-            InboxTab::All => "all",
+            InboxTab::All => "inbox",
             InboxTab::Wants => "wants",
             InboxTab::Failed => "failed",
             InboxTab::Done => "done",
@@ -417,6 +417,10 @@ impl InboxTab {
 /// stand in an empty inbox.
 pub const INBOX_ROWS: usize = qoro_runtime::avatar::ART_ROWS;
 
+/// The rows above the title of an open inbox at its first height: the tab row, its list
+/// and the edge under it.
+pub const TITLE_ROW: usize = 1 + INBOX_ROWS + 1;
+
 /// The inbox at the top of the column, as this client left it.
 ///
 /// Client-local like the column's own fold: the daemon never knows, and a second client
@@ -430,6 +434,18 @@ pub struct Inbox {
     pub folded: bool,
     /// The first list row the wheel moved to.
     pub scroll: usize,
+}
+
+impl Inbox {
+    /// The list a click on `tab` shows: that one, or, clicked again where it is already
+    /// open, the inbox, everything that waits.
+    pub fn picked(&self, tab: InboxTab) -> InboxTab {
+        if !self.folded && self.tab == tab {
+            InboxTab::All
+        } else {
+            tab
+        }
+    }
 }
 
 impl Default for Inbox {
@@ -784,6 +800,11 @@ fn parts(
     let room = height - foot;
     let pet_cols = pet_in_inbox(c, height, avatar).map(|(cols, _)| cols);
     let mut head = inbox_rows(c, inbox_height(c, room), pet_cols);
+    // The open inbox's edge, then the title: the edge first when both fit, so the inbox
+    // reads as its own tray above the tree. Folded to its one row, it needs none.
+    if head.len() > 1 && head.len() + 1 < room {
+        head.push((tray_line(c.width), None));
+    }
     if head.len() < room {
         head.push((title_line(c), Some(Hit::Title)));
     }
@@ -824,7 +845,7 @@ pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
         return false;
     }
     let room = height - PET_FOOT_ROWS;
-    inbox_height(c, room) + 1 + content(c).len() <= room
+    inbox_height(c, room) + 2 + content(c).len() <= room
 }
 
 /// Where the pet stands in an empty inbox instead of the foot: its width in cells and the
@@ -1059,14 +1080,17 @@ fn tab_cells(c: &Column, counts: &[usize; 6]) -> Vec<(Option<InboxTab>, usize, S
             rest.push((Some(*tab), format!(" {}{n}", tab_mark(*tab)), n));
         }
     } else {
-        head.push((
-            Some(chosen),
-            format!(" {} {} ", chosen.word(), count(chosen)),
-        ));
+        // The chosen list in the fill: `inbox` for everything, or a state's mark and count,
+        // the same cell it is when not chosen, so choosing one moves nothing but the fill.
+        let cell = |tab: InboxTab| match tab {
+            InboxTab::All => format!(" {} ", tab.word()),
+            _ => format!(" {}{} ", tab_mark(tab), count(tab)),
+        };
+        head.push((Some(chosen), cell(chosen)));
         for tab in InboxTab::ORDER.iter().filter(|t| **t != chosen) {
             let n = count(*tab);
             let text = if *tab == InboxTab::All {
-                format!(" all {n} ")
+                cell(*tab)
             } else {
                 format!(" {}{n}", tab_mark(*tab))
             };
@@ -1117,9 +1141,10 @@ fn tab_row(c: &Column) -> Row {
         match tab {
             // The chosen tab, filled, the cell after the caret.
             Some(t) if !c.inbox.folded && i == 1 => fill = Some((*at, w, t.role())),
+            // Every list keeps its state's ink, empty or not, chosen one or another: a row
+            // of grey marks would say nothing about which is which.
             Some(t) => {
-                let n = counts[*t as usize];
-                runs.push((*at, w, if n == 0 { Role::Rule } else { t.role() }));
+                runs.push((*at, w, t.role()));
             }
             // `inbox` on the folded row says whether anything waits under it.
             None if c.inbox.folded && i == 1 => {
@@ -1202,7 +1227,29 @@ fn inbox_height(c: &Column, room: usize) -> usize {
     if c.inbox.folded {
         return 1;
     }
-    1 + c.inbox.rows.max(1).min(room - 3)
+    // What is left once its edge, the title and one row of the tree are paid for.
+    1 + c.inbox.rows.max(1).min(room.saturating_sub(4).max(1))
+}
+
+/// The edge under the inbox: the column's own ember corners, turning up at each end, and its
+/// rule between them, one column in from each side. Not the panel rule the column's line
+/// joins: the corners close it on their own.
+fn tray_line(width: usize) -> Line {
+    use crate::theme::Role;
+    let inner = width.saturating_sub(4);
+    Line {
+        text: fit(
+            &format!(" \u{2570}{}\u{256f} ", "\u{2500}".repeat(inner)),
+            width,
+        ),
+        colour: None,
+        runs: vec![
+            (1, 1, Role::Brand),
+            (2, inner, Role::Rule),
+            (2 + inner, 1, Role::Brand),
+        ],
+        ..Line::default()
+    }
 }
 
 /// The rows above the foot in a column of `height` rows: the inbox, the title and the list.
@@ -1212,13 +1259,13 @@ fn room_of(c: &Column, height: usize, avatar: Option<&qoro_runtime::avatar::Avat
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
-/// the title and one row of the tree. Zero when the inbox has no list rows to drag.
+/// its edge, the title and one row of the tree. Zero when the inbox has no list rows to drag.
 pub(crate) fn inbox_room(
     c: &Column,
     height: usize,
     avatar: Option<&qoro_runtime::avatar::Avatar>,
 ) -> usize {
-    room_of(c, height, avatar).saturating_sub(3)
+    room_of(c, height, avatar).saturating_sub(4)
 }
 
 /// The inbox's first list row after one notch of the wheel over its list, never past
@@ -5779,7 +5826,7 @@ mod tests {
         let texts = texts(&rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>());
         assert!(texts[1].starts_with(" \u{282f}\u{2807}codex"), "{texts:?}");
         assert_eq!(rows[1].1, Some(Hit::Next(Some(1))));
-        assert_eq!(rows[1 + INBOX_ROWS].1, Some(Hit::Title));
+        assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
         assert_eq!(order(&rows), vec![1]);
         assert!(!texts.iter().any(|t| t.contains("idle")), "{texts:?}");
     }
@@ -5861,7 +5908,7 @@ mod tests {
         let rows = rows_folded(&c, 20, None);
         assert_eq!(rows[1].0.text.trim_end(), " nothing needs you");
         assert_eq!(rows[1].1, Some(Hit::Next(None)));
-        assert_eq!(rows[1 + INBOX_ROWS].1, Some(Hit::Title));
+        assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
     }
 
     /// Every height from nothing to a tall window, every pulled width, with and without a
@@ -6311,7 +6358,7 @@ mod tests {
         let rows = at(&agents, &unseen);
         assert_eq!(rows[0].1, Some(Hit::Tabs));
         assert!(
-            rows[0].0.text.starts_with("\u{25be}  all 3 "),
+            rows[0].0.text.starts_with("\u{25be}  inbox "),
             "{:?}",
             rows[0].0
         );
@@ -6341,7 +6388,7 @@ mod tests {
             assert_eq!(crate::width::width(&line.text), WIDTH, "{line:?}");
         }
         let title = |rows: &[Row]| rows.iter().position(|(_, h)| *h == Some(Hit::Title));
-        assert_eq!(title(&rows), Some(1 + INBOX_ROWS));
+        assert_eq!(title(&rows), Some(TITLE_ROW));
         // Nobody waiting.
         let mut calm = agents.clone();
         for a in &mut calm {
@@ -6412,7 +6459,10 @@ mod tests {
         };
         let working = list(InboxTab::Working);
         assert!(
-            working[0].0.text.starts_with("\u{25be}  working 1 "),
+            working[0]
+                .0
+                .text
+                .starts_with(&format!("\u{25be}  {}1 ", tab_mark(InboxTab::Working))),
             "{:?}",
             working[0].0
         );
@@ -6482,11 +6532,14 @@ mod tests {
                 .take_while(|(_, hit)| *hit != Some(Hit::Title))
                 .count();
             let room = h.saturating_sub(foot);
-            let want = if room < 3 {
+            let inbox = if room < 3 {
                 0
             } else {
-                1 + INBOX_ROWS.min(room - 3)
+                1 + INBOX_ROWS.min(room.saturating_sub(4).max(1))
             };
+            // The open inbox's edge, when it and the title both fit.
+            let edge = usize::from(inbox > 1 && inbox + 1 < room);
+            let want = inbox + edge;
             if rows.iter().any(|(_, hit)| *hit == Some(Hit::Title)) {
                 assert_eq!(above, want, "height {h}");
             }
@@ -6498,7 +6551,7 @@ mod tests {
         let rows = rows_folded(&flat, 40, None);
         assert_eq!(rows[0].1, Some(Hit::Tabs));
         assert_eq!(rows[1].1, Some(Hit::Next(Some(1))));
-        assert_eq!(rows[1 + INBOX_ROWS].1, Some(Hit::Title));
+        assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
     }
 
     /// The wheel over the list stops at both ends; the tab walk wraps; a drag never asks
@@ -6538,8 +6591,90 @@ mod tests {
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
         let foot = foot_rows(WIDTH, false, None).len();
-        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 3);
+        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4);
         assert_eq!(inbox_room(&c, 3, None), 0);
+    }
+
+    /// A tab clicked again where it is already open puts the inbox back; folded, a click on
+    /// a tab opens that tab.
+    #[test]
+    fn the_open_tab_clicked_again_goes_back_to_the_inbox() {
+        let open = Inbox {
+            tab: InboxTab::Working,
+            ..Inbox::default()
+        };
+        assert_eq!(open.picked(InboxTab::Working), InboxTab::All);
+        assert_eq!(open.picked(InboxTab::Wants), InboxTab::Wants);
+        assert_eq!(Inbox::default().picked(InboxTab::All), InboxTab::All);
+        let folded = Inbox {
+            folded: true,
+            ..open
+        };
+        assert_eq!(folded.picked(InboxTab::Working), InboxTab::Working);
+    }
+
+    /// Under an open inbox, its edge: ember corners turning up at both ends and the rule
+    /// between, one column in from each side, then the title.
+    #[test]
+    fn an_open_inbox_ends_in_its_edge_before_the_title() {
+        use crate::theme::Role;
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        c.inbox = Inbox::default();
+        let rows = rows_folded(&c, 40, None);
+        let title = rows
+            .iter()
+            .position(|(_, h)| *h == Some(Hit::Title))
+            .expect("the title");
+        assert!(title > 1, "an open inbox above it");
+        let edge = &rows[title - 1];
+        assert_eq!(edge.1, None, "the edge answers nothing");
+        let text: Vec<char> = edge.0.text.chars().collect();
+        assert_eq!(
+            (text[1], text[WIDTH - 2]),
+            ('\u{2570}', '\u{256f}'),
+            "{:?}",
+            edge.0
+        );
+        assert!(
+            text[2..WIDTH - 2].iter().all(|c| *c == '\u{2500}'),
+            "{:?}",
+            edge.0
+        );
+        assert!(edge.0.runs.contains(&(1, 1, Role::Brand)));
+        assert!(edge.0.runs.contains(&(WIDTH - 2, 1, Role::Brand)));
+        assert_ne!(
+            edge.0.colour,
+            Some(Role::Rule),
+            "not the panel rule the column joins"
+        );
+        assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
+    }
+
+    /// Every tab wears its state's ink, empty or not, and the chosen one says its mark and
+    /// count, not a word.
+    #[test]
+    fn the_tabs_keep_their_inks_and_the_chosen_one_has_no_word() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        c.inbox = Inbox {
+            tab: InboxTab::Failed,
+            ..Inbox::default()
+        };
+        let (row, _) = tab_row(&c);
+        assert!(!row.text.contains("failed"), "{row:?}");
+        assert!(row.text.contains(" inbox "), "{row:?}");
+        for tab in &InboxTab::ORDER[1..] {
+            if *tab == InboxTab::Failed {
+                continue;
+            }
+            assert!(
+                row.runs.iter().any(|(_, _, r)| *r == tab.role()),
+                "{tab:?} keeps its ink: {row:?}"
+            );
+        }
     }
 
     /// With nothing waiting the pet stands in the inbox beside the words, and the foot keeps

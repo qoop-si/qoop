@@ -207,7 +207,7 @@ const ROWS: u16 = 30;
 /// written as a number, so this test cannot disagree with the layout the next time the layout
 /// changes. The tab bar is over the pane, not over this column, so the column starts at the
 /// very top.
-const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + 1 + qoro_tui::sidebar::INBOX_ROWS;
+const SPACES_TITLE_ROW: usize = qoro_tui::screen::SIDEBAR_TOP + qoro_tui::sidebar::TITLE_ROW;
 
 /// The screen row the tab names are on, one based: the bar's top row. The folders run on
 /// the row under it.

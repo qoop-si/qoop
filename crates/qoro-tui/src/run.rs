@@ -5640,7 +5640,7 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::InboxTab(tab)) => {
-                                        state.inbox.tab = tab;
+                                        state.inbox.tab = state.inbox.picked(tab);
                                         state.inbox.scroll = 0;
                                         state.inbox.folded = false;
                                         dirty = true;
@@ -12680,7 +12680,7 @@ mod tests {
         state.space = Some(1);
         assert!(matches!(
             state.clicked(
-                (crate::screen::SIDEBAR_TOP + 1 + crate::sidebar::INBOX_ROWS) as u16,
+                (crate::screen::SIDEBAR_TOP + crate::sidebar::TITLE_ROW) as u16,
                 crate::sidebar::WIDTH as u16
             ),
             Some(Clicked::NewSpace)
@@ -12688,7 +12688,7 @@ mod tests {
         assert!(
             state
                 .clicked(
-                    (crate::screen::SIDEBAR_TOP + 1 + crate::sidebar::INBOX_ROWS) as u16,
+                    (crate::screen::SIDEBAR_TOP + crate::sidebar::TITLE_ROW) as u16,
                     5
                 )
                 .is_none()
