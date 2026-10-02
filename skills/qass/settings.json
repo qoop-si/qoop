@@ -8,7 +8,6 @@
       "Bash(qoro prompt *)",
       "Bash(qoro send *)",
       "Bash(wend search *)",
-      "Bash(wend recall *)",
       "Read(~/.qass/**)",
       "Edit(~/.qass/goals.md)"
     ],

@@ -313,12 +313,9 @@ def check_bash(command, subagent):
             check_write("send", w[2], w[-1], keys=keys[1::2])
             return
         raise Deny(f"qoro {sub} is not allowed")
-    if w[:2] in (["wend", "recall"], ["wend", "search"]) and len(w) > 2 and w[2].startswith("-"):
-        raise Deny("the query comes first")
-    if w[:2] == ["wend", "recall"] and len(w) > 2:
-        flags(w[3:], {"--json": None, "--limit": is_num})
-        return
     if w[:2] == ["wend", "search"] and len(w) > 2:
+        if w[2].startswith("-"):
+            raise Deny("the query comes first")
         flags(w[3:], {"--json": None, "--limit": is_num,
                       "--role": lambda v: v in ("user", "assistant")})
         return

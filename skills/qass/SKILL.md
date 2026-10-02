@@ -81,9 +81,10 @@ step".
    (already loaded in this session).
 4. **Repo rules:** `AGENTS.md`, `CLAUDE.md` and `.claude/rules/` in the
    worker's repo. What they pre-authorize still needs a `policy` grant.
-5. **His standards for this moment:** `wend recall '<what the worker did and
-   asks>' --json`; when it abstains, `wend search '<two or three key
-   words>'`. These are the criteria he applies, never his answer.
+5. **His standards for this moment:** `wend search '<two or three key
+   words>' --role user`, what he himself wrote around those words before.
+   Skip pasted logs among the hits. These are the criteria he applies, never
+   his answer.
 
 Write `plan:` and `stage:` into the worker's `goals.md` line, and update
 `stage:` when it moves.
