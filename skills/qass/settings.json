@@ -29,7 +29,7 @@
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" owner" }] }
     ],
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; echo \"qass: after a wake or a resume the fleet watcher is not running; start it again (Start, step 2) before anything else.\"; true" }] }
     ]
   }
 }

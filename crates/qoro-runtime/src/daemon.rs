@@ -5580,7 +5580,15 @@ fn vet_for_sleep(
     let foreground = master
         .and_then(qoro_pty::sys::foreground_pgrp)
         .map(|group| group.0);
-    let blockers = crate::idle::sleep_blockers(table, leader, foreground, tty);
+    let sleep_safe = |pid: i32| {
+        qoro_pty::sys::argv_of(qoro_pty::Pid(pid))
+            .iter()
+            .any(|arg| {
+                arg.split_whitespace()
+                    .any(|w| w.trim_matches('\'') == "QORO_SLEEP_SAFE=1")
+            })
+    };
+    let blockers = crate::idle::sleep_blockers(table, leader, foreground, tty, &sleep_safe);
     if !blockers.is_empty() {
         return Err(format!("{} running in the background", blockers.join(", ")));
     }

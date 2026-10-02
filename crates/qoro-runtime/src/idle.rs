@@ -163,12 +163,16 @@ pub fn group_holds_task(master: std::os::fd::RawFd) -> bool {
 /// foreground's (`postgres &`), a job that would end without coming back. Everything under
 /// the foreground that is still on the terminal is the program's own, MCP servers in groups
 /// of their own included (measured under codex): teardown ends them and the program starts
-/// them again when it resumes. Pure, so the measured trees are its tests.
+/// them again when it resumes. A process that says it may be lost (`sleep_safe`: the
+/// `QORO_SLEEP_SAFE=1` mark on its command line, which a watcher that ends with its agent
+/// carries) blocks nothing, nor does anything under it. Pure, so the measured trees are its
+/// tests.
 pub fn sleep_blockers(
     table: &[qoro_pty::sys::ProcRow],
     leader: i32,
     foreground: Option<i32>,
     tty: u64,
+    sleep_safe: &dyn Fn(i32) -> bool,
 ) -> Vec<String> {
     let mut children: BTreeMap<i32, Vec<&qoro_pty::sys::ProcRow>> = BTreeMap::new();
     for row in table {
@@ -183,14 +187,12 @@ pub fn sleep_blockers(
     let mut stack = vec![(leader, false)];
     while let Some((pid, under_foreground)) = stack.pop() {
         for child in children.get(&pid).map(Vec::as_slice).unwrap_or_default() {
-            if child.tty != Some(tty) {
-                blockers.push(child.name.clone());
-                continue;
-            }
             let foreground_here =
                 under_foreground || (Some(child.pgid) == foreground && child.pgid != shell_group);
-            if !foreground_here && child.pgid != shell_group {
-                blockers.push(child.name.clone());
+            if child.tty != Some(tty) || (!foreground_here && child.pgid != shell_group) {
+                if !sleep_safe(child.pid) {
+                    blockers.push(child.name.clone());
+                }
                 continue;
             }
             stack.push((child.pid, foreground_here));
@@ -600,7 +602,7 @@ mod tests {
     #[test]
     fn a_shell_at_its_prompt_has_nothing_in_the_way() {
         let t = [row(10, 1, 10, Some(5), "zsh")];
-        assert!(sleep_blockers(&t, 10, Some(10), 5).is_empty());
+        assert!(sleep_blockers(&t, 10, Some(10), 5, &|_| false).is_empty());
     }
 
     #[test]
@@ -611,7 +613,7 @@ mod tests {
             row(20, 10, 20, Some(5), "claude"),
             row(21, 20, 20, Some(5), "caffeinate"),
         ];
-        assert!(sleep_blockers(&t, 10, Some(20), 5).is_empty());
+        assert!(sleep_blockers(&t, 10, Some(20), 5, &|_| false).is_empty());
     }
 
     #[test]
@@ -623,7 +625,28 @@ mod tests {
             row(30, 20, 30, None, "zsh"),
             row(31, 30, 30, None, "sleep"),
         ];
-        assert_eq!(sleep_blockers(&t, 10, Some(20), 5), vec!["zsh".to_string()]);
+        assert_eq!(
+            sleep_blockers(&t, 10, Some(20), 5, &|_| false),
+            vec!["zsh".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_background_shell_marked_sleep_safe_lets_it_sleep() {
+        // qass's watcher: a setsid shell that ends by itself once its agent is gone.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "claude"),
+            row(30, 20, 30, None, "zsh"),
+            row(31, 30, 30, None, "bash"),
+            row(40, 20, 40, None, "zsh"),
+        ];
+        assert_eq!(
+            sleep_blockers(&t, 10, Some(20), 5, &|pid| pid == 30),
+            vec!["zsh".to_string()],
+            "only the unmarked one blocks"
+        );
+        assert!(sleep_blockers(&t, 10, Some(20), 5, &|pid| pid == 30 || pid == 40).is_empty());
     }
 
     #[test]
@@ -637,7 +660,7 @@ mod tests {
             row(23, 20, 23, Some(5), "app-mcp"),
             row(24, 23, 24, Some(5), "Google Chrome"),
         ];
-        assert!(sleep_blockers(&t, 10, Some(20), 5).is_empty());
+        assert!(sleep_blockers(&t, 10, Some(20), 5, &|_| false).is_empty());
     }
 
     #[test]
@@ -647,7 +670,7 @@ mod tests {
             row(40, 10, 40, Some(5), "postgres"),
         ];
         assert_eq!(
-            sleep_blockers(&t, 10, Some(10), 5),
+            sleep_blockers(&t, 10, Some(10), 5, &|_| false),
             vec!["postgres".to_string()]
         );
     }
@@ -661,7 +684,7 @@ mod tests {
             row(21, 20, 21, None, "muxd"),
         ];
         assert_eq!(
-            sleep_blockers(&t, 10, Some(20), 5),
+            sleep_blockers(&t, 10, Some(20), 5, &|_| false),
             vec!["muxd".to_string()]
         );
     }

@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +43,9 @@ E_ITEM = re.compile(r"\bE([1-9][0-9]{0,5})\b")
 OK = r"(?:ok|okay|yes|tamam|evet)"
 PS = r"P[1-9][0-9]{0,5}(?:\s+P[1-9][0-9]{0,5})*"
 P_OK = re.compile(rf"{OK}\s+{PS}|{PS}\s+{OK}", re.IGNORECASE)
+# What the owner calls an item instead of its number: one word of the agent's sidebar name.
+HANDLE = re.compile(r"[a-z0-9][a-z0-9-]{1,29}")
+NOT_HANDLE = {"ok", "okay", "yes", "tamam", "evet", "no", "hayir", "yok", "dur"}
 RELAY_HEAD = re.compile(r"The owner answered E([1-9][0-9]{0,5}): ")
 # One choice on an escalation card; the owner can always answer in his own words instead.
 OPTION = re.compile(r"[A-D]: [^\n]{1,200}")
@@ -68,7 +72,9 @@ READ_ONLY_QORO = {"agents", "context", "read", "history"}
 FREE_TOOLS = {"ToolSearch", "TodoWrite"}
 PER_WORKER = 3
 PER_HOUR = 10
-SPAWNED_ALIVE = 2
+SPAWNED_ALIVE = 4
+AGENTS = {"claude", "opencode"}
+CARD_FRESH = 86400   # a lone letter answers the one card younger than this
 
 
 class Deny(Exception):
@@ -199,26 +205,68 @@ def clauses(text):
     return [c for c in re.split(r"[,;\n]|\band\b|\bve\b", text) if c.strip()]
 
 
-def said_yes(text):
-    """The P numbers a message says yes to: clauses that are exactly "ok P3" or "P3 ok"."""
-    return {int(n) for c in clauses(text) if P_OK.fullmatch(c.strip().rstrip(".!"))
-            for n in P_ITEM.findall(c)}
+def norm(word):
+    """A word as the owner may type it: no case, no accents, ı as i, no trailing punctuation."""
+    word = unicodedata.normalize("NFKD", word.replace("ı", "i").replace("İ", "i")).lower()
+    return "".join(ch for ch in word if not unicodedata.combining(ch)).strip(".,!:;")
 
 
-def answered(text):
-    """The E numbers a message answers: a clause naming one, with more in it than the number
-    (yes, no, an option letter, his own words), that is not a question."""
-    return {int(n) for c in clauses(text) if "?" not in c and E_ITEM.sub("", c).strip()
-            for n in E_ITEM.findall(c)}
+def is_handle(word):
+    return bool(HANDLE.fullmatch(word)) and word not in NOT_HANDLE \
+        and not re.fullmatch(r"[ep][0-9]+", word)
+
+
+def answered(text, cards, now):
+    """The open cards a message answers, each with the letter it picks or None: a clause that
+    names the card's E<n> or starts with its handle, with more in it than that, and is not a
+    question; or a lone letter while exactly one card younger than a day is open. A number
+    may also answer a card already passed on (a correction); that is the caller's."""
+    out = {}
+    fresh = [n for n, c in cards.items() if now - c["ts"] < CARD_FRESH and not c.get("done")]
+    for c in clauses(text):
+        c = c.strip().rstrip(".!")
+        # "korea ok" is a yes to the proposal korea, never an answer to a card.
+        if "?" in c or not c or (not E_ITEM.search(c) and re.fullmatch(
+                rf"{OK}\s+\S+|\S+\s+{OK}", c, re.IGNORECASE)):
+            continue
+        found = [(n, f"E{n}") for n in map(int, E_ITEM.findall(c)) if E_ITEM.sub("", c).strip()]
+        first, rest = c.split()[0], c.split()[1:]
+        # A handle finds the newest open card that has it.
+        named = [n for n, card in cards.items() if rest and not card.get("done")
+                 and card.get("handle") and norm(first) == card["handle"]]
+        found += [(max(named), first)] if named else []
+        for n, token in found:
+            m = re.fullmatch(rf"{re.escape(token)}\s+([A-Da-d])", c)
+            out[n] = m.group(1).upper() if m else None
+        if re.fullmatch(r"[A-Da-d]", c) and len(fresh) == 1:
+            out[fresh[0]] = c.upper()
+    return out
+
+
+def said_yes(text, proposals):
+    """The P numbers a message says yes to: clauses that are exactly "ok P3" or "P3 ok", or
+    "ok <handle>" / "<handle> ok" for a proposal recorded with that handle."""
+    yes = set()
+    for c in clauses(text):
+        c = c.strip().rstrip(".!")
+        if P_OK.fullmatch(c):
+            yes |= {int(n) for n in P_ITEM.findall(c)}
+        elif m := re.fullmatch(rf"{OK}\s+(\S+)|(\S+)\s+{OK}", c, re.IGNORECASE):
+            word = norm(m.group(1) or m.group(2))
+            if word in proposals:
+                yes.add(proposals[word])
+    return yes
 
 
 def approvals(history, now):
     """Writes the owner's ok to proposals still allows: one per P number he said yes to,
     counted once, and only for an hour (an old unused ok must not open a new write)."""
-    left, seen = 0, set()
+    left, seen, proposals = 0, set(), {}
     for r in history:
-        if r.get("owner"):
-            new = said_yes(r.get("text", "")) - seen
+        if "proposed" in r:
+            proposals[r["handle"]] = int(r["proposed"][1:])
+        elif r.get("owner"):
+            new = said_yes(r.get("text", ""), proposals) - seen
             seen |= new
             if now - r.get("ts", 0) < 3600:
                 left += len(new)
@@ -227,20 +275,45 @@ def approvals(history, now):
     return left
 
 
-def relays(history):
-    """Escalations he answered and that were not passed on yet:
-    number -> (terminal, his words, the options he was shown)."""
-    asked, waiting = {}, {}
+def cards_state(history):
+    """Open cards (asked, not passed on yet) and the ones he answered:
+    (number -> card, number -> (terminal, his words, the options he was shown, his pick)).
+    By its number he can still answer a card already passed on, to correct himself."""
+    asked, cards, waiting = {}, {}, {}
     for r in history:
         if "escalated" in r:
-            asked[int(r["escalated"][1:])] = (r.get("terminal"), r.get("options") or {})
+            asked[int(r["escalated"][1:])] = cards[int(r["escalated"][1:])] = {
+                "terminal": r.get("terminal"), "options": r.get("options") or {},
+                "handle": r.get("handle"), "ts": r.get("ts", 0)}
         elif r.get("owner"):
-            for n in answered(r.get("text", "")):
-                if n in asked:
-                    waiting[n] = (asked[n][0], one_line(r["text"]), asked[n][1])
+            found = answered(r.get("text", ""), asked, r.get("ts", 0))
+            for n, pick in found.items():
+                by_number = any(n in map(int, E_ITEM.findall(c)) for c in clauses(r["text"]))
+                if n in cards or (n in asked and by_number):
+                    waiting[n] = (asked[n]["terminal"], one_line(r["text"]),
+                                  asked[n]["options"], pick)
         elif r.get("relay"):
-            waiting.pop(int(r["relay"][1:]), None)
-    return waiting
+            n = int(r["relay"][1:])
+            waiting.pop(n, None)
+            if n in cards:
+                cards.pop(n)["done"] = True
+    return cards, waiting
+
+
+def open_proposals(history):
+    """Proposals recorded and not yet said yes to: handle -> number."""
+    props = {}
+    for r in history:
+        if "proposed" in r:
+            props[r["handle"]] = int(r["proposed"][1:])
+        elif r.get("owner"):
+            yes = said_yes(r.get("text", ""), props)
+            props = {h: n for h, n in props.items() if n not in yes}
+    return props
+
+
+def relays(history):
+    return cards_state(history)[1]
 
 
 def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
@@ -266,8 +339,6 @@ def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
         # Waking it to pass on his answer to its card needs no further ok.
         relay = any(w[0] == terminal for w in relays(history).values()) and "wake"
     elif kind == "spawn":
-        if mode != "auto":
-            raise Deny("spawning needs mode auto")
         alive = {(r["terminal"], r["generation"]) for r in live}
         spawned = {(r["spawned"], r["gen"]) for r in history if "spawned" in r}
         if len(spawned & alive) >= SPAWNED_ALIVE:
@@ -292,17 +363,16 @@ def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
                 waiting = relays(history).get(n)
                 if waiting is None:
                     raise Deny(f"E{n} has no answer of the owner waiting to be passed on")
-                term, words, options = waiting
+                term, words, options, pick = waiting
                 if term != terminal:
                     raise Deny(f"E{n} was asked for terminal {term}")
                 base = f'The owner answered E{n}: "{words}".'
-                # A pick is a clause that is exactly "E7 B": then the option may be spelled out,
-                # word for word as recorded. "E7 not B", "E7 B mi A mi" pick nothing.
-                picks = {m.group(1).upper() for c in clauses(words)
-                         if (m := re.fullmatch(rf"E{n}\s+([A-Da-d])[.!]?", c.strip()))}
-                forms = [f"{base} {FENCE_OWNER}"] + [
-                    f"{base} He chose {k}: {options[k]}. {FENCE_OWNER}"
-                    for k in sorted(picks) if k in options]
+                # A pick is a clause that is exactly "E7 B", "<handle> B", or a lone "B" for the
+                # one fresh card: then the option may be spelled out, word for word as recorded.
+                # "E7 not B", "E7 B mi A mi" pick nothing.
+                forms = [f"{base} {FENCE_OWNER}"] + (
+                    [f"{base} He chose {pick}: {options[pick]}. {FENCE_OWNER}"]
+                    if pick in options else [])
                 if text.rstrip() not in forms:
                     raise Deny("a relay is exactly one of: " + " | ".join(forms))
                 relay = f"E{n}"
@@ -320,9 +390,16 @@ def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
                 if missing:
                     raise Deny(f"policy grants no {', '.join(sorted(missing))} for {root}")
 
+    spawned = {(str(r["spawned"]), str(r["gen"])) for r in history if "spawned" in r}
+    briefed = {str(r.get("terminal")) for r in history if r.get("write") == "prompt"}
+    first_brief = kind == "prompt" and not relay and not machine \
+        and (terminal, generation) in spawned and terminal not in briefed
+    # qass starts workers as it sees fit, and briefs them once, fenced like any prompt:
+    # neither needs his ok, both count against the caps.
+    own_work = first_brief or kind == "spawn"
     if relay:
         pass  # bound to an escalation he answered (relays())
-    elif mode == "propose":
+    elif mode == "propose" and not own_work:
         if not approvals(history, now):
             raise Deny("mode propose: waiting for the owner's ok to a P<n>")
     else:
@@ -338,7 +415,8 @@ def check_write(kind, terminal, generation, text=None, keys=None, machine=None):
 
     append({"write": kind, "terminal": terminal, "generation": generation,
             # Waking spends no ok: the message it wakes the tab for spends it.
-            "spent": mode == "propose" and not relay and kind != "wake",
+            "spent": mode == "propose" and not relay and not first_brief
+            and kind not in ("wake", "spawn"),
             "relay": relay if relay != "wake" else False,
             "text": text if text is not None else " ".join(keys or [])})
 
@@ -409,25 +487,75 @@ def check_bash(command, subagent):
     if subagent:
         raise Deny("subagents only read")
     if is_script(w[0], "escalate.sh"):
-        # escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to D]
-        opts = w[4:]
-        if len(w) < 4 or not E_ITEM.fullmatch(w[1]) \
-                or not re.fullmatch(r"-|[0-9]{1,6}|[A-Za-z0-9_-]+/[0-9]{1,6}", w[2]) \
-                or w[3] not in ("now", "later") or len(opts) > 4 \
-                or [o[:1] for o in opts] != list("ABCD"[:len(opts)]) \
-                or not all(OPTION.fullmatch(o) for o in opts):
-            raise Deny("escalate.sh E<n> <terminal|-> now|later ['A: ...' 'B: ...' up to 'D: ...']")
-        # An old answer ("E6 yes") must never fit a new question, so a number is used once.
-        used = {int(r["escalated"][1:]) for r in log_rows() if "escalated" in r}
-        if int(w[1][1:]) in used:
-            raise Deny(f"{w[1]} was used before; number this one E{max(used) + 1}")
-        append({"escalated": w[1], "terminal": w[2], "urgency": w[3],
-                "options": {o[0]: o[3:] for o in opts}})
+        check_escalate(w[1:])
         return
-    if is_script(w[0], "spawn.sh") and len(w) == 3:
+    if is_script(w[0], "spawn.sh") and len(w) in (3, 5, 7):
+        opts = dict(zip(w[3::2], w[4::2]))
+        if len(opts) != (len(w) - 3) // 2 or not set(opts) <= {"--agent", "--space"} \
+                or opts.get("--agent", "claude") not in AGENTS \
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", opts.get("--space", "x")):
+            raise Deny("spawn.sh <repo> <branch> [--agent claude|opencode] [--space NAME]")
         check_write("spawn", "-", "-")
         return
     raise Deny(f"{w[0]} is not allowed")
+
+
+def check_escalate(w):
+    """escalate.sh E<n> <terminal|-> now|later <handle> ['A: ...' up to 'D: ...'] for a card,
+    escalate.sh P<n> <terminal|-> later <handle> for a proposal. The handle is what the owner
+    types instead of the number: unique among open cards, so his answer finds one card."""
+    usage = ("escalate.sh E<n> <terminal|-> now|later <handle> ['A: ...' up to 'D: ...'] "
+             "or escalate.sh P<n> <terminal|-> later <handle>")
+    if len(w) < 4 or not re.fullmatch(r"-|[0-9]{1,6}|[A-Za-z0-9_-]+/[0-9]{1,6}", w[1]) \
+            or w[2] not in ("now", "later"):
+        raise Deny(usage)
+    handle, opts = norm(w[3]), w[4:]
+    if not is_handle(handle):
+        raise Deny(f"{w[3]} is not a handle: one word of the agent's sidebar name, "
+                   "2 to 30 letters or digits, not a yes or no")
+    history = log_rows()
+    # Unique among what he may still be answering today; an older card keeps its number.
+    now = time.time()
+    cards, _ = cards_state(history)
+    taken = {c.get("handle") for c in cards.values() if now - c["ts"] < CARD_FRESH} | (
+        set(open_proposals(history))
+        & {r["handle"] for r in history if "proposed" in r and now - r["ts"] < CARD_FRESH})
+    if handle in taken:
+        raise Deny(f"an open card or proposal already has the handle {handle}; "
+                   "pick another word of the name")
+    machine, _, number = w[1].rpartition("/")
+    row = next((r for r in rows(machine or None) if str(r.get("terminal")) == number), None) \
+        if number != "-" else None
+    name = (row or {}).get("agent_title") or (row or {}).get("name") or ""
+    if name:
+        if handle not in {norm(x) for x in re.split(r"[^\w-]+", name) if x}:
+            raise Deny(f"the handle is a word of the agent's sidebar name: {name!r}")
+    if P_ITEM.fullmatch(w[0]):
+        if opts or w[2] != "later":
+            raise Deny(usage)
+        append({"proposed": w[0], "terminal": w[1], "handle": handle})
+        return
+    if not E_ITEM.fullmatch(w[0]) or len(opts) > 4 \
+            or [o[:1] for o in opts] != list("ABCD"[:len(opts)]) \
+            or not all(OPTION.fullmatch(o) for o in opts):
+        raise Deny(usage)
+    # An old answer ("E6 yes") must never fit a new question, so a number is used once.
+    used = {int(r["escalated"][1:]) for r in history if "escalated" in r}
+    if int(w[0][1:]) in used:
+        raise Deny(f"{w[0]} was used before; number this one E{max(used) + 1}")
+    append({"escalated": w[0], "terminal": w[1], "urgency": w[2], "handle": handle,
+            "options": {o[0]: o[3:] for o in opts}})
+
+
+def owner_named(path):
+    """A file the owner's latest message names by its path (a screenshot he pasted)."""
+    last = next((r for r in reversed(log_rows()) if r.get("owner")), None)
+    text = (last or {}).get("text", "").replace("\\ ", " ")
+    p = os.path.normpath(os.path.expanduser(path)) if path else ""
+    named = re.search(rf"(?<![^\s\"'(]){re.escape(p)}(?=$|[\s\"'),;:]|\.(?:\s|$))", text) if p else None
+    # Read follows links: the file he named must be the file read (/var is /private/var).
+    real = str(Path(p).resolve()) if p else ""
+    return bool(named) and real in (p, "/private" + p) and Path(p).is_file()
 
 
 def inside(path, root):
@@ -518,13 +646,15 @@ def check(payload):
     if tool == "Bash":
         check_bash(args.get("command") or "", subagent)
     elif tool == "Monitor":
-        if subagent or "ws" in args or not is_script((args.get("command") or "").strip(), "watch.sh"):
-            raise Deny("Monitor runs only watch.sh")
+        command = (args.get("command") or "").strip().removeprefix("QORO_SLEEP_SAFE=1 ")
+        if subagent or "ws" in args or not is_script(command.strip(), "watch.sh"):
+            raise Deny("Monitor runs only QORO_SLEEP_SAFE=1 <this skill's dir>/watch.sh")
     elif tool == "Read":
         path = args.get("file_path") or ""
-        if not (inside(path, QASS) or inside(path, OWNER) or guide_file(path)):
+        if not (inside(path, QASS) or inside(path, OWNER) or guide_file(path)
+                or owner_named(path)):
             raise Deny("Read is limited to qass's folders, AGENTS.md / CLAUDE.md / .claude/rules, "
-                       "plans/*.md and skills' SKILL.md")
+                       "plans/*.md, skills' SKILL.md and files the owner's last message names")
     elif tool == "Glob":
         if not glob_ok(args):
             raise Deny("Glob is limited to qass's folders")
@@ -552,7 +682,7 @@ def owner(payload):
     # A Monitor event or another harness message is not the owner speaking.
     if prompt.lstrip().startswith("<"):
         return
-    append({"owner": True, "text": prompt[:500]})
+    append({"owner": True, "text": prompt[:2000]})
 
 
 def main():

@@ -16,6 +16,10 @@
 # `hands off until <unix time>` on its goals.md line. Once that time passes and
 # it still waits, it is printed once more, as `hands-off->idle`.
 #
+# Started as `QORO_SLEEP_SAFE=1 watch.sh`: that mark on the command line lets qoro put the
+# tab to sleep while this runs, and this ends by itself once the agent that started it is
+# gone (asleep or closed), within the 10 s tick.
+#
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
 set -euo pipefail
@@ -171,6 +175,11 @@ due() {
         nap=$!
         wait "$nap"
         kill -0 $$ 2>/dev/null || exit 0
+        # The agent's background shell is our parent; with the agent gone it is launchd's.
+        if [ "$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')" = 1 ]; then
+            kill -TERM $$ 2>/dev/null
+            exit 0
+        fi
         due | while read -r label t; do
             [ "$label" = - ] && label=""
             # With that machine's daemon away its last snapshot is stale: wait.

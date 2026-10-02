@@ -100,6 +100,11 @@ const QASS: &[(&str, &str, bool)] = &[
         include_str!("../../../skills/qass/worker.json"),
         false,
     ),
+    (
+        "worker-opencode.json",
+        include_str!("../../../skills/qass/worker-opencode.json"),
+        false,
+    ),
 ];
 
 /// One agent's skills directory, and whether it is proven to be read.
