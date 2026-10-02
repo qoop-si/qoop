@@ -28,8 +28,8 @@ qoro uses the fastest way the terminal you run it in understands:
 | anywhere else on Linux | `notify-send` |
 | over ssh | only the terminal escapes above, which reach the terminal on your side; a system program would show it on the far machine, so none is used |
 
-The settings box (`ctrl-a space`, then `settings`) shows which one this session uses, or
-why there is none.
+`qoro settings` shows which one a note from that terminal takes (its desktop row), or why
+there is none.
 
 Names in a notification are passed as data, never as code: a tab named like a command
 cannot run anything.
@@ -42,12 +42,13 @@ you and `Glass` when one finished (through `afplay`); Linux plays freedesktop so
 sound is played from a qoro running over ssh. A name from the other system (a Mac name read
 on Linux) plays that default.
 
-To hear them and choose, run `qoro sound`: macOS lists its own sounds, Linux the
+To hear them and choose, open `qoro settings` (the sound rows play as left and right change
+them) or run `qoro sound`: macOS lists its own sounds, Linux the
 freedesktop ones installed. The arrows move through them and play each one, space plays it
 again, enter keeps it, first for a finished agent, then for one that waits on you. Piped,
 it reads lines instead: a number or a name plays one, an empty line keeps it. Keeping one turns
-`sound` on, `o` (`off` piped) turns it off. A running qoro takes the change the next time its settings
-open (prefix, space, `settings`).
+`sound` on, `o` (`off` piped) turns it off. A running qoro takes the change within two
+seconds.
 
 ## Turning it off
 

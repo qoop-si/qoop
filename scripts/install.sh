@@ -190,6 +190,14 @@ chmod 0755 "$tmp"
 mv "$tmp" "$DEST"
 echo "installed $($DEST --version) to $DEST"
 
+# A first install: no config.toml and no pet yet, read before the steps below, which may
+# write the config (the notch). A binary that says nothing (the install check) is not one.
+first=""
+if "$DEST" config 2>/dev/null | head -n 1 | grep -q "(no file yet" \
+    && [ "$("$DEST" avatar show --json 2>/dev/null)" = "null" ]; then
+    first=1
+fi
+
 # The rest is the CLI's own verbs, never a copy of their logic. Each one on its own: a
 # hooks directory the CLI refuses is no reason to leave the skill and the PATH hint out.
 "$DEST" hooks install || echo "qoro install: hooks were not installed; see the message above" >&2
@@ -200,25 +208,13 @@ if [ "$(uname -s)" = "Darwin" ]; then
     "$DEST" notch install || echo "the notch was not turned on; the rest of qoro is installed"
 fi
 
-# The questions the install asks, and only when there is a person to answer them:
-# pick the terminal pet, and whether a finished or waiting agent plays a sound. Piped
-# runs and CI stay non-interactive by construction, and quitting keeps the install
-# just done. The sound is asked once: a config.toml that already says is kept.
-if [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
-    "$DEST" avatar pick || true
-    cfg=$("$DEST" config | head -n 1 | sed 's/  (no file.*//')
-    if ! grep -Eqs '(^|[.{,[:space:]])sound[[:space:]]*=' "$cfg"; then
-        printf 'play a sound when an agent finishes or needs you? [Y/n] '
-        read -r answer || answer=n
-        case "$answer" in
-            [nN]*) sound=false ;;
-            *) sound=true ;;
-        esac
-        "$DEST" config set notify.sound "$sound" || true
-    fi
+# On a first install, and only when there is a person to answer, the onboarding steps:
+# the pet, the sounds, light or dark, the command key, notifications, sleep. Piped runs and
+# CI stay non-interactive by construction, and quitting keeps the install just done.
+if [ -n "$first" ] && [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
+    "$DEST" onboard || true
 else
-    echo "pick an avatar when ready: qoro avatar pick"
-    echo "sounds when an agent finishes or needs you: qoro config set notify.sound true"
+    echo "the pet, the sounds and every other setting: qoro settings"
 fi
 
 # The hooks call `qoro` by name, so it has to be on PATH. Said, not done: an rc

@@ -193,7 +193,7 @@ pub fn route(env: &Env) -> Route {
     }
 }
 
-/// Where a note goes, as the settings box says it.
+/// Where a note goes, as `qoro settings` says it.
 pub fn describe(route: Route) -> String {
     match route {
         Route::Escape { escape, tmux } => {

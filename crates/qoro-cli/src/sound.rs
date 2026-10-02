@@ -10,14 +10,13 @@
 //! kept as written: a Mac name in a file shared with Linux stays when enter keeps it, and
 //! only what plays here is shown.
 
-use std::io::{IsTerminal, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{IsTerminal, Write};
 use std::sync::mpsc;
-use std::time::Duration;
 
-use qoro_runtime::client::TerminalGuard;
 use qoro_tui::config;
 use qoro_tui::notify;
+
+use crate::page::{Key, Player, Session, next_keys};
 
 /// What one step ended with.
 enum Pick {
@@ -46,21 +45,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     let path = config::path();
     let c = config::read().config;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let (guard, typed) = if tty {
-        let guard = TerminalGuard::enter_raw()?;
-        // A panic must not leave the terminal raw, nor its message on a screen that goes.
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            TerminalGuard::restore();
-            previous_hook(info);
-        }));
-        // The alternate screen, cursor hidden; the guard's restore leaves both.
-        print!("\x1b[?1049h\x1b[?25l");
-        (Some(guard), Some(typing()))
-    } else {
-        (None, None)
-    };
-    let mut player = Player(None);
+    let session = if tty { Some(Session::start()?) } else { None };
+    let typed = session.as_ref().map(|s| &s.typed);
+    let mut player = Player::new();
     let mut said = Vec::new();
     let steps = [
         (
@@ -104,7 +91,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     };
     // What was written is said even when a later step failed.
     let result = each();
-    drop(guard);
+    drop(session);
     if !tty {
         println!();
     }
@@ -112,122 +99,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         println!("{line}");
     }
     if said.iter().any(|line| line.ends_with('"')) {
-        println!("a running qoro takes it when its settings open (prefix, space, settings)");
+        println!("a running qoro takes it within two seconds");
     }
     result
-}
-
-/// The terminal's bytes, read on a thread of their own so the picker can wait a moment
-/// for the rest of an escape sequence without blocking on it.
-fn typing() -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 64];
-        while let Ok(n @ 1..) = stdin.read(&mut buf) {
-            if tx.send(buf[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
-    rx
-}
-
-/// The sound playing now, stopped when the next one starts so moving fast never stacks
-/// them.
-struct Player(Option<Child>);
-
-impl Player {
-    fn play(&mut self, name: &str, macos: bool) {
-        if let Some(mut was) = self.0.take() {
-            let _ = was.kill();
-            let _ = was.wait();
-        }
-        let Some(call) = notify::sound(false, macos, name, name) else {
-            return;
-        };
-        self.0 = Command::new(call.program)
-            .args(&call.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok();
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Key {
-    Left,
-    Right,
-    Up,
-    Down,
-    Enter,
-    Again,
-    Off,
-    Quit,
-}
-
-/// The keys in `bytes`, and how many bytes they used. An arrow comes as `ESC [ x` (or
-/// `ESC O x`); an escape at the very end may be the start of one cut off by the read, so it
-/// is left unused for the caller to wait on; bytes that mean nothing here are skipped.
-fn keys(bytes: &[u8]) -> (Vec<Key>, usize) {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let key = match bytes[i] {
-            0x1b if i + 1 == bytes.len()
-                || (i + 2 == bytes.len() && matches!(bytes[i + 1], b'[' | b'O')) =>
-            {
-                return (out, i);
-            }
-            0x1b if matches!(bytes[i + 1], b'[' | b'O') => {
-                i += 2;
-                match bytes[i] {
-                    b'D' => Some(Key::Left),
-                    b'C' => Some(Key::Right),
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    _ => None,
-                }
-            }
-            b'h' => Some(Key::Left),
-            b'l' => Some(Key::Right),
-            b'k' => Some(Key::Up),
-            b'j' => Some(Key::Down),
-            b'\r' | b'\n' => Some(Key::Enter),
-            b' ' => Some(Key::Again),
-            b'o' => Some(Key::Off),
-            b'q' | 0x03 | 0x04 => Some(Key::Quit),
-            _ => None,
-        };
-        out.extend(key);
-        i += 1;
-    }
-    (out, i)
-}
-
-/// The keys typed next: what arrives, and when it ends in a cut-off escape, what follows
-/// within a moment. Nothing following, a lone escape is the escape key and quits.
-fn next_keys(typed: &mpsc::Receiver<Vec<u8>>) -> Vec<Key> {
-    let Ok(mut bytes) = typed.recv() else {
-        return vec![Key::Quit];
-    };
-    loop {
-        let (mut found, used) = keys(&bytes);
-        if used == bytes.len() {
-            return found;
-        }
-        match typed.recv_timeout(Duration::from_millis(50)) {
-            Ok(more) => bytes.extend(more),
-            Err(_) => {
-                if bytes[used..] == [0x1b] {
-                    found.push(Key::Quit);
-                }
-                return found;
-            }
-        }
-    }
 }
 
 /// Where the cursor goes: left and right wrap through the whole list, up and down stay in
@@ -290,21 +164,35 @@ fn choose_with_keys(
     loop {
         out.write_all(screen(title, list, at).as_bytes())?;
         out.flush()?;
-        for key in next_keys(typed) {
+        // Redrawn when something was typed, not on the quiet ticks: the screen starts with a
+        // clear, and clearing it three times a second is a flicker.
+        let mut keys = Vec::new();
+        while keys.is_empty() {
+            keys = next_keys(typed);
+        }
+        for key in keys {
+            let key = match key {
+                Key::Char('h') => Key::Left,
+                Key::Char('l') => Key::Right,
+                Key::Char('k') => Key::Up,
+                Key::Char('j') => Key::Down,
+                other => other,
+            };
             match key {
                 Key::Enter if untouched => return Ok(Pick::Keep(shown)),
                 Key::Enter => return Ok(Pick::Keep(list[at])),
-                Key::Off => return Ok(Pick::Off),
-                Key::Quit => return Ok(Pick::Quit),
-                Key::Again => {
+                Key::Char('o') => return Ok(Pick::Off),
+                Key::Char('q') | Key::Esc | Key::Stop => return Ok(Pick::Quit),
+                Key::Char(' ') => {
                     untouched = false;
                     player.play(list[at], macos);
                 }
-                _ => {
+                Key::Left | Key::Right | Key::Up | Key::Down => {
                     untouched = false;
                     at = moved(key, at, list.len(), per_row);
                     player.play(list[at], macos);
                 }
+                _ => {}
             }
         }
     }
@@ -401,46 +289,6 @@ mod tests {
             Line::Play("window-question")
         );
         assert_eq!(parse_line("glass", linux), Line::Invalid);
-    }
-
-    #[test]
-    fn arrows_letters_and_a_cut_off_escape() {
-        let only = |bytes: &[u8]| keys(bytes).0;
-        assert_eq!(
-            only(b"\x1b[C\x1b[D\x1b[A\x1b[B\x1bOC"),
-            [Key::Right, Key::Left, Key::Up, Key::Down, Key::Right]
-        );
-        assert_eq!(
-            only(b"hjkl \r"),
-            [
-                Key::Left,
-                Key::Down,
-                Key::Up,
-                Key::Right,
-                Key::Again,
-                Key::Enter
-            ]
-        );
-        assert_eq!(only(b"q"), [Key::Quit]);
-        assert_eq!(only(b"\x03"), [Key::Quit]);
-        assert_eq!(only(b"o"), [Key::Off]);
-        assert_eq!(keys(b"x\x1b[Z"), (vec![], 4));
-        // An escape at the end, alone or with its `[`, is left for the next read.
-        assert_eq!(keys(b"\x1b"), (vec![], 0));
-        assert_eq!(keys(b"\x1b[C\x1b"), (vec![Key::Right], 3));
-        assert_eq!(keys(b"\x1b[C\x1b["), (vec![Key::Right], 3));
-    }
-
-    #[test]
-    fn a_lone_escape_quits_and_a_cut_arrow_waits_for_its_rest() {
-        let (tx, rx) = mpsc::channel();
-        tx.send(b"\x1b".to_vec()).unwrap();
-        assert_eq!(next_keys(&rx), [Key::Quit]);
-        tx.send(b"l\x1b[".to_vec()).unwrap();
-        tx.send(b"D".to_vec()).unwrap();
-        assert_eq!(next_keys(&rx), [Key::Right, Key::Left]);
-        drop(tx);
-        assert_eq!(next_keys(&rx), [Key::Quit]);
     }
 
     #[test]

@@ -2,10 +2,11 @@
 
 One file, `~/.config/qoro/config.toml` (or `$XDG_CONFIG_HOME/qoro/config.toml`), and every
 key in it is optional. A value that cannot be used keeps its default and is named, by its
-line, on the interface's hint row and in the settings box (`ctrl-a m`, settings); nothing in
+line, on the interface's hint row and by `qoro config`; nothing in
 the file ever stops qoro from starting.
 
-The interface reads it when it starts and again whenever the settings box opens. `[sleep]`
+The interface reads it when it starts, and again within two seconds of any change to it
+(`qoro settings`, `qoro config set`, an editor). `[sleep]`
 and `[daemon]` are the daemon's, read from the same file: `daemon.exit_when_asleep` each
 time it falls quiet, `sleep.idle_minutes` when it starts (so a change to it takes a
 `qoro stop`, or the next time everything sleeps and the daemon leaves). A daemon on another

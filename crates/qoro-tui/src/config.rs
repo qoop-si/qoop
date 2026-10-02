@@ -18,11 +18,11 @@
 //! lm = "opencode"
 //! ```
 //!
-//! Read by the interface at start and again whenever the settings box opens, so an edit
-//! takes effect without a restart and without a watcher; `qoro bridge` reads `[agents]` the
-//! same way whenever a phone asks for the list. `[sleep]` and `[daemon]` are the daemon's:
-//! it reads them itself when it decides, and their rules live beside it in
-//! `qoro_runtime::config`, which this file asks rather than repeating them.
+//! Read by the interface at start and again within two seconds of a change (its modified
+//! time, checked with the ack), so an edit takes effect without a restart; `qoro bridge`
+//! reads `[agents]` the same way whenever a phone asks for the list. `[sleep]` and
+//! `[daemon]` are the daemon's: it reads them itself when it decides, and their rules live
+//! beside it in `qoro_runtime::config`, which this file asks rather than repeating them.
 //!
 //! Read as TOML by the `toml` crate, so dotted keys (`notify.desktop = false`), inline
 //! tables and quoting behave the way the format says. Nothing here is ever fatal: a value
@@ -183,7 +183,7 @@ impl Problem {
         }
     }
 
-    /// As the settings box says it, beside the file's own path.
+    /// As the hint row says it, beside the file's own path.
     pub fn short(&self) -> String {
         match self.line {
             Some(line) => format!("line {line}: {}", self.what),
@@ -543,7 +543,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 7] = [
+pub const KEYS: [&str; 9] = [
     "prefix",
     "theme",
     "notify.desktop",
@@ -551,6 +551,8 @@ pub const KEYS: [&str; 7] = [
     "notify.done_sound",
     "notify.alert_sound",
     "notch.enabled",
+    "sleep.idle_minutes",
+    "daemon.exit_when_asleep",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -567,11 +569,17 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
         },
-        "notify.desktop" | "notify.sound" | "notch.enabled" => match value {
-            "true" => toml_edit::value(true),
-            "false" => toml_edit::value(false),
-            _ => return Err(format!("{key} is true or false")),
+        "sleep.idle_minutes" => match value.parse::<i64>() {
+            Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
+            _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
         },
+        "notify.desktop" | "notify.sound" | "notch.enabled" | "daemon.exit_when_asleep" => {
+            match value {
+                "true" => toml_edit::value(true),
+                "false" => toml_edit::value(false),
+                _ => return Err(format!("{key} is true or false")),
+            }
+        }
         _ => {
             return Err(format!(
                 "there is no setting {key}; the settings are {}",
@@ -627,92 +635,6 @@ fn prefix_byte(name: &str) -> Option<u8> {
         .as_bytes()
         .contains(&byte)
         .then(|| byte - b'a' + 1)
-}
-
-/// The settings box's rows, computed once when the file is read.
-///
-/// Held here for the reason `keys::show_prefix` holds the prefix: the box is painted from
-/// the frame, and every frame test in the interface builds a `Frame` by hand, so a field
-/// there for a box that is open a few seconds a week is a larger change than the box.
-static SHOWN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// Say what the settings box should show. Set wherever the file is read.
-pub fn show(rows: Vec<String>) {
-    *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = rows;
-}
-
-/// The settings box's rows about the file, as last shown.
-pub fn shown() -> Vec<String> {
-    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// The rows about the file, in its own syntax, so what the box shows is what a person
-/// would write: where the file is, each setting in effect with what it may be, where a
-/// notification goes (`notes`), and what could not be used.
-pub fn describe(read: &Read, light: bool, notes: &str) -> Vec<String> {
-    let config = read.config;
-    // Each setting as it is written in the file, then what it may be, in one column.
-    let row = |written: String, about: &str| format!(" {written:<19} {about}");
-    let theme_now = match config.theme {
-        Theme::Auto if light => "auto | dark | light, light now",
-        Theme::Auto => "auto | dark | light, dark now",
-        _ => "auto | dark | light",
-    };
-    let notes = if config.desktop {
-        format!("notes go to {notes}")
-    } else {
-        "no desktop notes".to_string()
-    };
-    let mut rows = vec![
-        format!(
-            " {}{}",
-            plain(&read.path.display().to_string()),
-            if read.exists {
-                ""
-            } else {
-                "  (no file: defaults)"
-            }
-        ),
-        row(
-            format!("prefix = \"{}\"", crate::keys::name_of(config.prefix)),
-            PREFIX_SAID,
-        ),
-        row(format!("theme = \"{}\"", config.theme.name()), theme_now),
-        " [notify]".to_string(),
-        row(format!("desktop = {}", config.desktop), &notes),
-        row(format!("sound = {}", config.sound), "true | false"),
-        row(
-            format!("done_sound = \"{}\"", config.done_sound),
-            "a finished agent, qoro sound to hear them",
-        ),
-        row(
-            format!("alert_sound = \"{}\"", config.alert_sound),
-            "one that waits on you or failed",
-        ),
-        " [notch]".to_string(),
-        row(format!("enabled = {}", config.notch), "true | false, macOS"),
-        " [sleep]".to_string(),
-        row(
-            format!("idle_minutes = {}", config.lifecycle.idle_minutes),
-            "0 = never, else a space idle this long sleeps",
-        ),
-        " [daemon]".to_string(),
-        row(
-            format!("exit_when_asleep = {}", config.lifecycle.exit_when_asleep),
-            "leave when nothing is awake",
-        ),
-    ];
-    if !read.agents.is_empty() {
-        rows.push(" [agents]".to_string());
-        rows.extend(read.agents.iter().map(|a| {
-            row(
-                format!("{} = \"{}\"", plain(&a.name), plain(&a.command)),
-                "a new agent",
-            )
-        }));
-    }
-    rows.extend(read.problems.iter().map(|p| format!(" ! {}", p.short())));
-    rows
 }
 
 #[cfg(test)]
@@ -876,41 +798,6 @@ mod tests {
         assert!(hint.contains("kept the default"), "{hint}");
     }
 
-    /// The settings box shows each setting as it is written in the file, where a note goes,
-    /// and each problem by its line without the path again.
-    #[test]
-    fn the_settings_rows_read_like_the_file() {
-        let (config, problems) = parse("theme = blue\n[notify]\nsound = true\n");
-        let read = Read {
-            config,
-            problems,
-            path: PathBuf::from("/c/config.toml"),
-            exists: true,
-            ..Read::default()
-        };
-        let rows = describe(&read, true, "terminal-notifier");
-        assert_eq!(rows[0], " /c/config.toml");
-        assert!(rows[1].starts_with(" prefix = \"ctrl-a\""), "{rows:?}");
-        assert!(rows[2].ends_with("light now"), "{rows:?}");
-        assert!(
-            rows[4].contains("notes go to terminal-notifier"),
-            "{rows:?}"
-        );
-        assert!(rows[5].starts_with(" sound = true"), "{rows:?}");
-        assert_eq!(
-            rows[6],
-            " done_sound = \"Glass\" a finished agent, qoro sound to hear them"
-        );
-        assert!(rows[7].starts_with(" alert_sound = \"Funk\" "), "{rows:?}");
-        assert_eq!(rows[8], " [notch]");
-        assert!(rows[9].starts_with(" enabled = true"), "{rows:?}");
-        assert_eq!(rows[10], " [sleep]");
-        assert!(rows[11].starts_with(" idle_minutes = 0"), "{rows:?}");
-        assert_eq!(rows[12], " [daemon]");
-        assert!(rows[13].starts_with(" exit_when_asleep = true"), "{rows:?}");
-        assert_eq!(rows[14], " ! line 1: needs quotes: theme = \"blue\"");
-    }
-
     /// Nothing from the file reaches the screen with a line break or a control character
     /// in it: the parser's own message spans lines, and a quoted key can hold anything.
     #[test]
@@ -957,6 +844,24 @@ mod tests {
             parse("prefix = \"ctrl-a\"\ntheme = \"blue\"\n[notify]\n\nsound = \"yes\"\n");
         let lines: Vec<Option<usize>> = problems.iter().map(|p| p.line).collect();
         assert_eq!(lines, vec![Some(2), Some(5)], "{problems:?}");
+    }
+
+    /// The two daemon settings are written as the daemon reads them, a whole number of
+    /// minutes and a true or false, and a minus or a fraction is refused.
+    #[test]
+    fn set_writes_the_daemon_sleep_settings_it_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("config.toml");
+        set(&file, "sleep.idle_minutes", "20").unwrap();
+        set(&file, "daemon.exit_when_asleep", "false").unwrap();
+        let lifecycle = read_from(&file).config.lifecycle;
+        assert_eq!(
+            (lifecycle.idle_minutes, lifecycle.exit_when_asleep),
+            (20, false)
+        );
+        for bad in ["-1", "x", "1.5"] {
+            assert!(set(&file, "sleep.idle_minutes", bad).is_err(), "{bad}");
+        }
     }
 
     /// One setting is written and nothing else moves: comments, order and a key this

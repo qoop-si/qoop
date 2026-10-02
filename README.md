@@ -182,8 +182,8 @@ qoro stop               end everything now: what was awake comes back on the nex
 ```
 
 The interface reads `~/.config/qoro/config.toml` (or `$XDG_CONFIG_HOME/qoro/config.toml`)
-when it starts and again whenever the settings box opens (`ctrl-a m`, settings). Every
-key is optional:
+when it starts, and again within two seconds of any change to it (`qoro settings`, also on
+`ctrl-a m`, settings; `qoro config set`; an editor). Every key is optional:
 
 ```toml
 prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
@@ -197,8 +197,9 @@ idle_minutes = 0    # 0 = never; else a tab idle and unwatched this long sleeps
 exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 ```
 
-A value it cannot use keeps its default and is named on the hint row. The settings box
-shows what is in effect and where a notification would go. `[sleep]` and `[daemon]` are
+A value it cannot use keeps its default and is named on the hint row. `qoro settings`
+shows every setting with your pet and changes it as you go, and where a notification would
+go; `qoro onboard` walks through the main ones on a first start. `[sleep]` and `[daemon]` are
 the daemon's own, read by it from the same file; every key is in
 [docs/config.md](docs/config.md).
 

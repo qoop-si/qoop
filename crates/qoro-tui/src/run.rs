@@ -417,6 +417,9 @@ struct State {
     /// `TerminalCreated`/`Failed` answer, with the name the person gave the tab, if
     /// any, which waits for its conversation.
     pending_agents: std::collections::BTreeMap<String, (String, Option<String>)>,
+    /// When `config.toml` was last changed, as last seen: checked with the ack (two
+    /// seconds), so a change made anywhere holds here with no restart.
+    config_stamp: Option<std::time::SystemTime>,
     /// Names owed to the conversations of new agent tabs, by terminal: sent once, as a
     /// session rename, the first time the index shows the agent in a conversation, so the
     /// name follows it through a sleep the way a rename from the box does. Dropped when
@@ -516,7 +519,7 @@ struct State {
     /// nothing else arrives to drain a flag on. Consumed by the loop, never
     /// on a timer.
     focus_fetch: bool,
-    /// An overlay showing something read only: the keys, or what this daemon is set to.
+    /// An overlay showing something read only: the keys.
     reading: Option<Reading>,
     /// Spaces asked for and not yet answered for.
     ///
@@ -1547,7 +1550,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("equalize panes", "=", "every pane the same share"),
     ("toggle view", "g", "spaces as a tree or agents by urgency"),
     ("keybinds", "?", "every key, and what it does"),
-    ("settings", "", "what this daemon is set to"),
+    ("settings", "", "every setting on one page, with your pet"),
     // After "settings": a letter jumps to the first row it starts, and `s` has
     // meant settings for longer than these two rows have existed.
     ("sleep space", "", "every tab of it sleeps"),
@@ -2042,11 +2045,18 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Nothing
         }
         "settings" => {
-            // Read again on the way in, so the box shows the file as it is now and an
-            // edit made since the start takes effect here, with no watcher and no restart.
-            use_config(state, &crate::config::read());
-            state.reading = Some(Reading::Settings);
-            MenuSend::Nothing
+            // The page is its own program, `qoro settings`, in a tab of its own: `exec`, so
+            // the tab goes when the page closes. By name, so a remote space runs that
+            // machine's qoro on that machine's file.
+            *request += 1;
+            let space = state.space;
+            MenuSend::Control(start_agent_terminal(
+                state,
+                *request,
+                "exec qoro settings",
+                space,
+                Some("settings".to_string()),
+            ))
         }
         "reload manifests" => {
             *request += 1;
@@ -2092,7 +2102,6 @@ fn menu_click(bytes: &[u8], cols: u16, lines: u16, kind: &MenuKind) -> Option<Op
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Reading {
     Keybinds,
-    Settings,
 }
 
 /// A person being asked what to call the thing they just asked for.
@@ -4257,6 +4266,7 @@ where
         split_saving: 0,
         resync: false,
         split_origin: std::collections::BTreeMap::new(),
+        config_stamp: config_stamp(),
         pending_agents: std::collections::BTreeMap::new(),
         session_titles: std::collections::BTreeMap::new(),
         agent_typing: Vec::new(),
@@ -4736,6 +4746,15 @@ where
                     if sidebar::refresh_files() {
                         dirty = true;
                     }
+                    if config_moved(&mut state) {
+                        let read = crate::config::read();
+                        use_config(&mut state, &read);
+                        // What in the changed file could not be used is said, as at the start.
+                        if let Some(said) = read.hint() {
+                            state.hint = Some(said);
+                        }
+                        dirty = true;
+                    }
                 }
                 _ = sigterm.recv() => return Ok(()),
                 _ = sighup.recv() => return Ok(()),
@@ -5100,7 +5119,7 @@ where
                         feed = Some(bytes);
                     }
                     if let Some(input) = feed {
-                    // The settings box read the file again and the prefix changed: the
+                    // The file was read again and the prefix changed: the
                     // decoder starts over with the new one.
                     if keys.prefix() != state.config.prefix {
                         keys = Keys::with_prefix(state.config.prefix);
@@ -6737,18 +6756,26 @@ fn exit_trailer() -> Vec<u8> {
     out
 }
 
+/// Whether `config.toml` changed since it was last seen, by its modified time: a change from
+/// `qoro settings` in a tab, `qoro sound`, `qoro config set` or an editor. A file that is
+/// gone, or comes back, counts as a change too.
+fn config_moved(state: &mut State) -> bool {
+    let now = config_stamp();
+    std::mem::replace(&mut state.config_stamp, now) != now
+}
+
+fn config_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::config::path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// Put a read of `config.toml` in effect: the prefix every overlay and the screen's words
-/// use, and what the settings box describes. The decoder follows the prefix on the next
-/// keystroke (see the stdin arm).
+/// use. The decoder follows the prefix on the next keystroke (see the stdin arm).
 fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
     retheme(state);
-    crate::config::show(crate::config::describe(
-        read,
-        crate::theme::light(),
-        &crate::notify::describe(state.route),
-    ));
 }
 
 /// Keep what the terminal said about itself.
@@ -10444,6 +10471,7 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            config_stamp: None,
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
@@ -11564,6 +11592,7 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            config_stamp: None,
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
@@ -11687,6 +11716,7 @@ mod tests {
             split_saving: 0,
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
+            config_stamp: None,
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),

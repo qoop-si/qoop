@@ -22,7 +22,7 @@ pub(crate) const PREFIX: u8 = 0x01;
 static SHOWN_PREFIX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PREFIX);
 
 /// Say which prefix the screen should name. Set where the interface starts and again
-/// whenever the settings box reads `config.toml`.
+/// whenever it reads `config.toml` again.
 pub fn show_prefix(byte: u8) {
     SHOWN_PREFIX.store(byte, std::sync::atomic::Ordering::Relaxed);
 }

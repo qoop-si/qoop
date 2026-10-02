@@ -18,9 +18,11 @@ sound = false
 | `notify.desktop` | `true` | desktop notifications, see [Notifications](#notifications) |
 | `notify.sound` | `false` | a sound with each notification |
 
-The file is read when the interface starts and again whenever the settings box opens
-(`ctrl-a space`, then `settings`), so an edit applies without a restart. The settings box shows the
-file, the value in force for each key, and any problem.
+The file is read when the interface starts, and again within two seconds of any change to it,
+so an edit applies without a restart. `qoro settings` (also `ctrl-a space`, then `settings`)
+changes it from a page. The page shows every setting with your pet and writes a
+change as you make it; `qoro config` prints the file, the value in force for each key, and any
+problem.
 
 A mistake never stops qoro: a value it cannot use keeps that key's default, and the hint row
 says which line and why (`line 3: sound is true or false`). A line that is not TOML at all

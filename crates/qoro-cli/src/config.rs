@@ -54,6 +54,8 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.done_sound": c.done_sound,
                 "notify.alert_sound": c.alert_sound,
                 "notch.enabled": c.notch,
+                "sleep.idle_minutes": c.lifecycle.idle_minutes,
+                "daemon.exit_when_asleep": c.lifecycle.exit_when_asleep,
             },
             "agents": read.agents.iter().map(|a| serde_json::json!({ "name": a.name, "command": a.command })).collect::<Vec<_>>(),
             "choices": {
@@ -83,6 +85,8 @@ fn show(json: bool) -> std::io::Result<()> {
     println!("notify.done_sound = \"{}\"", c.done_sound);
     println!("notify.alert_sound = \"{}\"", c.alert_sound);
     println!("notch.enabled = {}", c.notch);
+    println!("sleep.idle_minutes = {}", c.lifecycle.idle_minutes);
+    println!("daemon.exit_when_asleep = {}", c.lifecycle.exit_when_asleep);
     for a in &read.agents {
         println!("agents.{} = {:?}", a.name, a.command);
     }

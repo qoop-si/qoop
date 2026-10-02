@@ -2036,98 +2036,15 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
     );
 }
 
-/// A read only overlay: the keys, or what this daemon is set to.
-///
-/// Every line of it is a real value read from the interface itself rather than a screen
-/// somebody drew once: a settings page that says what the program wishes were true is worse
-/// than no settings page. Answers where the cursor goes while the keys are searched.
+/// A read only overlay: the keys. Answers where the cursor goes while they are searched.
 fn paint_reading(
     frame: &Frame,
     reading: crate::run::Reading,
     out: &mut String,
 ) -> Option<(usize, usize)> {
-    if reading == crate::run::Reading::Keybinds {
-        return paint_keys(frame, frame.chrome.keys_query, out);
+    match reading {
+        crate::run::Reading::Keybinds => paint_keys(frame, frame.chrome.keys_query, out),
     }
-    let lines = [
-        format!(" window          {} by {}", frame.cols, frame.lines),
-        format!(
-            " left column     {} columns{}",
-            if frame.collapsed {
-                sidebar::COLLAPSED
-            } else {
-                frame.sidebar_width
-            },
-            if frame.collapsed { ", folded" } else { "" }
-        ),
-        format!(" spaces          {}", frame.spaces.len()),
-        format!(" terminals       {}", frame.rows.len()),
-        format!(
-            " agents          {}",
-            frame
-                .rows
-                .iter()
-                .filter(|r| r.agent && r.state != "sleeping")
-                .count()
-        ),
-        format!(
-            " waiting         {}",
-            frame
-                .rows
-                .iter()
-                .filter(|r| matches!(r.state.as_str(), "blocked" | "failed"))
-                .count()
-        ),
-    ];
-    let file = crate::config::shown();
-    let widest = lines
-        .iter()
-        .chain(&file)
-        .map(|l| width::width(l))
-        .max()
-        .unwrap_or(0);
-    let inner = box_inner(frame, widest + 1, "settings");
-    let rows: Vec<String> = lines
-        .iter()
-        .map(|line| live_row(line, inner))
-        .chain(file.iter().map(|line| {
-            // The file's lines as written, a `[section]` as a heading.
-            let ink = if line.trim_start().starts_with('[') {
-                theme::Role::Title
-            } else {
-                theme::Role::Text
-            };
-            format!("{}{}", theme::fg(ink), width::fit(line, inner))
-        }))
-        .chain(std::iter::once(hint_line(CLOSE_HINT, inner)))
-        .collect();
-    paint_box(frame, "settings", inner, &rows, out);
-    None
-}
-
-/// What closes a box that is only being read. Any key does; esc is the one to say.
-const CLOSE_HINT: &[(&str, &str)] = &[("esc", "close")];
-
-/// One of the live settings rows: its name faint and its value plain, somebody waiting
-/// in the colour that says so. The value starts after the name's run of spaces.
-fn live_row(text: &str, inner: usize) -> String {
-    let fitted = width::fit(text, inner);
-    let name = fitted.trim_start();
-    let at = (fitted.len() - name.len())
-        + name.find("  ").map_or(name.len(), |gap| {
-            gap + (name[gap..].len() - name[gap..].trim_start().len())
-        });
-    let (head, tail) = fitted.split_at(at);
-    let ink = if head.trim() == "waiting" && tail.trim() != "0" {
-        theme::Role::Blocked
-    } else {
-        theme::Role::Text
-    };
-    format!(
-        "{}{head}{}{tail}",
-        theme::fg(theme::Role::Faint),
-        theme::fg(ink)
-    )
 }
 
 /// One group of the keys overlay: its name, which ink of the space wheel tells it apart,
@@ -6794,58 +6711,6 @@ mod tests {
             pane_size_for(120, 24, false, 0, 18),
             (120 - 18 - 1, (24 - TABS - STATUS) as u16)
         );
-    }
-
-    /// The settings census counts live agents: a sleeping tomb is listed,
-    /// not counted.
-    #[test]
-    fn the_settings_census_counts_live_agents_not_sleepers() {
-        let rows = [row(1, "claude", "working"), row(2, "claude", "sleeping")];
-        let mut out = String::new();
-        paint_reading(
-            &Frame {
-                armed: None,
-                rows: &rows,
-                spaces: &spaces(),
-                panes: std::collections::BTreeMap::new(),
-                space: Some(1),
-                focused: 1,
-                snapshot: None,
-                cols: 100,
-                lines: 24,
-                message: None,
-                hint: None,
-                palette: None,
-                prompt: None,
-                menu: None,
-                collapsed: false,
-                reading: Some(crate::run::Reading::Settings),
-                selection: None,
-                scroll: 0,
-                tick: 0,
-                now_unix: TEST_NOW,
-                sidebar_width: sidebar::WIDTH,
-                view: sidebar::View::Tree,
-                seen: &sidebar::Seen::new(),
-                unseen: &sidebar::Unseen::new(),
-                anchor: 0,
-                rows_back: 0,
-                tiles: Vec::new(),
-                behind: &crate::run::Behind {
-                    terminal: 0,
-                    from: 0,
-                    lines: Vec::new(),
-                    total: 0,
-                },
-                image_notice: None,
-                chrome: Default::default(),
-            },
-            crate::run::Reading::Settings,
-            &mut out,
-        );
-        let shown = strip(&out);
-        assert!(shown.contains(" agents          1"), "{out:?}");
-        assert!(shown.contains(" terminals       2"), "{out:?}");
     }
 
     /// The close box and the keys box on windows that cannot hold them, and a name that

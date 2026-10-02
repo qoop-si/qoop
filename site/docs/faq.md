@@ -32,8 +32,8 @@ qoro's `ctrl-a` and tmux's `ctrl-b` apart.
 
 ## No desktop notification appears
 
-The settings box (`ctrl-a space`, then `settings`) says where notifications go in this
-session, or why nowhere. The usual fixes are in [Notifications](#notifications).
+`qoro settings` says where notifications go from that terminal (its desktop row), or why
+nowhere. The usual fixes are in [Notifications](#notifications).
 
 ## Colors look wrong on a light terminal
 
