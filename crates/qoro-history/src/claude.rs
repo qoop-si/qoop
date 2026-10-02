@@ -31,6 +31,8 @@ pub fn parse_lines(lines: &[String]) -> (Vec<Message>, usize) {
 
 fn route(obj: &Value) -> Option<Message> {
     match obj.get("type").and_then(Value::as_str).unwrap_or("") {
+        // Text the agent adds on its own (a loaded skill): nobody's message.
+        "user" | "assistant" if obj.get("isMeta").and_then(Value::as_bool) == Some(true) => None,
         "user" | "assistant" => {
             let role = obj
                 .get("message")
@@ -191,6 +193,19 @@ mod tests {
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[1].text, "3 passed");
+    }
+
+    /// What the agent adds on its own (a skill's text when it loads) is marked
+    /// `isMeta`: nobody typed it and nobody said it, so it is no message at all.
+    #[test]
+    fn meta_lines_are_no_message() {
+        let (msgs, _) = parse_lines(&lines(vec![
+            json!({"type":"user","message":{"role":"user","content":"/commit"}}),
+            json!({"type":"user","isMeta":true,"message":{"role":"user","content":[
+                {"type":"text","text":"Base directory for this skill: /x"}]}}),
+        ]));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text, "/commit");
     }
 
     #[test]
