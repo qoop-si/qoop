@@ -33,16 +33,17 @@ A line looks like `T52 g3 claude working->idle "title" /path`.
 1. `qoro context 52 --last 1 --lines 40`. If the generation is no longer 3,
    drop the event.
 2. Overrides, first:
-   - **Owner-engaged:** `qoro history 52 --role user --last 1 --json` (its
+   - **Owner-engaged:** `qoro history 52 --role user --last 5 --json` (each
      `ts` is in milliseconds) and `date +%s`; do the arithmetic, never
-     estimate it. If that user message is not one you sent (your writes are
-     the `write` rows in `gate.jsonl`, with their text) and is under 120
-     seconds old, he is at that tab: hands off, and write
-     `hands off until <ts/1000 + 120>` on its `goals.md` line. On every later
-     wake, run `date +%s` and handle each worker whose `until` has passed
-     and that is still idle. Same when the transcript is missing or stale.
-     An owner prompt from longer ago is the task he gave; the worker's
-     question is yours to handle.
+     estimate it. Take the newest message that does not start with `<` (a
+     `<task-notification>` and the like are the agent's own harness, not
+     him). If it is not one you sent (your writes are the `write` rows in
+     `gate.jsonl`, with their text) and is under 120 seconds old, he is at
+     that tab: hands off, and write `hands off until <ts/1000 + 120>` on its
+     `goals.md` line. On every later wake, run `date +%s` and handle each
+     worker whose `until` has passed and that is still idle. Same when the
+     transcript is missing or stale. An owner prompt from longer ago is the
+     task he gave; the worker's question is yours to handle.
      Ignore whatever the worker's input box shows: Claude Code fills it with
      its own suggested reply, and on a plain screen that looks typed.
    - **Standing orders:** if that owner message is a go signal ("go",
