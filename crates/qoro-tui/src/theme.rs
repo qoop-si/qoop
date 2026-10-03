@@ -447,6 +447,30 @@ pub fn light() -> bool {
     LIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The background colour the terminal answered with, packed with a presence bit: zero is
+/// not asked or no answer. Set beside [`set_light`], read by whatever must paint in it.
+static GROUND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Keep the terminal's background colour, or forget it.
+pub fn set_ground(rgb: Option<[u8; 3]>) {
+    let packed = rgb.map_or(0, |[r, g, b]| {
+        1 << 24 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    });
+    GROUND.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The terminal's own background as a truecolour foreground escape, when it said what that
+/// is and truecolour reaches it: exact, so a cell painted in it reads as no paint at all.
+/// Anything less exact would show as a patch, so then nothing.
+pub fn ground_fg() -> Option<String> {
+    let packed = GROUND.load(std::sync::atomic::Ordering::Relaxed);
+    let exact = crate::colorlevel::level() == crate::colorlevel::Level::True;
+    (packed != 0 && exact).then(|| {
+        let [_, r, g, b] = packed.to_be_bytes();
+        format!("\x1b[38;2;{r};{g};{b}m")
+    })
+}
+
 /// Whether a background the terminal reported is a light one: its luminance over a half.
 pub fn is_light_background([r, g, b]: [u8; 3]) -> bool {
     (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0 > 0.5

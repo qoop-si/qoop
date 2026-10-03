@@ -2842,8 +2842,8 @@ pub(crate) const PET_COLS: usize = 8;
 /// The same for every avatar, so the words sit in the same rows whatever the pet is.
 pub(crate) const PET_FOOT_ROWS: usize = qoro_runtime::avatar::ART_ROWS + 1;
 
-/// The pet as itself: its five half-block rows (a cell is two pixels, top in the
-/// foreground and bottom in the background), trimmed to the columns any row lights, the
+/// The pet as itself: its five half-block rows (a cell is two pixels, drawn as
+/// [`qoro_runtime::avatar::paint`] says), trimmed to the columns any row lights, the
 /// same trim for every row so the picture is never skewed. Pre-escaped for the overlay to
 /// stamp at the right of the foot, with its width in cells. Rows it does not light are
 /// blank, so the pet stands on the menu row whatever its hair. Empty without colour,
@@ -2855,34 +2855,38 @@ pub(crate) fn avatar_overlay(
     if !colour {
         return (0, Vec::new());
     }
-    use qoro_runtime::avatar::{ART_COLS, art_cells, bg, fg};
+    use qoro_runtime::avatar::{ART_COLS, Paint, art_cells, bg, fg, paint};
     let cells = art_cells(avatar);
     let lit = |x: usize| cells.iter().any(|row| row[x] != (None, None));
     let Some(lo) = (0..ART_COLS).find(|x| lit(*x)) else {
         return (0, Vec::new());
     };
     let hi = (0..ART_COLS).rfind(|x| lit(*x)).unwrap_or(lo);
-    let ink = |ink: u8| crate::theme::pet(ink);
+    let fore = |n: u8| fg(crate::theme::pet(n));
+    let back =
+        |n: Option<u8>| n.map_or_else(|| "\x1b[49m".to_string(), |n| bg(crate::theme::pet(n)));
+    let ground = crate::theme::ground_fg();
     let rows = cells
         .iter()
         .map(|row| {
             // Reset first: whatever the column last painted must not tint the blanks.
             let mut line = String::from("\x1b[0m");
-            let (mut fg_now, mut bg_now): (Option<u8>, Option<u8>) = (None, None);
-            for &(top, bottom) in &row[lo..=hi] {
-                // A lit bottom under an empty top is the lower half block in the bottom's
-                // ink, so an empty half is always the terminal's own background.
-                let (glyph, fore, back) = match (top, bottom) {
-                    (Some(_), _) => ('\u{2580}', top, bottom),
-                    (None, Some(_)) => ('\u{2584}', bottom, None),
-                    (None, None) => (' ', fg_now, None),
+            let (mut fg_now, mut bg_now) = (String::new(), back(None));
+            for &cell in &row[lo..=hi] {
+                // An empty half is always the terminal's own background, or its exact colour.
+                let (glyph, fore, back) = match (paint(cell), &ground) {
+                    (Paint::Blank, _) => (' ', fg_now.clone(), back(None)),
+                    (Paint::Fill(n), _) => (' ', fg_now.clone(), back(Some(n))),
+                    (Paint::Lower { ink, over }, _) => ('\u{2584}', fore(ink), back(over)),
+                    (Paint::Upper(n), Some(ground)) => ('\u{2584}', ground.clone(), back(Some(n))),
+                    (Paint::Upper(n), None) => ('\u{2580}', fore(n), back(None)),
                 };
                 if fore != fg_now {
-                    line.push_str(&fore.map(|n| fg(ink(n))).unwrap_or_default());
+                    line.push_str(&fore);
                     fg_now = fore;
                 }
                 if back != bg_now {
-                    line.push_str(&back.map_or_else(|| "\x1b[49m".to_string(), |n| bg(ink(n))));
+                    line.push_str(&back);
                     bg_now = back;
                 }
                 line.push(glyph);
@@ -5078,7 +5082,7 @@ mod tests {
                 "unaccounted cells: {row:?}"
             );
         }
-        assert!(rows[0].contains("38;5;212"), "hair on top: {:?}", rows[0]);
+        assert!(rows[0].contains(";5;212m"), "hair on top: {:?}", rows[0]);
         assert!(rows.iter().any(|r| r.contains("48;5;33")), "body: {rows:?}");
         assert_eq!(avatar_overlay(&art_pet(), false), (0, Vec::new()));
         // The widest pet there is still fits the room the foot keeps for it.

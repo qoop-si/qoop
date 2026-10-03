@@ -7027,6 +7027,7 @@ fn retheme(state: &State) {
             .unwrap_or(false),
     };
     crate::theme::set_light(light);
+    crate::theme::set_ground(state.host_colors[1]);
 }
 
 /// The colours to tell the daemon, when both are known, they are not what it was last

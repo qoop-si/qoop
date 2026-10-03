@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use qoro_runtime::avatar::{
     self, Avatar, BODY, BODY_INK, EYE_STYLES, EYE_TITLES, GRID_H, GRID_W, HAIR_INK_TITLES,
-    HAIR_INKS, HAIR_STYLES, HAIR_TITLES, art_cells, bg, fg, pixel,
+    HAIR_INKS, HAIR_STYLES, HAIR_TITLES, Paint, art_cells, bg, fg, paint, pixel,
 };
 
 /// How many pets a batch holds.
@@ -344,21 +344,25 @@ fn art_lines(pet: &Avatar) -> Vec<String> {
             let mut line = String::new();
             let mut cur: (Option<u8>, Option<u8>) = (None, None);
             let mut filled = false;
-            for (top, bottom) in row {
-                filled = filled || top.is_some() || bottom.is_some();
-                if *top != cur.0 {
-                    line.push_str(&(*top).map(fg).unwrap_or_else(|| "\x1b[39m".to_string()));
-                    cur.0 = *top;
+            for &cell in row {
+                filled = filled || cell != (None, None);
+                // The picker cannot know the terminal's background, so a top alone stays
+                // the upper half block; everything else keeps its lit top a background.
+                let (glyph, fore, back) = match paint(cell) {
+                    Paint::Blank => (' ', cur.0, None),
+                    Paint::Fill(n) => (' ', cur.0, Some(n)),
+                    Paint::Lower { ink, over } => ('\u{2584}', Some(ink), over),
+                    Paint::Upper(n) => ('\u{2580}', Some(n), None),
+                };
+                if fore != cur.0 {
+                    line.push_str(&fore.map(fg).unwrap_or_else(|| "\x1b[39m".to_string()));
+                    cur.0 = fore;
                 }
-                if *bottom != cur.1 {
-                    line.push_str(&(*bottom).map(bg).unwrap_or_else(|| "\x1b[49m".to_string()));
-                    cur.1 = *bottom;
+                if back != cur.1 {
+                    line.push_str(&back.map(bg).unwrap_or_else(|| "\x1b[49m".to_string()));
+                    cur.1 = back;
                 }
-                line.push(if top.is_some() || bottom.is_some() {
-                    '\u{2580}'
-                } else {
-                    ' '
-                });
+                line.push(glyph);
             }
             line.push_str("\x1b[0m");
             (line, filled)

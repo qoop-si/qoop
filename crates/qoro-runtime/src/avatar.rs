@@ -149,6 +149,37 @@ pub fn art_cells(pet: &Avatar) -> [[Cell; ART_COLS]; ART_ROWS] {
     out
 }
 
+/// How one half-block cell is drawn. A background fills the whole cell in every terminal,
+/// and a font's lower half block reaches the cell's foot, but a font's upper half block
+/// often starts below the cell's top (iTerm2 with its own box drawing off, for one), which
+/// cuts a dark line between two lit rows. So a lit top is always a background, never the
+/// upper block's ink, wherever the cell allows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paint {
+    /// Nothing lit: a space on the terminal's own background.
+    Blank,
+    /// Both halves one ink: a space on that ink.
+    Fill(u8),
+    /// The lower half block in `ink` over `over`, `None` being the terminal's own ground.
+    Lower { ink: u8, over: Option<u8> },
+    /// Only the top lit, in this ink. With the terminal's background colour known, the
+    /// lower half block in that colour over the ink; without it, the upper half block.
+    Upper(u8),
+}
+
+/// See [`Paint`].
+pub fn paint((top, bottom): Cell) -> Paint {
+    match (top, bottom) {
+        (None, None) => Paint::Blank,
+        (Some(top), Some(bottom)) if top == bottom => Paint::Fill(top),
+        (top, Some(bottom)) => Paint::Lower {
+            ink: bottom,
+            over: top,
+        },
+        (Some(top), None) => Paint::Upper(top),
+    }
+}
+
 /// The pet as filled rects `(x, y, w, h, "#rrggbb")`, moved so its top left pixel is at 0, 0:
 /// how a phone's lock screen card draws it, which cannot read a file and gets only this.
 /// Runs of one colour in a row, merged with the same run in the rows below.
@@ -450,5 +481,28 @@ mod tests {
         let art = art_cells(&sample());
         assert!(art[0].iter().any(|(top, _)| *top == Some(212)));
         assert!(art[4].iter().any(|cell| cell.0 == Some(BODY_INK)));
+    }
+
+    /// A lit top is never left to the upper half block when anything sits under it: one
+    /// ink fills, two inks put the top in the background.
+    #[test]
+    fn a_lit_top_is_a_background_wherever_the_cell_allows() {
+        assert_eq!(paint((None, None)), Paint::Blank);
+        assert_eq!(paint((Some(33), Some(33))), Paint::Fill(33));
+        assert_eq!(
+            paint((Some(231), Some(33))),
+            Paint::Lower {
+                ink: 33,
+                over: Some(231)
+            }
+        );
+        assert_eq!(
+            paint((None, Some(33))),
+            Paint::Lower {
+                ink: 33,
+                over: None
+            }
+        );
+        assert_eq!(paint((Some(33), None)), Paint::Upper(33));
     }
 }
