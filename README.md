@@ -144,10 +144,8 @@ It opens qass in its own space on the agent `qoro settings` names (`qass runs on
 default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
 `claudes = "claude --model sonnet"`), or shows or wakes the one you have. Close it with the
 `x` on its row.
-Under Claude Code a hook on every tool call bounds what it may do, whatever it decides; it lives in
-`$(qoro paths qass-data)/.claude/settings.json`, so qass is bound the same way when a
-restore or a wake brings it back with nothing but `claude --resume`. Under Codex, Gemini
-or opencode that hook does not bind it: qass runs with that agent's own permissions. Your file
+Its rules live in the skill itself: what it answers alone, what it asks you, and what it
+never does. Your file
 `$(qoro paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
 your "ok <name>") or `mode auto`, and per repository grants such as
 `grant /path/to/repo commit`. When you correct it, it keeps the rule in

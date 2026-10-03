@@ -25,8 +25,8 @@ urgency="${3:-now}"
 handle="${4:-$id}"
 dir="@QASS_DATA@"
 mkdir -p "$dir"
-# A card for later is only written down; the gate keeps its options. Only now rings.
-# The options exactly as the gate recorded them, so the owner sees what a letter will send.
+# A card for later is only written down, in goals.md. Only now rings.
+# The options as given, so qass shows him exactly what a letter will send.
 shift 4 2>/dev/null || true
 for o in "$@"; do echo "  $o"; done
 if [ "${urgency:-now}" = later ]; then

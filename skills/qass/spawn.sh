@@ -4,15 +4,12 @@
 #   spawn.sh <repo> <branch> [--agent claude|opencode] [--space NAME]
 #                                   prints "<terminal> <generation>"
 #
-# The repo must be a git repository under $HOME and not $HOME itself. A Claude
-# worker runs in the owner's default permission mode with worker.json, whose
-# deny rules win over the owner's user allow list; an opencode worker gets the
-# same denials from worker-opencode.json, merged over the owner's opencode config.
-# The space is made when missing, as `qoro new --space` does.
-# The brief goes afterwards, through the gate, with `qoro prompt`.
+# The repo must be a git repository under $HOME and not $HOME itself. The worker
+# runs with the owner's own settings for that agent; what it may do is in its
+# brief. The space is made when missing, as `qoro new --space` does. The brief
+# goes afterwards, with `qoro prompt`.
 set -euo pipefail
 
-here="$(cd "$(dirname "$0")" && pwd -P)"
 repo="${1:?usage: spawn.sh <repo> <branch>}"
 branch="${2:?usage: spawn.sh <repo> <branch>}"
 shift 2
@@ -28,10 +25,8 @@ while [ $# -ge 2 ]; do
 done
 [ $# -eq 0 ] || { echo "spawn: $1 needs a value" >&2; exit 1; }
 case "$agent" in
-    claude) cmd=(claude --settings "$here/worker.json") ;;
-    # Inline: opencode 1.18 lists an OPENCODE_CONFIG file's rules but does not enforce
-    # them (measured); OPENCODE_CONFIG_CONTENT's it does.
-    opencode) cmd=(env OPENCODE_CONFIG_CONTENT="$(cat "$here/worker-opencode.json")" opencode) ;;
+    claude) cmd=(claude) ;;
+    opencode) cmd=(opencode) ;;
     *) echo "spawn: agent is claude or opencode" >&2; exit 1 ;;
 esac
 case "$branch" in -*) echo "spawn: bad branch $branch" >&2; exit 1 ;; esac
@@ -62,7 +57,6 @@ for _ in $(seq 180); do
     if [ -n "$g" ] && [ "$program" = opencode ] && [ "$agent" = opencode ]; then
         if [ "$state" = idle ]; then seen=$((seen + 1)); else seen=0; fi
         if [ "$seen" -ge 2 ]; then
-            printf '{"ts":%s,"spawned":%s,"gen":%s}\n' "$(date +%s)" "$t" "$g" >> "@QASS_DATA@/gate.jsonl"
             echo "$t $g"
             exit 0
         fi
@@ -83,7 +77,6 @@ for _ in $(seq 180); do
         elif [ "$state" != blocked ] && printf '%s' "$screen" | grep -q "❯"; then
             seen=$((seen + 1))
             if [ "$seen" -ge 2 ]; then
-                printf '{"ts":%s,"spawned":%s,"gen":%s}\n' "$(date +%s)" "$t" "$g" >> "@QASS_DATA@/gate.jsonl"
                 echo "$t $g"
                 exit 0
             fi

@@ -25,18 +25,18 @@ const FILE: &str = "SKILL.md";
 
 /// qass, the assistant over every other agent: installed beside each agent's qoro skill
 /// (`.claude/skills/qass`, `.codex/skills/qass`, ...), as files that sit beside each other
-/// because the scripts find one another by their own directory. The gate is Claude Code's
-/// (a PreToolUse hook in the working folder's settings); under another agent qass runs with
-/// that agent's own permissions.
+/// because the scripts find one another by their own directory. Its rules are in its
+/// SKILL.md; nothing beside them holds it back.
 fn qass_dir(target: &Target) -> PathBuf {
     Path::new(target.dir).with_file_name("qass")
 }
 
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
 /// `qoro paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
-/// filled in here at install. The working folder's `.claude/settings.json` holds the gate
-/// and its permission mode, loaded by any Claude started there, by hand, restored or woken
-/// (a restore types a bare `claude --resume`, so flags given at launch do not come back).
+/// filled in here at install. The working folder's `.claude/settings.json` lets Claude run
+/// qass's commands without asking and loads its lessons, for any Claude started there, by
+/// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
+/// launch do not come back).
 struct QassDirs {
     data: PathBuf,
     owner: PathBuf,
@@ -74,16 +74,6 @@ const QASS: &[(&str, &str, bool)] = &[
         true,
     ),
     (
-        "gate.sh",
-        include_str!("../../../skills/qass/gate.sh"),
-        true,
-    ),
-    (
-        "gate.py",
-        include_str!("../../../skills/qass/gate.py"),
-        false,
-    ),
-    (
         "escalate.sh",
         include_str!("../../../skills/qass/escalate.sh"),
         true,
@@ -99,17 +89,10 @@ const QASS: &[(&str, &str, bool)] = &[
         include_str!("../../../skills/qass/settings.json"),
         false,
     ),
-    (
-        "worker.json",
-        include_str!("../../../skills/qass/worker.json"),
-        false,
-    ),
-    (
-        "worker-opencode.json",
-        include_str!("../../../skills/qass/worker-opencode.json"),
-        false,
-    ),
 ];
+
+/// What older installs wrote and qass no longer has: taken out at the next install.
+const QASS_GONE: [&str; 4] = ["gate.sh", "gate.py", "worker.json", "worker-opencode.json"];
 
 /// One agent's skills directory, and whether it is proven to be read.
 struct Target {
@@ -241,6 +224,9 @@ fn install_qass(home: &Path, dirs: &QassDirs, target: &Target) -> std::io::Resul
     let dir = home.join(qass_dir(target));
     std::fs::create_dir_all(&dir)?;
     let mut changed = migrate_old_qass(home, dirs)?;
+    for gone in QASS_GONE {
+        changed |= std::fs::remove_file(dir.join(gone)).is_ok();
+    }
     for (name, body, program) in QASS {
         let path = dir.join(name);
         let body = dirs.render(body);
@@ -504,15 +490,18 @@ mod tests {
                     .expect("file");
             assert!(!body.contains("@QASS_"), "{name} still names a placeholder");
         }
-        // Its folder carries the gate too, so a restored or woken qass is gated.
+        // Its folder loads the lessons, so a restored or woken qass still has them.
         let folder = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
-        assert!(folder.contains("gate.sh") && folder.contains(&dirs.owner.display().to_string()));
-        let gate = home
+        assert!(folder.contains(&dirs.owner.display().to_string()));
+        let watch = home
             .path()
             .join(qass_dir(&target("claude")))
-            .join("gate.sh");
-        let mode = std::fs::metadata(&gate).expect("gate").permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "gate.sh is not runnable");
+            .join("watch.sh");
+        let mode = std::fs::metadata(&watch)
+            .expect("watch")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "watch.sh is not runnable");
         assert!(
             !install_qass(home.path(), &dirs, &target("claude")).expect("reinstall"),
             "the second install changed something"
@@ -528,6 +517,21 @@ mod tests {
         assert!(!remove_qass(home.path(), &dirs, &target("claude")).expect("uninstall again"));
         assert!(!home.path().join(qass_dir(&target("claude"))).exists());
         assert!(!dirs.folder_settings().exists());
+    }
+
+    /// What an older install wrote and qass no longer has goes at the next install.
+    #[test]
+    fn an_older_install_loses_its_gate() {
+        let home = home_dir();
+        let dirs = QassDirs {
+            data: home.path().join("data/qass"),
+            owner: home.path().join("config/qass"),
+        };
+        let dir = home.path().join(qass_dir(&target("claude")));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("gate.py"), "old").expect("old gate");
+        assert!(install_qass(home.path(), &dirs, &target("claude")).expect("install"));
+        assert!(!dir.join("gate.py").exists());
     }
 
     /// Every agent gets qass beside its qoro skill; taking it from one leaves the others

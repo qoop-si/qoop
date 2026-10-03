@@ -1,33 +1,9 @@
 {
   "permissions": {
     "defaultMode": "dontAsk",
-    "allow": [
-      "Bash(qoro agents*)",
-      "Bash(qoro context *)",
-      "Bash(qoro read *)",
-      "Bash(qoro history *)",
-      "Bash(qoro prompt *)",
-      "Bash(qoro send *)",
-      "Bash(wend search *)",
-      "Read(/@QASS_DATA@/**)",
-      "Read(/@QASS_CONFIG@/**)",
-      "Edit(/@QASS_DATA@/goals.md)",
-      "Edit(/@QASS_CONFIG@/lessons.md)"
-    ],
-    "deny": [
-      "Edit(/@QASS_CONFIG@/policy)",
-      "Edit(/@QASS_DATA@/gate.jsonl)",
-      "WebFetch",
-      "WebSearch"
-    ]
+    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"]
   },
   "hooks": {
-    "PreToolUse": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" tool", "timeout": 20 }] }
-    ],
-    "UserPromptSubmit": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/skills/qass/gate.sh\" owner" }] }
-    ],
     "SessionStart": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; echo \"qass: after a wake or a resume the fleet watcher is not running; start it again (Start, step 2) before anything else.\"; true" }] }
     ]
