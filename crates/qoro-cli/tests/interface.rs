@@ -192,8 +192,7 @@ impl Drop for Interface {
         // other test's daemon on the machine. Three of five of these gates failed with a
         // broken pipe as soon as the suite ran in parallel, and the daemon they were
         // talking to had been sent a SIGTERM by a test that was already over.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.end_client();
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
@@ -356,8 +355,29 @@ impl Interface {
     /// Kill only the client, leaving the daemon and its terminals: the
     /// next attach finds a live session with an unowned size.
     fn disconnect_client(&mut self) {
+        self.end_client();
+    }
+
+    /// Kill the interface and reap it, reading its terminal until it has gone. On macOS the
+    /// last close of a pty's slave waits for what is queued on it to be read: an interface
+    /// that was drawing when the test stopped reading stayed in exit for good, and a `wait`
+    /// with the master open and unread never returned (about one run in four of this file
+    /// in parallel, always the gate whose terminal draws all the time).
+    fn end_client(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut sink = [0u8; 4096];
+        while matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: a read into a buffer this function owns, from the non blocking master
+            // `self.master` owns; what it reads is thrown away.
+            unsafe {
+                libc::read(
+                    self.master.as_raw_fd(),
+                    sink.as_mut_ptr().cast(),
+                    sink.len(),
+                )
+            };
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// A second screen with its own window size on another interface's
