@@ -772,17 +772,76 @@ pub(crate) fn rows_folded(
     height: usize,
     avatar: Option<&qoro_runtime::avatar::Avatar>,
 ) -> Vec<Row> {
+    rows_folded_with(c, height, avatar, None)
+}
+
+/// [`rows_folded`] with a dragged row's landing rule opened before column row `rule.0`, in
+/// the colour `rule.1`. The rule goes in after the window is cut, and the window's last row
+/// makes room for it, so the list never scrolls under a held button and the foot stays put.
+/// The rows a click maps onto are always [`rows_folded`]'s: the rule is paint only, so the
+/// pointer can never chase its own rule.
+pub(crate) fn rows_folded_with(
+    c: &Column,
+    height: usize,
+    avatar: Option<&qoro_runtime::avatar::Avatar>,
+    rule: Option<(usize, crate::theme::Role)>,
+) -> Vec<Row> {
     if height == 0 {
         return Vec::new();
     }
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
     let (head, feet, body) = parts(c, height, avatar);
+    let mut list = window(content(c), body, c, c.width);
+    if let Some((at, role)) = rule.filter(|(at, _)| *at >= head.len() && !list.is_empty()) {
+        list.pop();
+        let at = (at - head.len()).min(list.len());
+        list.insert(at, (drop_rule(c.width, role), None));
+    }
     let mut out = head;
-    out.extend(window(content(c), body, c, c.width));
+    out.extend(list);
     out.extend(feet);
     out
 }
+
+/// The one-row rule a dragged row would land on: a thin line across the column.
+fn drop_rule(width: usize, role: crate::theme::Role) -> Line {
+    let text = format!(
+        " \u{2576}{}\u{2574}",
+        "\u{2500}".repeat(width.saturating_sub(4))
+    );
+    Line {
+        text: crate::width::fit(&text, width),
+        colour: Some(role),
+        ..Line::default()
+    }
+}
+
+/// What a dragged agent row reads as beside the pointer: its still mark, the role the mark
+/// wears, and its session name, with how many panes ride along when it carries a split.
+pub(crate) fn drag_chip(
+    c: &Column,
+    agent: &AgentRow,
+    more: usize,
+) -> (String, crate::theme::Role, String) {
+    let (role, _) = dot_of(c, agent);
+    let name = chip_name(&session_name(agent));
+    let name = if more > 0 {
+        format!("{name} (+{more})")
+    } else {
+        name
+    };
+    (cell_mark(role, false, 0), role, name)
+}
+
+/// A dragged row's name as its chip shows it, shortened in the middle.
+pub(crate) fn chip_name(name: &str) -> String {
+    shorten_middle(name, DRAG_CHIP_NAME)
+}
+
+/// The most columns a dragged row's name takes in its chip: enough to tell agents apart,
+/// short enough that the chip does not cover the pane it is being dragged over.
+const DRAG_CHIP_NAME: usize = 24;
 
 /// The rows above the list, the foot rows kept, and how many rows the list gets between.
 fn parts(
@@ -3202,6 +3261,56 @@ mod tests {
             ),
             height,
         )
+    }
+
+    /// A landing rule opens inside the list and costs its last row: the column keeps its
+    /// height, the rows above the rule and the foot do not move, and the rows under it move
+    /// down by one.
+    #[test]
+    fn a_drop_rule_opens_inside_the_list_and_keeps_the_foot() {
+        let spaces = [space(1, "qoro"), space(2, "app")];
+        let agents = [
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+            agent(3, 2, "claude", "blocked"),
+        ];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            0,
+            WIDTH,
+            &shut,
+        );
+        let plain = rows_folded(&c, 30, None);
+        let at = plain
+            .iter()
+            .position(|(_, hit)| *hit == Some(Hit::Terminal(2)))
+            .expect("drawn");
+        let role = crate::theme::space_in(&spaces, 1);
+        let ruled = rows_folded_with(&c, 30, None, Some((at, role)));
+        assert_eq!(ruled.len(), plain.len());
+        assert_eq!(ruled[..at], plain[..at]);
+        assert_eq!(
+            ruled[at].1, None,
+            "the rule is paint, never a place to click"
+        );
+        assert_eq!(ruled[at].0.colour, Some(role));
+        assert!(
+            ruled[at].0.text.contains('\u{2576}'),
+            "{:?}",
+            ruled[at].0.text
+        );
+        assert_eq!(crate::width::width(&ruled[at].0.text), WIDTH);
+        assert_eq!(ruled[at + 1], plain[at], "the rows under it move down one");
+        let foot = |rows: &[Row]| rows[rows.len() - 3..].to_vec();
+        assert_eq!(foot(&ruled), foot(&plain), "the foot stays put");
     }
 
     /// What a click on `row` of [`render`]'s column hits.

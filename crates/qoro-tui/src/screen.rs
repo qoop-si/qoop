@@ -137,6 +137,28 @@ pub struct Chrome<'a> {
     pub list_scroll: Option<usize>,
     /// The inbox at the top of the column, as this client left it.
     pub inbox: sidebar::Inbox,
+    /// A row held by the mouse and moving, drawn while it is carried.
+    pub drag: Option<&'a DragPaint>,
+}
+
+/// What a carried row looks like while the button is held: the rows it leaves dimmed, a
+/// chip with its mark and name riding beside the pointer, the rule where it would land in
+/// the column, and over a pane the rectangle it would take.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DragPaint {
+    /// The terminals whose rows dim: the carried tab and the panes riding with it.
+    pub carried: Vec<u32>,
+    /// The carried space, whose rule dims with its rows.
+    pub space: Option<i64>,
+    /// The chip: the still mark and its role, then the name.
+    pub chip: (String, theme::Role, String),
+    /// The pointer, one based screen row and column.
+    pub pointer: (u16, u16),
+    /// The landing rule: the column row it opens before, and the space whose colour it wears.
+    pub rule: Option<(usize, i64)>,
+    /// Over a pane, the cells the dropped tab would take: one based screen row and column of
+    /// the top left corner, then rows and columns.
+    pub outline: Option<(usize, usize, usize, usize)>,
 }
 
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
@@ -156,6 +178,7 @@ impl Default for Chrome<'_> {
             mode: None,
             list_scroll: None,
             inbox: sidebar::Inbox::default(),
+            drag: None,
         }
     }
 }
@@ -747,7 +770,12 @@ pub fn paint(frame: &Frame) -> String {
     let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
         sidebar::rows_collapsed(&column, column_rows)
     } else if wide_enough {
-        sidebar::rows_folded(&column, column_rows, avatar.as_ref())
+        let rule = frame
+            .chrome
+            .drag
+            .and_then(|drag| drag.rule)
+            .map(|(at, space)| (at, theme::space_in(frame.spaces, space)));
+        sidebar::rows_folded_with(&column, column_rows, avatar.as_ref(), rule)
     } else {
         Vec::new()
     };
@@ -786,6 +814,14 @@ pub fn paint(frame: &Frame) -> String {
         out.push('\u{256e}');
         out.push_str(theme::RESET);
     }
+    // The rows a held drag carries away stay where they were, dimmed, until it lands.
+    let carried = |hit: &Option<sidebar::Hit>| {
+        frame.chrome.drag.is_some_and(|drag| match hit {
+            Some(sidebar::Hit::Terminal(t)) => drag.carried.contains(t),
+            Some(sidebar::Hit::Space(s)) => drag.space == Some(*s),
+            _ => false,
+        })
+    };
     for row in 0..column_rows {
         out.push_str(&at(row + SIDEBAR_TOP, 1));
         // The state's colour, on the whole row. A person scanning this column is looking
@@ -801,6 +837,10 @@ pub fn paint(frame: &Frame) -> String {
         // edge.
         if let Some((line, _)) = panel.get(row).filter(|_| spotlight) {
             out.push_str(&faded);
+            out.push_str(&line.text);
+            out.push_str(theme::RESET);
+        } else if let Some((line, _)) = panel.get(row).filter(|(_, hit)| carried(hit)) {
+            out.push_str(&theme::fg(theme::Role::Faint));
             out.push_str(&line.text);
             out.push_str(theme::RESET);
         } else if let Some((line, hit)) = panel.get(row) {
@@ -1083,6 +1123,12 @@ pub fn paint(frame: &Frame) -> String {
                 colour,
             ));
         }
+    }
+
+    // A carried row over everything the column and the panes drew, and under every box a
+    // person can open, so a palette or a question still reads in front of it.
+    if let Some(drag) = frame.chrome.drag.filter(|_| !spotlight) {
+        paint_drag(frame, drag, &mut out);
     }
 
     // The palette floats over the terminal, so it is painted last: every row it takes
@@ -2434,6 +2480,45 @@ fn confirm_fits(frame: &Frame, terminal: u32) -> bool {
     frame.cols >= 24
         && frame.lines as usize >= TABS + STATUS + 5
         && frame.rows.iter().any(|r| r.terminal == terminal)
+}
+
+/// A carried row: the rectangle it would take over a pane, then its chip beside the pointer.
+///
+/// The chip sits two columns right of the pointer so the pointer never hides its mark, and
+/// is pulled back inside the screen and above the notice row, which says the same thing in
+/// words.
+fn paint_drag(frame: &Frame, drag: &DragPaint, out: &mut String) {
+    let (cols, lines) = (frame.cols as usize, frame.lines as usize);
+    if let Some((top, left, rows, wide)) = drag.outline.filter(|o| o.2 >= 2 && o.3 >= 2) {
+        out.push_str(&theme::fg(theme::Role::Text));
+        let inner = "\u{2500}".repeat(wide - 2);
+        out.push_str(&at(top, left));
+        out.push_str(&format!("\u{256d}{inner}\u{256e}"));
+        for row in top + 1..top + rows - 1 {
+            out.push_str(&at(row, left));
+            out.push('\u{2502}');
+            out.push_str(&at(row, left + wide - 1));
+            out.push('\u{2502}');
+        }
+        out.push_str(&at(top + rows - 1, left));
+        out.push_str(&format!("\u{2570}{inner}\u{256f}"));
+        out.push_str(theme::RESET);
+    }
+    let (mark, role, name) = &drag.chip;
+    let text_cols = 1 + width::width(mark) + width::width(name) + 1;
+    if text_cols > cols || lines <= STATUS {
+        return;
+    }
+    let row = (drag.pointer.0 as usize).clamp(1, lines - STATUS);
+    let col = (drag.pointer.1 as usize + 2).clamp(1, cols + 1 - text_cols);
+    out.push_str(&at(row, col));
+    out.push_str(&theme::selected_in(*role));
+    out.push(' ');
+    out.push_str(mark);
+    out.push_str(&theme::selected_in(theme::Role::Focused));
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(theme::RESET);
 }
 
 /// Asking before a busy agent is closed: the only box in the colour that says work can be
@@ -4587,6 +4672,102 @@ mod tests {
         });
         assert!(painted.contains("\x1b[?25l"));
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
+    }
+
+    /// A carried row paints its chip beside the pointer, the rectangle it would take over
+    /// the pane, and its own row dimmed in place.
+    #[test]
+    fn a_carried_row_shows_its_chip_its_outline_and_its_faded_row() {
+        let rows = [row(1, "claude", "idle"), row(2, "codex", "working")];
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind::default();
+        let panes = std::collections::BTreeMap::new();
+        let spaces = spaces();
+        let drag = DragPaint {
+            carried: vec![2],
+            space: None,
+            chip: (
+                "..".to_string(),
+                theme::Role::Working,
+                "carried".to_string(),
+            ),
+            pointer: (6, 50),
+            rule: None,
+            outline: Some((3, 60, 5, 10)),
+        };
+        let frame = Frame {
+            armed: None,
+            drawer: None,
+            rows: &rows,
+            spaces: &spaces,
+            panes,
+            space: Some(1),
+            focused: 1,
+            snapshot: None,
+            cols: 80,
+            lines: 24,
+            message: None,
+            hint: None,
+            palette: None,
+            prompt: None,
+            menu: None,
+            collapsed: false,
+            reading: None,
+            selection: None,
+            scroll: 0,
+            tick: 0,
+            now_unix: TEST_NOW,
+            sidebar_width: sidebar::WIDTH,
+            view: sidebar::View::Tree,
+            seen: &seen,
+            unseen: &unseen,
+            anchor: 0,
+            rows_back: 0,
+            tiles: Vec::new(),
+            behind: &behind,
+            image_notice: None,
+            chrome: Chrome {
+                drag: Some(&drag),
+                ..Default::default()
+            },
+        };
+        let out = paint(&frame);
+        let chip = format!(
+            "{}{} ..",
+            at(6, 52),
+            theme::selected_in(theme::Role::Working)
+        );
+        assert!(
+            out.contains(&chip),
+            "the chip two columns right of the pointer"
+        );
+        assert!(out.contains("carried "), "{:?}", strip(&out));
+        assert!(
+            out.contains(&format!("{}\u{256d}", at(3, 60))),
+            "top left corner"
+        );
+        let bottom = format!("{}\u{2570}{}\u{256f}", at(7, 60), "\u{2500}".repeat(8));
+        assert!(out.contains(&bottom), "bottom edge, both corners");
+        assert!(
+            out.contains(&format!("{}\u{2502}", at(4, 69))),
+            "right edge"
+        );
+        // The carried row is written in one faint ink, nothing else on it.
+        let faint = theme::fg(theme::Role::Faint);
+        let column = frame.column();
+        let panel = sidebar::rows_folded(&column, column_rows(24), None);
+        let carried = panel
+            .iter()
+            .find(|(_, hit)| *hit == Some(sidebar::Hit::Terminal(2)))
+            .map(|(line, _)| line.text.clone())
+            .expect("drawn");
+        assert!(out.contains(&format!("{faint}{carried}{}", theme::RESET)));
+        // And without the drag none of it is there.
+        let still = paint(&Frame {
+            chrome: Chrome::default(),
+            ..frame
+        });
+        assert!(!still.contains("carried"));
     }
 
     /// The last answer covers every row of the pane: its title on the first, the page

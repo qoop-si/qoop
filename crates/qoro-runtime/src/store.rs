@@ -126,12 +126,20 @@ impl StoreHandle {
     /// record its layout and the foreign key would refuse it.
     pub async fn open_workspace(&self) -> Result<i64, HandleError> {
         self.run(move |s| {
-            if let Some(first) = s.workspaces()?.first() {
-                return Ok(first.id);
+            // The lowest id, not the top of the list: a person reordering the spaces must
+            // not change which one is the daemon's own.
+            if let Some(first) = s.first_workspace()? {
+                return Ok(first);
             }
             s.create_workspace("default", now())
         })
         .await
+    }
+
+    /// Put a workspace just before `before` in the list, or last. Answers whether there was
+    /// such a workspace.
+    pub async fn move_workspace(&self, id: i64, before: Option<i64>) -> Result<bool, HandleError> {
+        self.run(move |s| s.move_workspace(id, before)).await
     }
 
     /// Every workspace this daemon holds.
@@ -293,9 +301,21 @@ impl StoreHandle {
             .await
     }
 
-    /// Move an open terminal to another workspace. Answers whether a row moved.
-    pub async fn move_terminal(&self, id: i64, workspace: i64) -> Result<bool, HandleError> {
-        self.run(move |s| s.move_terminal(id, workspace)).await
+    /// Move open terminals into a workspace, together, just before `before` or at the end.
+    /// Answers whether they moved.
+    pub async fn move_terminals(
+        &self,
+        ids: Vec<i64>,
+        workspace: i64,
+        before: Option<i64>,
+    ) -> Result<bool, HandleError> {
+        self.run(move |s| s.move_terminals(&ids, workspace, before))
+            .await
+    }
+
+    /// Every open terminal's place in its workspace's order.
+    pub async fn layout_order(&self) -> Result<Vec<(i64, i64)>, HandleError> {
+        self.run(|s| s.layout_order()).await
     }
 
     /// Forget a terminal's name, so a cleared tab comes back cleared too.

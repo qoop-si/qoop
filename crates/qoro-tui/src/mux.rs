@@ -47,6 +47,11 @@ pub fn is_remote_workspace(workspace: i64) -> bool {
     workspace >= 1 << WORKSPACE_SHIFT
 }
 
+/// Which machine a space is on, as the list groups them: zero for this one.
+pub fn machine_of(workspace: i64) -> usize {
+    workspace_in(workspace).0
+}
+
 /// A daemon's terminal number as the interface sees it, or `None` when it does not fit
 /// the range. Never wrapped: a wrapped number is somebody else's terminal.
 fn terminal_out(link: usize, id: u32) -> Option<u32> {
@@ -784,6 +789,64 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(link, R::CloseWorkspace { id, workspace })
                     .await
             }
+            // Each machine orders its own spaces, and they stay in its group of the list.
+            R::MoveWorkspace {
+                id,
+                workspace,
+                before,
+            } => {
+                let (link, workspace) = workspace_in(workspace);
+                let before = before.map(workspace_in);
+                if before.is_some_and(|(at, _)| at != link) {
+                    return self
+                        .failed(id, "spaces stay in their machine's group".to_string())
+                        .await;
+                }
+                self.send_one(
+                    link,
+                    R::MoveWorkspace {
+                        id,
+                        workspace,
+                        before: before.map(|(_, b)| b),
+                    },
+                )
+                .await
+            }
+            // A tab, the space it goes to and the tab it goes before all have to be on one
+            // machine: each daemon only knows its own.
+            R::MoveTerminal {
+                id,
+                terminal,
+                workspace,
+                place,
+            } => {
+                use qoro_runtime::control::Place;
+                let (link, terminal) = terminal_in(terminal);
+                let (to, workspace) = workspace_in(workspace);
+                let before = match place {
+                    Some(Place::Before(t)) => Some(terminal_in(t)),
+                    _ => None,
+                };
+                if to != link || before.is_some_and(|(at, _)| at != link) {
+                    return self
+                        .failed(id, "a tab cannot move between machines".to_string())
+                        .await;
+                }
+                let place = match before {
+                    Some((_, t)) => Some(Place::Before(t)),
+                    None => place,
+                };
+                self.send_one(
+                    link,
+                    R::MoveTerminal {
+                        id,
+                        terminal,
+                        workspace,
+                        place,
+                    },
+                )
+                .await
+            }
             // The machine whose idle sleep it is: the space's, a pane going with its space.
             R::SetKeepAwake {
                 id,
@@ -1491,6 +1554,24 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.touched(link);
                 self.respond(&C::Renamed { id }).await
             }
+            C::TerminalMoved {
+                id,
+                terminal,
+                workspace,
+            } => {
+                self.touched(link);
+                match (terminal_out(link, terminal), workspace_out(link, workspace)) {
+                    (Some(terminal), Some(workspace)) => {
+                        self.respond(&C::TerminalMoved {
+                            id,
+                            terminal,
+                            workspace,
+                        })
+                        .await
+                    }
+                    _ => Ok(()),
+                }
+            }
             // Answers that carry no number of either kind.
             other => self.respond(&other).await,
         }
@@ -2043,6 +2124,98 @@ mod tests {
                 ink: Some(4),
             }
         );
+    }
+
+    /// A tab moved on a remote goes to that machine in its own numbering, the tab it goes
+    /// before too, and its answer comes back in the interface's; a move that would cross
+    /// machines is refused here, never sent to a daemon that cannot know the other's tabs.
+    #[tokio::test]
+    async fn a_remote_tab_moves_on_its_machine_and_never_between_machines() {
+        use qoro_runtime::control::Place;
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let tab = terminal_out(1, 7).expect("fits");
+        let space = workspace_out(1, 3).expect("fits");
+        mux.control(ControlRequest::MoveTerminal {
+            id: "move-1".into(),
+            terminal: tab,
+            workspace: space,
+            place: Some(Place::Before(terminal_out(1, 5).expect("fits"))),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::MoveTerminal {
+                id: "move-1".into(),
+                terminal: 7,
+                workspace: 3,
+                place: Some(Place::Before(5)),
+            }
+        );
+        mux.answer(
+            1,
+            ControlResponse::TerminalMoved {
+                id: "move-1".into(),
+                terminal: 7,
+                workspace: 3,
+            },
+        )
+        .await
+        .expect("answered");
+        let said = String::from_utf8_lossy(&mux.down).to_string();
+        assert!(said.contains(&format!("\"terminal\":{tab}")), "{said}");
+        assert!(said.contains(&format!("\"workspace\":{space}")), "{said}");
+        // Into a space of this machine, or before a tab of it: refused, nothing sent.
+        for (workspace, place) in [(1, None), (space, Some(Place::Before(2)))] {
+            mux.down.clear();
+            mux.control(ControlRequest::MoveTerminal {
+                id: "move-2".into(),
+                terminal: tab,
+                workspace,
+                place,
+            })
+            .await
+            .expect("answered");
+            assert!(home_rx.try_recv().is_err() && remote_rx.try_recv().is_err());
+            let said = String::from_utf8_lossy(&mux.down).to_string();
+            assert!(said.contains("cannot move between machines"), "{said}");
+        }
+    }
+
+    /// A remote space moves in its own machine's list, in that machine's numbering; a move
+    /// that would put it among another machine's spaces is refused here.
+    #[tokio::test]
+    async fn a_remote_space_moves_among_its_machines_spaces_only() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::MoveWorkspace {
+            id: "order-1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            before: Some(workspace_out(1, 2).expect("fits")),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::MoveWorkspace {
+                id: "order-1".into(),
+                workspace: 3,
+                before: Some(2),
+            }
+        );
+        mux.control(ControlRequest::MoveWorkspace {
+            id: "order-2".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            before: Some(1),
+        })
+        .await
+        .expect("answered");
+        assert!(home_rx.try_recv().is_err() && remote_rx.try_recv().is_err());
+        let said = String::from_utf8_lossy(&mux.down).to_string();
+        assert!(said.contains("their machine's group"), "{said}");
     }
 
     /// A cup filled on a remote space or one of its panes reaches that machine's idle sleep,

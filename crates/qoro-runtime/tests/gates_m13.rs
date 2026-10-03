@@ -1268,6 +1268,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 id: "m0".into(),
                 terminal: second,
                 workspace: space + 100,
+                place: None,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1283,6 +1284,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 id: "m1".into(),
                 terminal: second,
                 workspace: space,
+                place: None,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1336,6 +1338,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 id: "m2".into(),
                 terminal: third,
                 workspace: space,
+                place: None,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1350,4 +1353,231 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
         vec![second as i64, third as i64]
     );
     assert!(d.store().splits().await.expect("splits").is_empty());
+}
+
+/// A tab reorders inside its own space, its split with it: the index lists the new order,
+/// the disk keeps it for the next start, an older client's move into its own space is
+/// still nothing, and a pane cannot be pulled out of its split's place on its own.
+#[tokio::test]
+async fn a_tab_reorders_in_its_own_space_split_and_all() {
+    use qoro_runtime::control::{ControlResponse, Place};
+    async fn mv(
+        client: &mut qoro_testkit::TestClient,
+        id: &str,
+        terminal: u32,
+        workspace: i64,
+        place: Option<Place>,
+    ) -> Option<ControlResponse> {
+        Box::pin(client.control(
+            &ControlRequest::MoveTerminal {
+                id: id.into(),
+                terminal,
+                workspace,
+                place,
+            },
+            qoro_testkit::PATIENCE,
+        ))
+        .await
+    }
+    async fn order(client: &mut qoro_testkit::TestClient, space: i64) -> Vec<u32> {
+        match client
+            .control(
+                &ControlRequest::ListAgents { id: "i".into() },
+                qoro_testkit::PATIENCE,
+            )
+            .await
+        {
+            Some(ControlResponse::Agents { agents, .. }) => agents
+                .iter()
+                .filter(|a| a.workspace == space)
+                .map(|a| a.terminal)
+                .collect(),
+            other => panic!("expected the index, got {other:?}"),
+        }
+    }
+    let moved =
+        |r: &Option<ControlResponse>| matches!(r, Some(ControlResponse::TerminalMoved { .. }));
+    let d = qoro_testkit::TestDaemon::start().await;
+    let first = d.terminals().streams()[0];
+    let space = d.workspace();
+    let mut client = d.attach("reorder").await;
+    let mut open = vec![first];
+    for id in ["t2", "t3", "t4"] {
+        match client
+            .control(
+                &ControlRequest::CreateTerminal {
+                    id: id.into(),
+                    cwd: None,
+                    workspace: None,
+                    name: None,
+                },
+                qoro_testkit::PATIENCE,
+            )
+            .await
+        {
+            Some(ControlResponse::TerminalCreated { terminal, .. }) => open.push(terminal),
+            other => panic!("expected a terminal, got {other:?}"),
+        }
+    }
+    let (second, third, fourth) = (open[1], open[2], open[3]);
+    // An older client's move into its own space: answered, and nothing moves.
+    let r = mv(&mut client, "r0", fourth, space, None).await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(
+        order(&mut client, space).await,
+        vec![first, second, third, fourth]
+    );
+    // To the front.
+    let r = mv(&mut client, "r1", fourth, space, Some(Place::Before(first))).await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(
+        order(&mut client, space).await,
+        vec![fourth, first, second, third]
+    );
+    // A split of the second and the third moves as one, and stays a split.
+    let tree = beside(leaf(second), leaf(third));
+    let saved = client
+        .control(
+            &ControlRequest::SetSplit {
+                id: "tree".into(),
+                tree: tree.clone(),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(saved, Some(ControlResponse::SplitSaved { .. })),
+        "{saved:?}"
+    );
+    let r = mv(
+        &mut client,
+        "r2",
+        second,
+        space,
+        Some(Place::Before(fourth)),
+    )
+    .await;
+    assert!(moved(&r), "{r:?}");
+    // A pane on its own has no place of its own.
+    let r = mv(&mut client, "r3", third, space, Some(Place::End)).await;
+    assert!(matches!(r, Some(ControlResponse::Failed { .. })), "{r:?}");
+    // Naming one of its own panes is where it already is.
+    let r = mv(&mut client, "r4", second, space, Some(Place::Before(third))).await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(
+        order(&mut client, space).await,
+        vec![second, third, fourth, first]
+    );
+    let stored: Vec<qoro_runtime::control::Pane> = d
+        .store()
+        .splits()
+        .await
+        .expect("splits")
+        .iter()
+        .map(|json| serde_json::from_str(json).expect("a tree"))
+        .collect();
+    assert_eq!(stored, vec![tree], "the split stayed whole");
+    // The next start opens them in this order.
+    let rows = d.store().open_terminals(space).await.expect("rows");
+    assert_eq!(
+        rows.iter().map(|r| r.id as u32).collect::<Vec<_>>(),
+        vec![second, third, fourth, first]
+    );
+    // A pane that closed is still in the recorded tree until the next start; the tab it
+    // leaves still moves, and a place named by it is its tab's.
+    let closed = client
+        .control(
+            &ControlRequest::CloseTerminal {
+                id: "x".into(),
+                terminal: third,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(closed, Some(ControlResponse::TerminalClosed { .. })),
+        "{closed:?}"
+    );
+    let gone = std::time::Instant::now();
+    while d.terminals().get(third).is_some() && gone.elapsed() < qoro_testkit::PATIENCE {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let r = mv(&mut client, "r5", second, space, Some(Place::End)).await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(order(&mut client, space).await, vec![fourth, first, second]);
+    let r = mv(&mut client, "r6", fourth, space, Some(Place::Before(third))).await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(order(&mut client, space).await, vec![first, fourth, second]);
+}
+
+/// Spaces keep the order a person gave them, and the daemon's own space stays its own
+/// wherever it is listed.
+#[tokio::test]
+async fn spaces_keep_their_order_and_the_first_stays_the_daemons() {
+    use qoro_runtime::control::ControlResponse;
+    let d = qoro_testkit::TestDaemon::start().await;
+    let home = d.workspace();
+    let mut client = d.attach("order").await;
+    let mut made = Vec::new();
+    for name in ["b", "c"] {
+        match client
+            .control(
+                &ControlRequest::CreateWorkspace {
+                    id: name.into(),
+                    name: name.into(),
+                },
+                qoro_testkit::PATIENCE,
+            )
+            .await
+        {
+            Some(ControlResponse::WorkspaceCreated { workspace, .. }) => made.push(workspace),
+            other => panic!("expected a workspace, got {other:?}"),
+        }
+    }
+    let (b, c) = (made[0], made[1]);
+    let moved = client
+        .control(
+            &ControlRequest::MoveWorkspace {
+                id: "o1".into(),
+                workspace: c,
+                before: Some(home),
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(moved, Some(ControlResponse::Renamed { .. })),
+        "{moved:?}"
+    );
+    match client
+        .control(
+            &ControlRequest::ListWorkspaces { id: "l".into() },
+            qoro_testkit::PATIENCE,
+        )
+        .await
+    {
+        Some(ControlResponse::Workspaces { workspaces, .. }) => {
+            assert_eq!(
+                workspaces.iter().map(|w| w.id).collect::<Vec<_>>(),
+                vec![c, home, b]
+            );
+            let first = workspaces.iter().find(|w| w.id == home).expect("listed");
+            assert!(!first.closable, "the daemon's own space is still its own");
+        }
+        other => panic!("expected the list, got {other:?}"),
+    }
+    let nowhere = client
+        .control(
+            &ControlRequest::MoveWorkspace {
+                id: "o2".into(),
+                workspace: 999,
+                before: None,
+            },
+            qoro_testkit::PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(nowhere, Some(ControlResponse::Failed { .. })),
+        "{nowhere:?}"
+    );
 }

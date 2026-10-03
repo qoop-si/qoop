@@ -745,6 +745,66 @@ impl TerminalRegistry {
         }
     }
 
+    /// Move a tab, its split and all, to a place in its own workspace's order. The split
+    /// lock is held from reading who is in the tab to writing the order, so a split made or
+    /// undone meanwhile cannot change the tab under the move. `Ok(None)` when the terminal
+    /// is a pane rather than its tab's first: a pane has no place of its own in the order.
+    async fn reorder(
+        &self,
+        stream: u32,
+        workspace: i64,
+        before: Option<i64>,
+        store: &crate::store::StoreHandle,
+    ) -> Result<Option<bool>, crate::store::HandleError> {
+        let _order = self.split_write.lock().await;
+        // The split as it stands: a pane that has closed is still in the recorded tree
+        // until the next start prunes it, and a tree naming another space's tab is not
+        // this space's to move.
+        let tab: Vec<u32> = self
+            .tab_of(stream)
+            .into_iter()
+            .filter(|t| self.workspace_of(*t) == Some(workspace))
+            .collect();
+        if tab.first() != Some(&stream) {
+            return Ok(None);
+        }
+        // A place named by a pane is its tab's, read under the same lock as the tab.
+        let before = before
+            .and_then(|b| u32::try_from(b).ok())
+            .map(|b| i64::from(self.lead_of(b)));
+        let ids = tab.iter().map(|t| i64::from(*t)).collect();
+        store.move_terminals(ids, workspace, before).await.map(Some)
+    }
+
+    /// Move one terminal into another workspace, just before the tab `before` names, read
+    /// under the split lock so a split changing meanwhile cannot leave the place stale.
+    async fn move_into(
+        &self,
+        stream: u32,
+        workspace: i64,
+        before: Option<i64>,
+        store: &crate::store::StoreHandle,
+    ) -> Result<bool, crate::store::HandleError> {
+        let _order = self.split_write.lock().await;
+        let before = before
+            .and_then(|b| u32::try_from(b).ok())
+            .map(|b| i64::from(self.lead_of(b)));
+        store
+            .move_terminals(vec![i64::from(stream)], workspace, before)
+            .await
+    }
+
+    /// The tab a terminal stands for in a space's order: the first live pane of its split,
+    /// or itself. A place named by a pane is its tab's place, so a split is never cut.
+    fn lead_of(&self, stream: u32) -> u32 {
+        let tab = self.tab_of(stream);
+        tab.iter()
+            .find(|t| self.get(**t).is_some())
+            .or(tab.first())
+            .copied()
+            .unwrap_or(stream)
+    }
+
     /// Give a terminal a different name. False when there is no such terminal.
     fn rename(&self, stream: u32, name: Option<String>) -> bool {
         match self.inner.lock().unwrap().get_mut(&stream) {
@@ -3377,6 +3437,7 @@ async fn handle_control(
         ControlRequest::MoveTerminal {
             terminal,
             workspace: to,
+            place,
             ..
         } => {
             let Some(from) = terminals.workspace_of(terminal) else {
@@ -3385,11 +3446,74 @@ async fn handle_control(
                     reason: format!("there is no terminal {terminal}"),
                 };
             };
+            // The tab a place names, as asked: resolved to its split's first pane where the
+            // move holds the split lock, so a split changing meanwhile cannot go stale.
+            let before = match place {
+                Some(crate::control::Place::Before(t)) => Some(i64::from(t)),
+                _ => None,
+            };
             if from == to {
-                return ControlResponse::TerminalMoved {
-                    id,
-                    terminal,
-                    workspace: to,
+                // An older client's move into its own space was always nothing at all.
+                let Some(_) = place else {
+                    return ControlResponse::TerminalMoved {
+                        id,
+                        terminal,
+                        workspace: to,
+                    };
+                };
+                let _space = books.lock_of(to).lock_owned().await;
+                // Read again under the lock: a move to another space that held it first
+                // must not be written back here.
+                if terminals.workspace_of(terminal) != Some(to) {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: "the tab moved while this was asked, try again".to_string(),
+                    };
+                }
+                if books.is_marked(terminal) {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("tab {terminal} is asleep, wake it first"),
+                    };
+                }
+                if agents.is_closed(terminal) {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("terminal {terminal} is closing"),
+                    };
+                }
+                // A split moves whole or not at all: half of it asleep would be left behind.
+                if terminals
+                    .tab_of(terminal)
+                    .iter()
+                    .any(|t| books.is_marked(*t))
+                {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: "part of this split is asleep, wake it first".to_string(),
+                    };
+                }
+                return match Box::pin(terminals.reorder(terminal, to, before, store)).await {
+                    Ok(Some(true)) => {
+                        agents.announce(terminal);
+                        ControlResponse::TerminalMoved {
+                            id,
+                            terminal,
+                            workspace: to,
+                        }
+                    }
+                    Ok(Some(false)) => ControlResponse::Failed {
+                        id,
+                        reason: format!("there is no open terminal {terminal}"),
+                    },
+                    Ok(None) => ControlResponse::Failed {
+                        id,
+                        reason: "drag the split by its first pane".to_string(),
+                    },
+                    Err(e) => ControlResponse::Failed {
+                        id,
+                        reason: format!("the order could not be saved: {e}"),
+                    },
                 };
             }
             // Both spaces' locks, the lower id first so two moves the other way round
@@ -3435,7 +3559,7 @@ async fn handle_control(
                     reason: format!("the split could not be saved: {e}"),
                 };
             }
-            match store.move_terminal(terminal as i64, to).await {
+            match Box::pin(terminals.move_into(terminal, to, before, store)).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return ControlResponse::Failed {
@@ -3501,6 +3625,19 @@ async fn handle_control(
                 },
             }
         }
+        ControlRequest::MoveWorkspace {
+            workspace, before, ..
+        } => match store.move_workspace(workspace, before).await {
+            Ok(false) => ControlResponse::Failed {
+                id,
+                reason: format!("there is no workspace {workspace}"),
+            },
+            Ok(true) => ControlResponse::Renamed { id },
+            Err(e) => ControlResponse::Failed {
+                id,
+                reason: format!("the order of the spaces could not be saved: {e}"),
+            },
+        },
         ControlRequest::SetKeepAwake {
             workspace,
             terminal,
@@ -3663,21 +3800,46 @@ async fn handle_control(
                 .into_iter()
                 .map(|t| (t, terminals.session_of(t)))
                 .collect();
-            let titles: BTreeMap<u32, String> =
-                crate::blocking::try_probe(PROBE_DEADLINE, move || {
-                    sessions
-                        .into_iter()
-                        .filter_map(|(t, s)| Some((t, agent_title(s.as_deref())?)))
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+            let titles = crate::blocking::try_probe(PROBE_DEADLINE, move || {
+                sessions
+                    .into_iter()
+                    .filter_map(|(t, s)| Some((t, agent_title(s.as_deref())?)))
+                    .collect::<BTreeMap<u32, String>>()
+            });
+            // Each tab's place in its space's order, and each space's place in the list, read
+            // beside the titles and held to their deadline, so a slow disk costs no more than
+            // the titles already may. Unread, the tabs keep id order.
+            // Boxed: this arm's future is part of every request's, and stays small that way.
+            let places = Box::pin(tokio::time::timeout(PROBE_DEADLINE, async {
+                tokio::join!(store.layout_order(), store.workspaces())
+            }));
+            let (titles, places) = tokio::join!(titles, places);
+            let titles = titles.unwrap_or_default();
+            let (order, spaces) = places.unwrap_or((Ok(Vec::new()), Ok(Vec::new())));
+            let order: BTreeMap<u32, i64> = order
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(t, at)| Some((u32::try_from(t).ok()?, at)))
+                .collect();
+            let listed: BTreeMap<i64, usize> = spaces
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(at, w)| (w.id, at))
+                .collect();
             // Read from the registry rather than by walking the process table here: the
             // registry is what the process watcher and the observation precedence in
             // ADR-008 already maintain, and a second reader would be a second answer.
             // One read of the registry for the rows and the splits both, so a terminal
-            // that closes in between cannot be in one and not the other.
-            let live = terminals.streams();
+            // that closes in between cannot be in one and not the other. Listed space by
+            // space in the list's order, each space's tabs in theirs, which is how every
+            // interface shows them.
+            let mut live = terminals.streams();
+            live.sort_by_cached_key(|t| {
+                let space = terminals.workspace_of(*t).unwrap_or(i64::MAX);
+                let place = listed.get(&space).copied().unwrap_or(usize::MAX);
+                (place, space, order.get(t).copied().unwrap_or(i64::MAX), *t)
+            });
             let rows: Vec<crate::control::AgentRow> = live
                 .iter()
                 .copied()

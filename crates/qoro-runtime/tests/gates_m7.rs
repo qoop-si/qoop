@@ -107,6 +107,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             workspace: 1,
             ink: Some(2),
         },
+        ControlRequest::MoveWorkspace {
+            id: "x14c".into(),
+            workspace: 1,
+            before: None,
+        },
         ControlRequest::SetKeepAwake {
             id: "x28".into(),
             workspace: 1,
@@ -179,6 +184,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x26".into(),
             terminal,
             workspace: 999,
+            place: None,
         },
         // 0.0.0 is no newer than this build, so it is answered as already there and nothing
         // is armed. A newer one would, at most, end every tab to become the binary on
@@ -207,6 +213,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }

@@ -258,6 +258,14 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS awake_terminal (
                  terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE
+             );
+             -- Where a person put each space in the list. A space never placed has no row
+             -- and comes after the placed ones, by id, so a new one lands at the end.
+             -- Cascaded like the rest, because ids are reused. New table, no version bump:
+             -- an older binary ignores it and lists the spaces by id.
+             CREATE TABLE IF NOT EXISTS workspace_order (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+                 position INTEGER NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -282,6 +290,42 @@ impl Store {
             "UPDATE workspace SET name = ?2 WHERE id = ?1",
             params![id, name],
         )?)
+    }
+
+    /// Put a workspace just before `before` in the list, or last when it is `None` or not a
+    /// workspace. Every space gets its place written, in one transaction, so the list is the
+    /// same on the next start. `before` naming the workspace itself moves nothing. Answers
+    /// false when there is no such workspace.
+    pub fn move_workspace(&mut self, id: i64, before: Option<i64>) -> Result<bool, StoreError> {
+        let mut order: Vec<i64> = self.workspaces()?.iter().map(|w| w.id).collect();
+        let Some(from) = order.iter().position(|w| *w == id) else {
+            return Ok(false);
+        };
+        if before == Some(id) {
+            return Ok(true);
+        }
+        order.remove(from);
+        let at = before
+            .and_then(|b| order.iter().position(|w| *w == b))
+            .unwrap_or(order.len());
+        order.insert(at, id);
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM workspace_order", [])?;
+        for (position, workspace) in order.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO workspace_order (workspace, position) VALUES (?1, ?2)",
+                params![workspace, position as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The daemon's own space: the lowest id, wherever the list has it.
+    pub fn first_workspace(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT MIN(id) FROM workspace", [], |r| r.get(0))?)
     }
 
     /// Pick a workspace's colour, or with `None` give it back the one its id gives it.
@@ -388,7 +432,9 @@ impl Store {
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT w.id, w.name, w.created_at, i.ink FROM workspace w \
-                 LEFT JOIN workspace_ink i ON i.workspace = w.id ORDER BY w.id",
+                 LEFT JOIN workspace_ink i ON i.workspace = w.id \
+                 LEFT JOIN workspace_order o ON o.workspace = w.id \
+                 ORDER BY o.position IS NULL, o.position, w.id",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -641,16 +687,49 @@ impl Store {
         Ok(())
     }
 
-    /// Move an open terminal to another workspace, at the end of its tabs. One
-    /// transaction for the row and its place, so a crash leaves it where it was.
-    /// Answers whether a row moved.
-    pub fn move_terminal(&mut self, id: i64, workspace: i64) -> Result<bool, StoreError> {
+    /// Move open terminals into a workspace, together and in the order given: just before
+    /// the open tab `before`, or after every open tab there when it is `None` or not one of
+    /// them. The workspace may be the one they are in, which is a reorder.
+    ///
+    /// One transaction for the rows and the whole order, so a crash leaves them where they
+    /// were. Answers whether they moved: nothing moves when one of them is not open. A
+    /// `before` that is one of them names where they already are when they are already in
+    /// this workspace, which moves nothing and answers yes; moving in from another, it names
+    /// nothing here, and they go last.
+    pub fn move_terminals(
+        &mut self,
+        ids: &[i64],
+        workspace: i64,
+        before: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        if before.is_some_and(|b| ids.contains(&b)) {
+            let mut here = true;
+            for id in ids {
+                let at: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT workspace FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                here &= at == Some(workspace);
+            }
+            if here {
+                return Ok(true);
+            }
+        }
+        let before = before.filter(|b| !ids.contains(b));
         let tx = self.conn.transaction()?;
-        let n = tx.execute(
-            "UPDATE terminal SET workspace = ?2 WHERE id = ?1 AND closed_at IS NULL",
-            params![id, workspace],
-        )?;
-        if n == 1 {
+        for id in ids {
+            let n = tx.execute(
+                "UPDATE terminal SET workspace = ?2 WHERE id = ?1 AND closed_at IS NULL",
+                params![id, workspace],
+            )?;
+            if n != 1 {
+                // Dropped unfinished: the transaction rolls back every row it touched.
+                return Ok(false);
+            }
             // A tab moves awake: the daemon refuses to move a sleeping one, and a mark
             // left here would hold its agent writes back in the new space.
             tx.execute(
@@ -658,14 +737,44 @@ impl Store {
                 params![id],
             )?;
             tx.execute("DELETE FROM layout WHERE terminal = ?1", params![id])?;
+        }
+        // The space's other open tabs in their order, the moved ones spliced in, and every
+        // place written again from zero. Closed rows keep theirs; a new tab still goes after
+        // them all, at the largest ordinal plus one.
+        let mut order: Vec<i64> = tx
+            .prepare(
+                "SELECT l.terminal FROM layout l JOIN terminal t ON t.id = l.terminal
+                 WHERE l.workspace = ?1 AND t.closed_at IS NULL
+                 ORDER BY l.ordinal, l.terminal",
+            )?
+            .query_map(params![workspace], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let at = before
+            .and_then(|b| order.iter().position(|t| *t == b))
+            .unwrap_or(order.len());
+        order.splice(at..at, ids.iter().copied());
+        for (ordinal, terminal) in order.iter().enumerate() {
             tx.execute(
-                "INSERT INTO layout (workspace, terminal, ordinal) VALUES (?2, ?1, \
-                 (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM layout WHERE workspace = ?2))",
-                params![id, workspace],
+                "INSERT INTO layout (workspace, terminal, ordinal) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (workspace, terminal) DO UPDATE SET ordinal = excluded.ordinal",
+                params![workspace, terminal, ordinal as i64],
             )?;
         }
         tx.commit()?;
-        Ok(n == 1)
+        Ok(true)
+    }
+
+    /// Every open terminal's place in its workspace's order, for a listing to sort by.
+    pub fn layout_order(&self) -> Result<Vec<(i64, i64)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.terminal, l.ordinal FROM layout l
+             JOIN terminal t ON t.id = l.terminal AND t.workspace = l.workspace
+             WHERE t.closed_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// The highest terminal id ever written, open or closed, or 0 for none.
@@ -687,7 +796,7 @@ impl Store {
                     t.created_at, t.closed_at
              FROM terminal t JOIN layout l ON l.terminal = t.id
              WHERE t.workspace = ?1 AND t.closed_at IS NULL
-             ORDER BY l.ordinal",
+             ORDER BY l.ordinal, t.id",
         )?;
         let rows = stmt
             .query_map(params![workspace], |r| {
@@ -1555,12 +1664,103 @@ mod tests {
         s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t");
         s.sleep_terminals(5, &[bare(1), bare(2)]).expect("sleep");
         s.close_terminal(1, 6).expect("close");
-        s.move_terminal(2, other).expect("move");
+        s.move_terminals(&[2], other, None).expect("move");
         assert!(s.asleep().expect("asleep").is_empty());
         // A closed row is never marked.
         s.sleep_terminals(7, &[bare(1)])
             .expect("sleep a closed one");
         assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    /// A move places tabs exactly: before a tab, at the end, in their own space or another,
+    /// a whole split together; naming one of the moved tabs, or a tab that is not open there,
+    /// changes nothing or lands at the end; a closed tab is never moved.
+    #[test]
+    fn a_move_places_tabs_where_it_is_asked() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        let other = s.create_workspace("o", 1).expect("ws");
+        for id in 1..=4 {
+            s.create_terminal(id, ws, "/tmp", "/bin/sh", 1).expect("t");
+        }
+        s.create_terminal(9, other, "/tmp", "/bin/sh", 1)
+            .expect("t");
+        let ids = |s: &Store, ws| -> Vec<i64> {
+            s.open_terminals(ws)
+                .expect("rows")
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        let order_of = |s: &Store| {
+            let mut all = s.layout_order().expect("order");
+            all.sort();
+            all
+        };
+        // Within its own space: to the front, into the middle, to the end.
+        assert!(s.move_terminals(&[3], ws, Some(1)).expect("move"));
+        assert_eq!(ids(&s, ws), vec![3, 1, 2, 4]);
+        assert!(s.move_terminals(&[3], ws, Some(4)).expect("move"));
+        assert_eq!(ids(&s, ws), vec![1, 2, 3, 4]);
+        assert!(s.move_terminals(&[1], ws, None).expect("move"));
+        assert_eq!(ids(&s, ws), vec![2, 3, 4, 1]);
+        // A split moves as one, in the order given.
+        assert!(s.move_terminals(&[4, 1], ws, Some(2)).expect("move"));
+        assert_eq!(ids(&s, ws), vec![4, 1, 2, 3]);
+        // Naming one of the moved tabs is where they already are.
+        let before = order_of(&s);
+        assert!(s.move_terminals(&[4, 1], ws, Some(1)).expect("no-op"));
+        assert_eq!(order_of(&s), before);
+        // Into another space naming itself: it names nothing there, and goes last.
+        assert!(s.move_terminals(&[3], other, Some(3)).expect("move"));
+        assert_eq!(ids(&s, other), vec![9, 3]);
+        assert!(s.move_terminals(&[3], ws, None).expect("back"));
+        // Into another space, at a place, and at the end when the place is not open there.
+        assert!(s.move_terminals(&[2], other, Some(9)).expect("move"));
+        assert_eq!(ids(&s, other), vec![2, 9]);
+        assert_eq!(ids(&s, ws), vec![4, 1, 3]);
+        assert!(s.move_terminals(&[3], other, Some(1)).expect("move"));
+        assert_eq!(ids(&s, other), vec![2, 9, 3]);
+        // A closed tab is not moved, and takes nothing with it.
+        s.close_terminal(4, 5).expect("close");
+        assert!(!s.move_terminals(&[1, 4], other, None).expect("refused"));
+        assert_eq!(ids(&s, ws), vec![1]);
+        assert_eq!(ids(&s, other), vec![2, 9, 3]);
+        // A new tab still lands after every other, closed ones included.
+        s.create_terminal(5, other, "/tmp", "/bin/sh", 1)
+            .expect("t");
+        assert_eq!(ids(&s, other), vec![2, 9, 3, 5]);
+    }
+
+    /// Spaces keep the order a person gave them: moved before another or to the end, new
+    /// ones after, a deleted one's place gone with it, and the lowest id still the first
+    /// space wherever it is listed.
+    #[test]
+    fn spaces_keep_the_order_they_were_put_in() {
+        let mut s = store();
+        let ids: Vec<i64> = ["a", "b", "c"]
+            .iter()
+            .map(|n| s.create_workspace(n, 1).expect("ws"))
+            .collect();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let listed = |s: &Store| -> Vec<i64> {
+            s.workspaces().expect("list").iter().map(|w| w.id).collect()
+        };
+        assert_eq!(listed(&s), vec![a, b, c], "never placed: by id");
+        assert!(s.move_workspace(c, Some(a)).expect("move"));
+        assert_eq!(listed(&s), vec![c, a, b]);
+        assert!(s.move_workspace(c, None).expect("move"));
+        assert_eq!(listed(&s), vec![a, b, c]);
+        assert!(s.move_workspace(a, Some(c)).expect("move"));
+        assert_eq!(listed(&s), vec![b, a, c]);
+        assert!(s.move_workspace(a, Some(a)).expect("no-op"));
+        assert_eq!(listed(&s), vec![b, a, c]);
+        assert!(!s.move_workspace(99, None).expect("no such space"));
+        let d = s.create_workspace("d", 1).expect("ws");
+        assert_eq!(listed(&s), vec![b, a, c, d], "a new space lands last");
+        s.delete_workspace(a).expect("delete");
+        assert_eq!(listed(&s), vec![b, c, d]);
+        assert_eq!(s.first_workspace().expect("first"), Some(b.min(c)));
     }
 
     #[test]

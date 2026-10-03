@@ -11,7 +11,7 @@ use std::path::Path;
 use bytes::BytesMut;
 use qoro_domain::AgentRuntimeState;
 use qoro_runtime::client::{self, Connection, Incoming, TerminalGuard};
-use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage};
+use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage, Place};
 use qoro_runtime::daemon::{ClientWire, SnapshotWire, StoredImage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -716,17 +716,44 @@ type TileHit = (u32, (usize, usize), (usize, usize));
 /// names the agent rather than the one under it.
 #[derive(Clone, Copy, Debug)]
 struct RowPress {
-    terminal: u32,
+    source: Source,
     at: (u16, u16),
+    /// Where the pointer is now, which the carried chip follows.
+    now: (u16, u16),
     name: bool,
     moved: bool,
+    /// Called off while the button is still down (Esc, a resize, the window losing focus,
+    /// a box opening): the rest of the gesture is swallowed, so a program in a pane never
+    /// sees motion and a release for a press it was never sent.
+    dead: bool,
 }
 
-/// Where a dragged agent row would go if it were let go here.
+/// What a held row carries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Source {
+    /// An agent's tab.
+    Agent(u32),
+    /// A space's rule. `fold` is what a click on it does: fold the space, or else go to it.
+    Space { space: i64, fold: bool },
+}
+
+/// Where a held row would go if it were let go here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RowDrop {
-    /// Another space, as a tab of its own.
+    /// Another space, at the end of its tabs: the drop where the column has no order to
+    /// point into (the priority list, the folded strip).
     Space(i64),
+    /// A place in a space's order, and the column row the landing rule opens before.
+    Slot {
+        space: i64,
+        place: Place,
+        rule: usize,
+    },
+    /// Where it already is: letting go changes nothing.
+    Here,
+    /// A carried space, just before `before` in the list or last of its machine's spaces,
+    /// and the column row the landing rule opens before.
+    SpaceSlot { before: Option<i64>, rule: usize },
     /// Beside this pane of the space on screen, on this side of it.
     Pane(u32, layout::Move),
 }
@@ -870,6 +897,7 @@ impl State {
             image_notice: None,
             chrome: screen::Chrome {
                 shut: &self.shut,
+                drag: None,
                 usage: &self.usage,
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
@@ -1255,44 +1283,210 @@ impl State {
         }
     }
 
-    /// What the column drew on a one based screen row, and whether that row is the first
-    /// of its kind: an agent's name rather than the row under it.
-    fn column_hit(&self, row: u16) -> Option<(sidebar::Hit, bool)> {
-        // The column, which starts at the top row and runs down to the status line.
-        let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+    /// The column at clock `now`, every row from the top: what a click and a drop both map
+    /// onto. A click maps onto the last paint (`paint_now`); a drag being painted maps onto
+    /// the frame it is painted in, so its rule lands on the rows drawn beside it.
+    fn column_rows_at(&self, now: i64) -> Vec<(sidebar::Line, Option<sidebar::Hit>)> {
         let column_rows = screen::column_rows(self.lines as usize);
-        // The last painted frame's clock, and frame zero of the animation: tiers move
-        // rows, the tick never does, and a click maps onto what the paint drew.
-        let column = self.column(self.paint_now, 0);
-        let rows = if self.collapsed {
+        // Frame zero of the animation: tiers move rows, the tick never does.
+        let column = self.column(now, 0);
+        if self.collapsed {
             sidebar::rows_collapsed(&column, column_rows)
         } else {
             // The paint gives the foot the pet's rows when a pet is picked, so the
             // click maps onto the same layout it drew.
             sidebar::rows_folded(&column, column_rows, sidebar::current_avatar().as_ref())
-        };
+        }
+    }
+
+    /// The column as the last paint drew it.
+    fn column_rows_now(&self) -> Vec<(sidebar::Line, Option<sidebar::Hit>)> {
+        self.column_rows_at(self.paint_now)
+    }
+
+    /// What the column drew on a one based screen row, and whether that row is the first
+    /// of its kind: an agent's name rather than the row under it.
+    fn column_hit(&self, row: u16) -> Option<(sidebar::Hit, bool)> {
+        // The column, which starts at the top row and runs down to the status line.
+        let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+        let rows = self.column_rows_now();
         let hit = rows.get(within).and_then(|(_, hit)| *hit)?;
-        let first = within == 0 || rows[within - 1].1 != Some(hit);
+        // An agent's name row carries its mark and the row under it does not, which holds
+        // however the list is scrolled; anything else is first where the row above differs.
+        let first = match hit {
+            sidebar::Hit::Terminal(_) => rows[within].0.indicator.is_some(),
+            _ => within == 0 || rows[within - 1].1 != Some(hit),
+        };
         Some((hit, first))
     }
 
-    /// Where a dragged agent row would land at a one based screen position: a space when
-    /// over the column (any row of it), a pane's side when over the pane, nothing
-    /// elsewhere. The side is the pane's edge nearest the pointer.
-    fn drop_target(&self, row: u16, col: u16) -> Option<RowDrop> {
+    /// The space a column row belongs to: its rule's, or its tab's, asleep or not.
+    fn space_of_hit(&self, hit: sidebar::Hit) -> Option<i64> {
+        match hit {
+            sidebar::Hit::Space(space) => Some(space),
+            sidebar::Hit::Terminal(t) => self
+                .rows
+                .iter()
+                .find(|r| r.terminal == t)
+                .map(|r| r.workspace)
+                .or_else(|| self.sleeping_space_of(t)),
+            _ => None,
+        }
+    }
+
+    /// Whether a carried tab is held over another machine's spaces, where it cannot go: the
+    /// space on screen, or the one a held row is over in the column.
+    fn over_other_machine(&self, terminal: u32) -> bool {
+        let Some(press) = self.row_press else {
+            return false;
+        };
+        let Some(from) = self.rows.iter().find(|r| r.terminal == terminal) else {
+            return false;
+        };
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let under = if (press.now.1 as usize) <= left {
+            self.column_hit(press.now.0)
+                .and_then(|(hit, _)| self.space_of_hit(hit))
+        } else {
+            self.space
+        };
+        under.is_some_and(|s| crate::mux::machine_of(s) != crate::mux::machine_of(from.workspace))
+    }
+
+    /// Whether a box a person reads or answers is open over the screen: a held drag ends
+    /// when one opens, so its release never lands on the answer.
+    fn overlay_open(&self) -> bool {
+        self.palette.is_some()
+            || self.menu.is_some()
+            || self.prompt.is_some()
+            || self.reading.is_some()
+            || self.modes.confirm_close.is_some()
+    }
+
+    /// Whether a terminal is asleep: a slept tab, or a tab of a sleeping space.
+    fn is_asleep(&self, terminal: u32) -> bool {
+        match self.rows.iter().find(|r| r.terminal == terminal) {
+            Some(row) => row.state == "sleeping",
+            None => self.sleeping_space_of(terminal).is_some(),
+        }
+    }
+
+    /// A space's live tabs in the daemon's order, shells and panes included: the order a
+    /// drop is placed in, which is more than the column shows.
+    fn space_order(&self, space: i64) -> Vec<u32> {
+        self.rows
+            .iter()
+            .filter(|r| r.workspace == space && r.state != "sleeping")
+            .map(|r| r.terminal)
+            .collect()
+    }
+
+    /// The tab a terminal belongs to, lead first: every leaf of its split, or itself.
+    fn group_of(&self, terminal: u32) -> Vec<u32> {
+        self.trees()
+            .map(|tree| tree.leaves())
+            .find(|leaves| leaves.contains(&terminal))
+            .unwrap_or_else(|| vec![terminal])
+    }
+
+    /// What a drop of `terminal` into `space` carries: the whole split when it stays in its
+    /// own space (a reorder moves a tab, panes and all), the terminal alone when it leaves
+    /// (it leaves its split too). `None` for a pane reordered on its own, which has no
+    /// place of its own in the order.
+    fn carried_into(&self, terminal: u32, space: i64) -> Option<Vec<u32>> {
+        let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        if from != space {
+            return Some(vec![terminal]);
+        }
+        // The split moves by the row the column shows first for it: its first pane, or its
+        // first agent when the first pane is a shell, which has no row.
+        let group = self.group_of(terminal);
+        let shown = group
+            .iter()
+            .find(|t| self.rows.iter().any(|r| r.terminal == **t && r.agent))
+            .copied();
+        (group.first() == Some(&terminal) || shown == Some(terminal)).then_some(group)
+    }
+
+    /// Where a held row would land at a one based screen position, on the column the last
+    /// paint drew.
+    fn drop_target(&self, source: Source, row: u16, col: u16) -> Option<RowDrop> {
+        match source {
+            Source::Agent(terminal) => self.drop_at(terminal, row, col, self.paint_now),
+            Source::Space { space, .. } => self.space_drop(space, row, col, self.paint_now),
+        }
+    }
+
+    /// Where a carried space would land: before the space whose rule is under the pointer,
+    /// or after the space whose rows are, with the rule drawn on that space's blank foot.
+    /// Only among its own machine's spaces, which the list keeps together; only in the
+    /// tree, where spaces have rules; never over a pane.
+    fn space_drop(&self, space: i64, row: u16, col: u16, now: i64) -> Option<RowDrop> {
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        if left == 0 || (col as usize) > left || self.collapsed || self.view != sidebar::View::Tree
+        {
+            return None;
+        }
+        let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+        let rows = self.column_rows_at(now);
+        let hit_of = |at: usize| rows.get(at).and_then(|(_, hit)| *hit);
+        let (hit, owner) = match hit_of(within) {
+            Some(hit) => (Some(hit), self.space_of_hit(hit)?),
+            None => (None, self.space_of_hit(hit_of(within.checked_sub(1)?)?)?),
+        };
+        let machine = crate::mux::machine_of(space);
+        if crate::mux::machine_of(owner) != machine {
+            return None;
+        }
+        let ids: Vec<i64> = self.spaces.iter().map(|s| s.id).collect();
+        if !ids.contains(&owner) {
+            return None;
+        }
+        let (before, rule) = match hit {
+            Some(sidebar::Hit::Space(s)) => (Some(s), within),
+            _ => {
+                let after = ids
+                    .iter()
+                    .skip_while(|id| **id != owner)
+                    .skip(1)
+                    .find(|id| **id != space && crate::mux::machine_of(**id) == machine)
+                    .copied();
+                // Down to the space's blank foot.
+                let mut foot = within;
+                while hit_of(foot).is_some_and(|h| self.space_of_hit(h) == Some(owner)) {
+                    foot += 1;
+                }
+                (after, foot)
+            }
+        };
+        // Where it already is: before itself, or the place the list would put it anyway.
+        let mut then: Vec<i64> = ids.iter().copied().filter(|id| *id != space).collect();
+        let at = match before {
+            Some(b) => then.iter().position(|id| *id == b).unwrap_or(then.len()),
+            None => then
+                .iter()
+                .rposition(|id| crate::mux::machine_of(*id) == machine)
+                .map_or(then.len(), |at| at + 1),
+        };
+        then.insert(at, space);
+        if before == Some(space) || then == ids {
+            return Some(RowDrop::Here);
+        }
+        Some(RowDrop::SpaceSlot { before, rule })
+    }
+
+    /// Where a dragged agent row would land at a one based screen position, on the column
+    /// at clock `now`: a place in a space's order when over the column, a pane's side when
+    /// over the pane, nothing elsewhere. The side is the pane's edge nearest the pointer.
+    fn drop_at(&self, terminal: u32, row: u16, col: u16, now: i64) -> Option<RowDrop> {
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         if left > 0 && (col as usize) <= left {
-            let space = match self.column_hit(row)?.0 {
-                sidebar::Hit::Space(space) => space,
-                sidebar::Hit::Terminal(t) => self
-                    .rows
-                    .iter()
-                    .find(|r| r.terminal == t)
-                    .map(|r| r.workspace)
-                    .or_else(|| self.sleeping_space_of(t))?,
-                _ => return None,
-            };
-            return Some(RowDrop::Space(space));
+            return self.column_drop(terminal, row, now);
+        }
+        // The pane is the space on screen's; a tab of another machine cannot join it.
+        let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        if crate::mux::machine_of(self.space?) != crate::mux::machine_of(from) {
+            return None;
         }
         let (target, _, (y, x)) = self.tile_at_screen(row, col)?;
         let area = pane_area(self);
@@ -1319,6 +1513,236 @@ impl State {
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, side)| side)?;
         Some(RowDrop::Pane(target, side))
+    }
+
+    /// Where in the column a dragged row would land, worked out on the rows the click test
+    /// reads (never the painted rule), so the rule cannot move what is under the pointer.
+    ///
+    /// In the tree an agent's name row means before its tab, the row under it after it
+    /// (after the whole split for a split's rows), a space's rule before its first tab, and
+    /// a space's sleeping rows or its blank foot the end of its live tabs. The priority
+    /// list and the folded strip have no order to point into: any row there is its space,
+    /// at the end.
+    fn column_drop(&self, terminal: u32, row: u16, now: i64) -> Option<RowDrop> {
+        let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
+        let rows = self.column_rows_at(now);
+        let hit_of = |at: usize| rows.get(at).and_then(|(_, hit)| *hit);
+        let (hit, owner) = match hit_of(within) {
+            Some(hit) => (Some(hit), self.space_of_hit(hit)?),
+            // A blank row belongs to the space right above it, which is its foot; a blank
+            // under another blank is the window's padding, and no place at all.
+            None => (None, self.space_of_hit(hit_of(within.checked_sub(1)?)?)?),
+        };
+        // A tab stays on its machine: no place is offered on another one's spaces.
+        let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        if crate::mux::machine_of(owner) != crate::mux::machine_of(from) {
+            return None;
+        }
+        let known = self.spaces.iter().any(|s| s.id == owner);
+        if self.collapsed || self.view != sidebar::View::Tree || !known {
+            return hit.map(|_| RowDrop::Space(owner));
+        }
+        let carried = self.carried_into(terminal, owner)?;
+        let full = self.space_order(owner);
+        let order: Vec<u32> = full
+            .iter()
+            .copied()
+            .filter(|t| !carried.contains(t))
+            .collect();
+        // The end of the live tabs is drawn above the space's sleeping rows, which follow
+        // them in the column.
+        let above_sleepers = |mut at: usize| {
+            while at > 0
+                && matches!(hit_of(at - 1), Some(sidebar::Hit::Terminal(u)) if self.is_asleep(u))
+            {
+                at -= 1;
+            }
+            at
+        };
+        let (place, rule) = match hit {
+            None => (Place::End, above_sleepers(within)),
+            // A folded space shows none of its tabs, so its rule is its end: nothing hidden
+            // is placed before.
+            Some(sidebar::Hit::Space(_)) if self.shut.contains(&owner) => {
+                // Under what a folded space still shows (the keyboard's own tab), on its foot.
+                let mut foot = within + 1;
+                while hit_of(foot).is_some_and(|h| self.space_of_hit(h) == Some(owner)) {
+                    foot += 1;
+                }
+                (Place::End, foot)
+            }
+            Some(sidebar::Hit::Space(_)) => (
+                order.first().copied().map_or(Place::End, Place::Before),
+                within + 1,
+            ),
+            Some(sidebar::Hit::Terminal(t)) if self.is_asleep(t) => {
+                (Place::End, above_sleepers(within))
+            }
+            Some(sidebar::Hit::Terminal(t)) => {
+                let group = self.group_of(t);
+                // An agent's name row carries its mark; the row under it does not. Read off the
+                // row itself, so a list scrolled to start on a second row still reads right.
+                let first = rows[within].0.indicator.is_some();
+                if first && group.first() == Some(&t) {
+                    (Place::Before(t), within)
+                } else {
+                    // After the whole split, in the order and under its lowest row.
+                    let last = full.iter().rposition(|u| group.contains(u));
+                    let place = full
+                        .iter()
+                        .skip(last.map_or(0, |at| at + 1))
+                        .find(|u| !carried.contains(u) && !group.contains(u))
+                        .copied()
+                        .map_or(Place::End, Place::Before);
+                    let lowest = (0..rows.len())
+                        .rev()
+                        .find(|at| {
+                            matches!(hit_of(*at), Some(sidebar::Hit::Terminal(u)) if group.contains(&u))
+                        })
+                        .unwrap_or(within);
+                    (place, lowest + 1)
+                }
+            }
+            Some(_) => return None,
+        };
+        // A place that leaves the order as it is, or that names what is carried, is where it
+        // already is: no move, and no rule promising one.
+        if let Place::Before(t) = place
+            && carried.contains(&t)
+        {
+            return Some(RowDrop::Here);
+        }
+        if from == owner {
+            let mut then = order.clone();
+            let at = match place {
+                Place::Before(t) => then.iter().position(|u| *u == t).unwrap_or(then.len()),
+                Place::End => then.len(),
+            };
+            then.splice(at..at, carried.iter().copied());
+            if then == full {
+                return Some(RowDrop::Here);
+            }
+        }
+        Some(RowDrop::Slot {
+            space: owner,
+            place,
+            rule,
+        })
+    }
+
+    /// The carried row as the frame at clock `now` draws it while the button is held, or
+    /// `None` when no row is carried, the drag was called off, or the carried tab is asleep
+    /// (it cannot move until it wakes).
+    fn drag_paint(&self, now: i64) -> Option<screen::DragPaint> {
+        let press = self.row_press.filter(|p| p.moved && !p.dead)?;
+        let terminal = match press.source {
+            Source::Agent(terminal) => terminal,
+            Source::Space { space, .. } => return self.space_paint(space, press.now, now),
+        };
+        let row = self.rows.iter().find(|r| r.terminal == terminal)?;
+        if self.is_asleep(terminal) {
+            return None;
+        }
+        let drop = self.drop_at(terminal, press.now.0, press.now.1, now);
+        // Staying in its own space it carries its split, wherever the pointer is in it.
+        let home = match drop {
+            Some(RowDrop::Slot { space, .. }) => space == row.workspace,
+            Some(RowDrop::Here) => true,
+            _ => false,
+        };
+        let carried = home
+            .then(|| self.carried_into(terminal, row.workspace))
+            .flatten()
+            .unwrap_or_else(|| vec![terminal]);
+        let rule = match drop {
+            Some(RowDrop::Slot { space, rule, .. }) => Some((rule, space)),
+            _ => None,
+        };
+        let outline = match drop {
+            Some(RowDrop::Pane(pane, side)) if pane != terminal => {
+                self.outline(terminal, pane, side)
+            }
+            _ => None,
+        };
+        let column = self.column(now, 0);
+        // The panes it carries that have a row, which a shell does not.
+        let more = carried
+            .iter()
+            .filter(|t| **t != terminal && self.rows.iter().any(|r| r.terminal == **t && r.agent))
+            .count();
+        let chip = sidebar::drag_chip(&column, row, more);
+        Some(screen::DragPaint {
+            carried,
+            space: None,
+            chip,
+            pointer: press.now,
+            rule,
+            outline,
+        })
+    }
+
+    /// A carried space as the frame at clock `now` draws it: its rule and every row under it
+    /// dimmed, a chip with its name and count in its colour, and its landing rule.
+    fn space_paint(&self, space: i64, pointer: (u16, u16), now: i64) -> Option<screen::DragPaint> {
+        let row = self.spaces.iter().find(|s| s.id == space)?;
+        let mut carried: Vec<u32> = self
+            .rows
+            .iter()
+            .filter(|r| r.workspace == space)
+            .map(|r| r.terminal)
+            .collect();
+        carried.extend(row.sleeping.iter().map(|t| t.terminal));
+        let count = self
+            .rows
+            .iter()
+            .filter(|r| r.workspace == space && r.agent)
+            .count();
+        let rule = match self.space_drop(space, pointer.0, pointer.1, now) {
+            Some(RowDrop::SpaceSlot { rule, .. }) => Some((rule, space)),
+            _ => None,
+        };
+        Some(screen::DragPaint {
+            carried,
+            space: Some(space),
+            chip: (
+                "\u{25be}".to_string(),
+                crate::theme::space_in(&self.spaces, space),
+                format!("{} ({count})", sidebar::chip_name(&row.name)),
+            ),
+            pointer,
+            rule,
+            outline: None,
+        })
+    }
+
+    /// The cells `terminal` would take beside `pane` on `side`, on screen, tried the way a
+    /// drop tries it: on a copy, and nothing where the drop would be refused.
+    fn outline(
+        &self,
+        terminal: u32,
+        pane: u32,
+        side: layout::Move,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let area = pane_area(self);
+        let mut tree = self.layouts.get(&self.space?)?.clone();
+        tree.remove(terminal);
+        if tree.zoomed.is_some()
+            || tree.has_pending()
+            || !tree.insert_beside(pane, terminal, side, area)
+        {
+            return None;
+        }
+        let (_, rect) = tree
+            .tile_rects(area)
+            .into_iter()
+            .find(|(t, _)| *t == terminal)?;
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        Some((
+            screen::TABS + 1 + rect.y,
+            left + 1 + rect.x,
+            rect.rows,
+            rect.cols,
+        ))
     }
 
     /// The terminal the column raises: the focused one, or the sleeping tab the keys rest on.
@@ -4729,6 +5153,9 @@ where
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
                 let mut frame = state.frame();
+                // The carried row on the rows of this very frame, its clock and all.
+                let drag = state.drag_paint(frame.now_unix);
+                frame.chrome.drag = drag.as_ref();
                 // A picture the outer terminal cannot draw is named on the pane
                 // instead. The notice is computed before the paint; the real
                 // picture never enters the painted text at all. Nothing is named
@@ -4914,6 +5341,9 @@ where
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
+                    // Every row moved under a held drag; it ends rather than land on
+                    // whatever is under the pointer now.
+                    drop_carry(&mut state);
                     // A column pulled to half a wide window stays at most half of a
                     // narrower one, so the pane and the edge to drag never vanish.
                     state.sidebar_width = state
@@ -4960,6 +5390,11 @@ where
                     if reported {
                         retheme(&state);
                     }
+                    // The window lost the mouse: the release a held drag waits for may
+                    // never come.
+                    if window_focus == Some(false) {
+                        drop_carry(&mut state);
+                    }
                     if ask_again && may_ask_terminal() {
                         // Both questions again, not colours alone: a scheme capable
                         // terminal that switched while away converges on refocus.
@@ -4995,6 +5430,12 @@ where
                     // Ahead of the keystroke itself: a resize behind the input
                     // loses the race with the shell reading it.
                     drain_adopt_resize(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                    // Esc while a row is carried puts it back, and goes no further.
+                    if bytes == b"\x1b" && state.row_press.is_some_and(|p| p.moved && !p.dead) {
+                        drop_carry(&mut state);
+                        dirty = true;
+                        continue;
+                    }
                     // The palette owns the keyboard while it is open: typing filters,
                     // enter goes, esc is back. A prefix or a detach inside it closes
                     // the palette and the bytes from there on are ordinary input, so
@@ -5002,8 +5443,8 @@ where
                     let mut feed: Option<Vec<u8>> = None;
                     // An overlay owns the mouse while it is open: a row held before it
                     // opened, whose release never came, must not drop on its answer.
-                    if state.palette.is_some() || state.menu.is_some() || state.prompt.is_some() {
-                        state.row_press = None;
+                    if state.overlay_open() {
+                        drop_carry(&mut state);
                     }
                     if state.palette.is_some() {
                         match palette_key(&mut state, &bytes) {
@@ -5385,6 +5826,7 @@ where
                                 // release swallowed elsewhere (the palette, a divider
                                 // drag) must not leave the program owed one.
                                 state.forwarded_press = false;
+                                drop_carry(&mut state);
                                 state.row_press = None;
                                 state.inbox_drag = None;
                                 // A click lands on the live pane, never on the
@@ -5494,10 +5936,12 @@ where
                                             Some((sidebar::Hit::Terminal(_), true))
                                         );
                                         state.row_press = Some(RowPress {
-                                            terminal: picked,
+                                            source: Source::Agent(picked),
                                             at: (row, col),
+                                            now: (row, col),
                                             name,
                                             moved: false,
+                                            dead: false,
                                         });
                                     }
                                     // A sleeping tab: a click wakes that tab alone and
@@ -5569,6 +6013,26 @@ where
                                         state.menu_kind = MenuKind::Plus;
                                         state.menu = Some(0);
                                         dirty = true;
+                                    }
+                                    // A space's rule in the tree waits for the release too: let go
+                                    // where it went down it folds or goes there, moved first it
+                                    // carries the space to another place in the list.
+                                    Some(Clicked::Fold(space) | Clicked::Space(space))
+                                        if in_column
+                                            && !state.collapsed
+                                            && state.view == sidebar::View::Tree =>
+                                    {
+                                        state.row_press = Some(RowPress {
+                                            source: Source::Space {
+                                                space,
+                                                fold: matches!(clicked, Some(Clicked::Fold(_))),
+                                            },
+                                            at: (row, col),
+                                            now: (row, col),
+                                            name: false,
+                                            moved: false,
+                                            dead: false,
+                                        });
                                     }
                                     Some(Clicked::Space(space)) => {
                                         if let Some(bytes) = enter_space(
@@ -5706,19 +6170,25 @@ where
                                     close_focus(&mut state);
                                     dirty = true;
                                 }
-                                // A held agent row: a drag once it leaves its row, and the
-                                // notice row says what letting go here would do.
+                                // A held row, an agent's or a space's: a drag once it leaves
+                                // its row, and the notice row says what letting go here would do.
+                                if state.overlay_open() {
+                                    drop_carry(&mut state);
+                                }
                                 if let Some(press) = state.row_press.as_mut() {
+                                    if press.dead {
+                                        continue;
+                                    }
                                     press.moved |=
                                         row != press.at.0 || col.abs_diff(press.at.1) > 2;
                                     if press.moved {
-                                        let terminal = press.terminal;
-                                        let hint =
-                                            drop_hint(&state, terminal, state.drop_target(row, col));
-                                        if state.message.as_deref() != Some(hint.as_str()) {
-                                            state.message = Some(hint);
-                                            dirty = true;
-                                        }
+                                        // The chip rides with the pointer, so every motion
+                                        // of a carried row is a paint.
+                                        press.now = (row, col);
+                                        let source = press.source;
+                                        let drop = state.drop_target(source, row, col);
+                                        state.message = Some(drop_hint(&state, source, drop));
+                                        dirty = true;
                                     }
                                     continue;
                                 }
@@ -5782,15 +6252,50 @@ where
                                 if state.inbox_drag.take().is_some() {
                                     continue;
                                 }
-                                // A held agent row comes up: a drop where it went, or the
-                                // click it was. A click on the name of the agent already
-                                // under the keyboard renames its conversation.
+                                // A held row comes up: a drop where it went, or the click it
+                                // was. A click on the name of the agent already under the
+                                // keyboard renames its conversation.
+                                if state.overlay_open() {
+                                    drop_carry(&mut state);
+                                }
                                 if let Some(press) = state.row_press.take() {
+                                    if press.dead {
+                                        continue;
+                                    }
+                                    // A held space's rule: carried to its place, or the click it
+                                    // was, folding the space or going to it.
+                                    if let Source::Space { space, fold } = press.source {
+                                        if press.moved {
+                                            state.message = None;
+                                            let drop = state.drop_target(press.source, row, col);
+                                            if let Some(ask) = drop.and_then(|drop| {
+                                                drop_space(&mut state, space, drop, &mut request)
+                                            }) {
+                                                wr.write_all(&client::encode_control_seq(
+                                                    &ask, &mut control_seq,
+                                                )?)
+                                                .await?;
+                                            }
+                                        } else if fold {
+                                            if !state.shut.remove(&space) {
+                                                state.shut.insert(space);
+                                            }
+                                        } else if let Some(bytes) = enter_space(
+                                            &mut state, space, &mut control_seq, &mut seqs,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                        }
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    let Source::Agent(terminal) = press.source else {
+                                        continue;
+                                    };
                                     if press.moved {
                                         state.message = None;
-                                        let drop = state.drop_target(row, col);
+                                        let drop = state.drop_target(press.source, row, col);
                                         if let Some(ask) = drop.and_then(|drop| {
-                                            drop_row(&mut state, press.terminal, drop, &mut request)
+                                            drop_row(&mut state, terminal, drop, &mut request)
                                         }) {
                                             wr.write_all(&client::encode_control_seq(
                                                 &ask, &mut control_seq,
@@ -5802,14 +6307,12 @@ where
                                             &mut dirty,
                                         )
                                         .await?;
-                                    } else if let Some(space) =
-                                        state.sleeping_space_of(press.terminal)
-                                    {
-                                        wake(&mut state, space, press.terminal, &mut request);
-                                    } else if press.name && press.terminal == state.focused {
-                                        rename_from_row(&mut state, press.terminal);
+                                    } else if let Some(space) = state.sleeping_space_of(terminal) {
+                                        wake(&mut state, space, terminal, &mut request);
+                                    } else if press.name && terminal == state.focused {
+                                        rename_from_row(&mut state, terminal);
                                     } else if let Some(bytes) = focus(
-                                        &mut state, press.terminal, &mut control_seq, &mut seqs,
+                                        &mut state, terminal, &mut control_seq, &mut seqs,
                                     )? {
                                         wr.write_all(&bytes).await?;
                                     }
@@ -5924,6 +6427,17 @@ where
                                         dirty = true;
                                     }
                                     if wheel_list(&mut state, row, col, up) {
+                                        // The rows moved under a held drag: what letting go
+                                        // would do now.
+                                        if let Some(press) =
+                                            state.row_press.filter(|p| p.moved && !p.dead)
+                                        {
+                                            let drop = state.drop_target(
+                                                press.source, press.now.0, press.now.1,
+                                            );
+                                            state.message =
+                                                Some(drop_hint(&state, press.source, drop));
+                                        }
                                         dirty = true;
                                     }
                                     continue;
@@ -7549,8 +8063,94 @@ fn prune_moved(state: &mut State, agents: &[AgentRow]) {
     prune_trees(state, |_| false);
 }
 
+/// Where a place in a space's order is, said by the rows a person can see: the agent it
+/// goes above, or the agent it goes below when the tab it goes before is a shell the column
+/// does not show.
+fn place_words(state: &State, terminal: u32, space: i64, place: Place) -> String {
+    let agent = |t: u32| state.rows.iter().find(|r| r.terminal == t && r.agent);
+    let carried = state
+        .carried_into(terminal, space)
+        .unwrap_or_else(|| vec![terminal]);
+    let order: Vec<u32> = state
+        .space_order(space)
+        .into_iter()
+        .filter(|t| !carried.contains(t))
+        .collect();
+    let at = match place {
+        Place::Before(t) => {
+            if let Some(row) = agent(t) {
+                return format!("above {}", sidebar::session_name(row));
+            }
+            order.iter().position(|u| *u == t).unwrap_or(order.len())
+        }
+        Place::End => order.len(),
+    };
+    if at == order.len() {
+        return format!("to the end of {}", space_name(state, space));
+    }
+    match order[..at].iter().rev().find_map(|t| agent(*t)) {
+        Some(row) => format!("below {}", sidebar::session_name(row)),
+        None => format!("to the top of {}", space_name(state, space)),
+    }
+}
+
+/// What letting a carried space go here would do, as the notice row says it.
+fn space_hint(state: &State, space: i64, drop: Option<RowDrop>) -> String {
+    let name = space_name(state, space);
+    match drop {
+        Some(RowDrop::Here) => "already here".to_string(),
+        Some(RowDrop::SpaceSlot {
+            before: Some(before),
+            ..
+        }) => format!("move {name} above {}", space_name(state, before)),
+        Some(RowDrop::SpaceSlot { before: None, .. }) => format!("move {name} to the end"),
+        _ => "drop on the list of spaces to put it in another place".to_string(),
+    }
+}
+
+/// Ask the daemon to put a carried space where it was let go, or nothing when it is already
+/// there.
+fn drop_space(
+    state: &mut State,
+    space: i64,
+    drop: RowDrop,
+    request: &mut u64,
+) -> Option<ControlRequest> {
+    let RowDrop::SpaceSlot { before, .. } = drop else {
+        return None;
+    };
+    *request += 1;
+    // The list moving under the eye is the answer; a line saying so would outlive it.
+    state.message = None;
+    Some(ControlRequest::MoveWorkspace {
+        id: format!("order-{request}"),
+        workspace: space,
+        before,
+    })
+}
+
+/// The id a reorder inside its own space is asked under.
+const REORDER: &str = "reorder-";
+
+/// Let go of a held row without dropping it, and of the hint it was showing.
+///
+/// The press stays, called off, until its release: the button is still down, and what it
+/// does next belongs to nobody.
+fn drop_carry(state: &mut State) {
+    if let Some(press) = state.row_press.as_mut() {
+        if press.moved && !press.dead {
+            state.message = None;
+        }
+        press.dead = true;
+    }
+}
+
 /// What letting a dragged row go here would do, as the notice row says it.
-fn drop_hint(state: &State, terminal: u32, drop: Option<RowDrop>) -> String {
+fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
+    let terminal = match source {
+        Source::Agent(terminal) => terminal,
+        Source::Space { space, .. } => return space_hint(state, space, drop),
+    };
     const ANYWHERE: &str = "drop on a space, or on a pane's edge to split it";
     let name = |t: u32| {
         state
@@ -7564,10 +8164,33 @@ fn drop_hint(state: &State, terminal: u32, drop: Option<RowDrop>) -> String {
         .iter()
         .find(|r| r.terminal == terminal)
         .map(|r| r.workspace);
+    if state.is_asleep(terminal) {
+        return "a sleeping tab stays where it is, wake it first".to_string();
+    }
+    if drop.is_none() && state.over_other_machine(terminal) {
+        return "a tab stays on its machine".to_string();
+    }
     match drop {
+        Some(RowDrop::Here) => "already here".to_string(),
+        Some(RowDrop::SpaceSlot { .. }) => ANYWHERE.to_string(),
         Some(RowDrop::Space(space)) if Some(space) == from => ANYWHERE.to_string(),
         Some(RowDrop::Space(space)) => {
             format!("move {} to {}", name(terminal), space_name(state, space))
+        }
+        Some(RowDrop::Slot { space, place, .. }) if Some(space) == from => format!(
+            "move {} {}",
+            name(terminal),
+            place_words(state, terminal, space, place)
+        ),
+        Some(RowDrop::Slot { space, place, .. }) => {
+            match place_words(state, terminal, space, place) {
+                words if words.starts_with("to ") => format!("move {} {words}", name(terminal)),
+                words => format!(
+                    "move {} to {}, {words}",
+                    name(terminal),
+                    space_name(state, space)
+                ),
+            }
         }
         Some(RowDrop::Pane(pane, _)) if pane == terminal => ANYWHERE.to_string(),
         Some(RowDrop::Pane(pane, side)) => {
@@ -7605,11 +8228,13 @@ fn drop_row(
         state.message = Some("a sleeping tab stays in its space, wake it first".to_string());
         return None;
     };
-    let (space, beside) = match drop {
+    let (space, beside, at) = match drop {
+        RowDrop::Here | RowDrop::SpaceSlot { .. } => return None,
         RowDrop::Space(space) if space == from => return None,
-        RowDrop::Space(space) => (space, None),
+        RowDrop::Space(space) => (space, None, None),
+        RowDrop::Slot { space, place, .. } => (space, None, Some(place)),
         RowDrop::Pane(pane, _) if pane == terminal => return None,
-        RowDrop::Pane(pane, side) => (state.space?, Some((pane, side))),
+        RowDrop::Pane(pane, side) => (state.space?, Some((pane, side)), None),
     };
     if let Some((pane, side)) = beside {
         // Tried on a copy: a drop with no room for the pane changes nothing.
@@ -7632,14 +8257,31 @@ fn drop_row(
         }
     }
     *request += 1;
+    // A reorder says so in its id, decided when it is asked: its answer is told apart by
+    // that and never by the rows, which an index can change before the answer arrives.
+    let id = if space == from {
+        format!("{REORDER}{request}")
+    } else {
+        format!("move-{request}")
+    };
     if let Some((pane, side)) = beside {
-        state.drop_after_move = Some((format!("move-{request}"), terminal, pane, side));
+        state.drop_after_move = Some((id.clone(), terminal, pane, side));
     }
-    state.message = Some(format!("moving to {}", space_name(state, space)));
+    // A split reorders by its first pane, whichever of its rows was carried.
+    let terminal = match state.carried_into(terminal, space) {
+        Some(carried) if space == from => carried[0],
+        _ => terminal,
+    };
+    state.message = Some(if space == from {
+        "reordering".to_string()
+    } else {
+        format!("moving to {}", space_name(state, space))
+    });
     Some(ControlRequest::MoveTerminal {
-        id: format!("move-{request}"),
+        id,
         terminal,
         workspace: space,
+        place: at,
     })
 }
 
@@ -9095,6 +9737,13 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             terminal,
             workspace,
         } => {
+            // A reorder: the tab stays in its space, its split and the keyboard with it. The
+            // index the daemon announces redraws the order.
+            if id.starts_with(REORDER) {
+                state.message = Some("reordered".to_string());
+                *dirty = true;
+                return;
+            }
             if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == terminal) {
                 row.workspace = workspace;
             }
@@ -9633,6 +10282,200 @@ mod tests {
             pgid: None,
             discards: None,
         }
+    }
+
+    /// Two spaces in a tall window, so nothing scrolls: app holds agent 1, a shell 3 the
+    /// column does not show, and agent 2, in that order; webshop holds agent 4.
+    fn drag_state() -> State {
+        let mut s = state();
+        s.lines = 50;
+        let mut shell = agent(3, 1, "zsh", "idle");
+        shell.agent = false;
+        s.rows = vec![
+            agent(1, 1, "codex", "blocked"),
+            shell,
+            agent(2, 1, "claude", "working"),
+            agent(4, 2, "claude", "idle"),
+        ];
+        s
+    }
+
+    /// The column row (zero based, from the top) whose hit is `hit`, its first or its last.
+    fn row_of(s: &State, hit: sidebar::Hit, last: bool) -> usize {
+        let rows = s.column_rows_now();
+        let mut at = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, h))| *h == Some(hit));
+        let found = if last { at.next_back() } else { at.next() };
+        found.map(|(at, _)| at).expect("drawn")
+    }
+
+    /// Where a carried row lands, read off the unshifted column: a name row is before
+    /// that tab, the row under it after it (before the hidden shell that follows), a rule
+    /// before the space's first tab, a space's blank foot its end; the padding under the
+    /// last space and the carried row's own place are no move at all.
+    #[test]
+    fn a_carried_row_lands_where_the_column_says() {
+        use sidebar::Hit;
+        let s = drag_state();
+        let screen = |at: usize| (at + screen::SIDEBAR_TOP) as u16;
+        let drop = |t: u32, at: usize| s.drop_target(Source::Agent(t), screen(at), 3);
+        let name1 = row_of(&s, Hit::Terminal(1), false);
+        let under1 = row_of(&s, Hit::Terminal(1), true);
+        let rule1 = row_of(&s, Hit::Space(1), false);
+        let foot1 = row_of(&s, Hit::Terminal(2), true) + 1;
+        let foot2 = row_of(&s, Hit::Terminal(4), true) + 1;
+        let slot = |place, rule| {
+            Some(RowDrop::Slot {
+                space: 1,
+                place,
+                rule,
+            })
+        };
+        assert_eq!(drop(4, name1), slot(Place::Before(1), name1));
+        assert_eq!(drop(4, under1), slot(Place::Before(3), under1 + 1));
+        assert_eq!(drop(4, rule1), slot(Place::Before(1), rule1 + 1));
+        assert_eq!(drop(4, foot1), slot(Place::End, foot1));
+        assert_eq!(drop(4, foot2 + 1), None, "the window's padding is no place");
+        // In its own space: its own name row, and the row after the tab before it, are
+        // where it already is.
+        let name2 = row_of(&s, Hit::Terminal(2), false);
+        assert_eq!(drop(2, name2), Some(RowDrop::Here));
+        assert_eq!(drop(2, foot1), Some(RowDrop::Here));
+        assert_eq!(drop(2, name1), slot(Place::Before(1), name1));
+        // The hint names what a person can see, never the hidden shell.
+        let hint = drop_hint(&s, Source::Agent(4), drop(4, under1));
+        assert!(
+            hint.starts_with("move ") && hint.contains(", below "),
+            "{hint}"
+        );
+        let end = drop_hint(&s, Source::Agent(4), drop(4, foot1));
+        assert!(end.ends_with("to the end of app"), "{end}");
+        // Its own place, named by itself, is where it already is.
+        assert_eq!(drop(1, name1), Some(RowDrop::Here));
+    }
+
+    /// A carried space lands before the space whose rule is under the pointer, or after the
+    /// space whose rows are, its rule on that space's blank foot; its own place, and the
+    /// place the list would give it anyway, are no move. Over a pane it has no place.
+    #[test]
+    fn a_carried_space_lands_before_or_after_a_space() {
+        use sidebar::Hit;
+        let s = drag_state();
+        let screen = |at: usize| (at + screen::SIDEBAR_TOP) as u16;
+        let drop = |space: i64, at: usize| {
+            s.drop_target(Source::Space { space, fold: true }, screen(at), 3)
+        };
+        let rule1 = row_of(&s, Hit::Space(1), false);
+        let rule2 = row_of(&s, Hit::Space(2), false);
+        let row4 = row_of(&s, Hit::Terminal(4), false);
+        let foot2 = row_of(&s, Hit::Terminal(4), true) + 1;
+        assert_eq!(
+            drop(2, rule1),
+            Some(RowDrop::SpaceSlot {
+                before: Some(1),
+                rule: rule1
+            })
+        );
+        assert_eq!(drop(2, rule2), Some(RowDrop::Here), "its own rule");
+        assert_eq!(
+            drop(2, row_of(&s, Hit::Terminal(1), false)),
+            Some(RowDrop::Here)
+        );
+        assert_eq!(
+            drop(1, row4),
+            Some(RowDrop::SpaceSlot {
+                before: None,
+                rule: foot2
+            })
+        );
+        assert_eq!(
+            s.drop_target(
+                Source::Space {
+                    space: 1,
+                    fold: true
+                },
+                screen(rule1),
+                60
+            ),
+            None,
+            "a space has no place over a pane"
+        );
+        assert_eq!(space_hint(&s, 2, drop(2, rule1)), "move webshop above app");
+        assert_eq!(space_hint(&s, 1, drop(1, row4)), "move app to the end");
+        // Carried, its rule and every row under it dim, and its chip names it.
+        let mut s = s;
+        s.row_press = Some(RowPress {
+            source: Source::Space {
+                space: 1,
+                fold: true,
+            },
+            at: (1, 1),
+            now: (screen(row4), 3),
+            name: false,
+            moved: true,
+            dead: false,
+        });
+        let drag = s.drag_paint(s.paint_now).expect("carried");
+        assert_eq!(drag.space, Some(1));
+        assert_eq!(drag.carried, vec![1, 3, 2]);
+        assert_eq!(drag.chip.2, "app (2)");
+        assert_eq!(drag.rule, Some((foot2, 1)));
+    }
+
+    /// The priority list has no order to point into: any row is its space, at the end.
+    #[test]
+    fn the_priority_list_drops_into_a_space_not_a_place() {
+        let mut s = drag_state();
+        s.view = sidebar::View::Priority;
+        let rows = s.column_rows_now();
+        let at = rows
+            .iter()
+            .position(|(_, h)| *h == Some(sidebar::Hit::Terminal(1)))
+            .expect("drawn");
+        let row = (at + screen::SIDEBAR_TOP) as u16;
+        assert_eq!(
+            s.drop_target(Source::Agent(4), row, 3),
+            Some(RowDrop::Space(1))
+        );
+    }
+
+    /// A carried row paints: its rows dim, its chip follows the pointer, and the place it
+    /// would land opens its rule, in another space or its own.
+    #[test]
+    fn a_carried_row_is_drawn_while_it_moves() {
+        use sidebar::Hit;
+        let mut s = drag_state();
+        let name1 = row_of(&s, Hit::Terminal(1), false);
+        let pointer = ((name1 + screen::SIDEBAR_TOP) as u16, 4);
+        s.row_press = Some(RowPress {
+            source: Source::Agent(4),
+            at: (1, 1),
+            now: pointer,
+            name: true,
+            moved: true,
+            dead: false,
+        });
+        let drag = s.drag_paint(s.paint_now).expect("carried");
+        assert_eq!(drag.carried, vec![4]);
+        assert_eq!(drag.rule, Some((name1, 1)));
+        assert_eq!(drag.pointer, pointer);
+        s.row_press = Some(RowPress {
+            source: Source::Agent(2),
+            ..s.row_press.unwrap()
+        });
+        // A reorder in its own space is promised its place too.
+        assert_eq!(
+            s.drag_paint(s.paint_now).expect("carried").rule,
+            Some((name1, 1))
+        );
+        // Not moved yet: a press is still a click.
+        s.row_press = Some(RowPress {
+            moved: false,
+            ..s.row_press.unwrap()
+        });
+        assert!(s.drag_paint(s.paint_now).is_none());
     }
 
     /// A divider drag arms only on the divider: the open column actually
@@ -12096,6 +12939,40 @@ mod tests {
         layout.focus_terminal(1);
         state.layouts.insert(1, layout);
         state
+    }
+
+    /// A reorder's answer leaves the tab where it is: its split stays whole and the keyboard
+    /// stays on it, even when an index already said the same space. An answer to a move
+    /// that was not a reorder still takes the tab out of its split.
+    #[test]
+    fn a_reorders_answer_keeps_the_split_and_the_keyboard() {
+        let mut state = tiled_state();
+        let before = state.layouts.get(&1).cloned();
+        let focused = state.focused;
+        let (mut request, mut dirty) = (0, false);
+        let moved = |id: &str| ControlResponse::TerminalMoved {
+            id: id.into(),
+            terminal: 2,
+            workspace: 1,
+        };
+        apply(&mut state, moved("reorder-1"), &mut request, &mut dirty);
+        assert!(dirty);
+        assert_eq!(state.message.as_deref(), Some("reordered"));
+        assert_eq!(
+            state.layouts.get(&1).cloned(),
+            before,
+            "the split stayed whole"
+        );
+        assert_eq!(state.focused, focused);
+        // Not asked as a reorder: the old path, which takes it out of its split.
+        apply(&mut state, moved("move-2"), &mut request, &mut dirty);
+        assert!(
+            !state
+                .layouts
+                .get(&1)
+                .is_some_and(|l| l.leaves().contains(&2)),
+            "a moved tab leaves its split"
+        );
     }
 
     #[test]

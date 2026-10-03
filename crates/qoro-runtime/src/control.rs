@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 /// A terminal is addressed by the number that travels in a frame's `stream` field.
 pub type TerminalStream = u32;
 
+/// Where in a space's order a moved tab goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    /// Just before this tab.
+    Before(TerminalStream),
+    /// After every live tab of the space.
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum ControlRequest {
@@ -56,15 +66,22 @@ pub enum ControlRequest {
         terminal: TerminalStream,
         title: Option<String>,
     },
-    /// Put a terminal in another workspace, at the end of its tabs.
+    /// Put a terminal in a workspace, at `place` in its order.
     ///
-    /// A pane leaves the split it was in and the rest of that split stays. Refused for a
-    /// sleeping space on either side: a sleeping tab has nothing running to move, and one
-    /// moved into a sleep would be running where nothing may run.
+    /// Into another workspace a pane leaves the split it was in and the rest of that split
+    /// stays. Within its own workspace it is a reorder: the tab moves with its split, and
+    /// only a split's first pane can move it. Refused for a sleeping space on either side: a
+    /// sleeping tab has nothing running to move, and one moved into a sleep would be running
+    /// where nothing may run.
+    ///
+    /// Without a `place`, the request older clients send: the end of another workspace's
+    /// tabs, and nothing at all in its own.
     MoveTerminal {
         id: String,
         terminal: TerminalStream,
         workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<Place>,
     },
     /// Give a workspace a different name.
     /// Rows of a terminal's scrollback, so a person can read what has gone past.
@@ -123,6 +140,15 @@ pub enum ControlRequest {
         id: String,
         workspace: i64,
         ink: Option<u8>,
+    },
+    /// Put a workspace just before `before` in the list, or last. Answered `Renamed`, like
+    /// the colour; the list is read again by whoever asked, and by the others at their next
+    /// listing.
+    MoveWorkspace {
+        id: String,
+        workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<i64>,
     },
     /// Keep a space awake, or with `terminal` one pane of it: idle sleep passes it by. A
     /// sleep a person asks for still sleeps it. Answered `Renamed`, like the colour; a pane's
@@ -392,6 +418,7 @@ impl ControlRequest {
             | Self::MoveTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
             | Self::SetWorkspaceInk { id, .. }
+            | Self::MoveWorkspace { id, .. }
             | Self::SetKeepAwake { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }

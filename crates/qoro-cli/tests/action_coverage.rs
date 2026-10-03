@@ -140,6 +140,7 @@ fn actions() -> Vec<Action> {
                     id: "a".into(),
                     terminal: 1,
                     workspace: 2,
+                    place: None,
                 })
             },
         },
@@ -160,6 +161,16 @@ fn actions() -> Vec<Action> {
                     id: "a".into(),
                     workspace: 1,
                     ink: Some(2),
+                })
+            },
+        },
+        Action {
+            name: "move a workspace in the list",
+            method: || {
+                Method::Control(ControlRequest::MoveWorkspace {
+                    id: "a".into(),
+                    workspace: 2,
+                    before: Some(1),
                 })
             },
         },
@@ -534,6 +545,11 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             ink: None,
         },
+        ControlRequest::MoveWorkspace {
+            id: String::new(),
+            workspace: 0,
+            before: None,
+        },
         ControlRequest::SetKeepAwake {
             id: String::new(),
             workspace: 0,
@@ -549,6 +565,7 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             terminal: 0,
             workspace: 0,
+            place: None,
         },
         ControlRequest::ListFocusEvents {
             id: String::new(),
@@ -600,6 +617,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
