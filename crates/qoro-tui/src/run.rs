@@ -363,6 +363,16 @@ struct State {
     /// others are live screens sized to their tiles (cropped only when another
     /// client owns the terminal's size).
     snapshots: std::collections::BTreeMap<u32, SnapshotWire>,
+    /// The last screen of each terminal this client stopped watching, by terminal. Drawn by
+    /// `frame()` in place of a blank pane until the fresh screen arrives, which from another
+    /// machine is a round trip or more away, and read by nothing else: every decision still
+    /// sees no screen until the daemon sends one. Bounded by the live terminals, since a
+    /// terminal that goes takes its entry with it.
+    last_seen: std::collections::BTreeMap<u32, SnapshotWire>,
+    /// Whether the focused pane may stand in its `last_seen` screen. Set only by `focus()`
+    /// and cleared by `forget_screen()`, so a pane emptied for a new terminal or a new space
+    /// never shows the screen it held before.
+    previewing: bool,
     /// The newest image per terminal, by terminal. Drawn by the frame painter
     /// (overlay or placeholder); keyed like `snapshots` so tiles work the same.
     images: std::collections::BTreeMap<u32, StoredImage>,
@@ -804,9 +814,11 @@ impl State {
         {
             for (terminal, rect) in layout.tile_rects(full) {
                 let snapshot = if terminal == self.focused {
-                    self.snapshot.as_ref()
+                    self.snapshot.as_ref().or_else(|| self.preview())
                 } else {
-                    self.snapshots.get(&terminal)
+                    self.snapshots
+                        .get(&terminal)
+                        .or_else(|| self.last_seen.get(&terminal))
                 };
                 tiles.push(screen::Tile {
                     terminal,
@@ -824,7 +836,10 @@ impl State {
             focused: self.focused,
             armed: self.armed,
             drawer: self.drawer_view(),
-            snapshot: self.peek_view().or(self.snapshot.as_ref()),
+            snapshot: self
+                .peek_view()
+                .or(self.snapshot.as_ref())
+                .or_else(|| self.preview()),
             cols: self.cols,
             lines: self.lines,
             // A mode speaks for itself on the notice row: its keys, or its question.
@@ -1399,6 +1414,21 @@ impl State {
             .map(|next| &self.spaces[next])
             .find(|w| !w.asleep)
             .map(|w| w.id)
+    }
+
+    /// The focused terminal's last seen screen, while `focus()` lets it stand in for the
+    /// one on its way.
+    fn preview(&self) -> Option<&SnapshotWire> {
+        self.previewing
+            .then(|| self.last_seen.get(&self.focused))
+            .flatten()
+    }
+
+    /// The focused pane's screen goes, and its stand-in with it: what comes next is
+    /// another picture, never the one this pane showed before.
+    fn forget_screen(&mut self) {
+        self.snapshot = None;
+        self.previewing = false;
     }
 
     /// The screen of the sleeping tab the keyboard rests on, when it has arrived.
@@ -4358,6 +4388,8 @@ where
         focused: 0,
         snapshot: None,
         snapshots: std::collections::BTreeMap::new(),
+        last_seen: std::collections::BTreeMap::new(),
+        previewing: false,
         images: std::collections::BTreeMap::new(),
         // Read once: what this client's outer terminal can draw decides real
         // picture versus placeholder for the life of the session.
@@ -7867,6 +7899,30 @@ fn zoom_flip(
     Ok((true, if out.is_empty() { None } else { Some(out) }))
 }
 
+/// The onlookers' screens outside `keep` move to `last_seen` instead of being dropped, so a
+/// tab come back to shows its last screen while the fresh one is on its way.
+fn park_screens(state: &mut State, keep: &std::collections::BTreeSet<u32>) {
+    let (kept, left): (
+        std::collections::BTreeMap<_, _>,
+        std::collections::BTreeMap<_, _>,
+    ) = std::mem::take(&mut state.snapshots)
+        .into_iter()
+        .partition(|(t, _)| keep.contains(t));
+    state.snapshots = kept;
+    state.last_seen.extend(left);
+}
+
+/// The focused screen and every onlooker's go to `last_seen`: the client stops watching
+/// all of them, and any may be come back to.
+fn park_all(state: &mut State) {
+    if state.focused != 0
+        && let Some(screen) = state.snapshot.take()
+    {
+        state.last_seen.insert(state.focused, screen);
+    }
+    park_screens(state, &std::collections::BTreeSet::new());
+}
+
 fn sync_subs(state: &mut State, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
     let want: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
     // A visible terminal with no screen here is asked again even when already subscribed:
@@ -8053,6 +8109,7 @@ fn move_focus(
             state.snapshots.insert(from, old);
         }
         state.snapshot = Some(snap);
+        state.previewing = false;
     } else {
         // Another terminal's screen, and another terminal's history. Both are
         // dropped rather than carried, or the new tab opens scrolled into rows
@@ -8060,7 +8117,10 @@ fn move_focus(
         if let Some(old) = state.snapshot.take() {
             state.snapshots.insert(from, old);
         }
-        state.snapshot = None;
+        state.forget_screen();
+        // Its last seen screen, if any, stands in until the daemon's answer lands: only
+        // drawn, so nothing above (history, selection, focus reports) reads it.
+        state.previewing = true;
     }
     state.anchor = None;
     state.behind = Behind::default();
@@ -8087,10 +8147,10 @@ fn move_focus(
             state.seen_done.insert((to, sidebar::gen_of(row)));
         }
     }
-    // Dropped from the onlookers: a snapshot kept past its unsubscription is
-    // a screen that can never update again.
+    // Out of the onlookers: a snapshot kept past its unsubscription is a screen that can
+    // never update again, so it is only last seen from here on.
     let visible: std::collections::BTreeSet<u32> = visible_set(state).into_iter().collect();
-    state.snapshots.retain(|t, _| visible.contains(t));
+    park_screens(state, &visible);
     let mut out = BytesMut::new();
     if let Some(sync) = sync_subs(state, control_seq)? {
         out.extend_from_slice(&sync);
@@ -8239,8 +8299,9 @@ fn peek(
 /// output painting under this space's tab bar, and left `ctrl-a x` closing it. Nothing on
 /// screen said any of that was happening.
 fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Option<BytesMut>> {
+    park_all(state);
     state.focused = 0;
-    state.snapshot = None;
+    state.forget_screen();
     state.modes.copy = None;
     state.modes.confirm_close = None;
     state.message = Some(why.to_string());
@@ -8658,7 +8719,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         ControlResponse::WorkspaceCreated { workspace, .. } => {
             state.creating = state.creating.saturating_sub(1);
             state.space = Some(workspace);
-            state.snapshot = None;
+            // The old space's screens are kept as last seen, for the way back.
+            park_all(state);
+            state.forget_screen();
             // A new space starts bare: no tree. The old space's subscriptions
             // stay in `subs` until the next sync drops them, since `apply`
             // cannot write: forgetting them here meant the unsubscribe never
@@ -8667,7 +8730,6 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // render filter drops the old space's renders by space meanwhile.
             state.layouts.remove(&workspace);
             state.parked.remove(&workspace);
-            state.snapshots.clear();
             // Asked for here rather than by the caller, because a space with no terminal in
             // it shows an empty pane and a bar with only a `+` on it, and the first thing
             // anybody does in a new space is start a terminal.
@@ -8696,7 +8758,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             state.parked.remove(&workspace);
             if state.space == Some(workspace) {
                 state.space = None;
-                state.snapshot = None;
+                state.forget_screen();
             }
             *dirty = true;
         }
@@ -8769,6 +8831,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // terminal, which the filter above drops.
             let live: std::collections::BTreeSet<u32> = agents.iter().map(|r| r.terminal).collect();
             state.snapshots.retain(|t, _| live.contains(t));
+            state.last_seen.retain(|t, _| live.contains(t));
             state.subs.retain(|t| live.contains(t));
             // Pictures too, up to 4 MiB each, or every terminal that exited on its own
             // kept its last one for the life of this client.
@@ -8791,7 +8854,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     ));
                 }
                 state.focused = 0;
-                state.snapshot = None;
+                state.forget_screen();
                 // The tree already picked the neighbour; fall back to the tab list
                 // only when the tree names nothing alive.
                 state.pending_focus = state
@@ -9083,8 +9146,13 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             if !is_split {
                 // The caller subscribes: a new terminal that the client is not
                 // watching draws the terminal it came from, which is what the
-                // first version did.
-                state.snapshot = None;
+                // first version did. The screen it came from is kept as last seen.
+                if state.focused != 0
+                    && let Some(screen) = state.snapshot.take()
+                {
+                    state.last_seen.insert(state.focused, screen);
+                }
+                state.forget_screen();
             }
             // An unbound split stays where the keyboard is: yanking the focus
             // to a terminal in another space would collapse that space's tree
@@ -9138,6 +9206,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // sync: the daemon already ended the terminal itself.
             prune_trees(state, |t| t == terminal);
             state.snapshots.remove(&terminal);
+            state.last_seen.remove(&terminal);
             // The picture with it. A Kitty placement still on the outer screen
             // comes down on the next painted frame, through the per-frame
             // reconcile. An iTerm2 one cannot be removed remotely (the protocol
@@ -9149,7 +9218,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // server-side too: pruning the local set without a goodbye write.
             state.subs.remove(&terminal);
             if terminal == state.focused {
-                state.snapshot = None;
+                state.forget_screen();
                 // From this space, and through the subscription path, which is why it is a
                 // pending focus rather than an assignment. Picking any terminal from
                 // `rows` put the keyboard in another space without moving the tab bar
@@ -10661,6 +10730,8 @@ mod tests {
             nowhere: false,
             config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
+            last_seen: std::collections::BTreeMap::new(),
+            previewing: false,
             images: std::collections::BTreeMap::new(),
             graphics: crate::graphics::GraphicsCap::off(),
             shown_images: std::collections::BTreeMap::new(),
@@ -11789,6 +11860,8 @@ mod tests {
             focused: 1,
             snapshot: None,
             snapshots: std::collections::BTreeMap::new(),
+            last_seen: std::collections::BTreeMap::new(),
+            previewing: false,
             images: std::collections::BTreeMap::new(),
             graphics: crate::graphics::GraphicsCap::off(),
             shown_images: std::collections::BTreeMap::new(),
@@ -11917,6 +11990,8 @@ mod tests {
             focused: 1,
             snapshot: Some(snapshot_with_behind(0)),
             snapshots: std::collections::BTreeMap::from([(2, snapshot_with_behind(0))]),
+            last_seen: std::collections::BTreeMap::new(),
+            previewing: false,
             images: std::collections::BTreeMap::new(),
             graphics: crate::graphics::GraphicsCap::off(),
             shown_images: std::collections::BTreeMap::new(),
@@ -12072,6 +12147,113 @@ mod tests {
             state.split_writes.is_empty(),
             "moving between tabs writes nothing"
         );
+    }
+
+    /// A tab come back to draws the screen it had while the fresh one crosses the link,
+    /// rather than a blank pane, and only draws it: every decision still sees no screen,
+    /// so the subscription that brings the live one goes out as before.
+    #[test]
+    fn a_tab_come_back_to_draws_its_last_screen_until_the_live_one_lands() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        assert!(
+            state.snapshots.is_empty(),
+            "a hidden pane's screen stayed live"
+        );
+        assert!(state.last_seen.contains_key(&1) && state.last_seen.contains_key(&2));
+        // Never seen here: nothing to stand in.
+        assert!(state.frame().snapshot.is_none());
+
+        focus(&mut state, 1, &mut control_seq, &mut seqs).unwrap();
+        assert!(state.snapshot.is_none(), "the old screen reached the logic");
+        assert_eq!(state.subs, std::collections::BTreeSet::from([1, 2]));
+        let frame = state.frame();
+        assert!(frame.snapshot.is_some(), "the pane came back blank");
+        assert!(
+            frame.tiles.iter().all(|t| t.snapshot.is_some()),
+            "a tile of the split came back blank"
+        );
+    }
+
+    /// A pane emptied for something new (here a new space, with the keyboard still on the
+    /// old terminal) shows nothing, never the screen it held.
+    #[test]
+    fn a_pane_emptied_for_a_new_space_never_shows_its_old_screen() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        let mut control_seq = 0;
+        focus(&mut state, 3, &mut control_seq, &mut seqs).unwrap();
+        focus(&mut state, 1, &mut control_seq, &mut seqs).unwrap();
+        assert!(state.frame().snapshot.is_some());
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::WorkspaceCreated {
+                id: "x".to_string(),
+                workspace: 9,
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        assert!(state.frame().snapshot.is_none(), "the old screen stood in");
+    }
+
+    /// Leaving for a space with nothing to focus keeps every screen as last seen.
+    #[test]
+    fn unfocusing_keeps_the_screens_as_last_seen() {
+        let mut state = tiled_state();
+        unfocus(&mut state, "nothing here", &mut 0).unwrap();
+        assert!(state.last_seen.contains_key(&1) && state.last_seen.contains_key(&2));
+        assert!(state.snapshots.is_empty());
+    }
+
+    /// A terminal no longer listed takes its last screen with it, as a remote's do when
+    /// that remote drops.
+    #[test]
+    fn a_terminal_gone_from_the_list_leaves_no_last_screen() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        focus(&mut state, 3, &mut 0, &mut seqs).unwrap();
+        assert!(state.last_seen.contains_key(&2));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "x".to_string(),
+                agents: vec![agent(1, 1, "zsh", "idle"), agent(3, 1, "sh", "idle")],
+                splits: Vec::new(),
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        assert!(!state.last_seen.contains_key(&2));
+        assert!(state.last_seen.contains_key(&1));
+    }
+
+    /// A terminal that goes takes its last screen with it.
+    #[test]
+    fn a_closed_terminal_leaves_no_last_screen() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "sh", "idle"));
+        let mut seqs = std::collections::BTreeMap::new();
+        focus(&mut state, 3, &mut 0, &mut seqs).unwrap();
+        assert!(state.last_seen.contains_key(&2));
+        let mut dirty = false;
+        apply(
+            &mut state,
+            ControlResponse::TerminalClosed {
+                id: "x".to_string(),
+                terminal: 2,
+            },
+            &mut 0,
+            &mut dirty,
+        );
+        assert!(!state.last_seen.contains_key(&2));
     }
 
     #[test]
@@ -12495,7 +12677,7 @@ mod tests {
         let mut state = tiled_state();
         let mut control_seq = 0;
         assert!(sync_subs(&mut state, &mut control_seq).unwrap().is_none());
-        state.snapshot = None;
+        state.forget_screen();
         let out = sync_subs(&mut state, &mut control_seq)
             .unwrap()
             .expect("a subscribe");
