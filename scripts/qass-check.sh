@@ -2,6 +2,8 @@
 # Checks skills/qass/watch.sh against recorded snapshots: a fake `qoro` prints
 # them, and the lines watch.sh prints must be exactly the expected ones.
 set -euo pipefail
+# Lines at once unless a case asks for the settle time.
+export QASS_SETTLE=0
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
@@ -119,5 +121,20 @@ got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.s
 want="$(printf '%s\n' 'T5 g1 claude new->idle "task" /w' 'ubox/T2 g3 claude working->idle "task" /w' 'ubox/link-down' | sort)"
 [ "$got" = "$want" ] || { echo "remote printed: $got"; exit 1; }
 rm -f "$tmp/bin/ssh"
+
+# A flapping agent is said once, after it settles; one that went back to work is not said.
+printf '%s\n' "[$(row 5 1 working),$(row 6 1 working)]" > "$tmp/home/.qass/last.json"
+printf '%s\n' "[$(row 5 1 idle),$(row 6 1 idle)]" "[$(row 5 1 working),$(row 6 1 working)]" \
+    "[$(row 5 1 idle),$(row 6 1 working)]" "[$(row 5 1 working),$(row 6 1 working)]" \
+    "[$(row 5 1 idle),$(row 6 1 working)]" > "$tmp/snapshots"
+: > "$tmp/home/.qass/goals.md"
+cat > "$tmp/bin/qoro" <<EOF
+#!/bin/sh
+[ "\$1" = ls ] && { echo '[]'; exit 0; }
+[ "\$1" = remote ] && exit 0
+cat "$tmp/snapshots"; exec sleep 14 2>/dev/null
+EOF
+got="$(HOME="$tmp/home" QORO_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
+[ "$got" = 'T5 g1 claude working->idle "task" /w' ] || { echo "settle printed: $got"; exit 1; }
 
 echo "qass watch: ok"

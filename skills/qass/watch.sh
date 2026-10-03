@@ -12,6 +12,10 @@
 # changed while nothing was watching. No saved snapshot means an empty one: every agent
 # already waiting is printed once.
 #
+# An agent that stops working is said once it has stayed stopped for QASS_SETTLE seconds
+# (20, said on the next 10 s tick): an agent that wakes for a background notice, works a
+# second and stops again, over and over, is one line once it settles, not one a turn.
+#
 # A worker qass left alone because the owner had just typed there carries
 # `hands off until <unix time>` on its goals.md line. Once that time passes and
 # it still waits, it is printed once more, as `hands-off->idle`.
@@ -28,6 +32,7 @@ here="$(cd "$(dirname "$0")" && pwd -P)"
 dir="@QASS_DATA@"   # filled in by `qoro skills install`
 mkdir -p "$dir"
 self="${QORO_TERMINAL:-0}"
+settle="${QASS_SETTLE:-20}"
 
 defs='
 def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
@@ -55,9 +60,52 @@ diff="$defs"'
 # Whether a row of $a is gone from $b: only then is `qoro ls` worth asking.
 vanished="$defs"'(($a | rows | keys) - ($b | rows | keys)) | length > 0'
 
+# $b is a row array; prints the held line for terminal $t when it still is generation $g
+# in state $state.
+settled="$defs"'
+($b | rows)[$t] // empty | select(.generation == $g and .state == $state) | line(.; $from)'
+
 # $b is a row array and $due terminal numbers; prints those that still wait.
 again="$defs"'
 ($b | rows) as $new | $due[] | $new[.] // empty | select(.state | waits) | line(.; "hands-off")'
+
+# A machine's lines held until they settle: "<terminal> <generation> <from> <state> <due>".
+settle_file() { if [ -z "$1" ]; then echo "$dir/settle"; else echo "$dir/settle-$1"; fi; }
+
+# One writer at a time for the settle files: the streams add, the tick takes.
+settle_locked() {
+    local i rc
+    for i in $(seq 50); do
+        if mkdir "$dir/settle.lock" 2>/dev/null; then
+            "$@"; rc=$?
+            rmdir "$dir/settle.lock"
+            return $rc
+        fi
+        sleep 0.1
+    done
+    "$@"
+}
+
+# Holds a working->idle or ->done line of a machine instead of saying it: a newer one for
+# the same terminal replaces it, so a flapping agent keeps pushing its own line back.
+held='^([A-Za-z0-9_-]+/)?T([0-9]+) g([0-9]+) [^ ]+ (working|starting)->(idle|done) '
+hold() {
+    local label="$1" line="$2" f
+    [ "$settle" -gt 0 ] || return 1
+    [[ "$line" =~ $held ]] || return 1
+    f="$(settle_file "$label")"
+    settle_locked eval '{ grep -v "^${BASH_REMATCH[2]} " "$f" 2>/dev/null; echo "${BASH_REMATCH[2]} ${BASH_REMATCH[3]} ${BASH_REMATCH[4]} ${BASH_REMATCH[5]} $(( $(date +%s) + settle ))"; } > "$f.tmp"; mv "$f.tmp" "$f"'
+    return 0
+}
+
+# The held lines whose time has come, taken out of the file, as they were held.
+take_due() {
+    local f="$1" now
+    now="$(date +%s)"
+    [ -f "$f" ] || return 0
+    awk -v now="$now" '$5 <= now' "$f"
+    awk -v now="$now" '$5 > now' "$f" > "$f.tmp"; mv "$f.tmp" "$f"
+}
 
 # Lines out one write each, so lines of two machines never run into each other.
 say() {
@@ -113,8 +161,14 @@ follow() {
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
                 --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || continue
-            if [ -n "$out" ]; then
-                say "$out"
+            now_lines=""
+            while IFS= read -r l; do
+                [ -n "$l" ] || continue
+                hold "$label" "$l" || now_lines="$now_lines$l
+"
+            done <<< "$out"
+            if [ -n "$now_lines" ]; then
+                say "${now_lines%?}"
             fi
         fi
         rm -f "$gone"
@@ -164,6 +218,8 @@ due() {
         done
 }
 
+rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null; rmdir "$dir/settle.lock" 2>/dev/null || true
+
 # Every 10 s, apart from the streams: the hands-off marks that have passed, against each
 # machine's last snapshot. A `read -t` would do it in the loops, but /bin/bash on macOS
 # (3.2) returns the same status for a timeout as for the end of the stream.
@@ -180,6 +236,20 @@ due() {
             kill -TERM $$ 2>/dev/null
             exit 0
         fi
+        for f in "$dir"/settle "$dir"/settle-*; do
+            [ -f "$f" ] || continue
+            label="${f#"$dir"/settle}"; label="${label#-}"
+            [ ! -e "$(gone_file "$label")" ] || continue
+            settle_locked take_due "$f" | while read -r t g from state _; do
+                snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
+                out="$(jq -rn --argjson b "$snap" --arg t "$t" --argjson g "$g" --arg from "$from" \
+                    --arg state "$state" --argjson self "$self" --arg at "$(at_of "$label")" \
+                    "$settled" 2>/dev/null)" || continue
+                if [ -n "$out" ]; then
+                    say "$out"
+                fi
+            done
+        done
         due | while read -r label t; do
             [ "$label" = - ] && label=""
             # With that machine's daemon away its last snapshot is stale: wait.
