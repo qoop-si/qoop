@@ -203,6 +203,40 @@ pub fn sleep_blockers(
     blockers
 }
 
+/// How many background agents Claude Code is running inside this screen's tab.
+///
+/// A subagent lives in Claude's own process, so `sleep_blockers` never sees it, and with the
+/// main turn over the tab reads idle: a sleep would end the agent's work with it. Claude
+/// draws a panel below the prompt box while any exist: a footer line that ends
+/// `↓ to manage`, then the lead's own row (`⏺ main`), then one `◯` row per agent. A running
+/// agent's row ends in its counter (`4s · ↓ 35.8k tokens`); a finished teammate that stays
+/// listed says `idle` instead and holds nothing. The shell and monitor counts in the footer
+/// are left out on purpose: they are processes, judged by `sleep_blockers`, which lets a
+/// `QORO_SLEEP_SAFE` watcher go. The footer, the lead row and the glyph are all required,
+/// so a panel quoted in an answer (a `qoro read` of another tab) is not mistaken for one.
+/// Measured on Claude Code 2.1.284. Pure, so the measured screens are its tests.
+pub fn running_background_agents(screen: &[String]) -> usize {
+    let Some(footer) = screen
+        .iter()
+        .rposition(|row| row.trim_end().ends_with("↓ to manage"))
+    else {
+        return 0;
+    };
+    let mut rows = screen[footer + 1..]
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty());
+    if !rows.next().is_some_and(|lead| lead.starts_with('⏺')) {
+        return 0;
+    }
+    rows.filter(|row| {
+        row.starts_with('◯')
+            && row.ends_with(" tokens")
+            && (row.contains(" · ↑ ") || row.contains(" · ↓ "))
+    })
+    .count()
+}
+
 /// Whether input from this sender counts as live traffic.
 ///
 /// Restore replay arrives as `Input` from `qoro-restore`: transcript bytes
@@ -647,6 +681,72 @@ mod tests {
             "only the unmarked one blocks"
         );
         assert!(sleep_blockers(&t, 10, Some(20), 5, &|pid| pid == 30 || pid == 40).is_empty());
+    }
+
+    fn screen(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|r| (*r).to_string()).collect()
+    }
+
+    #[test]
+    fn a_running_background_agent_row_is_counted() {
+        // Measured: Claude Code 2.1.284 with one subagent in the background, main turn over.
+        let s = screen(&[
+            "❯",
+            "────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on · 1 shell · ← 5 agents · ↓ to manage",
+            "",
+            "  ⏺ main",
+            "  ◯ sleep-agent  Run this shell command and report done          4s · ↓ 35.8k tokens",
+            "  ◯ rs-reader    Find the 20 largest .rs files under /Users/u...  1m 5s · ↑ 50 tokens",
+        ]);
+        assert_eq!(running_background_agents(&s), 2);
+    }
+
+    #[test]
+    fn a_finished_teammate_and_a_plain_footer_hold_nothing() {
+        let finished = screen(&[
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents · ↓ to manage",
+            "  ⏺ main",
+            "  ◯ hi-agent-2  Answer with the word hi and nothing else.  idle",
+        ]);
+        assert_eq!(running_background_agents(&finished), 0);
+        let none = screen(&[
+            "❯",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents",
+        ]);
+        assert_eq!(running_background_agents(&none), 0);
+    }
+
+    #[test]
+    fn a_whole_panel_quoted_in_an_answer_is_not_a_running_agent() {
+        // A `qoro read` of another tab, pasted into an answer: the footer is quoted too,
+        // but no lead row follows it, and the real footer below has no panel.
+        let s = screen(&[
+            "⏺ the other tab shows:",
+            "  ⏵⏵ bypass permissions on · 1 shell · ← 5 agents · ↓ to manage",
+            "  ◯ rs-reader  Find the largest files    4s · ↓ 35.8k tokens",
+            "❯",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents",
+        ]);
+        assert_eq!(running_background_agents(&s), 0);
+        // A footer quoted mid-line does not end the way the real one does.
+        let mid = screen(&[
+            "⏺ it says `↓ to manage` when something runs",
+            "  ⏺ main",
+            "  ◯ x  y    4s · ↓ 1k tokens",
+        ]);
+        assert_eq!(running_background_agents(&mid), 0);
+    }
+
+    #[test]
+    fn a_counter_quoted_above_the_footer_is_not_a_running_agent() {
+        let s = screen(&[
+            "⏺ the row reads `◯ x  desc  4s · ↓ 1k tokens` while it runs",
+            "  ◯ old  desc  4s · ↓ 1k tokens",
+            "  ⏵⏵ bypass permissions on · ← 5 agents · ↓ to manage",
+            "  ⏺ main",
+        ]);
+        assert_eq!(running_background_agents(&s), 0);
     }
 
     #[test]

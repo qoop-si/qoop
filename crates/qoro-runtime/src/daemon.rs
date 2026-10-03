@@ -5547,6 +5547,13 @@ fn vet_for_sleep(
                     return Err(format!("{name} is {state}"));
                 }
                 let handle = into.terminals.get(stream).ok_or("it has gone")?;
+                // A subagent is no process, so only the screen shows it is still working.
+                if snap.background_agents > 0 {
+                    return Err(format!(
+                        "{name} has {} background agents running",
+                        snap.background_agents
+                    ));
+                }
                 // Settled here as well as by the recorder, which may not have seen this
                 // agent yet: a sleep asked for the moment a wake ends finds it resumed.
                 let said = handle
@@ -8094,6 +8101,12 @@ async fn terminal_task(
                         && let Some(manifest) = qoro_detect::rules_for(&program)
                     {
                         let screen = engine.visible_text();
+                        // Counted from the live screen here, where it is read whether or
+                        // not anyone watches: the published copy goes stale unwatched.
+                        agents.note_background_agents(
+                            stream,
+                            crate::idle::running_background_agents(&screen),
+                        );
                         let osc = qoro_detect::OscContext {
                             title: engine.title(),
                         };

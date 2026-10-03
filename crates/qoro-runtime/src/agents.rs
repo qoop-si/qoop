@@ -72,6 +72,11 @@ pub struct TerminalAgent {
     /// than continuing one. Set from the matched manifest rule, never
     /// inferred, and cleared by any later screen reading without one.
     pub setup_gate: bool,
+    /// How many background agents the screen showed running at its last reading. Read
+    /// from the live screen by the detect loop, watched or not, because a subagent is
+    /// no process and the screen is the only place it shows. Zero on every generation
+    /// change, since it described a process that is gone.
+    pub background_agents: usize,
     /// The rule the screen last matched in this generation, if any.
     ///
     /// What `qoro agents explain` reports. Recorded on every evaluation,
@@ -139,6 +144,8 @@ pub struct ReapSnapshot {
     /// through): reads as no program, but must veto, never close.
     pub boundary: bool,
     pub setup_gate: bool,
+    /// Background agents the screen showed running, see `TerminalAgent::background_agents`.
+    pub background_agents: usize,
     pub idle_since: Option<i64>,
 }
 
@@ -238,6 +245,14 @@ impl AgentRegistry {
             .get(&stream)
             .is_some_and(|a| a.belief.visible_blocker)
     }
+
+    /// Record how many background agents the screen shows running. Changes no state and
+    /// announces nothing: it is read only when a sleep is vetted.
+    pub fn note_background_agents(&self, stream: u32, running: usize) {
+        if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
+            agent.background_agents = running;
+        }
+    }
 }
 
 fn fresh_belief(generation: GenerationId) -> AgentBelief {
@@ -279,6 +294,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     // with it, for the same reason.
     agent.setup_gate = false;
     agent.screen_rule = None;
+    agent.background_agents = 0;
     agent.screen_manifest = None;
     let idle = qoro_domain::AgentObservation {
         agent_id: qoro_domain::AgentId::new(stream.to_string()),
@@ -377,6 +393,7 @@ impl AgentRegistry {
                 last_active_at_unix: None,
                 last_io_unix: None,
                 setup_gate: false,
+                background_agents: 0,
                 screen_rule: None,
                 screen_manifest: None,
                 leader: None,
@@ -463,6 +480,7 @@ impl AgentRegistry {
             agent: is_agent,
             boundary,
             setup_gate: agent.setup_gate,
+            background_agents: agent.background_agents,
             idle_since,
         })
     }
@@ -752,6 +770,7 @@ impl AgentRegistry {
             // reading is void with it.
             agent.setup_gate = false;
             agent.screen_rule = None;
+            agent.background_agents = 0;
             agent.screen_manifest = None;
             agent.identity = AgentIdentity::Known {
                 program,
@@ -776,6 +795,7 @@ impl AgentRegistry {
         // is no longer there. The old rule reading belonged to it too.
         agent.setup_gate = false;
         agent.screen_rule = None;
+        agent.background_agents = 0;
         agent.screen_manifest = None;
         agent.identity = match leader {
             None => AgentIdentity::None,
@@ -837,6 +857,7 @@ impl AgentRegistry {
             // The old rule reading goes with it.
             agent.setup_gate = false;
             agent.screen_rule = None;
+            agent.background_agents = 0;
             agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
@@ -1307,6 +1328,20 @@ mod tests {
         let after = r.agent(1).expect("agent");
         assert_eq!(after.screen_rule, None);
         assert_eq!(after.screen_manifest, None);
+    }
+
+    /// The count of background agents the screen shows rides to the reaper's snapshot, and a
+    /// new foreground generation voids it: it counted agents inside a process that is gone.
+    #[test]
+    fn running_background_agents_reach_the_snapshot_and_a_new_generation_voids_them() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 0);
+        r.note_background_agents(1, 2);
+        assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 2);
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me), NOW).expect("a change");
+        assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 0);
     }
 
     #[test]
