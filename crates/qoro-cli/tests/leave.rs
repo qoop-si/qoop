@@ -125,6 +125,46 @@ fn a_watcher_does_not_keep_it_up_and_an_interface_does() {
     );
 }
 
+/// A watch whose reader went away ends at once, though the session is quiet and it has
+/// nothing to write: over ssh with no tty that is the only sign the link dropped, and a
+/// watch that waited for its next write outlived the link by hours.
+#[test]
+fn a_watch_ends_when_its_reader_goes_though_nothing_changes() {
+    let dir = private_dir();
+    let socket = qoro_testkit::socket_in(dir.path());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut daemon = spawn_daemon(dir.path());
+    // Held, so the daemon stays and the watch has no reason of its own to write again.
+    let _holder = rt
+        .block_on(qoro_runtime::client::connect(&socket, "hold-test"))
+        .expect("a client connects");
+    let mut watch = Running(
+        qoro(dir.path())
+            .args(["agents", "--watch", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the watch"),
+    );
+    let mut first = String::new();
+    BufReader::new(watch.0.stdout.take().expect("stdout"))
+        .read_line(&mut first)
+        .expect("the first index");
+    assert!(first.starts_with('['), "the watch said {first:?}");
+    // The reader is dropped with the line read: the pipe has no reader now.
+    assert!(
+        ends_within(&mut watch, Duration::from_secs(3)),
+        "the watch outlived its reader"
+    );
+    assert!(
+        matches!(daemon.0.try_wait(), Ok(None)),
+        "the daemon left, so the watch had news to write"
+    );
+}
+
 /// The notch's watcher: when the daemon leaves it says there is nothing, stays, and follows
 /// the next daemon when one starts, without being started again.
 #[cfg(target_os = "macos")]

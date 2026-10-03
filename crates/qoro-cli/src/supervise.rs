@@ -342,7 +342,7 @@ pub(crate) fn run_watch(
         )]))
     };
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
+    let watch = async move {
         let mut last = String::new();
         // Printed only when it changes, so a watcher that reconnects says nothing new.
         let mut say = |text: String| -> std::io::Result<bool> {
@@ -377,7 +377,32 @@ pub(crate) fn run_watch(
                 return Err(ended);
             }
         }
+    };
+    rt.block_on(async {
+        tokio::select! {
+            ended = watch => ended,
+            () = reader_gone() => Ok(()),
+        }
     })
+}
+
+/// Resolves once whoever reads stdout has gone: a pipe's reader closed, or the ssh link a
+/// remote watch runs over dropped (no tty there, so no hangup arrives). A watch over a quiet
+/// session writes nothing for hours, and without this it only learnt of it on its next
+/// write, outliving its reader all that time. Woken by the kernel's edge (epoll, kqueue),
+/// never by a timer. Never resolves for a stdout that cannot be watched, such as a file.
+async fn reader_gone() {
+    use tokio::io::{Interest, unix::AsyncFd};
+
+    if let Ok(out) = AsyncFd::with_interest(std::io::stdout(), Interest::WRITABLE) {
+        while let Ok(mut ready) = out.writable().await {
+            if ready.ready().is_write_closed() {
+                return;
+            }
+            ready.clear_ready();
+        }
+    }
+    std::future::pending().await
 }
 
 /// Whether an error means there is no daemon now (never started, or it left), rather than
