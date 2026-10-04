@@ -150,6 +150,7 @@ qoro sleep --tab <terminal>    # end one tab, keep it; refused with reasons
 qoro sleep <space>             # every tab of a space that can sleep
 qoro wake --tab <terminal>     # bring one tab back; `wake <space>` all of it
 qoro wake                      # the tab that slept last
+qoro space rm <id|name>        # drop a space with no tabs; refused if it has any
 qoro stop                      # end qoro; what was awake comes back next open
 ```
 

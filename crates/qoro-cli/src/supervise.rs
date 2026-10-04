@@ -1613,6 +1613,65 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
     })
 }
 
+/// `qoro space rm <id|name>`: drop an empty space, as `ctrl-a W` does.
+///
+/// Only an empty one: a space with a tab in it, awake or asleep, is refused with how many,
+/// and the daemon checks the same again, because it is the one that knows. A name two
+/// spaces share is refused rather than guessed. Never starts a daemon: with none running
+/// there is no space to remove.
+pub(crate) fn run_space_rm(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoro space rm <id|name>";
+    let (Some("rm"), [wanted]) = (
+        args.get(2).map(String::as_str),
+        args.get(3..).unwrap_or_default(),
+    ) else {
+        return Err(super::usage(help));
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut link = Link::open("qoro-space-rm").await.map_err(|e| {
+            if daemon_gone(&e) {
+                std::io::Error::other("nothing is awake: `qoro` or `qoro wake` starts it")
+            } else {
+                e
+            }
+        })?;
+        let spaces = link.spaces().await?;
+        let space = resolve_space(&spaces, wanted)?;
+        let row = spaces
+            .iter()
+            .find(|s| s.id == space)
+            .expect("resolved above");
+        if row.terminals > 0 {
+            return Err(std::io::Error::other(format!(
+                "space {} ({}) still holds {} tab{}, {} asleep: close them first",
+                row.id,
+                row.name,
+                row.terminals,
+                if row.terminals == 1 { "" } else { "s" },
+                row.sleeping.len()
+            )));
+        }
+        match link
+            .ask(&ControlRequest::CloseWorkspace {
+                id: super::request_id("space-rm"),
+                workspace: space,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::WorkspaceClosed { .. } => {
+                println!("removed space {} ({})", row.id, row.name);
+                Ok(())
+            }
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other(
+                "unexpected answer to a space removal",
+            )),
+        }
+    })
+}
+
 /// `qoro send <terminal> --key NAME...`: press named keys, one frame each.
 pub(crate) fn send_keys(terminal: u32, keys: &[String]) -> std::io::Result<()> {
     for key in keys {

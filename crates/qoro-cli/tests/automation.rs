@@ -314,6 +314,38 @@ fn a_new_space_by_name_is_made_once_and_reused() {
 }
 
 #[test]
+fn space_rm_removes_an_empty_space_and_refuses_one_with_a_tab() {
+    let daemon = Daemon::start();
+    let tab = new_terminal(&daemon, &["--space", "scratch"]);
+    let listed = |d: &Daemon| text(&d.run(&["ls"]).stdout);
+    assert!(listed(&daemon).contains("scratch"), "{}", listed(&daemon));
+
+    let refused = daemon.run(&["space", "rm", "scratch"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        text(&refused.stderr).contains("still holds 1 tab"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(listed(&daemon).contains("scratch"), "a refusal removed it");
+
+    daemon.close(&tab);
+    let removed = daemon.run(&["space", "rm", "scratch"]);
+    assert!(removed.status.success(), "{}", text(&removed.stderr));
+    assert!(
+        text(&removed.stdout).contains("removed space"),
+        "{}",
+        text(&removed.stdout)
+    );
+    assert!(!listed(&daemon).contains("scratch"), "{}", listed(&daemon));
+
+    let gone = daemon.run(&["space", "rm", "scratch"]);
+    assert_eq!(gone.status.code(), Some(1));
+    assert!(text(&gone.stderr).contains("no space with id or name"));
+    assert_eq!(daemon.run(&["space", "rm"]).status.code(), Some(2));
+}
+
+#[test]
 fn parallel_callers_naming_one_new_space_make_it_once() {
     let daemon = Daemon::start();
     let made: Vec<String> = std::thread::scope(|scope| {

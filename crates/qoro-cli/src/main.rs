@@ -126,6 +126,7 @@ fn run() -> std::io::Result<()> {
         Some("wake") => supervise::run_wake(&args),
         Some("close") => supervise::run_close(&args),
         Some("worktree") => worktree::run(&args),
+        Some("space") => supervise::run_space_rm(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("reload-manifests") => run_reload_manifests(),
@@ -192,6 +193,7 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro worktree ls [--json]  every worktree and the terminals inside\n\
                   \x20 qoro worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
+                  \x20 qoro space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
                   \x20 qoro close <terminal>  end a terminal and what it started\n\
                   \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\

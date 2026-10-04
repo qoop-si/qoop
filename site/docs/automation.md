@@ -60,6 +60,15 @@ qoro worktree rm feat/login                 remove it, keeping the branch
 while any process has its directory inside (named by pid, and by qoro terminal where it
 knows), and refuses a tree with uncommitted changes unless `--force`.
 
+## Spaces
+
+```
+qoro space rm review                        remove a space that has no tabs in it
+```
+
+`space rm` refuses a space that still holds a tab, awake or asleep, and says how many.
+It never closes tabs for you: close them first.
+
 ## Exit codes
 
 Every command exits 0 on success, 1 when it failed, and 2 when it was called wrong. Errors
