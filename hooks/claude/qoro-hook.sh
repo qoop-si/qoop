@@ -105,6 +105,14 @@ except Exception:
     raise SystemExit(0)
 
 name = payload.get("hook_event_name") or ""
+# An edit, by the agent or by one of its subagents, is real work in this terminal: qoro opens
+# its task record now if it has none, so the record never waits on the agent to open it.
+# Before the subagent filter below, which is about state, not about the work.
+if name == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+    try:
+        subprocess.run(["qoro", "task", "begin"], capture_output=True, timeout=2)
+    except Exception:
+        pass
 # A subagent's tool calls and its end are not this terminal's turn. Reported, a
 # background agent finishing after the turn ended put the tab back to working,
 # and the screen's idle composer took it away again a moment later.
@@ -173,7 +181,25 @@ try:
     subprocess.run(args, timeout=5, capture_output=True)
 except Exception:
     pass
+
+# A session starting, resuming, clearing or compacting: tell the agent the short rules for
+# recording its task, and the task it has open, so they survive a compaction too. After the
+# report, so the state is never late for it; quiet on any failure, and qoro itself prints
+# nothing in qass's own space.
+# With every request, one line about the task: given once, the rules were read and then not
+# followed.
+if name in ("SessionStart", "UserPromptSubmit"):
+    ask = ["qoro", "task", "rules"] + (["--turn"] if name == "UserPromptSubmit" else [])
+    try:
+        got = subprocess.run(ask, capture_output=True, timeout=2, text=True)
+        rules = got.stdout.strip()
+        if got.returncode == 0 and rules:
+            sys.stdout.write(rules + "\n")
+    except Exception:
+        pass
 PY
 )
-printf '%s' "$input" | python3 -c "$prog" >/dev/null 2>&1 || true
+# Standard output is the agent's context on SessionStart and nothing anywhere else: the
+# program prints only the rules, only then.
+printf '%s' "$input" | python3 -c "$prog" 2>/dev/null || true
 exit 0

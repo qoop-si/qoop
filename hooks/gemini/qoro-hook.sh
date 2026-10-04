@@ -6,15 +6,15 @@
 # `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project):
 #
 #   { "hooks": {
-#       "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
-#         "command": "qoro-hook.sh working" }] }],
+#       "SessionStart": [{ "matcher": "*", "hooks": [{ "type": "command",
+#         "command": "qoro-hook.sh starting" }] }],
 #       "BeforeAgent": [{ "matcher": "*", "hooks": [{ "type": "command",
 #         "command": "qoro-hook.sh working" }] }],
 #       "BeforeTool": [{ "matcher": "*", "hooks": [{ "type": "command",
 #         "command": "qoro-hook.sh working" }] }],
 #       "AfterAgent": [{ "matcher": "*", "hooks": [{ "type": "command",
 #         "command": "qoro-hook.sh idle" }] }],
-#       "SessionEnd": [{ "matcher": "exit", "hooks": [{ "type": "command",
+#       "SessionEnd": [{ "matcher": "*", "hooks": [{ "type": "command",
 #         "command": "qoro-hook.sh idle" }] }]
 #   } }
 #
@@ -94,6 +94,13 @@ flags = os.environ.get("QORO_HOOK_FLAGS") or ""
 # because an entry installed earlier still passes `working` for it.
 if name == "SessionStart":
     state, flags = "starting", ""
+# An edit is real work in this terminal: qoro opens its task record now if it has none, so
+# the record never waits on the agent to open it.
+if name == "BeforeTool" and payload.get("tool_name") in ("write_file", "replace"):
+    try:
+        subprocess.run(["qoro", "task", "begin"], capture_output=True, timeout=2)
+    except Exception:
+        pass
 args = ["qoro", "hook-report", "--state", state]
 if flags:
     args.append(flags)
@@ -109,10 +116,33 @@ if name == "BeforeTool":
         args += ["--label", label]
 elif name == "BeforeAgent":
     args += ["--event", "user"]
+    # The head of the request, as the Claude hook sends it: what a task qoro opens is
+    # named after.
+    prompt = one_line(payload.get("prompt") or "")
+    if prompt:
+        args += ["--label", prompt]
 elif name == "AfterAgent":
     # The turn ended: its last tool is not what the agent is doing any more.
     args += ["--event", "done"]
-subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+except Exception:
+    pass
+# A session starting or resuming: tell the agent the short rules for recording its task,
+# and the task it has open. After the report, so the state is never late for it; quiet on
+# any failure, and qoro itself prints nothing in the qass space. Gemini reads only JSON
+# here, so the text goes inside its own envelope.
+# With every request too, one line about the task: given once, the rules were read and then
+# not followed.
+if name in ("SessionStart", "BeforeAgent"):
+    ask = ["qoro", "task", "rules"] + (["--turn"] if name == "BeforeAgent" else [])
+    try:
+        got = subprocess.run(ask, capture_output=True, timeout=2, text=True)
+        rules = got.stdout.strip()
+        if got.returncode == 0 and rules:
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": rules}}))
+    except Exception:
+        pass
 ' 2>/dev/null && exit 0
 fi
 

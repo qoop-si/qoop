@@ -75,7 +75,7 @@ pub struct StoreHandle {
     inner: Arc<Mutex<Store>>,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -89,7 +89,7 @@ impl StoreHandle {
         }
     }
 
-    async fn run<T, F>(&self, f: F) -> Result<T, HandleError>
+    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, HandleError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,

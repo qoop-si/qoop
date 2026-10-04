@@ -16,6 +16,7 @@ pub mod release;
 pub mod spill;
 pub mod state;
 pub mod store;
+mod tasks;
 pub mod terminal;
 
 pub use daemon::Daemon;

@@ -13,12 +13,14 @@
 #![forbid(unsafe_code)]
 
 pub mod history;
+pub mod task;
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use history::History;
 use rusqlite::{Connection, OptionalExtension, params};
+pub use task::{Outcome, TaskError, TaskEventRow, TaskRow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -26,6 +28,10 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("no workspace {0}")]
     NoWorkspace(i64),
+    /// A task write refused for what it asked, not for the database: the message is the
+    /// answer to give.
+    #[error("{0}")]
+    Task(#[from] task::TaskError),
     #[error(
         "this database was written by a newer qoro (schema {found}, this build understands \
          {understood}); use that build or move the file aside"
@@ -266,7 +272,33 @@ impl Store {
              CREATE TABLE IF NOT EXISTS workspace_order (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  position INTEGER NOT NULL
-             );",
+             );
+             -- The work an agent said it is doing (`task.rs`). `terminal` is not a foreign
+             -- key: terminal ids are reused, so every path that ends a terminal closes its
+             -- open task instead, and a closed task keeps its history with `terminal` NULL.
+             -- New tables, no version bump: an older binary ignores them.
+             CREATE TABLE IF NOT EXISTS task (
+                 id INTEGER PRIMARY KEY,
+                 workspace INTEGER REFERENCES workspace(id) ON DELETE SET NULL,
+                 terminal INTEGER,
+                 goal TEXT NOT NULL,
+                 stage TEXT NOT NULL,
+                 opened_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 claimed_at INTEGER,
+                 closed_at INTEGER,
+                 outcome TEXT
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS task_one_open_per_terminal
+                 ON task(terminal) WHERE closed_at IS NULL;
+             CREATE TABLE IF NOT EXISTS task_event (
+                 id INTEGER PRIMARY KEY,
+                 task INTEGER NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+                 at INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 body TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS task_event_by_task ON task_event(task, id);",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
@@ -424,9 +456,21 @@ impl Store {
     /// workspace with no live terminal, so what goes is dead history, never a session
     /// somebody is looking at.
     pub fn delete_workspace(&self, id: i64) -> Result<usize, StoreError> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM workspace WHERE id = ?1", params![id])?)
+        let tx = self.conn.unchecked_transaction()?;
+        // Read before the delete: the cascade takes the terminal rows with it.
+        let terminals = {
+            let mut stmt = tx.prepare("SELECT id FROM terminal WHERE workspace = ?1")?;
+            stmt.query_map(params![id], |r| r.get(0))?
+                .collect::<Result<Vec<i64>, _>>()?
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        task::abandon_open_tasks(&tx, &terminals, now)?;
+        let n = tx.execute("DELETE FROM workspace WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
@@ -504,6 +548,7 @@ impl Store {
             "DELETE FROM asleep_terminal WHERE terminal = ?1",
             params![id],
         )?;
+        task::abandon_open_tasks(&tx, &[id], now)?;
         tx.execute(
             "DELETE FROM applied WHERE idempotency_key = ?1 AND outcome = ?2",
             params![key, created_answer(id)?],
@@ -621,19 +666,23 @@ impl Store {
     /// Mark a terminal closed. The row stays: what was open and when is history, and
     /// deleting it would make a restart unable to say why a workspace looks different.
     pub fn close_terminal(&self, id: i64, now: i64) -> Result<bool, StoreError> {
-        let n = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let n = tx.execute(
             "UPDATE terminal SET closed_at = ?2 WHERE id = ?1 AND closed_at IS NULL",
             params![id, now],
         )?;
         // A closed tab is not asleep: nothing will ever wake it, nor keep it awake.
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM asleep_terminal WHERE terminal = ?1",
             params![id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM awake_terminal WHERE terminal = ?1",
             params![id],
         )?;
+        // Nor working on anything: its id may be handed out again.
+        task::abandon_open_tasks(&tx, &[id], now)?;
+        tx.commit()?;
         Ok(n == 1)
     }
 

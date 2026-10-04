@@ -137,4 +137,12 @@ EOF
 got="$(HOME="$tmp/home" QORO_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
 [ "$got" = 'T5 g1 claude working->idle "task" /w' ] || { echo "settle printed: $got"; exit 1; }
 
+# A row with a task carries it at the end of its line, claim and all.
+task_row='{"terminal":8,"generation":1,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"verifying","claimed":true}}'
+printf '%s\n' "[$(printf "$task_row" working)]" "[$(printf "$task_row" idle)]" > "$tmp/snapshots"
+rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/settle"*
+got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+[ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] \
+    || { echo "task line printed: $got"; exit 1; }
+
 echo "qass watch: ok"

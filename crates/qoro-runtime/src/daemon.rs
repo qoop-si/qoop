@@ -3851,12 +3851,19 @@ async fn handle_control(
             // beside the titles and held to their deadline, so a slow disk costs no more than
             // the titles already may. Unread, the tabs keep id order.
             // Boxed: this arm's future is part of every request's, and stays small that way.
+            // The open tasks too, under the same deadline: unread, the rows carry none.
             let places = Box::pin(tokio::time::timeout(PROBE_DEADLINE, async {
-                tokio::join!(store.layout_order(), store.workspaces())
+                tokio::join!(
+                    store.layout_order(),
+                    store.workspaces(),
+                    store.run(|s| s.open_tasks())
+                )
             }));
             let (titles, places) = tokio::join!(titles, places);
             let titles = titles.unwrap_or_default();
-            let (order, spaces) = places.unwrap_or((Ok(Vec::new()), Ok(Vec::new())));
+            let (order, spaces, open_tasks) =
+                places.unwrap_or((Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())));
+            let mut task_refs = crate::tasks::refs(open_tasks.unwrap_or_default());
             let order: BTreeMap<u32, i64> = order
                 .unwrap_or_default()
                 .into_iter()
@@ -3994,6 +4001,7 @@ async fn handle_control(
                         pgid,
                         background: u32::try_from(agents.background_of(terminal))
                             .unwrap_or(u32::MAX),
+                        task: task_refs.remove(&terminal),
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals
@@ -4258,6 +4266,42 @@ async fn handle_control(
                 .save_session(terminal, session, program.as_deref(), store)
                 .await;
             ControlResponse::AgentStateReported { id, terminal }
+        }
+        ControlRequest::TaskWrite {
+            id,
+            terminal,
+            token,
+            task,
+            action,
+        } => {
+            // A begin skips qass's own space, so it needs the space's name; nothing else does.
+            let space = match (&action, terminal.and_then(|t| terminals.workspace_of(t))) {
+                (crate::control::TaskOp::Begin, Some(space)) => space_name(store, space).await,
+                _ => None,
+            };
+            // Boxed, like the listing: this arm's future is part of every request's.
+            Box::pin(crate::tasks::write(
+                id, terminal, token, task, action, space, agents, store,
+            ))
+            .await
+        }
+        ControlRequest::TaskRead {
+            id,
+            task,
+            terminal,
+            token,
+            before,
+        } => {
+            // The asking terminal's space name, read in time or not at all: `qoro task rules`
+            // stays quiet in qass's own space.
+            let space = match terminal.and_then(|t| terminals.workspace_of(t)) {
+                Some(space) => space_name(store, space).await,
+                None => None,
+            };
+            Box::pin(crate::tasks::read(
+                id, task, terminal, token, before, space, agents, store,
+            ))
+            .await
         }
         ControlRequest::ListFocusEvents {
             terminal, last_n, ..
@@ -6670,6 +6714,17 @@ pub(crate) fn unparsable(error: &str) -> String {
         );
     }
     format!("malformed control request: {error}")
+}
+
+/// A space's name, read in time or not at all. Only ever compared with a short name, so it
+/// is kept short and an answer carrying it still fits one frame.
+async fn space_name(store: &crate::store::StoreHandle, space: i64) -> Option<String> {
+    Box::pin(tokio::time::timeout(PROBE_DEADLINE, store.workspaces()))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|all| all.into_iter().find(|w| w.id == space))
+        .map(|w| w.name.chars().take(100).collect())
 }
 
 /// The most rows one scrollback request may ask for.

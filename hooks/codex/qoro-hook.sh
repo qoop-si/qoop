@@ -98,6 +98,13 @@ flags = os.environ.get("QORO_HOOK_FLAGS") or ""
 # because an entry installed earlier still passes `working` for it.
 if name == "SessionStart":
     state, flags = "starting", ""
+# An edit is real work in this terminal: qoro opens its task record now if it has none, so
+# the record never waits on the agent to open it.
+if name == "PreToolUse" and (payload.get("tool_name") == "apply_patch" or first_fileish(payload.get("tool_input")) == "apply_patch"):
+    try:
+        subprocess.run(["qoro", "task", "begin"], capture_output=True, timeout=2)
+    except Exception:
+        pass
 args = ["qoro", "hook-report", "--state", state]
 if flags:
     args.append(flags)
@@ -113,10 +120,33 @@ if name in ("PreToolUse", "PermissionRequest"):
         args += ["--label", label]
 elif name == "UserPromptSubmit":
     args += ["--event", "user"]
+    # The head of the request, as the Claude hook sends it: what a task qoro opens is
+    # named after.
+    prompt = one_line(payload.get("prompt") or "")
+    if prompt:
+        args += ["--label", prompt]
 elif name == "Stop":
     # The turn ended: its last tool is not what the agent is doing any more.
     args += ["--event", "done"]
-subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+except Exception:
+    pass
+# A session starting or resuming: tell the agent the short rules for recording its task,
+# and the task it has open. After the report, so the state is never late for it; quiet on
+# any failure, and qoro itself prints nothing in the qass space. Codex adds this output
+# to what the agent reads.
+# With every request too, one line about the task: given once, the rules were read and then
+# not followed.
+if name in ("SessionStart", "UserPromptSubmit"):
+    ask = ["qoro", "task", "rules"] + (["--turn"] if name == "UserPromptSubmit" else [])
+    try:
+        got = subprocess.run(ask, capture_output=True, timeout=2, text=True)
+        rules = got.stdout.strip()
+        if got.returncode == 0 and rules:
+            sys.stdout.write(rules + "\n")
+    except Exception:
+        pass
 ' 2>/dev/null && exit 0
 fi
 

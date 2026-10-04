@@ -14,7 +14,7 @@ use qoro_tui::config;
 use crate::supervise;
 
 /// The space qass lives in.
-const SPACE: &str = "qass";
+pub(crate) const SPACE: &str = "qass";
 
 /// What starts the qass skill as each agent's first message, as each was seen to take it:
 /// Claude a slash command, Codex a `$skill` mention, Gemini and opencode a request to use

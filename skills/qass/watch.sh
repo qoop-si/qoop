@@ -26,6 +26,8 @@
 #
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
+# A row with an open task (`qoro task`) ends with its id and stage, and `:claimed` once the
+# agent said done: ... /home/me/src/app task:12:verifying:claimed
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -40,9 +42,11 @@ def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
 def waits: . as $s | ["idle", "blocked", "failed", "done", "sleeping"] | index($s) != null;
 def clean: tostring | gsub("[^\\p{L}\\p{N} ._/-]"; "") | .[0:40];
 def place: tostring | gsub("[^\\p{L}\\p{N} ._/~-]"; "");
+def task: if .task == null then "" else
+  " task:\(.task.id | clean):\(.task.stage | clean)" + (if .task.claimed then ":claimed" else "" end) end;
 def line($r; $from):
   "\($at)T\($r.terminal) g\($r.generation) \($r.program // "-" | clean) \($from)->\($r.state)"
-  + " \"\(($r.name // $r.agent_title // "") | clean)\" \($r.cwd // "-" | place)";
+  + " \"\(($r.name // $r.agent_title // "") | clean)\" \($r.cwd // "-" | place)\($r | task)";
 '
 # $a and $b are row arrays; prints the lines for what changed from $a to $b.
 diff="$defs"'

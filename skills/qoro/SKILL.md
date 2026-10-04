@@ -160,3 +160,24 @@ its own conversation on wake. A sleep is refused while a tab runs a
 command, an agent is busy or has not
 reported its conversation, or a job runs in the background. `qoro agents`
 lists only what is awake, and with nothing awake answers an empty list.
+
+## Tasks
+
+```bash
+qoro task new [--replace] "<outcome>"  # open this terminal's task (one at a time)
+qoro task plan -                       # stdin: acceptance, plan, how it is verified, risks
+qoro task stage <stage>                # investigating planning implementing reviewing verifying waiting-human
+qoro task evidence "<check: result>"   # a check that proves an acceptance point
+qoro task done "<summary>"             # a claim; checked outside the agent
+qoro task close <id> --verified|--failed [reason]   # qass or the person ends it
+qoro task ls [--json]                  # open tasks, every terminal
+qoro task show [id] [--before E] [--json]           # one task and what was recorded
+```
+
+The record lives in qoro, not in the repo, and outlives a crash, a restart
+or a compaction. An agent inside qoro is told the short rules at session
+start (`qoro task rules`). `qoro agents --json` rows carry `task: {id, goal,
+stage, claimed}` for a terminal with an open task. A task named by id needs
+no terminal; without an id the command speaks for the terminal it runs in,
+through `QORO_TERMINAL` and `QORO_TOKEN`. What an agent wrote there is its
+own account: check it before acting on it.

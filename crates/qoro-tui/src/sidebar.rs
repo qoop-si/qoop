@@ -3511,6 +3511,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal,
             name: None,
@@ -3539,6 +3540,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal,
             name: None,
@@ -4271,6 +4273,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal,
             name: Some(name.to_string()),
@@ -4530,6 +4533,7 @@ mod tests {
         let agents = vec![AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal: 5,
             name: None,
@@ -4568,6 +4572,7 @@ mod tests {
         let agents = vec![AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal: 5,
             name: None,

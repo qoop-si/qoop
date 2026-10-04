@@ -498,6 +498,31 @@ fn install(args: &[String]) -> std::io::Result<()> {
                 target.agent
             ),
         }
+        // Codex skips a hook it has not been told to trust, without a word: measured, the
+        // hooks were installed and none of them ran. Trusting is the person's to do.
+        if target.agent == "codex" {
+            println!(
+                "  {:<10} Codex runs these hooks only once trusted: start Codex and pick \
+                 \"Trust all\" when it lists them, or use /hooks",
+                ""
+            );
+        }
+        // Said, never changed for the person: it widens what Codex may reach. Quiet once set.
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
+        let reachable = std::fs::read_to_string(codex_home.join("config.toml")).is_ok_and(|c| {
+            c.lines()
+                .any(|l| l.replace(' ', "") == "network_access=true")
+        });
+        if target.agent == "codex" && !reachable {
+            println!(
+                "  {:<10} its workspace-write sandbox keeps qoro's socket out of reach; set \
+                 sandbox_workspace_write.network_access = true in ~/.codex/config.toml, or run \
+                 it with full access, for qoro commands from inside Codex",
+                ""
+            );
+        }
     }
     println!("\nan agent already running does not read its configuration again: start it afresh.");
     Ok(())
@@ -538,6 +563,7 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
             continue;
         }
         let mut removed = false;
+        let mut failed = false;
         for (config, outcome) in remove_everywhere(&target, &home, &script) {
             let shown = config.strip_prefix(&home).unwrap_or(&config).display();
             match outcome {
@@ -546,13 +572,21 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
                     println!("  {:<10} removed from {shown}", target.agent);
                 }
                 Ok(false) => {}
-                Err(e) => println!("  {:<10} {shown} not edited: {e}", target.agent),
+                Err(e) => {
+                    failed = true;
+                    println!("  {:<10} {shown} not edited: {e}", target.agent);
+                }
             }
         }
         if !removed {
             println!("  {:<10} was not there", target.agent);
         }
         let _ = std::fs::remove_file(&script);
+        // The permissions went with the hooks, in the same rewrite; kept while a file could
+        // not be edited, so a second uninstall still knows they are ours.
+        if target.agent == "claude" && !failed {
+            let _ = std::fs::remove_file(dir.join(ALLOW_MARKER));
+        }
     }
     Ok(())
 }
@@ -815,10 +849,111 @@ fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io
         // Handled before this is ever called: there is no file to edit.
         Shape::Dropped => false,
     };
-    if changed {
+    let added = if target.agent == "claude" {
+        allow_task(&mut root)
+    } else {
+        Vec::new()
+    };
+    let allowed = !added.is_empty();
+    if changed || allowed {
         write(config, &root)?;
     }
-    Ok(changed)
+    // Only once the rules are on disk: a marker for rules that never landed would let an
+    // uninstall take away identical ones the person added later.
+    // Exactly the rules this install added, with any an earlier one added: a rule the person
+    // already had is not ours to take away.
+    if allowed {
+        let marker = script.with_file_name(ALLOW_MARKER);
+        let mut ours = ours(&marker);
+        ours.extend(added);
+        std::fs::write(marker, ours.join("\n"))?;
+    }
+    Ok(changed || allowed)
+}
+
+/// The Claude permissions that let an agent run `qoro task` without asking each time: the
+/// rules its hook gives it ask for several per task. Every subcommand an agent uses on its
+/// own task, and not `close`, which ends somebody's task and stays a question.
+const ALLOW: [&str; 8] = [
+    "Bash(qoro task new:*)",
+    "Bash(qoro task stage:*)",
+    "Bash(qoro task plan:*)",
+    "Bash(qoro task evidence:*)",
+    "Bash(qoro task done:*)",
+    "Bash(qoro task show:*)",
+    "Bash(qoro task ls:*)",
+    "Bash(qoro task rules:*)",
+];
+
+/// Rules the person may already have that cover all of `ALLOW`.
+const COVERING: [&str; 4] = [
+    "Bash(qoro task:*)",
+    "Bash(qoro task *)",
+    "Bash(qoro:*)",
+    "Bash(qoro *)",
+];
+
+/// What says the permissions are ours: written beside the scripts once the install added
+/// them, so an uninstall takes away only rules it put there, never ones the person had.
+const ALLOW_MARKER: &str = "claude-allow-added";
+
+/// Add `ALLOW` to Claude's `permissions.allow` unless a rule there already covers it.
+/// Answers whether anything was added.
+fn allow_task(root: &mut serde_json::Value) -> Vec<String> {
+    let present: Vec<String> = root
+        .pointer("/permissions/allow")
+        .and_then(|a| a.as_array())
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if present.iter().any(|r| COVERING.contains(&r.as_str())) {
+        return Vec::new();
+    }
+    let missing: Vec<String> = ALLOW
+        .iter()
+        .filter(|rule| !present.iter().any(|r| r == *rule))
+        .map(|rule| (*rule).to_string())
+        .collect();
+    if !missing.is_empty() {
+        let allow = array(object(root, "permissions"), "allow");
+        allow.extend(missing.iter().map(|rule| serde_json::json!(rule)));
+    }
+    missing
+}
+
+/// The rules the marker says an install added.
+fn ours(marker: &Path) -> Vec<String> {
+    std::fs::read_to_string(marker)
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Take `ALLOW` back out of a settings value, and with it a list or a `permissions` object
+/// it left empty. Called by `remove` only while the marker says the install added it, in the
+/// same rewrite as the hooks, so a file the install created still goes away whole.
+fn strip_allow(root: &mut serde_json::Value, ours: &[String]) -> bool {
+    let Some(permissions) = root.get_mut("permissions").and_then(|p| p.as_object_mut()) else {
+        return false;
+    };
+    let Some(allow) = permissions.get_mut("allow").and_then(|a| a.as_array_mut()) else {
+        return false;
+    };
+    let before = allow.len();
+    allow.retain(|r| !r.as_str().is_some_and(|r| ours.iter().any(|o| o == r)));
+    if allow.len() == before {
+        return false;
+    }
+    if allow.is_empty() {
+        permissions.shift_remove("allow");
+    }
+    if permissions.is_empty() {
+        root.as_object_mut().map(|o| o.shift_remove("permissions"));
+    }
+    true
 }
 
 /// Take this hook back out. Answers whether anything changed.
@@ -887,6 +1022,10 @@ fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> 
         && let Some(root) = root.as_object_mut()
     {
         root.shift_remove("hooks");
+    }
+    let added = ours(&script.with_file_name(ALLOW_MARKER));
+    if !added.is_empty() {
+        changed |= strip_allow(&mut root, &added);
     }
     if changed {
         // No kept copy at all means no write ever found the file there before it: the
@@ -1302,9 +1441,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("reports");
         let fake = dir.path().join("qoro");
+        // The rules a session start also asks for are not a report.
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+            format!(
+                "#!/bin/sh\n[ \"$1\" = task ] && exit 0\necho \"$*\" >> '{}'\n",
+                log.display()
+            ),
         )
         .expect("write");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -2000,5 +2143,322 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A session start hands the agent the task rules on its standard output, which is
+    /// what Claude and Codex add to its context; Gemini only reads JSON there. Every other
+    /// event prints nothing, outside qoro nothing prints, and a `qoro` without tasks (an
+    /// older one on a remote) leaves the hook quiet and successful.
+    #[test]
+    fn a_session_start_prints_the_task_rules_and_nothing_else_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let fake = dir.path().join("qoro");
+        let set_fake = |rules: &str| {
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\n[ \"$1\" = task ] && {rules}\nexit 0\n"),
+            )
+            .expect("write");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        let run = |agent: &str, payload: &str, inside: bool| -> String {
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg(&script)
+                .arg("working")
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env_remove("QORO_TERMINAL")
+                .env_remove("QORO_TOKEN")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            if inside {
+                cmd.env("QORO_TERMINAL", "1").env("QORO_TOKEN", "t");
+            }
+            let mut child = cmd.spawn().expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            let out = child.wait_with_output().expect("wait");
+            assert!(out.status.success(), "a hook must exit 0");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        set_fake("echo \"RULES LINE $3\"; exit 0");
+        let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
+        for agent in ["claude", "codex"] {
+            assert_eq!(run(agent, start, true).trim(), "RULES LINE", "{agent}");
+            assert_eq!(run(agent, start, false), "", "{agent} outside qoro");
+            assert_eq!(
+                run(
+                    agent,
+                    r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
+                    true
+                )
+                .trim(),
+                "RULES LINE --turn",
+                "{agent} gets the line with each request"
+            );
+            assert_eq!(
+                run(agent, r#"{"hook_event_name":"Stop"}"#, true),
+                "",
+                "{agent} stop"
+            );
+        }
+        for source in ["resume", "clear", "compact"] {
+            let payload = format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#);
+            assert_eq!(
+                run("claude", &payload, true).trim(),
+                "RULES LINE",
+                "{source}"
+            );
+        }
+        for source in ["resume", "clear"] {
+            let payload = format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#);
+            assert_eq!(
+                run("codex", &payload, true).trim(),
+                "RULES LINE",
+                "codex {source}"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&run("gemini", &payload, true)).expect("json");
+            assert_eq!(
+                json["hookSpecificOutput"]["additionalContext"],
+                "RULES LINE"
+            );
+        }
+        let gemini = run("gemini", r#"{"hook_event_name":"SessionStart"}"#, true);
+        let json: serde_json::Value = serde_json::from_str(&gemini).expect("Gemini gets JSON only");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            json["hookSpecificOutput"]["additionalContext"],
+            "RULES LINE"
+        );
+        let turn: serde_json::Value =
+            serde_json::from_str(&run("gemini", r#"{"hook_event_name":"BeforeAgent"}"#, true))
+                .expect("Gemini gets JSON with each request too");
+        assert_eq!(turn["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+        assert_eq!(
+            turn["hookSpecificOutput"]["additionalContext"],
+            "RULES LINE --turn"
+        );
+        assert_eq!(
+            run("gemini", r#"{"hook_event_name":"AfterAgent"}"#, true),
+            ""
+        );
+
+        // A qoro that does not know `task` answers 2 and says so on stderr.
+        set_fake("echo 'unknown command' >&2; exit 2");
+        for agent in ["claude", "codex", "gemini"] {
+            assert_eq!(run(agent, start, true), "", "{agent} with an older qoro");
+        }
+        // And one that prints nothing (qass's own space) prints nothing.
+        set_fake("exit 0");
+        for agent in ["claude", "codex", "gemini"] {
+            assert_eq!(run(agent, start, true), "", "{agent} with nothing to say");
+        }
+    }
+
+    /// The Claude permission for `qoro task` is added once, never over a rule that already
+    /// covers it, and an uninstall takes back only one it added.
+    #[test]
+    fn the_task_permission_is_ours_to_add_and_ours_to_remove() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let config = dir.path().join("settings.json");
+        let script = dir.path().join("qoro-hook.sh");
+        let marker = dir.path().join(ALLOW_MARKER);
+        let allow = |config: &Path| -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(config).expect("read"),
+            )
+            .expect("json")
+            .pointer("/permissions/allow")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+        };
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
+        assert_eq!(allow(&config), serde_json::json!(ALLOW));
+        assert!(marker.exists());
+        assert!(
+            !ALLOW.iter().any(|r| r.contains("close")),
+            "ending a task is never pre-approved"
+        );
+        assert!(!edit(&config, &target("claude"), &script, false).expect("again"));
+        assert!(remove(&config, &script, false).expect("remove"));
+        assert!(
+            !config.exists(),
+            "a file the install created goes away whole"
+        );
+
+        // Beside the person's own settings, only ours goes.
+        std::fs::write(
+            &config,
+            r#"{"model":"opus","permissions":{"allow":["Read"]}}"#,
+        )
+        .expect("write");
+        assert!(edit(&config, &target("claude"), &script, false).expect("install"));
+        let mut both = vec!["Read"];
+        both.extend(ALLOW);
+        assert_eq!(allow(&config), serde_json::json!(both));
+        assert!(remove(&config, &script, false).expect("remove"));
+        assert_eq!(allow(&config), serde_json::json!(["Read"]));
+
+        // A person who already allows all of qoro keeps exactly their rule.
+        let theirs = dir.path().join("theirs.json");
+        std::fs::write(&theirs, r#"{"permissions":{"allow":["Bash(qoro:*)"]}}"#).expect("write");
+        let elsewhere = tempfile::tempdir().expect("a directory");
+        let their_script = elsewhere.path().join("qoro-hook.sh");
+        assert!(edit(&theirs, &target("claude"), &their_script, false).expect("install"));
+        assert!(
+            !elsewhere.path().join(ALLOW_MARKER).exists(),
+            "covered, so not ours"
+        );
+        assert_eq!(allow(&theirs), serde_json::json!(["Bash(qoro:*)"]));
+        assert!(remove(&theirs, &their_script, false).expect("remove"));
+        assert_eq!(
+            allow(&theirs),
+            serde_json::json!(["Bash(qoro:*)"]),
+            "their rule stays"
+        );
+
+        // A person who already allows one of the subcommands keeps it after an uninstall.
+        let mine = dir.path().join("mine.json");
+        std::fs::write(
+            &mine,
+            r#"{"permissions":{"allow":["Bash(qoro task show:*)"]}}"#,
+        )
+        .expect("write");
+        let third = tempfile::tempdir().expect("a directory");
+        let third_script = third.path().join("qoro-hook.sh");
+        assert!(edit(&mine, &target("claude"), &third_script, false).expect("install"));
+        assert_eq!(allow(&mine).as_array().map(Vec::len), Some(ALLOW.len()));
+        assert!(remove(&mine, &third_script, false).expect("remove"));
+        assert_eq!(
+            allow(&mine),
+            serde_json::json!(["Bash(qoro task show:*)"]),
+            "theirs stays"
+        );
+    }
+
+    /// An edit attempt, by the agent or one of its subagents, opens the terminal's task
+    /// through `qoro task begin`; nothing else does. Codex edits through `apply_patch`,
+    /// Gemini through `write_file` and `replace`. Codex and Gemini send the prompt head.
+    #[test]
+    fn an_edit_attempt_begins_the_task_and_nothing_else_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let log = dir.path().join("calls");
+        let fake = dir.path().join("qoro");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let calls = |agent: &str, arg: &str, payload: &str| -> String {
+            let _ = std::fs::remove_file(&log);
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .arg(arg)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QORO_TERMINAL", "1")
+                .env("QORO_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        let begins = |said: &str| said.lines().any(|l| l == "task begin");
+        for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            let said = calls(
+                "claude",
+                "",
+                &format!(r#"{{"hook_event_name":"PreToolUse","tool_name":"{tool}"}}"#),
+            );
+            assert!(begins(&said), "{tool}: {said:?}");
+        }
+        let said = calls(
+            "claude",
+            "",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","agent_id":"sub1"}"#,
+        );
+        assert!(begins(&said), "a subagent's edit is work too: {said:?}");
+        assert!(
+            !said.contains("hook-report"),
+            "and still says nothing about state"
+        );
+        for payload in [
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Read"}"#,
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"edit it"}"#,
+        ] {
+            assert!(!begins(&calls("claude", "", payload)), "{payload}");
+        }
+        let said = calls(
+            "codex",
+            "working",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"apply_patch"}"#,
+        );
+        assert!(begins(&said), "codex apply_patch: {said:?}");
+        let said = calls(
+            "codex",
+            "working",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":["apply_patch","*** Begin Patch"]}}"#,
+        );
+        assert!(
+            begins(&said),
+            "codex apply_patch through the shell: {said:?}"
+        );
+        assert!(!begins(&calls(
+            "codex",
+            "working",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":["ls"]}}"#,
+        )));
+        for tool in ["write_file", "replace"] {
+            let said = calls(
+                "gemini",
+                "working",
+                &format!(r#"{{"hook_event_name":"BeforeTool","tool_name":"{tool}"}}"#),
+            );
+            assert!(begins(&said), "gemini {tool}: {said:?}");
+        }
+        assert!(!begins(&calls(
+            "gemini",
+            "working",
+            r#"{"hook_event_name":"BeforeTool","tool_name":"read_file"}"#,
+        )));
+        let said = calls(
+            "codex",
+            "working",
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"make it  shout\nplease"}"#,
+        );
+        assert!(
+            said.contains("--event user --label make it shout please"),
+            "{said:?}"
+        );
+        let said = calls(
+            "gemini",
+            "working",
+            r#"{"hook_event_name":"BeforeAgent","prompt":"make it shout"}"#,
+        );
+        assert!(
+            said.contains("--event user --label make it shout"),
+            "{said:?}"
+        );
     }
 }

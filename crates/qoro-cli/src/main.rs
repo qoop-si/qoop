@@ -31,6 +31,7 @@ mod settings;
 mod skills;
 mod sound;
 mod supervise;
+mod task;
 mod update;
 mod worktree;
 
@@ -129,6 +130,7 @@ fn run() -> std::io::Result<()> {
         Some("space") => supervise::run_space_rm(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
+        Some("task") => task::run(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
@@ -170,6 +172,8 @@ fn run() -> std::io::Result<()> {
                  \x20 qoro setup ...  capture, inspect, trust and run a Setup\n\
                    \x20 qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
+                  \x20 qoro task new|stage|plan|evidence|done|close|ls|show|rules  the work this\n\
+                  \x20                 terminal's agent is doing, kept by qoro; `qoro task` for more\n\
                   \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoro send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
@@ -2681,6 +2685,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            task: None,
             news: false,
             terminal,
             workspace: 1,

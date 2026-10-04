@@ -412,6 +412,117 @@ pub enum ControlRequest {
         id: String,
         version: String,
     },
+    /// Write to a task: open one, move it, record its plan, evidence or done claim, or
+    /// close it.
+    ///
+    /// `task` names one directly, which any client of this socket may do (the socket is the
+    /// owner's own). Without it, the target is the open task of `terminal`, which must come
+    /// with that terminal's token, checked like a hook report. `Close` always names its task.
+    TaskWrite {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<i64>,
+        action: TaskOp,
+    },
+    /// Read tasks: one by `task` (or the open one of `terminal`, with its token) with its
+    /// events newest first, older than `before` when given; with neither, every open task.
+    TaskRead {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<i64>,
+    },
+}
+
+/// What a `TaskWrite` does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskOp {
+    New {
+        goal: String,
+        replace: bool,
+    },
+    /// The terminal's open task, or a new one named after its newest prompt: what a hook
+    /// sends at the agent's first file edit, so the record never waits on the agent.
+    Begin,
+    Stage {
+        stage: String,
+    },
+    Plan {
+        text: String,
+    },
+    Evidence {
+        text: String,
+    },
+    Done {
+        summary: String,
+    },
+    Close {
+        outcome: TaskOutcome,
+        reason: String,
+    },
+}
+
+/// How a task is closed by a person or qass. The two other endings, superseded and
+/// abandoned, happen to a task; nobody asks for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Verified,
+    Failed,
+}
+
+/// A task as a row in the agents listing: enough to say what the terminal is working on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRef {
+    pub id: i64,
+    /// Cut to `TASK_REF_GOAL` characters: every row carries it, and the listing is one frame.
+    pub goal: String,
+    pub stage: String,
+    /// The agent said it is done and nothing has moved it since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claimed: bool,
+}
+
+/// How much of a goal an agents row carries.
+pub const TASK_REF_GOAL: usize = 100;
+
+/// A task as `qoro task` shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub id: i64,
+    #[serde(default)]
+    pub workspace: Option<i64>,
+    #[serde(default)]
+    pub terminal: Option<i64>,
+    pub goal: String,
+    pub stage: String,
+    pub opened_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub claimed_at: Option<i64>,
+    #[serde(default)]
+    pub closed_at: Option<i64>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+/// One thing recorded on a task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEventInfo {
+    pub id: i64,
+    pub at: i64,
+    pub kind: String,
+    pub body: String,
 }
 
 impl ControlRequest {
@@ -448,6 +559,8 @@ impl ControlRequest {
             | Self::SaveUpload { id, .. }
             | Self::SetSplit { id, .. }
             | Self::RestartWhenSafe { id, .. }
+            | Self::TaskWrite { id, .. }
+            | Self::TaskRead { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -612,6 +725,24 @@ pub enum ControlResponse {
         /// daemon already runs that version or a newer one, so there is nothing to move to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         waiting_on: Option<String>,
+    },
+    /// A `TaskWrite` landed on `task`.
+    TaskWritten {
+        id: String,
+        task: i64,
+    },
+    /// What a `TaskRead` asked for, kept under one frame: `more` says the list or the events
+    /// were cut there, and older events come with `before`. `space` is the asking terminal's
+    /// space name, when one was asked about and it could be read in time.
+    Tasks {
+        id: String,
+        tasks: Vec<TaskInfo>,
+        #[serde(default)]
+        events: Vec<TaskEventInfo>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<String>,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -1028,6 +1159,10 @@ pub struct AgentRow {
     /// and zero from a daemon that predates it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background: u32,
+    /// The task the agent in this terminal opened and has not had closed (`qoro task`).
+    /// Absent when there is none, and from a daemon that predates tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskRef>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1099,6 +1234,8 @@ impl ControlResponse {
             | Self::NewsNoted { id }
             | Self::SplitSaved { id }
             | Self::RestartArmed { id, .. }
+            | Self::TaskWritten { id, .. }
+            | Self::Tasks { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }
@@ -1377,6 +1514,7 @@ mod tests {
             news: false,
             keep_awake: false,
             background: 0,
+            task: None,
             terminal: 3,
             workspace: 1,
             name: None,
@@ -1419,6 +1557,29 @@ mod tests {
         .expect("decode");
         assert_eq!(new.last_active_at_unix, Some(1_750_000_000));
         assert_eq!(new.cwd.as_deref(), Some("/tmp/work"));
+    }
+
+    /// A row's task crosses old daemons both ways: absent from an older daemon's row, kept
+    /// from a newer one's, and a row with none writes no key at all.
+    #[test]
+    fn the_task_field_parses_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"idle"}"#).expect("decode");
+        assert_eq!(old.task, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("\"task\""));
+        let new: AgentRow = serde_json::from_str(
+            r#"{"terminal":1,"workspace":1,"state":"idle","task":{"id":3,"goal":"g","stage":"planning","claimed":true,"later":1}}"#,
+        )
+        .expect("decode");
+        assert_eq!(
+            new.task,
+            Some(TaskRef {
+                id: 3,
+                goal: "g".into(),
+                stage: "planning".into(),
+                claimed: true
+            })
+        );
     }
 
     #[test]

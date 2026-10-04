@@ -194,6 +194,24 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x27".into(),
             version: "0.0.0".into(),
         },
+        // A task is a record about the work: text kept by the daemon, never typed.
+        ControlRequest::TaskWrite {
+            id: "x28".into(),
+            terminal: Some(terminal),
+            token: Some("not-its-token".into()),
+            task: None,
+            action: qoro_runtime::control::TaskOp::New {
+                goal: "echo PWNED".into(),
+                replace: true,
+            },
+        },
+        ControlRequest::TaskRead {
+            id: "x29".into(),
+            task: None,
+            terminal: Some(terminal),
+            token: None,
+            before: None,
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -228,6 +246,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
+            | ControlRequest::TaskWrite { .. }
+            | ControlRequest::TaskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

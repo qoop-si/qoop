@@ -1,0 +1,341 @@
+//! The daemon's side of `qoro task`: which task a request means, the write, and an answer
+//! that fits one frame.
+//!
+//! A terminal names its own task through its token, checked like a hook report: a token
+//! that does not match refuses the call, with no guessing. A task named by id needs no
+//! terminal, because the socket is the owner's own. Who closes a task is a convention (qass
+//! or the person), not a check.
+
+use qoro_domain::{CapabilityToken, TerminalId};
+use qoro_store::{Outcome, TaskEventRow, TaskRow};
+
+use crate::agents::AgentRegistry;
+use crate::control::{
+    ControlResponse, TASK_REF_GOAL, TaskEventInfo, TaskInfo, TaskOp, TaskOutcome, TaskRef,
+};
+use crate::store::{HandleError, StoreHandle, now};
+
+/// The space qass works in: nothing there opens a task on its own.
+const QASS_SPACE: &str = "qass";
+
+/// The most a `Tasks` answer carries, serialized, under the 65,536 byte frame.
+const ANSWER_BYTES: usize = 60_000;
+
+/// The most events one read looks at before the byte cap decides.
+const EVENTS_READ: usize = 200;
+
+/// Whether `token` is this terminal's, the same check a hook report passes.
+fn admitted(agents: &AgentRegistry, terminal: u32, token: &str) -> bool {
+    let id = TerminalId::new(terminal.to_string());
+    let token = CapabilityToken::new(token.to_string());
+    let Some(generation) = agents.agent(terminal).map(|a| a.belief.generation) else {
+        return false;
+    };
+    agents
+        .admit(terminal, &id, Some(&token), generation)
+        .is_ok()
+}
+
+fn failed(id: String, reason: impl Into<String>) -> ControlResponse {
+    ControlResponse::Failed {
+        id,
+        reason: reason.into(),
+    }
+}
+
+fn store_failed(id: String, error: HandleError) -> ControlResponse {
+    match error {
+        // The deadline does not cancel the write, so it may still land.
+        HandleError::Timeout => failed(
+            id,
+            "qoro did not confirm in time; it may have been recorded, check qoro task show",
+        ),
+        HandleError::Store(e) => failed(id, e.to_string()),
+    }
+}
+
+/// The terminal a request speaks for, once its token is checked. `None` when it named none.
+fn speaker(
+    agents: &AgentRegistry,
+    terminal: Option<u32>,
+    token: Option<&str>,
+) -> Result<Option<u32>, String> {
+    match (terminal, token) {
+        (None, _) => Ok(None),
+        (Some(t), Some(token)) if admitted(agents, t, token) => Ok(Some(t)),
+        (Some(t), _) => Err(format!("the task request for terminal {t} was refused")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write(
+    id: String,
+    terminal: Option<u32>,
+    token: Option<String>,
+    task: Option<i64>,
+    action: TaskOp,
+    space: Option<String>,
+    agents: &AgentRegistry,
+    store: &StoreHandle,
+) -> ControlResponse {
+    let speaker = match speaker(agents, terminal, token.as_deref()) {
+        Ok(s) => s,
+        Err(reason) => return failed(id, reason),
+    };
+    let now = now();
+    if let TaskOp::Begin = action {
+        let Some(terminal) = speaker else {
+            return failed(id, "a task is begun from inside a qoro terminal");
+        };
+        // qass edits its own files; it never has a task of its own.
+        // An unread name could be qass's: nothing is opened on a guess, the next edit asks again.
+        if space.is_none() || space.as_deref() == Some(QASS_SPACE) {
+            return ControlResponse::TaskWritten { id, task: 0 };
+        }
+        let (goal, asked_at) = match agents.last_prompt(terminal) {
+            Some((goal, at)) => (goal, Some(at)),
+            None => (String::new(), None),
+        };
+        return match store
+            .run(move |s| s.begin_task(i64::from(terminal), &goal, asked_at, now))
+            .await
+        {
+            Ok((task, opened)) => {
+                if opened {
+                    agents.announce(terminal);
+                }
+                ControlResponse::TaskWritten { id, task }
+            }
+            Err(e) => store_failed(id, e),
+        };
+    }
+    if let TaskOp::New { goal, replace } = action {
+        let Some(terminal) = speaker else {
+            return failed(id, "a task is opened from inside a qoro terminal");
+        };
+        return match store
+            .run(move |s| s.open_task(i64::from(terminal), &goal, replace, now))
+            .await
+        {
+            Ok(task) => {
+                agents.announce(terminal);
+                ControlResponse::TaskWritten { id, task }
+            }
+            Err(e) => store_failed(id, e),
+        };
+    }
+    if matches!(action, TaskOp::Close { .. }) && task.is_none() {
+        return failed(id, "close names its task: qoro task close <id>");
+    }
+    // The task meant: the one named, which must be the speaker's own when a speaker came
+    // with it, or the speaker's open one.
+    let target = store
+        .run(move |s| match (task, speaker) {
+            (Some(task), None) => Ok(s.task(task)?.map(|t| (task, t.terminal))),
+            (Some(task), Some(terminal)) => Ok(s
+                .task(task)?
+                .filter(|t| t.terminal == Some(i64::from(terminal)))
+                .map(|t| (task, t.terminal))),
+            (None, Some(terminal)) => Ok(s
+                .open_task_of(i64::from(terminal))?
+                .map(|t| (t.id, t.terminal))),
+            (None, None) => Ok(None),
+        })
+        .await;
+    let (task, home) = match target {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return failed(
+                id,
+                match (task, speaker) {
+                    (Some(task), Some(t)) => format!("task #{task} is not terminal {t}'s"),
+                    (Some(task), None) => format!("no task #{task}"),
+                    (None, Some(_)) => {
+                        "this terminal has no open task: qoro task new <goal>".into()
+                    }
+                    (None, None) => "no task named, and not inside a qoro terminal".into(),
+                },
+            );
+        }
+        Err(e) => return store_failed(id, e),
+    };
+    let wrote = store
+        .run(move |s| match action {
+            TaskOp::New { .. } | TaskOp::Begin => unreachable!("handled above"),
+            TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
+            TaskOp::Plan { text } => s.task_plan(task, &text, now).map(|()| false),
+            TaskOp::Evidence { text } => s.task_evidence(task, &text, now).map(|()| false),
+            TaskOp::Done { summary } => s.claim_task_done(task, &summary, now).map(|()| true),
+            TaskOp::Close { outcome, reason } => {
+                let outcome = match outcome {
+                    TaskOutcome::Verified => Outcome::Verified,
+                    TaskOutcome::Failed => Outcome::Failed,
+                };
+                s.close_task(task, outcome, &reason, now).map(|_| true)
+            }
+        })
+        .await;
+    match wrote {
+        Ok(shown) => {
+            // Only what a row shows: plan and evidence change nothing a reader draws.
+            if shown && let Some(home) = home.and_then(|t| u32::try_from(t).ok()) {
+                agents.announce(home);
+            }
+            ControlResponse::TaskWritten { id, task }
+        }
+        Err(e) => store_failed(id, e),
+    }
+}
+
+fn info(t: TaskRow) -> TaskInfo {
+    TaskInfo {
+        id: t.id,
+        workspace: t.workspace,
+        terminal: t.terminal,
+        goal: t.goal,
+        stage: t.stage,
+        opened_at: t.opened_at,
+        updated_at: t.updated_at,
+        claimed_at: t.claimed_at,
+        closed_at: t.closed_at,
+        outcome: t.outcome,
+    }
+}
+
+fn event_info(e: TaskEventRow) -> TaskEventInfo {
+    TaskEventInfo {
+        id: e.id,
+        at: e.at,
+        kind: e.kind,
+        body: e.body,
+    }
+}
+
+/// Keep items, in order, while the answer stays under the cap. Answers whether any was cut.
+fn fit<T: serde::Serialize>(items: Vec<T>, budget: &mut usize) -> (Vec<T>, bool) {
+    let mut kept = Vec::new();
+    let total = items.len();
+    for item in items {
+        // The comma between items, and the item as it will be written.
+        let size = serde_json::to_vec(&item)
+            .map(|v| v.len() + 1)
+            .unwrap_or(usize::MAX);
+        if size > *budget {
+            break;
+        }
+        *budget -= size;
+        kept.push(item);
+    }
+    let cut = kept.len() < total;
+    (kept, cut)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read(
+    id: String,
+    task: Option<i64>,
+    terminal: Option<u32>,
+    token: Option<String>,
+    before: Option<i64>,
+    space: Option<String>,
+    agents: &AgentRegistry,
+    store: &StoreHandle,
+) -> ControlResponse {
+    let speaker = match speaker(agents, terminal, token.as_deref()) {
+        Ok(s) => s,
+        Err(reason) => return failed(id, reason),
+    };
+    let found = store
+        .run(move |s| {
+            let one = match (task, speaker) {
+                (Some(task), _) => Some(s.task(task)?),
+                (None, Some(terminal)) => Some(s.open_task_of(i64::from(terminal))?),
+                (None, None) => None,
+            };
+            Ok(match one {
+                // One task (or none open), with its events.
+                Some(row) => {
+                    let events = match &row {
+                        // One more than is kept, so a cut is known even below the byte cap.
+                        Some(t) => s.task_events(t.id, before, EVENTS_READ + 1)?,
+                        None => Vec::new(),
+                    };
+                    (row.into_iter().collect::<Vec<_>>(), events, true)
+                }
+                // Every open task.
+                None => (s.open_tasks()?, Vec::new(), false),
+            })
+        })
+        .await;
+    let (tasks, events, one) = match found {
+        Ok(found) => found,
+        Err(e) => return store_failed(id, e),
+    };
+    if one && task.is_some() && tasks.is_empty() {
+        return failed(id, format!("no task #{}", task.unwrap_or_default()));
+    }
+    let read_cut = events.len() > EVENTS_READ;
+    let events: Vec<TaskEventRow> = events.into_iter().take(EVENTS_READ).collect();
+    // Room for the envelope first: the fixed keys, and the id and space the caller chose,
+    // which are as long as they are. Then rows, then events.
+    // Measured, not guessed: an id is the caller's and JSON may write a character of it as
+    // six bytes.
+    let envelope = serde_json::to_vec(&ControlResponse::Tasks {
+        id: id.clone(),
+        tasks: Vec::new(),
+        events: Vec::new(),
+        more: true,
+        space: space.clone(),
+    })
+    .map_or(ANSWER_BYTES, |v| v.len() + 64);
+    let mut budget = ANSWER_BYTES.saturating_sub(envelope);
+    let (tasks, rows_cut) = fit(tasks.into_iter().map(info).collect(), &mut budget);
+    let (events, events_cut) = fit(events.into_iter().map(event_info).collect(), &mut budget);
+    ControlResponse::Tasks {
+        id,
+        tasks,
+        events,
+        more: rows_cut || events_cut || read_cut,
+        space,
+    }
+}
+
+/// The agents listing's view of the open tasks, by terminal.
+pub(crate) fn refs(open: Vec<TaskRow>) -> std::collections::BTreeMap<u32, TaskRef> {
+    open.into_iter()
+        .filter_map(|t| {
+            let terminal = u32::try_from(t.terminal?).ok()?;
+            Some((
+                terminal,
+                TaskRef {
+                    id: t.id,
+                    goal: t.goal.chars().take(TASK_REF_GOAL).collect(),
+                    stage: t.stage,
+                    claimed: t.claimed_at.is_some(),
+                },
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows and events alike stop where the next one would pass the budget, in order, and
+    /// say so.
+    #[test]
+    fn fit_keeps_whole_items_in_order_until_the_budget_is_spent() {
+        let rows: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(98))).collect();
+        let one = serde_json::to_vec(&rows[0]).unwrap().len() + 1;
+        let mut budget = one * 4 + one / 2;
+        let (kept, cut) = fit(rows.clone(), &mut budget);
+        assert_eq!(kept, rows[..4].to_vec());
+        assert!(cut);
+        assert!(budget < one, "what is left is less than one more item");
+        let mut plenty = usize::MAX / 2;
+        let (all, cut) = fit(rows.clone(), &mut plenty);
+        assert_eq!(all.len(), 10);
+        assert!(!cut);
+    }
+}

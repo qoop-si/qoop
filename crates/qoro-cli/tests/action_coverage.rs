@@ -409,6 +409,33 @@ fn actions() -> Vec<Action> {
             name: "resize the focused terminal",
             method: || Method::Terminal("Resize"),
         },
+        Action {
+            name: "record what this terminal's agent is working on",
+            method: || {
+                Method::Control(ControlRequest::TaskWrite {
+                    id: "a".into(),
+                    terminal: Some(1),
+                    token: Some("t".into()),
+                    task: None,
+                    action: qoro_runtime::control::TaskOp::New {
+                        goal: "g".into(),
+                        replace: false,
+                    },
+                })
+            },
+        },
+        Action {
+            name: "show a task and what was recorded on it",
+            method: || {
+                Method::Control(ControlRequest::TaskRead {
+                    id: "a".into(),
+                    task: Some(1),
+                    terminal: None,
+                    token: None,
+                    before: None,
+                })
+            },
+        },
     ]
 }
 
@@ -600,6 +627,22 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             version: String::new(),
         },
+        ControlRequest::TaskWrite {
+            id: String::new(),
+            terminal: None,
+            token: None,
+            task: Some(0),
+            action: qoro_runtime::control::TaskOp::Stage {
+                stage: String::new(),
+            },
+        },
+        ControlRequest::TaskRead {
+            id: String::new(),
+            task: None,
+            terminal: None,
+            token: None,
+            before: None,
+        },
     ];
     for request in &all {
         match request {
@@ -633,6 +676,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
+            | ControlRequest::TaskWrite { .. }
+            | ControlRequest::TaskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

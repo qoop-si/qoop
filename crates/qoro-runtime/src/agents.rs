@@ -184,6 +184,11 @@ pub struct AgentRegistry {
     /// here as well as in the belief. Never journalled, never pushed,
     /// never observed. A terminal that is gone takes its log with it.
     focus: Mutex<BTreeMap<u32, VecDeque<crate::control::FocusEvent>>>,
+    /// The newest prompt head each terminal's hook reported (redacted and cut like every
+    /// focus label) and when, kept apart from the focus log because that log is capped and a
+    /// few dozen tool calls push the prompt out of it. What a task opened by qoro is named
+    /// after, and how it tells a new request from the one a done claim answered.
+    prompts: Mutex<BTreeMap<u32, (String, i64)>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
@@ -345,6 +350,7 @@ impl AgentRegistry {
             by_pid: Mutex::new(HashMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             focus: Mutex::new(BTreeMap::new()),
+            prompts: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
             leaders: Mutex::new(HashMap::new()),
             closed: Mutex::new(BTreeSet::new()),
@@ -653,6 +659,7 @@ impl AgentRegistry {
     fn remove_live(&self, stream: u32) {
         self.masters.lock().unwrap().remove(&stream);
         self.focus.lock().unwrap().remove(&stream);
+        self.prompts.lock().unwrap().remove(&stream);
         if let Some(agent) = self.terminals.lock().unwrap().remove(&stream)
             && let Some(pid) = agent.leader
         {
@@ -1078,6 +1085,12 @@ impl AgentRegistry {
     /// the shield.
     pub fn push_focus_event(&self, stream: u32, event: crate::control::FocusEvent) {
         self.note_shield(stream, event.at_unix);
+        if event.kind == "user" && !event.label.is_empty() {
+            self.prompts
+                .lock()
+                .unwrap()
+                .insert(stream, (event.label.clone(), event.at_unix));
+        }
         let mut focus = self.focus.lock().unwrap();
         let log = focus.entry(stream).or_default();
         log.push_back(event);
@@ -1091,7 +1104,9 @@ impl AgentRegistry {
     /// such label, and `None` once the turn ended or before anything was said.
     ///
     /// Labels, not the prompt: a `user` event reads as the word `thinking`, so what a
-    /// person typed never leaves the focus view. Empty labels are skipped rather than
+    /// person typed is not shown as activity. Its redacted head is kept apart (`prompts`)
+    /// and becomes the goal of a task qoro opens at an edit, which is stored and listed with
+    /// that terminal's row. Empty labels are skipped rather than
     /// taken, because a labelled permission request is followed by a label-less
     /// notification that says the same thing with less.
     pub fn activity(&self, stream: u32) -> Option<String> {
@@ -1107,6 +1122,11 @@ impl AgentRegistry {
             }
         }
         None
+    }
+
+    /// The newest prompt head this terminal's hook reported, and when, if any.
+    pub fn last_prompt(&self, stream: u32) -> Option<(String, i64)> {
+        self.prompts.lock().unwrap().get(&stream).cloned()
     }
 
     /// A terminal's focus events, oldest first.
