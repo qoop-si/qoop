@@ -1021,6 +1021,17 @@ pub struct AgentRow {
     /// the space's row. Written only when true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_awake: bool,
+    /// How many things the agent has running in the background that its own state does not
+    /// show: shells and monitors its footer counts, and subagents. An agent with its turn over
+    /// reads `idle` while these run, so a client says so beside it. The state is left alone on
+    /// purpose: scripts that wait on `idle` keep their meaning. Written only when above zero,
+    /// and zero from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub background: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The readiness an older daemon's row carries when the field is absent.
@@ -1365,6 +1376,7 @@ mod tests {
         let live = AgentRow {
             news: false,
             keep_awake: false,
+            background: 0,
             terminal: 3,
             workspace: 1,
             name: None,

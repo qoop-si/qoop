@@ -1955,6 +1955,7 @@ mod tests {
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             workspace: 1,

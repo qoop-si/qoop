@@ -523,6 +523,7 @@ pub fn bar_tabs(
     {
         tabs.push(AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal: tab.terminal,
             name: tab.title.clone(),
@@ -3260,6 +3261,7 @@ mod tests {
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: None,
@@ -5519,6 +5521,7 @@ mod tests {
     fn blocked_row(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: None,
@@ -6140,6 +6143,7 @@ mod tests {
             .enumerate()
             .map(|(i, state)| AgentRow {
                 keep_awake: false,
+                background: 0,
                 news: false,
                 terminal: i as u32 + 1,
                 name: None,

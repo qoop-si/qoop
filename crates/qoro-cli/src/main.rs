@@ -2356,8 +2356,12 @@ fn agent_line(row: &qoro_runtime::control::AgentRow) -> String {
         .generation
         .map(|g| g.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let background = match row.background {
+        0 => String::new(),
+        n => format!(" background={n}"),
+    };
     format!(
-        "term={} state={} program={} name={} workspace={} generation={}",
+        "term={} state={} program={} name={} workspace={} generation={}{background}",
         row.terminal, row.state, program, name, row.workspace, generation
     )
 }
@@ -2676,6 +2680,7 @@ mod tests {
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             workspace: 1,

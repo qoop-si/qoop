@@ -237,6 +237,40 @@ pub fn running_background_agents(screen: &[String]) -> usize {
     .count()
 }
 
+/// How many background shells and monitors Claude Code says it is running in this tab.
+///
+/// The footer under the prompt box counts them while any exist (`⏵⏵ bypass permissions on ·
+/// 2 shells · 1 monitor · ← 5 agents`), and that is Claude's own claim, which is why it is read
+/// and the process tree is not: a background shell is a `setsid` process nobody can tell from
+/// a stale one by name, and the tree walk is a sleep-time cost. Only the first line under the
+/// last rule is read, so a footer quoted in an answer above the box says nothing. The turn
+/// summary (`done 4:20 AM · 1 shell still running`) is left out on purpose: it stays in the
+/// transcript after the shell ends. `← N agents` is left out too, it counts teammates that
+/// are listed and not only running (see `running_background_agents`).
+/// Measured on Claude Code 2.1.284. Pure, so the measured screens are its tests.
+pub fn running_background_tasks(screen: &[String]) -> usize {
+    // ponytail: with no rule on screen the region is the whole screen, so a plain shell
+    // could in theory read; the `N shell(s)` segment next to a ` · ` is too specific to
+    // meet one, and the count only ever decorates an idle row.
+    let region = qoro_detect::Region::AfterLastHorizontalRule.view(
+        screen,
+        &qoro_detect::OscContext { title: "" },
+        false,
+    );
+    let Some(footer) = region.lines.into_iter().find(|row| !row.trim().is_empty()) else {
+        return 0;
+    };
+    footer
+        .split(" · ")
+        .filter_map(|segment| {
+            let (count, kind) = segment.trim().split_once(' ')?;
+            matches!(kind, "shell" | "shells" | "monitor" | "monitors")
+                .then(|| count.parse::<usize>().ok())
+                .flatten()
+        })
+        .sum()
+}
+
 /// Whether input from this sender counts as live traffic.
 ///
 /// Restore replay arrives as `Input` from `qoro-restore`: transcript bytes
@@ -747,6 +781,81 @@ mod tests {
             "  ⏺ main",
         ]);
         assert_eq!(running_background_agents(&s), 0);
+    }
+
+    const BOX_RULE: &str = "────────────────────────────────────────";
+
+    #[test]
+    fn the_footer_counts_background_shells_and_monitors() {
+        // Measured: the owner's live tabs, Claude Code 2.1.284, turn over, box visible.
+        let one_shell = screen(&[
+            "✻ Sautéed for 41m 31s · done 4:20 AM · 1 shell still running",
+            "",
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on · 1 shell · ← 5 agents · ↓ to manage",
+        ]);
+        assert_eq!(running_background_tasks(&one_shell), 1);
+        let monitor = screen(&[
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on · 1 monitor · ← 5 agents · ↓ to manage",
+        ]);
+        assert_eq!(running_background_tasks(&monitor), 1);
+        let both = screen(&[
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on · 2 shells · 1 monitor · ← for agents",
+        ]);
+        assert_eq!(running_background_tasks(&both), 3);
+    }
+
+    #[test]
+    fn a_footer_with_no_counts_holds_nothing() {
+        let plain = screen(&[
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents",
+        ]);
+        assert_eq!(running_background_tasks(&plain), 0);
+        // `← N agents` is teammates listed, running or not: never counted here.
+        let agents = screen(&[BOX_RULE, "❯", BOX_RULE, "  ⏵⏵ auto mode on · ← for agents"]);
+        assert_eq!(running_background_tasks(&agents), 0);
+    }
+
+    #[test]
+    fn a_stale_summary_or_a_quoted_footer_is_not_a_running_task() {
+        // The shell ended: the summary above the box still says it ran, the footer says no.
+        let ended = screen(&[
+            "✻ Sautéed for 41m 31s · done 4:20 AM · 1 shell still running",
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]);
+        assert_eq!(running_background_tasks(&ended), 0);
+        // A footer pasted into an answer sits above the real box.
+        let quoted = screen(&[
+            "⏺ the other tab shows:",
+            "  ⏵⏵ bypass permissions on · 2 shells · ← 5 agents · ↓ to manage",
+            BOX_RULE,
+            "❯",
+            BOX_RULE,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]);
+        assert_eq!(running_background_tasks(&quoted), 0);
+        // A dialog replaced the composer: what sits under the last rule is the dialog.
+        let dialog = screen(&[
+            BOX_RULE,
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+        ]);
+        assert_eq!(running_background_tasks(&dialog), 0);
     }
 
     #[test]

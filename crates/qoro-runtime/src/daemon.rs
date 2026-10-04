@@ -3992,6 +3992,8 @@ async fn handle_control(
                         slept_at_unix: None,
                         activity,
                         pgid,
+                        background: u32::try_from(agents.background_of(terminal))
+                            .unwrap_or(u32::MAX),
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals
@@ -8306,9 +8308,10 @@ async fn terminal_task(
                         let screen = engine.visible_text();
                         // Counted from the live screen here, where it is read whether or
                         // not anyone watches: the published copy goes stale unwatched.
-                        agents.note_background_agents(
+                        agents.note_background(
                             stream,
                             crate::idle::running_background_agents(&screen),
+                            crate::idle::running_background_tasks(&screen),
                         );
                         let osc = qoro_detect::OscContext {
                             title: engine.title(),

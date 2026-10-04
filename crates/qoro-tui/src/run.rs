@@ -10463,6 +10463,7 @@ mod tests {
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: None,

@@ -1060,6 +1060,8 @@ struct Item {
     name: String,
     space: i64,
     waited: Option<String>,
+    /// What a calm agent still has running in the background, for the tail of its row.
+    background: u32,
 }
 
 /// The rows of one of the inbox's lists, in the order it shows them.
@@ -1071,6 +1073,11 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
         name: session_name(a),
         space: a.workspace,
         waited: if timed { waited(c, a) } else { None },
+        background: if matches!(a.state.as_str(), "idle" | "done") {
+            a.background
+        } else {
+            0
+        },
     };
     match tab {
         InboxTab::Working => c
@@ -1092,6 +1099,7 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
                 name: t.label().to_string(),
                 space: s.id,
                 waited: None,
+                background: 0,
             })
             .collect(),
         _ => waiting(c.agents, c.focused_terminal, c.seen, c.unseen)
@@ -1235,11 +1243,15 @@ fn item_row(c: &Column, item: &Item) -> Line {
     let mark = cell_mark(item.role, false, 0);
     let lead = 1 + crate::width::width(&mark);
     // The right side gives way before the name: the space goes, then the wait.
-    let mut right: Vec<String> = [Some(space), item.waited.clone()]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut right: Vec<String> = [
+        Some(space),
+        item.waited.clone(),
+        (item.background > 0).then(|| format!("bg:{}", item.background)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.is_empty())
+    .collect();
     let right_w = |right: &[String]| -> usize {
         let w: usize = right.iter().map(|s| crate::width::width(s)).sum();
         w + right.len().saturating_sub(1) + usize::from(!right.is_empty())
@@ -2082,10 +2094,17 @@ fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) ->
 
 /// What an agent's activity says in its state, and the colour it says it in: working
 /// quietly, waiting as what it wants in the blocked colour, failed in the failed colour.
-/// A waiting agent whose newest word is `thinking` has said nothing about what it wants
+/// An idle agent with work running in the background says how much of it. A waiting agent whose newest word is `thinking` has said nothing about what it wants
 /// (a label-less prompt), so it says nothing rather than `wants: thinking`.
 fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
     use crate::theme::Role;
+    // Its turn is over and it reads idle, but its footer says something still runs: said
+    // quietly, so a person does not take a busy agent for a free one.
+    if agent.state == "idle" && agent.background > 0 {
+        let n = agent.background;
+        let s = if n == 1 { "" } else { "s" };
+        return Some((format!("{n} background task{s}"), Role::Faint));
+    }
     let raw = agent
         .activity
         .as_deref()
@@ -3491,6 +3510,7 @@ mod tests {
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: None,
@@ -3518,6 +3538,7 @@ mod tests {
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: None,
@@ -4249,6 +4270,7 @@ mod tests {
     fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal,
             name: Some(name.to_string()),
@@ -4507,6 +4529,7 @@ mod tests {
     fn a_wrapper_is_shown_as_standing_in_the_way_and_never_as_the_program() {
         let agents = vec![AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal: 5,
             name: None,
@@ -4544,6 +4567,7 @@ mod tests {
     fn an_unknown_state_is_drawn_as_nothing_and_leaves_the_name_the_whole_row() {
         let agents = vec![AgentRow {
             keep_awake: false,
+            background: 0,
             news: false,
             terminal: 5,
             name: None,
@@ -6211,6 +6235,59 @@ mod tests {
         }
     }
 
+    /// An agent whose turn is over reads idle while its footer says shells, monitors or
+    /// subagents still run: its row says so, quietly, and the state word stays `idle`. One
+    /// with nothing running keeps its tab row, and a busy one is not taken for a free one in
+    /// the inbox either.
+    #[test]
+    fn an_idle_agent_with_background_work_says_so() {
+        let spaces = vec![space(1, "app")];
+        let mut busy = agent(1, 1, "claude", "idle");
+        busy.background = 3;
+        let mut one = agent(2, 1, "claude", "idle");
+        one.background = 1;
+        let free = agent(3, 1, "claude", "idle");
+        let agents = vec![busy.clone(), one, free];
+        let rows = tree_rows(&spaces, &agents, 9, 30, &Seen::new(), &Shut::new());
+        let under = |terminal: u32| -> Vec<&Line> {
+            rows.iter()
+                .skip_while(|(_, h)| *h != Some(Hit::Title))
+                .filter(|(_, h)| *h == Some(Hit::Terminal(terminal)))
+                .map(|(l, _)| l)
+                .collect()
+        };
+        assert_eq!(unbox(&under(1)[1].text), "   \u{2514} 3 background tasks");
+        assert_eq!(unbox(&under(2)[1].text), "   \u{2514} 1 background task");
+        assert_eq!(unbox(&under(3)[1].text), "   \u{2514} claude");
+        assert_eq!(busy.state, "idle", "the state is not rewritten");
+
+        // The same agent finished while the person was away: the inbox row carries the count.
+        let item = |background| Item {
+            terminal: 1,
+            role: crate::theme::Role::Done,
+            name: "claude".into(),
+            space: 1,
+            waited: None,
+            background,
+        };
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let column = column_armed(
+            &spaces,
+            &agents,
+            1,
+            0,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            0,
+            WIDTH,
+            &shut,
+            None,
+        );
+        assert!(item_row(&column, &item(3)).text.contains("bg:3"));
+        assert!(!item_row(&column, &item(0)).text.contains("bg:"));
+    }
     /// A waiting agent whose newest word is `thinking` has not said what it wants: no
     /// `wants: thinking` row in the tree.
     #[test]

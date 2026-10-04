@@ -77,6 +77,10 @@ pub struct TerminalAgent {
     /// no process and the screen is the only place it shows. Zero on every generation
     /// change, since it described a process that is gone.
     pub background_agents: usize,
+    /// How many background shells and monitors the footer showed running at its last reading,
+    /// by the same loop and with the same reset as `background_agents`. Read by the index, not
+    /// by the sleep check: those are processes, and `sleep_blockers` judges them.
+    pub background_tasks: usize,
     /// The rule the screen last matched in this generation, if any.
     ///
     /// What `qoro agents explain` reports. Recorded on every evaluation,
@@ -246,12 +250,30 @@ impl AgentRegistry {
             .is_some_and(|a| a.belief.visible_blocker)
     }
 
-    /// Record how many background agents the screen shows running. Changes no state and
-    /// announces nothing: it is read only when a sleep is vetted.
-    pub fn note_background_agents(&self, stream: u32, running: usize) {
-        if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
-            agent.background_agents = running;
+    /// Record what the screen shows running in the background: subagents, and the shells
+    /// and monitors the footer counts. Changes no state. The sleep check reads the agents;
+    /// the index shows both, so a changed total is announced and a repeat is not.
+    pub fn note_background(&self, stream: u32, agents: usize, tasks: usize) {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return;
+        };
+        let before = agent.background_agents + agent.background_tasks;
+        agent.background_agents = agents;
+        agent.background_tasks = tasks;
+        drop(terminals);
+        if before != agents + tasks {
+            self.announce(stream);
         }
+    }
+
+    /// What the screen last showed running in the background, all kinds together.
+    pub fn background_of(&self, stream: u32) -> usize {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map_or(0, |a| a.background_agents + a.background_tasks)
     }
 }
 
@@ -295,6 +317,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     agent.setup_gate = false;
     agent.screen_rule = None;
     agent.background_agents = 0;
+    agent.background_tasks = 0;
     agent.screen_manifest = None;
     let idle = qoro_domain::AgentObservation {
         agent_id: qoro_domain::AgentId::new(stream.to_string()),
@@ -394,6 +417,7 @@ impl AgentRegistry {
                 last_io_unix: None,
                 setup_gate: false,
                 background_agents: 0,
+                background_tasks: 0,
                 screen_rule: None,
                 screen_manifest: None,
                 leader: None,
@@ -771,6 +795,7 @@ impl AgentRegistry {
             agent.setup_gate = false;
             agent.screen_rule = None;
             agent.background_agents = 0;
+            agent.background_tasks = 0;
             agent.screen_manifest = None;
             agent.identity = AgentIdentity::Known {
                 program,
@@ -796,6 +821,7 @@ impl AgentRegistry {
         agent.setup_gate = false;
         agent.screen_rule = None;
         agent.background_agents = 0;
+        agent.background_tasks = 0;
         agent.screen_manifest = None;
         agent.identity = match leader {
             None => AgentIdentity::None,
@@ -858,6 +884,7 @@ impl AgentRegistry {
             agent.setup_gate = false;
             agent.screen_rule = None;
             agent.background_agents = 0;
+            agent.background_tasks = 0;
             agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
@@ -1337,11 +1364,39 @@ mod tests {
         let r = registry();
         r.register(1, TerminalId::new("1"), mint_token(1));
         assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 0);
-        r.note_background_agents(1, 2);
+        r.note_background(1, 2, 0);
         assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 2);
         let me = Pid(std::process::id() as i32);
         r.note_foreground(1, Some(me), NOW).expect("a change");
         assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 0);
+    }
+
+    /// Background work the footer shows is told to the index when the total moves and not
+    /// on a repeat, changes no state (`idle` stays `idle` for whoever waits on it), and is
+    /// void with the generation it was read from.
+    #[test]
+    fn background_work_is_announced_on_change_only_and_voided_by_a_new_generation() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let mut rx = r.subscribe();
+        let state = || r.agent(1).expect("agent").belief.state;
+        let before = state();
+
+        r.note_background(1, 0, 0);
+        assert!(rx.try_recv().is_err(), "nothing moved");
+        r.note_background(1, 1, 2);
+        rx.try_recv().expect("the index is told about the work");
+        assert_eq!(r.background_of(1), 3);
+        r.note_background(1, 1, 2);
+        assert!(rx.try_recv().is_err(), "a repeat is not news");
+        assert_eq!(state(), before, "the state is left alone");
+
+        r.note_background(1, 0, 0);
+        rx.try_recv().expect("the work ended");
+        r.note_background(1, 0, 1);
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me), NOW).expect("a change");
+        assert_eq!(r.background_of(1), 0, "counted inside a process now gone");
     }
 
     #[test]
