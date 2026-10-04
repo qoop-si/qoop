@@ -794,6 +794,35 @@ impl TerminalRegistry {
             .await
     }
 
+    /// Take a pane out of its split and make it a tab of its own in `workspace`, just before
+    /// the tab `before` names: both under one split lock, so it is never out of the split
+    /// and not yet placed for a split change to see.
+    async fn leave_split(
+        &self,
+        stream: u32,
+        workspace: i64,
+        before: Option<i64>,
+        store: &crate::store::StoreHandle,
+    ) -> Result<bool, crate::store::HandleError> {
+        let _order = self.split_write.lock().await;
+        let trees = {
+            let mut splits = self.splits.lock().unwrap();
+            *splits = splits
+                .iter()
+                .filter_map(|tree| tree.retain(&|t| t != stream))
+                .filter(|tree| tree.leaves().len() > 1)
+                .collect();
+            splits.clone()
+        };
+        store.set_splits(splits_json(&trees)).await?;
+        let before = before
+            .and_then(|b| u32::try_from(b).ok())
+            .map(|b| i64::from(self.lead_of(b)));
+        store
+            .move_terminals(vec![i64::from(stream)], workspace, before)
+            .await
+    }
+
     /// The tab a terminal stands for in a space's order: the first live pane of its split,
     /// or itself. A place named by a pane is its tab's place, so a split is never cut.
     fn lead_of(&self, stream: u32) -> u32 {
@@ -3438,6 +3467,7 @@ async fn handle_control(
             terminal,
             workspace: to,
             place,
+            leave_split,
             ..
         } => {
             let Some(from) = terminals.workspace_of(terminal) else {
@@ -3493,7 +3523,17 @@ async fn handle_control(
                         reason: "part of this split is asleep, wake it first".to_string(),
                     };
                 }
-                return match Box::pin(terminals.reorder(terminal, to, before, store)).await {
+                // Asked to leave its split: a tab of its own there, the rest of the split
+                // staying as it was. Otherwise the tab moves, its split with it; a pane that is
+                // not its split's first is refused, as the asker's view of the split is not this.
+                let moved = if leave_split {
+                    Box::pin(terminals.leave_split(terminal, to, before, store))
+                        .await
+                        .map(Some)
+                } else {
+                    Box::pin(terminals.reorder(terminal, to, before, store)).await
+                };
+                return match moved {
                     Ok(Some(true)) => {
                         agents.announce(terminal);
                         ControlResponse::TerminalMoved {
@@ -3508,7 +3548,8 @@ async fn handle_control(
                     },
                     Ok(None) => ControlResponse::Failed {
                         id,
-                        reason: "drag the split by its first pane".to_string(),
+                        reason: "that pane moves with its split; take it out of the split first"
+                            .to_string(),
                     },
                     Err(e) => ControlResponse::Failed {
                         id,

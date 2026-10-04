@@ -82,6 +82,11 @@ pub enum ControlRequest {
         workspace: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<Place>,
+        /// Within its own workspace, a pane taken out of its split for a tab of its own at
+        /// `place`, whichever pane of the split it is. Absent, a split's first pane moves
+        /// the whole split.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        leave_split: bool,
     },
     /// Give a workspace a different name.
     /// Rows of a terminal's scrollback, so a person can read what has gone past.

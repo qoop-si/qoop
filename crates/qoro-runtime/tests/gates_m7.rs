@@ -185,6 +185,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal,
             workspace: 999,
             place: None,
+            leave_split: false,
         },
         // 0.0.0 is no newer than this build, so it is answered as already there and nothing
         // is armed. A newer one would, at most, end every tab to become the binary on

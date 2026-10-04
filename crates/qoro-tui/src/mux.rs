@@ -173,6 +173,12 @@ struct Link {
     /// Requests for a parked link, sent once it is up again: the ask that wakes a machine
     /// is the one it should answer.
     pending: Vec<ControlRequest>,
+    /// Whether this machine's own list may give its spaces' order among themselves: not
+    /// while its part of a new order is unanswered (a list already on its way is older),
+    /// and not once it missed or refused one (a qoro from before the ask, or away): its
+    /// list would put a different space in the place a person dragged one to.
+    order_owed: usize,
+    order_off: bool,
     /// The version a newer qoro on this remote's disk says it is, while its daemon has not
     /// been asked to move to it yet: the link was down when the push finished. Asked on the
     /// next connection, unless that daemon already runs it.
@@ -223,6 +229,8 @@ impl Link {
             wake: Arc::new(Notify::new()),
             parked: Arc::new(tokio::sync::watch::channel(false).0),
             pending: Vec::new(),
+            order_owed: 0,
+            order_off: false,
             arm: None,
             server_version: String::new(),
             conn: None,
@@ -338,6 +346,12 @@ struct Mux<W> {
     pushed_spaces: Vec<i64>,
     /// The link of the terminal last typed into or sized, which is the focused one.
     last_link: usize,
+    /// Where a person put each space in the merged list, across machines: each space as
+    /// `<remote name>:<its id there>`, this machine's with an empty name. A space never
+    /// placed follows the one listed before it.
+    order: Vec<String>,
+    /// Where `order` is kept, or nowhere (tests).
+    order_file: Option<std::path::PathBuf>,
     /// For the tasks the mux starts itself: a new link's supervisor, a session list.
     events: mpsc::Sender<FromLink>,
     /// `qoro --space`: the one local space this interface shows. Every other space, and
@@ -437,13 +451,169 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     }
 
     fn merged_spaces(&self) -> Vec<WorkspaceRow> {
-        self.links
+        let listed: Vec<WorkspaceRow> = self
+            .links
             .iter()
             .enumerate()
             .filter_map(|(i, l)| l.as_ref().map(|l| l.listed_spaces(i)))
             .flatten()
             .filter(|w| self.only.is_none_or(|only| w.id == only))
-            .collect()
+            .collect();
+        // In the order a person put them. One never placed follows the space its machine lists
+        // before it, so a new space lands beside its machine's others; with none placed
+        // before it on its machine, it goes last.
+        let at = |w: &WorkspaceRow| match self.space_key(w.id) {
+            Some(key) => self.order.iter().position(|k| *k == key),
+            // A machine not listed yet stands where its spaces were put.
+            None => {
+                let name = &self.links.get(workspace_in(w.id).0)?.as_ref()?.name;
+                let prefix = format!("{name}:");
+                self.order.iter().position(|k| k.starts_with(&prefix))
+            }
+        };
+        let last = 2 * self.order.len() + 2;
+        let mut after: Option<(usize, usize)> = None;
+        let mut ranked: Vec<(usize, usize, WorkspaceRow)> = listed
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let machine = workspace_in(w.id).0;
+                let rank = match at(&w) {
+                    Some(place) => {
+                        after = Some((machine, 2 * place + 2));
+                        2 * place + 2
+                    }
+                    None => match after {
+                        Some((m, rank)) if m == machine => rank + 1,
+                        _ => last,
+                    },
+                };
+                (rank, i, w)
+            })
+            .collect();
+        ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
+        ranked.into_iter().map(|(_, _, w)| w).collect()
+    }
+
+    /// A space's name in the saved order: its machine's name and its id there. None for the
+    /// placeholder a remote shows before it has listed, which is no space to keep a place for.
+    fn space_key(&self, workspace: i64) -> Option<String> {
+        let (link, id) = workspace_in(workspace);
+        if link > 0 && id == 0 {
+            return None;
+        }
+        let name = &self.links.get(link)?.as_ref()?.name;
+        Some(format!("{name}:{id}"))
+    }
+
+    /// Fold a machine's own list into the order: the file says where each machine's spaces
+    /// sit among the others', the machine says their order among themselves. The places of
+    /// spaces it no longer lists go first, as ids are reused and a new space must not take a
+    /// closed one's place; then, when its list can be trusted with it, its kept places are
+    /// filled again with its spaces in the order it lists them, so a reorder made on it by
+    /// anyone (the phone, another window) shows here too. Read from the file first: another
+    /// interface may have changed it.
+    fn refresh_order(&mut self, link: usize, name: &str, listed: &[String]) {
+        let Some(file) = self.order_file.clone() else {
+            return;
+        };
+        self.order = load_order(&file);
+        let prefix = format!("{name}:");
+        let mut order: Vec<String> = self
+            .order
+            .iter()
+            .filter(|k| !k.starts_with(&prefix) || listed.contains(k))
+            .cloned()
+            .collect();
+        let trusted = self
+            .links
+            .get(link)
+            .and_then(Option::as_ref)
+            .is_some_and(|l| l.order_owed == 0 && !l.order_off);
+        if trusted {
+            let slots: Vec<usize> = (0..order.len())
+                .filter(|at| order[*at].starts_with(&prefix))
+                .collect();
+            let fresh: Vec<String> = listed
+                .iter()
+                .filter(|k| order.contains(k))
+                .cloned()
+                .collect();
+            for (slot, key) in slots.into_iter().zip(fresh) {
+                order[slot] = key;
+            }
+        }
+        if order != self.order {
+            let _ = save_order(&file, &order);
+            self.order = order;
+        }
+    }
+
+    /// Put a space just before `before` in the merged list, or last, and keep the order.
+    /// Answers the machine the space is on, its id there, and the next space of the same
+    /// machine after it now, so that machine can keep its own list in the same order.
+    fn place_space(
+        &mut self,
+        workspace: i64,
+        before: Option<i64>,
+    ) -> Option<(usize, i64, Option<i64>)> {
+        // Another interface may have moved something since this one last read the order.
+        if let Some(file) = &self.order_file {
+            self.order = load_order(file);
+        }
+        let shown: Vec<i64> = self.merged_spaces().iter().map(|w| w.id).collect();
+        let moved = self
+            .space_key(workspace)
+            .filter(|_| shown.contains(&workspace))?;
+        // Every space shown has a place first, an unplaced one where it is shown: after the
+        // space before it on its machine, or last. A space of a machine that is away keeps
+        // the place it had.
+        let mut keys = self.order.clone();
+        let mut prev: Option<(usize, String)> = None;
+        for id in &shown {
+            let Some(key) = self.space_key(*id) else {
+                continue;
+            };
+            let machine = workspace_in(*id).0;
+            if !keys.contains(&key) {
+                let at = prev
+                    .as_ref()
+                    .filter(|(m, _)| *m == machine)
+                    .and_then(|(_, p)| keys.iter().position(|k| k == p))
+                    .map_or(keys.len(), |at| at + 1);
+                keys.insert(at, key.clone());
+            }
+            prev = Some((machine, key));
+        }
+        keys.retain(|k| *k != moved);
+        // Last means after the last space shown here, which a view of one machine also
+        // shows, not after the places of spaces this view cannot see.
+        let end = shown
+            .iter()
+            .filter_map(|id| self.space_key(*id))
+            .filter_map(|key| keys.iter().position(|k| *k == key))
+            .max()
+            .map_or(keys.len(), |at| at + 1);
+        let at = before
+            .and_then(|b| self.space_key(b))
+            .and_then(|b| keys.iter().position(|k| *k == b))
+            .unwrap_or(end);
+        keys.insert(at, moved);
+        self.order = keys;
+        if let Some(file) = &self.order_file {
+            // ponytail: a failed save keeps the order for this run only; the list still moves.
+            let _ = save_order(file, &self.order);
+        }
+        let (link, id) = workspace_in(workspace);
+        let ids: Vec<i64> = self.merged_spaces().iter().map(|w| w.id).collect();
+        let next = ids
+            .iter()
+            .skip_while(|w| **w != workspace)
+            .skip(1)
+            .map(|w| workspace_in(*w))
+            .find(|(l, _)| *l == link)
+            .map(|(_, w)| w);
+        Some((link, id, next))
     }
 
     fn merged_agents(&self) -> Vec<AgentRow> {
@@ -749,8 +919,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     None => (self.home, self.only),
                 };
                 // A directory is a place on one machine. Carried to another it is at best
-                // missing and at worst somewhere else with the same name.
-                let cwd = cwd.filter(|_| link == self.last_link);
+                // missing and at worst somewhere else with the same name. It goes where it
+                // is known: a directory a tab of that machine reports being in, or any one
+                // when that machine is the one last typed into, the focused one.
+                let known = |dir: &String| {
+                    self.links
+                        .get(link)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|l| l.agents.iter().any(|a| a.cwd.as_ref() == Some(dir)))
+                };
+                let cwd = cwd.filter(|dir| link == self.last_link || known(dir));
                 self.send_one(
                     link,
                     R::CreateTerminal {
@@ -813,28 +991,66 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(link, R::CloseWorkspace { id, workspace })
                     .await
             }
-            // Each machine orders its own spaces, and they stay in its group of the list.
+            // The merged list is this interface's: its order is kept here, across machines.
+            // The space's own machine is told its part, so its list reads the same order to
+            // whoever reads that machine alone; one too old to know the ask refuses it, and
+            // that refusal is the mux's own housekeeping.
             R::MoveWorkspace {
                 id,
                 workspace,
                 before,
             } => {
-                let (link, workspace) = workspace_in(workspace);
-                let before = before.map(workspace_in);
-                if before.is_some_and(|(at, _)| at != link) {
+                let Some((link, local, next)) = self.place_space(workspace, before) else {
                     return self
-                        .failed(id, "spaces stay in their machine's group".to_string())
+                        .failed(id, format!("there is no workspace {workspace}"))
                         .await;
+                };
+                // The machine's part: this move alone when it holds the order so far, else its
+                // whole order again, each space to the end in turn, since one move on top of an
+                // order it never took would put the wrong space in a dragged one's place.
+                let asks: Vec<ControlRequest> = match self.link(link) {
+                    Some(l) if l.order_off => {
+                        let prefix = format!("{}:", l.name);
+                        // Only spaces it lists now: one closed since would be refused.
+                        let listed: Vec<i64> =
+                            l.spaces.iter().map(|w| workspace_in(w.id).1).collect();
+                        let own: Vec<i64> = self
+                            .order
+                            .iter()
+                            .filter_map(|k| k.strip_prefix(&prefix)?.parse().ok())
+                            .filter(|w| listed.contains(w))
+                            .collect();
+                        own.into_iter()
+                            .enumerate()
+                            .map(|(at, w)| R::MoveWorkspace {
+                                id: format!("{ORDER_ID}{id}-{at}"),
+                                workspace: w,
+                                before: None,
+                            })
+                            .collect()
+                    }
+                    _ => vec![R::MoveWorkspace {
+                        id: format!("{ORDER_ID}{id}"),
+                        workspace: local,
+                        before: next,
+                    }],
+                };
+                // A machine that is away misses its part, and holds its own order until it
+                // takes a whole one again.
+                if let Some(l) = self.link(link) {
+                    let mut all = true;
+                    for ask in &asks {
+                        if l.send(ask) {
+                            l.order_owed += 1;
+                        } else {
+                            all = false;
+                        }
+                    }
+                    l.order_off = !all;
                 }
-                self.send_one(
-                    link,
-                    R::MoveWorkspace {
-                        id,
-                        workspace,
-                        before: before.map(|(_, b)| b),
-                    },
-                )
-                .await
+                // The list moves now, not when every machine has answered again.
+                self.push_spaces("mux").await?;
+                self.respond(&ControlResponse::Renamed { id }).await
             }
             // A tab, the space it goes to and the tab it goes before all have to be on one
             // machine: each daemon only knows its own.
@@ -843,10 +1059,26 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 terminal,
                 workspace,
                 place,
+                leave_split,
             } => {
                 use qoro_runtime::control::Place;
                 let (link, terminal) = terminal_in(terminal);
                 let (to, workspace) = workspace_in(workspace);
+                // A remote on a release from before places existed ignores them and answers
+                // a move into its own space as done: said here instead, rather than shown done.
+                if link != 0
+                    && (place.is_some() || leave_split)
+                    && let Some(l) = self.link(link)
+                    && !qoro_runtime::paths::is_newer_version(&l.server_version, BEFORE_PLACES)
+                {
+                    let name = l.name.clone();
+                    return self
+                        .failed(
+                            id,
+                            format!("{name} runs an older qoro: it places tabs once it updates"),
+                        )
+                        .await;
+                }
                 let before = match place {
                     Some(Place::Before(t)) => Some(terminal_in(t)),
                     _ => None,
@@ -867,6 +1099,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         terminal,
                         workspace,
                         place,
+                        leave_split,
                     },
                 )
                 .await
@@ -1141,6 +1374,9 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     return Ok(());
                 }
                 l.conn = None;
+                // Its part of an order, asked and never answered, may never have been taken.
+                l.order_off |= l.order_owed > 0;
+                l.order_owed = 0;
                 l.stale_agents = false;
                 l.stale_spaces = false;
                 l.agents.clear();
@@ -1352,6 +1588,12 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         })
                     })
                     .collect();
+                let listed: Vec<String> = l
+                    .spaces
+                    .iter()
+                    .map(|w| format!("{name}:{}", workspace_in(w.id).1))
+                    .collect();
+                self.refresh_order(link, &name, &listed);
                 // Its own answer to coming up, or the interface's question: either way the
                 // interface gets the whole list, with anything that vanished closed first.
                 let id = if id.starts_with("mux-") {
@@ -1391,6 +1633,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     format!("{name} keeps its qoro for now: {reason}")
                 };
                 self.failed(UPDATE_NOTICE.into(), line).await
+            }
+            // Its part of a new order, taken or refused.
+            C::Renamed { .. } if id.starts_with(ORDER_ID) => {
+                l.order_owed = l.order_owed.saturating_sub(1);
+                Ok(())
+            }
+            C::Failed { .. } if id.starts_with(ORDER_ID) => {
+                l.order_owed = l.order_owed.saturating_sub(1);
+                l.order_off = true;
+                Ok(())
             }
             // Its own first lists refused, by a store that was busy for instance: the merged
             // lists stop waiting for them rather than waiting for the next change, and the
@@ -1600,6 +1852,37 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             other => self.respond(&other).await,
         }
     }
+}
+
+/// The last release whose daemon knows no place for a moved tab: one this old or older
+/// would take a placed move, or a pane leaving its split, as done without doing it.
+const BEFORE_PLACES: &str = "0.5.2";
+
+/// The file the merged list's order is kept in, beside the list of remotes.
+const ORDER_FILE: &str = "space-order.json";
+
+/// The id each machine is told its part of a new order under. Its answer is the mux's own:
+/// a daemon from before the ask refuses it, and that changes nothing here.
+const ORDER_ID: &str = "mux-order-";
+
+/// The kept order, or none when there is no file or it does not read.
+fn load_order(file: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Keep the order, written beside the file and renamed over it so a reader never sees
+/// half of it.
+fn save_order(file: &std::path::Path, order: &[String]) -> io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string(order).map_err(io::Error::other)?;
+    let partial = file.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&partial, text + "\n")?;
+    std::fs::rename(&partial, file)
 }
 
 /// Marks a link whose cached lists an answer just made old. See `Link::stale_agents`.
@@ -1880,6 +2163,7 @@ pub async fn serve<D>(
     }
     // With no local daemon, the first remote is where requests naming nothing go.
     let home = if has_local { 0 } else { 1 };
+    let order_file = qoro_remote::saved::path().with_file_name(ORDER_FILE);
     let mut mux = Mux {
         links,
         home,
@@ -1887,6 +2171,8 @@ pub async fn serve<D>(
         down_seqs: BTreeMap::new(),
         pushed_spaces: Vec::new(),
         last_link: home,
+        order: load_order(&order_file),
+        order_file: Some(order_file),
         events: link_tx,
         only,
         tried: BTreeSet::new(),
@@ -2077,6 +2363,8 @@ mod tests {
             down_seqs: BTreeMap::new(),
             pushed_spaces: Vec::new(),
             last_link: 0,
+            order: Vec::new(),
+            order_file: None,
             events,
             only: None,
             tried: BTreeSet::new(),
@@ -2165,11 +2453,28 @@ mod tests {
         let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         let tab = terminal_out(1, 7).expect("fits");
         let space = workspace_out(1, 3).expect("fits");
+        // A remote on a release from before places is told no here, never asked.
+        mux.link(1).expect("remote").server_version = BEFORE_PLACES.into();
+        mux.control(ControlRequest::MoveTerminal {
+            id: "move-0".into(),
+            terminal: tab,
+            workspace: space,
+            place: Some(Place::End),
+            leave_split: false,
+        })
+        .await
+        .expect("answered");
+        assert!(remote_rx.try_recv().is_err(), "an old remote was asked");
+        let said = String::from_utf8_lossy(&mux.down).to_string();
+        assert!(said.contains("older qoro"), "{said}");
+        mux.down.clear();
+        mux.link(1).expect("remote").server_version = "0.6.0".into();
         mux.control(ControlRequest::MoveTerminal {
             id: "move-1".into(),
             terminal: tab,
             workspace: space,
             place: Some(Place::Before(terminal_out(1, 5).expect("fits"))),
+            leave_split: false,
         })
         .await
         .expect("sent");
@@ -2182,6 +2487,7 @@ mod tests {
                 terminal: 7,
                 workspace: 3,
                 place: Some(Place::Before(5)),
+                leave_split: false,
             }
         );
         mux.answer(
@@ -2205,6 +2511,7 @@ mod tests {
                 terminal: tab,
                 workspace,
                 place,
+                leave_split: false,
             })
             .await
             .expect("answered");
@@ -2214,38 +2521,258 @@ mod tests {
         }
     }
 
-    /// A remote space moves in its own machine's list, in that machine's numbering; a move
-    /// that would put it among another machine's spaces is refused here.
+    /// Spaces move anywhere in the merged list, across machines: the order is kept by the
+    /// mux, answered at once, and each machine is told its own part of it in its numbering.
     #[tokio::test]
-    async fn a_remote_space_moves_among_its_machines_spaces_only() {
+    async fn spaces_move_anywhere_and_each_machine_keeps_its_part() {
         let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let row = |id: i64, name: &str| WorkspaceRow {
+            keep_awake: false,
+            id,
+            name: name.into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+        };
+        let far = workspace_out(1, 3).expect("fits");
+        for (link, rows) in [
+            (0, vec![row(1, "qoro"), row(2, "app")]),
+            (1, vec![row(far, "devbox:api")]),
+        ] {
+            let l = mux.link(link).expect("link");
+            l.listed = true;
+            l.spaces = rows;
+        }
+        let ids =
+            |mux: &Mux<Vec<u8>>| -> Vec<i64> { mux.merged_spaces().iter().map(|w| w.id).collect() };
+        assert_eq!(ids(&mux), vec![1, 2, far], "never placed: by machine");
+        // The remote's space to the top.
         mux.control(ControlRequest::MoveWorkspace {
             id: "order-1".into(),
-            workspace: workspace_out(1, 3).expect("fits"),
-            before: Some(workspace_out(1, 2).expect("fits")),
-        })
-        .await
-        .expect("sent");
-        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
-        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
-        assert_eq!(
-            asked,
-            ControlRequest::MoveWorkspace {
-                id: "order-1".into(),
-                workspace: 3,
-                before: Some(2),
-            }
-        );
-        mux.control(ControlRequest::MoveWorkspace {
-            id: "order-2".into(),
-            workspace: workspace_out(1, 3).expect("fits"),
+            workspace: far,
             before: Some(1),
         })
         .await
         .expect("answered");
-        assert!(home_rx.try_recv().is_err() && remote_rx.try_recv().is_err());
+        assert_eq!(ids(&mux), vec![far, 1, 2]);
         let said = String::from_utf8_lossy(&mux.down).to_string();
-        assert!(said.contains("their machine's group"), "{said}");
+        assert!(
+            said.contains("\"Renamed\"") && said.contains("order-1"),
+            "{said}"
+        );
+        let told: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was told"));
+        assert_eq!(
+            told,
+            ControlRequest::MoveWorkspace {
+                id: "mux-order-order-1".into(),
+                workspace: 3,
+                before: None,
+            }
+        );
+        assert!(home_rx.try_recv().is_err(), "nothing changed at home");
+        // A local space below the remote's: home keeps its own two in the new order.
+        mux.control(ControlRequest::MoveWorkspace {
+            id: "order-2".into(),
+            workspace: 2,
+            before: Some(1),
+        })
+        .await
+        .expect("answered");
+        assert_eq!(ids(&mux), vec![far, 2, 1]);
+        let told: ControlRequest = body_of(&home_rx.try_recv().expect("home was told"));
+        assert_eq!(
+            told,
+            ControlRequest::MoveWorkspace {
+                id: "mux-order-order-2".into(),
+                workspace: 2,
+                before: Some(1),
+            }
+        );
+        // Home lists its own in that order now; a new space there lands after the one it
+        // lists before it, not at the top.
+        mux.link(0).expect("home").spaces = vec![row(2, "app"), row(1, "qoro"), row(5, "new")];
+        assert_eq!(ids(&mux), vec![far, 2, 1, 5]);
+    }
+
+    /// The kept order survives the mux, folds each machine's own order in when it lists,
+    /// forgets a closed space's place, and keeps an unlisted machine where its spaces were.
+    #[tokio::test]
+    async fn the_kept_order_follows_each_machines_own_list() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join(ORDER_FILE);
+        let (mut mux, _home_rx, _remote_rx, _events) = two_links();
+        mux.order_file = Some(file.clone());
+        let row = |id: i64, name: &str| WorkspaceRow {
+            keep_awake: false,
+            id,
+            name: name.into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+        };
+        let far = workspace_out(1, 3).expect("fits");
+        let set = |mux: &mut Mux<Vec<u8>>, link: usize, rows: Vec<WorkspaceRow>| {
+            let l = mux.link(link).expect("link");
+            l.listed = true;
+            l.spaces = rows;
+        };
+        set(&mut mux, 0, vec![row(1, "a"), row(2, "b")]);
+        set(&mut mux, 1, vec![row(far, "devbox:api")]);
+        let ids =
+            |mux: &Mux<Vec<u8>>| -> Vec<i64> { mux.merged_spaces().iter().map(|w| w.id).collect() };
+        // The remote's space between the two local ones, kept on disk.
+        mux.control(ControlRequest::MoveWorkspace {
+            id: "o".into(),
+            workspace: far,
+            before: Some(2),
+        })
+        .await
+        .expect("answered");
+        assert_eq!(ids(&mux), vec![1, far, 2]);
+        assert_eq!(load_order(&file), vec![":1", "devbox:3", ":2"]);
+        // Home reorders its own (the phone, another window): its two swap places around the
+        // remote's, which stays between them.
+        mux.refresh_order(0, "", &[":2".into(), ":1".into()]);
+        set(&mut mux, 0, vec![row(2, "b"), row(1, "a")]);
+        assert_eq!(ids(&mux), vec![2, far, 1]);
+        // A space home no longer lists loses its place.
+        mux.refresh_order(0, "", &[":2".into()]);
+        assert_eq!(load_order(&file), vec![":2", "devbox:3"]);
+        // A remote not listed yet stands where its spaces were put, after `2`; the space whose
+        // place was forgotten follows the one its machine lists before it.
+        set(&mut mux, 0, vec![row(2, "b"), row(1, "a")]);
+        let placeholder = 1i64 << WORKSPACE_SHIFT;
+        set(&mut mux, 1, vec![row(placeholder, "devbox")]);
+        mux.order = load_order(&file);
+        assert_eq!(ids(&mux), vec![2, 1, placeholder]);
+        mux.order = vec!["devbox:3".into(), ":2".into()];
+        assert_eq!(
+            ids(&mux),
+            vec![placeholder, 2, 1],
+            "it keeps its machine's place"
+        );
+    }
+
+    /// A machine's closed space gives up only its own place, wherever it sat; and a machine
+    /// that refused its part of a new order (a qoro from before the ask) does not get to put
+    /// its old order back over the one a person dragged.
+    #[tokio::test]
+    async fn a_closed_space_and_a_refused_order_keep_every_other_place() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join(ORDER_FILE);
+        let (mut mux, _home_rx, _remote_rx, _events) = two_links();
+        mux.order_file = Some(file.clone());
+        save_order(
+            &file,
+            &[
+                ":1".into(),
+                "devbox:3".into(),
+                ":2".into(),
+                "devbox:4".into(),
+            ],
+        )
+        .expect("saved");
+        // `:1`, in the first slot, closes: the remote's space keeps the top.
+        mux.refresh_order(0, "", &[":2".into()]);
+        assert_eq!(load_order(&file), vec!["devbox:3", ":2", "devbox:4"]);
+        // The remote refused its part: its list, still in its old order, changes nothing.
+        mux.link(1).expect("remote").order_off = true;
+        mux.refresh_order(1, "devbox", &["devbox:4".into(), "devbox:3".into()]);
+        assert_eq!(load_order(&file), vec!["devbox:3", ":2", "devbox:4"]);
+        // Once it takes one, its own order is its again.
+        mux.link(1).expect("remote").order_off = false;
+        mux.refresh_order(1, "devbox", &["devbox:4".into(), "devbox:3".into()]);
+        assert_eq!(load_order(&file), vec!["devbox:4", ":2", "devbox:3"]);
+    }
+
+    /// A machine that missed or refused its part of an order is sent its whole order on the
+    /// next move, each of its spaces to the end in turn, rather than one move on top of an
+    /// order it never took.
+    #[tokio::test]
+    async fn a_machine_out_of_step_is_sent_its_whole_order() {
+        let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
+        let row = |id: i64, name: &str| WorkspaceRow {
+            keep_awake: false,
+            id,
+            name: name.into(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+        };
+        let (r1, r2, r3) = (
+            workspace_out(1, 1).expect("fits"),
+            workspace_out(1, 2).expect("fits"),
+            workspace_out(1, 3).expect("fits"),
+        );
+        let l = mux.link(1).expect("remote");
+        l.listed = true;
+        l.spaces = vec![
+            row(r1, "devbox:a"),
+            row(r2, "devbox:b"),
+            row(r3, "devbox:c"),
+        ];
+        l.order_off = true;
+        mux.control(ControlRequest::MoveWorkspace {
+            id: "o".into(),
+            workspace: r3,
+            before: Some(r1),
+        })
+        .await
+        .expect("answered");
+        let mut told = Vec::new();
+        while let Ok(bytes) = remote_rx.try_recv() {
+            let ask: ControlRequest = body_of(&bytes);
+            if let ControlRequest::MoveWorkspace {
+                workspace, before, ..
+            } = ask
+            {
+                assert_eq!(before, None, "each to the end, in turn");
+                told.push(workspace);
+            }
+        }
+        assert_eq!(told, vec![3, 1, 2]);
+        let l = mux.link(1).expect("remote");
+        assert!(!l.order_off && l.order_owed == 3);
+    }
+
+    /// A new tab carries a directory a tab of its machine is in, whichever machine was typed
+    /// into last; any other directory only goes to the machine last typed into.
+    #[tokio::test]
+    async fn a_new_tab_naming_its_space_keeps_its_directory() {
+        let (mut mux, mut home_rx, _remote_rx, _events) = two_links();
+        mux.last_link = 1;
+        let dir = "/Users/me/coding/qoro".to_string();
+        let mut tab: AgentRow = serde_json::from_value(serde_json::json!({
+            "terminal": 4, "workspace": 1, "agent": true, "state": "idle",
+            "readiness": "ready", "cwd": dir,
+        }))
+        .expect("a row");
+        tab.cwd = Some(dir.clone());
+        mux.link(0).expect("home").agents = vec![tab];
+        for (cwd, kept) in [(dir.clone(), true), ("/somewhere/else".to_string(), false)] {
+            mux.control(ControlRequest::CreateTerminal {
+                id: "new-1".into(),
+                cwd: Some(cwd.clone()),
+                workspace: Some(1),
+                name: None,
+            })
+            .await
+            .expect("sent");
+            let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+            let ControlRequest::CreateTerminal { cwd: sent, .. } = asked else {
+                panic!("{asked:?}");
+            };
+            assert_eq!(sent.is_some(), kept, "{cwd}");
+        }
     }
 
     /// A cup filled on a remote space or one of its panes reaches that machine's idle sleep,
@@ -2350,6 +2877,8 @@ mod tests {
             down_seqs: BTreeMap::new(),
             pushed_spaces: Vec::new(),
             last_link: 1,
+            order: Vec::new(),
+            order_file: None,
             events,
             only: None,
             tried: BTreeSet::new(),
@@ -2434,6 +2963,8 @@ mod tests {
             down_seqs: BTreeMap::new(),
             pushed_spaces: Vec::new(),
             last_link: 1,
+            order: Vec::new(),
+            order_file: None,
             events,
             only: None,
             tried: BTreeSet::new(),
@@ -2537,6 +3068,8 @@ mod tests {
             down_seqs: BTreeMap::new(),
             pushed_spaces: Vec::new(),
             last_link: 0,
+            order: Vec::new(),
+            order_file: None,
             events,
             only: Some(2),
             tried: BTreeSet::new(),

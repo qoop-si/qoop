@@ -731,8 +731,11 @@ struct RowPress {
 /// What a held row carries.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Source {
-    /// An agent's tab.
+    /// An agent's tab, by its row in the column.
     Agent(u32),
+    /// A pane of a split, by its name on its top edge: always that pane alone, which leaves
+    /// its split wherever it is let go in its own space.
+    Pane(u32),
     /// A space's rule. `fold` is what a click on it does: fold the space, or else go to it.
     Space { space: i64, fold: bool },
 }
@@ -749,6 +752,8 @@ enum RowDrop {
         place: Place,
         rule: usize,
     },
+    /// A place on the tab bar of the space on screen: a tab of its own there.
+    Bar { space: i64, place: Place },
     /// Where it already is: letting go changes nothing.
     Here,
     /// A carried space, just before `before` in the list or last of its machine's spaces,
@@ -1334,6 +1339,32 @@ impl State {
         }
     }
 
+    /// The pane whose name on its top edge is at a one based screen position: the handle a
+    /// pane is carried by, out to the tab bar or anywhere a row can go. Only where the panes
+    /// are framed, which is a split, and only on the panes' top edge: the name of a pane
+    /// stacked under another sits on the divider between them, which stays the divider to
+    /// resize them (that pane goes by its row in the column).
+    fn title_at_screen(&self, row: u16, col: u16) -> Option<u32> {
+        let layout = self.layouts.get(&self.space?)?;
+        let rects = layout.tile_rects(pane_area(self));
+        if rects.len() < 2 {
+            return None;
+        }
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let x = (col as usize).checked_sub(left + 1)?;
+        rects.into_iter().find_map(|(terminal, r)| {
+            // Drawn on the row above the pane, two cells in from its corner, as ` name `.
+            let top = r.y.checked_sub(1)?;
+            if top != 0 || row as usize != screen::TABS + 1 + top {
+                return None;
+            }
+            let agent = self.rows.iter().find(|a| a.terminal == terminal)?;
+            let room = r.cols.saturating_sub(2);
+            let wide = crate::width::width(&sidebar::label(agent)).min(room.checked_sub(2)?);
+            (room >= 3 && x > r.x && x <= r.x + wide + 2).then_some(terminal)
+        })
+    }
+
     /// Whether a carried tab is held over another machine's spaces, where it cannot go: the
     /// space on screen, or the one a held row is over in the column.
     fn over_other_machine(&self, terminal: u32) -> bool {
@@ -1389,10 +1420,10 @@ impl State {
             .unwrap_or_else(|| vec![terminal])
     }
 
-    /// What a drop of `terminal` into `space` carries: the whole split when it stays in its
-    /// own space (a reorder moves a tab, panes and all), the terminal alone when it leaves
-    /// (it leaves its split too). `None` for a pane reordered on its own, which has no
-    /// place of its own in the order.
+    /// What a drop of `terminal` into `space` carries: the whole split when its first row
+    /// stays in its own space (a reorder moves a tab, panes and all), the terminal alone
+    /// otherwise: leaving for another space, or a pane of the split placed on its own, which
+    /// takes it out of the split as a tab of its own.
     fn carried_into(&self, terminal: u32, space: i64) -> Option<Vec<u32>> {
         let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
         if from != space {
@@ -1405,22 +1436,57 @@ impl State {
             .iter()
             .find(|t| self.rows.iter().any(|r| r.terminal == **t && r.agent))
             .copied();
-        (group.first() == Some(&terminal) || shown == Some(terminal)).then_some(group)
+        Some(
+            if group.first() == Some(&terminal) || shown == Some(terminal) {
+                group
+            } else {
+                vec![terminal]
+            },
+        )
+    }
+
+    /// What a carry of `terminal` takes into `space`: the pane alone when held by its name,
+    /// else what its row carries.
+    fn carried_for(&self, terminal: u32, space: i64, handle: bool) -> Option<Vec<u32>> {
+        if handle {
+            Some(vec![terminal])
+        } else {
+            self.carried_into(terminal, space)
+        }
+    }
+
+    /// Whether a drop of `terminal` in its own space takes it out of its split: always when
+    /// held by its name, else when its row is a pane's rather than the split's.
+    fn leaving(&self, terminal: u32, handle: bool) -> bool {
+        (handle && self.group_of(terminal).len() > 1) || self.leaves_split(terminal)
+    }
+
+    /// Whether `terminal` is a pane of a split that a drop in its own space would take out
+    /// of the split, rather than the row that moves the whole split.
+    fn leaves_split(&self, terminal: u32) -> bool {
+        self.group_of(terminal).len() > 1
+            && self
+                .rows
+                .iter()
+                .find(|r| r.terminal == terminal)
+                .and_then(|r| self.carried_into(terminal, r.workspace))
+                .is_some_and(|carried| carried.len() == 1)
     }
 
     /// Where a held row would land at a one based screen position, on the column the last
     /// paint drew.
     fn drop_target(&self, source: Source, row: u16, col: u16) -> Option<RowDrop> {
         match source {
-            Source::Agent(terminal) => self.drop_at(terminal, row, col, self.paint_now),
+            Source::Agent(terminal) => self.drop_at(terminal, row, col, self.paint_now, false),
+            Source::Pane(terminal) => self.drop_at(terminal, row, col, self.paint_now, true),
             Source::Space { space, .. } => self.space_drop(space, row, col, self.paint_now),
         }
     }
 
     /// Where a carried space would land: before the space whose rule is under the pointer,
     /// or after the space whose rows are, with the rule drawn on that space's blank foot.
-    /// Only among its own machine's spaces, which the list keeps together; only in the
-    /// tree, where spaces have rules; never over a pane.
+    /// Anywhere in the list, whichever machine each space is on; only in the tree, where
+    /// spaces have rules; never over a pane.
     fn space_drop(&self, space: i64, row: u16, col: u16, now: i64) -> Option<RowDrop> {
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         if left == 0 || (col as usize) > left || self.collapsed || self.view != sidebar::View::Tree
@@ -1434,10 +1500,6 @@ impl State {
             Some(hit) => (Some(hit), self.space_of_hit(hit)?),
             None => (None, self.space_of_hit(hit_of(within.checked_sub(1)?)?)?),
         };
-        let machine = crate::mux::machine_of(space);
-        if crate::mux::machine_of(owner) != machine {
-            return None;
-        }
         let ids: Vec<i64> = self.spaces.iter().map(|s| s.id).collect();
         if !ids.contains(&owner) {
             return None;
@@ -1449,7 +1511,7 @@ impl State {
                     .iter()
                     .skip_while(|id| **id != owner)
                     .skip(1)
-                    .find(|id| **id != space && crate::mux::machine_of(**id) == machine)
+                    .find(|id| **id != space)
                     .copied();
                 // Down to the space's blank foot.
                 let mut foot = within;
@@ -1461,13 +1523,9 @@ impl State {
         };
         // Where it already is: before itself, or the place the list would put it anyway.
         let mut then: Vec<i64> = ids.iter().copied().filter(|id| *id != space).collect();
-        let at = match before {
-            Some(b) => then.iter().position(|id| *id == b).unwrap_or(then.len()),
-            None => then
-                .iter()
-                .rposition(|id| crate::mux::machine_of(*id) == machine)
-                .map_or(then.len(), |at| at + 1),
-        };
+        let at = before
+            .and_then(|b| then.iter().position(|id| *id == b))
+            .unwrap_or(then.len());
         then.insert(at, space);
         if before == Some(space) || then == ids {
             return Some(RowDrop::Here);
@@ -1478,15 +1536,25 @@ impl State {
     /// Where a dragged agent row would land at a one based screen position, on the column
     /// at clock `now`: a place in a space's order when over the column, a pane's side when
     /// over the pane, nothing elsewhere. The side is the pane's edge nearest the pointer.
-    fn drop_at(&self, terminal: u32, row: u16, col: u16, now: i64) -> Option<RowDrop> {
+    fn drop_at(
+        &self,
+        terminal: u32,
+        row: u16,
+        col: u16,
+        now: i64,
+        handle: bool,
+    ) -> Option<RowDrop> {
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         if left > 0 && (col as usize) <= left {
-            return self.column_drop(terminal, row, now);
+            return self.column_drop(terminal, row, now, handle);
         }
         // The pane is the space on screen's; a tab of another machine cannot join it.
         let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
         if crate::mux::machine_of(self.space?) != crate::mux::machine_of(from) {
             return None;
+        }
+        if (1..=screen::TABS).contains(&(row as usize)) {
+            return self.bar_drop(terminal, row, col, handle);
         }
         let (target, _, (y, x)) = self.tile_at_screen(row, col)?;
         let area = pane_area(self);
@@ -1515,6 +1583,52 @@ impl State {
         Some(RowDrop::Pane(target, side))
     }
 
+    /// Where on the tab bar a carried terminal would land: before the tab under the pointer,
+    /// or after the last one. A pane let go there leaves its split for a tab of its own; a
+    /// tab moves along the bar; a tab of another space comes into this one.
+    fn bar_drop(&self, terminal: u32, row: u16, col: u16, handle: bool) -> Option<RowDrop> {
+        let space = self.space?;
+        let (pane_cols, _) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let hit = tabs::hit(
+            &screen::bar_tabs(&self.rows, &self.panes(), self.space, &self.spaces),
+            self.focused_tab(),
+            pane_cols as usize,
+            (col as usize).saturating_sub(left + 1),
+            row as usize - 1,
+        );
+        let place = match hit {
+            Some(tabs::Hit::Terminal(t) | tabs::Hit::Close(t)) => Place::Before(t),
+            _ => Place::End,
+        };
+        let carried = self.carried_for(terminal, space, handle)?;
+        if let Place::Before(t) = place
+            && carried.contains(&t)
+            && !self.leaving(terminal, handle)
+        {
+            return Some(RowDrop::Here);
+        }
+        let from = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        if from == space && !self.leaving(terminal, handle) {
+            let full = self.space_order(space);
+            let mut then: Vec<u32> = full
+                .iter()
+                .copied()
+                .filter(|t| !carried.contains(t))
+                .collect();
+            let at = match place {
+                Place::Before(t) => then.iter().position(|u| *u == t).unwrap_or(then.len()),
+                Place::End => then.len(),
+            };
+            then.splice(at..at, carried.iter().copied());
+            if then == full {
+                return Some(RowDrop::Here);
+            }
+        }
+        Some(RowDrop::Bar { space, place })
+    }
+
     /// Where in the column a dragged row would land, worked out on the rows the click test
     /// reads (never the painted rule), so the rule cannot move what is under the pointer.
     ///
@@ -1523,7 +1637,7 @@ impl State {
     /// a space's sleeping rows or its blank foot the end of its live tabs. The priority
     /// list and the folded strip have no order to point into: any row there is its space,
     /// at the end.
-    fn column_drop(&self, terminal: u32, row: u16, now: i64) -> Option<RowDrop> {
+    fn column_drop(&self, terminal: u32, row: u16, now: i64, handle: bool) -> Option<RowDrop> {
         let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
         let rows = self.column_rows_at(now);
         let hit_of = |at: usize| rows.get(at).and_then(|(_, hit)| *hit);
@@ -1542,7 +1656,7 @@ impl State {
         if self.collapsed || self.view != sidebar::View::Tree || !known {
             return hit.map(|_| RowDrop::Space(owner));
         }
-        let carried = self.carried_into(terminal, owner)?;
+        let carried = self.carried_for(terminal, owner, handle)?;
         let full = self.space_order(owner);
         let order: Vec<u32> = full
             .iter()
@@ -1612,7 +1726,9 @@ impl State {
         {
             return Some(RowDrop::Here);
         }
-        if from == owner {
+        // A pane let go anywhere in its own space leaves its split, which is a move even
+        // where it already stands in the order.
+        if from == owner && !self.leaving(terminal, handle) {
             let mut then = order.clone();
             let at = match place {
                 Place::Before(t) => then.iter().position(|u| *u == t).unwrap_or(then.len()),
@@ -1635,23 +1751,26 @@ impl State {
     /// (it cannot move until it wakes).
     fn drag_paint(&self, now: i64) -> Option<screen::DragPaint> {
         let press = self.row_press.filter(|p| p.moved && !p.dead)?;
-        let terminal = match press.source {
-            Source::Agent(terminal) => terminal,
+        let (terminal, handle) = match press.source {
+            Source::Agent(terminal) => (terminal, false),
+            Source::Pane(terminal) => (terminal, true),
             Source::Space { space, .. } => return self.space_paint(space, press.now, now),
         };
         let row = self.rows.iter().find(|r| r.terminal == terminal)?;
         if self.is_asleep(terminal) {
             return None;
         }
-        let drop = self.drop_at(terminal, press.now.0, press.now.1, now);
+        let drop = self.drop_at(terminal, press.now.0, press.now.1, now, handle);
         // Staying in its own space it carries its split, wherever the pointer is in it.
         let home = match drop {
-            Some(RowDrop::Slot { space, .. }) => space == row.workspace,
+            Some(RowDrop::Slot { space, .. } | RowDrop::Bar { space, .. }) => {
+                space == row.workspace
+            }
             Some(RowDrop::Here) => true,
             _ => false,
         };
         let carried = home
-            .then(|| self.carried_into(terminal, row.workspace))
+            .then(|| self.carried_for(terminal, row.workspace, handle))
             .flatten()
             .unwrap_or_else(|| vec![terminal]);
         let rule = match drop {
@@ -2156,6 +2275,15 @@ fn focused_cwd(state: &State) -> Option<String> {
     usable_cwd(row)
 }
 
+/// The focused terminal's directory for a new tab in `space`, only when the two are on one
+/// machine: a directory is a place on its own machine and nowhere else.
+fn focused_cwd_in(state: &State, space: i64) -> Option<String> {
+    let focused = state.rows.iter().find(|r| r.terminal == state.focused)?;
+    (crate::mux::machine_of(focused.workspace) == crate::mux::machine_of(space))
+        .then(|| usable_cwd(focused))
+        .flatten()
+}
+
 /// A row's last reported directory, when a new tab can start there.
 fn usable_cwd(row: &AgentRow) -> Option<String> {
     let cwd = row.cwd.clone()?;
@@ -2168,8 +2296,10 @@ fn usable_cwd(row: &AgentRow) -> Option<String> {
 /// Where a new tab in `space` starts: the focused terminal's directory when that space is
 /// on screen, else the first of its tabs with a usable one, else the daemon's own.
 fn space_cwd(state: &State, space: i64) -> Option<String> {
+    // The focused terminal is not always in the space on screen (a space just made is shown
+    // before its first tab is): its directory only where it is on the same machine.
     if state.space == Some(space)
-        && let Some(cwd) = focused_cwd(state)
+        && let Some(cwd) = focused_cwd_in(state, space)
     {
         return Some(cwd);
     }
@@ -2264,9 +2394,10 @@ fn start_agent_terminal(
         id,
         // Like every other new tab: the agent starts where the
         // person already is rather than where the daemon started.
-        cwd: space
-            .and_then(|space| space_cwd(state, space))
-            .or_else(|| focused_cwd(state)),
+        cwd: match space {
+            Some(space) => space_cwd(state, space).or_else(|| focused_cwd_in(state, space)),
+            None => focused_cwd(state),
+        },
         workspace: space,
         name,
     }
@@ -2838,8 +2969,12 @@ fn answer_prompt(
         }
         Naming::Terminal => vec![ControlRequest::CreateTerminal {
             id: format!("new-{request}"),
-            // The new tab follows the focused terminal's directory.
-            cwd: focused_cwd(state),
+            // The new tab follows the focused terminal's directory, on the
+            // machine of the space the person is looking at.
+            cwd: match state.space {
+                Some(space) => focused_cwd_in(state, space),
+                None => focused_cwd(state),
+            },
             // The space the person is looking at.
             workspace: state.space,
             name,
@@ -5849,6 +5984,24 @@ where
                                 let clicked = state.clicked(row, col);
                                 let asked_about = put_question_down(&mut state, clicked);
 
+                                // A pane's name on the top edge of the panes is its handle: held,
+                                // it carries the pane like a row of the column (to the tab bar
+                                // for a tab of its own); let go where it went down, it is a click
+                                // on that pane.
+                                if !shift && let Some(terminal) = state.title_at_screen(row, col) {
+                                    if state.selection.take().is_some() {
+                                        dirty = true;
+                                    }
+                                    state.row_press = Some(RowPress {
+                                        source: Source::Pane(terminal),
+                                        at: (row, col),
+                                        now: (row, col),
+                                        name: false,
+                                        moved: false,
+                                        dead: false,
+                                    });
+                                    continue;
+                                }
                                 if !shift && (state.divider_press(col, row) || state.split_press(col, row)) {
                                     // A press anywhere else puts down whatever
                                     // was selected, divider presses included.
@@ -6288,14 +6441,16 @@ where
                                         dirty = true;
                                         continue;
                                     }
-                                    let Source::Agent(terminal) = press.source else {
-                                        continue;
+                                    let (terminal, handle) = match press.source {
+                                        Source::Agent(terminal) => (terminal, false),
+                                        Source::Pane(terminal) => (terminal, true),
+                                        Source::Space { .. } => continue,
                                     };
                                     if press.moved {
                                         state.message = None;
                                         let drop = state.drop_target(press.source, row, col);
                                         if let Some(ask) = drop.and_then(|drop| {
-                                            drop_row(&mut state, terminal, drop, &mut request)
+                                            drop_row(&mut state, terminal, drop, &mut request, handle)
                                         }) {
                                             wr.write_all(&client::encode_control_seq(
                                                 &ask, &mut control_seq,
@@ -7177,9 +7332,10 @@ where
                     }
                     // A new space's first terminal follows the
                     // focused terminal's directory, which still names the space
-                    // the person came from at this point.
-                    let cwd = focused_cwd(&state);
+                    // the person came from at this point, when the new space is on
+                    // the same machine.
                     for space in std::mem::take(&mut state.wants_terminal_in) {
+                        let cwd = focused_cwd_in(&state, space);
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::CreateTerminal {
@@ -8132,6 +8288,9 @@ fn drop_space(
 /// The id a reorder inside its own space is asked under.
 const REORDER: &str = "reorder-";
 
+/// The id a pane taken out of its split for a tab of its own is asked under.
+const LEAVE: &str = "leave-";
+
 /// Let go of a held row without dropping it, and of the hint it was showing.
 ///
 /// The press stays, called off, until its release: the button is still down, and what it
@@ -8147,8 +8306,9 @@ fn drop_carry(state: &mut State) {
 
 /// What letting a dragged row go here would do, as the notice row says it.
 fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
-    let terminal = match source {
-        Source::Agent(terminal) => terminal,
+    let (terminal, handle) = match source {
+        Source::Agent(terminal) => (terminal, false),
+        Source::Pane(terminal) => (terminal, true),
         Source::Space { space, .. } => return space_hint(state, space, drop),
     };
     const ANYWHERE: &str = "drop on a space, or on a pane's edge to split it";
@@ -8177,11 +8337,31 @@ fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
         Some(RowDrop::Space(space)) => {
             format!("move {} to {}", name(terminal), space_name(state, space))
         }
-        Some(RowDrop::Slot { space, place, .. }) if Some(space) == from => format!(
-            "move {} {}",
-            name(terminal),
-            place_words(state, terminal, space, place)
-        ),
+        Some(RowDrop::Bar { space, place }) => {
+            let at = match place {
+                Place::Before(t) => format!("before {}", name(t)),
+                Place::End => "at the end".to_string(),
+            };
+            if Some(space) != from {
+                format!(
+                    "move {} to {}, {at}",
+                    name(terminal),
+                    space_name(state, space)
+                )
+            } else if state.leaving(terminal, handle) {
+                format!("take {} out of its split, a tab {at}", name(terminal))
+            } else {
+                format!("move tab {} {at}", name(terminal))
+            }
+        }
+        Some(RowDrop::Slot { space, place, .. }) if Some(space) == from => {
+            let words = place_words(state, terminal, space, place);
+            if state.leaving(terminal, handle) {
+                format!("take {} out of its split, {words}", name(terminal))
+            } else {
+                format!("move {} {words}", name(terminal))
+            }
+        }
         Some(RowDrop::Slot { space, place, .. }) => {
             match place_words(state, terminal, space, place) {
                 words if words.starts_with("to ") => format!("move {} {words}", name(terminal)),
@@ -8218,6 +8398,7 @@ fn drop_row(
     terminal: u32,
     drop: RowDrop,
     request: &mut u64,
+    handle: bool,
 ) -> Option<ControlRequest> {
     let Some(from) = state
         .rows
@@ -8232,7 +8413,9 @@ fn drop_row(
         RowDrop::Here | RowDrop::SpaceSlot { .. } => return None,
         RowDrop::Space(space) if space == from => return None,
         RowDrop::Space(space) => (space, None, None),
-        RowDrop::Slot { space, place, .. } => (space, None, Some(place)),
+        RowDrop::Slot { space, place, .. } | RowDrop::Bar { space, place } => {
+            (space, None, Some(place))
+        }
         RowDrop::Pane(pane, _) if pane == terminal => return None,
         RowDrop::Pane(pane, side) => (state.space?, Some((pane, side)), None),
     };
@@ -8257,9 +8440,12 @@ fn drop_row(
         }
     }
     *request += 1;
-    // A reorder says so in its id, decided when it is asked: its answer is told apart by
-    // that and never by the rows, which an index can change before the answer arrives.
-    let id = if space == from {
+    // What the move is says so in its id, decided when it is asked: its answer is told apart
+    // by that and never by the rows, which an index can change before the answer arrives.
+    let leave = space == from && state.leaving(terminal, handle);
+    let id = if leave {
+        format!("{LEAVE}{request}")
+    } else if space == from {
         format!("{REORDER}{request}")
     } else {
         format!("move-{request}")
@@ -8269,10 +8455,12 @@ fn drop_row(
     }
     // A split reorders by its first pane, whichever of its rows was carried.
     let terminal = match state.carried_into(terminal, space) {
-        Some(carried) if space == from => carried[0],
+        Some(carried) if space == from && !leave => carried[0],
         _ => terminal,
     };
-    state.message = Some(if space == from {
+    state.message = Some(if leave {
+        "taking it out of its split".to_string()
+    } else if space == from {
         "reordering".to_string()
     } else {
         format!("moving to {}", space_name(state, space))
@@ -8282,6 +8470,7 @@ fn drop_row(
         terminal,
         workspace: space,
         place: at,
+        leave_split: leave,
     })
 }
 
@@ -9739,6 +9928,20 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         } => {
             // A reorder: the tab stays in its space, its split and the keyboard with it. The
             // index the daemon announces redraws the order.
+            // A pane taken out of its split: the daemon took it out, and this client's tree
+            // lets it go too, whichever pane of the split it was. The keyboard on it follows it
+            // to its own tab, never left on a terminal no longer on screen.
+            if id.starts_with(LEAVE) {
+                prune_trees(state, |t| t == terminal);
+                if state.focused == terminal {
+                    state.space = Some(workspace);
+                    activate(state, workspace, terminal);
+                    state.adopted_resize = true;
+                }
+                state.message = Some("a tab of its own now".to_string());
+                *dirty = true;
+                return;
+            }
             if id.starts_with(REORDER) {
                 state.message = Some("reordered".to_string());
                 *dirty = true;
@@ -10422,6 +10625,211 @@ mod tests {
         assert_eq!(drag.carried, vec![1, 3, 2]);
         assert_eq!(drag.chip.2, "app (2)");
         assert_eq!(drag.rule, Some((foot2, 1)));
+    }
+
+    /// A space carries across machines: a remote's space lands above a local one, and a
+    /// local one below the remote's, wherever the list has them.
+    #[test]
+    fn a_carried_space_crosses_machines() {
+        use sidebar::Hit;
+        let mut s = drag_state();
+        let far = (1i64 << 40) | 3;
+        s.spaces.push(space(far, "devbox:api"));
+        s.rows.push(agent(9, far, "claude", "idle"));
+        let screen = |at: usize| (at + screen::SIDEBAR_TOP) as u16;
+        let drop = |s: &State, space: i64, at: usize| {
+            s.drop_target(Source::Space { space, fold: true }, screen(at), 3)
+        };
+        let rule1 = row_of(&s, Hit::Space(1), false);
+        assert_eq!(
+            drop(&s, far, rule1),
+            Some(RowDrop::SpaceSlot {
+                before: Some(1),
+                rule: rule1
+            })
+        );
+        let row9 = row_of(&s, Hit::Terminal(9), false);
+        let foot = row_of(&s, Hit::Terminal(9), true) + 1;
+        assert_eq!(
+            drop(&s, 1, row9),
+            Some(RowDrop::SpaceSlot {
+                before: None,
+                rule: foot
+            })
+        );
+    }
+
+    /// The focused terminal's directory starts a new tab only on its own machine.
+    #[test]
+    fn a_directory_stays_on_its_machine() {
+        let mut s = drag_state();
+        s.focused = 1;
+        s.rows[0].cwd = Some(std::env::temp_dir().display().to_string());
+        assert!(
+            focused_cwd_in(&s, 2).is_some(),
+            "another space, same machine"
+        );
+        assert_eq!(
+            focused_cwd_in(&s, (1i64 << 40) | 3),
+            None,
+            "another machine"
+        );
+    }
+
+    /// A pane of a split, let go in its own space, leaves the split for a tab of its own
+    /// there, even where it already stands; its split's first row still moves the split.
+    #[test]
+    fn a_pane_let_go_in_its_own_space_leaves_its_split() {
+        use sidebar::Hit;
+        let mut s = drag_state();
+        let area = pane_area(&s);
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, layout::Dir::V, area));
+        assert!(layout.bind_placeholder(2));
+        s.layouts.insert(1, layout);
+        s.space = Some(1);
+        let screen = |at: usize| (at + screen::SIDEBAR_TOP) as u16;
+        let drop = |s: &State, t: u32, at: usize| s.drop_target(Source::Agent(t), screen(at), 3);
+        assert!(s.leaves_split(2) && !s.leaves_split(1));
+        let name1 = row_of(&s, Hit::Terminal(1), false);
+        assert_eq!(
+            drop(&s, 2, name1),
+            Some(RowDrop::Slot {
+                space: 1,
+                place: Place::Before(1),
+                rule: name1
+            })
+        );
+        // On its own rows: out of the split, after it, where a reorder would see no move.
+        let low = row_of(&s, Hit::Terminal(2), true);
+        assert!(matches!(
+            drop(&s, 2, low),
+            Some(RowDrop::Slot { space: 1, .. })
+        ));
+        let hint = drop_hint(&s, Source::Agent(2), drop(&s, 2, name1));
+        assert!(hint.contains("out of its split"), "{hint}");
+        // Its answer takes it out of this client's tree too, and keeps the keyboard.
+        let focused = s.focused;
+        let (mut request, mut dirty) = (0, false);
+        apply(
+            &mut s,
+            ControlResponse::TerminalMoved {
+                id: format!("{LEAVE}1"),
+                terminal: 2,
+                workspace: 1,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!s.is_pane(2));
+        assert_eq!(s.focused, focused);
+        // The keyboard on the pane that leaves follows it to its own tab.
+        let mut s = drag_state();
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, layout::Dir::V, pane_area(&s)));
+        assert!(layout.bind_placeholder(2));
+        s.layouts.insert(1, layout);
+        s.space = Some(1);
+        s.focused = 2;
+        apply(
+            &mut s,
+            ControlResponse::TerminalMoved {
+                id: format!("{LEAVE}2"),
+                terminal: 2,
+                workspace: 1,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.focused, 2);
+        assert!(
+            s.layouts.get(&1).is_some_and(|l| l.leaves().contains(&2)),
+            "the tab on screen is the one the keyboard is on"
+        );
+    }
+
+    /// A pane's name on its top edge is a handle for it, and the tab bar a place to let it
+    /// go: past the last tab, the pane leaves its split for a tab of its own at the end.
+    #[test]
+    fn a_panes_name_carries_it_to_the_tab_bar() {
+        let mut s = drag_state();
+        s.cols = 160;
+        let area = pane_area(&s);
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, layout::Dir::V, area));
+        assert!(layout.bind_placeholder(2));
+        s.layouts.insert(1, layout);
+        s.space = Some(1);
+        let (_, rect) = s.layouts[&1]
+            .tile_rects(area)
+            .into_iter()
+            .find(|(t, _)| *t == 2)
+            .expect("tiled");
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let row = (screen::TABS + rect.y) as u16;
+        let col = (left + 1 + rect.x + 2) as u16;
+        assert_eq!(s.title_at_screen(row, col), Some(2), "on its name");
+        assert_eq!(s.title_at_screen(row + 1, col), None, "inside the pane");
+        assert_eq!(
+            s.title_at_screen(row, (left + 1 + rect.x + rect.cols - 1) as u16),
+            None,
+            "the edge past its name is the edge"
+        );
+        let end = (left + 1 + area.cols - 1) as u16;
+        let place = RowDrop::Bar {
+            space: 1,
+            place: Place::End,
+        };
+        let bar = Some(place);
+        assert_eq!(s.drop_target(Source::Pane(2), 1, end), bar);
+        let hint = drop_hint(&s, Source::Pane(2), s.drop_target(Source::Pane(2), 1, end));
+        assert!(hint.contains("out of its split, a tab"), "{hint}");
+        // The split's first pane, held by its name, leaves too: it is asked to, by name.
+        assert_eq!(s.drop_target(Source::Pane(1), 1, end), bar);
+        let mut request = 0;
+        let ask = drop_row(&mut s, 1, place, &mut request, true);
+        assert!(
+            matches!(&ask, Some(ControlRequest::MoveTerminal { id, terminal: 1, leave_split: true, .. })
+                if id.starts_with(LEAVE)),
+            "{ask:?}"
+        );
+        // Its row in the column still moves the whole split.
+        let ask = drop_row(&mut s, 1, place, &mut request, false);
+        assert!(
+            matches!(
+                &ask,
+                Some(ControlRequest::MoveTerminal {
+                    leave_split: false,
+                    ..
+                })
+            ),
+            "{ask:?}"
+        );
+    }
+
+    /// A pane stacked under another has its name on the divider between them, which stays
+    /// the divider: no handle there.
+    #[test]
+    fn a_name_on_a_divider_stays_the_divider() {
+        let mut s = drag_state();
+        s.cols = 160;
+        s.lines = 50;
+        let area = pane_area(&s);
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, layout::Dir::H, area));
+        assert!(layout.bind_placeholder(2));
+        s.layouts.insert(1, layout);
+        s.space = Some(1);
+        let rects = s.layouts[&1].tile_rects(area);
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let at = |t: u32| {
+            let (_, r) = rects.iter().find(|(x, _)| *x == t).expect("tiled");
+            ((screen::TABS + r.y) as u16, (left + 1 + r.x + 2) as u16)
+        };
+        let (row, col) = at(1);
+        assert_eq!(s.title_at_screen(row, col), Some(1), "the top pane's name");
+        let (row, col) = at(2);
+        assert_eq!(s.title_at_screen(row, col), None, "on the divider");
     }
 
     /// The priority list has no order to point into: any row is its space, at the end.
@@ -12950,12 +13358,13 @@ mod tests {
         let before = state.layouts.get(&1).cloned();
         let focused = state.focused;
         let (mut request, mut dirty) = (0, false);
-        let moved = |id: &str| ControlResponse::TerminalMoved {
+        let moved = |id: &str, terminal: u32| ControlResponse::TerminalMoved {
             id: id.into(),
-            terminal: 2,
+            terminal,
             workspace: 1,
         };
-        apply(&mut state, moved("reorder-1"), &mut request, &mut dirty);
+        // The split's first pane moved the whole split.
+        apply(&mut state, moved("reorder-1", 1), &mut request, &mut dirty);
         assert!(dirty);
         assert_eq!(state.message.as_deref(), Some("reordered"));
         assert_eq!(
@@ -12965,7 +13374,7 @@ mod tests {
         );
         assert_eq!(state.focused, focused);
         // Not asked as a reorder: the old path, which takes it out of its split.
-        apply(&mut state, moved("move-2"), &mut request, &mut dirty);
+        apply(&mut state, moved("move-2", 2), &mut request, &mut dirty);
         assert!(
             !state
                 .layouts

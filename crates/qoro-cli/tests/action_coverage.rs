@@ -141,6 +141,7 @@ fn actions() -> Vec<Action> {
                     terminal: 1,
                     workspace: 2,
                     place: None,
+                    leave_split: false,
                 })
             },
         },
@@ -566,6 +567,7 @@ fn every_control_method_is_reachable_from_some_action() {
             terminal: 0,
             workspace: 0,
             place: None,
+            leave_split: false,
         },
         ControlRequest::ListFocusEvents {
             id: String::new(),

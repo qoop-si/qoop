@@ -1269,6 +1269,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 terminal: second,
                 workspace: space + 100,
                 place: None,
+                leave_split: false,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1285,6 +1286,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 terminal: second,
                 workspace: space,
                 place: None,
+                leave_split: false,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1339,6 +1341,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
                 terminal: third,
                 workspace: space,
                 place: None,
+                leave_split: false,
             },
             qoro_testkit::PATIENCE,
         )
@@ -1357,7 +1360,7 @@ async fn a_tab_moves_to_another_space_and_leaves_its_split() {
 
 /// A tab reorders inside its own space, its split with it: the index lists the new order,
 /// the disk keeps it for the next start, an older client's move into its own space is
-/// still nothing, and a pane cannot be pulled out of its split's place on its own.
+/// still nothing, and a pane placed on its own leaves its split for a tab of its own.
 #[tokio::test]
 async fn a_tab_reorders_in_its_own_space_split_and_all() {
     use qoro_runtime::control::{ControlResponse, Place};
@@ -1374,6 +1377,7 @@ async fn a_tab_reorders_in_its_own_space_split_and_all() {
                 terminal,
                 workspace,
                 place,
+                leave_split: false,
             },
             qoro_testkit::PATIENCE,
         ))
@@ -1458,9 +1462,6 @@ async fn a_tab_reorders_in_its_own_space_split_and_all() {
     )
     .await;
     assert!(moved(&r), "{r:?}");
-    // A pane on its own has no place of its own.
-    let r = mv(&mut client, "r3", third, space, Some(Place::End)).await;
-    assert!(matches!(r, Some(ControlResponse::Failed { .. })), "{r:?}");
     // Naming one of its own panes is where it already is.
     let r = mv(&mut client, "r4", second, space, Some(Place::Before(third))).await;
     assert!(moved(&r), "{r:?}");
@@ -1508,6 +1509,50 @@ async fn a_tab_reorders_in_its_own_space_split_and_all() {
     let r = mv(&mut client, "r6", fourth, space, Some(Place::Before(third))).await;
     assert!(moved(&r), "{r:?}");
     assert_eq!(order(&mut client, space).await, vec![first, fourth, second]);
+    // A pane placed on its own leaves its split and is a tab of its own at that place.
+    let tree = beside(leaf(first), leaf(fourth));
+    let saved = Box::pin(client.control(
+        &ControlRequest::SetSplit {
+            id: "tree2".into(),
+            tree,
+        },
+        qoro_testkit::PATIENCE,
+    ))
+    .await;
+    assert!(
+        matches!(saved, Some(ControlResponse::SplitSaved { .. })),
+        "{saved:?}"
+    );
+    // Without being asked to leave, a pane that is not its split's first is refused.
+    let r = mv(&mut client, "r7", fourth, space, Some(Place::End)).await;
+    assert!(matches!(r, Some(ControlResponse::Failed { .. })), "{r:?}");
+    let r = Box::pin(client.control(
+        &ControlRequest::MoveTerminal {
+            id: "r8".into(),
+            terminal: fourth,
+            workspace: space,
+            place: Some(Place::End),
+            leave_split: true,
+        },
+        qoro_testkit::PATIENCE,
+    ))
+    .await;
+    assert!(moved(&r), "{r:?}");
+    assert_eq!(order(&mut client, space).await, vec![first, second, fourth]);
+    let trees: Vec<qoro_runtime::control::Pane> = d
+        .store()
+        .splits()
+        .await
+        .expect("splits")
+        .iter()
+        .map(|json| serde_json::from_str(json).expect("a tree"))
+        .collect();
+    assert!(
+        !trees
+            .iter()
+            .any(|t| t.leaves().contains(&fourth) || t.leaves().contains(&first)),
+        "the split it left had one pane, which is a tab: {trees:?}"
+    );
 }
 
 /// Spaces keep the order a person gave them, and the daemon's own space stays its own
