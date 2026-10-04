@@ -9773,6 +9773,15 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     }
                     state.message = Some(format!("{} is {}", sidebar::label(row), row.state));
                 }
+                // The agent moved on, answered or not: the line that said it needed a
+                // person has nothing left to say, and nothing else would take it down
+                // while the keyboard rests on a quiet pane.
+                if let Some(was) = before.as_deref().filter(|b| *b != row.state)
+                    && state.message.as_deref()
+                        == Some(format!("{} is {was}", sidebar::label(row)).as_str())
+                {
+                    state.message = None;
+                }
                 // A screen agent that worked and now sits idle while the
                 // keyboard is elsewhere finished without ever reporting done.
                 // Same news as a daemon done, same bell, same `new` row.
@@ -14778,6 +14787,38 @@ mod tests {
             );
             assert_eq!(state.message.is_none(), cleared, "{state_word}");
         }
+    }
+
+    /// The line saying an agent is blocked goes when the agent works again, and only that
+    /// line: whatever else is on the bar is not its to take down.
+    #[test]
+    fn the_blocked_line_goes_when_the_agent_works_again() {
+        let index = |state: &mut State, word: &str| {
+            apply(
+                state,
+                ControlResponse::Agents {
+                    id: "index".to_string(),
+                    splits: Vec::new(),
+                    agents: vec![agent(1, 1, "claude", word), agent(2, 1, "claude", "idle")],
+                },
+                &mut 0,
+                &mut false,
+            );
+        };
+        let mut state = bare_state();
+        state.space = Some(1);
+        state.adopted = true;
+        state.focused = 2;
+        index(&mut state, "working");
+        index(&mut state, "blocked");
+        assert_eq!(state.message.as_deref(), Some("claude is blocked"));
+        index(&mut state, "working");
+        assert_eq!(state.message, None, "answered, so nothing is asked");
+
+        index(&mut state, "blocked");
+        state.message = Some("copied".to_string());
+        index(&mut state, "working");
+        assert_eq!(state.message.as_deref(), Some("copied"));
     }
 
     /// The first workspace list parks the bar: a keyboard adopted from

@@ -329,6 +329,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
         sequence: agent.belief.sequence.saturating_add(1),
         visible_blocker: false,
         visible_idle: false,
+        visible_working: false,
     };
     if let Ok(next) = agent.belief.clone().accept(&idle) {
         agent.belief = next;
@@ -943,6 +944,7 @@ impl AgentRegistry {
             sequence: agent.belief.sequence.saturating_add(1),
             visible_blocker: verdict.visible_blocker,
             visible_idle: verdict.visible_idle,
+            visible_working: verdict.visible_working,
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -1029,6 +1031,7 @@ impl AgentRegistry {
             sequence: agent.belief.sequence.saturating_add(1),
             visible_blocker,
             visible_idle,
+            visible_working: false,
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -1700,6 +1703,7 @@ mod tests {
             sequence: 99,
             visible_blocker: false,
             visible_idle: false,
+            visible_working: false,
         };
         assert_eq!(
             r.agent(1).expect("agent").belief.evaluate(&stale_screen),
@@ -1752,6 +1756,43 @@ mod tests {
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Idle
         );
+    }
+
+    /// A permission prompt answered while a long tool runs: the hook said `blocked`
+    /// and has nothing more to say until the tool ends, so only the screen sees the
+    /// agent work again. A screen that positively shows work clears the hook's
+    /// blocker; a weak working reading with no rule behind it must not.
+    #[test]
+    fn a_visible_working_screen_clears_a_hook_held_blocker() {
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        r.observe_hook(
+            1,
+            &TerminalId::new("1"),
+            &token,
+            AgentRuntimeState::Blocked,
+            false,
+            false,
+            NOW,
+        )
+        .expect("applies");
+        let state = || r.agent(1).expect("agent").belief.state;
+        assert_eq!(state(), AgentRuntimeState::Blocked);
+
+        let weak = screen_verdict(AgentRuntimeState::Working, false);
+        assert!(!r.observe_screen(1, "test-manifest", &weak, NOW));
+        assert_eq!(state(), AgentRuntimeState::Blocked, "absence of evidence");
+
+        let spinner = qoro_detect::Verdict {
+            visible_working: true,
+            ..weak
+        };
+        let mut rx = r.subscribe();
+        assert!(r.observe_screen(1, "test-manifest", &spinner, NOW));
+        assert_eq!(state(), AgentRuntimeState::Working);
+        rx.try_recv()
+            .expect("the index is told the agent works again");
     }
 
     /// A trust dialog on screen raises the setup gate, and the reading after

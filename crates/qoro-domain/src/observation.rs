@@ -80,6 +80,10 @@ pub struct AgentObservation {
     /// idle with neither flag set is an absence of evidence, never an
     /// override.
     pub visible_idle: bool,
+    /// True only for a screen observation that positively saw work in progress. It clears
+    /// a held `Blocked` and nothing else: a prompt that was answered leaves no hook event
+    /// until the tool ends, and a spinner on screen cannot lie about the prompt being gone.
+    pub visible_working: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,14 +169,15 @@ impl AgentBelief {
         if self.state == AgentRuntimeState::Unknown {
             return ObservationVerdict::Accept;
         }
-        // Weaker source. Two exceptions, both requiring positive on-screen
-        // evidence newer than what is overridden: a blocking modal, or the
-        // idle composer. A hook can lag or miss a transition in either
-        // direction; the live screen cannot lie about a dialog or a composer
-        // being on screen. Anything weaker is an absence of evidence and stays
-        // outranked, which is what keeps a no-rule screen from clearing a
-        // hook-held state it cannot see.
-        if (obs.visible_blocker || obs.visible_idle) && obs.sequence > self.sequence {
+        // Weaker source. Three exceptions, all requiring positive on-screen
+        // evidence newer than what is overridden: a blocking modal, the idle
+        // composer, or work in progress over a held blocker. A hook can lag or
+        // miss a transition in either direction; the live screen cannot lie
+        // about a dialog, a composer or a spinner being on screen. Anything
+        // weaker is an absence of evidence and stays outranked, which is what
+        // keeps a no-rule screen from clearing a hook-held state it cannot see.
+        let answered = obs.visible_working && self.state == AgentRuntimeState::Blocked;
+        if (obs.visible_blocker || obs.visible_idle || answered) && obs.sequence > self.sequence {
             return ObservationVerdict::Accept;
         }
         ObservationVerdict::Outranked
@@ -238,6 +243,7 @@ mod one_source_changing_its_mind {
             sequence,
             visible_blocker: false,
             visible_idle: false,
+            visible_working: false,
         }
     }
 
@@ -291,6 +297,7 @@ mod unknown_is_not_a_claim {
             sequence,
             visible_blocker: false,
             visible_idle: false,
+            visible_working: false,
         }
     }
 
@@ -362,6 +369,7 @@ mod tests {
             sequence: seq,
             visible_blocker: false,
             visible_idle: false,
+            visible_working: false,
         }
     }
 
