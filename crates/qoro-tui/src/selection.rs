@@ -56,6 +56,22 @@ impl Selection {
         self.anchor == self.head
     }
 
+    /// A selection covering exactly these two cells, in reading order whichever way
+    /// they are given.
+    pub fn covering(one: (usize, usize), other: (usize, usize)) -> Self {
+        if one <= other {
+            Selection {
+                anchor: one,
+                head: other,
+            }
+        } else {
+            Selection {
+                anchor: other,
+                head: one,
+            }
+        }
+    }
+
     /// The columns selected on one row of the pane, if any are.
     ///
     /// The end is exclusive, and the last column of the drag is included: a person who
@@ -94,6 +110,69 @@ impl Selection {
         }
         out.join("\n")
     }
+}
+
+/// Whether `c` holds a double-clicked word together.
+///
+/// Letters, digits and the underscore, plus the characters a path or an address
+/// is made of (`-`, `.`, `/`, `:`, `@`): a double click on `src/main.rs`
+/// takes the path, on `user@example.com:8080` the address, while a bracket or
+/// a comma still stops it the way every terminal does.
+pub fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@')
+}
+
+/// The word under `(row, col)` in `lines`, as a selection, or `None` when the
+/// cell holds no word character.
+///
+/// `lines` are the window rows as drawn and `cols` the tile width, the same
+/// inputs [`Selection::text`] reads: a word is one row, never wrapped onto the
+/// next. Wide characters count two columns, the way the grid draws them.
+pub fn word_at(lines: &[String], cols: usize, row: usize, col: usize) -> Option<Selection> {
+    let line = lines.get(row)?;
+    // The characters with their starting screen columns.
+    let mut cells: Vec<(usize, usize, char)> = Vec::new();
+    let mut at = 0;
+    let mut skip_spacer = false;
+    for (i, c) in line.chars().enumerate() {
+        if skip_spacer && c == ' ' {
+            skip_spacer = false;
+            continue;
+        }
+        let w = crate::width::columns(c);
+        skip_spacer = w == 2;
+        cells.push((i, at, c));
+        at += w;
+    }
+    let at = cells
+        .iter()
+        .position(|&(_, start, c)| col >= start && col < start + crate::width::columns(c))
+        .or_else(|| {
+            // Past the last character: the word ending at the line's end still counts
+            // when the click lands just after it.
+            let last = cells.last()?;
+            (col == last.1 + crate::width::columns(last.2)).then(|| cells.len() - 1)
+        })?;
+    if !is_word_char(cells[at].2) {
+        return None;
+    }
+    let mut from = at;
+    while from > 0 && is_word_char(cells[from - 1].2) {
+        from -= 1;
+    }
+    let mut to = at;
+    while to + 1 < cells.len() && is_word_char(cells[to + 1].2) {
+        to += 1;
+    }
+    let start_col = cells[from].1;
+    let end_col = cells[to].1 + crate::width::columns(cells[to].2) - 1;
+    if start_col >= cols {
+        return None;
+    }
+    Some(Selection::covering(
+        (row, start_col),
+        (row, end_col.min(cols.saturating_sub(1))),
+    ))
 }
 
 /// The part of a grid row that lies in a range of screen columns.
@@ -311,6 +390,31 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_click_takes_the_word_under_the_pointer() {
+        let lines = vec!["hello world".to_string()];
+        let word = word_at(&lines, 80, 0, 7).expect("a word");
+        assert_eq!(word.text(&lines, 80), "world");
+        let same = word_at(&lines, 80, 0, 10).expect("same word");
+        assert_eq!(same.text(&lines, 80), "world");
+    }
+
+    #[test]
+    fn a_double_click_takes_paths_and_addresses_whole() {
+        let lines = vec!["open src/main.rs (user@example.com:8080)".to_string()];
+        let path = word_at(&lines, 80, 0, 7).expect("a path");
+        assert_eq!(path.text(&lines, 80), "src/main.rs");
+        let address = word_at(&lines, 80, 0, 22).expect("an address");
+        assert_eq!(address.text(&lines, 80), "user@example.com:8080");
+    }
+
+    #[test]
+    fn a_double_click_on_blank_space_selects_nothing() {
+        let lines = vec!["hello world".to_string()];
+        assert_eq!(word_at(&lines, 80, 0, 5), None, "the space between");
+        assert_eq!(word_at(&lines, 80, 1, 0), None, "past the last row");
+    }
 
     #[test]
     fn a_click_selects_nothing_at_all() {

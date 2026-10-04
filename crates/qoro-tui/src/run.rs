@@ -108,6 +108,75 @@ fn short_copied(text: &str) -> String {
     }
 }
 
+/// Say `text` twice: on the notice row, and as the small box over the pane.
+///
+/// The notice row alone is wiped by the next render, which while an agent streams is
+/// milliseconds away, so a copy made mid-stream never got read. The box stays its
+/// two seconds on a clock instead.
+fn say(state: &mut State, text: String) {
+    state.message = Some(text.clone());
+    state.toast = Some(Toast {
+        text,
+        until: std::time::Instant::now() + std::time::Duration::from_millis(TOAST_MS),
+    });
+}
+
+/// The toast to draw, if one is still standing.
+fn toast_text(state: &State) -> Option<&str> {
+    state
+        .toast
+        .as_ref()
+        .filter(|toast| std::time::Instant::now() < toast.until)
+        .map(|toast| toast.text.as_str())
+}
+
+/// The rows under the pointer as drawn, for selection and double-click word lookup.
+///
+/// Read from the window as it is drawn, not from the live screen: scrolled back, the
+/// rows under the pointer are rows that went past, and copying the live screen instead
+/// would hand the person text they never saw. Sized to the focused tile, like the
+/// selection itself.
+fn window_rows(state: &State) -> Vec<String> {
+    let tile = focused_rect(&state);
+    (0..tile.rows)
+        .map(|row| {
+            screen::window_row(
+                state.snapshot.as_ref(),
+                &state.behind,
+                state.scrolled_rows(),
+                state.anchor.unwrap_or_default(),
+                row,
+            )
+            .0
+            .to_string()
+        })
+        .collect()
+}
+
+/// Copy `text` to the clipboard and say what left, the way every copy path does.
+///
+/// Answers whether anything was copied: empty text writes nothing and says nothing.
+fn copy_and_say(
+    state: &mut State,
+    text: &str,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    if text.is_empty() {
+        return Ok(false);
+    }
+    match crate::selection::copy(text, out)? {
+        Some(via) => {
+            say(state, copied(text, via));
+            Ok(true)
+        }
+        // The escape could not be written: nothing to say, and the highlight goes.
+        None => {
+            state.selection = None;
+            Ok(false)
+        }
+    }
+}
+
 /// Where this interface run starts numbering its requests: nanoseconds
 /// since the epoch, so no later run reuses an id an earlier one sent.
 fn request_seed() -> u64 {
@@ -177,6 +246,14 @@ const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// numbers a few seconds later, and the keyboard goes back to the same one rather than to
 /// the first tab of the space.
 const FOCUS_RETURN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How close together two presses on the same cell must be to count as one
+/// double click: half a second, the terminal's own ballpark.
+const DOUBLE_CLICK_MS: u64 = 500;
+
+/// How long the small copy confirmation stays on screen: long enough to read,
+/// short enough to never be in the way.
+const TOAST_MS: u64 = 2500;
 
 /// Whether the person asked to see what agents cost: `QORO_USAGE=1`, and nothing else.
 fn usage_on() -> bool {
@@ -706,6 +783,20 @@ struct State {
     /// program is owed the rest of that gesture wherever the pointer goes; without the
     /// flag a release outside the tile was dropped and vim never saw the button come up.
     forwarded_press: bool,
+    /// The last press in the focused pane, as the terminal and its tile-local cell,
+    /// with when it landed. Two presses on the same cell within [`DOUBLE_CLICK_MS`]
+    /// are one double click, which takes the word under the pointer and copies it.
+    last_press: Option<(u32, usize, usize, std::time::Instant)>,
+    /// A small confirmation box over the pane, with when it goes. Kept on a clock
+    /// rather than the notice row alone, because a render arriving mid-stream wipes
+    /// the notice row before anybody reads it, while the box stays its two seconds.
+    toast: Option<Toast>,
+}
+
+/// A small confirmation box over the pane, and when it goes.
+struct Toast {
+    text: String,
+    until: std::time::Instant,
 }
 
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
@@ -900,6 +991,7 @@ impl State {
             // the outer terminal cannot draw. `None` here keeps `frame()` pure:
             // capability is a client property, not daemon state.
             image_notice: None,
+            toast: toast_text(self),
             chrome: screen::Chrome {
                 shut: &self.shut,
                 drag: None,
@@ -2293,13 +2385,20 @@ fn usable_cwd(row: &AgentRow) -> Option<String> {
     (!cwd.is_empty() && std::path::Path::new(&cwd).is_absolute() && here).then_some(cwd)
 }
 
-/// Where a new tab in `space` starts: the focused terminal's directory when that space is
-/// on screen, else the first of its tabs with a usable one, else the daemon's own.
+/// Where a new tab in `space` starts: the focused terminal's directory when the
+/// focused terminal is itself in that space, else the first of that space's tabs
+/// with a usable one, else the daemon's own.
+///
+/// Per space on purpose: a tab opened for space B starts where B already is,
+/// never where the keyboard last was in space A. The focused directory only
+/// counts when it is in the space being opened in.
 fn space_cwd(state: &State, space: i64) -> Option<String> {
     // The focused terminal is not always in the space on screen (a space just made is shown
-    // before its first tab is): its directory only where it is on the same machine.
-    if state.space == Some(space)
-        && let Some(cwd) = focused_cwd_in(state, space)
+    // before its first tab is, or a `+` aimed at another space): its directory only counts
+    // where it is in the space the new tab goes to.
+    if let Some(focused) = state.rows.iter().find(|r| r.terminal == state.focused)
+        && focused.workspace == space
+        && let Some(cwd) = usable_cwd(focused)
     {
         return Some(cwd);
     }
@@ -2392,10 +2491,11 @@ fn start_agent_terminal(
         .insert(id.clone(), (command.to_string(), given));
     ControlRequest::CreateTerminal {
         id,
-        // Like every other new tab: the agent starts where the
-        // person already is rather than where the daemon started.
+        // Like every other new tab: the agent starts where that
+        // space already is rather than where the daemon started, and never where
+        // another space is.
         cwd: match space {
-            Some(space) => space_cwd(state, space).or_else(|| focused_cwd_in(state, space)),
+            Some(space) => space_cwd(state, space),
             None => focused_cwd(state),
         },
         workspace: space,
@@ -2969,10 +3069,10 @@ fn answer_prompt(
         }
         Naming::Terminal => vec![ControlRequest::CreateTerminal {
             id: format!("new-{request}"),
-            // The new tab follows the focused terminal's directory, on the
-            // machine of the space the person is looking at.
+            // The new tab follows its own space's directory, never the
+            // focused terminal's when that one lives in another space.
             cwd: match state.space {
-                Some(space) => focused_cwd_in(state, space),
+                Some(space) => space_cwd(state, space),
                 None => focused_cwd(state),
             },
             // The space the person is looking at.
@@ -4737,10 +4837,10 @@ async fn drain_modes(
     }
     if let Some(text) = state.modes.clipboard.take() {
         let mut out = std::io::stdout();
-        state.message = Some(match crate::selection::copy(&text, &mut out)? {
-            Some(via) => copied(&text, via),
-            None => "nothing to copy: the selection is blank".to_string(),
-        });
+        match crate::selection::copy(&text, &mut out)? {
+            Some(via) => say(state, copied(&text, via)),
+            None => say(state, "nothing to copy: the selection is blank".to_string()),
+        }
         *dirty = true;
     }
     Ok(())
@@ -5038,6 +5138,8 @@ where
         modes: Modes::default(),
         selection: None,
         forwarded_press: false,
+        last_press: None,
+        toast: None,
         anchor: None,
         behind: Behind::default(),
         outer_focus: None,
@@ -5448,6 +5550,11 @@ where
             let hold_at = reports.deadline().map(tokio::time::Instant::from_std);
             // Notes waiting out their second. `None` with nothing held, so nothing is armed.
             let notes_at = state.notes_due.map(tokio::time::Instant::from_std);
+            // A standing toast goes on its clock, then repaints once to come down. `None`
+            // with no toast, so nothing is armed.
+            let toast_at = state.toast.as_ref().map(|toast| {
+                tokio::time::Instant::from_std(toast.until)
+            });
 
             tokio::select! {
                 biased;
@@ -6043,6 +6150,7 @@ where
                                         if state.selection.take().is_some() {
                                             dirty = true;
                                         }
+                                        state.last_press = None;
                                         if let Some(bytes) =
                                             mouse_report(0, tile_row, tile_col, true)
                                         {
@@ -6051,6 +6159,42 @@ where
                                             state.forwarded_press = true;
                                         }
                                     } else {
+                                        // A second press on the same cell within half a
+                                        // second is a double click: take the word under the
+                                        // pointer and copy it at once, the way a terminal
+                                        // does, rather than starting a drag of one cell.
+                                        let now = std::time::Instant::now();
+                                        let double = state.last_press.is_some_and(
+                                            |(term, prow, pcol, at)| {
+                                                term == terminal
+                                                    && prow == tile_row
+                                                    && pcol == tile_col
+                                                    && now.duration_since(at).as_millis()
+                                                        <= DOUBLE_CLICK_MS as u128
+                                            },
+                                        );
+                                        if double {
+                                            state.last_press = None;
+                                            let window = window_rows(&state);
+                                            let tile = focused_rect(&state);
+                                            if let Some(word) =
+                                                crate::selection::word_at(
+                                                    &window,
+                                                    tile.cols,
+                                                    tile_row,
+                                                    tile_col,
+                                                )
+                                            {
+                                                let text = word.text(&window, tile.cols);
+                                                state.selection = Some(word);
+                                                let mut out = std::io::stdout();
+                                                copy_and_say(&mut state, &text, &mut out)?;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                        }
+                                        state.last_press =
+                                            Some((terminal, tile_row, tile_col, now));
                                         state.selection =
                                             Some(crate::selection::Selection::start(
                                                 tile_row, tile_col,
@@ -6524,41 +6668,14 @@ where
                                     // Copied when the button comes up, with no key to
                                     // press: a selection that has to be confirmed is a
                                     // selection a person makes twice.
-                                    // Read from the window as it is drawn, not from the
-                                    // live screen: scrolled back, the rows under the
-                                    // pointer are rows that went past, and copying the
-                                    // live screen instead would hand the person text they
-                                    // never saw. Sized to the focused tile, like the
-                                    // selection itself.
                                     let tile = focused_rect(&state);
-                                    let window: Vec<String> = (0..tile.rows)
-                                        .map(|row| {
-                                            screen::window_row(
-                                                state.snapshot.as_ref(),
-                                                &state.behind,
-                                                state.scrolled_rows(),
-                                                state.anchor.unwrap_or_default(),
-                                                row,
-                                            )
-                                            .0
-                                            .to_string()
-                                        })
-                                        .collect();
+                                    let window = window_rows(&state);
                                     let text = selection.text(&window, tile.cols);
                                     if !text.is_empty() {
                                         let mut out = std::io::stdout();
-                                        match crate::selection::copy(&text, &mut out)? {
-                                            Some(via) => {
-                                                state.message = Some(copied(&text, via));
-                                            }
-                                            // Empty text never reaches here (guarded
-                                            // above); a `None` without text is a click
-                                            // that released outside any cell.
-                                            None => {
-                                                state.selection = None;
-                                            }
+                                        if copy_and_say(&mut state, &text, &mut out)? {
+                                            dirty = true;
                                         }
-                                        dirty = true;
                                     } else {
                                         // A click, not a drag. Nothing was selected, so
                                         // nothing stays highlighted.
@@ -7494,6 +7611,18 @@ where
                     state.tick = state.tick.wrapping_add(1).max(1);
                     state.step_drawer();
                     motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
+                    dirty = true;
+                }
+                // A standing toast's clock: repaint once to come down. Expired toasts
+                // are taken down here rather than in the paint, so the state never
+                // holds one past its time.
+                _ = async {
+                    match toast_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    state.toast = None;
                     dirty = true;
                 }
                 // The next cost sample, armed only while `QORO_USAGE=1`.
@@ -10272,7 +10401,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
 /// the pointer has left it. Only for a gesture whose press already went to the program:
 /// a release with no press, or a drag begun on the sidebar, is never sent.
 fn clamped_to_focused(state: &State, row: u16, col: u16) -> (usize, usize) {
-    let tile = focused_rect(state);
+    let tile = focused_rect(&state);
     let first_col = screen::left_for(state.cols, state.collapsed, state.sidebar_width) + 1;
     let x = (col as usize)
         .saturating_sub(first_col)
@@ -10638,6 +10767,24 @@ mod tests {
         assert_eq!(drag.rule, Some((foot2, 1)));
     }
 
+    /// Saying something shows it on the notice row and as the small box, until the
+    /// box's clock runs out.
+    #[test]
+    fn a_copy_is_said_twice_until_its_clock_runs_out() {
+        let mut s = bare_state();
+        say(&mut s, "copied hello".to_string());
+        assert_eq!(s.message.as_deref(), Some("copied hello"));
+        assert_eq!(toast_text(&s), Some("copied hello"));
+        s.toast.as_mut().expect("a toast").until =
+            std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert_eq!(toast_text(&s), None, "an expired toast still drew");
+        assert_eq!(
+            s.message.as_deref(),
+            Some("copied hello"),
+            "the notice row is the toast's doing too, and stays"
+        );
+    }
+
     /// A space carries across machines: a remote's space lands above a local one, and a
     /// local one below the remote's, wherever the list has them.
     #[test]
@@ -10685,6 +10832,31 @@ mod tests {
             None,
             "another machine"
         );
+    }
+
+    /// A new tab starts where its own space is, never where another space was left.
+    #[test]
+    fn a_new_tab_starts_in_its_own_space() {
+        let mut s = drag_state();
+        let tmp = std::env::temp_dir().display().to_string();
+        // Focused tab lives in space 1; space 2 has its own tab with its own directory.
+        s.focused = 1;
+        s.space = Some(2);
+        let other = std::env::temp_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| tmp.clone());
+        s.rows[0].cwd = Some(tmp.clone());
+        s.rows[3].cwd = Some(other.clone());
+        // Same space: the focused directory counts.
+        assert_eq!(space_cwd(&s, 1), Some(tmp.clone()));
+        // Another space on screen while focus still rests in space 1: space 2's own
+        // tab wins over the focused one.
+        assert_eq!(space_cwd(&s, 2), Some(other.clone()));
+        // Focused in space 1 must never leak into space 2 when space 2 has no
+        // usable directory of its own.
+        s.rows[3].cwd = None;
+        assert_eq!(space_cwd(&s, 2), None);
     }
 
     /// A pane of a split, let go in its own space, leaves the split for a tab of its own
@@ -11975,6 +12147,8 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            last_press: None,
+            toast: None,
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,
@@ -13204,6 +13378,8 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            last_press: None,
+            toast: None,
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,
@@ -13334,6 +13510,8 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            last_press: None,
+            toast: None,
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,

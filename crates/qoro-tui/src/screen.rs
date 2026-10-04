@@ -101,6 +101,10 @@ pub struct Frame<'a> {
     /// as itself. Painted as an overlay, never as grid, so the snapshot contract
     /// (plain rows) holds for every gate and the whole corpus.
     pub image_notice: Option<&'a str>,
+    /// A small confirmation box over the pane ("copied ..."), kept on a clock so a
+    /// render arriving mid-stream cannot wipe it before anybody reads it. `None`
+    /// while nothing was copied lately. Painted as an overlay, never as grid.
+    pub toast: Option<&'a str>,
     /// The visible terminals and their rectangles, in pane-local cells. Empty
     /// means one terminal filling the pane, drawn from `snapshot` exactly as
     /// before, so a single pane paints pixel for pixel what it always has.
@@ -1135,6 +1139,9 @@ pub fn paint(frame: &Frame) -> String {
 
     // The palette floats over the terminal, so it is painted last: every row it takes
     // overwrites what the pane and the column drew under it.
+    if let Some(toast) = frame.toast.filter(|_| !spotlight) {
+        paint_toast(frame, toast, &mut out);
+    }
     if let Some(palette) = frame.palette {
         paint_palette(frame, palette, &mut out);
     }
@@ -2523,6 +2530,34 @@ fn paint_drag(frame: &Frame, drag: &DragPaint, out: &mut String) {
     out.push_str(theme::RESET);
 }
 
+/// A small confirmation over the pane ("copied ..."), the same box every overlay
+/// goes through, drawn just above the status rows and centred. One row, no title:
+/// it confirms and goes, and a bigger box would be in the way of the text it
+/// just took.
+fn paint_toast(frame: &Frame, toast: &str, out: &mut String) {
+    let cols = frame.cols as usize;
+    let lines = frame.lines as usize;
+    // Cut to the window rather than skipped: a toast that never draws still owns
+    // its clock, and the next copy would reuse a standing one.
+    let clean = width::text(toast, width::width(toast));
+    let inner = width::width(&clean).min(cols.saturating_sub(6)).max(1);
+    let shown = width::fit(&clean, inner);
+    let styled = format!(
+        "{}{}",
+        theme::fg(theme::Role::Focused),
+        width::fit(&shown, inner)
+    );
+    let rows = vec![styled];
+    let w = inner + 2;
+    if lines <= STATUS + 3 || w >= cols {
+        return;
+    }
+    let left = cols.saturating_sub(w) / 2;
+    let top = lines.saturating_sub(STATUS + 3);
+    let (rule, ink) = spot_inks();
+    paint_boxed(out, lines, (left, top, w), "", (&rule, &ink), &rows);
+}
+
 /// Asking before a busy agent is closed: the only box in the colour that says work can be
 /// lost, what it is and what it is doing, and the one key that closes it.
 fn paint_confirm(frame: &Frame, terminal: u32, out: &mut String) {
@@ -3593,6 +3628,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         })
     }
@@ -3609,6 +3645,86 @@ mod tests {
         let b = PromptBox::at(cols, lines, &prompt(crate::run::Naming::Space, "", ""))
             .expect("the box fits");
         at(b.text_row() + 1, b.field_col() + shown + 1)
+    }
+
+    /// A copy toast draws the confirmation as a small box over the pane, and with no
+    /// toast nothing of it is drawn.
+    #[test]
+    fn a_copy_toast_draws_a_small_box_over_the_pane() {
+        let rows = [row(1, "zsh", "idle")];
+        let spaces = spaces();
+        let seen = sidebar::Seen::new();
+        let unseen = sidebar::Unseen::new();
+        let behind = crate::run::Behind {
+            terminal: 0,
+            from: 0,
+            lines: Vec::new(),
+            total: 0,
+        };
+        fn frame_of<'a>(
+            rows: &'a [AgentRow],
+            spaces: &'a [WorkspaceRow],
+            seen: &'a sidebar::Seen,
+            unseen: &'a sidebar::Unseen,
+            behind: &'a crate::run::Behind,
+            toast: Option<&'a str>,
+        ) -> Frame<'a> {
+            Frame {
+                armed: None,
+                drawer: None,
+                rows,
+                spaces,
+                panes: std::collections::BTreeMap::new(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols: 80,
+                lines: 24,
+                message: None,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Tree,
+                seen,
+                unseen,
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind,
+                image_notice: None,
+                toast,
+                chrome: Default::default(),
+            }
+        }
+        let painted = paint(&frame_of(
+            &rows,
+            &spaces,
+            &seen,
+            &unseen,
+            &behind,
+            Some("copied hello"),
+        ));
+        assert!(
+            painted.contains("copied hello"),
+            "no toast text: {painted:?}"
+        );
+        assert!(
+            painted.contains("\u{256d}") && painted.contains("\u{2570}"),
+            "no box around the toast: {painted:?}"
+        );
+        let plain = paint(&frame_of(&rows, &spaces, &seen, &unseen, &behind, None));
+        assert!(
+            !plain.contains("copied hello"),
+            "a toast with nothing to say still drew: {plain:?}"
+        );
     }
 
     /// The caret sits right after what has been typed.
@@ -3838,6 +3954,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("keys, after"), "no keys box on 80x24");
@@ -3887,6 +4004,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("hello from the shell"));
@@ -3942,6 +4060,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // The tab bar is the first row: between the cursor address and the reset.
@@ -4001,6 +4120,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
@@ -4059,6 +4179,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let bar_start = painted.find("\x1b[1;").expect("no tab bar row");
@@ -4115,6 +4236,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("new tab"), "menu missing row: {painted:?}");
@@ -4225,6 +4347,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let (pane_cols, _) = pane_size(40, 5);
@@ -4272,6 +4395,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("starting a terminal"));
@@ -4328,6 +4452,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // Bold and red on, the text, and then off again: a run that is not closed leaks its
@@ -4380,6 +4505,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // The row the shell printed, found by what it printed and then read as bytes. The
@@ -4447,6 +4573,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // `X` is at cell 2, so it is the green one, and the character before it is not.
@@ -4513,6 +4640,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // One row down for the tab bar, and the pane starts after the column and its rule.
@@ -4567,6 +4695,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let placed = format!("\x1b[{};{}H", 1 + TABS, 2 + sidebar::WIDTH + 2);
@@ -4614,6 +4743,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             });
             // Every positioned run, measured as a terminal measures it.
@@ -4672,6 +4802,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("\x1b[?25l"));
@@ -4730,6 +4861,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Chrome {
                 drag: Some(&drag),
                 ..Default::default()
@@ -4814,6 +4946,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Chrome {
                 answer: true,
                 ..Default::default()
@@ -4934,6 +5067,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             });
             let keys = strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default());
@@ -5127,6 +5261,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             });
             let shown = strip(&painted);
@@ -5183,6 +5318,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             });
             // The two status rows own the bottom of the screen, so nothing else may
@@ -5256,6 +5392,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let ink = theme::fg(theme::space_of(1));
@@ -5316,6 +5453,7 @@ mod tests {
                     total: 0,
                 },
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             })
         };
@@ -5399,6 +5537,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(!painted.contains('\u{fffd}'), "a name was cut in half");
@@ -5515,6 +5654,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(!painted.contains('\u{fffd}'));
@@ -5607,6 +5747,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(
@@ -5656,6 +5797,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(strip(&painted).contains("[d\u{2192}detach]"), "{painted:?}");
@@ -5702,6 +5844,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("starting a terminal"), "{painted:?}");
@@ -5760,6 +5903,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let shown = strip(&painted);
@@ -5808,6 +5952,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // Read as a terminal shows it: the row is painted in pieces now, since the space
@@ -5893,6 +6038,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let w = palette_width(80);
@@ -5969,6 +6115,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &behind,
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             });
             let w = palette_width(cols);
@@ -6047,6 +6194,7 @@ mod tests {
             unseen: &unseen,
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         };
         let left = left_for(80, false, sidebar::WIDTH);
@@ -6118,6 +6266,7 @@ mod tests {
                 total: 0,
             },
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let shown = strip(&painted);
@@ -6272,6 +6421,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &crate::run::Behind::default(),
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         // The five columns under the drag are reversed, and the escape is written once at
@@ -6337,6 +6487,7 @@ mod tests {
                 tiles: Vec::new(),
                 behind: &crate::run::Behind::default(),
                 image_notice: None,
+                toast: None,
                 chrome: Default::default(),
             })
         };
@@ -6393,6 +6544,7 @@ mod tests {
             rows_back: 2,
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
             tiles: Vec::new(),
         });
@@ -6455,6 +6607,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert!(painted.contains("live 0") && painted.contains("live 1"));
@@ -6608,6 +6761,7 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         })
     }
@@ -6650,6 +6804,7 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         let tiled = paint(&Frame {
@@ -6693,6 +6848,7 @@ mod tests {
             unseen: &sidebar::Unseen::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         });
         assert_eq!(tiled, legacy);
@@ -6741,6 +6897,7 @@ mod tests {
             unseen: &unseen,
             behind: &behind,
             image_notice: notice,
+            toast: None,
             chrome: Default::default(),
         };
         let plain = paint(&frame_of(None));
@@ -7002,6 +7159,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Chrome {
                 closing,
                 ..Default::default()
@@ -7066,6 +7224,7 @@ mod tests {
             tiles: Vec::new(),
             behind: &behind,
             image_notice: None,
+            toast: None,
             chrome: Default::default(),
         };
         let slept = here(&frame(2));

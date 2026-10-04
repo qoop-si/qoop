@@ -99,6 +99,7 @@ fn main() {
         tiles: Vec::new(),
         behind: &behind,
         image_notice: None,
+        toast: None,
         chrome: Default::default(),
     });
     print!("{painted}");
