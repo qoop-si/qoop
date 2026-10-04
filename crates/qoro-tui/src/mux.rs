@@ -473,6 +473,30 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         Some(link)
     }
 
+    /// Start a link for every saved remote that has none: a machine added from a shell
+    /// (`qoro remote add`) after this interface started. A list that does not read is left
+    /// for the next look; the start already said so.
+    async fn adopt_saved(&mut self) -> io::Result<()> {
+        let Ok(saved) = qoro_remote::saved::load() else {
+            return Ok(());
+        };
+        let mut added = false;
+        for remote in saved {
+            let linked = self
+                .links
+                .iter()
+                .flatten()
+                .any(|l| l.remote.as_ref().is_some_and(|r| r.target == remote.target));
+            if !linked {
+                added |= self.add_remote(remote).is_some();
+            }
+        }
+        if added {
+            self.push_lists("mux").await?;
+        }
+        Ok(())
+    }
+
     /// Something was asked of a link that is down: try it now rather than after the wait.
     fn wake(&mut self, link: usize) {
         if let Some(l) = self.link(link)
@@ -1896,8 +1920,14 @@ async fn route<W: AsyncWrite + Unpin>(
             return;
         }
     }
+    // The full interface only: `--space` shows one space and `--remote` one machine, and
+    // neither takes in the rest of the saved list.
+    let follows_saved = has_local && mux.only.is_none();
+    let mut saved_tick = tokio::time::interval(client::ACK_INTERVAL);
+    saved_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let step = tokio::select! {
+            _ = saved_tick.tick(), if follows_saved => mux.adopt_saved().await,
             message = tui_rx.recv() => match message {
                 Some(message) => mux.on_tui(message).await,
                 // The interface is gone, and so is the reason for everything else here.

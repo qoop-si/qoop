@@ -550,6 +550,21 @@ fn scenario() {
             let kept = qoro_remote::saved::load_from(&home.path().join("remotes.json"))
                 .expect("remotes saved");
             assert_eq!(kept.len(), 1, "added twice: {kept:?}");
+
+            // Added from a shell (`qoro remote add`) while this interface runs: written to
+            // the list by someone else, and its spaces arrive without a restart or a `+`.
+            let file = home.path().join("remotes.json");
+            let mut list = qoro_remote::saved::load_from(&file).expect("remotes saved");
+            list.push(Remote {
+                name: "shelled".into(),
+                target: "shelled.example".into(),
+            });
+            qoro_remote::saved::save_to(&file, &list).expect("add from a shell");
+            tui.spaces_where("a remote added from a shell", |s| {
+                s.iter()
+                    .any(|w| is_remote_workspace(w.id) && w.name.starts_with("shelled:"))
+            })
+            .await;
             stop_session(remote.path(), "work");
 
             Box::pin(install_onto_a_bare_machine(&mut tui, bare.path())).await;
