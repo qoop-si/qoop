@@ -251,7 +251,7 @@ fn run() -> std::io::Result<()> {
             // SIGKILL cannot be caught, so a killed client can leave the outer terminal in
             // raw mode. This is the escape hatch the honest version of that guarantee needs.
             print!(
-                "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[?1049l"
+                "\x1b]72;t=A\x1b\\\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[?1049l"
             );
             std::io::stdout().flush()?;
             Command::new("stty").arg("sane").status().ok();

@@ -2514,6 +2514,10 @@ fn paint_drag(frame: &Frame, drag: &DragPaint, out: &mut String) {
         out.push_str(theme::RESET);
     }
     let (mark, role, name) = &drag.chip;
+    // A file dragged in from outside has an outline and nothing riding beside the pointer.
+    if name.is_empty() {
+        return;
+    }
     let text_cols = 1 + width::width(mark) + width::width(name) + 1;
     if text_cols > cols || lines <= STATUS {
         return;

@@ -31,6 +31,13 @@ const ATTACH_PREAMBLE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h";
 const RESTORE_SEQUENCE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[?1049l";
 
+/// Set by the interface when it told the terminal it takes drops (`OSC 72 ; t=a`), so that
+/// leaving, by any road, tells it to stop: a terminal left taking drops for a program that
+/// is gone keeps a file dragged in from pasting its path.
+pub static DROPS_ASKED: AtomicBool = AtomicBool::new(false);
+/// `OSC 72 ; t=A`: no longer taking drops.
+pub const STOP_DROPS: &[u8] = b"\x1b]72;t=A\x1b\\";
+
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
@@ -75,6 +82,9 @@ impl TerminalGuard {
             unsafe { libc::tcsetattr(io::stdin().as_raw_fd(), libc::TCSANOW, &original) };
         }
         let mut out = io::stdout();
+        if DROPS_ASKED.swap(false, Ordering::SeqCst) {
+            let _ = out.write_all(STOP_DROPS);
+        }
         let _ = out.write_all(RESTORE_SEQUENCE);
         let _ = out.flush();
     }

@@ -28,16 +28,25 @@ use std::time::{Duration, Instant};
 /// that an Alt key is not felt to lag.
 pub const HOLD: Duration = Duration::from_millis(10);
 
+/// How long half a drag report waits for the rest. A chunk of dropped data is up to 4 KB
+/// and a read is no bigger, so a long one always arrives in two, and the second is not
+/// owed to the Alt key the way the start of `ESC ]` is: once `ESC ] 72 ;` has been read it
+/// is a report, and typing it into the pane would be the one wrong answer.
+const DRAG_HOLD: Duration = Duration::from_secs(1);
+
 /// The longest report this reads. A colour answer is about thirty bytes; anything much
 /// longer that has not ended is not one of these and is handed on as typed.
 const MAX_REPORT: usize = 96;
+
+/// The longest drag report: a chunk of base64 is at most 4096 bytes, and its metadata is short.
+const MAX_DRAG: usize = 4096 + 128;
 
 /// The most of a terminal's name that is read: `WezTerm 20240203-110809-5046fc22` is the
 /// longest seen. The answer is still read to its end, up to [`MAX_REPORT`].
 const MAX_NAME: usize = 64;
 
 /// Something the terminal said about itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Report {
     /// The window the interface runs in gained (`true`) or lost the focus (`CSI I`, `CSI O`).
     Focus(bool),
@@ -50,6 +59,33 @@ pub enum Report {
     /// Its primary device attributes (`CSI ? ... c`), the answer to `CSI c`. Every terminal
     /// gives one, so one arriving before a name means the terminal has no name to give.
     Attributes,
+    /// Something dragged over the window, from the terminal's drag and drop protocol
+    /// (`OSC 72`), which a program asks for with `t=a` and which gives a cell to a drag.
+    Drag(Drag),
+}
+
+/// One thing the terminal said about a drag, as far as this interface asks.
+///
+/// Cells are zero based, from the top left of the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Drag {
+    /// The pointer moved over the window with something held; `-1, -1` is the drag
+    /// leaving it.
+    Over {
+        col: i32,
+        row: i32,
+        mimes: Vec<String>,
+    },
+    /// Released over a cell, with the MIME types on offer in the order they are asked for.
+    Dropped {
+        col: i32,
+        row: i32,
+        mimes: Vec<String>,
+    },
+    /// A chunk of the data asked for, decoded; `end` on the last one.
+    Data { bytes: Vec<u8>, end: bool },
+    /// The terminal could not give what was asked for.
+    Failed,
 }
 
 /// The filter. One per client, like the key decoder.
@@ -114,7 +150,12 @@ impl Reports {
     ///
     /// `None` while nothing is held, so the loop arms no timer at all on a quiet screen.
     pub fn deadline(&self) -> Option<Instant> {
-        self.since.map(|since| since + HOLD)
+        let wait = if self.held.starts_with(b"\x1b]72;") {
+            DRAG_HOLD
+        } else {
+            HOLD
+        };
+        self.since.map(|since| since + wait)
     }
 
     /// The wait ran out: the held bytes were a key after all, and the next [`strip`]
@@ -198,29 +239,23 @@ fn dcs(bytes: &[u8]) -> Found {
     )
 }
 
-/// `OSC 10 ; rgb:... ST` and `OSC 11 ; rgb:... ST`, ended by `BEL` or `ESC \`.
+/// `OSC 10 ; rgb:... ST` and `OSC 11 ; rgb:... ST`, ended by `BEL` or `ESC \`, and the
+/// drag reports `OSC 72 ; metadata ; payload ST`.
 fn osc(bytes: &[u8]) -> Found {
     let body = &bytes[2..];
-    let background = if body.starts_with(b"11;") {
+    let background = if body.starts_with(b"72;") {
+        return drag(bytes);
+    } else if body.starts_with(b"11;") {
         true
     } else if body.starts_with(b"10;") {
         false
-    } else if b"10;".starts_with(body) || b"11;".starts_with(body) {
+    } else if b"10;".starts_with(body) || b"11;".starts_with(body) || b"72;".starts_with(body) {
         return Found::Partial;
     } else {
         return Found::No;
     };
     let payload = &body[3..];
-    // Whichever terminator comes first ends it.
-    let end = payload
-        .iter()
-        .enumerate()
-        .find_map(|(at, byte)| match byte {
-            0x07 => Some((at, 1)),
-            0x1b if payload.get(at + 1) == Some(&b'\\') => Some((at, 2)),
-            _ => None,
-        });
-    let Some((at, terminator)) = end else {
+    let Some((at, terminator)) = terminator(payload) else {
         return if bytes.len() < MAX_REPORT {
             Found::Partial
         } else {
@@ -232,6 +267,94 @@ fn osc(bytes: &[u8]) -> Found {
     // and dropped rather than typed into the pane.
     let report = parse_rgb(&payload[..at]).map(|rgb| Report::Color { background, rgb });
     Found::Report(used, report)
+}
+
+/// Where an OSC ends, and how many bytes its terminator takes: whichever of `BEL` and
+/// `ESC \` comes first.
+fn terminator(payload: &[u8]) -> Option<(usize, usize)> {
+    payload
+        .iter()
+        .enumerate()
+        .find_map(|(at, byte)| match byte {
+            0x07 => Some((at, 1)),
+            0x1b if payload.get(at + 1) == Some(&b'\\') => Some((at, 2)),
+            _ => None,
+        })
+}
+
+/// `OSC 72 ; t=m:x=3:y=4 ; mimes ST` and the rest of the drag and drop protocol that this
+/// interface speaks as the receiving end. Every one is taken out, read or not.
+fn drag(bytes: &[u8]) -> Found {
+    let payload = &bytes[5..];
+    let Some((at, terminator)) = terminator(payload) else {
+        return if bytes.len() < MAX_DRAG {
+            Found::Partial
+        } else {
+            Found::No
+        };
+    };
+    let used = 5 + at + terminator;
+    let text = String::from_utf8_lossy(&payload[..at]);
+    let (meta, data) = text.split_once(';').unwrap_or((&text, ""));
+    Found::Report(used, read_drag(meta, data).map(Report::Drag))
+}
+
+/// What one `OSC 72` says, from its `key=value:` metadata and its payload.
+fn read_drag(meta: &str, data: &str) -> Option<Drag> {
+    let mut kind = None;
+    let (mut col, mut row, mut more) = (0, 0, None);
+    for pair in meta.split(':') {
+        match pair.split_once('=')? {
+            ("t", value) => kind = value.chars().next(),
+            ("x", value) => col = value.parse().ok()?,
+            ("y", value) => row = value.parse().ok()?,
+            ("m", value) => more = Some(value == "1"),
+            _ => {}
+        }
+    }
+    // The chunks after the first may carry nothing but `m`, and are still data.
+    match kind.or(more.map(|_| 'r'))? {
+        'm' => Some(Drag::Over {
+            col,
+            row,
+            mimes: data.split_whitespace().map(str::to_string).collect(),
+        }),
+        'M' => Some(Drag::Dropped {
+            col,
+            row,
+            mimes: data.split_whitespace().map(str::to_string).collect(),
+        }),
+        'r' => Some(Drag::Data {
+            bytes: base64(data)?,
+            end: more != Some(true),
+        }),
+        'R' | 'E' => Some(Drag::Failed),
+        _ => None,
+    }
+}
+
+/// Standard base64, padded or not. `None` on anything else.
+fn base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut bits, mut have) = (0u32, 0);
+    for byte in text.trim_end_matches('=').bytes() {
+        let six = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        bits = bits << 6 | u32::from(six);
+        have += 6;
+        if have >= 8 {
+            have -= 8;
+            out.push((bits >> have) as u8);
+            bits &= (1 << have) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// `rgb:R/G/B` with one to four hex digits a channel, scaled to eight bits.
@@ -376,7 +499,7 @@ mod tests {
                 assert!(filter.deadline().is_some(), "cut {cut} held nothing");
                 let (second, reports) = filter.strip(&whole[cut..]);
                 assert!(second.is_empty(), "cut {cut} of {whole:?} typed {second:?}");
-                assert_eq!(reports, vec![expected], "cut {cut} of {whole:?}");
+                assert_eq!(reports, vec![expected.clone()], "cut {cut} of {whole:?}");
                 assert_eq!(filter.deadline(), None);
             }
         }
@@ -470,5 +593,117 @@ mod tests {
         let (out, reports) = strip(&long);
         assert_eq!(out, long, "a runaway sequence is typed, not swallowed");
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_drag_over_a_cell_and_leaving_are_read() {
+        let (out, reports) = strip(b"a\x1b]72;t=m:x=12:y=5:X=99:Y=80:o=3;text/uri-list\x1b\\b");
+        assert_eq!(out, b"ab");
+        assert_eq!(
+            reports,
+            vec![Report::Drag(Drag::Over {
+                col: 12,
+                row: 5,
+                mimes: vec!["text/uri-list".into()]
+            })]
+        );
+        let (_, reports) = strip(b"\x1b]72;t=m:x=-1:y=-1\x07");
+        assert_eq!(
+            reports,
+            vec![Report::Drag(Drag::Over {
+                col: -1,
+                row: -1,
+                mimes: vec![]
+            })]
+        );
+    }
+
+    #[test]
+    fn a_drop_carries_the_cell_and_the_offered_types_in_order() {
+        let (_, reports) = strip(b"\x1b]72;t=M:x=70:y=9:o=1;text/plain text/uri-list\x1b\\");
+        assert_eq!(
+            reports,
+            vec![Report::Drag(Drag::Dropped {
+                col: 70,
+                row: 9,
+                mimes: vec!["text/plain".into(), "text/uri-list".into()]
+            })]
+        );
+    }
+
+    #[test]
+    fn dropped_data_is_decoded_chunk_by_chunk() {
+        let (_, reports) = strip(b"\x1b]72;t=r:x=1:m=1;ZmlsZTov\x1b\\\x1b]72;t=r:x=1:m=0;L2EgYg==\x1b\\\x1b]72;t=r:x=1:m=0\x1b\\");
+        assert_eq!(
+            reports,
+            vec![
+                Report::Drag(Drag::Data {
+                    bytes: b"file:/".to_vec(),
+                    end: false
+                }),
+                Report::Drag(Drag::Data {
+                    bytes: b"/a b".to_vec(),
+                    end: true
+                }),
+                Report::Drag(Drag::Data {
+                    bytes: vec![],
+                    end: true
+                }),
+            ]
+        );
+        // A later chunk with nothing but its `m` is data too.
+        let (_, reports) = strip(b"\x1b]72;m=0\x1b\\");
+        assert_eq!(
+            reports,
+            vec![Report::Drag(Drag::Data {
+                bytes: vec![],
+                end: true
+            })]
+        );
+        let (_, reports) = strip(b"\x1b]72;t=R:x=1;EPERM\x1b\\");
+        assert_eq!(reports, vec![Report::Drag(Drag::Failed)]);
+    }
+
+    #[test]
+    fn a_drag_report_split_between_reads_is_held_and_never_typed() {
+        let mut filter = Reports::default();
+        let (out, reports) = filter.strip(b"\x1b]72;t=m:x=3");
+        assert!(out.is_empty() && reports.is_empty());
+        let (out, reports) = filter.strip(b":y=4\x1b\\");
+        assert!(out.is_empty());
+        assert_eq!(
+            reports,
+            vec![Report::Drag(Drag::Over {
+                col: 3,
+                row: 4,
+                mimes: vec![]
+            })]
+        );
+    }
+
+    #[test]
+    fn half_a_drag_report_waits_long_and_half_an_escape_waits_a_moment() {
+        let mut filter = Reports::default();
+        filter.strip(b"\x1b]72;t=r:x=1;QUJD");
+        let wait = filter
+            .deadline()
+            .unwrap()
+            .duration_since(filter.since.unwrap());
+        assert_eq!(wait, DRAG_HOLD);
+        let mut filter = Reports::default();
+        filter.strip(b"\x1b]");
+        let wait = filter
+            .deadline()
+            .unwrap()
+            .duration_since(filter.since.unwrap());
+        assert_eq!(wait, HOLD);
+    }
+
+    #[test]
+    fn base64_reads_padded_and_unpadded_text_and_refuses_the_rest() {
+        assert_eq!(base64("aGk="), Some(b"hi".to_vec()));
+        assert_eq!(base64("aGk"), Some(b"hi".to_vec()));
+        assert_eq!(base64(""), Some(vec![]));
+        assert_eq!(base64("a*k="), None);
     }
 }

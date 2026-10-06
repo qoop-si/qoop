@@ -745,6 +745,17 @@ struct State {
     behind: Behind,
     /// The outer window's focus as the terminal last reported it; `None` until it says.
     outer_focus: Option<bool>,
+    /// What is being dragged over the window from outside, as the terminal's drag and drop
+    /// protocol reports it: the terminal under the pointer, if it is over one.
+    drop_hover: Option<u32>,
+    /// What the terminal was last told about a drop here (`t=m:o=1` or `o=0`), so a
+    /// reply is sent when it changes and not for every cell the pointer crosses.
+    drop_told: Option<bool>,
+    /// Whether what is dragged over the window offers anything this takes, once it has said.
+    drop_offer: Option<bool>,
+    /// A drop being read: the terminal it goes to, whether the data is a `text/uri-list`,
+    /// and the bytes that have come.
+    drop_read: Option<(u32, bool, Vec<u8>)>,
     /// The outer terminal's own foreground and background, as it last answered `OSC 10/11`.
     host_colors: [Option<[u8; 3]>; 2],
     /// Whether the outer terminal last said its scheme is light (`CSI ? 997 ; 2 n`).
@@ -1842,7 +1853,9 @@ impl State {
     /// `None` when no row is carried, the drag was called off, or the carried tab is asleep
     /// (it cannot move until it wakes).
     fn drag_paint(&self, now: i64) -> Option<screen::DragPaint> {
-        let press = self.row_press.filter(|p| p.moved && !p.dead)?;
+        let Some(press) = self.row_press.filter(|p| p.moved && !p.dead) else {
+            return self.drop_paint();
+        };
         let (terminal, handle) = match press.source {
             Source::Agent(terminal) => (terminal, false),
             Source::Pane(terminal) => (terminal, true),
@@ -1890,6 +1903,44 @@ impl State {
             rule,
             outline,
         })
+    }
+
+    /// The tile a file is dragged over, outlined: what a drop would go to. `None` while
+    /// nothing is dragged over one.
+    fn drop_paint(&self) -> Option<screen::DragPaint> {
+        let hover = self.drop_hover?;
+        let area = pane_area(self);
+        let rect = match self.space.and_then(|space| self.layouts.get(&space)) {
+            Some(layout) => layout
+                .tile_rects(area)
+                .into_iter()
+                .find(|(t, _)| *t == hover)
+                .map(|(_, r)| r)?,
+            None => area,
+        };
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        Some(screen::DragPaint {
+            carried: Vec::new(),
+            space: None,
+            chip: (String::new(), crate::theme::Role::Text, String::new()),
+            pointer: (0, 0),
+            rule: None,
+            outline: Some((
+                screen::TABS + 1 + rect.y,
+                left + 1 + rect.x,
+                rect.rows,
+                rect.cols,
+            )),
+        })
+    }
+
+    /// The tile under a cell the terminal named (zero based), if there is one.
+    fn tile_under(&self, col: i32, row: i32) -> Option<u32> {
+        let (col, row) = (
+            u16::try_from(col.checked_add(1)?).ok()?,
+            u16::try_from(row.checked_add(1)?).ok()?,
+        );
+        self.tile_at_screen(row, col).map(|hit| hit.0)
     }
 
     /// A carried space as the frame at clock `now` draws it: its rule and every row under it
@@ -5143,6 +5194,10 @@ where
         anchor: None,
         behind: Behind::default(),
         outer_focus: None,
+        drop_hover: None,
+        drop_told: None,
+        drop_offer: None,
+        drop_read: None,
         host_colors: [None, None],
         host_light: None,
         icon_reply: crate::icons::Reply::Silent,
@@ -5258,6 +5313,12 @@ where
     // Everywhere else clicks stay inert and the keyboard runs everything.
     if mouse_on() {
         out.write_all(b"\x1b[?1002h\x1b[?1006h")?;
+        // A file dragged in lands on the pane under it, which only a terminal that says
+        // where the pointer is can tell; one that does not know this ignores it.
+        if may_ask_terminal() && std::env::var_os("TMUX").is_none() {
+            out.write_all(ACCEPT_DROPS)?;
+            client::DROPS_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     // Focus reports (`CSI ? 1004 h`), so the interface knows when the person looked away,
     // and the questions about the terminal's own colours. See `input`.
@@ -5623,6 +5684,12 @@ where
                     let mut window_focus = None;
                     let mut ask_again = false;
                     for report in said {
+                        if let crate::input::Report::Drag(drag) = report {
+                            note_drag(&mut state, drag, &mut control_seq, &mut seqs, &mut wr, &mut out)
+                                .await?;
+                            dirty = true;
+                            continue;
+                        }
                         if let crate::input::Report::Focus(focused) = report {
                             window_focus = Some(focused);
                         }
@@ -7740,7 +7807,15 @@ where
 /// and reset are the point: a program that hid the cursor must not leave the
 /// host cursor invisible, and no chrome colour may leak into the next prompt.
 fn exit_trailer() -> Vec<u8> {
+    exit_trailer_with(client::DROPS_ASKED.swap(false, std::sync::atomic::Ordering::SeqCst))
+}
+
+/// [`exit_trailer`], told whether drops were asked for.
+fn exit_trailer_with(drops: bool) -> Vec<u8> {
     let mut out = Vec::new();
+    if drops {
+        out.extend_from_slice(client::STOP_DROPS);
+    }
     out.extend_from_slice(b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     out.extend_from_slice(b"\x1b[?25h\x1b[0m\x1b[?1049l");
     out
@@ -7815,12 +7890,221 @@ fn note_report(state: &mut State, report: crate::input::Report) -> bool {
             }
             false
         }
+        // A drag is answered where there is a wire to answer on: `note_drag`.
+        Report::Drag(_) => false,
         Report::Scheme { light } => {
             let switched = state.host_light.is_some_and(|was| was != light);
             state.host_light = Some(light);
             switched
         }
     }
+}
+
+/// Something dragged in from outside, as the terminal reports it: the pane under the
+/// pointer is outlined while it is over, and what is dropped goes to that pane, which takes
+/// the keyboard. The terminal gives the cell; a plain paste gives none, which is why a drop
+/// used to land on whichever pane had the keyboard.
+async fn note_drag(
+    state: &mut State,
+    drag: crate::input::Drag,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+    out: &mut impl Write,
+) -> io::Result<()> {
+    use crate::input::Drag;
+    match drag {
+        Drag::Over { col, row, mimes } => {
+            state.drop_read = None;
+            state.drop_hover = state.tile_under(col, row);
+            if col < 0 {
+                (state.drop_told, state.drop_offer) = (None, None);
+                return Ok(());
+            }
+            if !mimes.is_empty() {
+                state.drop_offer = Some(
+                    mimes
+                        .iter()
+                        .any(|m| m == "text/uri-list" || m == "text/plain"),
+                );
+            }
+            // Over the panes, with no box or mode open that is reading keys, and carrying
+            // something this takes.
+            let accept = state.drop_hover.is_some()
+                && state.drop_offer != Some(false)
+                && !state.overlay_open()
+                && !state.modes.open();
+            if !accept {
+                state.drop_hover = None;
+            }
+            if state.drop_told != Some(accept) {
+                state.drop_told = Some(accept);
+                out.write_all(if accept {
+                    b"\x1b]72;t=m:o=1;text/uri-list text/plain\x1b\\".as_slice()
+                } else {
+                    b"\x1b]72;t=m:o=0\x1b\\".as_slice()
+                })?;
+                out.flush()?;
+            }
+        }
+        Drag::Dropped { col, row, mimes } => {
+            let target = state
+                .tile_under(col, row)
+                .filter(|_| !state.overlay_open() && !state.modes.open());
+            state.drop_hover = None;
+            (state.drop_told, state.drop_offer) = (None, None);
+            let pick = |kind: &str| mimes.iter().position(|m| m == kind);
+            let wanted = pick("text/uri-list")
+                .map(|at| (at, true))
+                .or_else(|| pick("text/plain").map(|at| (at, false)));
+            match (target, wanted) {
+                (Some(terminal), Some((at, uris))) => {
+                    state.drop_read = Some((terminal, uris, Vec::new()));
+                    write!(out, "\x1b]72;t=r:x={}\x1b\\", at + 1)?;
+                }
+                _ => out.write_all(b"\x1b]72;t=r:o=0\x1b\\")?,
+            }
+            out.flush()?;
+        }
+        Drag::Data { bytes, end } => {
+            let Some((_, _, got)) = state.drop_read.as_mut() else {
+                return Ok(());
+            };
+            got.extend_from_slice(&bytes);
+            // A list of paths is a few hundred bytes; this is a file's worth of text.
+            if got.len() > DROP_LIMIT {
+                state.drop_read = None;
+                out.write_all(b"\x1b]72;t=r:o=0\x1b\\")?;
+                out.flush()?;
+            } else if end && let Some((terminal, uris, got)) = state.drop_read.take() {
+                let text = dropped_text(&got, uris);
+                out.write_all(if text.is_empty() {
+                    b"\x1b]72;t=r:o=0\x1b\\".as_slice()
+                } else {
+                    b"\x1b]72;t=r:o=1\x1b\\".as_slice()
+                })?;
+                out.flush()?;
+                if !text.is_empty() {
+                    drop_into(state, terminal, text, control_seq, seqs, wr).await?;
+                }
+            }
+        }
+        Drag::Failed => {
+            state.drop_read = None;
+            state.drop_hover = None;
+            (state.drop_told, state.drop_offer) = (None, None);
+        }
+    }
+    Ok(())
+}
+
+/// The most dropped data read before it is refused: what one paste message carries, so a
+/// drop is one paste with one pair of markers.
+const DROP_LIMIT: usize = client::MAX_INPUT_MESSAGE;
+
+/// Type `text` into `terminal`, which takes the keyboard first so the drop is where the
+/// person is looking.
+async fn drop_into(
+    state: &mut State,
+    terminal: u32,
+    text: String,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    // What typing does to the view: the program is at the bottom, and a selection is spent.
+    state.hint = None;
+    state.in_column = false;
+    state.anchor = None;
+    state.selection = None;
+    if let Some(moved) = focus(state, terminal, control_seq, seqs)? {
+        wr.write_all(&moved).await?;
+    }
+    // The terminal went away between the drop and its data: nowhere to type it.
+    if state.focused != terminal {
+        return Ok(());
+    }
+    let focused = terminal;
+    let bytes = text.into_bytes();
+    for piece in client::split_input(&bytes) {
+        // A paste, so the daemon puts the markers on when the program asked for them: an
+        // agent attaches a picture whose path is pasted and keeps a typed one as text.
+        wr.write_all(&client::encode_command_to(
+            focused,
+            &ClientWire::Paste {
+                bytes: piece.to_vec(),
+            },
+            seqs.entry(focused).or_default(),
+        )?)
+        .await?;
+    }
+    Ok(())
+}
+
+/// What a drop types: paths as a shell reads them, one space after each, or the dropped
+/// text as it is. An escape is never typed, so dropped text cannot end a paste early.
+fn dropped_text(data: &[u8], uris: bool) -> String {
+    let text = String::from_utf8_lossy(data);
+    let text = if uris {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| match line.strip_prefix("file://") {
+                // `file:///a` and `file://localhost/a` are both `/a`; a host and no path
+                // is nothing.
+                Some(rest) => rest
+                    .find('/')
+                    .map(|at| shell_path(&percent_decode(&rest.as_bytes()[at..]))),
+                // A link dragged from a browser stays a link.
+                None => Some(line.to_string()),
+            })
+            .map(|path| format!("{path} "))
+            .collect()
+    } else {
+        text.into_owned()
+    };
+    // Never an escape, so dropped text cannot end a paste early, and no other control
+    // character either, bar the line breaks and tabs that text has.
+    text.chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect()
+}
+
+/// `%20` and its kind back to bytes.
+fn percent_decode(text: &[u8]) -> String {
+    let mut out = Vec::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            text[at],
+            text.get(at + 1).and_then(|b| hex(*b)),
+            text.get(at + 2).and_then(|b| hex(*b)),
+        ) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (byte, ..) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A path with a backslash before every ASCII character a shell would read as more than
+/// a name, the way the terminal escapes a path it pastes.
+fn shell_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars().filter(|ch| !ch.is_control()) {
+        if ch.is_ascii() && !ch.is_ascii_alphanumeric() && !"_./+@%:,=-".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// What the interface asks the terminal about itself: its foreground and background, then
@@ -7832,6 +8116,10 @@ const ASK_SCHEME: &[u8] = b"\x1b[?2031h\x1b[?996n";
 /// Its name (XTVERSION, `CSI > 0 q`) and then its device attributes (`CSI c`), which every
 /// terminal answers: the second answer arriving says the first one is not coming.
 const ASK_VERSION: &[u8] = b"\x1b[>0q\x1b[c";
+
+/// Take drops of files and text (`OSC 72 ; t=a`). Stopping is `client::STOP_DROPS`, written
+/// wherever the terminal is given back. See `note_drag`.
+const ACCEPT_DROPS: &[u8] = b"\x1b]72;t=a;text/uri-list text/plain\x1b\\";
 
 /// Whether the terminal may be asked at all. The Linux console answers none of these and
 /// has been seen to print the question instead; a `dumb` terminal is a pipe, and asking
@@ -10530,11 +10818,18 @@ mod tests {
     #[test]
     fn leaving_shows_the_cursor_resets_and_leaves_last() {
         assert_eq!(
-            exit_trailer(),
+            exit_trailer_with(false),
             b"\x1b[?2031l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l"
                 .to_vec(),
             "the exit sequence changed shape"
         );
+    }
+
+    /// A terminal that was told it takes drops is told it no longer does, first of all.
+    #[test]
+    fn leaving_stops_the_drops_it_asked_for() {
+        assert!(exit_trailer_with(true).starts_with(b"\x1b]72;t=A\x1b\\"));
+        assert!(!exit_trailer_with(false).windows(4).any(|w| w == b"72;t"));
     }
 
     /// The mouse is enabled where it reports usefully and nowhere else:
@@ -12152,6 +12447,10 @@ mod tests {
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,
+            drop_hover: None,
+            drop_told: None,
+            drop_offer: None,
+            drop_read: None,
             host_colors: [None, None],
             host_light: None,
             icon_reply: crate::icons::Reply::Silent,
@@ -13383,6 +13682,10 @@ mod tests {
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,
+            drop_hover: None,
+            drop_told: None,
+            drop_offer: None,
+            drop_read: None,
             host_colors: [None, None],
             host_light: None,
             icon_reply: crate::icons::Reply::Silent,
@@ -13515,6 +13818,10 @@ mod tests {
             anchor: None,
             behind: Behind::default(),
             outer_focus: None,
+            drop_hover: None,
+            drop_told: None,
+            drop_offer: None,
+            drop_read: None,
             host_colors: [None, None],
             host_light: None,
             icon_reply: crate::icons::Reply::Silent,
@@ -14142,6 +14449,199 @@ mod tests {
             state.in_pane((screen::TABS + 1) as u16, (left + 1) as u16),
             None
         );
+    }
+
+    /// The zero based cell the terminal names for the middle of `terminal`'s tile.
+    fn cell_in(state: &State, terminal: u32) -> (i32, i32) {
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let rect = state
+            .layouts
+            .get(&1)
+            .unwrap()
+            .tile_rects(pane_area(state))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .unwrap()
+            .1;
+        (
+            (left + rect.x + rect.cols / 2) as i32,
+            (screen::TABS + rect.y + rect.rows / 2) as i32,
+        )
+    }
+
+    #[test]
+    fn a_drag_names_the_tile_under_it_and_not_the_one_with_the_keyboard() {
+        let mut state = tiled_state();
+        assert_eq!(state.focused, 1);
+        let (col, row) = cell_in(&state, 2);
+        assert_eq!(state.tile_under(col, row), Some(2));
+        let (col, row) = cell_in(&state, 1);
+        assert_eq!(state.tile_under(col, row), Some(1));
+        // The column on the left, and the cell the terminal gives for a drag that left.
+        assert_eq!(state.tile_under(2, 10), None);
+        assert_eq!(state.tile_under(-1, -1), None);
+        // The outline is that tile's rectangle, only while a drag is over it.
+        assert!(state.drop_paint().is_none());
+        state.drop_hover = Some(2);
+        let outline = state.drop_paint().and_then(|d| d.outline).unwrap();
+        let rect = state
+            .layouts
+            .get(&1)
+            .unwrap()
+            .tile_rects(pane_area(&state))
+            .into_iter()
+            .find(|(t, _)| *t == 2)
+            .unwrap()
+            .1;
+        assert_eq!((outline.2, outline.3), (rect.rows, rect.cols));
+        assert_eq!(state.drag_paint(0).and_then(|d| d.outline), Some(outline));
+    }
+
+    #[tokio::test]
+    async fn a_file_dropped_on_the_unfocused_tile_is_typed_there_and_takes_the_keyboard() {
+        use crate::input::Drag;
+        let mut state = tiled_state();
+        let (mut out, mut wire) = (Vec::new(), Vec::new());
+        let (mut control, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (col, row) = cell_in(&state, 2);
+        let mut say = async |state: &mut State, drag, out: &mut Vec<u8>, wire: &mut Vec<u8>| {
+            note_drag(state, drag, &mut control, &mut seqs, wire, out)
+                .await
+                .unwrap();
+        };
+        let mimes = vec!["text/uri-list".to_string()];
+        say(
+            &mut state,
+            Drag::Over { col, row, mimes },
+            &mut out,
+            &mut wire,
+        )
+        .await;
+        assert_eq!(state.drop_hover, Some(2));
+        assert_eq!(out, b"\x1b]72;t=m:o=1;text/uri-list text/plain\x1b\\");
+        out.clear();
+        let mimes = vec!["text/plain".to_string(), "text/uri-list".to_string()];
+        say(
+            &mut state,
+            Drag::Dropped { col, row, mimes },
+            &mut out,
+            &mut wire,
+        )
+        .await;
+        assert_eq!(
+            out, b"\x1b]72;t=r:x=2\x1b\\",
+            "the list of files, not the text"
+        );
+        out.clear();
+        let list = b"file:///tmp/a%20b.png\r\n".to_vec();
+        say(
+            &mut state,
+            Drag::Data {
+                bytes: list,
+                end: true,
+            },
+            &mut out,
+            &mut wire,
+        )
+        .await;
+        assert_eq!(out, b"\x1b]72;t=r:o=1\x1b\\");
+        assert_eq!(state.focused, 2, "the pane it landed on has the keyboard");
+        let typed: Vec<String> = b"/tmp/a\\ b.png ".iter().map(u8::to_string).collect();
+        let sent = String::from_utf8_lossy(&wire);
+        assert!(sent.contains(&format!("[{}]", typed.join(","))), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_drag_with_nothing_to_take_or_a_box_open_is_not_accepted() {
+        use crate::input::Drag;
+        let mut state = tiled_state();
+        let (mut out, mut wire) = (Vec::new(), Vec::new());
+        let (mut control, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (col, row) = cell_in(&state, 2);
+        // Only a picture on offer: no outline, and the terminal is told no.
+        let mimes = vec!["image/png".to_string()];
+        let over = Drag::Over { col, row, mimes };
+        note_drag(
+            &mut state,
+            over,
+            &mut control,
+            &mut seqs,
+            &mut wire,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.drop_hover, out.as_slice()),
+            (None, b"\x1b]72;t=m:o=0\x1b\\".as_slice())
+        );
+        // A naming box open: the keys are its, so is a drop's refusal.
+        state.prompt = Some(Prompt::new(Naming::Terminal, ""));
+        out.clear();
+        let mimes = vec!["text/uri-list".to_string()];
+        let over = Drag::Over {
+            col: col + 1,
+            row,
+            mimes,
+        };
+        note_drag(
+            &mut state,
+            over,
+            &mut control,
+            &mut seqs,
+            &mut wire,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.drop_hover, None);
+    }
+
+    #[tokio::test]
+    async fn a_drop_outside_every_tile_is_refused_and_types_nothing() {
+        use crate::input::Drag;
+        let mut state = tiled_state();
+        let (mut out, mut wire) = (Vec::new(), Vec::new());
+        let (mut control, mut seqs) = (0, std::collections::BTreeMap::new());
+        let mimes = vec!["text/uri-list".to_string()];
+        let drag = Drag::Dropped {
+            col: 2,
+            row: 10,
+            mimes,
+        };
+        note_drag(
+            &mut state,
+            drag,
+            &mut control,
+            &mut seqs,
+            &mut wire,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, b"\x1b]72;t=r:o=0\x1b\\");
+        assert!(wire.is_empty() && state.focused == 1);
+    }
+
+    #[test]
+    fn dropped_paths_are_typed_the_way_a_shell_reads_them() {
+        let list = b"# a comment\r\nfile:///Users/me/My%20Pics/caf%C3%A9 (1).png\r\nfile://localhost/tmp/a.txt\r\n";
+        assert_eq!(
+            dropped_text(list, true),
+            "/Users/me/My\\ Pics/caf\u{e9}\\ \\(1\\).png /tmp/a.txt "
+        );
+        // A link dragged from a browser stays a link; plain text stays text, minus escapes.
+        assert_eq!(
+            dropped_text(b"https://x.dev/a?b=1\r\n", true),
+            "https://x.dev/a?b=1 "
+        );
+        assert_eq!(dropped_text(b"hi\x1b[201~there", false), "hi[201~there");
+        // A newline smuggled into a name is not typed, and a leading tilde stays a name.
+        assert_eq!(
+            dropped_text(b"file:///tmp/a%0Ab%7E\r\n", true),
+            "/tmp/ab\\~ "
+        );
+        assert_eq!(dropped_text(b"file://host\r\n", true), "");
     }
 
     /// A visible terminal with no screen here is subscribed again although it already is,
