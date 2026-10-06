@@ -149,6 +149,11 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     install_to(latest, current, &exe)?;
     // A running notch is the old build's; launchd starts the new one in its place.
     crate::notch::restart_if_installed();
+    // The same for a phone's bridge service, which would otherwise keep the old build or,
+    // once launchd has pinned the replaced file, never start again.
+    if let Err(e) = crate::mobile::reload_service() {
+        eprintln!("qoro: the bridge service was not reloaded ({e}); run `qoro bridge reload`");
+    }
     Ok(())
 }
 

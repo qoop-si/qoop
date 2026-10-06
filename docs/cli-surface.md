@@ -89,7 +89,7 @@ a claim nobody has to keep.
 | `qoro pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |
 | `qoro devices ls` | the phones paired with this machine, with their key fingerprints | no |
 | `qoro devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
-| `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoro while it runs | yes |
+| `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoro while it runs; `qoro bridge reload` puts the installed bridge service back on the binary now on disk (nothing when there is none), after a replaced binary | yes |
 | `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it; refused while a tab is awake (a qoro with nothing awake is stopped first), and `--check` only notes what is newest | yes |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |

@@ -34,15 +34,13 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     }
 }
 
-/// Stop the notch that is running so launchd starts it again from the binary now on disk.
-/// What `qoro update` calls once it has swapped the binary: silent, and nothing when the
-/// notch was never installed.
+/// Put the notch back on the binary now on disk, through a fresh launchd registration (a
+/// kickstart is refused for an agent whose file was replaced). What `qoro update` calls once
+/// it has swapped the binary: silent, and nothing when the notch was never installed.
 pub fn restart_if_installed() {
     #[cfg(target_os = "macos")]
-    if mac::plist_path().is_some_and(|p| p.exists()) {
-        let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &mac::service()])
-            .output();
+    if let Some(plist) = mac::plist_path().filter(|p| p.exists()) {
+        let _ = crate::launchd::reload(mac::LABEL, &plist);
     }
 }
 
@@ -73,7 +71,7 @@ mod mac {
 
     static APP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qoro-notch"));
 
-    const LABEL: &str = "qoro.notch";
+    pub const LABEL: &str = "qoro.notch";
 
     fn home() -> std::io::Result<PathBuf> {
         std::env::var_os("HOME")
@@ -221,34 +219,13 @@ mod mac {
         std::fs::File::create(&staged)?.write_all(plist(&exe.to_string_lossy()).as_bytes())?;
         std::fs::rename(&staged, &plist_path)?;
         // A notch already loaded is taken down first, so a second install picks up a
-        // moved binary rather than failing on a label that is taken. `bootout` can return
-        // before the service is gone, and a bootstrap into that gap fails with an I/O
-        // error, so the label is watched until launchd no longer knows it.
-        let _ = Command::new("launchctl")
-            .args(["bootout", &service()])
-            .output();
-        for _ in 0..20 {
-            let known = Command::new("launchctl")
-                .args(["print", &service()])
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if !known {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let domain = format!("gui/{}", qoro_runtime::paths::current_uid());
-        let out = Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "wrote {} but launchd would not start it: {}",
-                plist_path.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
+        // moved binary rather than failing on a label that is taken.
+        crate::launchd::reload(LABEL, &plist_path).map_err(|e| {
+            std::io::Error::other(format!(
+                "wrote {} but launchd would not start it: {e}",
+                plist_path.display()
+            ))
+        })?;
         println!("the notch is on, and starts at login; qoro notch uninstall takes it out");
         Ok(())
     }

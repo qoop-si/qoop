@@ -54,6 +54,7 @@ sh scripts/install.sh >/dev/null || fail "happy path exited nonzero"
 [ "$("$QORO_DEST" --version)" = "qoro 9.9.9" ] || fail "installed binary reports wrong version"
 grep -q "hooks install" "$T/calls" || fail "hooks install was not delegated"
 grep -q "skills install" "$T/calls" || fail "skills install was not delegated"
+grep -q "bridge reload" "$T/calls" || fail "bridge reload was not delegated"
 # The notch on a Mac and nowhere else.
 if [ "$(uname -s)" = "Darwin" ]; then
     grep -q "notch install" "$T/calls" || fail "notch install was not delegated on macOS"

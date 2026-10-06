@@ -207,6 +207,9 @@ fi
 if [ "$(uname -s)" = "Darwin" ]; then
     "$DEST" notch install || echo "the notch was not turned on; the rest of qoro is installed"
 fi
+# A phone's bridge service, when there is one, back on the file just put in place: launchd
+# will not start an agent whose file was replaced, and a running one is the old build.
+"$DEST" bridge reload || echo "qoro install: the bridge service was not reloaded; run: qoro bridge reload" >&2
 
 # On a first install, and only when there is a person to answer, the onboarding steps:
 # the pet, the sounds, light or dark, the command key, notifications, sleep. Piped runs and

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 mod avatar;
 mod config;
 mod hooks;
+mod launchd;
 mod mirror;
 mod mobile;
 mod notch;
@@ -144,7 +145,7 @@ fn run() -> std::io::Result<()> {
         Some("update") => update::run(&args),
         Some("pair") => mobile::run_pair(&args),
         Some("devices") => mobile::run_devices(&args),
-        Some("bridge") => mobile::run_bridge(),
+        Some("bridge") => mobile::run_bridge(&args),
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
@@ -236,6 +237,7 @@ fn run() -> std::io::Result<()> {
                  \x20 qoro devices rm <name>  unpair one; its open streams close at once\n\
                  \x20 qoro bridge     run the phones' end in the foreground (the service\n\
                  \x20                 that pairing installs runs exactly this)\n\
+                 \x20 qoro bridge reload  put that service back on the installed binary\n\
                  \x20 qoro update [--check]  fetch the newest release, and install it when\n\
                  \x20                 nothing is live\n\
                  \x20 qoro --version\n\
