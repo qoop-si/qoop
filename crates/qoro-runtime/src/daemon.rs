@@ -243,6 +243,8 @@ pub struct Connection {
     welcomed: std::sync::atomic::AtomicBool,
     /// Whether it said it only watches: a daemon with nothing awake leaves with it open.
     observer: std::sync::atomic::AtomicBool,
+    /// The link it said it is, so the next connection of that link can end this one.
+    replaces: std::sync::OnceLock<String>,
 }
 
 impl ConnectionRegistry {
@@ -295,15 +297,41 @@ impl ConnectionRegistry {
         unheld
     }
 
-    /// A welcomed peer, and whether it only watches.
-    fn mark_welcomed(&self, client: &ClientId, observer: bool) {
-        for c in self.inner.lock().unwrap().iter() {
-            if &c.client == client {
-                c.observer.store(observer, Ordering::Relaxed);
-                c.welcomed.store(true, Ordering::Relaxed);
+    /// A welcomed peer, and whether it only watches. A peer that names its link (`replaces`)
+    /// ends the connections that link made before it, and says which.
+    ///
+    /// Over ssh a dropped network leaves the far `qoro relay` holding its socket here: the
+    /// remote sshd has not noticed, so this daemon never sees the close that ADR-007 moves a
+    /// size on, and the reconnected link is refused every size until the no-ack sweep. The
+    /// link reconnecting is the proof that its old connection is dead. Only connections
+    /// admitted earlier: welcomes can land out of order, and a slow attempt the link
+    /// already gave up on must not end the one that replaced it. Asked to end, not removed:
+    /// its own exit removes it, so what it held as news is still announced.
+    fn mark_welcomed(
+        &self,
+        client: &ClientId,
+        observer: bool,
+        replaces: Option<&str>,
+    ) -> Vec<ClientId> {
+        let inner = self.inner.lock().unwrap();
+        let mut ended = Vec::new();
+        if let Some(me) = inner.iter().find(|c| &c.client == client) {
+            me.observer.store(observer, Ordering::Relaxed);
+            me.welcomed.store(true, Ordering::Relaxed);
+            if let Some(key) = replaces {
+                let _ = me.replaces.set(key.to_string());
+                for c in inner.iter() {
+                    if c.admitted < me.admitted && c.replaces.get().map(String::as_str) == Some(key)
+                    {
+                        c.shutdown.notify_one();
+                        ended.push(c.client.clone());
+                    }
+                }
             }
         }
+        drop(inner);
         self.changed.notify_one();
+        ended
     }
 
     /// Connections that keep a daemon with nothing awake from leaving: welcomed, and not
@@ -1472,6 +1500,7 @@ impl Daemon {
                 news: std::sync::Mutex::default(),
                 welcomed: std::sync::atomic::AtomicBool::new(false),
                 observer: std::sync::atomic::AtomicBool::new(false),
+                replaces: std::sync::OnceLock::new(),
             });
             let announce = self.agents.clone();
             if !admitted {
@@ -1980,7 +2009,18 @@ async fn serve_client(
     if matches!(outcome, qoro_proto::HandshakeOutcome::Welcome(_)) {
         let observer =
             hello.extra.get(crate::client::OBSERVER) == Some(&serde_json::Value::Bool(true));
-        connections.mark_welcomed(&client, observer);
+        let replaces = hello
+            .extra
+            .get(crate::client::REPLACES)
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty() && key.len() <= 64);
+        for ended in connections.mark_welcomed(&client, observer, replaces) {
+            eprintln!(
+                "qorod: {} replaces {}, the same link reconnected",
+                client.as_str(),
+                ended.as_str()
+            );
+        }
     }
     // At most this many terminal messages unacknowledged, when the client asks: past it the
     // writer holds renders, latest wins, until an ack. A phone behind a relay needs it, or

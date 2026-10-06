@@ -33,6 +33,7 @@ The full rules:
 |---|---|
 | owner detaches cleanly | ownership passes to the writable client that was refused a size first, and the size it last asked for applies at once; if none asked, the terminal is unowned and the next writable resize claims it |
 | owner connection dies | same as a clean detach, triggered by the connection's close, not by a timeout |
+| the owner's link reconnects | its new connection names the link (hello key `replaces`), and the daemon closes the ones that link made before: over ssh a dropped network leaves the far relay holding the old socket, and the reconnect is the proof it is dead. The close is the row above, not a steal |
 | a writable client attaches to an unowned terminal | it becomes the owner and may resize |
 | a writable client attaches to an owned terminal | it does not become the owner and cannot resize |
 | a client requests ownership | the current owner is asked; it must actively agree. A silent or slow owner **keeps** ownership |

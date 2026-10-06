@@ -120,10 +120,18 @@ pub const OBSERVER: &str = "observer";
 /// relay gets the newest screen instead of a queue of old ones. Absent means unpaced.
 pub const RENDER_WINDOW: &str = "render_window";
 
-fn hello(client_id: &str, observer: bool) -> ClientHello {
+/// The hello key a link sets to a random value it keeps across its reconnects (at most 64
+/// bytes). The daemon ends the connections that link made before, which a dropped ssh can
+/// leave open on the far side, holding the size of every terminal they showed (ADR-007).
+pub const REPLACES: &str = "replaces";
+
+fn hello(client_id: &str, observer: bool, replaces: Option<&str>) -> ClientHello {
     let mut extra = serde_json::Map::new();
     if observer {
         extra.insert(OBSERVER.into(), serde_json::Value::Bool(true));
+    }
+    if let Some(key) = replaces {
+        extra.insert(REPLACES.into(), serde_json::Value::String(key.into()));
     }
     ClientHello {
         codec_generation_min: qoro_proto::CODEC_GENERATION,
@@ -171,7 +179,7 @@ async fn connect_as(
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoro_proto::reassembly::SEQUENCE_DEADLINE, async {
         let stream = UnixStream::connect(socket).await.map_err(not_running)?;
-        let (stream, leftover, _) = handshake_as(stream, client_id, observer).await?;
+        let (stream, leftover, _) = handshake_as(stream, client_id, observer, None).await?;
         Ok((stream, leftover))
     })
     .await
@@ -201,25 +209,28 @@ fn not_running(e: io::Error) -> io::Error {
 ///
 /// The welcome comes back with the stream: it names the version the daemon is running, which
 /// over a relay can be older than the qoro on that machine's disk.
+/// `replaces` is the key of the link this connection belongs to ([`REPLACES`]).
 pub async fn handshake<S>(
     stream: S,
     client_id: &str,
+    replaces: Option<&str>,
 ) -> io::Result<(S, BytesMut, qoro_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, false).await
+    handshake_as(stream, client_id, false, replaces).await
 }
 
 async fn handshake_as<S>(
     mut stream: S,
     client_id: &str,
     observer: bool,
+    replaces: Option<&str>,
 ) -> io::Result<(S, BytesMut, qoro_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let body = serde_json::to_vec(&hello(client_id, observer))
+    let body = serde_json::to_vec(&hello(client_id, observer, replaces))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = BytesMut::new();
     Frame::new(Channel::Handshake, 0, Bytes::from(body))

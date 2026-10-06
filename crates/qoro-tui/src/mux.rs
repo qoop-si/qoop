@@ -2055,6 +2055,7 @@ async fn supervise(
     let mut backoff = Duration::from_secs(1);
     let mut conn = 0u64;
     let mut unparked = parked.subscribe();
+    let key = link_key();
     loop {
         // Parked: nothing is tried until something is asked of this machine.
         if unparked.wait_for(|parked| !*parked).await.is_err() {
@@ -2062,7 +2063,7 @@ async fn supervise(
         }
         conn += 1;
         let attempted = Instant::now();
-        match crate::link::open(&remote, true).await {
+        match crate::link::open(&remote, true, &key).await {
             Ok(opened) => {
                 let crate::link::Link {
                     stream,
@@ -2123,6 +2124,20 @@ async fn supervise(
                 tokio::time::sleep_until((attempted + backoff).into()).await;
             }
         }
+    }
+}
+
+/// One link's key, kept across its reconnects: a far daemon ends the connections it made
+/// before, which a dropped network leaves open there holding terminal sizes. Random, so no
+/// other link, in this interface or another, ever names the same one. Empty when there is no
+/// randomness to read, which a daemon takes as no key: the old connection then waits for
+/// the no-ack sweep, as before keys.
+fn link_key() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => String::new(),
     }
 }
 

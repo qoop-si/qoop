@@ -66,7 +66,9 @@ pub fn control_path() -> Option<String> {
 ///
 /// `batch` is for a connection nobody is watching: it never prompts, and ssh's complaint
 /// is kept for the offline row instead of being written over the interface.
-pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
+/// `key` is the link's own, the same on every reconnect, so the far daemon ends the
+/// connection this one replaces.
+pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
     let mut transport = SshTransport::new(&remote.target);
     if let Some(path) = control_path() {
         transport = transport.with_control_path(path);
@@ -112,7 +114,7 @@ pub async fn open(remote: &Remote, batch: bool) -> io::Result<Link> {
     let connected = tokio::time::timeout(OPEN_DEADLINE, async {
         let mut out = BufReader::new(stdout);
         skip_to_marker(&mut out).await?;
-        client::handshake(tokio::io::join(out, stdin), "qoro-tui").await
+        client::handshake(tokio::io::join(out, stdin), "qoro-tui", Some(key)).await
     })
     .await;
     let failure = |e: io::Error| {
