@@ -6,41 +6,12 @@ wherever the person reading it sits.
 
 ## Shipping a release
 
-From a clean tree on this Mac (Apple silicon):
-
-```
-./scripts/release.sh 0.4.0
-```
-
-One-time setup:
-
-```
-rustup target add x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-cargo install cargo-zigbuild        # and zig itself: brew install zig
-softwareupdate --install-rosetta --agree-to-license
-```
-
-and Docker running. The script checks all of that before it stamps anything.
-
-It stamps the version into every workspace member and builds four binaries:
-`aarch64-apple-darwin` and `x86_64-apple-darwin` with cargo, and
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with cargo-zigbuild against
-glibc 2.17 (debug info dropped on Linux, symbols kept). Each one is started before anything
-is published and must report the stamped version: the Intel Mac build under Rosetta, the
-Linux builds in a CentOS 7 container of their own architecture, which is the oldest glibc
-the build promises. Each is packed as `qoro-<triple>.tar.gz` with its sha256; then the bump
-is committed, `v0.4.0` tagged and pushed, and the GitHub release created with notes from
-the commits since the previous tag. The asset names are the contract: `qoro update` and
-`scripts/install.sh` look for exactly `qoro-<triple>.tar.gz` for the machine they run on
-(an Apple silicon Mac gets the arm64 build even from a Rosetta shell). If a push or the
-release step fails, run it again with the same version: it makes the commit and the tag
-only if they are missing.
-
-There is deliberately no release-please. Its usual home is a GitHub Actions workflow, and
-this private repository's Actions minutes are gone; its CLI could run from this machine,
-but then it and this script would both own the version, the tag and the release, and one
-of them would be wrong. So this script owns them. Commits stay conventional, and the
-release notes are their subjects.
+Releases are built outside this repository: a release is the app build, phone part included.
+Each one carries four binaries, `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (the Linux ones against glibc
+2.17), packed as `qoro-<triple>.tar.gz` with its sha256. The asset names are the contract:
+`qoro update` and `scripts/install.sh` look for exactly `qoro-<triple>.tar.gz` for the
+machine they run on (an Apple silicon Mac gets the arm64 build even from a Rosetta shell).
 
 ## Checking and installing
 

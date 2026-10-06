@@ -151,14 +151,13 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     crate::notch::restart_if_installed();
     // The same for a phone's bridge service, which would otherwise keep the old build or,
     // once launchd has pinned the replaced file, never start again.
-    let reload = crate::bridge_binary()
+    // Asked of the new binary, which is the one the service must run from now on.
+    let reload = Command::new(&exe)
         .args(["bridge", "reload"])
         .stdout(std::process::Stdio::null())
         .status();
-    match reload {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(status) if status.success() => {}
-        _ => eprintln!("qoro: the bridge service was not reloaded; run `qoro bridge reload`"),
+    if !reload.is_ok_and(|status| status.success()) {
+        eprintln!("qoro: the bridge service was not reloaded; run `qoro bridge reload`");
     }
     Ok(())
 }
@@ -280,7 +279,7 @@ mod tests {
     const MAC_ARM: &str = "qoro-aarch64-apple-darwin.tar.gz";
 
     /// A stand-in release tarball: a script answering `--version` the way the
-    /// real binary does, packed the way `scripts/release.sh` packs it.
+    /// real binary does, packed the way the release script packs it.
     fn fake_release(dir: &std::path::Path, reported: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("qoro");

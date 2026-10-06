@@ -266,15 +266,16 @@ agent in a space, put a space to sleep or wake one of its tabs, and start the Ma
 once everything slept, and the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
 end encrypted through a relay, `qoro-hub`, that sees neither the screens nor the keys, and a
 push carries a fixed sentence and four numbers, nothing from a screen. The phone side (the
-app, the hub and `qoro-bridge`, which `qoro pair`, `qoro devices` and `qoro bridge` hand off
-to) is not part of this repository.
+app, the hub, and the part of the release that runs `qoro pair`, `qoro devices` and `qoro
+bridge`) is not part of this repository.
 
 `qoro --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
 Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc
-2.17 and newer) live on GitHub Releases, all built on one Mac with `./scripts/release.sh
-0.1.0`: GitHub only hosts the files, nothing is compiled there. `qoro update --check` notes
+2.17 and newer) live on GitHub Releases, all built on one Mac by the release script of the qoro app (it builds
+this repository's crates with the phone part): GitHub only hosts the files, nothing is compiled
+there. `qoro update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
 how it installs, and `qoro update` installs it once nothing is awake. How a release is
 cut and how an update lands: [docs/update.md](docs/update.md).

@@ -194,10 +194,10 @@ fn update_fails_closed_with_the_network_gone() {
     );
 }
 
-/// With no `qoro-bridge` beside qoro or on PATH, a phone command says what is missing, and a
-/// bridge reload (what install and update run) has nothing to do.
+/// Built from this repository alone, a phone command says the phone part is missing, a bridge
+/// reload (what install and update run) does nothing and says nothing, and `qoro bridge` fails.
 #[test]
-fn phone_commands_need_qoro_bridge() {
+fn a_build_without_the_phone_part_says_so() {
     let run = |args: &[&str]| {
         Command::new(qoro())
             .args(args)
@@ -205,21 +205,32 @@ fn phone_commands_need_qoro_bridge() {
             .output()
             .expect("run qoro")
     };
-    let out = run(&["pair", "--hub", "ws://127.0.0.1:1"]);
+    // A hub that counts: this build must not reach it, not even to fail.
+    let hub = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    hub.set_nonblocking(true).expect("nonblocking");
+    let url = format!("ws://{}", hub.local_addr().expect("addr"));
+    let out = run(&["pair", "--hub", &url]);
+    assert!(
+        hub.accept().is_err(),
+        "`qoro pair` without the phone part reached the hub"
+    );
     assert!(
         !out.status.success(),
         "`qoro pair` succeeded with no bridge"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("qoro-bridge") && stderr.contains("not installed"),
+        stderr.contains("no phone support"),
         "the failure does not say what is missing: {stderr}"
     );
     let out = run(&["bridge", "reload"]);
     assert!(
-        out.status.success(),
-        "`qoro bridge reload` failed with no bridge: {}",
-        String::from_utf8_lossy(&out.stderr)
+        out.status.success() && out.stderr.is_empty() && out.stdout.is_empty(),
+        "`qoro bridge reload` was not a quiet no-op: {out:?}"
+    );
+    assert!(
+        !run(&["bridge"]).status.success(),
+        "`qoro bridge` succeeded"
     );
 }
 

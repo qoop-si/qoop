@@ -19,7 +19,7 @@ pub const RELEASES: &str = "https://api.github.com/repos/pat/qoro/releases";
 /// `scripts/install.sh` reads, so a platform pick can be tested with no network at all.
 pub const RELEASE_BASE_ENV: &str = "QORO_RELEASE_BASE";
 
-/// The tarball `scripts/release.sh` packs for a platform, named by its target triple.
+/// The tarball the release script packs for a platform, named by its target triple.
 ///
 /// `None` is a platform no binary is built for, which is refused with the way to build
 /// one rather than with a download that could never run.
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(platform("Linux", "riscv64"), None);
     }
 
-    /// A tarball packed the way `scripts/release.sh` packs one, with its checksum file,
+    /// A tarball packed the way the release script packs one, with its checksum file,
     /// both reachable as `file://` URLs.
     fn packed(dir: &Path, content: &[u8], sums_for: Option<&[u8]>) -> Release {
         let src = dir.join("src");

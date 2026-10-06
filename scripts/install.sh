@@ -27,7 +27,7 @@ DEST="${QORO_DEST:-$HOME/.local/bin/qoro}"
 # shape: how the platform pick is tested with no network. `qoro update` reads the same.
 BASE="${QORO_RELEASE_BASE:-https://api.github.com/repos/$REPO/releases}"
 
-# The tarball scripts/release.sh packs for this machine, by target triple.
+# The tarball the release script packs for this machine, by target triple.
 MACHINE="$(uname -m)"
 # A shell running under Rosetta reports x86_64 on an Apple silicon Mac; the machine
 # itself is arm64, and that is the binary that runs natively.

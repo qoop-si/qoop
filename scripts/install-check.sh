@@ -17,7 +17,7 @@ T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT INT TERM
 export T
 
-# A stand-in release packed the way release.sh packs it, under every triple
+# A stand-in release packed the way the release script packs it, under every triple
 # install.sh may pick, so the check runs on whichever machine this is.
 TRIPLES="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
 REL="$T/releases"

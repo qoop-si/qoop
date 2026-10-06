@@ -15,7 +15,8 @@
    agents or qass: use an isolated `QORO_RUNTIME_DIR`.
 8. Commit through `/commit`, push the branch, open a PR (`ref` an issue, never `closes`), and
    rebase-and-merge it. Pre-authorized here by `AGENTS.md`; never push to `main` directly.
-9. Pull `main` in the plain checkout, take a fresh release build, install it to
+9. Pull `main` in the plain checkout, take a fresh release build (the qoro app build, never
+   this repository alone on a paired machine), install it to
    `~/.local/bin/qoro`, and run `qoro bridge reload` after replacing the binary.
 10. Clean up: remove the worktree, delete the local and remote branch, drop the worktree's
     `target/`.
