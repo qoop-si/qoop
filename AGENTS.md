@@ -10,3 +10,5 @@
 4. Then clean up: remove the worktree (`git worktree remove <path>`) and
    delete the merged remote branch (`git push origin --delete <branch>`),
    so no stale worktree or branch is left behind.
+5. The whole path from a request to a shipped change, its checks and what to ask
+   first are in `.qoro/workflow.md`.

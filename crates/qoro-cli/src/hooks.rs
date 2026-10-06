@@ -2461,4 +2461,114 @@ mod tests {
             "{said:?}"
         );
     }
+
+    /// A turn that changed the files or the history, by whatever tool (an agent may write
+    /// through its shell, not its edit tool), begins the task at its end; a turn that changed
+    /// nothing does not. Measured on a real Claude: it wrote both files through Bash.
+    #[test]
+    fn a_turn_that_changed_the_repo_begins_the_task() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let log = dir.path().join("calls");
+        let fake = dir.path().join("qoro");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let turns = dir.path().join("turns");
+        std::fs::create_dir(&turns).expect("turns");
+        let plain = dir.path().join("plain");
+        std::fs::create_dir(&plain).expect("a directory outside git");
+        let run_in = |agent: &str, event: &str, cwd: &std::path::Path| -> String {
+            let _ = std::fs::remove_file(&log);
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let payload = format!(
+                r#"{{"hook_event_name":"{event}","session_id":"s-{agent}","cwd":"{}"}}"#,
+                cwd.display()
+            );
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .arg("working")
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QORO_TERMINAL", "1")
+                .env("QORO_TOKEN", "t")
+                .env("TMPDIR", &turns)
+                .env_remove("XDG_RUNTIME_DIR")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        let run = |agent: &str, event: &str| run_in(agent, event, &repo);
+        let begins = |said: &str| said.lines().any(|l| l == "task begin");
+        for (agent, starts, ends) in [
+            ("claude", "UserPromptSubmit", "Stop"),
+            ("codex", "UserPromptSubmit", "Stop"),
+            ("gemini", "BeforeAgent", "AfterAgent"),
+        ] {
+            run(agent, starts);
+            assert!(
+                !begins(&run(agent, ends)),
+                "{agent}: nothing changed, no task"
+            );
+            run(agent, starts);
+            std::fs::write(repo.join("a.txt"), format!("changed by {agent}\n")).expect("write");
+            assert!(
+                begins(&run(agent, ends)),
+                "{agent}: a file changed in the turn"
+            );
+            run(agent, starts);
+            git(&["commit", "-qam", agent]);
+            assert!(
+                begins(&run(agent, ends)),
+                "{agent}: a commit is a change too"
+            );
+            run(agent, starts);
+            std::fs::write(repo.join("a.txt"), format!("again by {agent}\n")).expect("write");
+            assert!(
+                !begins(&run_in(agent, ends, &plain)),
+                "{agent}: a turn that ends in another directory compares nothing"
+            );
+            run(agent, starts);
+            run_in(agent, starts, &plain);
+            std::fs::write(repo.join("a.txt"), format!("last by {agent}\n")).expect("write");
+            assert!(
+                !begins(&run(agent, ends)),
+                "{agent}: a turn begun outside git leaves no old mark behind"
+            );
+        }
+    }
 }

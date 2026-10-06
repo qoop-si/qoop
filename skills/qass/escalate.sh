@@ -12,6 +12,8 @@
 #   escalate.sh E<n> <terminal it is about, or -> now|later <handle> ['A: ...' ...]
 #   escalate.sh P<n> <terminal it is about, or -> later <handle>
 #   escalate.sh show E<n>    the card qass is showing him now: his next message answers it
+#   escalate.sh next E|P     the number for a new card (E) or proposal (P): never one used
+#                            before, even when it is long answered and gone from goals.md
 #
 # The handle is the word of the agent's sidebar name the owner types to answer.
 set -eu
@@ -19,6 +21,24 @@ set -eu
 id="${1:?usage: escalate.sh E<n> <terminal or -> now|later <handle> [options]}"
 if [ "$id" = show ]; then
     echo "showing ${2:-}"
+    exit 0
+fi
+if [ "$id" = next ]; then
+    kind="${2:-E}"
+    case "$kind" in E | P) ;; *) echo "usage: escalate.sh next E|P" >&2; exit 2 ;; esac
+    dir="@QASS_DATA@"
+    mkdir -p "$dir"
+    # One count for cards and proposals. A first count starts above every number goals.md has
+    # ever shown, so a fresh counter never hands out an E6 an old "E6 yes" could still answer.
+    # Written whole through a rename, so a reader never sees it half written.
+    # ponytail: no lock, one qass per machine asks for numbers; lock it if that changes.
+    n="$(cat "$dir/next-card" 2>/dev/null || true)"
+    case "$n" in '' | *[!0-9]*)
+        seen="$(grep -oE '\b[EP][0-9]+\b' "$dir/goals.md" 2>/dev/null | tr -d EP | sort -n | tail -1 || true)"
+        n=$(( ${seen:-0} + 1 )) ;;
+    esac
+    echo $((n + 1)) > "$dir/next-card.new" && mv -f "$dir/next-card.new" "$dir/next-card"
+    echo "$kind$n"
     exit 0
 fi
 urgency="${3:-now}"

@@ -332,7 +332,7 @@ impl Store {
             &tx,
             id,
             "opened",
-            &format!("opened by qoro at an edit attempt: {goal}"),
+            &format!("opened by qoro when the agent changed files: {goal}"),
             now,
         )?;
         tx.commit()?;

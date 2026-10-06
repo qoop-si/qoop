@@ -78,7 +78,8 @@ got="$(HOME="$tmp/home" QORO_TERMINAL=5 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh
 now=$(date +%s)
 printf '%s\n' "[$(row 5 1 idle),$(row 6 1 working)]" > "$tmp/snapshots"
 printf '%s\n' "[$(row 5 1 idle),$(row 6 1 working)]" > "$tmp/home/.qass/last.json"
-printf -- '- T5 g1 x: task; hands off until %s\n- T6 g1 y: task; hands off until %s\n- T7 g1 z: task; hands off until %s\n' \
+# T5 in the line shape of a worker with a task, T6 and T7 in the older one: both are read.
+printf -- '- T5 g1 0a1b2c3d "fix x" task:12; hands off until %s\n- T6 g1 y: task; hands off until %s\n- T7 g1 z: task; hands off until %s\n' \
     $((now + 3)) $((now - 1)) $((now + 999)) > "$tmp/home/.qass/goals.md"
 cat > "$tmp/bin/qoro" <<EOF
 #!/bin/sh
@@ -144,5 +145,22 @@ rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/settle"*
 got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
 [ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] \
     || { echo "task line printed: $got"; exit 1; }
+
+# Card and proposal numbers come from one count that starts above every number goals.md shows,
+# and never hand the same number out twice.
+rm -f "$tmp/home/.qass/next-card"
+printf -- '# Waiting on you\nE53 · T5 · cv\n- P90 · wend: send x\n' > "$tmp/home/.qass/goals.md"
+got="$("$skill_w/escalate.sh" next E) $("$skill_w/escalate.sh" next P) $("$skill_w/escalate.sh" next E)"
+[ "$got" = "E91 P92 E93" ] || { echo "numbers: $got"; exit 1; }
+printf -- '# Waiting on you\n' > "$tmp/home/.qass/goals.md"
+got="$("$skill_w/escalate.sh" next E)"
+[ "$got" = "E94" ] || { echo "a removed card freed its number: $got"; exit 1; }
+rm -f "$tmp/home/.qass/next-card" "$tmp/home/.qass/goals.md"
+got="$("$skill_w/escalate.sh" next E)"
+[ "$got" = "E1" ] || { echo "a first count: $got"; exit 1; }
+echo half > "$tmp/home/.qass/next-card"
+printf -- 'E2E tests over HTTP20, then card E7\n' > "$tmp/home/.qass/goals.md"
+got="$("$skill_w/escalate.sh" next E)"
+[ "$got" = "E8" ] || { echo "a broken count, or a word read as a card: $got"; exit 1; }
 
 echo "qass watch: ok"

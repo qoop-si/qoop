@@ -60,7 +60,62 @@ esac
 if command -v python3 >/dev/null 2>&1; then
   QORO_HOOK_STATE="$state" QORO_HOOK_FLAGS="$flags" \
     GEMINI_SESSION_ID="${GEMINI_SESSION_ID:-}" python3 -c '
-import json, os, subprocess, sys
+import hashlib, json, os, subprocess, sys, tempfile
+
+
+def worktree_mark(cwd):
+    # What the files and the history in cwd look like now, or None outside git. A repo with no
+    # commit yet has no HEAD: those parts stay empty and the files still count. No optional locks,
+    # so the hook never takes `index.lock` from under the git the agent runs.
+    try:
+        parts = []
+        for git in (["status", "--porcelain=v1", "-uall"], ["diff", "HEAD"], ["rev-parse", "HEAD"]):
+            got = subprocess.run(["git", "--no-optional-locks", "-C", cwd] + git, capture_output=True, timeout=2)
+            if got.returncode != 0 and git[0] == "status":
+                return None
+            parts.append(got.stdout if got.returncode == 0 else b"")
+        return hashlib.sha256(b"\0".join(parts)).hexdigest()
+    except Exception:
+        return None
+
+
+def turn_file(payload):
+    session = str(payload.get("session_id") or "")
+    if not session or len(session) > 128 or not all(c.isalnum() or c in "-_." for c in session):
+        session = "none"
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    name = "qoro-turn-%d-%s-%s" % (os.getuid(), os.environ.get("QORO_TERMINAL", "0"), session)
+    return os.path.join(base, name)
+
+
+def turn(payload, starts, ends):
+    # A turn that changed the files or the history, by any tool, is real work: qoro opens the
+    # task record at its end if none is open. Marked when the request arrives, compared when the
+    # turn ends in the same directory; the mark is removed either way.
+    name = payload.get("hook_event_name") or ""
+    if name not in (starts, ends):
+        return
+    cwd = str(payload.get("cwd") or os.getcwd())
+    path = turn_file(payload)
+    try:
+        if name == starts:
+            mark = worktree_mark(cwd)
+            if not mark:
+                os.remove(path)
+                return
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(cwd + "\n" + mark)
+            return
+        with open(path) as f:
+            was_cwd, _, was = f.read().partition("\n")
+        os.remove(path)
+        mark = worktree_mark(cwd)
+        if mark and was and was_cwd == cwd and mark != was:
+            subprocess.run(["qoro", "task", "begin"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
 
 try:
     payload = json.load(sys.stdin)
@@ -128,6 +183,8 @@ try:
     subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 except Exception:
     pass
+# Mark or compare the turn after the report, so the state never waits on its git calls.
+turn(payload, "BeforeAgent", "AfterAgent")
 # A session starting or resuming: tell the agent the short rules for recording its task,
 # and the task it has open. After the report, so the state is never late for it; quiet on
 # any failure, and qoro itself prints nothing in the qass space. Gemini reads only JSON

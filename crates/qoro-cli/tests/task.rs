@@ -492,7 +492,10 @@ $Q task ls > ls.out 2>&1"#,
     assert!(ls.contains("#1 make greet shout (investigating)"), "{ls}");
     assert_eq!(ls.lines().count(), 1, "one task for two begins: {ls}");
     let (_, show, _) = daemon.run(&["task", "show", "1"]);
-    assert!(show.contains("opened by qoro at an edit attempt"), "{show}");
+    assert!(
+        show.contains("opened by qoro when the agent changed files"),
+        "{show}"
+    );
 
     let (ok, out, err) = daemon.run(&["new", "--space", "qass"]);
     assert!(ok, "{err}");

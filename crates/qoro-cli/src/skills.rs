@@ -85,6 +85,11 @@ const QASS: &[(&str, &str, bool)] = &[
     ),
     ("on.sh", include_str!("../../../skills/qass/on.sh"), true),
     (
+        "init.md",
+        include_str!("../../../skills/qass/init.md"),
+        false,
+    ),
+    (
         "settings.json",
         include_str!("../../../skills/qass/settings.json"),
         false,
@@ -469,6 +474,45 @@ mod tests {
         // Our directory is gone when left empty; theirs stays.
         assert!(!home.path().join(".claude/skills/qoro").exists());
         assert!(neighbour.exists());
+    }
+
+    /// The workflows qass reads stay inside the budget they promise an agent's context: the
+    /// default in init.md and this repo's own, at most 12 steps and 4,000 characters each.
+    #[test]
+    fn the_workflows_stay_within_their_budget() {
+        let init = QASS
+            .iter()
+            .find(|(name, _, _)| *name == "init.md")
+            .expect("init.md is installed")
+            .1;
+        let default = init
+            .split("## The default workflow")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the default workflow section");
+        let own = include_str!("../../../.qoro/workflow.md");
+        for (what, text) in [("the default", default), ("qoro's own", own)] {
+            let chars = text.chars().count();
+            assert!(chars <= 4_000, "{what} workflow is {chars} characters");
+            let steps = text
+                .lines()
+                .filter(|l| {
+                    l.split_once(". ")
+                        .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
+                })
+                .count();
+            assert!(
+                (1..=12).contains(&steps),
+                "{what} workflow has {steps} steps"
+            );
+        }
+        let skill = QASS
+            .iter()
+            .find(|(name, _, _)| *name == "SKILL.md")
+            .expect("SKILL.md is installed")
+            .1;
+        assert!(skill.contains("init.md"), "SKILL.md points at init.md");
+        assert!(skill.lines().count() <= 400, "SKILL.md grew past 400 lines");
     }
 
     /// qass installs whole, its programs runnable, changes nothing the second time,
