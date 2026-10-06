@@ -26,14 +26,11 @@ pub fn read_session(
     db_path: &Path,
     session_id: &str,
 ) -> Result<Option<(Vec<Message>, usize)>, Error> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        // Raw rusqlite text stays: it names operations on the user's own
-        // database in the user's own terminal, where it debugs lock and
-        // schema failures. Located transcript paths (the probe-able part)
-        // never enter any error; see `locate::checked`.
-        .map_err(|e| Error::Store(e.to_string()))?;
-    conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| Error::Store(e.to_string()))?;
+    // Raw rusqlite text stays in errors: it names operations on the user's own
+    // database in the user's own terminal, where it debugs lock and schema
+    // failures. Located transcript paths (the probe-able part) never enter any
+    // error; see `locate::checked`.
+    let conn = open(db_path)?;
     if !session_exists(&conn, session_id)? {
         return Ok(None);
     }
@@ -134,6 +131,88 @@ fn read_messages(conn: &Connection, session_id: &str) -> Result<(Vec<Message>, u
         });
     }
     Ok((out, skipped))
+}
+
+/// The database opened the way every read here opens it: read only, a short wait on a writer.
+pub(crate) fn open(db_path: &Path) -> Result<Connection, Error> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| Error::Store(e.to_string()))?;
+    Ok(conn)
+}
+
+/// Every top-level session: `(id, directory, last update in millis)`. A child session (a
+/// subagent's) carries its parent's prompts, not a person's, so it is left out where the
+/// schema says which those are.
+pub(crate) fn top_sessions(conn: &Connection) -> Result<Vec<(String, String, i64)>, Error> {
+    let has_parent = conn
+        .prepare("SELECT 1 FROM pragma_table_info('session') WHERE name='parent_id'")
+        .and_then(|mut s| s.exists([]))
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let sql = if has_parent {
+        "SELECT id, directory, time_updated FROM session WHERE parent_id IS NULL"
+    } else {
+        "SELECT id, directory, time_updated FROM session"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| Error::Store(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| Error::Store(e.to_string()))?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|e| Error::Store(e.to_string()))
+}
+
+/// What the person typed in one session, oldest first: the text parts of user messages,
+/// never the synthetic ones opencode adds itself. The role is read in SQL, so the large
+/// assistant parts are never parsed.
+pub(crate) fn typed(conn: &Connection, session_id: &str) -> Result<Vec<Message>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.time_created, p.data FROM message m JOIN part p ON p.message_id = m.id
+             WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'user'
+             ORDER BY m.time_created, m.id, p.id",
+        )
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| Error::Store(e.to_string()))?;
+    let mut out: Vec<Message> = Vec::new();
+    let mut last_id = String::new();
+    for row in rows {
+        let (mid, ts, data) = row.map_err(|e| Error::Store(e.to_string()))?;
+        let Ok(part) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if part.get("type").and_then(Value::as_str) != Some("text")
+            || part.get("synthetic").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(m) if mid == last_id => {
+                m.text.push('\n');
+                m.text.push_str(text);
+            }
+            _ => out.push(Message {
+                role: Role::User,
+                text: text.to_string(),
+                ts: Some(ts),
+            }),
+        }
+        last_id = mid;
+    }
+    Ok(out)
 }
 
 /// One part to display text. Reasoning and file bytes are excluded (see

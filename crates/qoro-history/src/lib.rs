@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dir;
 pub mod locate;
 pub mod model;
 pub mod select;
@@ -20,8 +21,10 @@ mod opencode;
 mod read;
 mod ts;
 
+pub use dir::{Repo, Typed, TypedIn, typed_in};
 pub use locate::{BaseDirs, Located, detect_product, valid_id};
 pub use model::{Message, Product, Role};
+pub use ts::date_utc;
 
 /// One transcript window: the last messages, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

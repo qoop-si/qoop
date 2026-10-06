@@ -81,6 +81,34 @@ fn worktrees() -> std::io::Result<Vec<Worktree>> {
     Ok(list)
 }
 
+/// The repository `dir` is in, for reading what was typed there: its main worktree, its
+/// git common dir and every live worktree. Refused outside a git repository.
+pub(crate) fn repo_of(dir: &std::path::Path) -> std::io::Result<qoro_history::Repo> {
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"].map(std::ffi::OsStr::new),
+    )
+    .map_err(|_| std::io::Error::other(format!("{} is not in a git repository", dir.display())))?;
+    let raw = git(
+        dir,
+        &["worktree", "list", "--porcelain", "-z"].map(std::ffi::OsStr::new),
+    )?;
+    let mut worktrees: Vec<PathBuf> = parse_worktrees(&raw)
+        .into_iter()
+        .filter(|w| !w.bare)
+        .map(|w| w.path)
+        .collect();
+    if worktrees.is_empty() {
+        return Err(std::io::Error::other("git listed no worktrees"));
+    }
+    let root = worktrees.remove(0);
+    Ok(qoro_history::Repo {
+        root,
+        common: PathBuf::from(common.trim()),
+        worktrees,
+    })
+}
+
 /// A branch name as one path component: lowercase letters and digits, every other run
 /// of characters one dash.
 fn worktree_slug(branch: &str) -> String {

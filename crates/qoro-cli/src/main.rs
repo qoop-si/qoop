@@ -203,6 +203,9 @@ fn run() -> std::io::Result<()> {
                   \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
                   \x20                 local files only; --json prints the full window\n\
+                  \x20 qoro history --dir <repo> [--last N] [--json]\n\
+                  \x20                 what you typed to your agents in a repo and its\n\
+                  \x20                 worktrees (Claude Code, Codex, opencode; not Gemini)\n\
                   \x20 qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
                   \x20                 understand another agent before writing to it:\n\
                   \x20                 who it is, whether it is writable, its live screen\n\
@@ -1759,6 +1762,9 @@ fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
 fn run_history(args: &[String]) -> std::io::Result<()> {
     use qoro_runtime::control::{ControlRequest, ControlResponse};
 
+    if args.iter().skip(2).any(|a| a == "--dir") {
+        return run_history_dir(args);
+    }
     let opts = parse_history_args(args).map_err(usage)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -1824,6 +1830,88 @@ fn run_history(args: &[String]) -> std::io::Result<()> {
         }
         Ok(())
     })
+}
+
+/// `qoro history --dir <repo>`: what the person typed to their agents in a repository and
+/// its worktrees, across every session there, oldest first. No daemon: only the products'
+/// own stores are read.
+fn run_history_dir(args: &[String]) -> std::io::Result<()> {
+    let opts = parse_history_dir_args(args).map_err(usage)?;
+    let repo = worktree::repo_of(&opts.dir)?;
+    let base =
+        qoro_history::BaseDirs::from_home().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let qoro_history::TypedIn {
+        messages: typed,
+        unread,
+    } = qoro_history::typed_in(&repo, &base, opts.last);
+    for gap in unread {
+        eprintln!("qoro: not read: {gap}");
+    }
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::to_string(&typed).map_err(std::io::Error::other)?
+        );
+    } else {
+        print!("{}", render_typed(&typed));
+    }
+    Ok(())
+}
+
+/// Parsed `qoro history --dir` arguments.
+struct HistoryDirOpts {
+    dir: PathBuf,
+    last: usize,
+    json: bool,
+}
+
+/// A repository's history reads at most this many messages per call: enough to learn how
+/// a person works there, small enough to read.
+const HISTORY_DIR_LAST_MAX: usize = 2_000;
+
+fn parse_history_dir_args(args: &[String]) -> Result<HistoryDirOpts, String> {
+    let usage = "usage: qoro history --dir <repo> [--last N] [--json]";
+    let mut dir = None;
+    let mut last = 200usize;
+    let mut json = false;
+    let mut rest = args.iter().skip(2);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--dir" => dir = Some(PathBuf::from(rest.next().ok_or_else(|| usage.to_string())?)),
+            "--last" => {
+                let n = rest.next().ok_or_else(|| usage.to_string())?;
+                last = n.parse::<usize>().map_err(|_| usage.to_string())?;
+                if last == 0 || last > HISTORY_DIR_LAST_MAX {
+                    return Err(usage.to_string());
+                }
+            }
+            "--json" => json = true,
+            _ => return Err(format!("unknown argument {arg}; {usage}")),
+        }
+    }
+    Ok(HistoryDirOpts {
+        dir: dir.ok_or_else(|| usage.to_string())?,
+        last,
+        json,
+    })
+}
+
+/// One line per message: day, product, session, and the text on one line, cut to 400
+/// characters, so a long history stays something to read and grep.
+fn render_typed(typed: &[qoro_history::Typed]) -> String {
+    let mut out = String::new();
+    for m in typed {
+        let flat = m.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cut: String = flat.chars().take(400).collect();
+        let more = if cut.len() < flat.len() { "…" } else { "" };
+        out.push_str(&format!(
+            "{} {} {}: {cut}{more}\n",
+            qoro_history::date_utc(m.ts),
+            m.product.as_str(),
+            m.session
+        ));
+    }
+    out
 }
 
 /// Parsed `qoro history` arguments, pure so the refusals are testable.
@@ -2676,12 +2764,14 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 mod tests {
     use super::{
         ContextJson, cli_sender_from, explain_row, is_usage, parse_context_args,
-        parse_history_args, parse_prompt_args, prompt_refusal, render_context_text,
-        render_window_text, resolve_target, take_session, trim_rows, truncate_text, usage,
+        parse_history_args, parse_history_dir_args, parse_prompt_args, prompt_refusal,
+        render_context_text, render_typed, render_window_text, resolve_target, take_session,
+        trim_rows, truncate_text, usage,
     };
     use qoro_history::{Message, Role, SessionId, Window};
     use qoro_runtime::control::AgentRow;
     use qoro_runtime::paths;
+    use std::path::PathBuf;
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
@@ -2943,6 +3033,45 @@ mod tests {
         );
         assert!(parse_history_args(&history_argv(&["qoro", "history", "2", "--bogus"])).is_err());
         assert!(parse_history_args(&history_argv(&["qoro", "history"])).is_err());
+    }
+
+    #[test]
+    fn history_of_a_repo_parses_and_prints_one_line_each() {
+        let opts = parse_history_dir_args(&history_argv(&[
+            "qoro", "history", "--dir", "/r", "--last", "2000", "--json",
+        ]))
+        .unwrap();
+        assert_eq!(opts.dir, PathBuf::from("/r"));
+        assert_eq!(opts.last, 2_000);
+        assert!(opts.json);
+        assert_eq!(
+            parse_history_dir_args(&history_argv(&["qoro", "history", "--dir", "/r"]))
+                .unwrap()
+                .last,
+            200
+        );
+        for bad in [
+            &["qoro", "history", "--dir"][..],
+            &["qoro", "history", "--last", "5"],
+            &["qoro", "history", "--dir", "/r", "--last", "2001"],
+            &["qoro", "history", "--dir", "/r", "--role", "user"],
+        ] {
+            assert!(
+                parse_history_dir_args(&history_argv(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        let line = render_typed(&[qoro_history::Typed {
+            ts: 0,
+            product: qoro_history::Product::Codex,
+            session: "abcd1234".into(),
+            text: format!("two\nlines {}", "x".repeat(500)),
+        }]);
+        assert!(
+            line.starts_with("1970-01-01 codex abcd1234: two lines x"),
+            "{line}"
+        );
+        assert!(line.ends_with("…\n") && line.lines().count() == 1, "{line}");
     }
 
     #[test]

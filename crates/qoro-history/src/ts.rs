@@ -73,7 +73,20 @@ pub fn rfc3339_to_millis(s: &str) -> Option<i64> {
     secs.checked_mul(1000)?.checked_add(millis)
 }
 
-/// Days since 1970-01-01 for a civil date. `None` outside a sane range.
+/// Epoch millis as a UTC day, `YYYY-MM-DD` (the inverse of `days_from_civil`).
+pub fn date_utc(ms: i64) -> String {
+    let z = ms.div_euclid(86_400_000) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -83,6 +96,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
         _ => 0,
     }
 }
+/// Days since 1970-01-01 for a civil date. `None` outside a sane range.
 fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     if !(1970..=9999).contains(&y) {
         return None;

@@ -44,7 +44,7 @@ fn line_ts(obj: &Value) -> Option<i64> {
         .and_then(rfc3339_to_millis)
 }
 
-fn route_line(obj: &Value, primary: &mut Vec<Message>, fallback: &mut Vec<Message>) {
+pub(crate) fn route_line(obj: &Value, primary: &mut Vec<Message>, fallback: &mut Vec<Message>) {
     match obj.get("type").and_then(Value::as_str).unwrap_or("") {
         "event_msg" => {
             let p = obj.get("payload");

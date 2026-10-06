@@ -29,7 +29,7 @@ pub fn parse_lines(lines: &[String]) -> (Vec<Message>, usize) {
     (out, skipped)
 }
 
-fn route(obj: &Value) -> Option<Message> {
+pub(crate) fn route(obj: &Value) -> Option<Message> {
     match obj.get("type").and_then(Value::as_str).unwrap_or("") {
         // Text the agent adds on its own (a loaded skill): nobody's message.
         "user" | "assistant" if obj.get("isMeta").and_then(Value::as_bool) == Some(true) => None,
