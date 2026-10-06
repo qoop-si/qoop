@@ -7414,6 +7414,19 @@ where
                                 state.images.insert(terminal, image);
                                 dirty = true;
                             }
+                            // A program's own copy (OSC 52): an agent that took the mouse
+                            // selects and copies itself, and on another machine this is
+                            // the only way its copy can reach the person. Taken from the
+                            // pane in front of them only, so a program in the background
+                            // never replaces what they copied.
+                            Incoming::Copy { terminal, text } => {
+                                if terminal != 0 && terminal == state.focused {
+                                    let mut out = std::io::stdout();
+                                    if copy_and_say(&mut state, &text, &mut out)? {
+                                        dirty = true;
+                                    }
+                                }
+                            }
                             Incoming::Event(EventMessage::AgentChanged { .. })
                             | Incoming::Event(EventMessage::Resync) => {
                                 // What changed is not in the message on purpose, so the

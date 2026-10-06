@@ -155,6 +155,12 @@ pub const MAX_IMAGES_PER_WINDOW: usize = 8;
 /// The rolling window the flood guard counts in.
 pub const FLOOD_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The longest clipboard write (OSC 52) a child may hand to its clients, in bytes of text.
+///
+/// Well inside the reassembly bound, and far above a selection anyone makes by hand: a
+/// write past it is dropped rather than cut, because half a copy pasted is worse than none.
+pub const MAX_COPY_BYTES: usize = 1024 * 1024;
+
 /// How many parse slices run before the terminal task gives the runtime a turn.
 ///
 /// The slice is sized by the engine's staging ring, at half its capacity, which is far
@@ -539,6 +545,12 @@ pub struct TerminalHandle {
     /// holds only the latest update, so a picture published while nobody watched
     /// would otherwise be gone before the first viewer arrives.
     pub last_image: Arc<std::sync::Mutex<Option<StoredImage>>>,
+    /// The newest clipboard write (OSC 52) this terminal's child asked for, numbered from
+    /// one so a subscription forwards each once. A program that selects text itself, such
+    /// as an agent that took the mouse, copies this way when it has no clipboard tool of
+    /// its own, which is every program on a remote reached over ssh. Never replayed to a
+    /// subscriber that arrives after it: a copy belongs to the moment it was made.
+    pub last_copy: Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Pictures dropped by the per-terminal flood guard. Counted, like every
     /// other discard: a missing picture must be sayable.
     pub image_flood_dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -1651,6 +1663,9 @@ pub struct RenderQueue {
     /// snapshots: a picture is not a screen, and dropping it as a stale screen would
     /// lose the only copy on its way to the client.
     images: std::sync::Mutex<BTreeMap<u32, StoredImage>>,
+    /// One clipboard write per terminal at most, replaced by the next: only the newest
+    /// copy is what the person's clipboard should end up holding.
+    copies: std::sync::Mutex<BTreeMap<u32, String>>,
     put_at: std::sync::Mutex<Option<std::time::Instant>>,
     notify: tokio::sync::Notify,
     /// Rung when the client acknowledges, or the queue closes: what a writer holding
@@ -1685,6 +1700,7 @@ impl RenderQueue {
         Self {
             pending: std::sync::Mutex::new(BTreeMap::new()),
             images: std::sync::Mutex::new(BTreeMap::new()),
+            copies: std::sync::Mutex::new(BTreeMap::new()),
             put_at: std::sync::Mutex::new(None),
             notify: tokio::sync::Notify::new(),
             acked: tokio::sync::Notify::new(),
@@ -1773,12 +1789,36 @@ impl RenderQueue {
         taken
     }
 
+    /// Replace this terminal's pending clipboard write. Never awaits, like `put`.
+    pub fn put_copy(&self, stream: u32, text: String) {
+        let added = text.len();
+        let removed = self
+            .copies
+            .lock()
+            .unwrap()
+            .insert(stream, text)
+            .map_or(0, |old| old.len());
+        self.charge(added as isize - removed as isize);
+        self.notify.notify_one();
+    }
+
+    /// Take every pending clipboard write. Returns empty when none.
+    pub fn take_copies(&self) -> Vec<(u32, String)> {
+        let taken: Vec<(u32, String)> = std::mem::take(&mut *self.copies.lock().unwrap())
+            .into_iter()
+            .collect();
+        let freed: usize = taken.iter().map(|(_, t)| t.len()).sum();
+        self.charge(-(freed as isize));
+        taken
+    }
+
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         // Whatever is still held stops counting against the global ceiling, or a closed
         // connection would keep a share of the budget forever.
         let _ = self.take();
         let _ = self.take_images();
+        let _ = self.take_copies();
         self.notify.notify_one();
         self.acked.notify_one();
     }
@@ -2088,6 +2128,25 @@ async fn serve_client(
                 // them here its acks run ahead of what was sent and the window never fills.
                 // The others count screens only: counted for them, a picture would stay
                 // outstanding for ever and get a healthy reader evicted as wedged.
+                if window.is_some() {
+                    rendered += 1;
+                }
+            }
+
+            // Clipboard writes ride the same way as pictures, and are counted the same
+            // way: an older client fails both parses above and skips them.
+            for (stream, copy) in writer_renders.take_copies() {
+                let body = match serde_json::to_vec(&CopyWire { v: 1, copy }) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let counter = seq.entry(stream).or_default();
+                let frames =
+                    qoro_proto::chunk(Channel::Terminal, stream, *counter, None, Bytes::from(body));
+                *counter = counter.wrapping_add(frames.len() as u32);
+                if frames.iter().any(|f| f.encode(&mut buf).is_err()) {
+                    return;
+                }
                 if window.is_some() {
                     rendered += 1;
                 }
@@ -2447,12 +2506,24 @@ fn subscribe(
     // A duplicate delivery is harmless: the client draws by image id.
     let last_image = handle.last_image.clone();
     let mut sent_image: Option<u64> = None;
+    // A copy made before this subscription is not this subscriber's to paste.
+    let last_copy = handle.last_copy.clone();
+    let mut sent_copy = last_copy.lock().unwrap().as_ref().map(|(id, _)| *id);
     if let Some(image) = last_image.lock().unwrap().clone() {
         sent_image = Some(image.id);
         queue.put_image(stream, image);
     }
     let task = tokio::spawn(async move {
         loop {
+            // Clipboard writes ride beside the screen in the handle, never in the channel:
+            // the next screen would overwrite one there before any wake read it. Read before
+            // the update, so a program that copies and exits still has its copy delivered.
+            if let Some((id, copy)) = last_copy.lock().unwrap().clone()
+                && sent_copy != Some(id)
+            {
+                sent_copy = Some(id);
+                queue.put_copy(stream, copy);
+            }
             // Attach delivers the current screen first, before any further update. Without
             // this a client that arrives after the shell printed its prompt sees a blank
             // terminal until something else happens to be typed.
@@ -4791,6 +4862,17 @@ impl From<&StoredImage> for ImageWire {
     }
 }
 
+/// A clipboard write a terminal's child asked for (OSC 52), on the terminal lane.
+///
+/// Shaped like no snapshot and no picture (`copy` is in neither), so a client that knows
+/// only those fails both parses and skips it (ADR-010). Text, not base64: OSC 52 carries
+/// text, and the engine has already decoded it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CopyWire {
+    pub v: u32,
+    pub copy: String,
+}
+
 /// The attribute bits, named once so the client and the daemon cannot disagree.
 pub mod attrs {
     pub const BOLD: u8 = 1;
@@ -5006,6 +5088,7 @@ pub fn open_terminal(
         commands,
         updates: updates.clone(),
         last_image: Arc::new(std::sync::Mutex::new(None)),
+        last_copy: Arc::default(),
         image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         discards: Arc::default(),
         last_dims: Arc::new(std::sync::atomic::AtomicU64::new((80u64 << 32) | 24u64)),
@@ -8224,6 +8307,22 @@ async fn terminal_task(
                                         *handle.last_image.lock().unwrap() = Some(image.clone());
                                     }
                                     let _ = updates.send(TerminalUpdate::Image(image));
+                                }
+                                // A program's own copy, kept on the handle and every
+                                // subscriber woken to forward it. Rare by nature (a person
+                                // made a selection), so no flood guard beyond the size cap.
+                                if let qoro_terminal::TerminalEffect::ClipboardWrite(text) = effect
+                                    && !text.is_empty()
+                                    && text.len() <= MAX_COPY_BYTES
+                                    && let Some(handle) = terminals.get(stream)
+                                {
+                                    {
+                                        let mut last = handle.last_copy.lock().unwrap();
+                                        let id = last.as_ref().map_or(1, |(id, _)| id + 1);
+                                        *last =
+                                            Some((id, String::from_utf8_lossy(text).into_owned()));
+                                    }
+                                    updates.send_modify(|_| {});
                                 }
                             }
                             // Nothing changed for anyone, so nothing runs. A snapshot

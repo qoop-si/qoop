@@ -20,7 +20,7 @@ use qoro_proto::{Channel, ClientHello, CodecOffers, Frame, Reassembler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::daemon::{ClientWire, ImageWire, SnapshotWire, StoredImage};
+use crate::daemon::{ClientWire, CopyWire, ImageWire, SnapshotWire, StoredImage};
 
 /// Sent on attach. Reconciling unconditionally is cheaper than tracking what a previous
 /// client may have left behind, and a previous client may not have exited cleanly at all.
@@ -565,6 +565,12 @@ pub enum Incoming {
         terminal: u32,
         image: StoredImage,
     },
+    /// Text the terminal's child asked to put on the clipboard (OSC 52). The client
+    /// decides whether to: only the person looking at that terminal should get it.
+    Copy {
+        terminal: u32,
+        text: String,
+    },
     /// A render or a picture, undecoded, from a [`Connection::raw`].
     Raw {
         terminal: u32,
@@ -654,6 +660,14 @@ impl Connection {
                             image.terminal = terminal;
                             out.push(Incoming::Image { terminal, image });
                         }
+                    } else if let Ok(wire) = serde_json::from_slice::<CopyWire>(&message.body)
+                        && wire.v == 1
+                    {
+                        // Not counted, like a picture.
+                        out.push(Incoming::Copy {
+                            terminal,
+                            text: wire.copy,
+                        });
                     }
                 }
                 Channel::Control => {
@@ -954,5 +968,34 @@ mod tests {
             }
             other => panic!("wrong message: {other:?}"),
         }
+    }
+
+    /// A clipboard write decodes to `Incoming::Copy` on a reader that knows it, and a
+    /// snapshot-only reader skips it uncounted, the way it skips a picture.
+    #[test]
+    fn a_copy_decodes_for_a_new_reader_and_is_skipped_by_an_old_one() {
+        let body = serde_json::to_vec(&CopyWire {
+            v: 1,
+            copy: "hi there".into(),
+        })
+        .expect("copy");
+        assert!(serde_json::from_slice::<SnapshotWire>(&body).is_err());
+        assert!(serde_json::from_slice::<ImageWire>(&body).is_err());
+        let encode = || {
+            let mut inbuf = BytesMut::new();
+            for frame in qoro_proto::chunk(Channel::Terminal, 4, 0, None, Bytes::from(body.clone()))
+            {
+                frame.encode(&mut inbuf).expect("encode");
+            }
+            inbuf
+        };
+        let got = Connection::new().drain(&mut encode()).expect("drain");
+        assert!(
+            matches!(&got[..], [Incoming::Copy { terminal: 4, text }] if text == "hi there"),
+            "{got:?}"
+        );
+        let mut old = RenderStream::new();
+        assert!(old.take_all(&mut encode()).expect("take").is_empty());
+        assert_eq!(old.received(), 0);
     }
 }

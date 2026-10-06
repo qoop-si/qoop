@@ -1466,7 +1466,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.write(Channel::Terminal, out, body).await
             }
             // Links are read raw, so these never arrive here.
-            Incoming::Render { .. } | Incoming::Image { .. } => Ok(()),
+            Incoming::Render { .. } | Incoming::Image { .. } | Incoming::Copy { .. } => Ok(()),
             Incoming::Event(EventMessage::AgentChanged { terminal }) => {
                 let Some(terminal) = terminal_out(link, terminal) else {
                     return Ok(());
