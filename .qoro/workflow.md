@@ -36,3 +36,14 @@ the task's stage to `reviewing`. At the limit, stop and ask the owner.
 A new dependency (`cargo add`, `bun add`, `uv add`), a tag, a version or a changelog edit
 (release-please owns those), a design or naming pick, anything external (email, a post, an issue
 comment, publishing), and the repo going public.
+
+## Verify where it runs
+
+- where: `installed ~/.local/bin/qoro`
+- check: its mtime is after the merge and `~/.local/bin/qoro --version` runs; `launchctl list |
+  grep dev.qoro.bridge` shows a PID. Then the command the task changed, against an isolated
+  stack only: `mktemp -d /tmp/qv.XXXXXX` prints `<s>`, and every qoro command is written out
+  as `env QORO_RUNTIME_DIR=<s> XDG_CONFIG_HOME=<s>/c XDG_DATA_HOME=<s>/d ~/.local/bin/qoro
+  <args>` (start with `ensure-awake`, end with `stop`), its output kept; then `rm -rf <s>`.
+- never: a qoro command without those three variables, the owner's live daemon, agents,
+  spaces or qass, `launchctl` writes, the owner's phone.
