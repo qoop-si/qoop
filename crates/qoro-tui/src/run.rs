@@ -137,7 +137,7 @@ fn toast_text(state: &State) -> Option<&str> {
 /// would hand the person text they never saw. Sized to the focused tile, like the
 /// selection itself.
 fn window_rows(state: &State) -> Vec<String> {
-    let tile = focused_rect(&state);
+    let tile = focused_rect(state);
     (0..tile.rows)
         .map(|row| {
             screen::window_row(
@@ -10401,7 +10401,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
 /// the pointer has left it. Only for a gesture whose press already went to the program:
 /// a release with no press, or a drag begun on the sidebar, is never sent.
 fn clamped_to_focused(state: &State, row: u16, col: u16) -> (usize, usize) {
-    let tile = focused_rect(&state);
+    let tile = focused_rect(state);
     let first_col = screen::left_for(state.cols, state.collapsed, state.sidebar_width) + 1;
     let x = (col as usize)
         .saturating_sub(first_col)
