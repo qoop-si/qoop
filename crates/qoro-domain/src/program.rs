@@ -57,7 +57,8 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["kimi", "kimi-cli"],
     &["cline"],
     &["antigravity", "agy"],
-    &["qodercli"],
+    // `qoderclicn` is the binary of Qoder CLI's China build (Qoder CLI CN).
+    &["qodercli", "qoderclicn"],
     // Agents whose own name is an ordinary word, so it is never enough on its own: see
     // `GENERIC_NAMES`. The other spellings are their packages and install directories,
     // which name nothing else.
@@ -87,7 +88,10 @@ pub fn agent_names() -> Vec<&'static str> {
 /// `@kilocode/cli`), or the name as the script
 /// a JavaScript or Python runtime is running, which is how `pi` and `hermes` run: node
 /// retitles itself `pi`, and hermes is a Python entry point.
-const GENERIC_NAMES: &[&str] = &["pi", "hermes", "kilo", "muse", "maki"];
+///
+/// `cursor` is the Cursor editor's own launcher (`cursor --wait` as `$EDITOR`); the agent is
+/// `cursor-agent`, so only that spelling makes a terminal a Cursor agent.
+const GENERIC_NAMES: &[&str] = &["pi", "hermes", "kilo", "muse", "maki", "cursor"];
 
 /// Flags whose argument is source text rather than a path.
 ///
@@ -586,7 +590,16 @@ mod tests {
         // `pi` the math tool, `hermes` the messaging binary, `muse` the music player: the
         // bare name is theirs as much as the agent's, and an agent bit here lets the
         // reaper close their terminal.
-        for name in ["pi", "hermes", "kilo", "muse", "maki", "PI", "hermes.exe"] {
+        for name in [
+            "pi",
+            "hermes",
+            "kilo",
+            "muse",
+            "maki",
+            "cursor",
+            "PI",
+            "hermes.exe",
+        ] {
             let program = identify(&format!("/usr/local/bin/{name}"), &argv(&[name]));
             assert!(!program.agent, "{name} counted on its bare name");
             assert_eq!(program.name, name, "an unknown program keeps its spelling");
@@ -655,6 +668,7 @@ mod tests {
             ("cline", "cline"),
             ("agy", "antigravity"),
             ("qodercli", "qodercli"),
+            ("qoderclicn", "qodercli"),
         ] {
             let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
             assert_eq!(program.name, shown, "{launched}");

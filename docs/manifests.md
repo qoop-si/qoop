@@ -15,15 +15,16 @@ rebuilding.
 shell prompt reads as idle; anything else reads as nothing).
 
 Every rule is written from the agent's own sources: its open repository where it has
-one, otherwise the strings in its published package or binary, otherwise its documentation.
-Each file's header names the source and version it was read from, and each rule says which
-screen it reads. Where a source gives the words but not where they are drawn, there is no
-rule for that screen: `amp` carries only its `[resume]` table, `antigravity` and `muse` read
-only their startup gates, and `devin` reads no dialog. Every blocker rule is tested against
-the same words quoted in an answer above the agent's idle prompt: blockers read the live
-bottom of the screen, or the dialog under its own rule, so a quoted question cannot pin an
-idle agent as waiting. Screens copied off real sessions of `claude`, `codex` and `opencode`
-are kept as tests of the engine as well.
+one, otherwise the strings in its published package or binary, otherwise its
+documentation. Each file's header names the source and version it was read from, and
+each rule says which screen it reads. Where a source gives the words but not where they
+are drawn, there is no rule for that screen: `amp` and `antigravity` carry only their
+`[resume]` tables, `muse` reads only its startup gates, and `devin` reads no dialog.
+Every blocker rule, startup gates included, is tested against the same words quoted in
+an answer above the agent's idle prompt: a blocker reads the live bottom of the screen
+or refuses while the agent's composer is showing, so a quoted question cannot pin an
+idle agent as waiting. Screens copied off real sessions of `claude`, `codex` and
+`opencode` are kept as tests of the engine as well.
 
 `aider` and `goose` ship a manifest that carries only a `[resume]` table and no
 rules. How to carry a conversation across a restart is a different question
@@ -84,8 +85,8 @@ contains = "esc to cancel"
   screen, with no expiry: closing the pager redraws the live prompt, and the next look
   reads that. A working agent whose pager is left open reads working until it is closed.
 - Claude draws every dialog in the composer's place, under one rule of its own, so its
-  blockers read only below the last rule and an answer above the composer never raises
-  one.
+  blockers read below the last rule, or refuse while the composer box is on screen, and an
+  answer above the composer never raises one.
 
 ## Carrying a conversation across a restart
 
