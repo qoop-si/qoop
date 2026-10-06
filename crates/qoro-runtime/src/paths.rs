@@ -64,20 +64,27 @@ pub fn runtime_dir() -> Result<PathBuf, PathError> {
     Ok(dir)
 }
 
+/// Where the runtime directory is when `QORO_RUNTIME_DIR` does not name one:
+/// `$XDG_RUNTIME_DIR/qoro`, else `qoro-<uid>` in the temp directory. Nothing is created or
+/// checked. A service that pins `QORO_RUNTIME_DIR` compares against this to know whether the
+/// pin only repeats it (a pinned one also moves the daemon's state, see `state_location`).
+pub fn default_runtime_base() -> PathBuf {
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(xdg) => Path::new(&xdg).join("qoro"),
+        Err(_) => std::env::temp_dir().join(format!("qoro-{}", current_uid())),
+    }
+}
+
 /// The directory above the daemon's.
 ///
 /// Verified the same way the daemon's directory is, because a world writable parent is a
 /// parent somebody else can put a directory into.
 pub fn runtime_base() -> Result<PathBuf, PathError> {
-    let dir = if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
-        PathBuf::from(explicit)
-    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        Path::new(&xdg).join("qoro")
-    } else {
-        // Fallback. The verification below matters most here: a shared temp directory is
-        // exactly where another user could have created the path first.
-        let uid = current_uid();
-        std::env::temp_dir().join(format!("qoro-{uid}"))
+    let dir = match std::env::var(RUNTIME_DIR_ENV) {
+        Ok(explicit) => PathBuf::from(explicit),
+        // The verification below matters most for the temp directory fallback: a shared temp
+        // directory is exactly where another user could have created the path first.
+        Err(_) => default_runtime_base(),
     };
     ensure_private_dir(&dir)?;
     ensure_private_dir(&sessions_dir(&dir))?;
@@ -298,12 +305,9 @@ pub fn lock_path(dir: &Path) -> PathBuf {
 /// touching the network: the TUI never fetches, it only reads this file. Built without
 /// creating or verifying anything, because reading a notice must not create state.
 pub fn update_notice_path() -> PathBuf {
-    let base = if let Ok(explicit) = std::env::var(RUNTIME_DIR_ENV) {
-        PathBuf::from(explicit)
-    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        Path::new(&xdg).join("qoro")
-    } else {
-        std::env::temp_dir().join(format!("qoro-{}", current_uid()))
+    let base = match std::env::var(RUNTIME_DIR_ENV) {
+        Ok(explicit) => PathBuf::from(explicit),
+        Err(_) => default_runtime_base(),
     };
     base.join("update-available")
 }
