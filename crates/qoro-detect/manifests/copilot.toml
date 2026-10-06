@@ -76,7 +76,7 @@ all = [
   { line_regex = '^\W*Confirm folder trust' },
   { line_regex = '^\W*Do you trust the files in this folder\?' },
 ]
-not = [{ line_regex = '^\s*▀{3,}\s*$' }]
+not = [{ regex = '(?s)Do you trust the files in this folder\?.*\n\s*▀{3,}\s*(\n|\z)' }]
 
 # The working line: the intent (or `Working`, `Executing`) then a dim `(Esc to cancel)`.
 [[rules]]

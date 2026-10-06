@@ -144,3 +144,16 @@ fn the_copy_dialog_leaves_the_reading_alone() {
     );
     assert_not_rule("qodercli", COMPOSER, "copy_dialog");
 }
+
+/// A live trust gate under a previous session's composer.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = COMPOSER.to_vec();
+    screen.extend([
+        "$ cd ../other && qodercli",
+        "Do you trust the files in this folder?",
+        " ❯ 1. Trust folder",
+        "   2. Don't trust and exit",
+    ]);
+    assert_rule("qodercli", &screen, "trust_folder", Blocked);
+}

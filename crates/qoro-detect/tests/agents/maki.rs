@@ -111,3 +111,17 @@ fn the_empty_composer_is_idle() {
         "composer_placeholder",
     );
 }
+
+/// A live trust card under a previous session's composer.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = COMPOSER.to_vec();
+    screen.extend([
+        "$ cd ../other && maki",
+        "┌ Folder Trust ────────────────────────────────────────────────┐",
+        "│   Trust this folder \u{2014} load its shared config now             │",
+        "│ > Not now \u{2014} stay restricted this run, ask again next start   │",
+        "└──────────────────────────────────────────────────────────────┘",
+    ]);
+    assert_rule("maki", &screen, "folder_trust", Blocked);
+}

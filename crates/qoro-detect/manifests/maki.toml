@@ -38,7 +38,7 @@ all = [
   { line_regex = '[─┌╭] Folder Trust [─┐╮]' },
   { line_regex = '^\W*(> )?Trust this folder\b' },
 ]
-not = [{ line_regex = '^\W*❯ (Ask maki to|Queue )' }]
+not = [{ regex = '(?s)Folder Trust.*\n\W*❯ (Ask maki to|Queue )' }]
 
 # The status row while a turn streams starts with a braille spinner frame
 # (`components/status_bar.rs`, `animation.rs`). No word says working; the glyph does.

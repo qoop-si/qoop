@@ -127,3 +127,17 @@ fn both_composers_are_idle() {
         "composer_placeholder",
     );
 }
+
+/// A live trust question under a previous session's composer.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = BUILD_COMPOSER.to_vec();
+    screen.extend([
+        "$ cd ../other && grok",
+        "  Do you trust the contents of this directory?",
+        "  Grok Build may run or modify contents in this directory,",
+        "  y Yes, proceed",
+        "  n No, quit",
+    ]);
+    assert_rule("grok", &screen, "trust_directory", Blocked);
+}

@@ -163,3 +163,18 @@ fn the_composer_is_idle() {
         "composer_placeholder",
     );
 }
+
+/// A live trust dialog under the shell's scrollback, a heredoc's `> ` lines among it.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = vec!["$ cat <<EOF > notes", "> hello", "> EOF", "$ qwen"];
+    screen.extend([
+        "│ Do you trust this folder?                    │",
+        "│ › 1. Trust folder (project)                  │",
+        "│   3. Don't trust (esc)                       │",
+    ]);
+    assert_rule("qwen", &screen, "trust_folder", Blocked);
+    let mut previous = COMPOSER.to_vec();
+    previous.extend(screen);
+    assert_rule("qwen", &previous, "trust_folder", Blocked);
+}

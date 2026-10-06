@@ -217,3 +217,31 @@ fn dialogs_the_person_opened_leave_the_reading_alone() {
     );
     assert_not_rule("gemini", COMPOSER, "dialog_open");
 }
+
+/// Gemini draws inline: a live trust dialog has the shell's scrollback above it, a
+/// `git branch` line or a previous session's composer among it.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    const TRUST: &[&str] = &[
+        "╭──────────────────────────────────────────────╮",
+        "│ Do you trust the files in this folder?       │",
+        "│ ● 1. Trust folder (project)                  │",
+        "│   2. Trust parent folder (code)              │",
+        "│   3. Don't trust                             │",
+        "╰──────────────────────────────────────────────╯",
+    ];
+    let mut branch = vec!["$ git branch", "* main", "  feature", "$ gemini"];
+    branch.extend(TRUST);
+    assert_rule("gemini", &branch, "trust_folder", Blocked);
+    let mut previous = COMPOSER.to_vec();
+    previous.push("$ cd ../other && gemini");
+    previous.extend(TRUST);
+    assert_rule("gemini", &previous, "trust_folder", Blocked);
+    let mut auth = COMPOSER.to_vec();
+    auth.extend([
+        "$ gemini",
+        "│ ? Get started                                │",
+        "│ How would you like to authenticate for this project? │",
+    ]);
+    assert_rule("gemini", &auth, "auth_dialog", Blocked);
+}

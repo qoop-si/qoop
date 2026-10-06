@@ -50,7 +50,7 @@ all = [
   { line_regex = '^\W*Warning: Kiro is running in trust all tools mode' },
   { line_regex = '^\W*(\S\s+)?No, exit\s*$' },
 ]
-not = [{ line_regex = '^\W*(> |! )?(ask a question or describe a task|Kiro is working)' }]
+not = [{ regex = '(?s)Warning: Kiro is running in trust all tools mode.*\n\W*(> |! )?(ask a question or describe a task|Kiro is working)' }]
 
 # Sign-in from the host: `Press enter to continue to the browser or esc to cancel`, the
 # screen's last line while it waits (`bin/kiro-cli`).

@@ -120,6 +120,9 @@ export const QoroPlugin = async () => ({
         if (type === "busy" || type === "retry") {
           report("working", { sessionID: p.sessionID });
         } else if (type === "idle" && !children.has(p.sessionID)) {
+          // The turn is over: nothing it asked can still be waiting, even when an
+          // answer came without a reply event that named its request.
+          pending.clear();
           report("idle", { sessionID: p.sessionID });
         }
         break;

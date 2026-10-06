@@ -147,9 +147,6 @@ fn the_status_line_is_working() {
         "",
     ]);
     assert_not_rule("codex", &quoted, "status_interrupt");
-    let quoted_at_the_margin = with_composer(&["• Working (2s • esc to interrupt)", ""]);
-    assert_not_rule("codex", &quoted_at_the_margin, "status_interrupt");
-
     assert_not_rule(
         "codex",
         &with_composer(&[
@@ -215,7 +212,21 @@ fn a_numbered_menu_is_a_blocker() {
         "  3. Skip until next version",
     ];
     assert_rule("codex", &menu, "numbered_menu", Blocked);
+    // The update prompt as its snapshot draws it, ending with its own hint line.
+    let prompt = [
+        "  ✨ Update available! 0.153.4 -> 0.154.0",
+        "",
+        "  Release notes: https://github.com/openai/codex/releases/latest",
+        "",
+        "› 1. Update now (runs `npm install -g @openai/codex`)",
+        "  2. Skip",
+        "  3. Skip until next version",
+        "",
+        "  enter continue · esc skip",
+    ];
+    assert_rule("codex", &prompt, "numbered_menu", Blocked);
     // One numbered line is ordinary output.
+
     assert_not_rule("codex", &["› 1. Update now"], "numbered_menu");
     // A list without the marker is an answer, with the composer under it.
     let answer = with_composer(&["• Done. Two changes:", "  1. the parser", "  2. a test", ""]);
@@ -299,4 +310,19 @@ fn the_transcript_pager_and_a_picker_leave_the_reading_alone() {
         "picker_open",
     );
     assert_not_rule("codex", EXEC_APPROVAL, "picker_open");
+}
+
+/// A turn running over an empty composer keeps the idle footer (`status_only_snapshot`):
+/// the status line still reads working.
+#[test]
+fn a_working_line_over_an_empty_composer_is_working() {
+    let screen = [
+        "• Working (0s • esc to interrupt)",
+        "",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  ? for shortcuts            100% context left",
+    ];
+    assert_rule("codex", &screen, "status_interrupt", Working);
 }

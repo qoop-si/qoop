@@ -121,3 +121,17 @@ fn the_model_picker_leaves_the_reading_alone() {
     );
     assert_not_rule("copilot", COMPOSER, "model_picker");
 }
+
+/// A live trust dialog under a previous session's composer band.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = COMPOSER.to_vec();
+    screen.extend([
+        "$ cd ../other && copilot",
+        "╭ Confirm folder trust ───────────────────╮",
+        "│ Do you trust the files in this folder?   │",
+        "│ ❯ 1. Yes                                 │",
+        "╰──────────────────────────────────────────╯",
+    ]);
+    assert_rule("copilot", &screen, "folder_trust", Blocked);
+}

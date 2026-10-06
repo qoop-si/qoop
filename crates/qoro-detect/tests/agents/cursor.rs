@@ -218,3 +218,17 @@ fn pagers_leave_the_reading_alone() {
     );
     assert_not_rule("cursor", PROMPT, "pager_open");
 }
+
+/// A live trust dialog under a previous session's prompt.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = PROMPT.to_vec();
+    screen.extend([
+        "$ cd ../other && cursor-agent",
+        "Workspace Trust Required",
+        "Do you trust the contents of this directory?",
+        "→ Trust this workspace (a)",
+        "  Quit (q)",
+    ]);
+    assert_rule("cursor", &screen, "workspace_trust", Blocked);
+}

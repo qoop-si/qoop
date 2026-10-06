@@ -74,10 +74,13 @@ all = [
 # Any other numbered menu in the composer's place, as the update prompt draws it in a real
 # session (`  ✨ Update available! ...`, `› 1. Update now (...)`, `  2. Skip`): the selected
 # row `› 1. ...` and at least one more numbered row, the last of them the screen's last
-# line. One numbered line is ordinary output and a list without the marker is an answer. A
-# numbered draft in the composer looks the same, but has the composer's footer under it
-# (`? for shortcuts`, `context left`, `tab to queue message`, the model and directory), and
-# rows quoted in an answer have the composer row (`› ` and text that is not a number) too.
+# line or followed only by the prompt's hint (`  enter continue · esc skip`,
+# `update_prompt__tests__update_prompt_modal.snap`). One numbered line is ordinary output
+# and a list without the marker is an answer. A numbered draft in the composer looks the
+# same, but has the composer's footer under it (`? for shortcuts`, `context left`,
+# `tab to queue message`, the model and directory), and rows quoted in an answer have the
+# composer row (`› ` and text that is not a number) too.
+
 [[rules]]
 id = "numbered_menu"
 state = "blocked"
@@ -87,7 +90,8 @@ visible_blocker = true
 all = [
   { line_regex = '^› \d+\. ' },
   { line_regex = '^\s+\d+\. \S' },
-  { regex = '(?m)^(› |\s+)\d+\. [^\n]*\z' },
+  { regex = '(?m)^(› |\s+)\d+\. [^\n]*(\n\s*enter [^\n]*· esc [^\n]*)?\z' },
+
 ]
 not = [
   { line_regex = '^› \D' },
@@ -100,8 +104,9 @@ not = [
 # `·` (`(11s · esc to interrupt)`), so either is read. The header changes, the timer and
 # the interrupt hint do not. The line starts at the first column (the glyph, or the header
 # when the glyph is hidden) and ends at the hint or its tail, so the same words inside an
-# answer, indented, do not count; nor does a screen whose footer is the idle
-# `? for shortcuts`.
+# answer, indented under its `• `, do not count. The footer is no evidence either way: with
+# an empty composer it reads `? for shortcuts` while a turn runs too
+# (`bottom_pane__tests__status_only_snapshot.snap`).
 [[rules]]
 id = "status_interrupt"
 state = "working"
@@ -109,7 +114,6 @@ priority = 200
 region = "bottom_non_empty_lines(8)"
 visible_working = true
 line_regex = '^\S.*\([^()•·]+ [•·] [^()]+ to interrupt\)( · .*)?\s*$'
-not = [{ line_regex = '^\s*\? for shortcuts' }]
 
 
 # The footer under the composer while a turn runs: `tab to queue message`

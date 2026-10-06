@@ -20,8 +20,9 @@ line_regex = '^\W*(Use arrow keys to navigate, Enter to select, Esc or Q to go b
 
 # A tool confirmation: the option rows `Yes, allow` (or `Yes, allow all`) and
 # `No, cancel` (or `No, cancel all`, prefixed `✕ ` when selected), while the spinner label
-# reads `Waiting for tool confirmation...`. The help hint under the idle input
-# (`Press ? for help`) under the same words means they were quoted.
+# reads `Waiting for tool confirmation...`. That label is drawn only while a confirmation is
+# open, which is what a quote of the options lacks. Whether the input and its help line stay
+# under a live confirmation is not sourced, so nothing under it is read.
 [[rules]]
 id = "tool_confirmation"
 state = "blocked"
@@ -33,10 +34,10 @@ all = [
   { line_regex = '^\W*(✕ )?No, cancel( all)?\s*\W*$' },
   { contains = "Waiting for tool confirmation..." },
 ]
-not = [{ line_regex = '^\W*Press \? for help' }]
 
 # Droid Shield, after a secret was found: `Droid-Shield approval required` with the option
-# `Proceed & report false positive`, without the idle input's help hint under them.
+# `Proceed & report false positive`. The idle input's help hint (`Press ? for help`) coming
+# after those words means they were quoted above the input.
 [[rules]]
 id = "droid_shield"
 state = "blocked"
@@ -47,10 +48,12 @@ all = [
   { line_regex = '^\W*Droid-Shield approval required' },
   { line_regex = '^\W*(✕ )?Proceed & report false positive' },
 ]
-not = [{ line_regex = '^\W*Press \? for help' }]
+not = [{ regex = '(?s)Proceed & report false positive.*\n\W*Press \? for help' }]
 
 # A question to the person: the label `ASK USER` and a help line ending `ESC stop agent`
-# (or `Enter Submit answer • ↑ back to options • ESC stop agent`).
+# (or `Enter Submit answer • ↑ back to options • ESC stop agent`), unless the idle input's
+# help hint comes after it.
+
 [[rules]]
 id = "ask_user"
 state = "blocked"
@@ -61,7 +64,7 @@ all = [
   { line_regex = '^\W*ASK USER\b' },
   { line_regex = '^\W*(↑/↓ Navigate|Enter Submit answer) • .+ • ESC stop agent\s*\W*$' },
 ]
-not = [{ line_regex = '^\W*Press \? for help' }]
+not = [{ regex = '(?s)ESC stop agent.*\n\W*Press \? for help' }]
 
 
 # Folder trust at startup: `Trust this folder?`, the options `1. Trust this folder` and
@@ -79,7 +82,7 @@ all = [
   { line_regex = '^\W*Trust this folder\?' },
   { line_regex = '^\W*Enter to confirm · Esc to exit' },
 ]
-not = [{ line_regex = '^\W*Press \? for help' }]
+not = [{ regex = '(?s)Trust this folder\?.*\n\W*Press \? for help' }]
 
 # Sign-in: `Login with Factory account` and `Continue with API key`.
 [[rules]]
@@ -93,7 +96,7 @@ all = [
   { line_regex = '^\W*Login with Factory account' },
   { line_regex = '^\W*Continue with API key' },
 ]
-not = [{ line_regex = '^\W*Press \? for help' }]
+not = [{ regex = '(?s)Login with Factory account.*\n\W*Press \? for help' }]
 
 # The spinner label by session status: `Thinking...`, `Streaming...`, `Invoking tools...`,
 # `Executing...`, `Compressing history...` and the others, or the hint

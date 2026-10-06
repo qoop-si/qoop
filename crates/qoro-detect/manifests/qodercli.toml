@@ -62,10 +62,7 @@ all = [
   { line_regex = '^\W*Do you trust the files in this folder\?' },
   { line_regex = "^\\W*(\\d+\\. )?Don't trust and exit" },
 ]
-not = [
-  { contains = "Type your message or @path/to/file" },
-  { contains = "Type your shell command" },
-]
+not = [{ regex = '(?s)Do you trust the files in this folder\?.*Type your (message or @path/to/file|shell command)' }]
 
 # The loading row: a spinner, a phrase, then `(esc to cancel, <duration>)`.
 [[rules]]

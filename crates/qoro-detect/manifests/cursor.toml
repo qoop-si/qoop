@@ -101,10 +101,7 @@ all = [
   { line_regex = '^\W*Workspace Trust Required' },
   { line_regex = '^\W*Do you trust the contents of this directory\?' },
 ]
-not = [
-  { contains = "Plan, search, build anything" },
-  { contains = "Add a follow-up" },
-]
+not = [{ regex = '(?s)Do you trust the contents of this directory\?.*(Plan, search, build anything|Add a follow-up)' }]
 
 # The generating row: a two-column braille spinner (`⠀⠞`, `⠠⠜`, `⠰⠰`, `⠘⠤`, `⠘⠆`, `⠘⠣`,
 # `⠰⠳`, `⠠⠛`) then a label (`Thinking`, `Working`, `Composing`, `Reconnecting`, ...).

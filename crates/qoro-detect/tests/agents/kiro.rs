@@ -161,3 +161,16 @@ fn the_title_reads_working_and_ready() {
     assert_rule_titled("kiro", &[""], "kiro: ~/project", "title_ready", Idle);
     assert_not_rule_titled("kiro", &[""], "zsh", "title_ready");
 }
+
+/// A live trust-all warning under a previous session's composer.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut screen = COMPOSER.to_vec();
+    screen.extend([
+        "$ kiro-cli --trust-all-tools",
+        "Warning: Kiro is running in trust all tools mode",
+        "❯ No, exit",
+        "  Yes, I accept",
+    ]);
+    assert_rule("kiro", &screen, "trust_all_tools_warning", Blocked);
+}

@@ -70,7 +70,7 @@ all = [
   { line_regex = '^[│\s]*Do you trust the files in this folder\?' },
   { line_regex = '^[│\s]*(● )?(\d+\. )?Trust folder \(' },
 ]
-not = [{ line_regex = '^[│\s]*[>!*] ' }]
+not = [{ regex = '(?s)Do you trust the files in this folder\?.*\n[│\s]*[>!*] ' }]
 
 # The sign-in dialog at startup: `Get started` over
 # `How would you like to authenticate for this project?` (`auth/AuthDialog.tsx`). The
@@ -86,7 +86,7 @@ all = [
   { line_regex = '^[│\s]*(\? )?Get started' },
   { line_regex = '^[│\s]*How would you like to authenticate for this project\?' },
 ]
-not = [{ line_regex = '^[│\s]*[>!*] ' }]
+not = [{ regex = '(?s)How would you like to authenticate for this project\?.*\n[│\s]*[>!*] ' }]
 
 # The loading line above the composer: a phrase, then `(esc to cancel, 5s)`, the time
 # turning into a duration after a minute (`LoadingIndicator.tsx` and its snapshot).

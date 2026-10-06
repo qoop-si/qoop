@@ -54,7 +54,7 @@ all = [
   { line_regex = '^[│\s]*Do you trust this folder\?' },
   { line_regex = '^[│\s]*(› )?(\d+\. )?Trust folder \(' },
 ]
-not = [{ line_regex = '^[│\s]*[>!] ' }]
+not = [{ regex = '(?s)Do you trust this folder\?.*\n[│\s]*[>!] ' }]
 
 # The loading line above the composer ends `(<time>[ · ↓ N tokens] · esc to cancel)`
 # (`LoadingIndicator.tsx`). The phrase before it is random, so only the suffix is read.

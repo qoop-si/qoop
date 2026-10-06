@@ -38,7 +38,7 @@ all = [
   { line_regex = '^\W*Do you trust the contents of this directory\?' },
   { line_regex = '^\W*Grok Build may run or modify contents in this directory,' },
 ]
-not = [{ line_regex = '^\W*(Build anything|Message Grok\.\.\.)\s*\W*$' }]
+not = [{ regex = '(?s)Do you trust the contents of this directory\?.*\n\W*(Build anything|Message Grok\.\.\.)\s*\W*(\n|\z)' }]
 
 # grok-cli: the payment approval panel, drawn with a left border `┃`: `Payment required`
 # and the hint row `↑↓ select   enter confirm   esc reject`. The border is what an answer

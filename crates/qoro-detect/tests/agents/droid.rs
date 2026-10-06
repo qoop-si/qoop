@@ -25,15 +25,14 @@ fn a_tool_confirmation_is_a_blocker() {
         "⠋ Waiting for tool confirmation...",
     ];
     assert_rule("droid", &screen, "tool_confirmation", Blocked);
-    let quoted = with_input(&[
-        "  It offers:",
-        "  Yes, allow",
-        "  No, cancel",
-        "⠋ Waiting for tool confirmation...",
-    ]);
-
+    let quoted = with_input(&["  It offers:", "  Yes, allow", "  No, cancel"]);
     assert_not_rule("droid", &quoted, "tool_confirmation");
     assert_no_blocker("droid", &quoted);
+    // Whether the input stays under a live confirmation is not sourced: if it does, the
+    // confirmation is still read.
+    let mut with_input_below = screen.to_vec();
+    with_input_below.extend(INPUT);
+    assert_rule("droid", &with_input_below, "tool_confirmation", Blocked);
 }
 
 #[test]
@@ -147,4 +146,32 @@ fn pickers_leave_the_reading_alone() {
         "picker_open",
     );
     assert_not_rule("droid", INPUT, "picker_open");
+}
+
+/// Live gates under a previous session's input and its help hint.
+#[test]
+fn a_live_gate_under_scrollback_is_still_a_gate() {
+    let mut trust = INPUT.to_vec();
+    trust.extend([
+        "$ cd ../other && droid",
+        "Trust this folder?",
+        "> 1. Trust this folder",
+        "  2. Exit without trusting",
+        "Enter to confirm · Esc to exit",
+    ]);
+    assert_rule("droid", &trust, "folder_trust", Blocked);
+    let mut login = INPUT.to_vec();
+    login.extend([
+        "$ droid",
+        "> Login with Factory account",
+        "  Continue with API key",
+    ]);
+    assert_rule("droid", &login, "login", Blocked);
+    let mut shield = INPUT.to_vec();
+    shield.extend([
+        "  Droid-Shield approval required",
+        "  ✕ Proceed anyway",
+        "    Proceed & report false positive",
+    ]);
+    assert_rule("droid", &shield, "droid_shield", Blocked);
 }
