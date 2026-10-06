@@ -21,8 +21,6 @@ members = [
     "crates/qoro-bench",
     "crates/qoro-detect",
     "crates/qoro-history",
-    "crates/qoro-hub",
-    "crates/qoro-bridge",
     "spikes/spike-runtime",
 ]
 

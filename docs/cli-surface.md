@@ -113,6 +113,10 @@ A word that is not a subcommand is an error naming it, not the interface: `qoro 
 says so and exits 1. Every error prints as one `qoro: ...` line on stderr and exits
 nonzero.
 
+The phone commands (pair, devices and bridge) run `qoro-bridge`, the phone app's end of this
+machine, with the same arguments: the one next to qoro, else the one on PATH. Without it they
+say it is not installed, and a bridge reload does nothing.
+
 Three rows say yes, and each is the point of its row: `qoro update` reaches GitHub
 Releases, and `qoro pair` and `qoro bridge` reach the hub a phone uses, and only once a
 person has asked for a phone. Nothing else touches the network: no control plane, no

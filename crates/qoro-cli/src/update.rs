@@ -151,8 +151,14 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     crate::notch::restart_if_installed();
     // The same for a phone's bridge service, which would otherwise keep the old build or,
     // once launchd has pinned the replaced file, never start again.
-    if let Err(e) = crate::mobile::reload_service() {
-        eprintln!("qoro: the bridge service was not reloaded ({e}); run `qoro bridge reload`");
+    let reload = crate::bridge_binary()
+        .args(["bridge", "reload"])
+        .stdout(std::process::Stdio::null())
+        .status();
+    match reload {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(status) if status.success() => {}
+        _ => eprintln!("qoro: the bridge service was not reloaded; run `qoro bridge reload`"),
     }
     Ok(())
 }

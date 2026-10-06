@@ -194,60 +194,32 @@ fn update_fails_closed_with_the_network_gone() {
     );
 }
 
-/// `qoro pair` with the hub unreachable fails closed and leaves nothing behind: no machine
-/// key, no device list, no service. HOME and every XDG directory point at a temp dir, so a
-/// real home is never touched even if the check regressed.
+/// With no `qoro-bridge` beside qoro or on PATH, a phone command says what is missing, and a
+/// bridge reload (what install and update run) has nothing to do.
 #[test]
-fn pair_fails_closed_with_the_hub_gone() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::set_permissions(
-        dir.path(),
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-    )
-    .expect("chmod");
-    let home = dir.path().join("home");
-    std::fs::create_dir(&home).expect("home");
-    // An installed qoro, as `scripts/install.sh` leaves one, so the run gets as far as the
-    // network rather than stopping at "install qoro first".
-    let installed = home.join(".local/bin/qoro");
-    std::fs::create_dir_all(installed.parent().expect("parent")).expect("bin dir");
-    std::os::unix::fs::symlink(qoro(), &installed).expect("symlink");
-    let out = Command::new(qoro())
-        .args(["pair", "--hub", "ws://127.0.0.1:1"])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("QORO_RUNTIME_DIR", dir.path().join("rt"))
-        .output()
-        .expect("run qoro");
-    assert!(!out.status.success(), "`qoro pair` succeeded with no hub");
+fn phone_commands_need_qoro_bridge() {
+    let run = |args: &[&str]| {
+        Command::new(qoro())
+            .args(args)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run qoro")
+    };
+    let out = run(&["pair", "--hub", "ws://127.0.0.1:1"]);
+    assert!(!out.status.success(), "`qoro pair` succeeded with no bridge");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("127.0.0.1:1"),
-        "the failure does not say what it could not reach: {stderr}"
+        stderr.contains("qoro-bridge") && stderr.contains("not installed"),
+        "the failure does not say what is missing: {stderr}"
     );
-    let left: Vec<_> = walk(&home)
-        .into_iter()
-        .filter(|p| p != &installed)
-        .collect();
+    let out = run(&["bridge", "reload"]);
     assert!(
-        left.is_empty(),
-        "a failed pairing left files behind: {left:?}"
+        out.status.success(),
+        "`qoro bridge reload` failed with no bridge: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(walk(&path));
-        } else {
-            out.push(path);
-        }
-    }
-    out
-}
 
 /// A mistyped `--check` is not a request to install: it is refused before anything
 /// reaches the network.

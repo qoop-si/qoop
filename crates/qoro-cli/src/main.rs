@@ -21,7 +21,6 @@ mod config;
 mod hooks;
 mod launchd;
 mod mirror;
-mod mobile;
 mod notch;
 mod onboard;
 mod page;
@@ -143,9 +142,7 @@ fn run() -> std::io::Result<()> {
         Some("paths") => places::run(&args[2..]),
         Some("qass") => qass::run_qass(&args),
         Some("update") => update::run(&args),
-        Some("pair") => mobile::run_pair(&args),
-        Some("devices") => mobile::run_devices(&args),
-        Some("bridge") => mobile::run_bridge(&args),
+        Some("pair" | "devices" | "bridge") => run_bridge_binary(&args),
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
@@ -2501,6 +2498,32 @@ fn explain_row(row: &qoro_runtime::control::AgentRow) -> String {
         ));
     }
     text
+}
+
+/// `qoro pair`, `qoro devices` and `qoro bridge` belong to the phone app, in a binary of its
+/// own: the `qoro-bridge` next to this one, else the one on PATH.
+pub(crate) fn bridge_binary() -> Command {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("qoro-bridge")))
+        .filter(|path| path.exists());
+    Command::new(beside.unwrap_or_else(|| PathBuf::from("qoro-bridge")))
+}
+
+/// Become `qoro-bridge` with the same arguments, so a pairing keeps this terminal's stdin.
+fn run_bridge_binary(args: &[String]) -> std::io::Result<()> {
+    let err = bridge_binary().args(&args[1..]).exec();
+    if err.kind() != std::io::ErrorKind::NotFound {
+        return Err(err);
+    }
+    // With no bridge installed there is no bridge service to put back on a new binary.
+    if args[1..] == ["bridge", "reload"] {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "`qoro {}` needs qoro-bridge, the phone app's end of this machine, and it is not installed",
+        args[1]
+    )))
 }
 
 /// Start the daemon if there is not one, and wait for its socket.
