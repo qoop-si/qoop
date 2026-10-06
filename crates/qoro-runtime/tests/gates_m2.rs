@@ -1426,7 +1426,7 @@ async fn g2_17_a_screen_that_never_settles_is_read_anyway() {
         &source,
         "fn main() {\n\
          \x20   for n in 0.. {\n\
-         \x20       println!(\"\\u{2022} Working ({n}s \\u{b7} esc to interrupt)\");\n\
+         \x20       println!(\"\\u{2022} Working ({n}s \\u{2022} esc to interrupt)\");\n\
          \x20       std::thread::sleep(std::time::Duration::from_millis(50));\n\
          \x20   }\n\
          }\n",

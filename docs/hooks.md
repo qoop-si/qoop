@@ -96,10 +96,12 @@ Notes:
 - aider has no lifecycle hook system, only `--lint-cmd`/`--test-cmd`. A generic
   command-hook feature is an open request (issue #2557). Aider stays on screen
   detection until that ships.
-- opencode's event names follow the plugin vocabulary used by its own
-  lifecycle; the mapping mirrors the session-status table (`idle` to idle,
-  `active`/`busy`/`pending`/`retry`/`running`/`streaming`/`working` to
-  working, `permission.asked` to blocked).
+- opencode: `session.status` `busy` and `retry` report working, `idle` and
+  `session.idle` idle, `permission.asked` (`permission.updated` in older
+  plugin types) and `question.asked` blocked, their replies working again,
+  and `session.error` failed. A subagent session (one with a parent) never
+  sends its id and never reports idle, because it is not the conversation a
+  person resumes. Reports go out one at a time, in event order.
 - claude's `Notification` is blocked only for the kinds that wait on the
   person: `permission_prompt`, `elicitation_dialog`,
   `elicitation_url_dialog`, `agent_needs_input` and `quota_auto_resume_stale`

@@ -11,26 +11,22 @@ timeout, conversation kept).
 
 ## Detected agents
 
-How well each is known is said plainly: rules checked against real screens of the agent are
-more trustworthy than rules adapted from another project's descriptions.
+Every agent's rules are written from its own sources, and the table says which. Where those
+sources give the words but not where they are drawn, the screen is not read and the generic
+rules or the hook carry the state.
 
-| Agent | Screen rules | Hook | Checked against |
+| Agent | Screen rules | Hook | Written from |
 |---|---|---|---|
-| Claude Code | yes | full | recorded sessions, real captures |
-| Codex | yes | full | recorded sessions |
-| Gemini CLI | yes | full | recorded sessions |
-| OpenCode | yes | full (plugin) | recorded sessions |
-| Cursor agent | yes | partial | recorded sessions |
-| Amp | yes | by hand | recorded sessions |
-| Devin | yes | none | real captures |
-| Muse | yes | none | real captures |
-| GitHub Copilot CLI | yes | conversation id | adapted rules |
-| Factory Droid | yes | conversation id | adapted rules |
-| Qwen Code | yes | conversation id | adapted rules |
-| Qoder CLI | yes | conversation id | adapted rules |
-| Grok CLI | yes | none | adapted rules |
-| Kimi, Kiro, Kilo, Hermes, Cline, Antigravity, Maki | yes | none | adapted rules |
-| Pi | yes | none | identity checked live, rules adapted |
+| Claude Code | yes | full | its package's strings, plus screens from real sessions |
+| Codex | yes | full | its open source, plus screens from real sessions |
+| OpenCode | yes | full (plugin) | its open source, plus screens from real sessions |
+| Gemini CLI | yes | full | its open source |
+| Cursor agent | yes | partial | its package |
+| Amp | resume only | by hand | its package (no screen layout in it) |
+| Qwen Code, Kilo, Cline, Kimi, Maki, Pi, Hermes, Grok | yes | none or conversation id | their open source |
+| GitHub Copilot CLI, Factory Droid, Qoder CLI, Kiro | yes | none or conversation id | their packages |
+| Devin | working and idle only | none | its binary and documentation |
+| Antigravity, Muse | startup gates only | none | their binaries and documentation |
 | Aider, Goose | generic | Goose by hand | generic rules |
 
 Anything else is read by the generic rules, and a shell reads as a shell.
@@ -38,9 +34,10 @@ Anything else is read by the generic rules, and a shell reads as a shell.
 ## Names that other programs use
 
 `pi`, `hermes`, `kilo`, `muse` and `maki` are also the names of unrelated programs, so they
-count as agents only when the process shows it: the package it came from, a runtime running
-it, or muse's versioned binary. A plain `kilo` editor is never treated as an agent, so the
-idle timeout and restore never act on it.
+count as agents only when the process shows it: the package it came from or a runtime
+running it. A plain `kilo` editor is never treated as an agent, so the idle timeout and
+restore never act on it. Muse installs only a launcher named `muse`, so it is not
+recognised yet.
 
 ## Overriding a rule
 

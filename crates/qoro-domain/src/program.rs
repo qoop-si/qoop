@@ -39,10 +39,8 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["cursor", "cursor-agent"],
     &["aider"],
     // `opencode2` is the OpenCode 2 binary, from its own v2 documentation.
-    // `open-code` is a spelling observed in the wild.
-    &["opencode", "opencode2", "open-code"],
-    // `amp-local` is a spelling observed in the wild, carried for the same reason.
-    &["amp", "amp-local"],
+    &["opencode", "opencode2"],
+    &["amp"],
     &["goose"],
     // Agents with no bundled screen rules yet, listed here so that what is running in a
     // terminal is named correctly and so that a restart knows whose conversation to carry
@@ -52,21 +50,21 @@ const AGENT_ALIASES: &[&[&str]] = &[
     &["qwen"],
     &["grok"],
     &["copilot"],
-    // Spellings that name only the agent: `qoder` is also the name of an IDE, so it is
-    // left out.
-    &["devin", "devin-cli"],
-    &["kiro", "kiro-cli"],
-    &["kimi", "kimi-code", "kimi-cli"],
+    // Each agent's own executable and package names. `qoder` is also the name of an IDE,
+    // so it is left out.
+    &["devin"],
+    &["kiro", "kiro-cli", "kiro-cli-chat"],
+    &["kimi", "kimi-cli"],
     &["cline"],
-    &["antigravity", "agy", "antigravity-cli"],
-    &["qodercli", "qoderclicn"],
+    &["antigravity", "agy"],
+    &["qodercli"],
     // Agents whose own name is an ordinary word, so it is never enough on its own: see
     // `GENERIC_NAMES`. The other spellings are their packages and install directories,
     // which name nothing else.
     &["pi", "pi-coding-agent"],
     &["hermes", "hermes-agent"],
-    &["kilo", "kilo-code", "kilocode", "@kilocode/cli"],
-    &["muse", "muse-code", "muse-cli"],
+    &["kilo", "kilocode", "@kilocode/cli"],
+    &["muse"],
     &["maki"],
 ];
 
@@ -86,7 +84,7 @@ pub fn agent_names() -> Vec<&'static str> {
 /// agent is not a label: it is what lets the idle reaper close a terminal and a restore
 /// run a resume line in it. So the bare executable name never counts for these. What
 /// counts is evidence only the agent leaves: its package (`pi-coding-agent`,
-/// `@kilocode/cli`), its versioned binary (`muse-bin-0.1.0`), or the name as the script
+/// `@kilocode/cli`), or the name as the script
 /// a JavaScript or Python runtime is running, which is how `pi` and `hermes` run: node
 /// retitles itself `pi`, and hermes is a Python entry point.
 const GENERIC_NAMES: &[&str] = &["pi", "hermes", "kilo", "muse", "maki"];
@@ -213,23 +211,12 @@ fn from_path(path: &str, wrapped: bool) -> Program {
 /// launched under, because that is a person's own script and its name is theirs.
 ///
 /// A Windows script suffix (`.exe`, `.cmd`, `.bat`, `.ps1`) is stripped before the
-/// lookup, so each agent has one name
-/// to match: on Windows the Cursor agent runs as `cursor-agent.cmd`, and the
+/// lookup: on Windows the Cursor agent runs as `cursor-agent.cmd`, and the
 /// same stripping maps `opencode2.exe` to `opencode2`. `.js` is deliberately not
 /// stripped: a node script named by its file goes through the package-name channel
 /// above instead.
 fn canonical_agent(name: &str) -> Option<&'static str> {
     let candidate = strip_script_suffix(name);
-    // Muse's launcher resolves the active release and execs `muse-bin-<version>`, so the
-    // running process never carries a bare name. A digit must follow the prefix, so
-    // `muse-binary` and a bare `muse-bin` stay unmatched.
-    if candidate
-        .get(..9)
-        .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
-        && candidate[9..].starts_with(|c: char| c.is_ascii_digit())
-    {
-        return Some("muse");
-    }
     AGENT_ALIASES
         .iter()
         .find(|row| {
@@ -402,8 +389,6 @@ mod tests {
             ("claude-code", "claude"),
             ("cursor-agent", "cursor"),
             ("opencode2", "opencode"),
-            ("open-code", "opencode"),
-            ("amp-local", "amp"),
         ] {
             let program = identify(&format!("/usr/local/bin/{launched}"), &[]);
             assert_eq!(program.name, shown, "{launched} should be shown as {shown}");
@@ -413,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_windows_script_suffix_is_stripped_before_the_lookup() {
-        // Suffixes are stripped before matching: the Cursor agent runs as `cursor-agent.cmd` on Windows, and the same
+        // The Cursor agent runs as `cursor-agent.cmd` on Windows, and the same
         // file name resolves here too. Paths stay Unix-style: this crate never
         // sees a backslash separator on its platforms.
         for (launched, shown) in [
@@ -648,12 +633,7 @@ mod tests {
                 vec!["node", "/x/node_modules/@kilocode/cli/bin/kilo.js"],
                 "kilo",
             ),
-            (
-                "/Users/u/.muse/releases/muse-bin-0.1.0-R708.1",
-                vec!["muse-bin-0.1.0-R708.1"],
-                "muse",
-            ),
-            ("/usr/local/bin/kilo-code", vec!["kilo-code"], "kilo"),
+            ("/usr/local/bin/kilocode", vec!["kilocode"], "kilo"),
             (
                 "/usr/local/bin/hermes-agent",
                 vec!["hermes-agent"],
@@ -663,10 +643,6 @@ mod tests {
             let program = identify(executable, &argv(&args));
             assert_eq!(program.name, shown, "{executable} {args:?}");
             assert!(program.agent, "{executable} {args:?}");
-        }
-        // Near misses stay what they are.
-        for name in ["muse-bin", "muse-binary", "muse-bin-x1"] {
-            assert!(!identify(&format!("/opt/{name}"), &[]).agent, "{name}");
         }
     }
 

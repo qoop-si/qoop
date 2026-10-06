@@ -1236,8 +1236,8 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     let agent = dir.join("claude");
     std::fs::write(
         &agent,
-        "#!/bin/sh\nprintf 'Do you want to proceed with this edit?\\n'\n\
-         printf '  1. Yes\\n  2. No\\n'\nsleep 30\n",
+        "#!/bin/sh\nprintf '\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\\n'\n\
+         printf ' Do you want to proceed?\\n \u{276F} 1. Yes\\n   2. No\\n'\nsleep 30\n",
     )
     .expect("write");
     std::fs::set_permissions(
@@ -1759,7 +1759,8 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     let agent = dir.join("claude");
     std::fs::write(
         &agent,
-        "#!/bin/sh\nprintf 'Do you want to proceed?\\n'\nprintf '  1. Yes\\n  2. No\\n'\nsleep 30\n",
+        "#!/bin/sh\nprintf '\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\\n'\n\
+         printf ' Do you want to proceed?\\n \u{276F} 1. Yes\\n   2. No\\n'\nsleep 30\n",
     )
     .expect("write");
     std::fs::set_permissions(

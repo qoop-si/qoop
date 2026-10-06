@@ -14,13 +14,16 @@ rebuilding.
 `qodercli`, plus `generic` for everything without its own manifest (a bare
 shell prompt reads as idle; anything else reads as nothing).
 
-The rules for `copilot` onwards, and part of `claude`'s, are written for this
-engine, and each file says in its header what it was checked against. Every blocker rule among them is tested
-against the same words quoted in an answer above the agent's idle prompt, and
-these rules read the live bottom of the screen
-or refuse while an empty composer is showing, so a quoted question cannot
-pin an idle agent as waiting. Most were written without a capture of that
-agent's own screen, and each file says which.
+Every rule is written from the agent's own sources: its open repository where it has
+one, otherwise the strings in its published package or binary, otherwise its documentation.
+Each file's header names the source and version it was read from, and each rule says which
+screen it reads. Where a source gives the words but not where they are drawn, there is no
+rule for that screen: `amp` carries only its `[resume]` table, `antigravity` and `muse` read
+only their startup gates, and `devin` reads no dialog. Every blocker rule is tested against
+the same words quoted in an answer above the agent's idle prompt: blockers read the live
+bottom of the screen, or the dialog under its own rule, so a quoted question cannot pin an
+idle agent as waiting. Screens copied off real sessions of `claude`, `codex` and `opencode`
+are kept as tests of the engine as well.
 
 `aider` and `goose` ship a manifest that carries only a `[resume]` table and no
 rules. How to carry a conversation across a restart is a different question
@@ -31,9 +34,10 @@ generic ones, so they are read exactly as they were before.
 `pi`, `hermes`, `kilo`, `muse` and `maki` are also ordinary words and other
 programs' names, so a program with one of those names counts as an agent only on
 evidence the agent alone leaves: its package (`pi-coding-agent`,
-`@kilocode/cli`), its versioned binary (`muse-bin-0.1.0`), or the name as the
-script a JavaScript or Python runtime is running. A bare executable called `pi`
-is somebody else's tool, and the idle reaper and a restore leave it alone.
+`@kilocode/cli`, `hermes-agent`) or the name as the script a JavaScript or Python
+runtime is running. A bare executable called `pi` is somebody else's tool, and the
+idle reaper and a restore leave it alone. Muse installs a launcher named `muse` and
+nothing else of its own name, so it is not recognised yet.
 
 ## The rule schema
 
@@ -52,9 +56,7 @@ contains = "esc to cancel"
 ```
 
 - One string per leaf: `contains` (case insensitive), `regex` (whole region),
-  `line_regex` (any single line). An array form
-  does not parse here;
-  expand it into `any` branches.
+  `line_regex` (any single line). Several strings are several `any` branches.
 - Nestable `all` / `any` / `not` gates; every part present must hold.
 - Regions: `whole_screen`, `bottom_lines(N)`, `bottom_non_empty_lines(N)`,
   `top_non_empty_lines(N)`, `after_last_prompt_marker`, `osc_title`, and from
@@ -78,13 +80,12 @@ contains = "esc to cancel"
 
 ## Known behaviour
 
-- A rule with `skip_state_update` that wins (Claude's and Codex's transcript viewer,
-  Claude's model picker) leaves the last reading in place for as long as it stays on
+- A rule with `skip_state_update` that wins (a transcript viewer, a model picker) leaves the last reading in place for as long as it stays on
   screen, with no expiry: closing the pager redraws the live prompt, and the next look
   reads that. A working agent whose pager is left open reads working until it is closed.
-- Claude's `live_prompt_box` reads the box drawn between two rules as idle at priority 950. It outranks the permission rules (900 to 903) but not a dialog's
-  own rules (970 and up), because a dialog replaces the box; a draft typed into the box
-  reads idle, whatever the answer above it asks.
+- Claude draws every dialog in the composer's place, under one rule of its own, so its
+  blockers read only below the last rule and an answer above the composer never raises
+  one.
 
 ## Carrying a conversation across a restart
 
@@ -109,19 +110,11 @@ Checked when the file is read, not when it is used. A `session` line that never 
 was having, and a `latest` line that does mention it would pass the placeholder through as
 an argument. Both are parse errors naming the manifest.
 
-The agents added with the rules above (`devin`, `kiro`, `kimi`, `kilo`, `hermes`,
-`antigravity`, `pi`, `qodercli`) carry a `session` line and never a `latest` one: they are
-resumed only into a conversation whose id was reported, never into whichever one is newest.
-`cline`, `muse` and `maki` have no table, for lack of a documented way to resume one
-conversation by id from the command line.
-
-The bundled lines for `claude`, `codex`, `opencode` and `gemini` were read from those
-binaries' own `--help` on a real install. The lines for `cursor`, `amp`, `aider`, `goose`,
-`droid`, `qwen`, `grok` and `copilot` come from each project's published CLI documentation
-and are not verified against an installed binary. `gemini` has
-no `session` line because its resume takes a position in a list rather than a name, and a
-position moves as soon as another conversation is saved. `aider` has none either, because it
-has no session ids at all: its conversation is a file in the project.
+Only `claude`, `codex`, `opencode`, `gemini`, `cursor`, `amp`, `droid`, `qwen`, `grok` and
+`copilot` carry a `latest` line. Every other agent is resumed only into a conversation whose
+id was reported, never into whichever one is newest. Each line comes from the agent's own
+flag definitions or documentation, named in the file's header. `aider` has no `session`
+line, because it has no session ids at all: its conversation is a file in the project.
 
 Charm Crush has no table and no manifest. Its own complete flag reference has nothing that
 resumes a conversation from the command line: switching is done in its own interface. There

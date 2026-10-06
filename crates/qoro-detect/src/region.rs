@@ -72,7 +72,7 @@ impl Region {
         };
         match (name, arg) {
             ("whole_screen", None) => Some(Self::WholeScreen),
-            // An alias for the visible screen: the same lines this engine is handed.
+            // Another name for the visible screen: the same lines this engine is handed.
             ("whole_recent", None) => Some(Self::WholeScreen),
             ("prompt_box_body", None) => Some(Self::PromptBoxBody),
             ("last_non_empty_above_prompt_box", None) => Some(Self::LastNonEmptyAbovePromptBox),
