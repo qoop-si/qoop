@@ -1,6 +1,6 @@
 # Agent workflow for this repo
 
-1. Never work directly in the plain checkout (`/Users/me/coding/qoro`).
+1. Never work directly in the plain checkout of this repository.
    It is the pristine main. Always start a fresh worktree from current
    `origin/main` and do all implementation, review and test loops there.
 2. Commit, push, opening a PR and rebase-and-merge are pre-authorized.
