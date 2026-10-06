@@ -206,7 +206,10 @@ fn phone_commands_need_qoro_bridge() {
             .expect("run qoro")
     };
     let out = run(&["pair", "--hub", "ws://127.0.0.1:1"]);
-    assert!(!out.status.success(), "`qoro pair` succeeded with no bridge");
+    assert!(
+        !out.status.success(),
+        "`qoro pair` succeeded with no bridge"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("qoro-bridge") && stderr.contains("not installed"),
@@ -219,7 +222,6 @@ fn phone_commands_need_qoro_bridge() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
 
 /// A mistyped `--check` is not a request to install: it is refused before anything
 /// reaches the network.
