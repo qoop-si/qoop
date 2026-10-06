@@ -591,3 +591,43 @@ fn an_mcp_tool_permission_is_a_blocker() {
         Blocked,
     );
 }
+
+/// A fresh session draws its composer with a dim suggestion in it, after a no-break space as
+/// real sessions draw it, or a plain one. Nothing is typed, so the agent is idle at once.
+#[test]
+fn a_fresh_composer_with_a_suggestion_is_visibly_idle() {
+    let rule = "\u{2500}".repeat(78);
+    for hint in [
+        "\u{276F}\u{a0}Try \"write a test for daemon.rs\"",
+        "\u{276F} Try \"write a test for daemon.rs\"",
+        "\u{276F} Try \"how does <filepath> work?\"",
+        "\u{276F} Try \"fix lint err\u{2026}",
+    ] {
+        let screen = [
+            "\u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.284",
+            "",
+            &rule,
+            hint,
+            &rule,
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)",
+        ];
+        let v = verdict("claude", &screen).expect("a verdict");
+        assert_eq!(v.state, AgentRuntimeState::Idle, "{hint}: {v:?}");
+        assert!(v.visible_idle, "{hint}: {v:?}");
+    }
+}
+
+/// A typed draft, after either space, is not the suggestion: never a visible idle, even with
+/// the `? for shortcuts` footer under it.
+#[test]
+fn a_draft_that_is_not_the_suggestion_is_not_visibly_idle() {
+    let rule = "\u{2500}".repeat(78);
+    for draft in [
+        "\u{276F} Try again with the other file",
+        "\u{276F}\u{a0}fix the parser",
+    ] {
+        let v =
+            verdict("claude", &["", &rule, draft, &rule, "  ? for shortcuts"]).expect("a verdict");
+        assert!(!v.visible_idle, "{draft}: {v:?}");
+    }
+}

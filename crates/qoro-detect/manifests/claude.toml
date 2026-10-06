@@ -87,7 +87,7 @@ visible_blocker = true
 setup_gate = true
 all = [
   { line_regex = '^\s*Select login method:' },
-  { line_regex = '^\s*([❯>] +)?(\d+\. )?Claude account with subscription' },
+  { line_regex = '^\s*([❯>]\s+)?(\d+\. )?Claude account with subscription' },
 ]
 not = [{ regex = '(?m)^─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^\n]*\n)*?─{3,}' }]
 
@@ -101,7 +101,7 @@ region = "after_last_horizontal_rule"
 visible_blocker = true
 all = [
   { line_regex = '^\s*Ready to code\?' },
-  { line_regex = '^\s*([❯>] +)?\d+\. (Yes|No)\b' },
+  { line_regex = '^\s*([❯>]\s+)?\d+\. (Yes|No)\b' },
 ]
 
 # Entering or leaving plan mode at Claude's request: `Enter plan mode?` with
@@ -161,8 +161,8 @@ priority = 300
 region = "after_last_horizontal_rule"
 visible_blocker = true
 all = [
-  { line_regex = '^\s*[❯>] +\d+\. ' },
-  { line_regex = '^\s*([❯>] +)?\d+\. No\b' },
+  { line_regex = '^\s*[❯>]\s+\d+\. ' },
+  { line_regex = '^\s*([❯>]\s+)?\d+\. No\b' },
 ]
 
 # The spinner row above the composer: one frame of `· ✢ ✳ ✶ ✻ ✽` (or `*`), then text
@@ -212,7 +212,17 @@ state = "idle"
 priority = 100
 region = "prompt_box_body"
 visible_idle = true
-line_regex = '^([❯>!]\s*|❯ Try ".*)$'
+line_regex = '^([❯>!]\s*|❯\s+Try ".*)$'
+
+# The empty composer of older versions, drawn in a box (`│ >   │`), as this crate's own
+# engine tests carry it.
+[[rules]]
+id = "composer_box_empty"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+line_regex = '^│ >\s*│$'
 
 # A draft in the composer, right under the end of a turn: the turn's summary
 # (`✻ Crunched for 16m 31s · done 6:31 PM`, from real sessions) or
@@ -235,15 +245,15 @@ id = "composer_draft"
 state = "working"
 priority = 90
 region = "prompt_box_body"
-line_regex = '^[❯>!] +\S'
+line_regex = '^[❯>!]\s+\S'
 
-# The footer under an empty composer: `? for shortcuts`.
+# The footer under the composer: `? for shortcuts`. It stays under a typed draft too, so it
+# is idle evidence but never visible on its own: the empty composer rule above is.
 [[rules]]
 id = "footer_shortcuts"
 state = "idle"
 priority = 100
 region = "after_last_horizontal_rule"
-visible_idle = true
 line_regex = '^\s*\? for shortcuts'
 
 # From the strings: `claude --resume <id>` and `claude --continue`.

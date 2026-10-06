@@ -4,46 +4,62 @@
 # pause-and-resume (550-650), stable composer from 950.
 agent: claude
 @@ 0
-⏵ Cogitating… (12s · esc to interrupt)
+✻ Cogitating… (12s · esc to interrupt)
 @@ 50
-⏵ Cogitating… (13s · esc to interrupt)
+✻ Cogitating… (13s · esc to interrupt)
 @@ 100
-⏵ Cogitating… (13s · esc to interrupt)
+✻ Cogitating… (13s · esc to interrupt)
 @@ 150
-⏵ Cogitating… (14s · esc to interrupt)
+✻ Cogitating… (14s · esc to interrupt)
 @@ 200
-⏵ Cogitating… (14s · esc to interrupt)
+✻ Cogitating… (14s · esc to interrupt)
 @@ 250
-⏵ Cogitating… (15s · esc to interrupt)
+✻ Cogitating… (15s · esc to interrupt)
 @@ 300
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 350
-⏵ Cogitating… (15s · esc to interrupt)
+✻ Cogitating… (15s · esc to interrupt)
 @@ 400
-⏵ Cogitating… (16s · esc to interrupt)
+✻ Cogitating… (16s · esc to interrupt)
 @@ 550
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 600
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 650
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 750
-⏵ Cogitating… (21s · esc to interrupt)
+✻ Cogitating… (21s · esc to interrupt)
 @@ 800
-⏵ Cogitating… (22s · esc to interrupt)
+✻ Cogitating… (22s · esc to interrupt)
 @@ 950
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 1000
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 1050
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
 @@ 1450
-│ >
+────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────
   ? for shortcuts
