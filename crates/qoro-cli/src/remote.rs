@@ -203,8 +203,10 @@ fn rm(name: Option<&str>) -> io::Result<()> {
 
 fn ls() -> io::Result<()> {
     let list = saved::load()?;
+    // On stderr: standard output is the list, and a script reading it (qass's watch) took the
+    // first word of this sentence for a machine called `no`.
     if list.is_empty() {
-        println!("no remotes. `qoro remote add <name> <ssh-target>` adds one");
+        eprintln!("no remotes. `qoro remote add <name> <ssh-target>` adds one");
     }
     for r in list {
         println!("{}  {}", r.name, r.target);
