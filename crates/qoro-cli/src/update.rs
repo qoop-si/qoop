@@ -12,9 +12,13 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use qoro_runtime::paths;
 use qoro_runtime::release::{Release, asset_for, check_sha256, download, fetch_latest};
+
+/// A staged copy of an install that was killed halfway is swept after this long.
+const STALE_STAGE: Duration = Duration::from_secs(30 * 60);
 
 /// Whether this process runs under Rosetta.
 fn translated() -> bool {
@@ -246,12 +250,17 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
             format!("qoro {}", latest.version)
         )));
     }
-    let staged = exe.with_extension("new");
-    std::fs::copy(&fresh, &staged)?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
-    if let Err(e) = std::fs::rename(&staged, exe) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(failed(format!("cannot replace {exe:?}: {e}")));
+    // Staged under a name of its own, beside the file so the rename stays on one filesystem:
+    // two updates at once each rename a whole verified copy, never one half written.
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    sweep_stale_stages(dir);
+    let staged = tempfile::Builder::new()
+        .prefix(".qoro-update.")
+        .tempfile_in(dir)?;
+    std::fs::copy(&fresh, staged.path())?;
+    std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o755))?;
+    if let Err(e) = staged.persist(exe) {
+        return Err(failed(format!("cannot replace {exe:?}: {}", e.error)));
     }
     cleanup();
     clear_notice();
@@ -267,6 +276,30 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
         "start qoro again to use it; nothing running was touched"
     )?;
     Ok(())
+}
+
+/// Take away the staged copies a killed install left in `dir`: a whole binary each, which a
+/// fixed staging name used to overwrite the next time. Only old ones, so an install running
+/// right now keeps its own.
+fn sweep_stale_stages(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".qoro-update.")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_STAGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Leave the newest version where the interface looks without touching the network.
@@ -414,5 +447,36 @@ mod tests {
             b"old binary",
             "a refused download must not touch the binary in hand"
         );
+    }
+
+    /// A staged copy left by a killed install is swept once it is old, and one that may
+    /// belong to an install running now is left.
+    #[test]
+    fn a_stale_staged_copy_is_swept_and_a_fresh_one_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack");
+        std::fs::create_dir(&pack).expect("pack dir");
+        let exe = dir.path().join("qoro");
+        std::fs::write(&exe, "old binary").expect("old");
+        let stale = dir.path().join(".qoro-update.stale");
+        let fresh = dir.path().join(".qoro-update.fresh");
+        for file in [&stale, &fresh] {
+            std::fs::write(file, "half").expect("staged");
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .expect("age it");
+        let latest = Release {
+            version: "9.9.9".to_string(),
+            asset: MAC_ARM.to_string(),
+            asset_url: fake_release(&pack, "9.9.9"),
+            checksum_url: None,
+        };
+        install_to(&latest, "0.0.0", &exe).expect("install");
+        assert!(!stale.exists(), "an old staged copy was kept");
+        assert!(fresh.exists(), "a fresh staged copy was taken");
     }
 }
