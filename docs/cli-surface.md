@@ -22,7 +22,7 @@ a claim nobody has to keep.
 |---|---|---|
 | `qoro` | open the interface, starting the daemon if there is not one | no |
 | `qoro attach` | attach to one terminal, with no interface around it | no |
-| `qoro daemon` | run the daemon in the foreground | no |
+| `qoro daemon` | run the daemon in the foreground. A daemon that moves onto a new binary starts that binary as `qoro daemon --adopt <file> --nonce <n>`, with the running tabs' ptys open; it asks the binary first with `qoro --handoff-formats` and `qoro daemon --adopt-check`. Neither is for typing | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
 | `qoro ensure-awake` | wake the tab that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |

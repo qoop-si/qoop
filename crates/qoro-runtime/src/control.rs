@@ -1202,6 +1202,14 @@ pub fn readiness_of(
     }
 }
 
+/// Whether a refusal is a daemon older than the request: it says `unknown variant`, and when
+/// the request is a single one that `variant` names, that it is that one. A daemon that could
+/// not read the request's id answers with none, so callers match on this and not on the id.
+pub fn too_old_for(reason: &str, variant: Option<&str>) -> bool {
+    reason.contains("unknown variant")
+        && variant.is_none_or(|variant| reason.contains(&format!("`{variant}`")))
+}
+
 impl ControlResponse {
     pub fn request_id(&self) -> &str {
         match self {

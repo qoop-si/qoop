@@ -108,6 +108,13 @@ impl SshTransport {
             argv.push("BatchMode=yes".into());
             argv.push("-o".into());
             argv.push("ConnectTimeout=10".into());
+            // What ssh says when it cannot get in (a refused connection, a key it was not
+            // given) is the reason a person is shown, so a `LogLevel QUIET` in their config
+            // does not get to hide it.
+            if !self.user_set.iter().any(|n| n == "LogLevel") {
+                argv.push("-o".into());
+                argv.push("LogLevel=ERROR".into());
+            }
         }
         if self.accept_new {
             argv.push("-o".into());
@@ -220,6 +227,9 @@ mod tests {
         assert!(quiet.iter().any(|a| a.starts_with("ConnectTimeout=")));
         let asked = SshTransport::new("host").argv("true");
         assert!(!asked.iter().any(|a| a == "BatchMode=yes"));
+        // The reason it gave up is what is shown, so it is said whatever the config says.
+        assert!(quiet.iter().any(|a| a == "LogLevel=ERROR"));
+        assert!(!asked.iter().any(|a| a.starts_with("LogLevel=")));
     }
 
     /// First contact takes an unknown key and nothing else: never `no`, which would also

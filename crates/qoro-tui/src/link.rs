@@ -330,7 +330,7 @@ pub enum Update {
 }
 
 /// Put the release of `version` in place of the older qoro at `target`, for its daemon
-/// to move onto when nothing there is working. The interface asks for the version it is;
+/// to move onto. The interface asks for the version it is;
 /// `qoro update` for the one it has just installed.
 ///
 /// Only a tagged release goes, never the running binary: a same-platform Mac would
@@ -469,6 +469,8 @@ chmod 755 "$t"
 [ "$("$t" --version 2>/dev/null)" = "qoro $2" ] || { echo "the copy is not qoro $2" >&2; exit 5; }
 mv -f "$t" "$r"
 t=
+rmdir "$l"
+h=
 printf '%s\n' MARKER
 for w in hooks skills; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoro $w install on it"
@@ -573,7 +575,10 @@ impl Answer {
             })
         };
         match (&self.marked, self.status) {
-            (None, _) => Err(said("ssh failed")),
+            (None, _) => Err(said(&match self.status {
+                Some(code) => format!("ssh failed (exit {code})"),
+                None => "ssh failed".to_string(),
+            })),
             (Some(_), Some(0)) => Ok(self.marked.clone().unwrap_or_default()),
             (Some(_), _) => Err(said("qoro there did not answer")),
         }
@@ -884,6 +889,31 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stderr).contains("link to nothing"));
     }
 
+    /// An ssh that cannot get in says why, and that is what is shown; with nothing said, the
+    /// exit status is.
+    #[test]
+    fn a_failed_ssh_carries_its_own_reason_or_at_least_its_status() {
+        let said = |status, said: &str| {
+            Answer {
+                status,
+                marked: None,
+                said: said.to_string(),
+            }
+            .answer()
+            .expect_err("ssh did not get in")
+            .to_string()
+        };
+        assert_eq!(
+            said(
+                Some(255),
+                "ssh: connect to host a port 22: Connection refused"
+            ),
+            "ssh: connect to host a port 22: Connection refused"
+        );
+        assert_eq!(said(Some(255), ""), "ssh failed (exit 255)");
+        assert_eq!(said(None, ""), "ssh failed");
+    }
+
     /// A qoro that says it is `version`, as a script.
     fn says(version: &str) -> Vec<u8> {
         format!("#!/bin/sh\necho 'qoro {version}'\n").into_bytes()
@@ -975,6 +1005,32 @@ mod tests {
         assert!(after.contains("bridge there was not reloaded"), "{after}");
         assert!(!after.contains("hooks"), "{after}");
         assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+    }
+
+    /// The swap lock is let go as soon as the file is replaced, not after the hooks, the skills
+    /// and a bridge reload that may take its whole wait: another update meets no lock while
+    /// they run.
+    #[test]
+    fn swap_lets_go_of_its_lock_before_it_refreshes_anything() {
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        // Notes, each time it is asked for hooks, skills or the bridge, whether the lock
+        // directory beside the file is still there.
+        let probing = "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoro 0.0.2';;\n\
+             hooks|skills|bridge) [ -d \"$HOME/.local/bin/.qoro-swap.lock\" ] \
+             && echo \"held during $1\" >> \"$HOME/held\"; exit 0;;\nesac\n";
+        let out = swap(home.path(), "0.0.1", "0.0.2", probing.as_bytes());
+        assert!(out.status.success());
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), probing.as_bytes());
+        assert!(
+            !home.path().join("held").exists(),
+            "the lock was held while the new qoro refreshed things: {:?}",
+            std::fs::read_to_string(home.path().join("held"))
+        );
+        assert!(
+            !home.path().join(".local/bin/.qoro-swap.lock").exists(),
+            "the lock was left behind"
+        );
     }
 
     /// A reload that hangs is cut off, said, and does not fail the swap or hold it.

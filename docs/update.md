@@ -70,7 +70,8 @@ or `GH_TOKEN` on this Mac), puts the binary in place of the qoro there in the ba
 one atomic rename beside the real file, and asks the daemon over there to move onto it. That
 daemon moves at the first moment nothing on it is working: a running command, a busy agent,
 an agent that has not named its conversation, or a background job holds it, and the
-interface says once, on its hint row, what it is waiting on. When it moves, every tab comes
+interface says once, on its hint row, what it is waiting on. (Onto a build that can take the
+tabs over as they are, it waits for nothing: see the next section.) When it moves, every tab comes
 back with the same number and every agent in its own conversation. A build from main between
 releases is never pushed, a qoro there that is as new or newer is never touched, and a swap
 another window or another Mac is making at the same time is said rather than raced. A machine
@@ -98,6 +99,32 @@ machine closes (run `qoro` again, everything is back); a window attached to a re
 reconnects by itself. The remote's bridge service, when it has
 one, is put back on the new file in the same step, since launchd refuses to start a service
 whose program file was replaced.
+
+## Tabs keep running through a move
+
+When the qoro on disk can take over a running daemon's tabs (it answers
+`qoro --handoff-formats` with the layout the running one writes), a move waits for nothing.
+Nothing needs to be idle, and nothing is ended or typed again: the daemon pauses every tab
+where it is, writes down what the next one needs (which descriptor is which tab, the shell's
+pid and start time, the hook token, the size, the screen and the modes a program set once, the
+agent's generation and conversation id), and becomes the new binary in the same process. The
+shells stay its children, so a command that was running keeps its pid and prints into the same
+tab afterwards, and an agent in the middle of a turn is the same agent, not a resumed one. A
+program that is not a shell at its prompt is made to redraw: the window shrinks by one row and
+comes back 800 ms later. The listening socket and the startup lock stay open across the move, so
+a client or a hook that starts a daemon meanwhile finds one serving and starts none. Open
+interfaces are disconnected for a moment, as before, and reconnect.
+
+A move that cannot hand over falls back to the way it always worked, waiting until nothing is
+working and then ending the tabs and bringing each back (an agent resumed in its conversation):
+when the qoro on disk does not answer `--handoff-formats` with a layout the running one writes
+(every build before this one), or answers and then cannot read the file in a dry run made
+before anything is given up. A tab whose pty or shell cannot be read is held to that same wait.
+Every agent is written down (which one, and its conversation) before the move, so even a move
+that is lost after the point of no return brings it back where it was. A shell that ends while
+the move is under way closes its tab, as it would have anyway. If the exec itself fails, every
+tab carries on in the running daemon and it stays on its version. A daemon that was started before this existed has nothing to hand over with, so the
+first move onto a build that has it is the old one; every move after that is live.
 
 The same check that holds a move also holds `qoro sleep` and the sleep an idle space falls
 into: a single command that prints nothing while it leads its own foreground group (`vim`,

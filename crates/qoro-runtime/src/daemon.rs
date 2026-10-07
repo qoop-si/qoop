@@ -1088,19 +1088,40 @@ impl Daemon {
         handoff: Option<crate::handoff::Handoff>,
     ) -> io::Result<Self> {
         let socket = paths::socket_path(dir);
-        remove_stale_socket(&socket)?;
-        // Before the bind, so a daemon refused because another has this state never answers
-        // on a socket first and leaves every client waiting on a handshake that cannot come.
-        let state_lock = if state == dir {
-            None
-        } else {
-            Some(hold_state(state).await?)
+        // What the daemon that moved onto this binary kept open for it. The socket is still
+        // bound and listening, so nobody was ever refused, and the state lock is still held.
+        let inherited = handoff
+            .as_ref()
+            .and_then(|h| inherited_listener(h.listener?, &socket));
+        let mut state_lock = handoff
+            .as_ref()
+            .and_then(|h| h.state_lock)
+            .filter(|fd| state != dir && fd_is_open(*fd))
+            // SAFETY: the daemon before this one passed this descriptor on for this lock,
+            // and nothing in this process owns it.
+            .map(|fd| unsafe { crate::lock::StartupLock::from_fd(fd) });
+        let listener = match inherited {
+            Some(listener) => listener,
+            None => {
+                remove_stale_socket(&socket)?;
+                // Before the bind, so a daemon refused because another has this state never
+                // answers on a socket first and leaves every client waiting on a handshake
+                // that cannot come.
+                if state != dir && state_lock.is_none() {
+                    state_lock = Some(hold_state(state).await?);
+                }
+                let listener = UnixListener::bind(&socket)?;
+                // Restricted right after bind. Between the two the socket has default
+                // permissions, and what protects it then is the verified 0700 directory
+                // around it: nobody else can reach a path inside it. A umask around the
+                // bind would race every other thread.
+                std::fs::set_permissions(
+                    &socket,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )?;
+                listener
+            }
         };
-        let listener = UnixListener::bind(&socket)?;
-        // Restricted right after bind. Between the two the socket has default permissions,
-        // and what protects it then is the verified 0700 directory around it: nobody else
-        // can reach a path inside it. A umask around the bind would race every other thread.
-        std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 
@@ -1133,6 +1154,16 @@ impl Daemon {
         scanner.refresh().await;
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let books = Bookkeeping::new(store.clone(), stopping.clone());
+        // What a move onto a new binary passes on: the socket this daemon listens on and
+        // the state lock it holds.
+        books
+            .restart
+            .listener
+            .store(listener.as_raw_fd(), std::sync::atomic::Ordering::SeqCst);
+        books.restart.state_lock.store(
+            state_lock.as_ref().map_or(-1, |lock| lock.as_raw_fd()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // What a person asked to keep awake. Unreadable is empty: idle sleep then treats
         // every tab as it did before the feature, and the next set writes it again.
         match store.kept_awake().await {
@@ -1612,6 +1643,37 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether a descriptor number is open in this process.
+pub fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+}
+
+/// The listening socket the daemon before this one passed on, when it is the one this
+/// daemon is to serve. Anything else is closed and the socket is bound as usual.
+fn inherited_listener(fd: std::os::fd::RawFd, socket: &Path) -> Option<UnixListener> {
+    if !fd_is_open(fd) {
+        eprintln!("qorod: the socket passed on is not open; binding a new one");
+        return None;
+    }
+    // SAFETY: the daemon before this one passed this descriptor on as its listener, and
+    // nothing in this process owns it.
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    let ours = listener
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_pathname().map(|path| path == socket))
+        .unwrap_or(false);
+    if !ours {
+        eprintln!("qorod: the socket passed on is not this daemon's; binding a new one");
+        return None;
+    }
+    // Close-on-exec again: the shells this daemon starts must not hold the socket open.
+    sys::set_cloexec(fd).ok()?;
+    listener.set_nonblocking(true).ok()?;
+    UnixListener::from_std(listener).ok()
 }
 
 /// The peer's uid, checked before any protocol byte is read.
@@ -4522,6 +4584,12 @@ async fn handle_control(
                 let mut arms = restart.wanted.lock().unwrap();
                 arms.0 += 1;
                 arms.1 = wanted.clone();
+                restart
+                    .no_handoff
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                restart
+                    .failures
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
                 !restart
                     .armed
                     .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -5174,7 +5242,7 @@ fn open_terminal_with(
     adopt: Option<Adopted>,
 ) -> io::Result<TerminalHandle> {
     let (commands, from_clients) = mpsc::channel(256);
-    let size = adopt.as_ref().map_or(INITIAL_SIZE, |a| a.size);
+    let size = adopt.as_ref().map_or(INITIAL_SIZE, |a| a.seed.size);
     let (updates, _) = watch::channel(TerminalUpdate::Full(Snapshot {
         cols: size.cols as usize,
         rows: size.rows as usize,
@@ -5601,7 +5669,8 @@ pub struct Bookkeeping {
     /// last row. A tab reopened on the same number waits for it: two writers on one
     /// directory would number their rows over each other.
     pub writers: Arc<std::sync::Mutex<std::collections::HashMap<u32, watch::Receiver<()>>>>,
-    /// What asks each terminal's history writer to put its rows on disk now.
+    /// What asks each terminal's history writer to put its rows on disk now. Like `writers`
+    /// and `locks` it keeps an entry for every id it was asked about, a few bytes each.
     flushers: Arc<std::sync::Mutex<std::collections::HashMap<u32, crate::spill::Flusher>>>,
     /// One lock per workspace, held by whatever changes whether it is asleep: a sleep, a
     /// wake, a tab made or closed in it, the workspace closing. It and `writers` keep an
@@ -5637,6 +5706,17 @@ pub struct Restart {
     exe: std::sync::OnceLock<PathBuf>,
     /// The runtime directory, where what a move hands over is written. Set with `exe`.
     dir: std::sync::OnceLock<PathBuf>,
+    /// The descriptors of the socket this daemon listens on and of the state lock it holds
+    /// (-1 for none), which a move passes on so no daemon can start in the gap.
+    listener: std::sync::atomic::AtomicI32,
+    state_lock: std::sync::atomic::AtomicI32,
+    /// Set when the binary on disk turned out not to read what this daemon writes, whatever
+    /// it said it reads: the move onto it waits for idle tabs instead. Cleared by the next
+    /// request, which may be for another binary.
+    no_handoff: std::sync::atomic::AtomicBool,
+    /// How many hand overs in a row failed after tabs were paused, which is what makes the
+    /// next try wait longer: every try parks every tab that answered.
+    failures: std::sync::atomic::AtomicU32,
     /// Whether the task that waits for the safe moment runs. It starts once and runs until
     /// the daemon goes, so a daemon never asked costs nothing.
     armed: std::sync::atomic::AtomicBool,
@@ -5661,6 +5741,10 @@ impl Default for Restart {
         Self {
             exe: std::sync::OnceLock::new(),
             dir: std::sync::OnceLock::new(),
+            listener: std::sync::atomic::AtomicI32::new(-1),
+            state_lock: std::sync::atomic::AtomicI32::new(-1),
+            no_handoff: std::sync::atomic::AtomicBool::new(false),
+            failures: std::sync::atomic::AtomicU32::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
             gate: std::sync::atomic::AtomicBool::new(false),
             waiting: watch::channel(None).0,
@@ -5737,15 +5821,23 @@ impl Bookkeeping {
     }
 
     /// Have each of these terminals' history writers put the rows handed to them on disk, and
-    /// wait for all of them. True when every one has.
-    async fn flush_histories(&self, streams: &[u32], within: std::time::Duration) -> bool {
-        let flushers: Vec<_> = {
-            let all = self.flushers.lock().unwrap();
-            streams.iter().filter_map(|s| all.get(s).cloned()).collect()
-        };
+    /// wait for all of them, under one deadline. True when every one has. A writer that has
+    /// already finished has nothing left to put there, and is not waited for.
+    async fn flush_histories(&self, streams: &[u32], deadline: tokio::time::Instant) -> bool {
+        let mut asked = Vec::new();
+        for stream in streams {
+            let flusher = self.flushers.lock().unwrap().get(stream).cloned();
+            if let Some(flusher) = flusher
+                && !self.writer_done(*stream, std::time::Duration::ZERO).await
+            {
+                let n = flusher.ask();
+                asked.push((flusher, n));
+            }
+        }
         let mut every = true;
-        for flusher in flushers {
-            every &= flusher.flush(within).await;
+        for (flusher, n) in asked {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            every &= flusher.reached(n, left).await;
         }
         every
     }
@@ -5814,28 +5906,138 @@ impl RestoreReport {
 }
 
 /// Take over the terminals the daemon before this one left running, and say how many. A
-/// terminal that cannot be taken over is closed on this side and keeps its row, so the
-/// restore that follows opens it again as a shell in its place.
+/// terminal that cannot be taken over is closed on this side, its processes stopped the way
+/// a terminal's are when its task fails, and it keeps its row: the restore that follows
+/// opens it again as a shell, resuming its agent, in its place.
 async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> usize {
     let mut adopted = 0;
     for carried in handoff.terminals {
-        let id = carried.id;
+        let (id, tty_dev, child, start) = (
+            carried.id,
+            carried.tty_dev,
+            carried.child,
+            carried.child_start,
+        );
         match adopt_one(into, carried) {
             Ok(()) => adopted += 1,
-            Err(why) => eprintln!("qorod: tab {id} could not be taken over: {why}"),
+            Err(refused) if refused.ended => {
+                // The shell ended while the daemon moved: the tab is closed, as it would
+                // have been had nobody been moving.
+                eprintln!("qorod: tab {id} ended while the daemon moved; closing it");
+                let closed = into.books.store.close_terminal(id as i64).await;
+                if closed.is_ok()
+                    && let Some(dir) = into.history_dir.as_ref().map(|d| d.join(id.to_string()))
+                {
+                    let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
+                }
+            }
+            Err(refused) => {
+                eprintln!("qorod: tab {id} could not be taken over: {}", refused.why);
+                if refused.ours {
+                    let seen = fallback_teardown(&into.scanner, tty_dev, child as u32, start).await;
+                    eprintln!("qorod: tab {id}: stopped {seen} tracked processes");
+                } else {
+                    // Closed without a terminal, its shell is hung up: waited for, so it
+                    // does not stay as a zombie of this process.
+                    reap_child(child as u32).await;
+                }
+            }
         }
     }
     adopted
 }
 
+/// Why a carried terminal was not taken over, and whether its shell is a running child of
+/// this process that now has no terminal and has to be stopped.
+struct Refused {
+    why: String,
+    ours: bool,
+    /// The shell ended while the daemon moved, which is the tab being closed and not a tab
+    /// that failed.
+    ended: bool,
+}
+
+impl Refused {
+    fn not_ours(why: String) -> Self {
+        Self {
+            why,
+            ours: false,
+            ended: false,
+        }
+    }
+}
+
+/// Whether a carried terminal is what the file says: its descriptor is the master of the pty
+/// whose slave the old daemon contained it by, and its shell is a child of this process, still
+/// running, and the one that was written down. The kernel answers the child question: only
+/// a child of this process can be waited for. A child that went while the daemon moved is
+/// reaped by the asking.
+fn check_carried(carried: &crate::handoff::Carried) -> Result<(), Refused> {
+    let (fd, child) = (carried.fd, carried.child);
+    // The slave this pty belongs to is the one the old daemon contained the tab by.
+    match sys::slave_tty_dev(fd) {
+        Ok(dev) if dev == carried.tty_dev => {}
+        Ok(_) => {
+            return Err(Refused::not_ours(format!(
+                "descriptor {fd} is another terminal's pty"
+            )));
+        }
+        Err(e) => {
+            return Err(Refused::not_ours(format!(
+                "descriptor {fd} is not a pty master: {e}"
+            )));
+        }
+    }
+    match wait_once(child) {
+        Waited::Running => {}
+        Waited::Reaped => {
+            return Err(Refused {
+                why: format!("process {child} ended while the daemon moved"),
+                ended: true,
+                ours: false,
+            });
+        }
+        _ => {
+            return Err(Refused::not_ours(format!(
+                "process {child} is not a child of this daemon"
+            )));
+        }
+    }
+    if carried.child_start.is_some()
+        && sys::start_time_of(qoro_pty::teardown::Pid(child)) != carried.child_start
+    {
+        // Ours, and running, but not what was written down: not this tab's shell, and not
+        // to be signalled either.
+        return Err(Refused::not_ours(format!(
+            "process {child} is not the one that was written down"
+        )));
+    }
+    Ok(())
+}
+
 /// One carried terminal: checked to be what the file says, then run as it was.
-fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), String> {
+fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Refused> {
     use crate::handoff::Carried;
+    // An open descriptor first: wrapping one that is not would close somebody else's.
+    if !fd_is_open(carried.fd) {
+        return Err(Refused::not_ours(format!(
+            "descriptor {} is not open",
+            carried.fd
+        )));
+    }
+    // SAFETY: it is open, was handed to this process for this terminal, and nothing here
+    // owns it yet. Wrapped before it is checked, so a refusal closes it.
+    let master = unsafe { OwnedFd::from_raw_fd(carried.fd) };
+    check_carried(&carried)?;
+    let ours = |why: String| Refused {
+        why,
+        ours: true,
+        ended: false,
+    };
     let Carried {
         id,
         fd,
         child,
-        child_start,
         tty_dev,
         workspace,
         name,
@@ -5849,41 +6051,13 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
         agent,
         session,
         session_said,
+        ..
     } = carried;
-    // An open descriptor first: wrapping one that is not would close somebody else's.
-    // SAFETY: F_GETFD only reads the descriptor's flags.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-        return Err(format!("descriptor {fd} is not open"));
-    }
-    // SAFETY: it is open, was handed to this process for this terminal, and nothing here
-    // owns it yet.
-    let master = unsafe { OwnedFd::from_raw_fd(fd) };
-    // The slave this pty belongs to is the one the old daemon contained the tab by.
-    if sys::slave_tty_dev(fd).map_err(|e| format!("descriptor {fd} is not a pty master: {e}"))?
-        != tty_dev
-    {
-        return Err(format!("descriptor {fd} is another terminal's pty"));
-    }
-    // Ours to wait for, still running, and the process that was written down. The kernel
-    // answers the first: only a child of this process can be waited for. A child that
-    // went during the move was reaped by the asking.
-    let mut status = 0;
-    // SAFETY: waitpid on one pid with WNOHANG blocks nothing and reaps nothing else.
-    match unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } {
-        0 => {}
-        r if r > 0 => return Err(format!("process {child} ended while the daemon moved")),
-        _ => return Err(format!("process {child} is not a child of this daemon")),
-    }
-    if child_start.is_some() && sys::start_time_of(qoro_pty::teardown::Pid(child)) != child_start {
-        return Err(format!(
-            "process {child} is not the one that was written down"
-        ));
-    }
     // Close-on-exec again, so no shell this daemon starts holds another tab's master.
-    sys::set_cloexec(fd).map_err(|e| format!("descriptor {fd}: {e}"))?;
+    sys::set_cloexec(fd).map_err(|e| ours(format!("descriptor {fd}: {e}")))?;
     let size = PtySize { cols, rows };
     if sys::window_size(fd).ok() != Some((cols, rows)) {
-        sys::resize(fd, cols, rows).map_err(|e| format!("its size could not be set: {e}"))?;
+        sys::resize(fd, cols, rows).map_err(|e| ours(format!("its size could not be set: {e}")))?;
     }
     into.terminals.mint_above(id);
     open_terminal_with(
@@ -5903,16 +6077,18 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
             token: qoro_domain::CapabilityToken::new(token),
             child: child as u32,
             tty_dev,
-            size,
-            pending,
-            screen,
-            nudge,
+            seed: Seed {
+                size,
+                pending,
+                screen,
+                nudge,
+            },
             agent,
             session: session.map(|session| (session, session_said)),
         }),
     )
     .map(|_| ())
-    .map_err(|e| e.to_string())
+    .map_err(|e| ours(e.to_string()))
 }
 
 /// Bring back the terminals the last daemon was holding, and say how many.
@@ -6785,13 +6961,20 @@ async fn handoff_on_disk(exe: &Path) -> bool {
 
 /// What the binary at `exe` prints on stdout for one argument.
 async fn ask_binary(exe: &Path, arg: &'static str) -> Result<String, String> {
+    run_binary(exe, vec![arg.to_string()])
+        .await
+        .map(|(_, printed)| printed)
+}
+
+/// Run the binary at `exe` with `args`: whether it succeeded, and what it printed on stdout.
+async fn run_binary(exe: &Path, args: Vec<String>) -> Result<(bool, String), String> {
     let exe = exe.to_path_buf();
     let shown = exe.display().to_string();
     let asked = shown.clone();
     crate::blocking::run_on(crate::blocking::Pool::Lifecycle, move || {
         use std::io::Read;
         let mut child = std::process::Command::new(&exe)
-            .arg(arg)
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -6800,24 +6983,24 @@ async fn ask_binary(exe: &Path, arg: &'static str) -> Result<String, String> {
         // Polled rather than waited on, so a binary that never answers is killed at the
         // deadline instead of holding a lifecycle thread for good.
         let deadline = std::time::Instant::now() + VERSION_PATIENCE;
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("{asked} did not answer {arg}"));
+                    return Err(format!("{asked} did not answer {}", args.join(" ")));
                 }
             }
-        }
+        };
         let mut out = String::new();
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_string(&mut out);
         }
-        Ok(out.trim().to_string())
+        Ok((status.success(), out.trim().to_string()))
     })
     .await
     .map_err(|e| format!("{shown} could not be run: {e}"))?
@@ -6856,6 +7039,10 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                         exe.display()
                     );
                     drop(handed);
+                    // Whoever is waiting on the answer hears that nothing will move.
+                    into.books.restart.waiting.send_replace(Some(format!(
+                        "the new binary could not be started: {e}; this daemon stays as it is"
+                    )));
                     into.books
                         .restart
                         .gate
@@ -6887,7 +7074,16 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
             }
             _ = tokio::time::sleep(LOOK_AGAIN_AFTER) => {}
         }
-        tokio::time::sleep_until(looked + LOOK_SPACING).await;
+        // Longer after every hand over that failed with tabs parked: each try freezes
+        // every tab that answered, so a tab that cannot be paused must not make them
+        // wait every two seconds.
+        let failed = into
+            .books
+            .restart
+            .failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .min(4);
+        tokio::time::sleep_until(looked + LOOK_SPACING * 2u32.pow(failed)).await;
         while matches!(
             changes.try_recv(),
             Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
@@ -6944,7 +7140,11 @@ async fn restart_look(
             .collect()
     };
     let streams = awake();
-    let live = handoff_on_disk(exe).await;
+    let live = !books
+        .restart
+        .no_handoff
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && handoff_on_disk(exe).await;
     // Handed over, a tab is not asked to be idle: it keeps running through the move.
     let checkpoints = if live {
         Vec::new()
@@ -7019,16 +7219,49 @@ async fn restart_look(
     if live {
         // Back out whole if any tab cannot be handed over: nothing has been ended, and
         // the tabs that were paused carry on when the handover is dropped.
-        return match hand_over(into, &streams).await {
-            Ok(handed) => Ok(Moving {
-                _held: held,
-                handed: Some(handed),
-            }),
+        return match hand_over(into, exe, &streams).await {
+            Ok(handed) => {
+                books
+                    .restart
+                    .failures
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                Ok(Moving {
+                    _held: held,
+                    handed: Some(handed),
+                })
+            }
             Err(why) => {
+                let failed = books
+                    .restart
+                    .failures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                // A cause that does not go away (a full disk, a tab that never answers a
+                // pause) must not park every tab for ever: after a few tries this move
+                // waits for idle tabs instead, as it does for a binary that cannot take
+                // them over. Nothing is ended either way.
+                if failed >= MAX_HANDOVER_FAILURES {
+                    books
+                        .restart
+                        .no_handoff
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!("qorod: {failed} hand overs failed in a row, the last because {why}");
+                }
                 books
                     .restart
                     .gate
                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                // The binary cannot read the handover after all: nothing has been ended, and
+                // the look is made again at once, the old way, instead of a minute later.
+                if books
+                    .restart
+                    .no_handoff
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    eprintln!("qorod: {why}");
+                    drop(held);
+                    return Box::pin(restart_look(into, exe, replaced)).await;
+                }
                 Err(why)
             }
         };
@@ -7046,8 +7279,16 @@ async fn restart_look(
     })
 }
 
-/// How long every tab has to say where it stands, and every history to reach the disk.
-const HANDOVER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long every tab has to say where it stands, and every history to reach the disk, all
+/// of them together: the tabs that answered first are parked for as long as it takes.
+const HANDOVER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many hand overs in a row may fail before the move is made the old way.
+const MAX_HANDOVER_FAILURES: u32 = 3;
+
+/// How long a daemon that is starting may hold the startup lock before the move gives up
+/// for now. Nothing is paused yet.
+const STARTUP_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The tabs of a daemon that is about to become another binary, paused and written down.
 struct HandedOver {
@@ -7056,20 +7297,20 @@ struct HandedOver {
     /// Each paused tab's wait. Dropped, the tab carries on as it was: a move that did not
     /// happen.
     _resume: Vec<tokio::sync::oneshot::Sender<()>>,
-    /// The masters as the next process will have them, at the numbers the file says.
-    masters: Vec<OwnedFd>,
+    /// The masters, the listening socket and the state lock as the next process will have
+    /// them, at the numbers the file says. Closed again if it never comes.
+    kept: Vec<OwnedFd>,
+    /// The startup lock, held from before the first tab was paused until the next daemon
+    /// is listening: a daemon started in between waits for it, and finds the socket served.
+    startup: crate::lock::StartupLock,
 }
 
 impl HandedOver {
-    /// Become `exe`, with the masters open in it. Returns only when that did not happen.
+    /// Become `exe`, with everything handed over open in it. Returns only when that did not
+    /// happen.
     fn exec(&self, exe: &Path) -> io::Error {
-        // Inheritable only now: a child started in between would carry every tab's master.
-        for master in &self.masters {
-            if let Err(e) = sys::clear_cloexec(master.as_raw_fd()) {
-                return e;
-            }
-        }
-        exec_into(
+        // Everything but the exec itself is done before the descriptors can be inherited.
+        let mut command = daemon_command(
             exe,
             &[
                 "--adopt".into(),
@@ -7077,7 +7318,20 @@ impl HandedOver {
                 "--nonce".into(),
                 self.nonce.clone(),
             ],
-        )
+        );
+        eprintln!("qorod: moving onto {}", exe.display());
+        // Inheritable only now: a child started in between would carry every tab's master.
+        let fds = self
+            .kept
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .chain([self.startup.as_raw_fd()]);
+        for fd in fds {
+            if let Err(e) = sys::clear_cloexec(fd) {
+                return e;
+            }
+        }
+        run_exec(&mut command)
     }
 }
 
@@ -7085,23 +7339,80 @@ impl Drop for HandedOver {
     fn drop(&mut self) {
         // Read and deleted by the next daemon; still here only when it never came.
         let _ = std::fs::remove_file(&self.file);
+        // A move that did not happen: the lock is this daemon's again, and not inheritable.
+        let _ = sys::set_cloexec(self.startup.as_raw_fd());
+    }
+}
+
+/// Whether a tab can be taken over by the next daemon, as far as this one can tell before
+/// it pauses anything: it has a pty that is a pty, a foreground group, and a shell it can
+/// still name. A tab that fails is ended by the exec like it was before, so it is held to
+/// what ending one has always been held to.
+fn adoptable(master: Option<std::os::fd::RawFd>, child: Option<i32>) -> Result<(), String> {
+    let master = master.ok_or("it has no pty")?;
+    let child = child.ok_or("it has no shell")?;
+    sys::slave_tty_dev(master).map_err(|e| format!("its pty is not readable: {e}"))?;
+    sys::foreground_pgrp(master).ok_or("its foreground group is not readable")?;
+    sys::start_time_of(qoro_pty::teardown::Pid(child)).ok_or("its shell is not readable")?;
+    Ok(())
+}
+
+/// Take the startup lock, waiting for a daemon that is starting to finish.
+async fn take_startup_lock(
+    dir: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<crate::lock::StartupLock, String> {
+    let path = paths::lock_path(dir);
+    loop {
+        match crate::lock::StartupLock::try_acquire(&path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Ok(None) => return Err("a daemon is starting; try again in a moment".into()),
+            Err(e) => return Err(format!("the startup lock could not be taken: {e}")),
+        }
     }
 }
 
 /// Pause every one of these tabs, flush their history, and write down what the next daemon
 /// needs to take them over. Every tab is paused or none carries on paused: any failure
 /// drops what was started, and each tab resumes.
-async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String> {
+///
+/// A tab this daemon cannot hand over is not paused. It is ended by the exec as every tab
+/// was before, and so it has to be at rest like one: written down, its agent idle.
+async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<HandedOver, String> {
     let restart = &into.books.restart;
     let dir = restart
         .dir
         .get()
         .cloned()
         .ok_or("this daemon does not know its runtime directory")?;
+    eprintln!("qorod: taking the startup lock to hand the tabs over");
+    let startup =
+        take_startup_lock(&dir, tokio::time::Instant::now() + STARTUP_LOCK_PATIENCE).await?;
+    // From here tabs are parked, so one deadline for everything that follows.
     let deadline = tokio::time::Instant::now() + HANDOVER_PATIENCE;
+    let (streams, left): (Vec<u32>, Vec<u32>) = streams.iter().partition(|stream| {
+        adoptable(
+            into.agents.master_of(**stream),
+            into.agents.leader_of(**stream).map(|(pid, _)| pid),
+        )
+        .is_ok()
+    });
+    if !left.is_empty() {
+        eprintln!("qorod: tabs {left:?} cannot be handed over and are ended by the move");
+        let table = fresh_process_table().await?;
+        let checkpoints = vet_tabs(into, &left, &table)?;
+        into.books
+            .store
+            .checkpoint(checkpoints)
+            .await
+            .map_err(|e| format!("the tabs could not be written down: {e}"))?;
+    }
     let mut resume = Vec::new();
     let mut waiting = Vec::new();
-    for stream in streams {
+    for stream in &streams {
         // A tab that ended since the look is not one to carry.
         let Some(handle) = into.terminals.get(*stream) else {
             continue;
@@ -7121,7 +7432,7 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
         resume.push(go);
         waiting.push((*stream, handle, answer));
     }
-    let mut masters = Vec::new();
+    let mut kept = Vec::new();
     let mut carried = Vec::new();
     for (stream, handle, answer) in waiting {
         let paused = match tokio::time::timeout_at(deadline, answer).await {
@@ -7130,7 +7441,7 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
         };
         // A second descriptor for the same pty, at a number of its own: the first closes
         // with the exec and the second is what the next process finds.
-        let master = sys::dup_from(paused.master, 3, true)
+        let master = sys::dup_cloexec_above_stdio(paused.master)
             .map_err(|e| format!("tab {stream}'s pty could not be passed on: {e}"))?;
         carried.push(crate::handoff::Carried {
             id: stream,
@@ -7151,29 +7462,107 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
             session: handle.session.clone(),
             session_said: handle.session_said.clone(),
         });
-        masters.push(master);
+        kept.push(master);
     }
+    // What a tab's agent is and which conversation it is in, written to its row as a sleep
+    // would, without asking it to be idle. If the next daemon cannot take a tab over after
+    // all, the row resumes the conversation as it is now and not as the last hook left it.
+    let checkpoints: Vec<qoro_store::Checkpoint> = carried
+        .iter()
+        .filter_map(|c| {
+            let handle = into.terminals.get(c.id)?;
+            let agent = agent_program(&into.agents, c.id)?;
+            let generation = into.agents.agent(c.id)?.belief.generation.0;
+            let said = handle
+                .session_said
+                .clone()?
+                .settle(Some((&agent, generation)));
+            let session = handle
+                .session
+                .clone()
+                .filter(|_| said == Some(Said::By(agent.clone(), generation)));
+            Some(qoro_store::Checkpoint {
+                terminal: c.id as i64,
+                agent: Some(agent),
+                agent_session: session,
+            })
+        })
+        .collect();
+    if !checkpoints.is_empty()
+        && let Err(e) = into.books.store.checkpoint(checkpoints).await
+    {
+        eprintln!("qorod: the agents could not be written down before the move: {e}");
+    }
+    // The socket and the state lock, as further descriptors of the same open files.
+    let mut pass_on =
+        |fd: std::os::fd::RawFd, what: &str| -> Result<Option<std::os::fd::RawFd>, String> {
+            if fd < 0 {
+                return Ok(None);
+            }
+            let dup = sys::dup_cloexec_above_stdio(fd)
+                .map_err(|e| format!("the {what} could not be passed on: {e}"))?;
+            let number = dup.as_raw_fd();
+            kept.push(dup);
+            Ok(Some(number))
+        };
+    let listener = pass_on(
+        restart.listener.load(std::sync::atomic::Ordering::SeqCst),
+        "socket",
+    )?;
+    let state_lock = pass_on(
+        restart.state_lock.load(std::sync::atomic::Ordering::SeqCst),
+        "state lock",
+    )?;
     // Nothing is pushed any more, so what the writers hold is all there will be.
     let carried_streams: Vec<u32> = carried.iter().map(|c| c.id).collect();
-    if !into
-        .books
-        .flush_histories(&carried_streams, HANDOVER_PATIENCE)
-        .await
-    {
+    if !into.books.flush_histories(&carried_streams, deadline).await {
         return Err("the history of a tab could not be written in time".into());
     }
     let handoff = crate::handoff::Handoff {
         format: crate::handoff::FORMAT,
         pid: std::process::id(),
-        nonce: crate::handoff::fresh_nonce().map_err(|e| format!("no nonce: {e}"))?,
+        nonce: crate::paths::random_hex().map_err(|e| format!("no nonce: {e}"))?,
         terminals: carried,
+        listener,
+        startup_lock: Some(startup.as_raw_fd()),
+        state_lock,
     };
     let nonce = handoff.nonce.clone();
     let file = crate::blocking::run(move || crate::handoff::write(&dir, &handoff))
         .await
         .map_err(|e| format!("the handover could not be written: {e}"))?
         .map_err(|e| format!("the handover could not be written: {e}"))?;
-    crate::store::settle_stores(deadline).await;
+    let handed = HandedOver {
+        file,
+        nonce,
+        _resume: resume,
+        kept,
+        startup,
+    };
+    // The dry run: the binary this daemon is about to become reads what was just written.
+    // A format it claims to read and cannot is found out here, with every tab still running
+    // in this one, and not by a daemon that has already gone.
+    let checked = run_binary(
+        exe,
+        vec![
+            "daemon".into(),
+            "--adopt-check".into(),
+            handed.file.display().to_string(),
+            "--nonce".into(),
+            handed.nonce.clone(),
+        ],
+    )
+    .await;
+    if !matches!(checked, Ok((true, _))) {
+        restart
+            .no_handoff
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(format!(
+            "{} cannot read what this daemon hands over ({checked:?}); the move waits for idle tabs",
+            exe.display()
+        ));
+    }
+    crate::store::settle_stores(tokio::time::Instant::now() + HANDOVER_PATIENCE).await;
     // A `qoro stop` that landed meanwhile is waiting in each tab's queue behind the pause:
     // it wins, and the tabs carry on to hear it.
     if into
@@ -7183,12 +7572,7 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
     {
         return Err("qoro is stopping".into());
     }
-    Ok(HandedOver {
-        file,
-        nonce,
-        _resume: resume,
-        masters,
-    })
+    Ok(handed)
 }
 
 /// Take the lock of every space not in `held` yet, the lowest id first. `MoveTerminal`
@@ -7232,12 +7616,29 @@ fn exec_daemon(exe: &Path) -> ! {
 
 /// `exe daemon <args>` in place of this process. Returns the error when it did not happen.
 fn exec_into(exe: &Path, args: &[String]) -> io::Error {
-    use std::os::unix::process::CommandExt;
+    let mut command = daemon_command(exe, args);
     eprintln!("qorod: moving onto {}", exe.display());
-    std::process::Command::new(exe)
-        .arg("daemon")
-        .args(args)
-        .exec()
+    run_exec(&mut command)
+}
+
+fn daemon_command(exe: &Path, args: &[String]) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command.arg("daemon").args(args);
+    command
+}
+
+/// Replace this process with `command`. Returns only when that did not happen.
+///
+/// The standard library puts SIGPIPE back to its default before it execs, as the program it
+/// starts expects, and leaves it there when the exec fails. A daemon that carries on after
+/// that dies of the first write to a closed client, and every tab with it, so it is ignored
+/// again as it was at start.
+fn run_exec(command: &mut std::process::Command) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    let e = command.exec();
+    // SAFETY: signal with SIG_IGN is always a valid disposition for SIGPIPE.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    e
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.
@@ -7848,21 +8249,18 @@ pub struct Adopted {
     pub token: qoro_domain::CapabilityToken,
     pub child: u32,
     pub tty_dev: u64,
-    pub size: PtySize,
-    pub pending: Vec<u8>,
-    pub screen: String,
-    pub nudge: bool,
+    pub seed: Seed,
     pub agent: Option<crate::agents::AgentCarry>,
     /// The conversation id its agent said, and who vouches for it.
     pub session: Option<(String, Option<Said>)>,
 }
 
 /// What a terminal's task starts from besides the descriptor: nothing for a new one.
-struct Seed {
-    size: PtySize,
-    pending: Vec<u8>,
-    screen: String,
-    nudge: bool,
+pub struct Seed {
+    pub size: PtySize,
+    pub pending: Vec<u8>,
+    pub screen: String,
+    pub nudge: bool,
 }
 
 /// Start a shell on a new pty: its master, the shell and the device of its slave.
@@ -7957,15 +8355,7 @@ fn spawn_terminal(
     // happened to start.
     let started_in = cwd.clone();
     let (master_fd, child, tty_dev, seed) = match adopt {
-        Some(a) => {
-            let seed = Seed {
-                size: a.size,
-                pending: a.pending,
-                screen: a.screen,
-                nudge: a.nudge,
-            };
-            (a.master, Leader::new(a.child), a.tty_dev, seed)
-        }
+        Some(a) => (a.master, Leader::new(a.child), a.tty_dev, a.seed),
         None => {
             let (master, child, tty_dev) = start_shell(&shell, cwd.as_deref(), &token, stream)?;
             let seed = Seed {
@@ -8192,6 +8582,14 @@ async fn fallback_teardown(
     seen
 }
 
+/// Wait for each of these pids, children of this process whose terminals were closed on them
+/// and which stay zombies until somebody does.
+pub async fn reap_children(pids: Vec<u32>) {
+    for pid in pids {
+        reap_child(pid).await;
+    }
+}
+
 /// Reap one child without its handle.
 ///
 /// The daemon is still the parent, so `waitpid` on exactly this pid reaps
@@ -8203,24 +8601,42 @@ async fn reap_child(child_pid: u32) {
     let pid = i32::try_from(child_pid).ok().filter(|p| *p > 0);
     let Some(pid) = pid else { return };
     for _ in 0..20 {
-        let mut status = 0;
-        // SAFETY: waitpid on our own child's pid with WNOHANG; blocks nothing,
-        // reaps nothing but this pid.
-        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-        if r > 0 {
-            return;
+        match wait_once(pid) {
+            Waited::Running => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            // Interrupted before reaping anything: retry rather than leave a zombie
+            // behind.
+            Waited::Interrupted => {}
+            // Reaped, or ECHILD or a real error, which both mean there is nothing left to
+            // wait for.
+            _ => return,
         }
-        if r == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            continue;
-        }
-        // Interrupted before reaping anything: retry rather than leave a
-        // zombie behind. Anything else negative is ECHILD or a real error,
-        // and both mean there is nothing left to wait for.
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        return;
+    }
+}
+
+/// What one look at a child of this process found.
+enum Waited {
+    /// Still running.
+    Running,
+    /// It had ended, and this look reaped it.
+    Reaped,
+    /// Not a child of this process, or already waited for.
+    NotOurs,
+    Interrupted,
+    Failed(io::Error),
+}
+
+/// One `waitpid` on one pid, without waiting. The only place a child is waited for.
+fn wait_once(pid: i32) -> Waited {
+    let mut status = 0;
+    // SAFETY: waitpid on one pid with WNOHANG blocks nothing and reaps nothing else.
+    match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+        0 => Waited::Running,
+        r if r > 0 => Waited::Reaped,
+        _ => match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::EINTR) => Waited::Interrupted,
+            e if e.raw_os_error() == Some(libc::ECHILD) => Waited::NotOurs,
+            e => Waited::Failed(e),
+        },
     }
 }
 
@@ -8282,23 +8698,13 @@ impl Leader {
         if self.reaped {
             return Ok(Some(()));
         }
-        let mut status = 0;
-        // SAFETY: waitpid on one pid with WNOHANG blocks nothing and reaps nothing else.
-        let r = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-        match r {
-            0 => Ok(None),
-            r if r > 0 => {
+        match wait_once(self.pid) {
+            Waited::Running | Waited::Interrupted => Ok(None),
+            Waited::Reaped | Waited::NotOurs => {
                 self.reaped = true;
                 Ok(Some(()))
             }
-            _ => match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => Ok(None),
-                Some(libc::ECHILD) => {
-                    self.reaped = true;
-                    Ok(Some(()))
-                }
-                _ => Err(io::Error::last_os_error()),
-            },
+            Waited::Failed(e) => Err(e),
         }
     }
 }
@@ -8529,7 +8935,12 @@ async fn terminal_task(
     let mut writes = WriteQueue::new(1024 * 1024, 64 * 1024);
     // What the daemon this one moved from had not typed into the child yet.
     for chunk in qoro_pty::chunk_paste(&seed.pending) {
-        let _ = writes.push(chunk, WritePriority::UserInput);
+        if writes.push(chunk, WritePriority::UserInput).is_err() {
+            eprintln!(
+                "qorod: tab {stream}: input carried over the move did not fit and was dropped"
+            );
+            break;
+        }
     }
     // Maintained during the terminal's life, not built at teardown. See the scan below.
     let mut containment = Containment::new();
@@ -10328,5 +10739,195 @@ mod leader_tests {
         let mut leader = Leader::new(1);
         assert!(matches!(leader.try_wait(), Ok(Some(()))));
         assert!(leader.reaped);
+    }
+}
+
+#[cfg(test)]
+mod adoption_tests {
+    use super::{adoptable, check_carried};
+    use crate::handoff::Carried;
+    use std::os::fd::AsRawFd;
+
+    fn carried(fd: i32, tty_dev: u64, child: i32, child_start: Option<u64>) -> Carried {
+        Carried {
+            id: 1,
+            fd,
+            child,
+            child_start,
+            tty_dev,
+            workspace: 1,
+            name: None,
+            cwd: None,
+            token: "t".into(),
+            cols: 80,
+            rows: 24,
+            pending: Vec::new(),
+            screen: String::new(),
+            nudge: false,
+            agent: None,
+            session: None,
+            session_said: None,
+        }
+    }
+
+    /// A pty and a child of this process, as a handover would describe them.
+    struct Pair {
+        pty: qoro_pty::sys::PtyPair,
+        tty_dev: u64,
+        child: std::process::Child,
+        start: Option<u64>,
+    }
+
+    fn pair() -> Pair {
+        let pty = qoro_pty::sys::open_pty(80, 24).expect("pty");
+        let tty_dev = qoro_pty::sys::tty_dev(pty.slave.as_raw_fd()).expect("tty");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let start = qoro_pty::sys::start_time_of(qoro_pty::teardown::Pid(child.id() as i32));
+        Pair {
+            pty,
+            tty_dev,
+            child,
+            start,
+        }
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn a_tab_is_handed_over_only_when_its_pty_and_shell_can_be_read() {
+        let p = pair();
+        let (fd, child) = (p.pty.master.as_raw_fd(), p.child.id() as i32);
+        assert!(adoptable(None, Some(child)).is_err());
+        assert!(adoptable(Some(fd), None).is_err());
+        let elsewhere = std::fs::File::open("/dev/null").expect("file");
+        assert!(adoptable(Some(elsewhere.as_raw_fd()), Some(child)).is_err());
+    }
+
+    #[test]
+    fn a_pty_and_a_child_that_are_what_the_file_says_are_taken() {
+        let p = pair();
+        let c = carried(
+            p.pty.master.as_raw_fd(),
+            p.tty_dev,
+            p.child.id() as i32,
+            p.start,
+        );
+        assert!(check_carried(&c).is_ok());
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_that_terminals_pty_is_refused_and_nothing_is_stopped() {
+        let p = pair();
+        let child = p.child.id() as i32;
+        let elsewhere = std::fs::File::open("/dev/null").expect("file");
+        for (what, c) in [
+            (
+                "not a pty",
+                carried(elsewhere.as_raw_fd(), p.tty_dev, child, p.start),
+            ),
+            (
+                "another pty",
+                carried(p.pty.master.as_raw_fd(), p.tty_dev + 1, child, p.start),
+            ),
+        ] {
+            let refused = check_carried(&c).expect_err(what);
+            assert!(!refused.ours, "{what}: a refusal must not stop anything");
+        }
+    }
+
+    #[test]
+    fn a_process_that_is_not_our_child_or_not_the_one_written_down_is_not_touched() {
+        let p = pair();
+        let fd = p.pty.master.as_raw_fd();
+        // Nobody's child of this process.
+        let stranger = carried(fd, p.tty_dev, 1, None);
+        assert!(!check_carried(&stranger).expect_err("pid 1").ours);
+        // Ours and running, but not the process that was written down.
+        let reused = carried(fd, p.tty_dev, p.child.id() as i32, p.start.map(|s| s + 7));
+        assert!(!check_carried(&reused).expect_err("another start time").ours);
+    }
+
+    #[test]
+    fn a_child_that_ended_during_the_move_is_not_taken() {
+        let mut p = pair();
+        let child = p.child.id() as i32;
+        p.child.kill().expect("kill");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let c = carried(p.pty.master.as_raw_fd(), p.tty_dev, child, p.start);
+        // Its exit is noticed by the asking, once the kernel has it: until then it still
+        // looks like a running child with no start time.
+        loop {
+            match check_carried(&c) {
+                Err(refused) if refused.ended => {
+                    assert!(!refused.ours);
+                    break;
+                }
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "never noticed");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::{Bookkeeping, watch};
+    use std::time::Duration;
+
+    fn books() -> Bookkeeping {
+        Bookkeeping::new(
+            crate::store::StoreHandle::new(qoro_store::Store::in_memory().expect("store")),
+            std::sync::Arc::default(),
+        )
+    }
+
+    /// One tab's history, as `open_terminal` registers it: the ring's flusher, and the
+    /// receiver that closes when its writer has gone.
+    fn register(books: &Bookkeeping, stream: u32) -> (crate::spill::SpillRing, watch::Sender<()>) {
+        let ring = crate::spill::SpillRing::new();
+        let (done, finished) = watch::channel(());
+        books.writers.lock().unwrap().insert(stream, finished);
+        books
+            .flushers
+            .lock()
+            .unwrap()
+            .insert(stream, ring.flusher());
+        (ring, done)
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_has_gone_is_not_waited_for_and_one_that_is_silent_is_bounded() {
+        let books = books();
+        // Tab 1's writer returned early (its history could not be opened): nothing to wait
+        // for, and asking it would never be answered.
+        let (_gone_ring, gone) = register(&books, 1);
+        drop(gone);
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        assert!(books.flush_histories(&[1], deadline).await);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // Tab 2's writer is alive and never answers: the wait ends at the deadline, once,
+        // however many tabs are like it.
+        let (_ring2, _alive2) = register(&books, 2);
+        let (_ring3, _alive3) = register(&books, 3);
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        assert!(!books.flush_histories(&[1, 2, 3], deadline).await);
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "each silent writer was given a deadline of its own: {:?}",
+            started.elapsed()
+        );
     }
 }

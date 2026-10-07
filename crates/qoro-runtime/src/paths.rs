@@ -350,6 +350,14 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
+/// Sixteen bytes of the system's own randomness, as hex: a name nobody could have guessed.
+pub fn random_hex() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub fn current_uid() -> u32 {
     // SAFETY: getuid takes no arguments and cannot fail.
     unsafe { libc::getuid() }

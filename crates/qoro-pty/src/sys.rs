@@ -93,19 +93,22 @@ pub fn slave_tty_dev(master: RawFd) -> io::Result<u64> {
     if unsafe { libc::stat(name.as_ptr(), &mut st) } != 0 {
         return Err(last_err());
     }
-    Ok(st.st_rdev as u32 as u64)
+    Ok(rdev_of(&st))
 }
 
-/// A second descriptor for the same open file, at or above `min`, left inheritable or not.
-/// The description is shared, so it stays open however the first one is dropped.
-pub fn dup_from(fd: RawFd, min: RawFd, cloexec: bool) -> io::Result<OwnedFd> {
-    let cmd = if cloexec {
-        libc::F_DUPFD_CLOEXEC
-    } else {
-        libc::F_DUPFD
-    };
+/// The device number of a stat, as every terminal identity here is kept.
+fn rdev_of(st: &libc::stat) -> u64 {
+    // `st_rdev` is signed on this platform, so a plain widening cast sign-extends and the
+    // two sides of the comparison stop being the same number. The device number is a 32 bit
+    // unsigned quantity, so narrow first.
+    st.st_rdev as u32 as u64
+}
+
+/// A second descriptor for the same open file, above stdin, stdout and stderr and close on
+/// exec. The description is shared, so it stays open however the first one is dropped.
+pub fn dup_cloexec_above_stdio(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: fd is live; the new descriptor is fresh and owned by nobody else.
-    let d = unsafe { libc::fcntl(fd, cmd, min) };
+    let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if d < 0 {
         return Err(last_err());
     }
@@ -215,10 +218,7 @@ pub fn tty_dev(slave: RawFd) -> io::Result<u64> {
     if unsafe { libc::fstat(slave, &mut st) } != 0 {
         return Err(last_err());
     }
-    // `st_rdev` is signed on this platform, so a plain widening cast sign-extends and the
-    // two sides of the comparison stop being the same number. The device number is a 32 bit
-    // unsigned quantity, so narrow first.
-    Ok(st.st_rdev as u32 as u64)
+    Ok(rdev_of(&st))
 }
 
 /// Signal one process, for the fallback that knows its child's pid.

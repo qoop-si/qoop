@@ -193,7 +193,7 @@ const CONNECTING: &str = "connecting";
 ///
 /// Said, not fetched: the interface never touches the network, it only reads the notice
 /// `qoro update --check` left beside the sessions. The install itself runs outside, as
-/// `qoro update`, which also moves every machine's daemon once nothing there is working.
+/// `qoro update`, which also moves every machine's daemon onto it.
 fn update_message() -> String {
     match qoro_runtime::paths::read_update_notice() {
         Some(seen) if qoro_runtime::paths::is_newer_version(&seen, env!("CARGO_PKG_VERSION")) => {
@@ -9676,7 +9676,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // not read the id either. The one search waiting is what it is answering.
         ControlResponse::Failed { id, reason }
             if id.is_empty()
-                && reason.contains("unknown variant")
+                && qoro_runtime::control::too_old_for(&reason, None)
                 && state
                     .modes
                     .copy

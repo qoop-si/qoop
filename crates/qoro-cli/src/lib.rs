@@ -97,12 +97,11 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
     }
     match args.get(1).map(String::as_str) {
         Some("daemon") => run_daemon(&args),
-        // What a daemon about to move onto this binary asks of it: the handover layouts it
-        // can take over from, one per line of output. A build that has no such answer
-        // fails the question, and is moved onto the old way.
+        // What a daemon about to move onto this binary asks of it: the handover layout it
+        // takes over from. A build that has no such answer fails the question, and is
+        // moved onto the old way.
         Some("--handoff-formats") => {
-            let formats: Vec<String> = handoff::FORMATS.iter().map(u32::to_string).collect();
-            println!("{}", formats.join(" "));
+            println!("{}", handoff::FORMAT);
             Ok(())
         }
         Some("--hello") => {
@@ -254,7 +253,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20                 that pairing installs runs exactly this)\n\
                  \x20 qoro bridge reload  put that service back on the installed binary\n\
                  \x20 qoro update [--check]  fetch the newest release, install it, and move every\n\
-                 \x20                 machine onto it once nothing there is working\n\
+                 \x20                 machine onto it, keeping running tabs running where it can\n\
                  \x20 qoro --version\n\
                  \n\
                  detach with ctrl-q. the shell keeps running.\n\
@@ -285,11 +284,33 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // can rename a new file over it: on Linux the running path then reads
     // `<path> (deleted)`. It is the file an update replaces and what the daemon becomes.
     let exe = std::env::current_exe().map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
+    // The dry run a daemon about to become this binary makes of it: can this read what it
+    // wrote? Nothing is started and nothing is deleted.
+    if let Some((file, nonce)) = handoff::check_requested(args) {
+        handoff::check(&file, &nonce)?;
+        // The state it would open next: a database from a newer build is found out here,
+        // with every tab still in the daemon that is asking, and not after the exec.
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let db = paths::state_dir(&dir)
+            .map_err(std::io::Error::other)?
+            .join("qoro.db");
+        if db.exists() {
+            qoro_store::Store::check_openable(&db).map_err(std::io::Error::other)?;
+        }
+        return Ok(());
+    }
     // The tabs the daemon before this one handed over, read before anything is closed:
     // their descriptors are the ones inherited that stay open.
+    let mut orphans = Vec::new();
     let handed = handoff::requested(args).and_then(|(file, nonce)| {
+        // Named before the read, which deletes the file: if it is refused, the shells it
+        // names lose their terminals as the descriptors close, and are waited for.
+        let named = handoff::children_in(&file);
         handoff::read(&file, &nonce)
-            .map_err(|e| eprintln!("qorod: the handover was refused: {e}"))
+            .map_err(|e| {
+                eprintln!("qorod: the handover was refused: {e}");
+                orphans = named;
+            })
             .ok()
     });
     qoro_runtime::daemon::close_inherited_fds(
@@ -302,7 +323,33 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // Held across the whole sequence: stale-socket check, unlink, bind, listen, initialise.
     // Two daemons started at once therefore serialise here rather than both concluding the
     // socket is stale and unlinking each other's.
-    let lock = lock::StartupLock::acquire(&paths::lock_path(&dir))?;
+    // Or, after a move, the one the daemon before this held across it: nobody could take it
+    // in between, so nobody started a second daemon.
+    let lock = match handed.as_ref().and_then(|h| h.startup_lock) {
+        Some(fd) if qoro_runtime::daemon::fd_is_open(fd) => {
+            let _ = qoro_pty::sys::set_cloexec(fd);
+            // SAFETY: the daemon before this one passed this descriptor on as the startup
+            // lock, and nothing in this process owns it.
+            unsafe { lock::StartupLock::from_fd(fd) }
+        }
+        _ => {
+            let path = paths::lock_path(&dir);
+            match lock::StartupLock::try_acquire(&path)? {
+                Some(lock) => lock,
+                None => {
+                    // Said, because a daemon that waits here for long is a different
+                    // thing from one that is not running, and nothing else tells them apart.
+                    eprintln!("qorod: waiting for the startup lock, another daemon holds it");
+                    lock::StartupLock::acquire(&path)?
+                }
+            }
+        }
+    };
+    // Handover files nobody will read, from a daemon that died on the way.
+    if let Some(dir) = paths::socket_path(&dir).parent() {
+        handoff::sweep(dir);
+    }
+    let carried_tabs = handed.as_ref().map_or(0, |h| h.terminals.len());
     // Why a start failed, left where `ensure_daemon` looks: a daemon started on demand has
     // no terminal to say it on, and "the daemon did not start" alone sent people to the
     // socket when the cause was the data directory.
@@ -327,7 +374,20 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
             },
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Another daemon won the race and is already serving. This is the expected
-                // outcome for the loser, not a failure.
+                // outcome for the loser, not a failure, unless this was a move: then the
+                // tabs it carried lose their terminals as this process goes, and their rows
+                // (written down before the move) bring them back.
+                if carried_tabs > 0 {
+                    // A failure and not a quiet exit: the tabs carried here are lost with
+                    // this process, and a unit that restarts on failure should look again.
+                    let why = format!(
+                        "another daemon is serving this socket; {carried_tabs} tabs carried \
+                         here are left to it and restart from their rows"
+                    );
+                    eprintln!("qorod: {why}");
+                    return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, why));
+                }
+                eprintln!("qorod: another daemon is already serving this socket");
                 return Ok(());
             }
             Err(e) => {
@@ -336,6 +396,9 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
             }
         };
         eprintln!("qorod: listening on {}", daemon.socket().display());
+        if !orphans.is_empty() {
+            tokio::spawn(qoro_runtime::daemon::reap_children(orphans));
+        }
         drop(lock);
         daemon.serve().await
     })
@@ -1040,7 +1103,8 @@ where
                 if let client::Incoming::Control(response) = incoming
                     && (response.request_id() == id
                         || matches!(&response, ControlResponse::Failed { id, reason }
-                            if id.is_empty() && reason.contains("`RestartWhenSafe`")))
+                            if id.is_empty()
+                                && qoro_runtime::control::too_old_for(reason, Some("RestartWhenSafe"))))
                 {
                     return Ok(response);
                 }

@@ -7,7 +7,8 @@
 //! The daemon never updates itself (ADR-019), and neither does the interface. This is a
 //! separate short lived process the person runs themselves. It never stops a session:
 //! after the install it asks every daemon, this machine's and each saved remote's, to
-//! move onto the new binary at the first moment nothing there is working, and returns
+//! move onto the new binary (at once with the tabs still running when both binaries can
+//! hand tabs over, else at the first moment nothing there is working), and returns
 //! as soon as they have answered rather than waiting for the moves. Run again with
 //! nothing newer to install, it does only that, so it is also "bring everything to this
 //! version".
@@ -46,7 +47,7 @@ const BUSY_WAIT: Duration = if cfg!(test) {
 const STALE_STAGE: Duration = Duration::from_secs(30 * 60);
 
 /// A line about a machine: `Ok` when all is as it should be, `Err` when it is not.
-type Said = Result<String, String>;
+type Line = Result<String, String>;
 
 /// Whether this process runs under Rosetta.
 fn translated() -> bool {
@@ -186,7 +187,7 @@ async fn hello(socket: &Path) -> std::io::Result<(tokio::net::UnixStream, BytesM
 }
 
 /// What came of the ask to this machine's own daemon, or that there is none to ask.
-async fn this_machine(version: &str) -> Said {
+async fn this_machine(version: &str) -> Line {
     let socket = match paths::runtime_dir() {
         Ok(dir) => paths::socket_path(&dir),
         Err(e) => return Err(format!("not asked to move: {e}")),
@@ -213,33 +214,58 @@ async fn this_machine(version: &str) -> Said {
 /// What came of putting `version` on one remote and asking its daemon onto it. Everything
 /// a remote said is plain text first: it would reach this terminal as it was printed.
 async fn remote_line(remote: &Remote, version: &str) -> String {
-    let (on_disk, warning) = match put_on(&remote.target, version).await {
+    // Opened as the interface opens one nobody is watching, with a key of its own: a fixed
+    // one would make two runs at once end each other's connection.
+    let open = || async { link::open(remote, true, &crate::request_id("update")).await };
+    remote_line_with(
+        version,
+        || put_on(&remote.target, version),
+        |on_disk| async move {
+            match open().await {
+                Ok(link) => {
+                    let again = || async { open().await.map(|link| link.server_version.clone()) };
+                    move_daemon(
+                        link.stream,
+                        link.leftover,
+                        &link.server_version,
+                        &on_disk,
+                        again,
+                    )
+                    .await
+                }
+                Err(e) => Err(format!(
+                    "{on_disk} is on its disk, but its daemon was not asked to move: {}",
+                    plain(&e.to_string())
+                )),
+            }
+        },
+    )
+    .await
+}
+
+/// `remote_line` with the two things it does over ssh handed in: putting the release there
+/// (what is on its disk afterwards, and what the swap warned of), and asking its daemon to
+/// move onto that.
+async fn remote_line_with<P, PF, M, MF>(version: &str, put: P, move_it: M) -> String
+where
+    P: FnOnce() -> PF,
+    PF: std::future::Future<Output = std::io::Result<Update>>,
+    M: FnOnce(String) -> MF,
+    MF: std::future::Future<Output = Line>,
+{
+    let (on_disk, warning) = match put().await {
         Ok(Update::OnDisk(on_disk, warning)) => (on_disk, warning),
         Ok(Update::NoRelease) => {
             return format!("no {version} release, left as it is");
         }
         Err(e) => return format!("not updated: {}", plain(&e.to_string())),
     };
-    // Opened as the interface opens one nobody is watching, with a key of its own: a fixed
-    // one would make two runs at once end each other's connection.
-    let open = || async { link::open(remote, true, &crate::request_id("update")).await };
-    let (Ok(line) | Err(line)) = match open().await {
-        Ok(link) => {
-            let again = || async { open().await.map(|link| link.server_version.clone()) };
-            move_daemon(
-                link.stream,
-                link.leftover,
-                &link.server_version,
-                &on_disk,
-                again,
-            )
-            .await
-        }
-        Err(e) => Err(format!(
-            "{on_disk} is on its disk, but its daemon was not asked to move: {}",
-            plain(&e.to_string())
-        )),
-    };
+    // What the machine says its qoro is reaches this terminal in every line below, so it
+    // has to be a version before it is used as one.
+    if paths::parse_version(&on_disk).is_none() {
+        return "not updated: the machine reported a version this qoro cannot read".to_string();
+    }
+    let (Ok(line) | Err(line)) = move_it(on_disk).await;
     match warning {
         Some(warning) => format!("{line}\n  but {warning}"),
         None => line,
@@ -250,7 +276,21 @@ async fn remote_line(remote: &Remote, version: &str) -> String {
 /// interface pushing at the same moment): when it finishes, this finds the version on disk.
 /// The lock's refusal is told by its sentence in `link.rs`; reword them together.
 async fn put_on(target: &str, version: &str) -> std::io::Result<Update> {
-    retry_busy(|| link::update(target, version)).await
+    put_on_with(
+        |target, version| async move { link::update(&target, &version).await },
+        target,
+        version,
+    )
+    .await
+}
+
+/// `put_on` with the update itself handed in.
+async fn put_on_with<F, Fut>(update: F, target: &str, version: &str) -> std::io::Result<Update>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<Update>>,
+{
+    retry_busy(|| update(target.to_string(), version.to_string())).await
 }
 
 async fn retry_busy<F, Fut>(mut attempt: F) -> std::io::Result<Update>
@@ -282,14 +322,14 @@ async fn move_daemon<S, F, Fut>(
     running: &str,
     version: &str,
     again: F,
-) -> Said
+) -> Line
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<String>>,
 {
     if !paths::is_newer_version(version, running) {
-        return Ok(format!("already {running}"));
+        return Ok(format!("already {}", plain(running)));
     }
     let request = ControlRequest::RestartWhenSafe {
         id: crate::request_id("update"),
@@ -308,16 +348,29 @@ where
 /// like: look for it again until `within` has passed, and say it is moving only when it
 /// answers as `version`. A daemon still answering as the old one may only be on its way
 /// out, so that is waited past too.
-async fn came_back<F, Fut>(version: &str, within: Duration, again: F) -> Said
+async fn came_back<F, Fut>(version: &str, within: Duration, again: F) -> Line
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<String>>,
 {
     let deadline = std::time::Instant::now() + within;
     loop {
-        let seen = match again().await {
-            Ok(running) if running == version => return Ok(format!("moving to {version} now")),
-            Ok(running) => format!("runs {}, not {version}", plain(&running)),
+        // One look is bounded by what is left of the budget, not only the wait between
+        // them: a connection and a handshake can each take far longer than the budget.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let looked = tokio::time::timeout(left.max(Duration::from_millis(1)), again())
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no answer in time",
+                ))
+            });
+        let seen = match looked {
+            Ok(running) if running == version => {
+                return Ok(format!("moving to {} now", plain(version)));
+            }
+            Ok(running) => format!("runs {}, not {}", plain(&running), plain(version)),
             Err(e) => format!("did not come back as {version}: {}", plain(&e.to_string())),
         };
         if std::time::Instant::now() >= deadline {
@@ -328,25 +381,31 @@ where
 }
 
 /// One daemon's answer to the ask to move, as a line. What it says is plain text first.
-fn arm_line(answer: std::io::Result<ControlResponse>, version: &str) -> Said {
+fn arm_line(answer: std::io::Result<ControlResponse>, version: &str) -> Line {
     match answer {
         Ok(ControlResponse::RestartArmed {
             waiting_on: Some(why),
             ..
         }) => Ok(format!(
-            "moves to {version} once nothing is working; waiting on {}",
+            "moves to {} once nothing is working; waiting on {}",
+            plain(version),
             plain(&why)
         )),
-        Ok(ControlResponse::RestartArmed { .. }) => {
-            Ok(format!("moves to {version} once nothing is working"))
-        }
+        Ok(ControlResponse::RestartArmed { .. }) => Ok(format!(
+            "moves to {} once nothing is working",
+            plain(version)
+        )),
         // A daemon from before the ask existed, told by serde's own wording, as the
         // interface tells it.
-        Ok(ControlResponse::Failed { reason, .. }) if reason.contains("unknown variant") => Err(
-            "runs a qoro from before updates moved on their own; the new one takes over \
+        Ok(ControlResponse::Failed { reason, .. })
+            if qoro_runtime::control::too_old_for(&reason, None) =>
+        {
+            Err(
+                "runs a qoro from before updates moved on their own; the new one takes over \
                  when it next restarts"
-                .to_string(),
-        ),
+                    .to_string(),
+            )
+        }
         Ok(ControlResponse::Failed { reason, .. }) => {
             Err(format!("keeps its qoro for now: {}", plain(&reason)))
         }
@@ -530,7 +589,7 @@ fn clear_notice() {
 mod tests {
     use super::{
         BytesMut, ControlResponse, Release, Update, arm_line, came_back, install_to, move_daemon,
-        retry_busy,
+        put_on_with, remote_line_with, retry_busy,
     };
 
     const MAC_ARM: &str = "qoro-aarch64-apple-darwin.tar.gz";
@@ -753,6 +812,142 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    /// A look at a daemon that takes longer than what is left of the budget is cut off at it:
+    /// a connection and a handshake can each take far longer than the budget itself.
+    #[tokio::test]
+    async fn one_slow_look_does_not_outlast_the_budget() {
+        let started = std::time::Instant::now();
+        let said = came_back("0.7.0", std::time::Duration::from_millis(300), || async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok("0.7.0".to_string())
+        })
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(said.is_err(), "{said:?}");
+    }
+
+    /// A remote's own words never reach the terminal as anything but text: what the daemon says
+    /// it runs, and what it says is on its disk.
+    #[tokio::test]
+    async fn what_a_remote_calls_its_version_is_text_or_refused() {
+        let (stream, _other) = tokio::io::duplex(64);
+        let said = move_daemon(
+            stream,
+            BytesMut::new(),
+            "0.7.0\u{1b}[31m",
+            "0.7.0",
+            || async { Ok(String::new()) },
+        )
+        .await;
+        let said = said.expect("not newer, so already there");
+        assert!(!said.contains('\u{1b}'), "{said:?}");
+
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let line = remote_line_with(
+            "0.7.0",
+            || async { Ok(Update::OnDisk("9\u{1b}]0;x\u{7}".into(), None)) },
+            |_| async {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(String::new())
+            },
+        )
+        .await;
+        assert_eq!(
+            line,
+            "not updated: the machine reported a version this qoro cannot read"
+        );
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "a daemon was asked to move onto something that is not a version"
+        );
+    }
+
+    /// One remote's line: what was put there, what its daemon answered, and what the swap
+    /// warned of, in that order and as text.
+    #[tokio::test]
+    async fn a_remote_line_says_what_was_done_and_what_failed() {
+        let line = |put: std::io::Result<Update>, moved: Result<String, String>| async {
+            remote_line_with("0.7.0", || async { put }, |_| async { moved }).await
+        };
+        assert_eq!(
+            line(Ok(Update::NoRelease), Ok(String::new())).await,
+            "no 0.7.0 release, left as it is"
+        );
+        // ssh's own reason, with nothing in it that could act on the terminal.
+        let said = line(
+            Err(std::io::Error::other(
+                "\u{1b}[2Jssh: connect to host a port 22: Connection refused",
+            )),
+            Ok(String::new()),
+        )
+        .await;
+        assert_eq!(
+            said,
+            "not updated: [2Jssh: connect to host a port 22: Connection refused"
+        );
+        assert_eq!(
+            line(
+                Ok(Update::OnDisk(
+                    "0.7.0".into(),
+                    Some("the bridge there was not reloaded".into())
+                )),
+                Ok("moving to 0.7.0 now".into()),
+            )
+            .await,
+            "moving to 0.7.0 now\n  but the bridge there was not reloaded"
+        );
+        // A daemon that could not be asked is told as the failure it is, with the version
+        // that is on its disk.
+        assert_eq!(
+            line(
+                Ok(Update::OnDisk("0.7.0".into(), None)),
+                Err("0.7.0 is on its disk, but its daemon was not asked to move: refused".into()),
+            )
+            .await,
+            "0.7.0 is on its disk, but its daemon was not asked to move: refused"
+        );
+    }
+
+    /// Putting the release over there waits out another update's lock and nothing else.
+    #[tokio::test]
+    async fn putting_a_release_on_a_machine_waits_out_a_busy_lock_and_stops_at_a_refusal() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let done = put_on_with(
+            |target, version| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!((target.as_str(), version.as_str()), ("box", "0.7.0"));
+                    if n < 2 {
+                        Err(std::io::Error::other(
+                            "another update of qoro is in progress there; try again later",
+                        ))
+                    } else {
+                        Ok(Update::OnDisk("0.7.0".into(), None))
+                    }
+                }
+            },
+            "box",
+            "0.7.0",
+        )
+        .await;
+        assert!(matches!(done, Ok(Update::OnDisk(..))));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let calls = AtomicU32::new(0);
+        let done = put_on_with(
+            |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(std::io::Error::other("no qoro file to replace")) }
+            },
+            "box",
+            "0.7.0",
+        )
+        .await;
+        assert!(done.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal was retried");
     }
 
     /// An already running version is said without asking anything of the daemon.

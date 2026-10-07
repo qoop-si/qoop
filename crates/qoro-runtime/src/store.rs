@@ -72,24 +72,20 @@ impl Drop for Owed {
 
 /// Wait, until `deadline`, for every owed write to land.
 pub(crate) async fn settle_owed(deadline: tokio::time::Instant) {
-    wait_for(deadline, true).await
+    wait_for(deadline, || {
+        OWED.load(std::sync::atomic::Ordering::SeqCst)
+            + WRITERS.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await
 }
 
 /// The same for the store alone, for a daemon that has already had every history writer
 /// flush and is not ending its terminals.
 pub(crate) async fn settle_stores(deadline: tokio::time::Instant) {
-    wait_for(deadline, false).await
+    wait_for(deadline, || OWED.load(std::sync::atomic::Ordering::SeqCst)).await
 }
 
-async fn wait_for(deadline: tokio::time::Instant, writers: bool) {
-    let owed = || {
-        OWED.load(std::sync::atomic::Ordering::SeqCst)
-            + if writers {
-                WRITERS.load(std::sync::atomic::Ordering::SeqCst)
-            } else {
-                0
-            }
-    };
+async fn wait_for(deadline: tokio::time::Instant, owed: impl Fn() -> usize) {
     while owed() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

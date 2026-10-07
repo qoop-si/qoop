@@ -91,16 +91,27 @@ pub struct Flusher {
 }
 
 impl Flusher {
-    /// Ask for a flush and wait for it, up to `within`. True when everything handed over
-    /// before the call is on disk.
-    pub async fn flush(&self, within: std::time::Duration) -> bool {
-        use std::sync::atomic::Ordering;
-        let n = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut done = self.done.subscribe();
+    /// Ask for a flush, and say which one it was. Everything handed over before the call is
+    /// on disk once `reached` of that number says so.
+    pub fn ask(&self) -> u64 {
+        let n = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         self.wake.notify_one();
+        n
+    }
+
+    /// Wait until the flush `n` is done, up to `within`.
+    pub async fn reached(&self, n: u64, within: std::time::Duration) -> bool {
+        let mut done = self.done.subscribe();
         tokio::time::timeout(within, done.wait_for(|d| *d >= n))
             .await
             .is_ok_and(|reached| reached.is_ok())
+    }
+
+    /// Ask for a flush and wait for it, up to `within`. True when everything handed over
+    /// before the call is on disk.
+    pub async fn flush(&self, within: std::time::Duration) -> bool {
+        let n = self.ask();
+        self.reached(n, within).await
     }
 }
 

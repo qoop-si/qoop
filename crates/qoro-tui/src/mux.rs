@@ -25,6 +25,7 @@ use qoro_remote::Remote;
 use qoro_runtime::client::{self, Connection, Incoming};
 use qoro_runtime::control::{
     AgentRow, ControlRequest, ControlResponse, EventMessage, LinkState, Pane, WorkspaceRow,
+    too_old_for,
 };
 use qoro_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -134,7 +135,8 @@ enum FromLink {
     /// The time a remote with nothing awake is given before its link is let go.
     ParkCheck { link: usize, conn: u64 },
     /// A newer qoro is on the disk of this remote, `version`: its daemon is asked to move to
-    /// it once nothing there is working.
+    /// it, at once with its tabs running when it can hand them over, else when nothing there
+    /// is working.
     Arm { link: usize, version: String },
 }
 
@@ -1632,9 +1634,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             // A daemon from before the ask existed. One too old to name the request in its
             // refusal answers with no id, but still names the ask it did not know.
             C::Failed { reason, .. }
-                if id == RESTART_ID || (id.is_empty() && reason.contains("`RestartWhenSafe`")) =>
+                if id == RESTART_ID
+                    || (id.is_empty() && too_old_for(&reason, Some("RestartWhenSafe"))) =>
             {
-                let line = if reason.contains("unknown variant") {
+                let line = if too_old_for(&reason, None) {
                     format!(
                         "{name} runs a qoro from before updates moved on their own: the new one \
                          is on disk there and takes over when {name} next restarts its qoro"
@@ -2143,12 +2146,7 @@ async fn supervise(
 /// randomness to read, which a daemon takes as no key: the old connection then waits for
 /// the no-ack sweep, as before keys.
 fn link_key() -> String {
-    use std::io::Read;
-    let mut bytes = [0u8; 16];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
-        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(_) => String::new(),
-    }
+    qoro_runtime::paths::random_hex().unwrap_or_default()
 }
 
 fn last_word(said: &Arc<Mutex<String>>) -> String {

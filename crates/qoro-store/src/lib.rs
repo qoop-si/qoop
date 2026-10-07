@@ -169,6 +169,22 @@ impl Store {
         Self::prepare(Connection::open_with_flags(path, flags)?)
     }
 
+    /// Whether this build could open the database at `path`, found out by reading and
+    /// nothing else: no table is made, no migration run, nothing written. For the dry run a
+    /// daemon makes of the binary it is about to become, while it still serves from the same
+    /// file.
+    pub fn check_openable(path: &Path) -> Result<(), StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found > SCHEMA_VERSION {
+            return Err(StoreError::FromTheFuture {
+                found,
+                understood: SCHEMA_VERSION,
+            });
+        }
+        Ok(())
+    }
+
     /// An in-memory store, for tests and for a daemon told not to persist.
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::prepare(Connection::open_in_memory()?)
@@ -1955,5 +1971,40 @@ mod tests {
         // Forgotten, an agent coming back with no id cannot bring the old one back.
         s.set_agent(3, Some("opencode"), None).expect("agent again");
         assert_eq!(s.open_terminals(ws).expect("rows")[0].agent_session, None);
+    }
+}
+
+#[cfg(test)]
+mod openable_tests {
+    use super::*;
+
+    #[test]
+    fn a_dry_run_reads_the_database_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("qoro.db");
+        assert!(
+            Store::check_openable(&path).is_err(),
+            "a missing file is not openable"
+        );
+        assert!(!path.exists(), "the dry run made a database");
+        drop(Store::open(&path).expect("a database"));
+        let before = std::fs::read(&path).expect("bytes");
+        Store::check_openable(&path).expect("a database of this build opens");
+        assert_eq!(std::fs::read(&path).expect("bytes"), before);
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_not_openable() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("qoro.db");
+        drop(Store::open(&path).expect("a database"));
+        Connection::open(&path)
+            .expect("open")
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("newer");
+        assert!(matches!(
+            Store::check_openable(&path),
+            Err(StoreError::FromTheFuture { .. })
+        ));
     }
 }

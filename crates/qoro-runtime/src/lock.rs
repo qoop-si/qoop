@@ -35,6 +35,27 @@ impl StartupLock {
         Ok(Self { _file: file })
     }
 
+    /// The lock a daemon that moved onto this binary was holding, from the descriptor it
+    /// passed on. `flock` belongs to the open file, so the lock is held the whole way across
+    /// the `exec`: nobody could take it between the two daemons.
+    ///
+    /// # Safety
+    /// `fd` must be the descriptor of a file this process was handed for this lock and
+    /// nothing else owns.
+    // SAFETY: the contract is the `# Safety` section above; each caller says how it meets it.
+    pub unsafe fn from_fd(fd: std::os::fd::RawFd) -> Self {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the caller says the descriptor is ours to own.
+        Self {
+            _file: unsafe { File::from_raw_fd(fd) },
+        }
+    }
+
+    /// The descriptor the lock is held on, for passing across an `exec`.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self._file.as_raw_fd()
+    }
+
     /// Take the lock only if it is free. Used by tests to observe contention.
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
         let file = OpenOptions::new()
@@ -89,6 +110,27 @@ mod tests {
             freed = StartupLock::try_acquire(&path).unwrap().is_some();
         }
         assert!(freed, "the lock must be free once released");
+    }
+
+    #[test]
+    fn a_lock_passed_on_as_a_descriptor_stays_held_by_whoever_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qorod.lock");
+        let held = StartupLock::acquire(&path).unwrap();
+        // What an `exec` does to a descriptor that is not close-on-exec: the same open file,
+        // at a number of its own, in whatever becomes of the process.
+        // SAFETY: dup of a live descriptor, owned by nothing else once taken.
+        let passed = unsafe { libc::dup(held.as_raw_fd()) };
+        assert!(passed >= 0);
+        drop(held);
+        // SAFETY: `passed` was just made for this lock and nothing else owns it.
+        let taken = unsafe { StartupLock::from_fd(passed) };
+        assert!(
+            StartupLock::try_acquire(&path).unwrap().is_none(),
+            "the lock was not held across the hand over"
+        );
+        drop(taken);
+        assert!(StartupLock::try_acquire(&path).unwrap().is_some());
     }
 
     #[test]
