@@ -10565,13 +10565,13 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             }
             // A daemon older than this client, refusing the colours it was told. It has
             // nothing to do with them anyway: said once, silently, and never again.
-            if id.is_empty() && reason.contains("`HostColors`") {
+            if id.is_empty() && qoro_runtime::control::too_old_for(&reason, Some("HostColors")) {
                 state.host_refused = true;
                 return;
             }
             // The same for the news this interface tells: an older daemon has no rows to
             // put it on.
-            if id.is_empty() && reason.contains("`News`") {
+            if id.is_empty() && qoro_runtime::control::too_old_for(&reason, Some("News")) {
                 state.news_refused = true;
                 return;
             }

@@ -469,8 +469,8 @@ chmod 755 "$t"
 [ "$("$t" --version 2>/dev/null)" = "qoro $2" ] || { echo "the copy is not qoro $2" >&2; exit 5; }
 mv -f "$t" "$r"
 t=
-rmdir "$l"
 h=
+rmdir "$l" || true
 printf '%s\n' MARKER
 for w in hooks skills; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoro $w install on it"
