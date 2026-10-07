@@ -608,8 +608,10 @@ async fn a_sleeping_tab_stays_asleep_across_a_restart_beside_an_awake_one() {
         );
         drop(c);
         serving.abort();
-        // Gone for certain, listener and all, before the next daemon binds the socket.
+        // Gone for certain, listener and all, before the next daemon binds the socket: the
+        // task is over when it has been awaited, and the listener a moment after.
         let _ = serving.await;
+        qoro_testkit::wait_until_unlistened(&qoro_runtime::socket_path(dir.path())).await;
         (space, tab)
     };
 

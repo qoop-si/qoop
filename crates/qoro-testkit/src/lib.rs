@@ -45,6 +45,24 @@ pub fn leaked_pids() -> Vec<i32> {
         .collect()
 }
 
+/// Wait until nothing answers on `socket` any more, for a test that stops a daemon (aborts its
+/// serving task and awaits it) and starts another on the same path.
+///
+/// Awaiting the task is not enough: the listener is closed a few milliseconds after the join
+/// completes, and a bind that checks for a live socket in between finds one. Measured, in
+/// about one run in six of a test binary that does it once.
+pub async fn wait_until_unlistened(socket: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} is still listening",
+            socket.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// A daemon with its own private runtime directory.
 /// Where a daemon started with `QORO_RUNTIME_DIR = dir` puts its socket.
 ///
