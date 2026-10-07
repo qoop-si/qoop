@@ -321,8 +321,9 @@ fn guarded(step: &str, path: &str) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Update {
     /// The version the qoro on its disk says it is now, which its daemon is asked to move
-    /// to: this one after a swap, or whatever was there when it was already as new.
-    OnDisk(String),
+    /// to: this one after a swap, or whatever was there when it was already as new. The
+    /// second is what went wrong refreshing its hooks and skills there, when anything did.
+    OnDisk(String, Option<String>),
     /// No release of this version could be read, which a build from source between
     /// releases is: nothing was sent, and there is nothing to tell anybody.
     NoRelease,
@@ -343,7 +344,7 @@ pub async fn update(target: &str) -> io::Result<Update> {
         return Err(io::Error::other("no qoro is there any more"));
     };
     if !qoro_runtime::paths::is_newer_version(here, &disk) {
-        return Ok(Update::OnDisk(disk));
+        return Ok(Update::OnDisk(disk, None));
     }
     let platform = platform_of(target).await?;
     let asset = qoro_runtime::release::asset_for(platform.os, platform.arch)
@@ -384,10 +385,13 @@ pub async fn update(target: &str) -> io::Result<Update> {
         let Probe::Ready { version } = probe(target).await? else {
             return Err(io::Error::other("no qoro is there any more"));
         };
-        return Ok(Update::OnDisk(version));
+        return Ok(Update::OnDisk(version, None));
     }
-    swapped.answer()?;
-    Ok(Update::OnDisk(here.to_string()))
+    let warning = swapped.answer()?;
+    Ok(Update::OnDisk(
+        here.to_string(),
+        (!warning.is_empty()).then_some(warning),
+    ))
 }
 
 /// What a release of this version that could not be read comes to. Only a release that
@@ -424,6 +428,8 @@ const SWAPPED_MEANWHILE: i32 = 6;
 /// another swap holds the lock (said, not quiet: a lock left by a swap that was killed
 /// would otherwise hide every update), and leaves nothing staged and no lock of its own
 /// behind. A lock older than half an hour is from a swap that was killed, and is swept.
+/// Once swapped, the new qoro refreshes its hooks and skills there (it skips an agent that
+/// is not on that machine); what fails is said after the marker and never fails the swap.
 const SWAP: &str = r#"set -eu
 trap 'exit 1' HUP INT TERM PIPE
 umask 022
@@ -451,6 +457,9 @@ chmod 755 "$t"
 mv -f "$t" "$r"
 t=
 printf '%s\n' MARKER
+for w in hooks skills; do
+  "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoro $w install on it"
+done
 "#;
 
 /// The ssh command for `SWAP`, from the version on disk to `new`, `size` bytes on stdin.
@@ -881,6 +890,44 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
         assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
         assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+    }
+
+    /// A qoro that says it is `version`, notes each `hooks` or `skills` call in `$HOME/ran`,
+    /// and fails `skills` when `$HOME/skills-fail` exists.
+    fn noting(version: &str) -> Vec<u8> {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoro {version}';;\n\
+             hooks|skills) echo \"$*\" >> \"$HOME/ran\"; \
+             [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; exit 0;;\nesac\n"
+        )
+        .into_bytes()
+    }
+
+    /// The qoro just put there refreshes its hooks and skills, and a failure of that is said
+    /// after the marker without failing the swap.
+    #[test]
+    fn swap_refreshes_hooks_and_skills_and_says_what_failed() {
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
+        assert!(out.status.success());
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(said.split_once(RELAY_MARKER).expect("marker").1.trim(), "");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("ran")).expect("ran"),
+            "hooks install\nskills install\n"
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+
+        installed(home.path(), &says("0.0.1"));
+        std::fs::write(home.path().join("skills-fail"), "").expect("flag");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
+        assert!(out.status.success(), "a refresh must never fail the swap");
+        let said = String::from_utf8_lossy(&out.stdout);
+        let after = said.split_once(RELAY_MARKER).expect("marker").1.trim();
+        assert!(after.contains("skills there were not refreshed"), "{after}");
+        assert!(!after.contains("hooks"), "{after}");
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
     }
 
     /// A qoro that is a link has the file behind it replaced, and stays a link.

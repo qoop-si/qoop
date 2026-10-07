@@ -300,6 +300,16 @@ fn present_in(target: &Target, home: &Path, path: &str) -> bool {
             .is_some_and(|dir| dir.is_dir())
 }
 
+/// Whether the agent named is on this machine, for `skills install` to skip the ones that
+/// are not, the way `hooks install` does.
+pub fn agent_present(agent: &str) -> bool {
+    home().is_some_and(|home| {
+        targets()
+            .iter()
+            .any(|t| t.agent == agent && present(t, &home))
+    })
+}
+
 /// Where the installed scripts live.
 ///
 /// Beside the agent-detection overrides, under the person's own configuration, because

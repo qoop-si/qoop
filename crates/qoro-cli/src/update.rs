@@ -147,6 +147,7 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| std::io::Error::other(format!("cannot find this binary: {e}")))?;
     install_to(latest, current, &exe)?;
+    refresh_integrations(&exe);
     // A running notch is the old build's; launchd starts the new one in its place.
     crate::notch::restart_if_installed();
     // The same for a phone's bridge service, which would otherwise keep the old build or,
@@ -160,6 +161,22 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
         eprintln!("qoro: the bridge service was not reloaded; run `qoro bridge reload`");
     }
     Ok(())
+}
+
+/// What `scripts/install.sh` does after it puts a binary down: the new build's own `hooks
+/// install` and `skills install`, which skip an agent that is not on this machine, so the
+/// files agents read are never older than the binary. A failure is said and never fails
+/// an update that has already happened.
+fn refresh_integrations(exe: &Path) {
+    for what in ["hooks", "skills"] {
+        if !Command::new(exe)
+            .args([what, "install"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("qoro: the {what} were not refreshed; run `qoro {what} install`");
+        }
+    }
 }
 
 /// The same swap onto an explicit path, so tests drive the whole chain without

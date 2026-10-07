@@ -696,7 +696,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         let events = self.events.clone();
         tokio::spawn(async move {
             let message = match crate::link::update(&target).await {
-                Ok(crate::link::Update::OnDisk(version)) => FromLink::Arm { link, version },
+                Ok(crate::link::Update::OnDisk(version, warning)) => {
+                    if let Some(warning) = warning {
+                        let _ = events
+                            .send(FromLink::Reply(ControlResponse::Failed {
+                                id: UPDATE_NOTICE.into(),
+                                reason: format!("qoro {here} is on {name}, but {warning}"),
+                            }))
+                            .await;
+                    }
+                    FromLink::Arm { link, version }
+                }
                 Ok(crate::link::Update::NoRelease) => return,
                 Err(e) => FromLink::Reply(ControlResponse::Failed {
                     id: UPDATE_NOTICE.into(),

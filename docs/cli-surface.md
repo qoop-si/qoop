@@ -64,7 +64,7 @@ a claim nobody has to keep.
 | `qoro hooks install [agent...]` | write an agent's hook and register it in that agent's own configuration, beside whatever is already there | no |
 | `qoro hooks uninstall [agent...]` | take out exactly what was installed | no |
 | `qoro skills status` | which agents' skills are installed, and whether they are current | no |
-| `qoro skills install [agent...]` | teach an agent what qoro is for, beside whatever skills it already has | no |
+| `qoro skills install [agent...]` | teach an agent what qoro is for, beside whatever skills it already has; with no agent named, only the ones on this machine | no |
 | `qoro skills uninstall [agent...]` | take out exactly what was installed | no |
 | `qoro avatar` | show the picked avatar, or pick one when on a terminal | no |
 | `qoro avatar pick` | choose a terminal pet from a batch: a number keeps one, `r` deals again | no |

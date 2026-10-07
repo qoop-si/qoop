@@ -376,6 +376,12 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     for target in wanted(args)? {
+        // Asked for every agent, only the ones on this machine, as `hooks install` does:
+        // an agent named on the command line is installed whether or not it is here yet.
+        if args.is_empty() && !crate::hooks::agent_present(target.agent) {
+            println!("  {:<10} not present, skipped", target.agent);
+            continue;
+        }
         if install_qass(&home, &QassDirs::here()?, &target)? {
             println!(
                 "  {:<10} qass installed into {}",
