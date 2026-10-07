@@ -4595,6 +4595,10 @@ async fn handle_control(
                     .swap(true, std::sync::atomic::Ordering::SeqCst)
             };
             if start {
+                // What an earlier arm left (a move called off, an exec that failed) is not
+                // what this one is waiting on.
+                restart.waiting.send_replace(None);
+                waiting.mark_unchanged();
                 eprintln!("qorod: {wanted} is on disk; moving onto it once nothing is working");
                 tokio::spawn(restart_when_safe(restore(), exe));
                 // The first look's answer, so the asker hears what is in the way. A look
