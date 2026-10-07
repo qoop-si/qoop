@@ -127,6 +127,9 @@ pub const NAME_AT: usize = 1;
 const DOT: char = '\u{25cf}';
 /// The failed dot: a diamond, the same single column as the circle.
 const FAILED_DOT: char = '\u{25c6}';
+/// The background dot: a hollow circle in the working ink, the same Geometric Shapes block
+/// and the same font coverage as the filled one it sits beside.
+const BACKGROUND_DOT: char = '\u{25cb}';
 /// The column the state dot sits at: one leading space.
 const DOT_AT: usize = 1;
 
@@ -137,6 +140,7 @@ const DOT_AT: usize = 1;
 fn dot_glyph(role: crate::theme::Role) -> char {
     match role {
         crate::theme::Role::Failed => FAILED_DOT,
+        crate::theme::Role::Background => BACKGROUND_DOT,
         _ => DOT,
     }
 }
@@ -150,6 +154,8 @@ fn dot_glyph(role: crate::theme::Role) -> char {
 /// wants    the empty ring          failed   an X
 /// done     the full square         idle     the centre dot
 /// asleep   a line across the middle, an eye shut
+/// idle, a task still running in the background
+///          one dot going round the ring, a step a frame, clockwise from the top left
 /// ```
 ///
 /// The dots that run while an agent works settle into its next state's picture, so the
@@ -169,6 +175,7 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
             Role::Failed => '!',
             Role::Done => '*',
             Role::Sleeping => 'z',
+            Role::Background => 'o',
             _ => '.',
         };
         return format!("{plain} ");
@@ -192,6 +199,10 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Failed => vec![(0, 0), (2, 0), (1, 1), (0, 2), (2, 2)],
         Role::Done => (0..3).flat_map(|y| (0..3).map(move |x| (x, y))).collect(),
         Role::Sleeping => vec![(0, 1), (1, 1), (2, 1)],
+        // A braille cell takes one ink, so the centre cannot stay grey beside a sky dot: the
+        // dot goes round alone, which no other state is (the centre is never missing from
+        // working's frames, and idle's dot is the centre).
+        Role::Background => vec![RING[if working { (tick / 2 % 8) as usize } else { 0 }]],
         _ => vec![(1, 1)],
     };
     braille_pair(&dots)
@@ -206,6 +217,8 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
 /// wants    a diagonal /       failed   a diagonal \
 /// done     the full square    idle     the lower left dot
 /// asleep   the lower line
+/// idle, a task still running in the background
+///          one dot going round the four, a step a frame, clockwise from the upper left
 /// ```
 ///
 /// One glyph, so the font spaces every dot of it. No working frame is another state's
@@ -218,6 +231,9 @@ fn one_cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
     const BR: u32 = 0x20;
     // One step every two ticks, as the grid's breath.
     const TURN: [u32; 4] = [TL | TR | BL, TL | TR | BR, TR | BR | BL, TL | BR | BL];
+    // The background dot's round, at the same pace. Its frame at the lower left is idle's
+    // picture, which only the ink tells apart: sky against grey.
+    const ORBIT: [u32; 4] = [TL, TR, BR, BL];
     let dots = match role {
         Role::Working if working => TURN[(tick / 2 % 4) as usize],
         Role::Working => TURN[0],
@@ -225,6 +241,8 @@ fn one_cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Failed => TL | BR,
         Role::Done => TL | TR | BL | BR,
         Role::Sleeping => BL | BR,
+        Role::Background if working => ORBIT[(tick / 2 % 4) as usize],
+        Role::Background => ORBIT[0],
         _ => BL,
     };
     format!("{} ", char::from_u32(0x2800 + dots).unwrap_or(' '))
@@ -542,8 +560,12 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
 /// A daemon `done` nobody looked at, or an idle or done row that finished
 /// while the keyboard was away. The focused row is never new: standing on it
 /// is reading it. Same sage dot as `done`, no new theme, and the next row names it.
+///
+/// An idle agent with work still running in the background has not finished, so it is not
+/// news yet: not in the done list, not in the queue, no sage. Its unseen entry stays, and
+/// the moment the job ends the row is plain idle and becomes the news it is.
 pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
-    if agent.terminal == focused {
+    if agent.terminal == focused || role_of(agent) == crate::theme::Role::Background {
         return false;
     }
     if is_unread(agent, focused, seen) {
@@ -1043,6 +1065,17 @@ fn wait_role(agent: &AgentRow) -> crate::theme::Role {
         "blocked" => Role::Blocked,
         "failed" => Role::Failed,
         _ => crate::theme::of("done"),
+    }
+}
+
+/// An agent's state as a role. An idle agent with work still running in the background is
+/// its own state here, derived from the row's count: the daemon's word stays `idle`, which
+/// scripts wait on.
+fn role_of(agent: &AgentRow) -> crate::theme::Role {
+    if agent.state == "idle" && agent.background > 0 {
+        crate::theme::Role::Background
+    } else {
+        crate::theme::of(&agent.state)
     }
 }
 
@@ -2228,21 +2261,49 @@ const SPIN: [char; 10] = [
 /// milliseconds is two seconds, the pace Codex's own sweep keeps.
 const SWEEP_TICKS: u64 = 25;
 
-/// Whether anything the column draws is moving: a working agent whose row is on it.
+/// What moves in the column, and so how fast the run loop has to step it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    /// Only the background dots going round: one frame is two of the working clock's ticks,
+    /// so the loop steps every other tick and every wake changes a cell.
+    Orbit,
+    /// A working agent's spinner, breath and sweep, at the working clock.
+    Spin,
+}
+
+/// Whether anything the column draws is moving, and what.
 ///
-/// A working agent folded away under its space's rule draws no row, so it moves nothing
-/// and arms no timer; the keyboard's own agent always draws. The run loop asks this
-/// before it arms the next frame.
+/// A working agent whose row is on it spins. An idle agent with background work orbits, however
+/// long it has been idle (a row with work running is never stale), but only where the orbit is
+/// drawn: not in the folded strip (`strip`), which shows a still circle. A working agent
+/// folded away under its space's rule draws no row, so it moves nothing and arms no timer;
+/// the keyboard's own agent always draws. The run loop asks this before it arms the next
+/// frame.
 /// ponytail: an agent scrolled out of the window still counts, a scroll-aware check
 /// would need the window's arithmetic twice.
-pub fn moves(c: &Column) -> bool {
-    c.agents.iter().any(|a| {
-        a.agent
-            && a.state == "working"
-            && (c.view == View::Priority
-                || !c.shut.contains(&a.workspace)
-                || a.terminal == c.focused_terminal)
-    })
+pub fn moves(c: &Column, strip: bool) -> Option<Motion> {
+    let drawn = |a: &AgentRow| {
+        c.view == View::Priority
+            || !c.shut.contains(&a.workspace)
+            || a.terminal == c.focused_terminal
+    };
+    let motion = |a: &AgentRow| {
+        if !a.agent || !drawn(a) {
+            return None;
+        }
+        if a.state == "working" {
+            return Some(Motion::Spin);
+        }
+        (role_of(a) == crate::theme::Role::Background && !strip).then_some(Motion::Orbit)
+    };
+    let mut found = None;
+    for m in c.agents.iter().filter_map(motion) {
+        if m == Motion::Spin {
+            return Some(m);
+        }
+        found = Some(m);
+    }
+    found
 }
 
 /// The mark an agent's row opens with: its state dot, or, while it works and the
@@ -2254,7 +2315,8 @@ fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
     if c.icons && role == crate::theme::Role::Sleeping {
         return asleep_mark();
     }
-    cell_mark(role, agent.state == "working", c.tick)
+    let moving = agent.state == "working" || role == crate::theme::Role::Background;
+    cell_mark(role, moving, c.tick)
 }
 
 /// An asleep tab's mark where icons are drawn: the zzz and the blank the two-cell mark
@@ -2328,18 +2390,20 @@ fn mem_text(bytes: u64) -> String {
 ///
 /// News keeps the done sage: a derived idle-after-work is news, not calm. A stale idle
 /// row dims as a whole, but only off focus and only when it is not news: standing on it
-/// is reading it, and news never shows faded.
+/// is reading it, and news never shows faded. A row with work running in the background is
+/// never stale: it stays lit however long it has been idle, so the work is seen to go on.
 fn dot_of(c: &Column, agent: &AgentRow) -> (crate::theme::Role, bool) {
     let fresh = is_new(agent, c.focused_terminal, c.seen, c.unseen);
     let stale = !fresh
         && agent.terminal != c.focused_terminal
+        && role_of(agent) != crate::theme::Role::Background
         && tier_of(&agent.state, agent.last_active_at_unix, c.now_unix) == Some(Tier::Stale);
     let role = if stale {
         crate::theme::Role::Faint
     } else if fresh {
         crate::theme::of("done")
     } else {
-        crate::theme::of(&agent.state)
+        role_of(agent)
     };
     (role, stale)
 }
@@ -2692,11 +2756,14 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
         return Vec::new();
     }
     let strip_row = |agent: &AgentRow| {
-        let role = colour_for(&agent.state).unwrap_or(crate::theme::Role::Idle);
+        let colour = colour_for(&agent.state)
+            .or((role_of(agent) == crate::theme::Role::Background)
+                .then_some(crate::theme::Role::Background));
+        let role = colour.unwrap_or(crate::theme::Role::Idle);
         (
             Line {
                 text: strip_agent(strip_mark(c, agent, role)),
-                colour: colour_for(&agent.state),
+                colour,
                 // The space mark sits on the first pad cell, never on the glyph: the glyph
                 // column keeps the state colour, so the strip carries state and space side
                 // by side instead of painting one over the other.
@@ -5417,6 +5484,7 @@ mod tests {
             cell_mark(Role::Blocked, false, 0),
             cell_mark(Role::Done, false, 0),
             cell_mark(Role::Failed, false, 0),
+            cell_mark(Role::Background, false, 0),
         ];
         for tick in 1..=64u64 {
             let mark = cell_mark(Role::Working, true, tick);
@@ -5438,6 +5506,7 @@ mod tests {
             Role::Blocked,
             Role::Done,
             Role::Failed,
+            Role::Background,
         ]
         .iter()
         .map(|&role| one_cell_mark(role, false, 0))
@@ -5462,6 +5531,77 @@ mod tests {
             one_cell_mark(Role::Working, true, 2),
             "the working mark never turned"
         );
+    }
+
+    /// The background dot goes once round the ring in eight frames (four on one cell), a
+    /// frame every two ticks as working's breath, and no frame of it is another state's
+    /// picture: one dot, never the centre's (idle), never working's plus, never blocked's
+    /// ring. On one cell its lower left frame is idle's picture, and only the ink (sky
+    /// against grey) tells them apart there.
+    #[test]
+    fn the_background_dot_orbits_and_is_never_another_states_picture() {
+        use crate::theme::Role;
+        let grid: Vec<String> = (0..16u64)
+            .map(|t| cell_mark(Role::Background, true, t))
+            .collect();
+        let cells: std::collections::BTreeSet<&String> = grid.iter().collect();
+        assert_eq!(cells.len(), 8, "{grid:?}");
+        assert_eq!(grid[0], grid[1], "a frame lasts two ticks");
+        assert_ne!(grid[1], grid[2]);
+        assert_eq!(
+            cell_mark(Role::Background, true, 16),
+            grid[0],
+            "eight frames round"
+        );
+        assert_eq!(
+            cell_mark(Role::Background, false, 9),
+            grid[0],
+            "still it rests on the first"
+        );
+        let others: Vec<String> = [
+            Role::Idle,
+            Role::Sleeping,
+            Role::Blocked,
+            Role::Done,
+            Role::Failed,
+        ]
+        .iter()
+        .map(|&r| cell_mark(r, false, 0))
+        .collect();
+        for tick in 0..=64u64 {
+            let orbit = cell_mark(Role::Background, true, tick);
+            assert!(!others.contains(&orbit), "tick {tick}: {orbit:?}");
+            for t in 0..=64u64 {
+                assert_ne!(
+                    orbit,
+                    cell_mark(Role::Working, true, t),
+                    "tick {tick} against working {t}"
+                );
+            }
+        }
+
+        let one: Vec<String> = (0..8u64)
+            .map(|t| one_cell_mark(Role::Background, true, t))
+            .collect();
+        let cells: std::collections::BTreeSet<&String> = one.iter().collect();
+        assert_eq!(cells.len(), 4, "{one:?}");
+        let idle = one_cell_mark(Role::Idle, false, 0);
+        assert_eq!(
+            one.iter().filter(|m| **m == idle).count(),
+            2,
+            "the lower left frame only"
+        );
+        let others: Vec<String> = [Role::Sleeping, Role::Blocked, Role::Done, Role::Failed]
+            .iter()
+            .map(|&r| one_cell_mark(r, false, 0))
+            .collect();
+        for tick in 0..=16u64 {
+            let orbit = one_cell_mark(Role::Background, true, tick);
+            assert!(!others.contains(&orbit), "tick {tick}: {orbit:?}");
+            for t in 0..=16u64 {
+                assert_ne!(orbit, one_cell_mark(Role::Working, true, t));
+            }
+        }
     }
 
     /// A working ring never closes into the shape blocked wears: the two must read apart
@@ -6293,6 +6433,92 @@ mod tests {
         assert!(item_row(&column, &item(3)).text.contains("bg:3"));
         assert!(!item_row(&column, &item(0)).text.contains("bg:"));
     }
+    /// Idle with background work is its own state, derived from the count: the mark and the
+    /// ink are the background's in the tree and in the strip, and one finished unread is not news
+    /// while its job runs: not in the done list or the queue, no sage. The word stays idle.
+    #[test]
+    fn idle_with_background_work_is_a_state_of_its_own_everywhere() {
+        use crate::theme::Role;
+        let mut busy = agent(7, 1, "claude", "idle");
+        busy.background = 2;
+        busy.generation = Some(3);
+        let free = agent(8, 1, "claude", "idle");
+        assert_eq!(role_of(&busy), Role::Background);
+        assert_eq!(role_of(&free), Role::Idle);
+        let mut working = busy.clone();
+        working.state = "working".into();
+        assert_eq!(role_of(&working), Role::Working);
+
+        let spaces = vec![space(1, "app")];
+        let (seen, shut) = (Seen::new(), Shut::new());
+        let mut unseen = Unseen::new();
+        unseen.insert((7, 3));
+        // Finished unread, which would be the done sage for a free agent.
+        let agents = vec![busy.clone(), free];
+        let rows = tree_rows(&spaces, &agents, 1, 10, &seen, &shut);
+        assert_eq!(
+            tree_row(&rows, 7).indicator,
+            Some((BOX_LEAD, 2, Role::Background))
+        );
+        let rows = tree_rows(&spaces, &agents[1..], 1, 10, &seen, &shut);
+        assert_eq!(tree_row(&rows, 8).indicator.map(|i| i.2), Some(Role::Idle));
+
+        let column = column(
+            &spaces,
+            &agents,
+            1,
+            0,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        // Not news while the job runs: not in the done list nor the queue, no sage line.
+        assert!(inbox_items(&column, InboxTab::Done).is_empty());
+        assert!(inbox_items(&column, InboxTab::All).is_empty());
+        assert!(!is_new(&busy, 0, &seen, &unseen));
+        assert!(queue(&agents, 0, &seen, &unseen).is_empty());
+
+        let strip = rows_collapsed(&column, 12);
+        let mark = |terminal: u32| {
+            strip
+                .iter()
+                .find(|(_, h)| *h == Some(Hit::Terminal(terminal)))
+                .map(|(l, _)| (l.text.clone(), l.colour))
+                .unwrap()
+        };
+        assert_eq!(mark(7).1, Some(Role::Background));
+        assert!(mark(7).0.contains(BACKGROUND_DOT), "{:?}", mark(7).0);
+        assert_eq!(mark(8).1, None);
+        assert!(!mark(8).0.contains(BACKGROUND_DOT));
+
+        // The job ends: plain idle with its unseen entry still set, the finish it is.
+        let mut ended = agents.clone();
+        ended[0].background = 0;
+        assert!(is_new(&ended[0], 0, &seen, &unseen));
+        let column = self::column(
+            &spaces,
+            &ended,
+            1,
+            0,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let roles: Vec<Role> = inbox_items(&column, InboxTab::Done)
+            .iter()
+            .map(|i| i.role)
+            .collect();
+        assert_eq!(roles, [Role::Done]);
+    }
+
     /// A waiting agent whose newest word is `thinking` has not said what it wants: no
     /// `wants: thinking` row in the tree.
     #[test]
@@ -6329,19 +6555,19 @@ mod tests {
             )
         };
         assert!(
-            moves(&c(&open, 1, View::Tree)),
+            moves(&c(&open, 1, View::Tree), false) == Some(Motion::Spin),
             "an open working agent moves"
         );
         assert!(
-            !moves(&c(&folded, 1, View::Tree)),
+            moves(&c(&folded, 1, View::Tree), false).is_none(),
             "a folded one moves nothing"
         );
         assert!(
-            moves(&c(&folded, 2, View::Tree)),
+            moves(&c(&folded, 2, View::Tree), false) == Some(Motion::Spin),
             "the keyboard's own always draws"
         );
         assert!(
-            moves(&c(&folded, 1, View::Priority)),
+            moves(&c(&folded, 1, View::Priority), false) == Some(Motion::Spin),
             "priority folds nothing"
         );
         let calm = vec![agent(1, 1, "claude", "idle")];
@@ -6358,7 +6584,83 @@ mod tests {
             WIDTH,
             &open,
         );
-        assert!(!moves(&still), "nothing working, nothing moving");
+        assert!(
+            moves(&still, false).is_none(),
+            "nothing working, nothing moving"
+        );
+    }
+
+    /// The orbit asks for the loop only where it is drawn and seen: an idle agent with a job
+    /// running in an open space does, however long it has been idle (work running is never
+    /// stale), a folded space and the folded strip do not, the keyboard's own row does, and a
+    /// working agent beside it still takes the fast clock.
+    #[test]
+    fn a_background_orbit_moves_the_column_only_where_it_is_seen() {
+        let spaces = vec![space(1, "app"), space(2, "dub")];
+        let busy = |terminal, workspace, age| {
+            let mut a = agent_at(terminal, workspace, "claude", "idle", age);
+            a.background = 1;
+            a
+        };
+        let (seen, unseen) = (Seen::new(), Unseen::new());
+        let (open, folded) = (Shut::new(), Shut::from([2]));
+        let motion = |agents: &[AgentRow], shut, focused, strip| {
+            let mut c = column(
+                &spaces,
+                agents,
+                1,
+                focused,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                WIDTH,
+                shut,
+            );
+            c.now_unix = NOW;
+            moves(&c, strip)
+        };
+        let live = vec![busy(1, 1, 60)];
+        assert_eq!(motion(&live, &open, 9, false), Some(Motion::Orbit));
+        assert_eq!(
+            motion(&live, &open, 9, true),
+            None,
+            "the strip shows a still circle"
+        );
+        let hidden = vec![busy(2, 2, 60)];
+        assert_eq!(
+            motion(&hidden, &folded, 9, false),
+            None,
+            "a folded space draws no row"
+        );
+        assert_eq!(
+            motion(&hidden, &folded, 2, false),
+            Some(Motion::Orbit),
+            "the keyboard's row draws"
+        );
+        let stale = vec![busy(1, 1, ACTIVITY_STALE_SECS + 60)];
+        assert_eq!(
+            motion(&stale, &open, 9, false),
+            Some(Motion::Orbit),
+            "work running is never stale, so the row keeps going round"
+        );
+        // And it stays lit: a stale idle row without work dims, this one does not.
+        let mut old_free = agent_at(2, 1, "claude", "idle", ACTIVITY_STALE_SECS + 60);
+        old_free.background = 0;
+        let both_old = vec![stale[0].clone(), old_free];
+        let rows = tree_rows(&spaces, &both_old, 9, 40, &Seen::new(), &Shut::new());
+        assert_eq!(
+            tree_row(&rows, 1).indicator.map(|i| i.2),
+            Some(crate::theme::Role::Background)
+        );
+        assert_ne!(tree_row(&rows, 1).colour, Some(crate::theme::Role::Faint));
+        assert_eq!(tree_row(&rows, 2).colour, Some(crate::theme::Role::Faint));
+        let mut both = live.clone();
+        both.push(agent(3, 1, "claude", "working"));
+        assert_eq!(motion(&both, &open, 9, false), Some(Motion::Spin));
+        let free = vec![agent(1, 1, "claude", "idle")];
+        assert_eq!(motion(&free, &open, 9, false), None);
     }
 
     /// Past frame zero a working agent's activity carries the band and a waiting one's

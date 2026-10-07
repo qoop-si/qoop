@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn the_chrome_glyph_set_is_free_of_disputed_sequences() {
         // The state marks' braille pairs and the joins of the frame around split panes too.
-        let chrome = "─│╭╮╰╯┤├┬┴┼●◆⡋⠙⢹⢸⢼⢴⠦⠧⠇⠏▀⠐⠀⠉⠃⠯⠕⠅⠿";
+        let chrome = "─│╭╮╰╯┤├┬┴┼●○◆⡋⠙⢹⢸⢼⢴⠦⠧⠇⠏▀⠐⠀⠉⠃⠯⠕⠅⠿";
         assert!(chrome_safe(chrome), "{chrome:?}");
         for c in chrome.chars() {
             assert!(columns(c) <= 2, "{c:?} takes more than two columns");

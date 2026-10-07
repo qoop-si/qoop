@@ -5363,6 +5363,8 @@ where
     // keeps it still. The next frame's deadline, when one is armed.
     let motion = motion_on();
     let mut motion_at: Option<tokio::time::Instant> = None;
+    // Ticks a frame moves on, and the clock's period in ticks: 2 while only an orbit moves.
+    let mut motion_step: u64 = 1;
     // Costs are sampled only when asked for, the first time straight away.
     let mut usage_at = usage_on().then(tokio::time::Instant::now);
     // Work that blocks (reading /proc, reading a transcript) runs on the blocking pool and
@@ -5587,13 +5589,21 @@ where
             // so nothing is armed. See `sidebar::wants_tick`.
             // A working agent on a drawn column arms the next animation frame; nothing
             // working disarms it, and the column stops on whatever frame it was on.
-            let moving = motion
-                && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0
-                && (sidebar::moves(&state.column(0, 0)) || state.drawer_moving());
-            if !moving {
+            //
+            // Only background dots going round step every other tick, at twice the period:
+            // a frame of the orbit lasts two ticks, so a faster clock would wake the loop to
+            // repaint the same cell.
+            let moving = if motion && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0 {
+                let rows = sidebar::moves(&state.column(0, 0), state.collapsed);
+                if state.drawer_moving() { Some(sidebar::Motion::Spin) } else { rows }
+            } else {
+                None
+            };
+            motion_step = if moving == Some(sidebar::Motion::Orbit) { 2 } else { 1 };
+            if moving.is_none() {
                 motion_at = None;
             } else if motion_at.is_none() {
-                motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
+                motion_at = Some(tokio::time::Instant::now() + MOTION_TICK * motion_step as u32);
             }
             let tier_at = if state.collapsed {
                 None
@@ -7688,9 +7698,9 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    state.tick = state.tick.wrapping_add(1).max(1);
+                    state.tick = state.tick.wrapping_add(motion_step).max(1);
                     state.step_drawer();
-                    motion_at = Some(tokio::time::Instant::now() + MOTION_TICK);
+                    motion_at = Some(tokio::time::Instant::now() + MOTION_TICK * motion_step as u32);
                     dirty = true;
                 }
                 // A standing toast's clock: repaint once to come down. Expired toasts

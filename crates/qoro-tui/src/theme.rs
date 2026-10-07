@@ -40,6 +40,11 @@ pub enum Role {
     Done,
     Failed,
     Idle,
+    /// An idle agent with work still running in the background: not done, not resting.
+    /// Derived by the sidebar (the daemon's state word stays `idle`), never sent, so `of`
+    /// never returns it. It wears the working ink: it is alive, and the grey of rest would
+    /// say otherwise. The picture tells the two apart.
+    Background,
     /// A tab the idle reaper slept: the process is gone, the marker stays.
     ///
     /// Calm-bottom, below idle, never attention: the only thing it has to
@@ -208,6 +213,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Done => 35,
         Role::Failed => 201,
         Role::Idle => 242,
+        Role::Background => dark_ink(Role::Working),
         Role::Sleeping => 140,
         Role::Unobserved => 238,
         Role::AvatarHair(ink) => ink,
@@ -537,6 +543,7 @@ const fn light_ink(role: Role) -> u8 {
         Role::Done => 28,
         Role::Failed => 164,
         Role::Idle => 242,
+        Role::Background => light_ink(Role::Working),
         Role::Sleeping => 97,
         Role::Unobserved => 244,
         Role::AvatarHair(ink) => light_pet(ink),
@@ -712,6 +719,20 @@ mod tests {
     /// named by `of`, distinct from every state, chrome and space ink.
     /// An unknown state still falls back to Unobserved: a newer daemon may
     /// say more than this build understands.
+    /// Background work is derived, so no state word maps to it, and it spends no ink of its
+    /// own: it is the working sky in both palettes.
+    #[test]
+    fn background_wears_the_working_ink_and_no_state_word_names_it() {
+        assert_eq!(ink(Role::Background), ink(Role::Working));
+        assert_eq!(dark_ink(Role::Background), 39);
+        assert_eq!(light_ink(Role::Background), light_ink(Role::Working));
+        for word in [
+            "working", "starting", "idle", "done", "blocked", "failed", "sleeping",
+        ] {
+            assert_ne!(of(word), Role::Background);
+        }
+    }
+
     #[test]
     fn sleeping_has_its_own_measured_colour_and_the_unknown_falls_back() {
         assert_eq!(of("sleeping"), Role::Sleeping);
