@@ -100,7 +100,7 @@ pub enum ObservationVerdict {
 }
 
 /// What is currently believed about an agent, and the rule for changing it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentBelief {
     pub generation: GenerationId,
     pub state: AgentRuntimeState,

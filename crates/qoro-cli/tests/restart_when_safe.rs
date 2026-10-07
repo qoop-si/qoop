@@ -692,6 +692,59 @@ fn a_running_command_goes_through_the_move_on_the_same_pid() {
     assert!(left.is_empty(), "the handover file stayed behind: {left:?}");
 }
 
+/// An agent in the middle of a turn goes through the move as the same agent: it is not
+/// resumed, its generation and its conversation are what they were, and a report it makes
+/// afterwards with the token it was started with is admitted.
+#[test]
+fn a_working_agent_goes_through_the_move_as_the_same_agent() {
+    let d = Daemon::start();
+    let go = d.dir.path().join("go");
+    d.install_agent(&go);
+    d.send(1, "droid");
+    d.wait_for_row(1, "was working in a named conversation", |row| {
+        row.program.as_deref() == Some("droid")
+            && row.state == "working"
+            && row.agent_session.as_deref() == Some(SESSION)
+    });
+    let before = d
+        .agents()
+        .into_iter()
+        .find(|row| row.terminal == 1)
+        .expect("the agent's row");
+
+    let _ = d.arm(NEXT);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.starts() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert_eq!(d.starts(), 2, "the daemon never moved: {log}");
+
+    // The first thing asked after the move: nothing has had time to be read again.
+    let after = d
+        .agents()
+        .into_iter()
+        .find(|row| row.terminal == 1)
+        .expect("the agent's row after the move");
+    assert_eq!(after.program.as_deref(), Some("droid"), "{after:?}");
+    assert_eq!(after.state, "working", "{after:?}");
+    assert_eq!(after.agent_session.as_deref(), Some(SESSION), "{after:?}");
+    assert_eq!(after.generation, before.generation, "{before:?} {after:?}");
+
+    // The agent finishes its turn and says so with the token it started with.
+    std::fs::write(&go, "").expect("go");
+    d.wait_for_row(1, "was admitted as idle", |row| {
+        row.state == "idle" && row.agent_session.as_deref() == Some(SESSION)
+    });
+    d.wait_for_screen(1, "DROID-IDLE");
+    let screen = text(&d.run(&["read", "1"]).stdout);
+    assert!(
+        !screen.contains("DROID-RESUMED"),
+        "the agent was started again: {screen}"
+    );
+    assert!(screen.contains("DROID-WORKING"), "{screen}");
+}
+
 /// The screen is in the tab the moment the move is over, before the program prints another
 /// byte: it was carried, not redrawn.
 #[test]
@@ -756,7 +809,7 @@ fn a_handover_that_cannot_be_adopted_starts_a_daemon_as_usual() {
     let stale = dir.path().join("handoff-1.json");
     std::fs::write(
         &stale,
-        r#"{"format":1,"pid":1,"nonce":"n","terminals":[{"id":1,"fd":9,"child":1,"child_start":null,"tty_dev":0,"workspace":1,"name":null,"cwd":null,"token":"t","cols":80,"rows":24,"pending":[],"screen":"","nudge":false}]}"#,
+        r#"{"format":1,"pid":1,"nonce":"n","terminals":[{"id":1,"fd":9,"child":1,"child_start":null,"tty_dev":0,"workspace":1,"name":null,"cwd":null,"token":"t","cols":80,"rows":24,"pending":[],"screen":"","nudge":false,"agent":null,"session":null,"session_said":null}]}"#,
     )
     .expect("file");
     std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("chmod");

@@ -105,6 +105,25 @@ pub struct TerminalAgent {
     pub born: Option<std::time::Instant>,
 }
 
+/// What one terminal's agent record is, as a daemon that is becoming another binary carries
+/// it: the process in the terminal is the same one, so its generation, what was believed
+/// about it and what has been said of its conversation have to be too. A fresh record would
+/// call it a new generation, and a conversation id said by the old one would be forgotten.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentCarry {
+    pub generation: GenerationId,
+    pub identity: AgentIdentity,
+    pub belief: AgentBelief,
+    pub leader: Option<i32>,
+    pub last_active_at_unix: Option<i64>,
+    pub last_io_unix: Option<i64>,
+    pub setup_gate: bool,
+    pub background_agents: usize,
+    pub background_tasks: usize,
+    pub screen_rule: Option<String>,
+    pub screen_manifest: Option<String>,
+}
+
 /// How long after a foreground change the weak idle fallback stays quiet: ADR-008's
 /// startup grace. Claude Code draws its first frame in pieces, a trust dialog included,
 /// well inside this, and a half drawn dialog matches no rule; read as idle, a task typed
@@ -434,6 +453,54 @@ impl AgentRegistry {
             },
         );
         self.announce_new(stream);
+    }
+
+    /// What this terminal's record says, for the daemon that takes it over.
+    pub fn export(&self, stream: u32) -> Option<AgentCarry> {
+        let terminals = self.terminals.lock().unwrap();
+        let agent = terminals.get(&stream)?;
+        Some(AgentCarry {
+            generation: agent.capability.generation,
+            identity: agent.identity.clone(),
+            belief: agent.belief.clone(),
+            leader: agent.leader.map(|pid| pid.0),
+            last_active_at_unix: agent.last_active_at_unix,
+            last_io_unix: agent.last_io_unix,
+            setup_gate: agent.setup_gate,
+            background_agents: agent.background_agents,
+            background_tasks: agent.background_tasks,
+            screen_rule: agent.screen_rule.clone(),
+            screen_manifest: agent.screen_manifest.clone(),
+        })
+    }
+
+    /// Put a carried record into a terminal just registered, before anything reads it. No
+    /// startup grace: the agent was not started now.
+    ///
+    /// A leader that can no longer be watched is gone, and what the carry says of it is
+    /// kept without it: the next look finds whatever is there and says so as usual.
+    pub fn adopt(&self, stream: u32, carry: AgentCarry) {
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return;
+        };
+        agent.capability.generation = carry.generation;
+        agent.identity = carry.identity;
+        agent.belief = carry.belief;
+        agent.last_active_at_unix = carry.last_active_at_unix;
+        agent.last_io_unix = carry.last_io_unix;
+        agent.setup_gate = carry.setup_gate;
+        agent.background_agents = carry.background_agents;
+        agent.background_tasks = carry.background_tasks;
+        agent.screen_rule = carry.screen_rule;
+        agent.screen_manifest = carry.screen_manifest;
+        agent.born = None;
+        if let Some(pid) = carry.leader.map(Pid)
+            && matches!(self.watch.watch(pid), Ok(true))
+        {
+            self.by_pid.lock().unwrap().insert(pid.0, stream);
+            agent.leader = Some(pid);
+        }
     }
 
     /// Seed both activity clocks at spawn. Creation counts as activity, so a
@@ -1225,6 +1292,57 @@ mod tests {
 
     fn registry() -> AgentRegistry {
         AgentRegistry::new().expect("registry")
+    }
+
+    /// What one registry exports another adopts, through the file between them: the same
+    /// generation and belief, no startup grace, and the token the child still holds is
+    /// the one that admits a report.
+    #[test]
+    fn a_carried_agent_is_the_same_agent_in_the_registry_that_takes_it() {
+        let old = registry();
+        let token = mint_token(7);
+        old.register(7, TerminalId::new("7"), token.clone());
+        old.note_foreground(7, Some(Pid(std::process::id() as i32)), NOW);
+        old.observe_hook(
+            7,
+            &TerminalId::new("7"),
+            &token,
+            AgentRuntimeState::Working,
+            false,
+            false,
+            NOW,
+        )
+        .expect("admitted");
+        let carry = old.export(7).expect("a record");
+        let wire = serde_json::to_string(&carry).expect("serialises");
+        let carry: AgentCarry = serde_json::from_str(&wire).expect("reads back");
+
+        let new = registry();
+        new.register(7, TerminalId::new("7"), token.clone());
+        new.adopt(7, carry);
+        let (before, after) = (old.agent(7).unwrap(), new.agent(7).unwrap());
+        assert_eq!(after.belief, before.belief);
+        assert_eq!(after.capability.generation, before.capability.generation);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.leader, before.leader);
+        assert!(after.born.is_none(), "no startup grace for an old agent");
+        new.observe_hook(
+            7,
+            &TerminalId::new("7"),
+            &token,
+            AgentRuntimeState::Idle,
+            false,
+            true,
+            LATER,
+        )
+        .expect("the old token is admitted");
+        assert_eq!(new.agent(7).unwrap().belief.state, AgentRuntimeState::Idle);
+        // The same leader is not a new process: no generation was minted for it.
+        new.note_foreground(7, before.leader, LATER);
+        assert_eq!(
+            new.agent(7).unwrap().capability.generation,
+            before.capability.generation
+        );
     }
 
     /// A stranger's program sharing an agent's name is read by the generic rules: the

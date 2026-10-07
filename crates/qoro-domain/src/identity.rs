@@ -21,7 +21,7 @@ use crate::observation::Confidence;
 ///
 /// Named rather than guessed. A list of names is a heuristic that will be wrong, so it is
 /// the caller that decides, and this type is what it says with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Boundary {
     /// A container runtime, a sandbox, or anything else that puts the real process in a
     /// namespace we cannot read.
@@ -29,7 +29,7 @@ pub enum Boundary {
 }
 
 /// What we know about the process in a terminal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentIdentity {
     /// We can see the process and read its identity.
     Known {

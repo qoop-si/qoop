@@ -63,6 +63,12 @@ pub struct Carried {
     pub screen: String,
     /// Whether its program is to be made to redraw once it is taken over.
     pub nudge: bool,
+    /// What the agent registry believes about the program: generation, identity, state.
+    pub agent: Option<crate::agents::AgentCarry>,
+    /// The conversation id its agent said by hook, and who vouches for it. Carried with the
+    /// generation: an id said by a generation the new daemon does not know is forgotten.
+    pub session: Option<String>,
+    pub session_said: Option<crate::daemon::Said>,
 }
 
 impl Handoff {
@@ -172,6 +178,9 @@ mod tests {
                 pending: b"ls\r".to_vec(),
                 screen: "\x1b[2J\x1b[1;1Hhi".into(),
                 nudge: true,
+                agent: None,
+                session: Some("conv-1".into()),
+                session_said: Some(crate::daemon::Said::By("claude".into(), 4)),
             }],
         }
     }

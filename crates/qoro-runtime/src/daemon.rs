@@ -108,6 +108,8 @@ pub struct Paused {
     /// Whether the program has to be made to redraw: it is not a shell at its prompt, so
     /// what the replay shows is the daemon's picture of its screen and not its own.
     pub nudge: bool,
+    /// What the registry believes about the agent in it.
+    pub agent: Option<crate::agents::AgentCarry>,
 }
 
 /// What the daemon publishes to attached clients.
@@ -523,7 +525,7 @@ impl Connection {
 /// and not a task. The runtime state (the pty, the engine, the write queue) is owned by the
 /// terminal task and is deliberately not reachable from here.
 /// Who vouches for the conversation id a terminal holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Said {
     /// The agent program of this generation said it, through its hook, or is the one a
     /// resume started.
@@ -5189,6 +5191,11 @@ fn open_terminal_with(
     // Creation counts as activity on both clocks: a tab that never produces
     // an accepted observation ages from here rather than living forever.
     agents.note_spawn(stream, crate::agents::now_unix());
+    // Before the terminal's task exists to read anything: a carried agent is the same one,
+    // in the same generation, and not a new process to be told apart from the old.
+    if let Some(carry) = adopt.as_ref().and_then(|a| a.agent.clone()) {
+        agents.adopt(stream, carry);
+    }
     let behind = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let handle = TerminalHandle {
         name,
@@ -5219,6 +5226,9 @@ fn open_terminal_with(
         incarnation: next_incarnation(),
     };
     terminals.insert(stream, handle.clone());
+    if let Some((session, said)) = adopt.as_ref().and_then(|a| a.session.clone()) {
+        terminals.set_session(stream, Some(session), said);
+    }
     let registry = terminals.clone();
     let spill = crate::spill::SpillRing::new();
     let history = history_dir.map(|dir| dir.join(stream.to_string()));
@@ -5836,6 +5846,9 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
         pending,
         screen,
         nudge,
+        agent,
+        session,
+        session_said,
     } = carried;
     // An open descriptor first: wrapping one that is not would close somebody else's.
     // SAFETY: F_GETFD only reads the descriptor's flags.
@@ -5894,6 +5907,8 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
             pending,
             screen,
             nudge,
+            agent,
+            session: session.map(|session| (session, session_said)),
         }),
     )
     .map(|_| ())
@@ -7132,6 +7147,9 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
             pending: paused.pending,
             screen: paused.screen,
             nudge: paused.nudge,
+            agent: paused.agent,
+            session: handle.session.clone(),
+            session_said: handle.session_said.clone(),
         });
         masters.push(master);
     }
@@ -7834,6 +7852,9 @@ pub struct Adopted {
     pub pending: Vec<u8>,
     pub screen: String,
     pub nudge: bool,
+    pub agent: Option<crate::agents::AgentCarry>,
+    /// The conversation id its agent said, and who vouches for it.
+    pub session: Option<(String, Option<Said>)>,
 }
 
 /// What a terminal's task starts from besides the descriptor: nothing for a new one.
@@ -8767,6 +8788,7 @@ async fn terminal_task(
                                 pending: writes.remaining(),
                                 screen: engine.replay(),
                                 nudge,
+                                agent: agents.export(stream),
                             });
                             // Nothing is read or typed from here until the move happens,
                             // which ends this process, or is called off, which drops `go`.
