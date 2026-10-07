@@ -110,11 +110,12 @@ impl SshTransport {
             argv.push("ConnectTimeout=10".into());
             // What ssh says when it cannot get in (a refused connection, a key it was not
             // given) is the reason a person is shown, so a `LogLevel QUIET` in their config
-            // does not get to hide it.
-            if !self.user_set.iter().any(|n| n == "LogLevel") {
-                argv.push("-o".into());
-                argv.push("LogLevel=ERROR".into());
-            }
+            // does not get to hide it. Always set for a batch connection, which nobody
+            // watches: ssh takes the first value it is given and the command line comes
+            // before the config, so this wins over the person's setting on purpose. It
+            // changes only what is printed, never what ssh decides.
+            argv.push("-o".into());
+            argv.push("LogLevel=ERROR".into());
         }
         if self.accept_new {
             argv.push("-o".into());
