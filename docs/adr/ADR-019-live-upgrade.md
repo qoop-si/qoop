@@ -85,10 +85,25 @@ pty masters over the existing socket, and the refusal above becomes the fallback
 fails. Nothing here has to be undone for that: what is decided now is that the fallback ships
 first.
 
-## Amendment, 2026-10-07: `qoro update` no longer refuses
+## Amendment, 2026-10-07: the daemon now moves itself, and keeps the terminals
 
-The decision above stands for the daemon, which still never replaces itself. What changed is
-the person's side of it: `qoro update` no longer refuses while a session runs and no longer
-stops the daemon. It installs the file, then asks each daemon, this machine's and every saved
-remote's, to move onto it at the first moment nothing there is working (`RestartWhenSafe`),
-so no working agent or running command is ended. The refusals quoted above are history.
+Two decisions above are reversed, and this says so plainly.
+
+"The daemon does not hand over live terminals" no longer holds. There is now fd passing and
+a re-exec that inherits the pty masters: the daemon pauses every tab, writes down what the next
+one needs, and `exec`s the new binary in the same process, so the shells stay its children
+and a running command or agent never notices. The reason is the one this ADR started from, an
+upgrade must not kill what a person has running, and the refusal it chose meant an update
+waited for the person to close everything first. What
+made the handover affordable is that it is the same process, with no second daemon and no
+transfer over a socket, and that the old way stays as the fallback for a binary that cannot
+take tabs over, for a tab that cannot be carried, and for a daemon that predates it. The
+second shape named under Rollback (a second daemon accepting masters over the socket) is not
+the one built.
+
+"The daemon does not restart itself" is superseded by `RestartWhenSafe` (0.5.2): `qoro
+update` no longer refuses while a session runs and no longer stops the daemon. It installs
+the file, then asks each daemon, this machine's and every saved remote's, to move onto it. A
+daemon that can hand its tabs to the new binary does it at once and they keep running; any
+other waits for the first moment nothing there is working. The refusals quoted above are
+history. The daemon still downloads nothing and checks no versions: `qoro update` does.

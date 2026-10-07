@@ -12,9 +12,11 @@ an update is waiting; the interface itself never touches the network. `ctrl-a U`
 installs.
 
 After the install, `qoro update` asks the daemon on this machine, and on each saved remote,
-to move onto the new binary at the first moment nothing there is working. A working agent or
-a running command is never ended; idle tabs are ended and restored, with agents resumed in
-their own conversations.
+to move onto the new binary. A working agent or a running command is never ended. When both
+the running qoro and the new one can hand tabs over, they keep running and nothing waits;
+otherwise the daemon moves at the first moment nothing there is working, ends the idle tabs
+and restores them, with agents resumed in their own conversations. The first move onto a build
+that has this is the second kind.
 
 The download is checked against its sha256, started once to confirm its version, and swapped
 in with one atomic rename. On an Apple silicon Mac it installs the Apple silicon build even

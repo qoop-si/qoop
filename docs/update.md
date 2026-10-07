@@ -38,14 +38,15 @@ needs no python (Linux boxes often have none), and falls back to `sha256sum` whe
 (`file:///path` holding a `latest` file in the API's shape), which is how the platform pick
 is tested with no network; the token never goes there.
 
-The install replaces the file and then asks each daemon to move onto it, which a daemon
-does only once nothing there is working (see "Other machines follow this one" below): a
-working agent or a running command is never ended, and the update never waits for the move.
-The tarball is checksum verified when its `.sha256` asset exists, and a listed checksum that
-cannot be downloaded is a refusal, not an unverified install. The downloaded binary must
-report the expected version before it replaces anything, and the swap is one atomic rename
-onto the file itself: launched through a symlink on PATH, the link is followed and stays a
-link.
+The install replaces the file and then asks each daemon to move onto it. A daemon that can
+hand its tabs to the new binary does it at once and nothing running is touched ("Tabs keep
+running through a move" below); any other waits until nothing there is working ("Other
+machines follow this one"). Either way a working agent or a running command is never ended,
+and the update never waits for the move. The tarball is checksum verified when its
+`.sha256` asset exists, and a listed checksum that cannot be downloaded is a refusal, not an
+unverified install. The downloaded binary must report the expected version before it
+replaces anything, and the swap is one atomic rename onto the file itself: launched through
+a symlink on PATH, the link is followed and stays a link.
 
 With the network gone the command fails closed on the install: nothing is downloaded, no
 notice is left behind, the failure names GitHub and the exit is nonzero. It still asks the
@@ -67,11 +68,11 @@ connects to a machine whose daemon runs an older version than this Mac's qoro, a
 of this Mac's version exists for that machine's platform, it fetches that release here
 (checksum verified, the same token rules as above, so a private release needs `gh auth login`
 or `GH_TOKEN` on this Mac), puts the binary in place of the qoro there in the background with
-one atomic rename beside the real file, and asks the daemon over there to move onto it. That
-daemon moves at the first moment nothing on it is working: a running command, a busy agent,
+one atomic rename beside the real file, and asks the daemon over there to move onto it. A
+daemon that can hand its tabs over moves at once and they keep running (next sections). Any
+other moves at the first moment nothing on it is working: a running command, a busy agent,
 an agent that has not named its conversation, or a background job holds it, and the
-interface says once, on its hint row, what it is waiting on. (Onto a build that can take the
-tabs over as they are, it waits for nothing: see the next section.) When it moves, every tab comes
+interface says once, on its hint row, what it is waiting on. When it moves, every tab comes
 back with the same number and every agent in its own conversation. A build from main between
 releases is never pushed, a qoro there that is as new or newer is never touched, and a swap
 another window or another Mac is making at the same time is said rather than raced. A machine
@@ -93,9 +94,11 @@ happens right after the command exits. The command returns as soon as the daemon
 answered and never waits for a move. A remote that cannot be reached or has no release for
 its platform is one line and does not change the exit status; this machine's own daemon not
 moving does. Asking a remote opens a link to it, which starts its daemon when none runs.
-What a move does today: nothing that is working is ended, but idle tabs are ended and
-restored, every agent is resumed in its own conversation, and a `qoro` window open on that
-machine closes (run `qoro` again, everything is back); a window attached to a remote
+What a move does depends on the two binaries. Where the running daemon can hand its tabs to
+the new one, nothing is ended: commands, agents and their conversations simply carry on (next
+section). Otherwise nothing that is working is ended, but idle tabs are ended and restored
+and every agent is resumed in its own conversation. Either way a `qoro` window open on that
+machine closes (run `qoro` again, everything is back), and a window attached to a remote
 reconnects by itself. The remote's bridge service, when it has
 one, is put back on the new file in the same step, since launchd refuses to start a service
 whose program file was replaced.
@@ -111,20 +114,29 @@ agent's generation and conversation id), and becomes the new binary in the same 
 shells stay its children, so a command that was running keeps its pid and prints into the same
 tab afterwards, and an agent in the middle of a turn is the same agent, not a resumed one. A
 program that is not a shell at its prompt is made to redraw: the window shrinks by one row and
-comes back 800 ms later. The listening socket and the startup lock stay open across the move, so
-a client or a hook that starts a daemon meanwhile finds one serving and starts none. Open
-interfaces are disconnected for a moment, as before, and reconnect.
+comes back 800 ms later. What does not cross is what a screen cannot be rebuilt from: the
+main screen under a program that uses the alternate one (quit `vim` after a move and the rows
+it covered stay blank until the shell draws them again), a scroll region, tab stops, character
+sets and the colour table a program changed. The scrollback is not carried either, but it is
+on disk already and still there. The listening socket and the startup lock stay open across
+the move, so a client or a hook that starts a daemon meanwhile finds one serving and starts
+none. Open interfaces lose their connection for a moment, with the effect described above.
 
-A move that cannot hand over falls back to the way it always worked, waiting until nothing is
-working and then ending the tabs and bringing each back (an agent resumed in its conversation):
-when the qoro on disk does not answer `--handoff-formats` with a layout the running one writes
-(every build before this one), or answers and then cannot read the file in a dry run made
-before anything is given up. A tab whose pty or shell cannot be read is held to that same wait.
-Every agent is written down (which one, and its conversation) before the move, so even a move
-that is lost after the point of no return brings it back where it was. A shell that ends while
-the move is under way closes its tab, as it would have anyway. If the exec itself fails, every
-tab carries on in the running daemon and it stays on its version. A daemon that was started before this existed has nothing to hand over with, so the
-first move onto a build that has it is the old one; every move after that is live.
+A move that cannot hand over falls back to the way it always worked: it waits until nothing
+is working, then ends the tabs and brings each back (an agent resumed in its conversation).
+That is what happens when the qoro on disk does not answer `--handoff-formats` with the
+layout the running one writes (every build before this one), when it answers and then cannot
+read the file in a dry run made before anything is given up, and when three hand overs in a
+row fail (a full disk, a tab that never stops). A tab whose pty or shell cannot be read is
+held to that same wait. Every agent is written down (which one, and its conversation) before
+the move, so even a move that is lost after the point of no return brings it back where it
+was. A shell that ends while the move is under way closes its tab, as it would have anyway.
+If the exec itself fails, every tab carries on in the running daemon and it stays on its
+version.
+
+A daemon that was started before this existed has nothing to hand over with, so the first
+move onto a build that has it is this fallback, here and on every remote; every move after
+that is live.
 
 The same check that holds a move also holds `qoro sleep` and the sleep an idle space falls
 into: a single command that prints nothing while it leads its own foreground group (`vim`,

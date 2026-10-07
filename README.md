@@ -250,7 +250,8 @@ speak only to this machine's daemon.
 A machine whose qoro is older than this one follows it on its own. When a release of this
 version exists for that machine's platform, the interface puts that release's binary in place
 of the old one over the same ssh, in the background, and the daemon over there moves onto it
-at the first moment nothing there is working: a running command, a busy agent or a
+and its tabs keep running through it where both qoros can hand them over. Otherwise it
+moves at the first moment nothing there is working: a running command, a busy agent or a
 background job holds it, and the interface says once what it is waiting on. Tabs keep their
 numbers and agents come back in their own conversations. A build from main between releases
 is never sent anywhere, a private release needs `gh auth login` or `GH_TOKEN` on this Mac,
@@ -277,8 +278,8 @@ Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm6
 this repository's crates with the phone part): GitHub only hosts the files, nothing is compiled
 there. `qoro update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
-how it installs, and `qoro update` installs it and moves every machine onto it once nothing
-there is working. How a release is cut and how an update lands:
+how it installs, and `qoro update` installs it and moves every machine onto it, keeping running
+tabs running where it can. How a release is cut and how an update lands:
 [docs/update.md](docs/update.md).
 
 ## What is measured

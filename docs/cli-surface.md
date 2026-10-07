@@ -22,7 +22,7 @@ a claim nobody has to keep.
 |---|---|---|
 | `qoro` | open the interface, starting the daemon if there is not one | no |
 | `qoro attach` | attach to one terminal, with no interface around it | no |
-| `qoro daemon` | run the daemon in the foreground. A daemon that moves onto a new binary starts that binary as `qoro daemon --adopt <file> --nonce <n>`, with the running tabs' ptys open; it asks the binary first with `qoro --handoff-formats` and `qoro daemon --adopt-check`. Neither is for typing | no |
+| `qoro daemon` | run the daemon in the foreground. A daemon that moves onto a new binary starts that binary as `qoro daemon --adopt <file> --nonce <n>`, with the running tabs' ptys open, after a dry run with `--adopt-check`; neither is for typing | no |
 | `qoro reset` | restore a terminal left in raw mode by a killed client | no |
 | `qoro relay` | pipe stdin and stdout to this machine's daemon, which is what `ssh` starts on the far side | no |
 | `qoro ensure-awake` | wake the tab that slept last, or open a first tab when nothing is asleep either, and exit; what `qoro --remote` asks of the far side before its interface opens | no |
@@ -91,7 +91,8 @@ a claim nobody has to keep.
 | `qoro devices ls` | the phones paired with this machine, with their key fingerprints | no |
 | `qoro devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
 | `qoro bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoro while it runs; `qoro bridge reload` puts the installed bridge service back on the binary now on disk (nothing when there is none), after a replaced binary | yes |
-| `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it, then ask this machine's daemon and each saved remote's to move onto it once nothing there is working (a working agent or a running command is never ended; idle tabs are ended and restored, agents resumed in their conversations); `--check` only notes what is newest | yes |
+| `qoro update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it, then ask this machine's daemon and each saved remote's to move onto it (a working agent or a running command is never ended: a daemon that can hand its tabs over keeps them running and waits for nothing, any other moves once nothing there is working, then ends idle tabs and restores them, agents resumed in their conversations); `--check` only notes what is newest | yes |
+| `qoro --handoff-formats` | the handover layout this build takes over from, which a daemon about to move onto it asks first; a build from before it fails the question | no |
 | `qoro --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoro --help` | this surface | no |
 | `qoro --version` | the version | no |
