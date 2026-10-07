@@ -1,5 +1,9 @@
-//! A daemon asked to move onto the qoro on disk does it only once nothing is working, and
-//! every tab comes back on the new binary as it was.
+//! A daemon asked to move onto the qoro on disk becomes it with every tab still running,
+//! when the new binary can take them over; and otherwise does it only once nothing is
+//! working, and every tab comes back on the new binary as it was.
+//!
+//! The tests of the second kind start from `Daemon::start_waiting`, whose binary on disk
+//! says it cannot take tabs over, which is what every build before the handover says.
 //!
 //! Driven with the real binary, because the move is the process becoming another program.
 //! Each daemon runs from a copy of its own, which is then replaced the way an update
@@ -43,10 +47,17 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// A daemon with `NEXT` on disk, ready to be moved onto it.
+    /// A daemon with `NEXT` on disk, ready to be moved onto it, tabs and all.
     fn start() -> Self {
         let d = Self::start_installed();
         replace_with_version(&d.exe, NEXT);
+        d
+    }
+
+    /// The same, with a `NEXT` that cannot take tabs over: the move waits for idle tabs.
+    fn start_waiting() -> Self {
+        let d = Self::start_installed();
+        replace_without_handoff(&d.exe, NEXT);
         d
     }
 
@@ -263,6 +274,38 @@ impl Drop for Daemon {
     }
 }
 
+/// The number right after the last `tag` that has digits behind it on a screen.
+fn number_after(screen: &str, tag: &str) -> Option<u32> {
+    screen
+        .match_indices(tag)
+        .filter_map(|(at, _)| {
+            let digits: String = screen[at + tag.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .last()
+}
+
+/// What `ps` says of a process: its state and command line, for a failure message.
+fn process_state(pid: u32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "pid,ppid,stat,command", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    text(&out.stdout)
+}
+
+/// The parent of a process, or `None` when there is no such process.
+fn parent_of(pid: u32) -> Option<u32> {
+    let out = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    text(&out.stdout).trim().parse().ok()
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -278,7 +321,7 @@ fn running_sleep(row: &AgentRow) -> bool {
 
 #[test]
 fn a_running_command_holds_the_move_and_is_named() {
-    let mut d = Daemon::start();
+    let mut d = Daemon::start_waiting();
     d.send(1, "sleep 30");
     d.wait_for_row(1, "ran sleep", running_sleep);
 
@@ -302,7 +345,7 @@ fn a_running_command_holds_the_move_and_is_named() {
 /// The gating test, and the regression that catches an agent dying in the move.
 #[test]
 fn the_move_waits_for_a_working_agent_and_a_command_then_brings_both_back() {
-    let mut d = Daemon::start();
+    let mut d = Daemon::start_waiting();
     let go = d.dir.path().join("go");
     d.install_agent(&go);
     let busy = d.new_tab();
@@ -353,7 +396,7 @@ fn the_move_waits_for_a_working_agent_and_a_command_then_brings_both_back() {
 
 #[test]
 fn a_tab_made_after_arming_holds_the_move_rather_than_being_ended() {
-    let mut d = Daemon::start();
+    let mut d = Daemon::start_waiting();
     d.send(1, "sleep 30");
     d.wait_for_row(1, "ran sleep", running_sleep);
     assert!(matches!(
@@ -382,7 +425,7 @@ fn a_tab_made_after_arming_holds_the_move_rather_than_being_ended() {
 /// between the two looks, which this harness cannot place.
 #[test]
 fn a_move_that_cannot_happen_yet_leaves_spaces_and_tabs_working() {
-    let d = Daemon::start();
+    let d = Daemon::start_waiting();
     d.send(1, "sleep 30");
     d.wait_for_row(1, "ran sleep", running_sleep);
     assert!(matches!(
@@ -466,7 +509,7 @@ fn a_binary_on_disk_saying_another_version_is_refused() {
 
 #[test]
 fn a_binary_replaced_after_arming_is_not_moved_onto() {
-    let mut d = Daemon::start();
+    let mut d = Daemon::start_waiting();
     d.send(1, "sleep 30");
     d.wait_for_row(1, "ran sleep", running_sleep);
     assert!(matches!(
@@ -580,6 +623,106 @@ fn a_tab_asleep_stays_asleep_across_a_move() {
         other => panic!("the tab did not wake after the move: {other:?}"),
     }
     d.wait_for_row(resting, "woke", |_| true);
+}
+
+/// The core of the handover: a command that is running is not waited for, not ended and not
+/// restarted. It is the same process, a child of the same daemon process, and what it
+/// prints after the move reaches its tab; a line typed after the move reaches it too.
+#[test]
+fn a_running_command_goes_through_the_move_on_the_same_pid() {
+    let mut d = Daemon::start();
+    d.send(
+        1,
+        "echo SHELL=$$; sh -c 'echo PID=$$; sleep 8; echo DONE-$$'",
+    );
+    d.wait_for_screen(1, "PID=");
+    let screen = text(&d.run(&["read", "1"]).stdout);
+    let shell = number_after(&screen, "SHELL=").expect("the shell's pid");
+    let command = number_after(&screen, "PID=").expect("the command's pid");
+    let daemon = d.child.id();
+    assert_eq!(parent_of(shell), Some(daemon), "the shell is not ours");
+    assert!(parent_of(command).is_some(), "the command is not running");
+
+    // Armed with the command still running: the move does not wait for it.
+    let armed = Instant::now();
+    let _ = d.arm(NEXT);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.starts() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    let log = format!("{log}\nthe daemon process: {}", process_state(d.child.id()));
+    assert_eq!(d.starts(), 2, "the daemon never moved: {log}");
+    // Well inside the eight seconds the command still has to run.
+    assert!(
+        armed.elapsed() < Duration::from_secs(4),
+        "the move waited for the command: {log}"
+    );
+    assert!(d.running(), "the daemon exited instead of moving: {log}");
+    assert!(log.contains("took over 1 of 1"), "{log}");
+
+    // The same processes, the same parent: nothing was ended and nothing started again.
+    assert_eq!(
+        parent_of(shell),
+        Some(daemon),
+        "the shell was replaced: {log}"
+    );
+    assert!(
+        parent_of(command).is_some(),
+        "the command did not survive the move: {log}"
+    );
+
+    // What it prints later arrives in the tab, and a key typed after the move reaches it.
+    d.wait_for_screen(1, &format!("DONE-{command}"));
+    d.send(1, "echo AFTER-$((6*7))");
+    d.wait_for_screen(1, "AFTER-42");
+    assert_eq!(parent_of(shell), Some(daemon), "{log}");
+    let left: Vec<_> = std::fs::read_dir(d.dir.path())
+        .expect("runtime dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("handoff"))
+        .collect();
+    assert!(left.is_empty(), "the handover file stayed behind: {left:?}");
+}
+
+/// A daemon started to adopt a handover it cannot read, because it is not there, is not what
+/// was promised, or was left behind by another process, starts as any daemon does: it
+/// listens, and it restores from its rows.
+#[test]
+fn a_handover_that_cannot_be_adopted_starts_a_daemon_as_usual() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let stale = dir.path().join("handoff-1.json");
+    std::fs::write(
+        &stale,
+        r#"{"format":1,"pid":1,"nonce":"n","terminals":[{"id":1,"fd":9,"child":1,"child_start":null,"tty_dev":0,"workspace":1,"name":null,"cwd":null,"token":"t","cols":80,"rows":24,"pending":[]}]}"#,
+    )
+    .expect("file");
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let log = dir.path().join("qorod.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qoro"))
+        .args(["daemon", "--adopt"])
+        .arg(&stale)
+        .args(["--nonce", "n"])
+        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("SHELL", "/bin/sh")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("spawn the daemon");
+    let socket = qoro_testkit::socket_in(dir.path());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let listening = std::os::unix::net::UnixStream::connect(&socket).is_ok();
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(listening, "the daemon never listened: {log}");
+    assert!(log.contains("the handover was refused"), "{log}");
+    assert!(!stale.exists(), "the refused file stayed behind");
 }
 
 /// A request for the version already running (a second window asking after the first one
@@ -769,9 +912,23 @@ fn an_update_names_a_running_command_and_moves_when_it_ends() {
 /// Put a script saying `qoro <version>` where `exe` is, the way an update renames a file in.
 /// Asked anything else, it runs this build: what a move onto it starts.
 fn replace_with_version(exe: &Path, version: &str) {
+    install_script(exe, version, "");
+}
+
+/// The same, for a build from before the handover: asked which layouts it takes over from,
+/// it says nothing.
+fn replace_without_handoff(exe: &Path, version: &str) {
+    install_script(
+        exe,
+        version,
+        "if [ \"$1\" = --handoff-formats ]; then exit 0; fi\n",
+    );
+}
+
+fn install_script(exe: &Path, version: &str, extra: &str) {
     let next = exe.with_file_name("qoro.next");
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoro {version}'; exit 0; fi\nexec '{}' \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoro {version}'; exit 0; fi\n{extra}exec '{}' \"$@\"\n",
         env!("CARGO_BIN_EXE_qoro")
     );
     std::fs::write(&next, script).expect("script");

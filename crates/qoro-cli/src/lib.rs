@@ -39,7 +39,7 @@ mod worktree;
 
 use qoro_runtime::client::{self, RenderStream, TerminalGuard};
 use qoro_runtime::daemon::ClientWire;
-use qoro_runtime::{Daemon, lock, paths};
+use qoro_runtime::{Daemon, handoff, lock, paths};
 
 fn shell() -> PathBuf {
     // A login shell is what the user expects, but a shell chosen by an environment variable
@@ -96,7 +96,15 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         std::process::exit(2);
     }
     match args.get(1).map(String::as_str) {
-        Some("daemon") => run_daemon(),
+        Some("daemon") => run_daemon(&args),
+        // What a daemon about to move onto this binary asks of it: the handover layouts it
+        // can take over from, one per line of output. A build that has no such answer
+        // fails the question, and is moved onto the old way.
+        Some("--handoff-formats") => {
+            let formats: Vec<String> = handoff::FORMATS.iter().map(u32::to_string).collect();
+            println!("{}", formats.join(" "));
+            Ok(())
+        }
         Some("--hello") => {
             // What a remote bootstrap asks for. JSON on one line, because it is read
             // between markers out of whatever a login shell prints around it, and because
@@ -272,12 +280,24 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
     }
 }
 
-fn run_daemon() -> std::io::Result<()> {
+fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // Where this binary is, read first and resolved through any link, before an update
     // can rename a new file over it: on Linux the running path then reads
     // `<path> (deleted)`. It is the file an update replaces and what the daemon becomes.
     let exe = std::env::current_exe().map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
-    qoro_runtime::daemon::close_inherited_fds();
+    // The tabs the daemon before this one handed over, read before anything is closed:
+    // their descriptors are the ones inherited that stay open.
+    let handed = handoff::requested(args).and_then(|(file, nonce)| {
+        handoff::read(&file, &nonce)
+            .map_err(|e| eprintln!("qorod: the handover was refused: {e}"))
+            .ok()
+    });
+    qoro_runtime::daemon::close_inherited_fds(
+        &handed
+            .as_ref()
+            .map(handoff::Handoff::fds)
+            .unwrap_or_default(),
+    );
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     // Held across the whole sequence: stale-socket check, unlink, bind, listen, initialise.
     // Two daemons started at once therefore serialise here rather than both concluding the
@@ -297,7 +317,7 @@ fn run_daemon() -> std::io::Result<()> {
     };
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let daemon = match Daemon::bind_in(&dir, &state, &shell()).await {
+        let daemon = match Daemon::bind_adopting(&dir, &state, &shell(), handed).await {
             Ok(d) => match exe {
                 Ok(exe) => d.leaving_when_idle().restarting_into(exe),
                 Err(e) => {

@@ -56,13 +56,52 @@ struct Inner {
 }
 
 /// The handover itself. Cloning shares it; the read loop pushes and the writer drains.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SpillRing {
     inner: Arc<Mutex<Inner>>,
     notify: Arc<tokio::sync::Notify>,
     /// Woken when the ring passes [`SPILL_PRESSURE`], so a writer waiting out its batch
     /// window drains now.
     pressure: Arc<tokio::sync::Notify>,
+    /// How many times a flush was asked for, and the last one the writer has done.
+    asked: Arc<std::sync::atomic::AtomicU64>,
+    done: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for SpillRing {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            notify: Arc::default(),
+            pressure: Arc::default(),
+            asked: Arc::default(),
+            done: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+}
+
+/// A way to ask the writer of a ring to put everything handed to it on disk, and to hear
+/// when it has. Not a handle on the rows: holding one never keeps a ring from being
+/// orphaned, so a writer still finishes when its terminal is gone.
+#[derive(Clone)]
+pub struct Flusher {
+    asked: Arc<std::sync::atomic::AtomicU64>,
+    done: Arc<tokio::sync::watch::Sender<u64>>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Flusher {
+    /// Ask for a flush and wait for it, up to `within`. True when everything handed over
+    /// before the call is on disk.
+    pub async fn flush(&self, within: std::time::Duration) -> bool {
+        use std::sync::atomic::Ordering;
+        let n = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut done = self.done.subscribe();
+        self.wake.notify_one();
+        tokio::time::timeout(within, done.wait_for(|d| *d >= n))
+            .await
+            .is_ok_and(|reached| reached.is_ok())
+    }
 }
 
 fn now_unix() -> i64 {
@@ -143,6 +182,26 @@ impl SpillRing {
         self.notify.notify_one();
     }
 
+    /// A way for somebody else to ask this ring's writer to flush.
+    pub fn flusher(&self) -> Flusher {
+        Flusher {
+            asked: self.asked.clone(),
+            done: self.done.clone(),
+            wake: self.notify.clone(),
+        }
+    }
+
+    /// How many flushes have been asked for. Read by the writer before it takes the rows,
+    /// so a flush it reports done covers everything pushed before the ask.
+    pub fn flushes_asked(&self) -> u64 {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Say that every flush up to `n` is done.
+    pub fn flushed_to(&self, n: u64) {
+        self.done.send_replace(n);
+    }
+
     /// Whether this is the last handle, so nobody will push again. The writer's cue to
     /// finish: it parks on `wait` holding its own clone, and without this it waited for
     /// the rest of the daemon's life after its terminal ended, holding the files open.
@@ -176,6 +235,26 @@ mod tests {
             .await
             .expect("the drop woke the writer");
         assert!(writer.orphaned());
+    }
+
+    #[tokio::test]
+    async fn a_flush_is_done_when_the_writer_says_so_and_covers_what_was_pushed_before() {
+        let ring = SpillRing::new();
+        let writer = ring.clone();
+        let flusher = ring.flusher();
+        // Nobody answers: the ask runs out and says so.
+        assert!(!flusher.flush(std::time::Duration::from_millis(30)).await);
+        tokio::spawn(async move {
+            loop {
+                writer.wait().await;
+                let asked = writer.flushes_asked();
+                let _ = writer.take();
+                writer.flushed_to(asked);
+            }
+        });
+        ring.push(["a".to_string()]);
+        assert!(flusher.flush(std::time::Duration::from_secs(2)).await);
+        assert!(ring.is_empty(), "the flush came before the rows were taken");
     }
 
     #[test]

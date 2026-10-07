@@ -55,6 +55,78 @@ pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// The slave's path, written into a caller-owned buffer. `ptsname` is deliberately not
+/// used: it returns a shared static buffer, which is not safe to call from more than one
+/// thread, and the whole point of `open_pty` is that it runs concurrently.
+fn slave_name(master: RawFd) -> io::Result<[libc::c_char; 128]> {
+    let mut name = [0 as libc::c_char; 128];
+    #[cfg(target_os = "macos")]
+    {
+        // TIOCPTYGNAME is what Apple's own ptsname calls underneath, and it writes into the
+        // buffer we hand it.
+        const TIOCPTYGNAME: libc::c_ulong = 0x40807453;
+        // SAFETY: master is live and name is a 128 byte buffer, which is the size the
+        // ioctl is defined against.
+        if unsafe { libc::ioctl(master, TIOCPTYGNAME, name.as_mut_ptr()) } != 0 {
+            return Err(last_err());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: name is a 128 byte buffer and its length is passed correctly.
+        let rc = unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    Ok(name)
+}
+
+/// The controlling terminal device of the slave a master belongs to, as [`tty_dev`] reads
+/// it from the slave itself. Answers `Err` for a descriptor that is not a pty master, which
+/// is how a handed over descriptor is told from anything else that was left open.
+pub fn slave_tty_dev(master: RawFd) -> io::Result<u64> {
+    let name = slave_name(master)?;
+    // SAFETY: zeroed stat is a valid out-param.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: name is a null-terminated path and st is a valid out-param.
+    if unsafe { libc::stat(name.as_ptr(), &mut st) } != 0 {
+        return Err(last_err());
+    }
+    Ok(st.st_rdev as u32 as u64)
+}
+
+/// A second descriptor for the same open file, at or above `min`, left inheritable or not.
+/// The description is shared, so it stays open however the first one is dropped.
+pub fn dup_from(fd: RawFd, min: RawFd, cloexec: bool) -> io::Result<OwnedFd> {
+    let cmd = if cloexec {
+        libc::F_DUPFD_CLOEXEC
+    } else {
+        libc::F_DUPFD
+    };
+    // SAFETY: fd is live; the new descriptor is fresh and owned by nobody else.
+    let d = unsafe { libc::fcntl(fd, cmd, min) };
+    if d < 0 {
+        return Err(last_err());
+    }
+    // SAFETY: d is fresh and unowned.
+    Ok(unsafe { OwnedFd::from_raw_fd(d) })
+}
+
+/// Let a descriptor survive `exec`.
+pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fd is a live descriptor for the duration of the call.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(last_err());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(last_err());
+    }
+    Ok(())
+}
+
 /// Open a PTY pair with both descriptors close-on-exec **at open**, and the master
 /// non-blocking.
 ///
@@ -83,29 +155,7 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<PtyPair> {
         return Err(last_err());
     }
 
-    // The slave's name, written into a caller-owned buffer. `ptsname` is deliberately not
-    // used: it returns a shared static buffer, which is not safe to call from more than one
-    // thread, and the whole point of this function is that it runs concurrently.
-    let mut name = [0 as libc::c_char; 128];
-    #[cfg(target_os = "macos")]
-    {
-        // TIOCPTYGNAME is what Apple's own ptsname calls underneath, and it writes into the
-        // buffer we hand it.
-        const TIOCPTYGNAME: libc::c_ulong = 0x40807453;
-        // SAFETY: master is live and name is a 128 byte buffer, which is the size the
-        // ioctl is defined against.
-        if unsafe { libc::ioctl(master.as_raw_fd(), TIOCPTYGNAME, name.as_mut_ptr()) } != 0 {
-            return Err(last_err());
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // SAFETY: name is a 128 byte buffer and its length is passed correctly.
-        let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-    }
+    let name = slave_name(master.as_raw_fd())?;
 
     // SAFETY: ptsname_r wrote a null-terminated path into name.
     let slave_fd = unsafe {

@@ -40,31 +40,60 @@ pub enum HandleError {
 /// close in flight would otherwise be lost with the process.
 static OWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The history writers alive, counted apart: a daemon that becomes another binary asks them
+/// to flush and waits for that, and a writer is alive for as long as its terminal is.
+static WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One write owed, for as long as it is held. Taken before the task that does the write
 /// is spawned, so an exit can never look between the spawn and the task's first step.
-pub(crate) struct Owed;
+pub(crate) struct Owed(&'static std::sync::atomic::AtomicUsize);
 
 impl Owed {
     pub(crate) fn new() -> Self {
-        OWED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Owed
+        Self::counted(&OWED)
+    }
+
+    /// The history writer of a terminal, owed for as long as the terminal is.
+    pub(crate) fn writer() -> Self {
+        Self::counted(&WRITERS)
+    }
+
+    fn counted(counter: &'static std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Owed(counter)
     }
 }
 
 impl Drop for Owed {
     fn drop(&mut self) {
-        OWED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 /// Wait, until `deadline`, for every owed write to land.
 pub(crate) async fn settle_owed(deadline: tokio::time::Instant) {
-    while OWED.load(std::sync::atomic::Ordering::SeqCst) > 0
-        && tokio::time::Instant::now() < deadline
-    {
+    wait_for(deadline, true).await
+}
+
+/// The same for the store alone, for a daemon that has already had every history writer
+/// flush and is not ending its terminals.
+pub(crate) async fn settle_stores(deadline: tokio::time::Instant) {
+    wait_for(deadline, false).await
+}
+
+async fn wait_for(deadline: tokio::time::Instant, writers: bool) {
+    let owed = || {
+        OWED.load(std::sync::atomic::Ordering::SeqCst)
+            + if writers {
+                WRITERS.load(std::sync::atomic::Ordering::SeqCst)
+            } else {
+                0
+            }
+    };
+    while owed() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let left = OWED.load(std::sync::atomic::Ordering::SeqCst);
+    let left = owed();
     if left > 0 {
         eprintln!("qorod: exiting with {left} writes to disk unfinished");
     }

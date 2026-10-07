@@ -40,7 +40,7 @@ use crate::terminal::{PARSE_SLICE, ReadOutcome, classify_read, replies};
 /// Every command carries who sent it. Resize is arbitrated per client (ADR-007), and a
 /// command type that could not say who asked would make that arbitration impossible to
 /// enforce at the only place it matters.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ClientCommand {
     Input {
         from: ClientId,
@@ -81,6 +81,28 @@ pub enum ClientCommand {
         from: ClientId,
         to: ClientId,
     },
+    /// Stop reading and writing, say where the terminal stands, and wait. A daemon moving
+    /// onto a new binary asks every tab this, then becomes that binary with the masters
+    /// open. The terminal carries on as it was when `go` is dropped, which is what a move
+    /// that did not happen does; the move itself ends this process, and the wait with it.
+    Pause {
+        reply: tokio::sync::oneshot::Sender<Paused>,
+        go: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+/// Where a paused terminal stands: what the next daemon needs of it besides its
+/// descriptor.
+#[derive(Debug)]
+pub struct Paused {
+    /// The master, as this terminal's task holds it.
+    pub master: std::os::fd::RawFd,
+    pub child: i32,
+    pub tty_dev: u64,
+    /// The size the clients asked for, not the one a redraw nudge is holding for a moment.
+    pub size: PtySize,
+    /// Bytes accepted from clients and not yet typed into the child.
+    pub pending: Vec<u8>,
 }
 
 /// What the daemon publishes to attached clients.
@@ -1047,6 +1069,17 @@ impl Daemon {
     /// The same, with the database and the history in `state` (`paths::state_dir`), moved
     /// there from `dir` by the first start that finds them in the old place.
     pub async fn bind_in(dir: &Path, state: &Path, shell: &Path) -> io::Result<Self> {
+        Self::bind_adopting(dir, state, shell, None).await
+    }
+
+    /// [`Daemon::bind_in`], taking over the running terminals `handoff` carries before it
+    /// restores anything: the daemon that wrote it became this one with their ptys open.
+    pub async fn bind_adopting(
+        dir: &Path,
+        state: &Path,
+        shell: &Path,
+        handoff: Option<crate::handoff::Handoff>,
+    ) -> io::Result<Self> {
         let socket = paths::socket_path(dir);
         remove_stale_socket(&socket)?;
         // Before the bind, so a daemon refused because another has this state never answers
@@ -1142,7 +1175,7 @@ impl Daemon {
 
         // What the last daemon was holding when it stopped. A person who closed qoro and
         // opened it again asked for their work back, not for an empty screen.
-        let report = restore_report(&Restore {
+        let into = Restore {
             terminals: terminals.clone(),
             books: books.clone(),
             shell: shell.to_path_buf(),
@@ -1150,8 +1183,13 @@ impl Daemon {
             history_dir: Some(state.join("history")),
             scanner: scanner.clone(),
             agents: agents.clone(),
-        })
-        .await;
+        };
+        if let Some(handoff) = handoff {
+            let carried = handoff.terminals.len();
+            let adopted = adopt_terminals(&into, handoff).await;
+            eprintln!("qorod: took over {adopted} of {carried} running tabs");
+        }
+        let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
         terminals.load_session_titles(books.store.session_titles().await.unwrap_or_default());
         Ok(Self {
@@ -1206,6 +1244,9 @@ impl Daemon {
     /// it the request is refused.
     pub fn restarting_into(self, exe: PathBuf) -> Self {
         let _ = self.books.restart.exe.set(exe);
+        if let Some(dir) = self.socket.parent() {
+            let _ = self.books.restart.dir.set(dir.to_path_buf());
+        }
         self
     }
 
@@ -5092,16 +5133,52 @@ pub fn open_terminal(
     agents: Arc<crate::agents::AgentRegistry>,
     books: Option<Bookkeeping>,
 ) -> io::Result<TerminalHandle> {
+    open_terminal_with(
+        terminals,
+        stream,
+        workspace,
+        name,
+        shell,
+        cwd,
+        warnings,
+        history_dir,
+        scanner,
+        agents,
+        books,
+        None,
+    )
+}
+
+/// [`open_terminal`], or with `adopt` the same terminal registered around a pty and a shell
+/// that are already running.
+#[allow(clippy::too_many_arguments)]
+fn open_terminal_with(
+    terminals: &Arc<TerminalRegistry>,
+    stream: u32,
+    workspace: i64,
+    name: Option<String>,
+    shell: &Path,
+    cwd: Option<&Path>,
+    warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
+    history_dir: Option<PathBuf>,
+    scanner: Arc<ContainmentScanner>,
+    agents: Arc<crate::agents::AgentRegistry>,
+    books: Option<Bookkeeping>,
+    adopt: Option<Adopted>,
+) -> io::Result<TerminalHandle> {
     let (commands, from_clients) = mpsc::channel(256);
+    let size = adopt.as_ref().map_or(INITIAL_SIZE, |a| a.size);
     let (updates, _) = watch::channel(TerminalUpdate::Full(Snapshot {
-        cols: 80,
-        rows: 24,
+        cols: size.cols as usize,
+        rows: size.rows as usize,
         cursor: (0, 0),
-        lines: vec![String::new(); 24],
+        lines: vec![String::new(); size.rows as usize],
         styles: Vec::new(),
         modes: Default::default(),
     }));
-    let token = crate::agents::mint_token(stream);
+    let token = adopt
+        .as_ref()
+        .map_or_else(|| crate::agents::mint_token(stream), |a| a.token.clone());
     let terminal_id = TerminalId::new(stream.to_string());
     agents.register(stream, terminal_id.clone(), token.clone());
     // Creation counts as activity on both clocks: a tab that never produces
@@ -5131,7 +5208,9 @@ pub fn open_terminal(
         last_copy: Arc::default(),
         image_flood_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         discards: Arc::default(),
-        last_dims: Arc::new(std::sync::atomic::AtomicU64::new((80u64 << 32) | 24u64)),
+        last_dims: Arc::new(std::sync::atomic::AtomicU64::new(
+            ((size.cols as u64) << 32) | size.rows as u64,
+        )),
         incarnation: next_incarnation(),
     };
     terminals.insert(stream, handle.clone());
@@ -5142,6 +5221,11 @@ pub fn open_terminal(
         let (done, finished) = watch::channel(());
         if let Some(books) = &books {
             books.writers.lock().unwrap().insert(stream, finished);
+            books
+                .flushers
+                .lock()
+                .unwrap()
+                .insert(stream, spill.flusher());
         }
         spawn_history_writer(
             dir.clone(),
@@ -5162,6 +5246,7 @@ pub fn open_terminal(
             agents,
             terminals: terminals.clone(),
             books: books.clone(),
+            adopt,
         },
         from_clients,
         updates,
@@ -5501,6 +5586,8 @@ pub struct Bookkeeping {
     /// last row. A tab reopened on the same number waits for it: two writers on one
     /// directory would number their rows over each other.
     pub writers: Arc<std::sync::Mutex<std::collections::HashMap<u32, watch::Receiver<()>>>>,
+    /// What asks each terminal's history writer to put its rows on disk now.
+    flushers: Arc<std::sync::Mutex<std::collections::HashMap<u32, crate::spill::Flusher>>>,
     /// One lock per workspace, held by whatever changes whether it is asleep: a sleep, a
     /// wake, a tab made or closed in it, the workspace closing. It and `writers` keep an
     /// entry for every id they were asked about: a few bytes each, for the daemon's life.
@@ -5533,6 +5620,8 @@ pub struct Restart {
     /// Linux the running path reads `<path> (deleted)` once a new file is renamed over it.
     /// Unset for a daemon embedded in something else, which has no `qoro daemon` to become.
     exe: std::sync::OnceLock<PathBuf>,
+    /// The runtime directory, where what a move hands over is written. Set with `exe`.
+    dir: std::sync::OnceLock<PathBuf>,
     /// Whether the task that waits for the safe moment runs. It starts once and runs until
     /// the daemon goes, so a daemon never asked costs nothing.
     armed: std::sync::atomic::AtomicBool,
@@ -5556,6 +5645,7 @@ impl Default for Restart {
     fn default() -> Self {
         Self {
             exe: std::sync::OnceLock::new(),
+            dir: std::sync::OnceLock::new(),
             armed: std::sync::atomic::AtomicBool::new(false),
             gate: std::sync::atomic::AtomicBool::new(false),
             waiting: watch::channel(None).0,
@@ -5582,6 +5672,7 @@ impl Bookkeeping {
             asleep: Arc::default(),
             closing: Arc::default(),
             writers: Arc::default(),
+            flushers: Arc::default(),
             locks: Arc::default(),
             restart: Arc::default(),
             awake: Arc::default(),
@@ -5628,6 +5719,20 @@ impl Bookkeeping {
             .entry(workspace)
             .or_default()
             .clone()
+    }
+
+    /// Have each of these terminals' history writers put the rows handed to them on disk, and
+    /// wait for all of them. True when every one has.
+    async fn flush_histories(&self, streams: &[u32], within: std::time::Duration) -> bool {
+        let flushers: Vec<_> = {
+            let all = self.flushers.lock().unwrap();
+            streams.iter().filter_map(|s| all.get(s).cloned()).collect()
+        };
+        let mut every = true;
+        for flusher in flushers {
+            every &= flusher.flush(within).await;
+        }
+        every
     }
 
     /// Wait until the history writer of a terminal number has finished, or `within` runs
@@ -5691,6 +5796,99 @@ impl RestoreReport {
             self.cwd_fallback,
         )
     }
+}
+
+/// Take over the terminals the daemon before this one left running, and say how many. A
+/// terminal that cannot be taken over is closed on this side and keeps its row, so the
+/// restore that follows opens it again as a shell in its place.
+async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> usize {
+    let mut adopted = 0;
+    for carried in handoff.terminals {
+        let id = carried.id;
+        match adopt_one(into, carried) {
+            Ok(()) => adopted += 1,
+            Err(why) => eprintln!("qorod: tab {id} could not be taken over: {why}"),
+        }
+    }
+    adopted
+}
+
+/// One carried terminal: checked to be what the file says, then run as it was.
+fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), String> {
+    use crate::handoff::Carried;
+    let Carried {
+        id,
+        fd,
+        child,
+        child_start,
+        tty_dev,
+        workspace,
+        name,
+        cwd,
+        token,
+        cols,
+        rows,
+        pending,
+    } = carried;
+    // An open descriptor first: wrapping one that is not would close somebody else's.
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!("descriptor {fd} is not open"));
+    }
+    // SAFETY: it is open, was handed to this process for this terminal, and nothing here
+    // owns it yet.
+    let master = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The slave this pty belongs to is the one the old daemon contained the tab by.
+    if sys::slave_tty_dev(fd).map_err(|e| format!("descriptor {fd} is not a pty master: {e}"))?
+        != tty_dev
+    {
+        return Err(format!("descriptor {fd} is another terminal's pty"));
+    }
+    // Ours to wait for, still running, and the process that was written down. The kernel
+    // answers the first: only a child of this process can be waited for. A child that
+    // went during the move was reaped by the asking.
+    let mut status = 0;
+    // SAFETY: waitpid on one pid with WNOHANG blocks nothing and reaps nothing else.
+    match unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } {
+        0 => {}
+        r if r > 0 => return Err(format!("process {child} ended while the daemon moved")),
+        _ => return Err(format!("process {child} is not a child of this daemon")),
+    }
+    if child_start.is_some() && sys::start_time_of(qoro_pty::teardown::Pid(child)) != child_start {
+        return Err(format!(
+            "process {child} is not the one that was written down"
+        ));
+    }
+    // Close-on-exec again, so no shell this daemon starts holds another tab's master.
+    sys::set_cloexec(fd).map_err(|e| format!("descriptor {fd}: {e}"))?;
+    let size = PtySize { cols, rows };
+    if sys::window_size(fd).ok() != Some((cols, rows)) {
+        sys::resize(fd, cols, rows).map_err(|e| format!("its size could not be set: {e}"))?;
+    }
+    into.terminals.mint_above(id);
+    open_terminal_with(
+        &into.terminals,
+        id,
+        workspace,
+        name,
+        &into.shell,
+        cwd.as_deref().map(Path::new),
+        into.warnings.clone(),
+        into.history_dir.clone(),
+        into.scanner.clone(),
+        into.agents.clone(),
+        Some(into.books.clone()),
+        Some(Adopted {
+            master,
+            token: qoro_domain::CapabilityToken::new(token),
+            child: child as u32,
+            tty_dev,
+            size,
+            pending,
+        }),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Bring back the terminals the last daemon was holding, and say how many.
@@ -5791,8 +5989,12 @@ async fn restore_rows(
         {
             break;
         }
-        report.terminals += 1;
         let stream = row.id as u32;
+        // Running already: the daemon this one moved from handed it over.
+        if into.terminals.get(stream).is_some() {
+            continue;
+        }
+        report.terminals += 1;
         // The row keeps its directory either way.
         let cwd = PathBuf::from(&row.cwd);
         let cwd = dirs.contains(&cwd).then_some(cwd);
@@ -6401,14 +6603,16 @@ async fn wake_locked(
 /// a pipe that leaked into the starter (a `$(qoro ...)` in a script, or another thread's
 /// pipe caught mid-spawn) would otherwise never see its end and its reader waits forever.
 /// Call it first thing, before anything of the daemon's own is open.
-pub fn close_inherited_fds() {
+///
+/// Except `keep`: the terminals a daemon that moved onto this binary handed over.
+pub fn close_inherited_fds(keep: &[std::os::fd::RawFd]) {
     let Ok(entries) = std::fs::read_dir("/dev/fd") else {
         return;
     };
     let fds: Vec<i32> = entries
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse().ok())
-        .filter(|&fd| fd > 2)
+        .filter(|fd| *fd > 2 && !keep.contains(fd))
         .collect();
     // The listing's own descriptor is among them and is already closed: EBADF, harmless,
     // since nothing else opens anything in between.
@@ -6540,13 +6744,30 @@ const VERSION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the binary at `exe` says it is: its `--version` line.
 async fn version_on_disk(exe: &Path) -> Result<String, String> {
+    ask_binary(exe, "--version").await
+}
+
+/// The layout the binary at `exe` reads a handover in, when it reads the one this daemon
+/// writes. A binary that does not know the question (every build before this one) says
+/// nothing, and the move onto it waits for idle tabs and brings them back instead.
+async fn handoff_on_disk(exe: &Path) -> bool {
+    let formats = ask_binary(exe, "--handoff-formats")
+        .await
+        .unwrap_or_default();
+    formats
+        .split_whitespace()
+        .any(|f| f.parse() == Ok(crate::handoff::FORMAT))
+}
+
+/// What the binary at `exe` prints on stdout for one argument.
+async fn ask_binary(exe: &Path, arg: &'static str) -> Result<String, String> {
     let exe = exe.to_path_buf();
     let shown = exe.display().to_string();
     let asked = shown.clone();
     crate::blocking::run_on(crate::blocking::Pool::Lifecycle, move || {
         use std::io::Read;
         let mut child = std::process::Command::new(&exe)
-            .arg("--version")
+            .arg(arg)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -6564,7 +6785,7 @@ async fn version_on_disk(exe: &Path) -> Result<String, String> {
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("{asked} did not say its version"));
+                    return Err(format!("{asked} did not answer {arg}"));
                 }
             }
         }
@@ -6598,7 +6819,28 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
         {
             let mut replaced = None;
             match restart_look(&into, &exe, &mut replaced).await {
-                Ok(_held) => exec_daemon(&exe),
+                Ok(Moving { handed: None, .. }) => exec_daemon(&exe),
+                Ok(Moving {
+                    handed: Some(handed),
+                    ..
+                }) => {
+                    // Only returns when the exec did not happen: the file is gone, the
+                    // descriptors closed, and every paused tab carries on as it was.
+                    let e = handed.exec(&exe);
+                    eprintln!(
+                        "qorod: {} could not be started: {e}; staying on this version",
+                        exe.display()
+                    );
+                    drop(handed);
+                    into.books
+                        .restart
+                        .gate
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    let asked = into.books.restart.wanted.lock().unwrap().0;
+                    if call_off(&into.books.restart, asked) {
+                        return;
+                    }
+                }
                 Err(why) => {
                     let before = into.books.restart.waiting.send_replace(Some(why.clone()));
                     if let Some(asked) = replaced
@@ -6642,10 +6884,18 @@ fn call_off(restart: &Restart, asked: u64) -> bool {
     true
 }
 
-/// One look across every space, the way a sleep looks at one, that ends with every tab
-/// ended and every row written down for the next daemon to bring back. Answers the space
-/// locks, still held, for the move to happen under; or what is still working, with nothing
-/// ended.
+/// What a look that decided to move holds until the exec: the space locks, and when the
+/// tabs go with the daemon what they were handed over in.
+struct Moving {
+    _held: BTreeMap<i64, tokio::sync::OwnedMutexGuard<()>>,
+    handed: Option<HandedOver>,
+}
+
+/// One look across every space. Onto a binary that reads a handover it does not wait for
+/// anything: every tab is paused where it is, and the move takes them with it. Otherwise,
+/// the way a sleep looks at one, it ends with every tab ended and every row written down
+/// for the next daemon to bring back. Answers what the move happens under; or what is
+/// still working, with nothing ended.
 ///
 /// Left open, as it is for a sleep: a key landing between the second look and the end.
 ///
@@ -6654,7 +6904,7 @@ async fn restart_look(
     into: &Restore,
     exe: &Path,
     replaced: &mut Option<u64>,
-) -> Result<BTreeMap<i64, tokio::sync::OwnedMutexGuard<()>>, String> {
+) -> Result<Moving, String> {
     let books = &into.books;
     let mut held = BTreeMap::new();
     lock_spaces(books, &mut held).await?;
@@ -6670,16 +6920,23 @@ async fn restart_look(
             .collect()
     };
     let streams = awake();
-    if let Some(why) = waiting_between(into, &streams) {
-        return Err(why);
-    }
-    let table = fresh_process_table().await?;
-    let checkpoints = vet_tabs(into, &streams, &table)?;
-    books
-        .store
-        .checkpoint(checkpoints.clone())
-        .await
-        .map_err(|e| format!("the tabs could not be written down: {e}"))?;
+    let live = handoff_on_disk(exe).await;
+    // Handed over, a tab is not asked to be idle: it keeps running through the move.
+    let checkpoints = if live {
+        Vec::new()
+    } else {
+        if let Some(why) = waiting_between(into, &streams) {
+            return Err(why);
+        }
+        let table = fresh_process_table().await?;
+        let checkpoints = vet_tabs(into, &streams, &table)?;
+        books
+            .store
+            .checkpoint(checkpoints.clone())
+            .await
+            .map_err(|e| format!("the tabs could not be written down: {e}"))?;
+        checkpoints
+    };
     // The binary is asked again before the gate goes up rather than under it: the exec
     // opens the path later anyway, and up to `VERSION_PATIENCE` of refused creates and
     // wakes, with the move's end pushed toward the link's patience, buys nothing.
@@ -6702,6 +6959,14 @@ async fn restart_look(
         lock_spaces(books, &mut held).await?;
         if awake() != streams {
             return Err("a tab came or went while the tabs were written down".into());
+        }
+        if live {
+            // Nothing is ended, so nothing says the daemon is going: a tab ending now is
+            // still an ordinary close, and the next daemon records what it finds.
+            if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("qoro is stopping".into());
+            }
+            return Ok(());
         }
         // Read again: a job started while the tabs were written down is the one to catch.
         let table = fresh_process_table().await?;
@@ -6727,6 +6992,23 @@ async fn restart_look(
             .store(false, std::sync::atomic::Ordering::SeqCst);
         return Err(why);
     }
+    if live {
+        // Back out whole if any tab cannot be handed over: nothing has been ended, and
+        // the tabs that were paused carry on when the handover is dropped.
+        return match hand_over(into, &streams).await {
+            Ok(handed) => Ok(Moving {
+                _held: held,
+                handed: Some(handed),
+            }),
+            Err(why) => {
+                books
+                    .restart
+                    .gate
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                Err(why)
+            }
+        };
+    }
     // No way back from here: `stopping` is set, so every tab ending now keeps its row
     // open, as at a stop.
     if let Err(e) = end_tabs(into, &into.terminals.streams()).await {
@@ -6734,7 +7016,150 @@ async fn restart_look(
         eprintln!("qorod: {e}; moving anyway");
     }
     crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
-    Ok(held)
+    Ok(Moving {
+        _held: held,
+        handed: None,
+    })
+}
+
+/// How long every tab has to say where it stands, and every history to reach the disk.
+const HANDOVER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The tabs of a daemon that is about to become another binary, paused and written down.
+struct HandedOver {
+    file: PathBuf,
+    nonce: String,
+    /// Each paused tab's wait. Dropped, the tab carries on as it was: a move that did not
+    /// happen.
+    _resume: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// The masters as the next process will have them, at the numbers the file says.
+    masters: Vec<OwnedFd>,
+}
+
+impl HandedOver {
+    /// Become `exe`, with the masters open in it. Returns only when that did not happen.
+    fn exec(&self, exe: &Path) -> io::Error {
+        // Inheritable only now: a child started in between would carry every tab's master.
+        for master in &self.masters {
+            if let Err(e) = sys::clear_cloexec(master.as_raw_fd()) {
+                return e;
+            }
+        }
+        exec_into(
+            exe,
+            &[
+                "--adopt".into(),
+                self.file.display().to_string(),
+                "--nonce".into(),
+                self.nonce.clone(),
+            ],
+        )
+    }
+}
+
+impl Drop for HandedOver {
+    fn drop(&mut self) {
+        // Read and deleted by the next daemon; still here only when it never came.
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
+/// Pause every one of these tabs, flush their history, and write down what the next daemon
+/// needs to take them over. Every tab is paused or none carries on paused: any failure
+/// drops what was started, and each tab resumes.
+async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String> {
+    let restart = &into.books.restart;
+    let dir = restart
+        .dir
+        .get()
+        .cloned()
+        .ok_or("this daemon does not know its runtime directory")?;
+    let deadline = tokio::time::Instant::now() + HANDOVER_PATIENCE;
+    let mut resume = Vec::new();
+    let mut waiting = Vec::new();
+    for stream in streams {
+        // A tab that ended since the look is not one to carry.
+        let Some(handle) = into.terminals.get(*stream) else {
+            continue;
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let (go, wait) = tokio::sync::oneshot::channel();
+        let sent = tokio::time::timeout_at(
+            deadline,
+            handle
+                .commands
+                .send(ClientCommand::Pause { reply, go: wait }),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            return Err(format!("tab {stream} could not be paused"));
+        }
+        resume.push(go);
+        waiting.push((*stream, handle, answer));
+    }
+    let mut masters = Vec::new();
+    let mut carried = Vec::new();
+    for (stream, handle, answer) in waiting {
+        let paused = match tokio::time::timeout_at(deadline, answer).await {
+            Ok(Ok(paused)) => paused,
+            _ => return Err(format!("tab {stream} did not stop in time")),
+        };
+        // A second descriptor for the same pty, at a number of its own: the first closes
+        // with the exec and the second is what the next process finds.
+        let master = sys::dup_from(paused.master, 3, true)
+            .map_err(|e| format!("tab {stream}'s pty could not be passed on: {e}"))?;
+        carried.push(crate::handoff::Carried {
+            id: stream,
+            fd: master.as_raw_fd(),
+            child: paused.child,
+            child_start: sys::start_time_of(qoro_pty::teardown::Pid(paused.child)),
+            tty_dev: paused.tty_dev,
+            workspace: handle.workspace,
+            name: handle.name.clone(),
+            cwd: into.terminals.cwd_of(stream),
+            token: handle.token.as_str().to_string(),
+            cols: paused.size.cols,
+            rows: paused.size.rows,
+            pending: paused.pending,
+        });
+        masters.push(master);
+    }
+    // Nothing is pushed any more, so what the writers hold is all there will be.
+    let carried_streams: Vec<u32> = carried.iter().map(|c| c.id).collect();
+    if !into
+        .books
+        .flush_histories(&carried_streams, HANDOVER_PATIENCE)
+        .await
+    {
+        return Err("the history of a tab could not be written in time".into());
+    }
+    let handoff = crate::handoff::Handoff {
+        format: crate::handoff::FORMAT,
+        pid: std::process::id(),
+        nonce: crate::handoff::fresh_nonce().map_err(|e| format!("no nonce: {e}"))?,
+        terminals: carried,
+    };
+    let nonce = handoff.nonce.clone();
+    let file = crate::blocking::run(move || crate::handoff::write(&dir, &handoff))
+        .await
+        .map_err(|e| format!("the handover could not be written: {e}"))?
+        .map_err(|e| format!("the handover could not be written: {e}"))?;
+    crate::store::settle_stores(deadline).await;
+    // A `qoro stop` that landed meanwhile is waiting in each tab's queue behind the pause:
+    // it wins, and the tabs carry on to hear it.
+    if into
+        .books
+        .stopping
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("qoro is stopping".into());
+    }
+    Ok(HandedOver {
+        file,
+        nonce,
+        _resume: resume,
+        masters,
+    })
 }
 
 /// Take the lock of every space not in `held` yet, the lowest id first. `MoveTerminal`
@@ -6760,7 +7185,7 @@ async fn lock_spaces(
     Ok(())
 }
 
-/// Become `exe` as `qoro daemon`, in this process.
+/// Become `exe` as `qoro daemon`, in this process, ending every tab first as the caller did.
 ///
 /// Rather than leaving for a client to start the next one: after an exit every tab stays
 /// down until a client comes, which may be never while the machine that would come sleeps.
@@ -6768,14 +7193,22 @@ async fn lock_spaces(
 /// the new daemon closes anything inherited past stderr before it opens anything, then
 /// takes the startup lock and binds over the socket left behind.
 fn exec_daemon(exe: &Path) -> ! {
-    use std::os::unix::process::CommandExt;
-    eprintln!("qorod: moving onto {}", exe.display());
-    let e = std::process::Command::new(exe).arg("daemon").exec();
+    let e = exec_into(exe, &[]);
     eprintln!(
         "qorod: {} could not be started: {e}; leaving, and the next start brings the tabs back",
         exe.display()
     );
     std::process::exit(1);
+}
+
+/// `exe daemon <args>` in place of this process. Returns the error when it did not happen.
+fn exec_into(exe: &Path, args: &[String]) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    eprintln!("qorod: moving onto {}", exe.display());
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .args(args)
+        .exec()
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.
@@ -7178,7 +7611,7 @@ fn spawn_history_writer(
     commands: mpsc::WeakSender<ClientCommand>,
     done: watch::Sender<()>,
 ) {
-    let owed = crate::store::Owed::new();
+    let owed = crate::store::Owed::writer();
     tokio::spawn(async move {
         let _owed = owed;
         // Dropped with the task, however it ends: that is the signal a reopen waits for.
@@ -7210,6 +7643,8 @@ fn spawn_history_writer(
         }
         drop(commands);
         let mut unflushed = false;
+        // The last flush somebody asked for that has been answered.
+        let mut flushed_to = 0u64;
         loop {
             // A timeout only while there is something to flush.
             //
@@ -7234,6 +7669,9 @@ fn spawn_history_writer(
             // Asked before the take: asked after, the terminal could push its last rows
             // and go in between, and the writer would leave them in the ring.
             let finished = spill.orphaned();
+            // The same for a flush somebody asked for: what it covers was pushed before the
+            // ask, so it is in this take or already on disk.
+            let asked = spill.flushes_asked();
             let (rows, gap) = spill.take();
             if gap.rows > 0 {
                 // Recorded, never silent. The rows are gone; saying how many and when is
@@ -7249,7 +7687,7 @@ fn spawn_history_writer(
             if rows.is_empty() {
                 // The terminal is gone and took its handle with it: nothing will arrive
                 // again, so flush what is buffered and let the files go.
-                if unflushed && (!woken || finished) {
+                if unflushed && (!woken || finished || asked > flushed_to) {
                     let flushed = crate::blocking::run(move || {
                         let _ = history.flush();
                         history
@@ -7260,6 +7698,10 @@ fn spawn_history_writer(
                         Err(_) => return,
                     }
                     unflushed = false;
+                }
+                if asked > flushed_to {
+                    spill.flushed_to(asked);
+                    flushed_to = asked;
                 }
                 if finished {
                     return;
@@ -7331,7 +7773,23 @@ fn spawn_history_writer(
                 if unflushed {
                     let _ = crate::blocking::run(move || history.flush()).await;
                 }
+                spill.flushed_to(asked);
                 return;
+            }
+            // Asked for: on disk before the answer, not at the next timer.
+            if asked > flushed_to {
+                let flushed = crate::blocking::run(move || {
+                    let _ = history.flush();
+                    history
+                })
+                .await;
+                match flushed {
+                    Ok(h) => history = h,
+                    Err(_) => return,
+                }
+                unflushed = false;
+                spill.flushed_to(asked);
+                flushed_to = asked;
             }
         }
     });
@@ -7350,35 +7808,34 @@ pub struct TerminalSpawn {
     /// Where what this terminal is and where it is get recorded, so a restart knows what
     /// to bring back. Absent for a daemon told not to persist.
     pub books: Option<Bookkeeping>,
+    /// A terminal the daemon before this one was running, taken over as it is: nothing is
+    /// started, and the shell stays the child it was.
+    pub adopt: Option<Adopted>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_terminal(
-    spawn: TerminalSpawn,
-    from_clients: mpsc::Receiver<ClientCommand>,
-    updates: watch::Sender<TerminalUpdate>,
-    warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
-    spill: crate::spill::SpillRing,
-    scanner: Arc<ContainmentScanner>,
-    on_end: impl FnOnce() + Send + 'static,
-) -> io::Result<()> {
-    let TerminalSpawn {
-        shell,
-        cwd,
-        token,
-        stream,
-        agents,
-        terminals,
-        books,
-    } = spawn;
-    let register_master = agents.clone();
-    // The directory the row already holds for this terminal, when one was asked for. None
-    // when it starts where the daemon is: a restored tab whose directory did not answer in
-    // time keeps its real one in the row, and must not have it replaced by where it
-    // happened to start.
-    let started_in = cwd.clone();
-    let shell = shell.as_path();
-    let cwd = cwd.as_deref();
+/// A running terminal's pty and shell, handed over by the daemon this one moved from.
+pub struct Adopted {
+    pub master: OwnedFd,
+    pub token: qoro_domain::CapabilityToken,
+    pub child: u32,
+    pub tty_dev: u64,
+    pub size: PtySize,
+    pub pending: Vec<u8>,
+}
+
+/// What a terminal's task starts from besides the descriptor: nothing for a new one.
+struct Seed {
+    size: PtySize,
+    pending: Vec<u8>,
+}
+
+/// Start a shell on a new pty: its master, the shell and the device of its slave.
+fn start_shell(
+    shell: &Path,
+    cwd: Option<&Path>,
+    token: &qoro_domain::CapabilityToken,
+    stream: u32,
+) -> io::Result<(OwnedFd, Leader, u64)> {
     let pty = sys::open_pty(INITIAL_SIZE.cols, INITIAL_SIZE.rows)?;
     let master_fd = pty.master;
     let slave_fd = pty.slave;
@@ -7431,9 +7888,55 @@ fn spawn_terminal(
     // because an empty containment set looks exactly like a terminal with nothing to
     // contain.
     let tty_dev = sys::tty_dev(slave_fd.as_raw_fd())?;
-    let child = cmd.spawn()?;
+    let child = Leader::new(cmd.spawn()?.id());
     // The parent must not keep the slave, or the master never sees end of stream.
     drop(slave_fd);
+    Ok((master_fd, child, tty_dev))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_terminal(
+    spawn: TerminalSpawn,
+    from_clients: mpsc::Receiver<ClientCommand>,
+    updates: watch::Sender<TerminalUpdate>,
+    warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
+    spill: crate::spill::SpillRing,
+    scanner: Arc<ContainmentScanner>,
+    on_end: impl FnOnce() + Send + 'static,
+) -> io::Result<()> {
+    let TerminalSpawn {
+        shell,
+        cwd,
+        token,
+        stream,
+        agents,
+        terminals,
+        books,
+        adopt,
+    } = spawn;
+    let register_master = agents.clone();
+    // The directory the row already holds for this terminal, when one was asked for. None
+    // when it starts where the daemon is: a restored tab whose directory did not answer in
+    // time keeps its real one in the row, and must not have it replaced by where it
+    // happened to start.
+    let started_in = cwd.clone();
+    let (master_fd, child, tty_dev, seed) = match adopt {
+        Some(a) => {
+            let seed = Seed {
+                size: a.size,
+                pending: a.pending,
+            };
+            (a.master, Leader::new(a.child), a.tty_dev, seed)
+        }
+        None => {
+            let (master, child, tty_dev) = start_shell(&shell, cwd.as_deref(), &token, stream)?;
+            let seed = Seed {
+                size: INITIAL_SIZE,
+                pending: Vec::new(),
+            };
+            (master, child, tty_dev, seed)
+        }
+    };
     // The registry re-reads the foreground group on a process event, which it cannot do
     // through the terminal's own task: that task is parked waiting for output that a
     // `sleep` will never produce.
@@ -7475,6 +7978,7 @@ fn spawn_terminal(
             terminals,
             books,
             started_in,
+            seed,
         ))
         .await;
         // Again for a panic, whose unwinding closed the descriptor without the line at the
@@ -7709,6 +8213,56 @@ fn scrub_parent_agent_env(cmd: &mut std::process::Command) {
     }
 }
 
+/// A terminal's shell, by its pid.
+///
+/// A child of this process whether this daemon started it or the daemon it moved from did,
+/// which a `std::process::Child` cannot say: it only exists for what its own process spawned.
+struct Leader {
+    pid: i32,
+    /// Set once it has been waited for, after which its pid is nobody's to wait for: it may
+    /// be another terminal's child by then.
+    reaped: bool,
+}
+
+impl Leader {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid: pid as i32,
+            reaped: false,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.pid as u32
+    }
+
+    /// Whether it has gone, reaping it when it has. Nothing left to wait for counts as
+    /// gone: the pid is not a child of ours, or was waited for already.
+    fn try_wait(&mut self) -> io::Result<Option<()>> {
+        if self.reaped {
+            return Ok(Some(()));
+        }
+        let mut status = 0;
+        // SAFETY: waitpid on one pid with WNOHANG blocks nothing and reaps nothing else.
+        let r = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+        match r {
+            0 => Ok(None),
+            r if r > 0 => {
+                self.reaped = true;
+                Ok(Some(()))
+            }
+            _ => match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => Ok(None),
+                Some(libc::ECHILD) => {
+                    self.reaped = true;
+                    Ok(Some(()))
+                }
+                _ => Err(io::Error::last_os_error()),
+            },
+        }
+    }
+}
+
 fn dup_stdio(fd: &OwnedFd) -> io::Result<std::process::Stdio> {
     // SAFETY: fd is live; dup produces a fresh descriptor owned by nobody else. The dup is
     // deliberately inheritable: these three become the child's stdin, stdout and stderr.
@@ -7897,7 +8451,7 @@ pub fn nudged_size(size: PtySize) -> PtySize {
 #[allow(clippy::too_many_arguments)]
 async fn terminal_task(
     master: OwnedFd,
-    mut child: std::process::Child,
+    mut child: Leader,
     tty_dev: u64,
     mut from_clients: mpsc::Receiver<ClientCommand>,
     updates: watch::Sender<TerminalUpdate>,
@@ -7910,12 +8464,13 @@ async fn terminal_task(
     books: Option<Bookkeeping>,
     // Where this terminal was started, which is what its row already says.
     started_in: Option<PathBuf>,
+    seed: Seed,
 ) -> io::Result<()> {
     let master_raw = master.as_raw_fd();
     let child_pid = child.id() as i32;
 
     let afd = AsyncFd::with_interest(MasterIo(master), Interest::READABLE | Interest::WRITABLE)?;
-    let mut engine = AlacrittyEngine::new(INITIAL_SIZE.cols, INITIAL_SIZE.rows);
+    let mut engine = AlacrittyEngine::new(seed.size.cols, seed.size.rows);
     // The engine's discards as last handed to the index.
     let mut discarded = qoro_terminal::Discards::default();
     let mut buf = vec![0u8; 64 * 1024];
@@ -7926,6 +8481,10 @@ async fn terminal_task(
     // Bounded by bytes, with capacity reserved for terminal replies so a saturated input
     // queue cannot deadlock an application waiting for a cursor position report.
     let mut writes = WriteQueue::new(1024 * 1024, 64 * 1024);
+    // What the daemon this one moved from had not typed into the child yet.
+    for chunk in qoro_pty::chunk_paste(&seed.pending) {
+        let _ = writes.push(chunk, WritePriority::UserInput);
+    }
     // Maintained during the terminal's life, not built at teardown. See the scan below.
     let mut containment = Containment::new();
     containment.absorb(qoro_pty::sys::enumerate_tty(tty_dev));
@@ -7982,7 +8541,7 @@ async fn terminal_task(
     // The size the PTY and the engine agree on. Seeded with the size both
     // are constructed with above, and updated on every applied resize, so
     // the equal-size decision never reads a converted snapshot.
-    let mut current_size = INITIAL_SIZE;
+    let mut current_size = seed.size;
     let trace = trace_latency();
 
     // The loop is a closure whose result is captured, so that teardown runs however it
@@ -8149,6 +8708,23 @@ async fn terminal_task(
                                 .apply(OwnershipEvent::OwnerAgreedTransfer(to), None);
                         }
                     }
+                        ClientCommand::Pause { reply, go } => {
+                            // Where this tab is, for a row the next daemon may have to
+                            // bring back as a new shell.
+                            note_cwd(child_pid, &mut last_cwd, &terminals, stream, &books);
+                            let size = nudge_restore.map_or(current_size, |(size, _)| size);
+                            let _ = reply.send(Paused {
+                                master: master_raw,
+                                child: child_pid,
+                                tty_dev,
+                                size,
+                                pending: writes.remaining(),
+                            });
+                            // Nothing is read or typed from here until the move happens,
+                            // which ends this process, or is called off, which drops `go`.
+                            // What the child prints meanwhile waits in the kernel.
+                            let _ = go.await;
+                        }
                         ClientCommand::Detached { client } => {
                             waiting.retain(|(c, _)| *c != client);
                             if policy == SizePolicy::Owner(client) {
@@ -8784,7 +9360,7 @@ fn override_dir() -> PathBuf {
 #[allow(clippy::too_many_arguments)]
 async fn tear_down(
     afd: &AsyncFd<MasterIo>,
-    child: &mut std::process::Child,
+    child: &mut Leader,
     child_pid: i32,
     tty_dev: u64,
     containment: &mut Containment,
@@ -9649,5 +10225,38 @@ mod keep_awake_tests {
         awake.spaces.insert(1);
         assert!(awake.holds(1, &[3]));
         assert!(!awake.holds(2, &[3]), "another space");
+    }
+}
+
+#[cfg(test)]
+mod leader_tests {
+    use super::Leader;
+
+    #[test]
+    fn a_child_is_reaped_once_and_never_waited_for_again() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let mut leader = Leader::new(pid);
+        // Dropped unwaited, as a terminal's is: the leader owns the wait from here.
+        drop(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(leader.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(leader.try_wait(), Ok(Some(()))), "pid {pid}");
+        // Reaped: a later call must not wait for whoever has the pid by then.
+        assert!(leader.reaped);
+        assert!(matches!(leader.try_wait(), Ok(Some(()))));
+    }
+
+    #[test]
+    fn a_pid_that_is_not_ours_counts_as_gone() {
+        // Process 1 is nobody's child of this process, so there is nothing to wait for.
+        let mut leader = Leader::new(1);
+        assert!(matches!(leader.try_wait(), Ok(Some(()))));
+        assert!(leader.reaped);
     }
 }

@@ -117,6 +117,16 @@ impl WriteQueue {
         Ok(())
     }
 
+    /// Everything still waiting, replies first: what a daemon that is handing its terminals
+    /// over carries to the next one.
+    pub fn remaining(&self) -> Vec<u8> {
+        self.replies
+            .iter()
+            .chain(self.input.iter())
+            .flat_map(|p| p.bytes[p.offset..].iter().copied())
+            .collect()
+    }
+
     /// The next slice to hand to `write`, at most `CHUNK` bytes. Replies first.
     pub fn peek(&self) -> Option<&[u8]> {
         let p = self.replies.front().or_else(|| self.input.front())?;
@@ -192,6 +202,17 @@ mod tests {
         q.advance(4);
         assert!(q.is_empty());
         assert_eq!(q.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn what_is_left_comes_out_replies_first_from_the_offset() {
+        let mut q = WriteQueue::new(4096, 512);
+        q.push(Bytes::from_static(b"typed"), WritePriority::UserInput)
+            .unwrap();
+        q.push(Bytes::from_static(b"reply"), WritePriority::TerminalReply)
+            .unwrap();
+        q.advance(2);
+        assert_eq!(q.remaining(), b"plytyped");
     }
 
     #[test]
