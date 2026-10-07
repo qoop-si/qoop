@@ -94,8 +94,7 @@ a re-exec that inherits the pty masters: the daemon pauses every tab, writes dow
 one needs, and `exec`s the new binary in the same process, so the shells stay its children
 and a running command or agent never notices. The reason is the one this ADR started from, an
 upgrade must not kill what a person has running, and the refusal it chose meant an update
-waited for the person to close everything first. What
-made the handover affordable is that it is the same process, with no second daemon and no
+waited for the person to close everything first. What made the handover affordable is that it is the same process, with no second daemon and no
 transfer over a socket, and that the old way stays as the fallback for a binary that cannot
 take tabs over, for a tab that cannot be carried, and for a daemon that predates it. The
 second shape named under Rollback (a second daemon accepting masters over the socket) is not
@@ -106,4 +105,5 @@ update` no longer refuses while a session runs and no longer stops the daemon. I
 the file, then asks each daemon, this machine's and every saved remote's, to move onto it. A
 daemon that can hand its tabs to the new binary does it at once and they keep running; any
 other waits for the first moment nothing there is working. The refusals quoted above are
-history. The daemon still downloads nothing and checks no versions: `qoro update` does.
+history. The daemon still downloads nothing: `qoro update` does, and the daemon only checks that the
+file on disk is the version it was asked to move onto.

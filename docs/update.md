@@ -117,10 +117,11 @@ program that is not a shell at its prompt is made to redraw: the window shrinks 
 comes back 800 ms later. What does not cross is what a screen cannot be rebuilt from: the
 main screen under a program that uses the alternate one (quit `vim` after a move and the rows
 it covered stay blank until the shell draws them again), a scroll region, tab stops, character
-sets and the colour table a program changed. The scrollback is not carried either, but it is
-on disk already and still there. The listening socket and the startup lock stay open across
-the move, so a client or a hook that starts a daemon meanwhile finds one serving and starts
-none. Open interfaces lose their connection for a moment, with the effect described above.
+sets and the colour table a program changed, and a sequence a program had written half of at
+the moment of the move. The scrollback is not carried either, but it is on disk already and
+still there. The listening socket and the startup lock stay open across the move, so a client
+or a hook that starts a daemon meanwhile finds one serving and starts none. Open interfaces
+lose their connection for a moment, with the effect described above.
 
 A move that cannot hand over falls back to the way it always worked: it waits until nothing
 is working, then ends the tabs and brings each back (an agent resumed in its conversation).
