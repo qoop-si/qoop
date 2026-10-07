@@ -244,6 +244,13 @@ impl Daemon {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// A program on the daemon's `PATH`: a shell script with this body.
+    fn install_program(&self, name: &str, body: &str) {
+        let path = self.bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("the program");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
     /// The stand-in agent: says it is working in a conversation, then idle once `go`
     /// exists, and waits on its keyboard like a real one. Resumed, it says into which.
     fn install_agent(&self, go: &Path) {
@@ -685,6 +692,60 @@ fn a_running_command_goes_through_the_move_on_the_same_pid() {
     assert!(left.is_empty(), "the handover file stayed behind: {left:?}");
 }
 
+/// The screen is in the tab the moment the move is over, before the program prints another
+/// byte: it was carried, not redrawn.
+#[test]
+fn a_tabs_screen_is_carried_across_the_move() {
+    let mut d = Daemon::start();
+    d.send(1, "echo BEFORE-THE-MOVE-$((6*7))");
+    d.wait_for_screen(1, "BEFORE-THE-MOVE-42");
+    let before = text(&d.run(&["read", "1"]).stdout);
+
+    let _ = d.arm(NEXT);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.starts() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert_eq!(d.starts(), 2, "the daemon never moved: {log}");
+    assert!(d.running(), "the daemon exited instead of moving: {log}");
+
+    // Nothing was typed since, and nothing was printed: this is the replay.
+    let after = text(&d.run(&["read", "1"]).stdout);
+    assert_eq!(before, after, "the screen changed across the move: {log}");
+}
+
+/// A full screen program that draws only when its window changes size is made to draw again
+/// by the move: its screen is its own again, and its modes were never lost.
+#[test]
+fn a_full_screen_program_is_nudged_to_redraw_after_the_move() {
+    let mut d = Daemon::start();
+    d.install_program(
+        "fullscreen",
+        "printf '\\033[?1049h\\033[?2004h\\033[?25l'\n\
+         N=0\n\
+         draw() { set -- $(stty size); printf '\\033[2J\\033[H'; printf 'FRAME-%sx%s-%s' \"$2\" \"$1\" \"$N\"; }\n\
+         trap 'N=$((N+1)); draw' WINCH\n\
+         draw\n\
+         while :; do sleep 0.2; done\n",
+    );
+    d.send(1, "fullscreen");
+    d.wait_for_screen(1, "FRAME-80x24-0");
+
+    let _ = d.arm(NEXT);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.starts() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert_eq!(d.starts(), 2, "the daemon never moved: {log}");
+
+    // Two window changes, a shrink and the size coming back, and a draw for each: the
+    // program got its own screen back at the size it had.
+    d.wait_for_screen(1, "FRAME-80x24-2");
+    assert!(d.running(), "{log}");
+}
+
 /// A daemon started to adopt a handover it cannot read, because it is not there, is not what
 /// was promised, or was left behind by another process, starts as any daemon does: it
 /// listens, and it restores from its rows.
@@ -695,7 +756,7 @@ fn a_handover_that_cannot_be_adopted_starts_a_daemon_as_usual() {
     let stale = dir.path().join("handoff-1.json");
     std::fs::write(
         &stale,
-        r#"{"format":1,"pid":1,"nonce":"n","terminals":[{"id":1,"fd":9,"child":1,"child_start":null,"tty_dev":0,"workspace":1,"name":null,"cwd":null,"token":"t","cols":80,"rows":24,"pending":[]}]}"#,
+        r#"{"format":1,"pid":1,"nonce":"n","terminals":[{"id":1,"fd":9,"child":1,"child_start":null,"tty_dev":0,"workspace":1,"name":null,"cwd":null,"token":"t","cols":80,"rows":24,"pending":[],"screen":"","nudge":false}]}"#,
     )
     .expect("file");
     std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("chmod");

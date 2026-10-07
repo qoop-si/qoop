@@ -103,6 +103,11 @@ pub struct Paused {
     pub size: PtySize,
     /// Bytes accepted from clients and not yet typed into the child.
     pub pending: Vec<u8>,
+    /// What rebuilds the screen and the modes in a fresh engine (`AlacrittyEngine::replay`).
+    pub screen: String,
+    /// Whether the program has to be made to redraw: it is not a shell at its prompt, so
+    /// what the replay shows is the daemon's picture of its screen and not its own.
+    pub nudge: bool,
 }
 
 /// What the daemon publishes to attached clients.
@@ -5829,6 +5834,8 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
         cols,
         rows,
         pending,
+        screen,
+        nudge,
     } = carried;
     // An open descriptor first: wrapping one that is not would close somebody else's.
     // SAFETY: F_GETFD only reads the descriptor's flags.
@@ -5885,6 +5892,8 @@ fn adopt_one(into: &Restore, carried: crate::handoff::Carried) -> Result<(), Str
             tty_dev,
             size,
             pending,
+            screen,
+            nudge,
         }),
     )
     .map(|_| ())
@@ -7121,6 +7130,8 @@ async fn hand_over(into: &Restore, streams: &[u32]) -> Result<HandedOver, String
             cols: paused.size.cols,
             rows: paused.size.rows,
             pending: paused.pending,
+            screen: paused.screen,
+            nudge: paused.nudge,
         });
         masters.push(master);
     }
@@ -7821,12 +7832,16 @@ pub struct Adopted {
     pub tty_dev: u64,
     pub size: PtySize,
     pub pending: Vec<u8>,
+    pub screen: String,
+    pub nudge: bool,
 }
 
 /// What a terminal's task starts from besides the descriptor: nothing for a new one.
 struct Seed {
     size: PtySize,
     pending: Vec<u8>,
+    screen: String,
+    nudge: bool,
 }
 
 /// Start a shell on a new pty: its master, the shell and the device of its slave.
@@ -7925,6 +7940,8 @@ fn spawn_terminal(
             let seed = Seed {
                 size: a.size,
                 pending: a.pending,
+                screen: a.screen,
+                nudge: a.nudge,
             };
             (a.master, Leader::new(a.child), a.tty_dev, seed)
         }
@@ -7933,6 +7950,8 @@ fn spawn_terminal(
             let seed = Seed {
                 size: INITIAL_SIZE,
                 pending: Vec::new(),
+                screen: String::new(),
+                nudge: false,
             };
             (master, child, tty_dev, seed)
         }
@@ -8420,6 +8439,12 @@ pub const INITIAL_SIZE: PtySize = PtySize { cols: 80, rows: 24 };
 /// event-driven timer arm in the terminal task, cancelled by a real resize.
 pub const NUDGE_RESTORE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(30);
 
+/// How long the shrunken size stays when a program is nudged after a move. Longer than for
+/// an attaching client: a real agent was measured repainting on the shrink alone, and only
+/// when it was given about this long before the size came back (a shrink and a restore with
+/// nothing between can reach it as one change).
+pub const ADOPT_NUDGE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(800);
+
 /// Whether an applied resize needs the shrink-then-restore nudge.
 ///
 /// A same-size `TIOCSWINSZ` is a no-op for the child: the kernel only
@@ -8542,6 +8567,22 @@ async fn terminal_task(
     // are constructed with above, and updated on every applied resize, so
     // the equal-size decision never reads a converted snapshot.
     let mut current_size = seed.size;
+    // A terminal taken over from the daemon before this one starts with the screen it had,
+    // and when its program is not a shell at a prompt, with a nudge for it to redraw.
+    if !seed.screen.is_empty() {
+        let _ = engine.feed(seed.screen.as_bytes());
+        // Rows the replay pushed up are the old daemon's to have written down already.
+        let _ = engine.take_scrolled_off();
+        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+    }
+    if seed.nudge {
+        let shrunk = nudged_size(seed.size);
+        if sys::resize(master_raw, shrunk.cols, shrunk.rows).is_ok() {
+            engine.resize(shrunk.cols, shrunk.rows);
+            current_size = shrunk;
+            nudge_restore = Some((seed.size, tokio::time::Instant::now() + ADOPT_NUDGE_DELAY));
+        }
+    }
     let trace = trace_latency();
 
     // The loop is a closure whose result is captured, so that teardown runs however it
@@ -8713,12 +8754,19 @@ async fn terminal_task(
                             // bring back as a new shell.
                             note_cwd(child_pid, &mut last_cwd, &terminals, stream, &books);
                             let size = nudge_restore.map_or(current_size, |(size, _)| size);
+                            // A shell at its prompt shows what the replay shows, and a
+                            // resize would only make it draw its prompt twice.
+                            let nudge = engine.modes().alt_screen
+                                || qoro_pty::sys::foreground_leader(master_raw)
+                                    .is_none_or(|leader| leader.0 != child_pid);
                             let _ = reply.send(Paused {
                                 master: master_raw,
                                 child: child_pid,
                                 tty_dev,
                                 size,
                                 pending: writes.remaining(),
+                                screen: engine.replay(),
+                                nudge,
                             });
                             // Nothing is read or typed from here until the move happens,
                             // which ends this process, or is called off, which drops `go`.

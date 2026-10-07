@@ -59,6 +59,10 @@ pub struct Carried {
     pub rows: u16,
     /// Bytes still waiting to be typed into it.
     pub pending: Vec<u8>,
+    /// Escape sequences that rebuild its screen and modes in a fresh engine.
+    pub screen: String,
+    /// Whether its program is to be made to redraw once it is taken over.
+    pub nudge: bool,
 }
 
 impl Handoff {
@@ -166,6 +170,8 @@ mod tests {
                 cols: 100,
                 rows: 30,
                 pending: b"ls\r".to_vec(),
+                screen: "\x1b[2J\x1b[1;1Hhi".into(),
+                nudge: true,
             }],
         }
     }

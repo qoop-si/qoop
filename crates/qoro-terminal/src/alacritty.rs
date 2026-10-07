@@ -18,6 +18,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::cell::Hyperlink;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
@@ -173,6 +174,121 @@ impl AlacrittyEngine {
         (text.chars().take(keep).collect(), spans)
     }
 
+    /// The whole of what the engine's modes say, as the engine keeps them.
+    pub fn mode_bits(&self) -> u32 {
+        self.term.mode().bits()
+    }
+
+    /// Escape sequences that, fed to a fresh engine of the same size, rebuild this screen:
+    /// the visible rows with their colours and links, the modes a program set once at its
+    /// start and never repeats (bracketed paste, mouse, focus events, the keyboard
+    /// protocol), the cursor and the pen, the title.
+    ///
+    /// For a daemon that is becoming another binary: the program in the terminal keeps
+    /// running through it and the new daemon starts with nothing. Never written to the
+    /// program, only fed to the engine.
+    ///
+    /// What it does not carry: the scrollback (on disk already), a scroll region, tab stops
+    /// and character sets, the colour table, a sequence the parser was in the middle of, and
+    /// the main screen under an alternate one. A program that repaints makes up for all of
+    /// them.
+    pub fn replay(&self) -> String {
+        use std::fmt::Write;
+        let grid = self.term.grid();
+        let mode = *self.term.mode();
+        let mut out = String::from("\x1b[0m\x1b[2J\x1b[H");
+        if mode.contains(TermMode::ALT_SCREEN) {
+            out.push_str("\x1b[?1049h\x1b[2J");
+        }
+        for line in 0..grid.screen_lines() {
+            let row = &grid[Line(line as i32)];
+            let end = (0..grid.columns())
+                .rev()
+                .find(|&col| !blank(&row[Column(col)]))
+                .map_or(0, |col| col + 1);
+            if end == 0 {
+                continue;
+            }
+            let _ = write!(out, "\x1b[{};1H", line + 1);
+            let mut pen = Pen::default();
+            let mut link: Option<Hyperlink> = None;
+            for col in 0..end {
+                let cell = &row[Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let here = Pen::of(cell);
+                if here != pen {
+                    out.push_str(&here.sgr());
+                    pen = here;
+                }
+                let target = cell.hyperlink();
+                if target != link {
+                    match &target {
+                        Some(l) => {
+                            let _ =
+                                write!(out, "\x1b]8;id={};{}\x1b\\", clean(l.id()), clean(l.uri()));
+                        }
+                        None => out.push_str("\x1b]8;;\x1b\\"),
+                    }
+                    link = target;
+                }
+                out.push(cell.c);
+                for z in cell.zerowidth().unwrap_or_default() {
+                    out.push(*z);
+                }
+            }
+            if link.is_some() {
+                out.push_str("\x1b]8;;\x1b\\");
+            }
+            out.push_str("\x1b[0m");
+        }
+        let fresh = TermMode::default();
+        for (flag, on, off) in MODE_SEQUENCES {
+            match (mode.contains(*flag), fresh.contains(*flag)) {
+                (true, false) => out.push_str(on),
+                (false, true) => out.push_str(off),
+                _ => {}
+            }
+        }
+        let kitty = (mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18;
+        if kitty != 0 {
+            let _ = write!(out, "\x1b[={kitty};1u");
+        }
+        let style = self.term.cursor_style();
+        if style != Default::default() {
+            use alacritty_terminal::vte::ansi::CursorShape as Shape;
+            let shape = match style.shape {
+                Shape::Underline => 3,
+                Shape::Beam => 5,
+                _ => 1,
+            };
+            let _ = write!(out, "\x1b[{} q", shape + u8::from(!style.blinking));
+        }
+        if !self.title.is_empty() {
+            let _ = write!(out, "\x1b]2;{}\x07", clean(&self.title));
+        }
+        let cursor = &grid.cursor;
+        let _ = write!(
+            out,
+            "\x1b[{};{}H",
+            cursor.point.line.0.max(0) + 1,
+            cursor.point.column.0 + 1
+        );
+        if cursor.input_needs_wrap {
+            // At the last column with the wrap still owed: the cell is written once more,
+            // which leaves the cursor in that state and the screen as it was.
+            let cell = &grid[cursor.point];
+            out.push_str(&Pen::of(cell).sgr());
+            out.push(cell.c);
+        }
+        out.push_str(&Pen::of(&cursor.template).sgr());
+        out
+    }
+
     /// Capture rows that have entered the history ring since the last feed.
     ///
     /// This is the half of the spill that works today. While the ring is filling, rows only
@@ -299,6 +415,118 @@ fn incomplete_utf8_tail(buf: &[u8]) -> usize {
         }
     }
     0
+}
+
+/// The modes `replay` carries, with what sets each and what clears it. Only the ones that
+/// differ from a fresh engine are written.
+const MODE_SEQUENCES: &[(TermMode, &str, &str)] = &[
+    (TermMode::SHOW_CURSOR, "\x1b[?25h", "\x1b[?25l"),
+    (TermMode::APP_CURSOR, "\x1b[?1h", "\x1b[?1l"),
+    (TermMode::APP_KEYPAD, "\x1b=", "\x1b>"),
+    (TermMode::MOUSE_REPORT_CLICK, "\x1b[?1000h", "\x1b[?1000l"),
+    (TermMode::MOUSE_DRAG, "\x1b[?1002h", "\x1b[?1002l"),
+    (TermMode::MOUSE_MOTION, "\x1b[?1003h", "\x1b[?1003l"),
+    (TermMode::FOCUS_IN_OUT, "\x1b[?1004h", "\x1b[?1004l"),
+    (TermMode::UTF8_MOUSE, "\x1b[?1005h", "\x1b[?1005l"),
+    (TermMode::SGR_MOUSE, "\x1b[?1006h", "\x1b[?1006l"),
+    (TermMode::ALTERNATE_SCROLL, "\x1b[?1007h", "\x1b[?1007l"),
+    (TermMode::BRACKETED_PASTE, "\x1b[?2004h", "\x1b[?2004l"),
+    (TermMode::LINE_WRAP, "\x1b[?7h", "\x1b[?7l"),
+    (TermMode::ORIGIN, "\x1b[?6h", "\x1b[?6l"),
+    (TermMode::INSERT, "\x1b[4h", "\x1b[4l"),
+    (TermMode::LINE_FEED_NEW_LINE, "\x1b[20h", "\x1b[20l"),
+];
+
+/// A cell that draws nothing and says nothing: a space in the default colours.
+fn blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    cell.c == ' '
+        && cell.zerowidth().is_none()
+        && Pen::of(cell) == Pen::default()
+        && cell.hyperlink().is_none()
+}
+
+/// Text that goes inside an escape sequence, with whatever could end it left out.
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// How a cell is drawn, as far as `replay` has to say it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    fg: alacritty_terminal::vte::ansi::Color,
+    bg: alacritty_terminal::vte::ansi::Color,
+    flags: Flags,
+}
+
+impl Default for Pen {
+    fn default() -> Self {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        Self {
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+        }
+    }
+}
+
+impl Pen {
+    fn of(cell: &alacritty_terminal::term::cell::Cell) -> Self {
+        // Only what changes how a cell looks: the wide character and wrap bookkeeping are
+        // not part of the pen.
+        let drawn = Flags::INVERSE
+            | Flags::BOLD
+            | Flags::ITALIC
+            | Flags::DIM
+            | Flags::HIDDEN
+            | Flags::STRIKEOUT
+            | Flags::ALL_UNDERLINES;
+        Self {
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags & drawn,
+        }
+    }
+
+    /// The sequence that sets exactly this, from any state.
+    fn sgr(&self) -> String {
+        let mut codes = String::from("0");
+        let f = self.flags;
+        for (flag, code) in [
+            (Flags::BOLD, "1"),
+            (Flags::DIM, "2"),
+            (Flags::ITALIC, "3"),
+            (Flags::UNDERLINE, "4"),
+            (Flags::DOUBLE_UNDERLINE, "4:2"),
+            (Flags::UNDERCURL, "4:3"),
+            (Flags::DOTTED_UNDERLINE, "4:4"),
+            (Flags::DASHED_UNDERLINE, "4:5"),
+            (Flags::INVERSE, "7"),
+            (Flags::HIDDEN, "8"),
+            (Flags::STRIKEOUT, "9"),
+        ] {
+            if f.contains(flag) {
+                codes.push(';');
+                codes.push_str(code);
+            }
+        }
+        for (colour, base, extended) in [(self.fg, 30, 38), (self.bg, 40, 48)] {
+            use alacritty_terminal::vte::ansi::Color;
+            let code = match colour {
+                Color::Named(named) => match named as usize {
+                    n @ 0..=7 => Some(format!("{}", base + n)),
+                    n @ 8..=15 => Some(format!("{}", base + 52 + n)),
+                    _ => None,
+                },
+                Color::Indexed(i) => Some(format!("{extended};5;{i}")),
+                Color::Spec(rgb) => Some(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+            };
+            if let Some(code) = code {
+                codes.push(';');
+                codes.push_str(&code);
+            }
+        }
+        format!("\x1b[{codes}m")
+    }
 }
 
 /// One cell's style, in this crate's vocabulary rather than the engine's.
