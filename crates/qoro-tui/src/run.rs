@@ -192,12 +192,12 @@ const CONNECTING: &str = "connecting";
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
 /// Said, not fetched: the interface never touches the network, it only reads the notice
-/// `qoro update --check` left beside the sessions. The install itself runs outside, with
-/// no session live, which is why the answer names detaching first.
+/// `qoro update --check` left beside the sessions. The install itself runs outside, as
+/// `qoro update`, which also moves every machine's daemon once nothing there is working.
 fn update_message() -> String {
     match qoro_runtime::paths::read_update_notice() {
         Some(seen) if qoro_runtime::paths::is_newer_version(&seen, env!("CARGO_PKG_VERSION")) => {
-            format!("update {seen} is ready: detach and run `qoro update` with no session running")
+            format!("update {seen} is ready: run `qoro update`")
         }
         _ => format!(
             "qoro {} is current: `qoro update --check` looks for more",

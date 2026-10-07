@@ -277,8 +277,9 @@ Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm6
 this repository's crates with the phone part): GitHub only hosts the files, nothing is compiled
 there. `qoro update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
-how it installs, and `qoro update` installs it once nothing is awake. How a release is
-cut and how an update lands: [docs/update.md](docs/update.md).
+how it installs, and `qoro update` installs it and moves every machine onto it once nothing
+there is working. How a release is cut and how an update lands:
+[docs/update.md](docs/update.md).
 
 ## What is measured
 

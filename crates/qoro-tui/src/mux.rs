@@ -695,7 +695,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         let (name, target) = (l.name.clone(), remote.target.clone());
         let events = self.events.clone();
         tokio::spawn(async move {
-            let message = match crate::link::update(&target).await {
+            let message = match crate::link::update(&target, here).await {
                 Ok(crate::link::Update::OnDisk(version, warning)) => {
                     if let Some(warning) = warning {
                         let _ = events

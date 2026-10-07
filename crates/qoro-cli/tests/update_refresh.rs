@@ -23,6 +23,8 @@ fn qoro(root: &Path, exe: &Path, args: &[&str]) -> std::process::Output {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("QORO_RUNTIME_DIR", root.join("rt"))
+        // An update walks the saved remotes: this one is empty, never the person's own.
+        .env("QORO_REMOTES", root.join("remotes.json"))
         .env(
             "QORO_RELEASE_BASE",
             format!("file://{}", root.join("rel").display()),
@@ -54,6 +56,7 @@ fn an_update_leaves_hooks_and_skills_current() {
     }
     std::fs::set_permissions(root.join("rt"), std::fs::Permissions::from_mode(0o700))
         .expect("chmod");
+    std::fs::write(root.join("remotes.json"), "[]").expect("remotes");
 
     // The installed build, and the "newer release": says 9.9.9, then is this build.
     let exe = root.join("bin/qoro");
@@ -97,6 +100,10 @@ fn an_update_leaves_hooks_and_skills_current() {
         + &String::from_utf8_lossy(&update.stderr);
     assert!(update.status.success(), "{said}");
     assert!(said.contains("updated qoro"), "{said}");
+    assert!(
+        said.contains("this machine: no daemon running, the next qoro starts 9.9.9"),
+        "{said}"
+    );
     assert!(
         said.contains("claude     installed"),
         "its output is shown: {said}"

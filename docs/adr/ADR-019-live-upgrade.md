@@ -84,3 +84,11 @@ If seamless handover ever becomes worth its cost, the shape is a second daemon t
 pty masters over the existing socket, and the refusal above becomes the fallback for when it
 fails. Nothing here has to be undone for that: what is decided now is that the fallback ships
 first.
+
+## Amendment, 2026-10-07: `qoro update` no longer refuses
+
+The decision above stands for the daemon, which still never replaces itself. What changed is
+the person's side of it: `qoro update` no longer refuses while a session runs and no longer
+stops the daemon. It installs the file, then asks each daemon, this machine's and every saved
+remote's, to move onto it at the first moment nothing there is working (`RestartWhenSafe`),
+so no working agent or running command is ended. The refusals quoted above are history.

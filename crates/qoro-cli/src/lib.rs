@@ -245,8 +245,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoro bridge     run the phones' end in the foreground (the service\n\
                  \x20                 that pairing installs runs exactly this)\n\
                  \x20 qoro bridge reload  put that service back on the installed binary\n\
-                 \x20 qoro update [--check]  fetch the newest release, and install it when\n\
-                 \x20                 nothing is live\n\
+                 \x20 qoro update [--check]  fetch the newest release, install it, and move every\n\
+                 \x20                 machine onto it once nothing there is working\n\
                  \x20 qoro --version\n\
                  \n\
                  detach with ctrl-q. the shell keeps running.\n\
@@ -975,29 +975,52 @@ async fn ask_daemon(
     client_id: &str,
     request: &qoro_runtime::control::ControlRequest,
 ) -> std::io::Result<qoro_runtime::control::ControlResponse> {
+    let (stream, inbuf) = client::connect(socket, client_id).await?;
+    ask_over(stream, inbuf, request, ASK_PATIENCE).await
+}
+
+/// The same question over a connection that has already done its handshake, a remote's
+/// relay as well as a local socket, waiting at most `patience` for the answer, the write of
+/// the question included.
+///
+/// A daemon that closes the connection first is `UnexpectedEof`, which for a move onto a
+/// new binary may be the good answer: the daemon had nothing in the way and is going. A
+/// daemon too old to know the move answers with no id, naming the ask it did not know (the
+/// same case the interface reads, `mux.rs`); that is its answer too.
+async fn ask_over<S>(
+    stream: S,
+    mut inbuf: bytes::BytesMut,
+    request: &qoro_runtime::control::ControlRequest,
+    patience: std::time::Duration,
+) -> std::io::Result<qoro_runtime::control::ControlResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use qoro_runtime::control::ControlResponse;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let id = request.request_id().to_string();
-    let (stream, mut inbuf) = client::connect(socket, client_id).await?;
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
     let mut seq = 0u32;
-    wr.write_all(&client::encode_control_seq(request, &mut seq)?)
-        .await?;
-    let mut connection = client::Connection::new();
-    let mut read = [0u8; 64 * 1024];
-    tokio::time::timeout(ASK_PATIENCE, async {
+    let question = client::encode_control_seq(request, &mut seq)?;
+    tokio::time::timeout(patience, async {
+        wr.write_all(&question).await?;
+        let mut connection = client::Connection::new();
+        let mut read = [0u8; 64 * 1024];
         loop {
             let n = rd.read(&mut read).await?;
             if n == 0 {
-                return Err::<ControlResponse, std::io::Error>(std::io::Error::other(
+                return Err::<ControlResponse, std::io::Error>(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
                     "the daemon closed the connection before answering",
                 ));
             }
             inbuf.extend_from_slice(&read[..n]);
             for incoming in connection.drain(&mut inbuf)? {
                 if let client::Incoming::Control(response) = incoming
-                    && response.request_id() == id
+                    && (response.request_id() == id
+                        || matches!(&response, ControlResponse::Failed { id, reason }
+                            if id.is_empty() && reason.contains("`RestartWhenSafe`")))
                 {
                     return Ok(response);
                 }
@@ -1005,9 +1028,7 @@ async fn ask_daemon(
         }
     })
     .await
-    .map_err(|_| {
-        std::io::Error::other(format!("the daemon did not answer within {ASK_PATIENCE:?}"))
-    })?
+    .map_err(|_| std::io::Error::other(format!("the daemon did not answer within {patience:?}")))?
 }
 
 /// How long to wait for a stopped daemon to actually go. Past its own teardown patience,
@@ -2789,7 +2810,7 @@ mod tests {
         trim_rows, truncate_text, usage,
     };
     use qoro_history::{Message, Role, SessionId, Window};
-    use qoro_runtime::control::AgentRow;
+    use qoro_runtime::control::{AgentRow, ControlRequest, ControlResponse};
     use qoro_runtime::paths;
     use std::path::PathBuf;
 
@@ -3403,5 +3424,108 @@ mod tests {
         assert!(is_usage(&usage("usage: qoro wait <target>")));
         assert!(!is_usage(&std::io::Error::other("terminal 3 closed")));
         assert_eq!(usage("usage: x").to_string(), "usage: x");
+    }
+
+    /// A daemon at the other end of a pipe that reads the question, then does `then`.
+    async fn asked(
+        patience: std::time::Duration,
+        then: impl AsyncFnOnce(&mut tokio::io::DuplexStream),
+    ) -> std::io::Result<ControlResponse> {
+        use tokio::io::AsyncReadExt;
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let request = ControlRequest::RestartWhenSafe {
+            id: "ask-1".into(),
+            version: "9.9.9".into(),
+        };
+        let daemon = async move {
+            let mut read = [0u8; 4096];
+            let _ = server.read(&mut read).await;
+            then(&mut server).await;
+        };
+        let (answer, ()) = tokio::join!(
+            super::ask_over(client, bytes::BytesMut::new(), &request, patience),
+            daemon
+        );
+        answer
+    }
+
+    async fn say(server: &mut tokio::io::DuplexStream, response: &ControlResponse) {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::to_vec(response).expect("json");
+        for frame in qoro_proto::chunk(
+            qoro_proto::Channel::Control,
+            0,
+            0,
+            None,
+            bytes::Bytes::from(body),
+        ) {
+            let mut buf = bytes::BytesMut::new();
+            frame.encode(&mut buf).expect("encode");
+            server.write_all(&buf).await.expect("write");
+        }
+    }
+
+    fn failed(id: &str, reason: &str) -> ControlResponse {
+        ControlResponse::Failed {
+            id: id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    const SOON: std::time::Duration = std::time::Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn an_answer_under_the_questions_id_is_returned() {
+        let answer = asked(SOON, async |server| {
+            say(server, &failed("other", "not mine")).await;
+            say(server, &failed("ask-1", "mine")).await;
+        })
+        .await;
+        assert!(matches!(answer, Ok(ControlResponse::Failed { reason, .. }) if reason == "mine"));
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_is_an_end_of_file() {
+        let answer = asked(SOON, async |_| {}).await;
+        assert_eq!(
+            answer.expect_err("closed").kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    /// An old daemon refuses the ask with no id, naming it: that is the answer. A refusal
+    /// with no id that names nothing of ours is not, and is waited past.
+    #[tokio::test]
+    async fn an_old_daemons_refusal_with_no_id_is_the_answer() {
+        let answer = asked(SOON, async |server| {
+            say(server, &failed("", "unknown variant `RestartWhenSafe`")).await;
+        })
+        .await;
+        assert!(matches!(answer, Ok(ControlResponse::Failed { .. })));
+        let answer = asked(SOON, async |server| {
+            say(server, &failed("", "something else")).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        })
+        .await;
+        assert!(
+            answer
+                .expect_err("ignored")
+                .to_string()
+                .contains("did not answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_daemon_is_given_up_on() {
+        let answer = asked(SOON, async |_| {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        })
+        .await;
+        assert!(
+            answer
+                .expect_err("silent")
+                .to_string()
+                .contains("did not answer")
+        );
     }
 }

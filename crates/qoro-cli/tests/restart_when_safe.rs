@@ -642,6 +642,130 @@ fn a_relay_ends_when_its_daemon_goes_though_its_input_stays_open() {
     );
 }
 
+/// A release of `NEXT` in a `file://` base under the daemon's directory: a script saying so,
+/// and running this build for anything else, for every platform `qoro update` may ask for.
+fn serve_release(d: &Daemon) -> PathBuf {
+    let base = d.dir.path().join("rel");
+    let pack = d.dir.path().join("pack");
+    for dir in [&base, &pack] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let fresh = pack.join("qoro");
+    std::fs::write(
+        &fresh,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoro {NEXT}'; exit 0; fi\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_qoro")
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let tarball = pack.join("release.tar.gz");
+    let tar = Command::new("tar")
+        .arg("-czf")
+        .arg(&tarball)
+        .arg("qoro")
+        .current_dir(&pack)
+        .status()
+        .expect("tar");
+    assert!(tar.success());
+    let assets: Vec<_> = [
+        "qoro-aarch64-apple-darwin.tar.gz",
+        "qoro-x86_64-apple-darwin.tar.gz",
+        "qoro-x86_64-unknown-linux-gnu.tar.gz",
+        "qoro-aarch64-unknown-linux-gnu.tar.gz",
+    ]
+    .iter()
+    .map(|name| serde_json::json!({"name": name, "url": format!("file://{}", tarball.display())}))
+    .collect();
+    std::fs::write(
+        base.join("latest"),
+        serde_json::json!({"tag_name": format!("v{NEXT}"), "assets": assets}).to_string(),
+    )
+    .expect("release");
+    base
+}
+
+/// `qoro update` as the daemon's own installed copy, in a home and a list of remotes that
+/// are empty, so it can reach nothing but this daemon.
+fn update(d: &Daemon) -> Output {
+    let release = serve_release(d);
+    let home = d.dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(d.dir.path().join("remotes.json"), "[]").expect("remotes");
+    Command::new(&d.exe)
+        .arg("update")
+        .env("HOME", &home)
+        .env("QORO_RUNTIME_DIR", d.dir.path())
+        .env("XDG_CONFIG_HOME", d.dir.path().join("config"))
+        .env("QORO_REMOTES", d.dir.path().join("remotes.json"))
+        .env("QORO_RELEASE_BASE", format!("file://{}", release.display()))
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("run qoro update")
+}
+
+/// `qoro update` with every tab at its prompt installs the newest release, and the daemon
+/// moves onto it on the same process, which is the only way to tell it from a stop.
+///
+/// The release here is a stand-in that runs this very build, so the daemon that comes back
+/// still says it is `VERSION`, not `NEXT`: `qoro update` looks for the new daemon, finds one
+/// that does not say it is the version it was told to move to, and reports exactly that,
+/// and fails. It is the one honest answer to a daemon that closed its connection and came
+/// back as something else; a real release would say `NEXT` and read "moving to NEXT now".
+#[test]
+fn an_update_moves_an_idle_daemon_onto_the_new_binary() {
+    let mut d = Daemon::start_installed();
+    let out = update(&d);
+    let said = text(&out.stdout);
+    assert!(
+        said.contains(&format!(
+            "this machine: closed the connection and runs {VERSION}, not {NEXT}"
+        )),
+        "{said}"
+    );
+    assert!(
+        !out.status.success(),
+        "a daemon that is not the version asked for is a failure"
+    );
+    assert!(d.starts() >= 2, "the daemon never moved: {said}");
+    assert!(d.running(), "the daemon was stopped, not moved");
+}
+
+/// A command running in a tab does not stop `qoro update`; it is named, left alone, and the
+/// move comes once the command is done.
+#[test]
+fn an_update_names_a_running_command_and_moves_when_it_ends() {
+    let mut d = Daemon::start_installed();
+    d.send(1, "sleep 30");
+    d.wait_for_row(1, "ran sleep", running_sleep);
+    let out = update(&d);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(
+        said.contains(&format!(
+            "this machine: moves to {NEXT} once nothing is working; waiting on tab 1"
+        )) && said.contains("sleep"),
+        "{said}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        d.running() && d.starts() == 1,
+        "the daemon moved under a command"
+    );
+    d.wait_for_row(1, "kept its command", running_sleep);
+    d.interrupt(1);
+    let deadline = Instant::now() + PATIENCE;
+    while d.starts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never moved after the command"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(d.running(), "the daemon was stopped, not moved");
+}
+
 /// Put a script saying `qoro <version>` where `exe` is, the way an update renames a file in.
 /// Asked anything else, it runs this build: what a move onto it starts.
 fn replace_with_version(exe: &Path, version: &str) {

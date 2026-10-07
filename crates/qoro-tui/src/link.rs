@@ -94,11 +94,11 @@ pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim();
+                let line = plain(line.trim());
                 if !line.is_empty()
                     && let Ok(mut said) = said.lock()
                 {
-                    *said = line.to_string();
+                    *said = line;
                 }
             }
         });
@@ -329,8 +329,9 @@ pub enum Update {
     NoRelease,
 }
 
-/// Put the release of this version in place of the older qoro at `target`, for its daemon
-/// to move onto when nothing there is working.
+/// Put the release of `version` in place of the older qoro at `target`, for its daemon
+/// to move onto when nothing there is working. The interface asks for the version it is;
+/// `qoro update` for the one it has just installed.
 ///
 /// Only a tagged release goes, never the running binary: a same-platform Mac would
 /// otherwise be handed whatever was built here last. The qoro replaced is the one
@@ -338,19 +339,19 @@ pub enum Update {
 /// is the version this asked about; one that changed meanwhile (another window or another
 /// Mac swapped first) counts as done. A qoro there as new as this one, or newer, is left
 /// alone: nothing is ever moved backwards.
-pub async fn update(target: &str) -> io::Result<Update> {
-    let here = env!("CARGO_PKG_VERSION");
+pub async fn update(target: &str, version: &str) -> io::Result<Update> {
     let Probe::Ready { version: disk } = probe(target).await? else {
         return Err(io::Error::other("no qoro is there any more"));
     };
-    if !qoro_runtime::paths::is_newer_version(here, &disk) {
+    if !qoro_runtime::paths::is_newer_version(version, &disk) {
         return Ok(Update::OnDisk(disk, None));
     }
     let platform = platform_of(target).await?;
     let asset = qoro_runtime::release::asset_for(platform.os, platform.arch)
         .ok_or_else(|| io::Error::other("no qoro is built for that machine"))?;
+    let tag = version.to_string();
     let release =
-        tokio::task::spawn_blocking(move || qoro_runtime::release::fetch_tagged(here, asset))
+        tokio::task::spawn_blocking(move || qoro_runtime::release::fetch_tagged(&tag, asset))
             .await
             .map_err(io::Error::other)?;
     let release = match release {
@@ -375,7 +376,7 @@ pub async fn update(target: &str) -> io::Result<Update> {
         .map_err(io::Error::other)?;
     let swapped = run(
         target,
-        &swap_command(&disk, here, binary.len()),
+        &swap_command(&disk, version, binary.len()),
         Some(binary),
     )
     .await?;
@@ -387,9 +388,15 @@ pub async fn update(target: &str) -> io::Result<Update> {
         };
         return Ok(Update::OnDisk(version, None));
     }
-    let warning = swapped.answer()?;
+    // Lines the remote printed after the marker: plain, and as one line each of its own.
+    let warning = swapped
+        .answer()?
+        .lines()
+        .map(plain)
+        .collect::<Vec<_>>()
+        .join("; ");
     Ok(Update::OnDisk(
-        here.to_string(),
+        version.to_string(),
         (!warning.is_empty()).then_some(warning),
     ))
 }
@@ -430,6 +437,12 @@ const SWAPPED_MEANWHILE: i32 = 6;
 /// behind. A lock older than half an hour is from a swap that was killed, and is swept.
 /// Once swapped, the new qoro refreshes its hooks and skills there (it skips an agent that
 /// is not on that machine); what fails is said after the marker and never fails the swap.
+/// It also puts the bridge service there back on the new file: launchd refuses to start a
+/// service whose program file was replaced, so a macOS machine's bridge would otherwise die
+/// at its next start. That reload gets `BRIDGE_WAIT` seconds, kept by a watcher since not
+/// every machine has `timeout`, and a reload that fails or runs out is said like the others.
+/// `qoro update` waits out exit 7 by matching its sentence ("update of qoro is in progress"),
+/// so the two are reworded together.
 const SWAP: &str = r#"set -eu
 trap 'exit 1' HUP INT TERM PIPE
 umask 022
@@ -460,13 +473,27 @@ printf '%s\n' MARKER
 for w in hooks skills; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoro $w install on it"
 done
+"$r" bridge reload </dev/null >/dev/null 2>&1 &
+b=$!
+( sleep BRIDGE_WAIT; kill "$b" ) >/dev/null 2>&1 &
+k=$!
+wait "$b" || echo "the bridge there was not reloaded: run qoro bridge reload on it"
+kill "$k" 2>/dev/null || true
 "#;
+
+/// How long the bridge reload at the end of `SWAP` may take. A second in tests, so one that
+/// hangs can be seen to be cut off.
+const BRIDGE_WAIT: u32 = if cfg!(test) { 1 } else { 15 };
 
 /// The ssh command for `SWAP`, from the version on disk to `new`, `size` bytes on stdin.
 fn swap_command(disk: &str, new: &str, size: usize) -> String {
     format!(
         "sh -c {} qoro {} {} {}",
-        shell_quote(&SWAP.replace("MARKER", RELAY_MARKER)),
+        shell_quote(
+            &SWAP
+                .replace("MARKER", RELAY_MARKER)
+                .replace("BRIDGE_WAIT", &BRIDGE_WAIT.to_string())
+        ),
         shell_quote(disk),
         shell_quote(new),
         shell_quote(&size.to_string())
@@ -510,6 +537,21 @@ fn running_binary() -> io::Result<Vec<u8>> {
     } else {
         std::fs::read(std::fs::canonicalize(std::env::current_exe()?)?)
     }
+}
+
+/// Something a remote said, as one plain line of at most 200 characters.
+///
+/// Control characters go, and so do the invisible ones that reorder or hide text, which
+/// could make a refusal read as something else: what a remote prints reaches a terminal
+/// as a command otherwise. Everything of a remote's that is shown goes through this.
+pub fn plain(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(200)
+        .collect()
 }
 
 /// What one remote command did: its exit status, what it printed after the marker if it
@@ -619,19 +661,12 @@ async fn run(target: &str, command: &str, input: Option<Vec<u8>>) -> io::Result<
     })??;
     // What ssh or the remote said, as one plain line: it is shown on the status line, and
     // an escape in it would reach this terminal as a command.
-    let said: String = String::from_utf8_lossy(&stderr)
-        .lines()
-        .rfind(|l| !l.trim().is_empty())
-        .unwrap_or_default()
-        .chars()
-        // Control characters, and the invisible ones that reorder or hide text, which could
-        // make a refusal read as something else.
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-        })
-        .take(200)
-        .collect();
+    let said = plain(
+        String::from_utf8_lossy(&stderr)
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or_default(),
+    );
     let text = String::from_utf8_lossy(&stdout);
     Ok(Answer {
         status: finished.code(),
@@ -687,6 +722,13 @@ mod tests {
         let mut rest = Vec::new();
         let _ = out.read_to_end(&mut rest).await;
         (result, rest)
+    }
+
+    /// What a remote says is shown as plain text: no escape, no hidden reordering, bounded.
+    #[test]
+    fn what_a_remote_says_is_plain() {
+        assert_eq!(plain("a\u{1b}[31mb\u{202E}c\u{7}"), "a[31mbc");
+        assert_eq!(plain(&"x".repeat(500)).len(), 200);
     }
 
     /// A login banner, then the marker, then binary protocol bytes: the banner goes, and
@@ -892,19 +934,22 @@ mod tests {
         assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
     }
 
-    /// A qoro that says it is `version`, notes each `hooks` or `skills` call in `$HOME/ran`,
-    /// and fails `skills` when `$HOME/skills-fail` exists.
+    /// A qoro that says it is `version`, notes each `hooks`, `skills` or `bridge` call in
+    /// `$HOME/ran`, fails `skills` when `$HOME/skills-fail` exists, and `bridge` when
+    /// `$HOME/bridge-fail` does or hangs it when `$HOME/bridge-hang` does.
     fn noting(version: &str) -> Vec<u8> {
         format!(
             "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoro {version}';;\n\
-             hooks|skills) echo \"$*\" >> \"$HOME/ran\"; \
-             [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; exit 0;;\nesac\n"
+             hooks|skills|bridge) echo \"$*\" >> \"$HOME/ran\"; \
+             [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; \
+             [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-hang\" ] && exec sleep 30; \
+             [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-fail\" ] && exit 1; exit 0;;\nesac\n"
         )
         .into_bytes()
     }
 
-    /// The qoro just put there refreshes its hooks and skills, and a failure of that is said
-    /// after the marker without failing the swap.
+    /// The qoro just put there refreshes its hooks and skills and reloads its bridge, and a
+    /// failure of any is said after the marker without failing the swap.
     #[test]
     fn swap_refreshes_hooks_and_skills_and_says_what_failed() {
         let home = tempfile::tempdir().expect("home");
@@ -915,18 +960,38 @@ mod tests {
         assert_eq!(said.split_once(RELAY_MARKER).expect("marker").1.trim(), "");
         assert_eq!(
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
-            "hooks install\nskills install\n"
+            "hooks install\nskills install\nbridge reload\n"
         );
         assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
 
         installed(home.path(), &says("0.0.1"));
         std::fs::write(home.path().join("skills-fail"), "").expect("flag");
+        std::fs::write(home.path().join("bridge-fail"), "").expect("flag");
         let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
         assert!(out.status.success(), "a refresh must never fail the swap");
         let said = String::from_utf8_lossy(&out.stdout);
         let after = said.split_once(RELAY_MARKER).expect("marker").1.trim();
         assert!(after.contains("skills there were not refreshed"), "{after}");
+        assert!(after.contains("bridge there was not reloaded"), "{after}");
         assert!(!after.contains("hooks"), "{after}");
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+    }
+
+    /// A reload that hangs is cut off, said, and does not fail the swap or hold it.
+    #[test]
+    fn swap_cuts_off_a_bridge_reload_that_hangs() {
+        let home = tempfile::tempdir().expect("home");
+        let qoro = installed(home.path(), &says("0.0.1"));
+        std::fs::write(home.path().join("bridge-hang"), "").expect("flag");
+        let started = std::time::Instant::now();
+        let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
+        assert!(out.status.success());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the reload was waited out"
+        );
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("bridge there was not reloaded"), "{said}");
         assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
     }
 
