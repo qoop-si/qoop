@@ -35,8 +35,8 @@ you would say, not the runtime underneath it: an agent installed as a node packa
 itself, not as `node`.
 
 The column opens thirty eight columns wide, and a drag on its edge pulls it anywhere from
-twenty four to half the window. Its foot signs it with the word in thick dots, one `●` a cell,
-the q's tail and the r's first dot in ember, and your picked pet standing beside it on the
+twenty four to half the window. Its foot signs it with the q in thick dots, one `●` a cell,
+its tail in ember, and your picked pet standing beside it on the
 menu row, the last row of the column. A column too narrow for both falls back to the word in
 braille.
 

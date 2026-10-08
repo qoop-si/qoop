@@ -100,7 +100,7 @@ impl Onboard {
         let mut s = Screen::new(w, h);
         let cx = w / 2;
         let step = &STEPS[self.step];
-        s.word(cx - 12, 1);
+        s.word(cx - 13, 1);
         if !step.groups.is_empty() {
             s.pet(cx + 20, 0, &self.pet);
         }

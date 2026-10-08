@@ -13,7 +13,7 @@ drawn for the site take their colours from here.
 | sky | `00BBFF` | 39 | working |
 | blue | `0044D7` | | |
 | cream | `FCF7F1` | 231 | text, the logo's letters |
-| ember | `FD4B03` | 202 | the brand: the q's tail |
+| ember | `FD4B03` | 202 | the brand: the q's tail and the p's |
 | pink | `FF8FD9` | 218 (a lighter step) | a space |
 | orange | `FF7700` | 208 | wants |
 | green | `00BB54` | 35 | done |
@@ -42,14 +42,15 @@ palette cannot give at 4.5 to 1 once the base holds it (64 is 4.2, 100 is 3.8); 
 ## Logo
 
 Letters on the nine-dot grid, three dots by three. The q is the full ring with one more dot
-hanging under its right side: its tail, the only dot in ember. The letters are cream on the
-ground, or ground on cream.
+hanging under its right side: its tail. The p is the same ring with its tail hanging under
+the left side, the mirror of the q's. The two tails are the only dots in ember. The letters
+are cream on the ground, or ground on cream. The word reads q o o p.
 
 - `brand/q-mark-dark.svg`, `brand/q-mark-light.svg`: the q alone as an app icon, the nine
   dots dead centre and the tail below them, outside the centring.
 - `brand/q-mark-bare-on-dark.svg`, `brand/q-mark-bare-on-light.svg`: the same with no tile.
-- `brand/qoop-word-*.svg`: the word; the three rows centred on the height, the q's tail under
-  the line, the r's first dot in ember too.
+- `brand/qoop-word-*.svg`: the word; the three rows centred on the height, the q's tail and the
+  p's under the line, both in ember.
 
 `brand/make.py` draws all of them (`uv run --no-project python docs/brand/make.py`).
 
@@ -73,10 +74,10 @@ row at the right, five rows of half blocks with its feet on the row above the me
 only a blank row above the q, so no word moves whatever the pet. Sixteen columns hold the q
 and the widest pet side by side, fewer than the narrowest the column drags to.
 
-A column too narrow for that falls back to the word in braille (`⣖⡆⣖⡆⡖⠀⣖⡆`), cream letters on
-the lower three dot rows of its row, and the q's tail as one ember dot (`⠁`) alone on the row
-under it; there the r's first dot shares its cell with the r's stem and stays cream. Where
-braille is not drawn that small word is `● qoop` in ember.
+A column too narrow for that falls back to the word in braille (`⣖⡆⣖⡆⣖⡆⣖⡆`, four rings),
+cream letters on the lower three dot rows of its row, and the two tails as one ember dot (`⠁`)
+each alone on the row under it (`⠀⠁⠀⠀⠀⠀⠁⠀`): the q's in the q's second cell, the p's in the
+p's first. Where braille is not drawn that small word is `● qoop` in ember.
 
 ## State marks
 

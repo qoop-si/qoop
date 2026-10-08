@@ -260,35 +260,26 @@ impl Screen {
         self.seg(cx.saturating_sub(n / 2), y, parts);
     }
 
-    /// The word on the nine-dot grid (docs/brand): q, o, r, o, the q's tail and the r's
-    /// first dot in the brand ink. Four rows, 25 columns.
+    /// The word on the nine-dot grid (docs/brand): q, o, o, p, the q's tail under its right
+    /// column and the p's tail under its left one, both in the brand ink. Four rows, 26
+    /// columns: four rings of five cells on a pitch of seven.
     pub fn word(&mut self, x: usize, y: usize) {
         let ring = ["xxx", "x.x", "xxx"];
-        let r = ["xx.", "x..", "x.."];
         let cream = ink(Role::Text);
         let brand = ink(Role::Brand);
-        for (letter, grid, at) in [
-            ('q', ring, 0),
-            ('o', ring, 7),
-            ('r', r, 14),
-            ('o', ring, 19),
-        ] {
-            for (dy, row) in grid.iter().enumerate() {
+        for (letter, at) in [('q', 0), ('o', 7), ('o', 14), ('p', 21)] {
+            for (dy, row) in ring.iter().enumerate() {
                 for (dx, dot) in row.chars().enumerate() {
                     if dot == 'x' {
-                        let accent = letter == 'r' && dy == 0 && dx == 0;
-                        self.put(
-                            x + at + dx * 2,
-                            y + dy,
-                            "●",
-                            if accent { &brand } else { &cream },
-                        );
+                        self.put(x + at + dx * 2, y + dy, "●", &cream);
                     }
                 }
             }
-            if letter == 'q' {
-                self.put(x + at + 4, y + 3, "●", &brand);
-            }
+            match letter {
+                'q' => self.put(x + at + 4, y + 3, "●", &brand),
+                'p' => self.put(x + at, y + 3, "●", &brand),
+                _ => x,
+            };
         }
     }
 
@@ -449,13 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn the_word_has_every_dot_and_the_tail_under_the_line() {
+    fn the_word_has_every_dot_and_both_tails_under_the_line() {
         let mut s = Screen::new(30, 4);
         s.word(0, 0);
         let dots = s.cells.iter().flatten().filter(|c| c.ch == '●').count();
-        // q 8 and its tail, o 8, r 4, o 8.
-        assert_eq!(dots, 29);
-        assert_eq!(s.cells[3][4].ch, '●');
-        assert_eq!(s.cells[0][14].ch, '●');
+        // Four rings of 8, and the q's tail and the p's.
+        assert_eq!(dots, 34);
+        let brand = ink(Role::Brand);
+        let embers: Vec<(usize, usize)> = (0..4)
+            .flat_map(|y| (0..30).map(move |x| (y, x)))
+            .filter(|&(y, x)| s.cells[y][x].ch == '●' && s.cells[y][x].esc == brand)
+            .collect();
+        // q's under its right column, p's under its left one: nothing else is ember.
+        assert_eq!(embers, vec![(3, 4), (3, 21)]);
+        // The letters read q o o p: a ring each, empty in the middle.
+        for at in [0, 7, 14, 21] {
+            assert_eq!(s.cells[1][at + 2].ch, ' ', "ring at {at} is hollow");
+            assert_eq!(s.cells[0][at].ch, '●');
+            assert_eq!(s.cells[2][at + 4].ch, '●');
+        }
     }
 }
