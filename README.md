@@ -34,6 +34,13 @@ bell, so you find out without looking, even when its space is folded. The name i
 you would say, not the runtime underneath it: an agent installed as a node package reads as
 itself, not as `node`.
 
+The search box under the title filters the column by space name, agent name, state and
+directory. `ctrl-a a` gives the column the keyboard: `j` `k` or the arrows move over its rows,
+`enter` opens one, `/` types in the search, `s` sleeps the row, `S` every space, `w` wakes it,
+`n` opens a new tab, `x` closes (asking first, as its `x` does), `f` folds, and `q` or `esc`
+gives the keyboard back. Each live agent's row ends in a moon: a click puts that one tab to
+sleep.
+
 The column opens thirty eight columns wide, and a drag on its edge pulls it anywhere from
 twenty four to half the window. Its foot signs it with the q in thick dots, one `●` a cell,
 its tail in ember, and your picked pet standing beside it on the
@@ -184,6 +191,7 @@ sleeps it.
 
 ```
 ctrl-a Z                sleep the tab you are in, or wake the sleeping one you are on
+ctrl-a a                the keyboard on the agents column: move, open, search, sleep
 qoop sleep --tab 7      the same from a shell, by tab number
 qoop sleep api          every tab of a space, by name or id
 qoop wake --tab 7       wake one tab; `qoop wake api` every tab of a space

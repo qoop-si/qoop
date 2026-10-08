@@ -166,6 +166,8 @@ pub enum Action {
     Tab(usize),
     /// ctrl-a space: the search palette over spaces, agents, tabs and actions.
     Palette,
+    /// ctrl-a a: the keyboard on the agents column: move over its rows, open, sleep, search.
+    Agents,
     /// ctrl-a g: the column as the tree of spaces or by urgency.
     ToggleView,
     /// ctrl-a f: fold the focused space's agents under its rule, or open them again.
@@ -420,6 +422,7 @@ impl Keys {
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
                     b' ' => Action::Palette,
+                    b'a' => Action::Agents,
                     b'g' => Action::ToggleView,
                     b'f' => Action::FoldSpace,
                     b'M' => Action::Answer,

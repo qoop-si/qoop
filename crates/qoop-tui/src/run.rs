@@ -907,6 +907,10 @@ struct Modes {
     outbox: Vec<ControlRequest>,
     /// Resize mode: `h j k l` move the nearest divider until the mode is left.
     resizing: bool,
+    /// The sidebar mode: the keyboard on the agents column, with its filter and its pick.
+    side: Option<sidebar::Nav>,
+    /// Where `enter` in the sidebar mode asked the loop to go, which needs the socket.
+    side_go: Option<Go>,
     /// A split divider held by the mouse: the path to its split.
     split_drag: Option<layout::SplitPath>,
     /// A close waiting for its `y`: the terminal, and the question on the notice row.
@@ -926,7 +930,7 @@ struct Modes {
 impl Modes {
     /// Whether a mode owns the keyboard.
     fn open(&self) -> bool {
-        self.copy.is_some() || self.resizing || self.confirm_close.is_some()
+        self.copy.is_some() || self.resizing || self.side.is_some() || self.confirm_close.is_some()
     }
 }
 
@@ -1011,6 +1015,7 @@ impl State {
                 dim: self.dim_tab().unwrap_or(0),
                 list_scroll: self.list_scroll(),
                 inbox: self.inbox,
+                nav: self.modes.side.as_ref(),
                 keys_query: self.keys_query.as_deref(),
                 closing: self
                     .modes
@@ -1021,6 +1026,15 @@ impl State {
                     None
                 } else if self.modes.resizing {
                     Some(("resize", screen::RESIZE_HINT))
+                } else if let Some(nav) = &self.modes.side {
+                    // With something to say, the row says it: a refusal from the daemon
+                    // would otherwise sit under the keys, unread.
+                    let said = self.message.is_some();
+                    Some(match (nav.typing, said) {
+                        (true, _) => ("search", screen::SEARCH_HINT),
+                        (false, true) => ("agents", &[][..]),
+                        (false, false) => ("agents", screen::SIDE_HINT),
+                    })
                 } else {
                     self.modes.copy.as_ref().map(|copy| {
                         let keys: &'static [(&'static str, &'static str)] =
@@ -1363,6 +1377,9 @@ impl State {
             if sidebar::on_agent_close(col as usize, terminal, &column) {
                 return Some(Clicked::CloseAgent(terminal));
             }
+            if sidebar::on_agent_sleep(col as usize, terminal, &column) {
+                return Some(Clicked::SleepAgent(terminal));
+            }
             if sidebar::on_agent_cup(col as usize, terminal, &column) {
                 return Some(Clicked::KeepAwakeAgent(terminal));
             }
@@ -1389,6 +1406,7 @@ impl State {
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
             sidebar::Act::InboxFold => Some(Clicked::InboxFold),
+            sidebar::Act::Search => Some(Clicked::Search),
         }
     }
 
@@ -2053,6 +2071,7 @@ impl State {
             scroll: self.list_scroll(),
             inbox: self.inbox,
             icons: crate::icons::on(),
+            nav: self.modes.side.as_ref(),
         }
     }
 
@@ -3667,6 +3686,8 @@ fn mode_input(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) ->
         confirm_key(state, &input, request)
     } else if state.modes.resizing {
         resize_key(state, &input)
+    } else if state.modes.side.is_some() {
+        side_key(state, &input, prefix, request)
     } else {
         copy_key(state, &input, prefix, request)
     };
@@ -3817,16 +3838,21 @@ fn sleep_toggle(state: &mut State, request: &mut u64) {
         return;
     };
     if state.focused != 0 {
-        *request += 1;
-        state.message = Some("putting this tab to sleep".to_string());
-        state.modes.outbox.push(ControlRequest::SleepWorkspace {
-            id: format!("sleep-tab-{request}"),
-            workspace: space,
-            terminal: Some(state.focused),
-        });
+        sleep_tab(state, space, state.focused, request);
     } else if let Some(tab) = state.dim_tab() {
         wake(state, space, tab, request);
     }
+}
+
+/// Put one tab of `space` to sleep, every pane of it: a key's or a click's, the same request.
+fn sleep_tab(state: &mut State, space: i64, terminal: u32, request: &mut u64) {
+    *request += 1;
+    state.message = Some("putting this tab to sleep".to_string());
+    state.modes.outbox.push(ControlRequest::SleepWorkspace {
+        id: format!("sleep-tab-{request}"),
+        workspace: space,
+        terminal: Some(terminal),
+    });
 }
 
 /// The rule's own `sleep`: put every tab of that space to sleep. It never wakes: the rule's
@@ -4260,6 +4286,374 @@ fn confirm_key(state: &mut State, bytes: &[u8], request: &mut u64) -> ModeOutcom
         });
     }
     ModeOutcome::Stay
+}
+
+/// Where `enter` in the sidebar mode goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Go {
+    Terminal(u32),
+    Space(i64),
+}
+
+/// Go where `enter` in the sidebar mode asked: wake a sleeping tab, focus an awake one, or enter
+/// a space, as a click on that row would.
+async fn side_go(
+    state: &mut State,
+    request: &mut u64,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    let out = match state.modes.side_go.take() {
+        Some(Go::Terminal(picked)) => match state.sleeping_space_of(picked) {
+            Some(space) => {
+                wake(state, space, picked, request);
+                None
+            }
+            None => focus(state, picked, control_seq, seqs)?,
+        },
+        Some(Go::Space(space)) => enter_space(state, space, control_seq, seqs)?,
+        None => None,
+    };
+    if let Some(out) = out {
+        wr.write_all(&out).await?;
+    }
+    Ok(())
+}
+
+/// A click on the search box: the typing goes there, with what was already typed kept when the
+/// keyboard already had the column.
+fn focus_search(state: &mut State) {
+    match state.modes.side.as_mut() {
+        Some(nav) => nav.typing = true,
+        None => enter_side(state, true),
+    }
+}
+
+/// The most characters the search box takes.
+const SIDE_QUERY_MAX: usize = 64;
+
+/// Give the keyboard to the agents column, standing on the row the person is in, with the
+/// search box taking the typing when `typing`.
+fn enter_side(state: &mut State, typing: bool) {
+    state.modes.side = Some(sidebar::Nav {
+        typing,
+        ..sidebar::Nav::default()
+    });
+    state.modes.side_go = None;
+    // The wheel's place is forgotten: the list follows the pick from here.
+    state.list_scroll = None;
+    let items = side_items(state);
+    // The agent the keyboard is in, else the rule of its space (a shell has no row), else the top.
+    let pick = [
+        (state.focused != 0).then_some(sidebar::Pick::Terminal(state.focused)),
+        state.space.map(sidebar::Pick::Space),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| items.contains(p))
+    .or(items.first().copied());
+    side_stand(state, &items, pick);
+}
+
+/// Every row the keyboard can stand on in the column as it is drawn now.
+fn side_items(state: &State) -> Vec<sidebar::Pick> {
+    sidebar::items(&state.column(state.paint_now, 0))
+}
+
+/// Put the pick on `pick`, and remember where in `items` that is.
+fn side_stand(state: &mut State, items: &[sidebar::Pick], pick: Option<sidebar::Pick>) {
+    if let Some(nav) = state.modes.side.as_mut() {
+        nav.at = pick
+            .and_then(|p| items.iter().position(|i| *i == p))
+            .unwrap_or_default();
+        nav.pick = pick;
+    }
+    state.list_scroll = None;
+}
+
+/// Where the pick stands now: where it was left, or on whatever took the place of a row
+/// that went away.
+fn side_pick(state: &State) -> Option<sidebar::Pick> {
+    sidebar::picked(&state.column(state.paint_now, 0))
+}
+
+/// Move the pick `by` rows, never past either end; `None` for the first or last row.
+fn side_move(state: &mut State, by: Option<isize>, end: bool) {
+    let items = side_items(state);
+    let Some(now) = side_pick(state).and_then(|p| items.iter().position(|i| *i == p)) else {
+        return;
+    };
+    let to = match by {
+        Some(by) => now.saturating_add_signed(by).min(items.len() - 1),
+        None if end => items.len() - 1,
+        None => 0,
+    };
+    side_stand(state, &items, items.get(to).copied());
+}
+
+/// The filter changed: the pick goes to the first row left, as a search starts at the top.
+/// Cleared, it stays on its row when that row is still there, so the search gives the place back.
+fn side_refilter(state: &mut State, keep: bool) {
+    let items = side_items(state);
+    let kept = side_pick(state).filter(|p| keep && items.contains(p));
+    side_stand(state, &items, kept.or(items.first().copied()));
+}
+
+/// The space a row of the column belongs to.
+fn side_space(state: &State, pick: sidebar::Pick) -> Option<i64> {
+    match pick {
+        sidebar::Pick::Space(id) => Some(id),
+        sidebar::Pick::Terminal(t) => state
+            .rows
+            .iter()
+            .find(|r| r.terminal == t)
+            .map(|r| r.workspace)
+            .or_else(|| state.sleeping_space_of(t)),
+    }
+}
+
+/// Whether a press, drag or wheel at this one based place is on the column.
+fn side_over(state: &State, row: u16, col: u16) -> bool {
+    let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+    left > 0
+        && (col as usize) <= left
+        && (row as usize) <= (state.lines as usize).saturating_sub(screen::STATUS)
+}
+
+/// Decide what one read of stdin meant while the keyboard has the agents column.
+///
+/// `j k` and the arrows move the pick, `enter` goes there, `/` types in the search box, and
+/// `s w S n N f x` act on the row: sleep, wake, sleep every space, a new tab, a new space,
+/// fold, close (which asks the way a click on its `x` does). `esc` clears a search and then
+/// leaves, `q` leaves at once. The prefix and a detach leave and are passed on. The mouse
+/// belongs to the ordinary path and the mode stays under it, unless a press lands outside
+/// the column: that leaves.
+fn side_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> ModeOutcome {
+    let mut pass: Vec<u8> = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() && state.modes.side.is_some() {
+        // The mouse first, with its place: `mode_key` forgets where.
+        if bytes[at..].starts_with(b"\x1b[<") {
+            match crate::keys::report(&bytes[at..]) {
+                crate::keys::Report::Partial => {
+                    state.modes.pending = bytes[at..].to_vec();
+                    break;
+                }
+                crate::keys::Report::Broken(used) => at += used.max(1),
+                crate::keys::Report::Whole(used, action) => {
+                    let place = match action {
+                        Some(
+                            Action::Click { row, col, .. }
+                            | Action::Drag { row, col, .. }
+                            | Action::Release { row, col, .. }
+                            | Action::Wheel { row, col, .. },
+                        ) => Some((row, col, matches!(action, Some(Action::Click { .. })))),
+                        _ => None,
+                    };
+                    if let Some((row, col, press)) = place {
+                        if press && !side_over(state, row, col) {
+                            state.modes.side = None;
+                            pass.extend_from_slice(&bytes[at..]);
+                            break;
+                        }
+                        pass.extend_from_slice(&bytes[at..at + used]);
+                    }
+                    at += used.max(1);
+                }
+            }
+            continue;
+        }
+        let (key, used) = mode_key(bytes, at);
+        if key == ModeKey::Partial {
+            state.modes.pending = bytes[at..].to_vec();
+            break;
+        }
+        if matches!(key, ModeKey::Byte(b) if b == prefix || b == crate::keys::DETACH) {
+            state.modes.side = None;
+            pass.extend_from_slice(&bytes[at..]);
+            break;
+        }
+        // An escape with bytes right behind it in one read is a chord (alt-x) or a sequence this
+        // does not know: never `esc` and then the keys behind it.
+        if key == ModeKey::Esc && at + used < bytes.len() {
+            break;
+        }
+        at += used.max(1);
+        // What the last key said (or the daemon answered) has been read: the keys come back.
+        state.message = None;
+        let typing = state.modes.side.as_ref().is_some_and(|n| n.typing);
+        if typing {
+            // A pasted line ends in its enter: what follows it was text, not keys.
+            let done = matches!(key, ModeKey::Byte(b'\r' | b'\n'));
+            side_typing(state, key);
+            if done {
+                break;
+            }
+        } else {
+            side_command(state, key, request);
+        }
+    }
+    if pass.is_empty() {
+        ModeOutcome::Stay
+    } else {
+        ModeOutcome::Passthrough(pass)
+    }
+}
+
+/// One key while the search box has the typing.
+fn side_typing(state: &mut State, key: ModeKey) {
+    let Some(nav) = state.modes.side.as_mut() else {
+        return;
+    };
+    match key {
+        // Done typing: the rows left are the keyboard's, from the first.
+        ModeKey::Byte(b'\r' | b'\n') => nav.typing = false,
+        ModeKey::Esc => {
+            nav.typing = false;
+            if !nav.query.is_empty() {
+                nav.query.clear();
+                side_refilter(state, true);
+            }
+        }
+        ModeKey::Byte(0x7f | 0x08) => {
+            nav.query.pop();
+            side_refilter(state, false);
+        }
+        // ctrl-u, as in a shell: the whole line.
+        ModeKey::Byte(0x15) => {
+            nav.query.clear();
+            side_refilter(state, true);
+        }
+        ModeKey::Down => {
+            nav.typing = false;
+            side_move(state, Some(1), false);
+        }
+        ModeKey::Up => {
+            nav.typing = false;
+            side_move(state, Some(-1), false);
+        }
+        ModeKey::Byte(byte)
+            if (byte == b' ' || byte.is_ascii_graphic())
+                && nav.query.chars().count() < SIDE_QUERY_MAX =>
+        {
+            nav.query.push(byte as char);
+            side_refilter(state, false);
+        }
+        ModeKey::Text(text) if nav.query.chars().count() < SIDE_QUERY_MAX => {
+            nav.query.push_str(&text);
+            side_refilter(state, false);
+        }
+        _ => {}
+    }
+}
+
+/// One key while the rows have the keyboard.
+fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
+    let pick = side_pick(state);
+    let space = pick.and_then(|p| side_space(state, p));
+    match key {
+        ModeKey::Byte(b'j') | ModeKey::Down => side_move(state, Some(1), false),
+        ModeKey::Byte(b'k') | ModeKey::Up => side_move(state, Some(-1), false),
+        ModeKey::Byte(b'g') | ModeKey::Home => side_move(state, None, false),
+        ModeKey::Byte(b'G') | ModeKey::End => side_move(state, None, true),
+        ModeKey::Byte(b'/') => {
+            if let Some(nav) = state.modes.side.as_mut() {
+                nav.typing = true;
+            }
+        }
+        ModeKey::Byte(b'q') => state.modes.side = None,
+        ModeKey::Esc => {
+            let searching = state
+                .modes
+                .side
+                .as_ref()
+                .is_some_and(|n| !n.query.is_empty());
+            if searching {
+                if let Some(nav) = state.modes.side.as_mut() {
+                    nav.query.clear();
+                }
+                side_refilter(state, true);
+            } else {
+                state.modes.side = None;
+            }
+        }
+        // Open it, and the keyboard goes with it.
+        ModeKey::Byte(b'\r' | b'\n') => {
+            state.modes.side_go = pick.map(|p| match p {
+                sidebar::Pick::Terminal(t) => Go::Terminal(t),
+                sidebar::Pick::Space(id) => Go::Space(id),
+            });
+            state.modes.side = None;
+        }
+        ModeKey::Byte(b's') => match pick {
+            Some(sidebar::Pick::Terminal(t)) if state.is_asleep(t) => {
+                state.message = Some("already asleep, enter wakes it".to_string());
+            }
+            Some(sidebar::Pick::Terminal(t)) => {
+                if let Some(space) = space {
+                    sleep_tab(state, space, t, request);
+                }
+            }
+            Some(sidebar::Pick::Space(id)) => sleep_space(state, id, request),
+            None => {}
+        },
+        ModeKey::Byte(b'w') => match (pick, space) {
+            (Some(sidebar::Pick::Terminal(t)), Some(space)) if state.is_asleep(t) => {
+                wake(state, space, t, request);
+            }
+            (Some(sidebar::Pick::Space(id)), _) => wake_space(state, id, request),
+            _ => state.message = Some("awake already".to_string()),
+        },
+        ModeKey::Byte(b'S') => {
+            let awake: Vec<i64> = state
+                .spaces
+                .iter()
+                .filter(|s| !s.asleep && s.terminals > 0)
+                .map(|s| s.id)
+                .collect();
+            for id in &awake {
+                sleep_space(state, *id, request);
+            }
+            state.message = Some(format!("putting {} spaces to sleep", awake.len()));
+        }
+        ModeKey::Byte(b'n' | b'+') => {
+            if let Some(space) = space {
+                open_new(state, space);
+            }
+        }
+        ModeKey::Byte(b'N') => {
+            state.menu_kind = MenuKind::Plus;
+            state.menu = Some(0);
+        }
+        ModeKey::Byte(b'f' | b' ') => {
+            if let Some(space) = space
+                && !state.shut.remove(&space)
+            {
+                state.shut.insert(space);
+                side_stand(state, &side_items(state), Some(sidebar::Pick::Space(space)));
+            }
+        }
+        ModeKey::Byte(b'h') | ModeKey::Left => {
+            if let Some(space) = space {
+                state.shut.insert(space);
+                side_stand(state, &side_items(state), Some(sidebar::Pick::Space(space)));
+            }
+        }
+        ModeKey::Byte(b'l') | ModeKey::Right => {
+            if let Some(space) = space {
+                state.shut.remove(&space);
+            }
+        }
+        // The question a click on the row's `x` asks: a busy agent is asked about first, a
+        // space is armed and answers its `y`.
+        ModeKey::Byte(b'x') => match pick {
+            Some(sidebar::Pick::Terminal(t)) => close_terminal(state, t, request),
+            Some(sidebar::Pick::Space(id)) => arm_close(state, id),
+            None => {}
+        },
+        _ => {}
+    }
 }
 
 /// Open resize mode, when there is a divider to move.
@@ -4950,6 +5344,10 @@ enum Clicked {
     Drawer(i64),
     /// The cup on an agent's row: the same for that agent's pane.
     KeepAwakeAgent(u32),
+    /// The sleep mark on an agent's row: that tab alone goes to sleep.
+    SleepAgent(u32),
+    /// The search box under the title: the keyboard takes the column, typing.
+    Search,
     /// The rule's close, which only arms the question.
     Close(i64),
     /// `y` on an armed rule: the space and everything in it goes.
@@ -5985,6 +6383,10 @@ where
                         // rest back when it is left.
                         let outcome = mode_input(&mut state, &bytes, keys.prefix(), &mut request);
                         dirty = true;
+                        // `enter` in the sidebar mode: go where the pick stands, as a click on
+                        // that row would.
+                        side_go(&mut state, &mut request, &mut control_seq, &mut seqs, &mut wr)
+                            .await?;
                         if let ModeOutcome::Passthrough(rest) = outcome {
                             feed = Some(rest);
                         }
@@ -6054,7 +6456,11 @@ where
                                 // as in `ctrl-a [ k`: the mode's, like everything after it.
                                 let bytes = if state.modes.open() {
                                     dirty = true;
-                                    match mode_input(&mut state, &bytes, keys.prefix(), &mut request) {
+                                    let outcome =
+                                        mode_input(&mut state, &bytes, keys.prefix(), &mut request);
+                                    side_go(&mut state, &mut request, &mut control_seq, &mut seqs, &mut wr)
+                                        .await?;
+                                    match outcome {
                                         ModeOutcome::Stay => continue,
                                         ModeOutcome::Passthrough(rest) => rest,
                                     }
@@ -6345,6 +6751,21 @@ where
                                         close_terminal(&mut state, terminal, &mut request);
                                         dirty = true;
                                     }
+                                    Some(Clicked::SleepAgent(terminal)) => {
+                                        if let Some(space) = state
+                                            .rows
+                                            .iter()
+                                            .find(|r| r.terminal == terminal)
+                                            .map(|r| r.workspace)
+                                        {
+                                            sleep_tab(&mut state, space, terminal, &mut request);
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Search) => {
+                                        focus_search(&mut state);
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Drawer(space)) => {
                                         state.toggle_drawer(space);
                                         if !motion {
@@ -6505,6 +6926,11 @@ where
                                     }
                                     Some(Clicked::Collapse) => {
                                         state.collapsed = !state.collapsed;
+                                        // The keys of a column that is gone would be taken
+                                        // with nothing on screen to say why.
+                                        if state.collapsed {
+                                            state.modes.side = None;
+                                        }
                                         // The pane's width changed with the column, and a
                                         // child that is not told reflows its output against
                                         // a width it no longer has.
@@ -7014,6 +7440,21 @@ where
                                     size_terminals(&mut state, &mut seqs)?
                                 {
                                     wr.write_all(&resize).await?;
+                                }
+                                dirty = true;
+                            }
+                            Action::Agents => {
+                                if state.collapsed {
+                                    state.collapsed = false;
+                                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                }
+                                if screen::left_for(state.cols, state.collapsed, state.sidebar_width) == 0 {
+                                    state.message =
+                                        Some("the window is too narrow for the agents column".to_string());
+                                } else {
+                                    enter_side(&mut state, false);
                                 }
                                 dirty = true;
                             }
@@ -12194,7 +12635,7 @@ mod tests {
         for (what, row, col) in [
             ("the order word", title, view_col),
             ("the plus", title, new_col),
-            ("a rule's own row", title + 1, 3),
+            ("a rule's own row", title + 2, 3),
         ] {
             let hit = s.clicked(row, col);
             assert!(
@@ -17376,5 +17817,216 @@ mod tests {
             !state.done,
             "the interface left while its space still had a tab"
         );
+    }
+    /// The keyboard on the agents column: the pick starts on the focused agent, `j k` move it
+    /// without leaving the rows, `/` filters, and `enter` goes where it stands and leaves.
+    #[test]
+    fn the_sidebar_mode_moves_a_pick_filters_and_enters() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, false);
+        assert!(s.modes.open());
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Terminal(2)));
+        // Up reaches the space's rule, then the agent of the space above; the first row stops it.
+        for _ in 0..9 {
+            mode_input(&mut s, b"k", 0x01, &mut request);
+        }
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Space(1)));
+        mode_input(&mut s, b"j", 0x01, &mut request);
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Terminal(1)));
+        mode_input(&mut s, b"G", 0x01, &mut request);
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Terminal(2)));
+        // A search narrows to what matches and starts at the top of it.
+        mode_input(&mut s, b"/webs", 0x01, &mut request);
+        assert!(
+            s.modes
+                .side
+                .as_ref()
+                .is_some_and(|n| n.typing && n.query == "webs")
+        );
+        assert_eq!(
+            side_items(&s),
+            vec![sidebar::Pick::Space(2), sidebar::Pick::Terminal(2)]
+        );
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Space(2)));
+        // Enter ends the typing and keeps the filter; the next one opens the row.
+        mode_input(&mut s, b"\r", 0x01, &mut request);
+        assert!(s.modes.side.as_ref().is_some_and(|n| !n.typing));
+        mode_input(&mut s, b"j\r", 0x01, &mut request);
+        assert_eq!(s.modes.side_go, Some(Go::Terminal(2)));
+        assert!(s.modes.side.is_none(), "enter hands the keyboard back");
+    }
+
+    /// Esc clears a search first and leaves second; `q` leaves at once; the prefix leaves and
+    /// is passed on, so `ctrl-a d` still detaches out of the mode.
+    #[test]
+    fn the_sidebar_mode_leaves_by_esc_q_and_the_prefix() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, true);
+        mode_input(&mut s, b"codex", 0x01, &mut request);
+        assert_eq!(side_items(&s).len(), 2);
+        mode_input(&mut s, b"\x1b", 0x01, &mut request);
+        assert!(
+            s.modes
+                .side
+                .as_ref()
+                .is_some_and(|n| !n.typing && n.query.is_empty())
+        );
+        assert_eq!(side_items(&s).len(), 4, "the filter went with it");
+        mode_input(&mut s, b"\x1b", 0x01, &mut request);
+        assert!(s.modes.side.is_none());
+        enter_side(&mut s, false);
+        mode_input(&mut s, b"q", 0x01, &mut request);
+        assert!(s.modes.side.is_none());
+        enter_side(&mut s, true);
+        let out = mode_input(&mut s, b"\x01d", 0x01, &mut request);
+        assert!(s.modes.side.is_none());
+        assert_eq!(out, ModeOutcome::Passthrough(b"\x01d".to_vec()));
+    }
+
+    /// `s` sleeps the one tab the pick stands on, `S` every space that is awake, with the
+    /// requests a click on the rule's `sleep` sends; `x` asks before it ends a busy agent.
+    #[test]
+    fn the_sidebar_mode_sleeps_one_tab_or_every_space_and_asks_before_a_close() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, false);
+        mode_input(&mut s, b"s", 0x01, &mut request);
+        assert!(matches!(
+            s.modes.outbox.as_slice(),
+            [ControlRequest::SleepWorkspace {
+                workspace: 2,
+                terminal: Some(2),
+                ..
+            }]
+        ));
+        s.modes.outbox.clear();
+        mode_input(&mut s, b"S", 0x01, &mut request);
+        let slept: Vec<(i64, Option<u32>)> = s
+            .modes
+            .outbox
+            .iter()
+            .filter_map(|r| match r {
+                ControlRequest::SleepWorkspace {
+                    workspace,
+                    terminal,
+                    ..
+                } => Some((*workspace, *terminal)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slept, vec![(1, None), (2, None)]);
+        s.modes.outbox.clear();
+        // The focused agent is working: the close asks first and sends nothing.
+        mode_input(&mut s, b"x", 0x01, &mut request);
+        assert!(s.modes.outbox.is_empty());
+        assert!(s.modes.confirm_close.is_some());
+    }
+
+    /// A press outside the column leaves the mode and is the pane's; one inside it is the
+    /// ordinary click and the mode stays.
+    #[test]
+    fn a_press_in_the_column_keeps_the_sidebar_mode_and_one_outside_leaves_it() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let mut request = 0;
+        enter_side(&mut s, false);
+        let inside = mode_input(&mut s, b"\x1b[<0;5;6M", 0x01, &mut request);
+        assert_eq!(inside, ModeOutcome::Passthrough(b"\x1b[<0;5;6M".to_vec()));
+        assert!(s.modes.side.is_some());
+        let outside = mode_input(&mut s, b"\x1b[<0;70;10M", 0x01, &mut request);
+        assert_eq!(
+            outside,
+            ModeOutcome::Passthrough(b"\x1b[<0;70;10M".to_vec())
+        );
+        assert!(s.modes.side.is_none());
+    }
+
+    /// The sleep mark on an agent's row is a click of its own, and the search box under the
+    /// title is one too.
+    #[test]
+    fn the_sleep_mark_and_the_search_box_are_clicks() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let found = |s: &State, want: fn(&Clicked) -> bool| {
+            (1..s.lines)
+                .flat_map(|row| (1..=crate::sidebar::WIDTH as u16).map(move |col| (row, col)))
+                .find_map(|(row, col)| s.clicked(row, col).filter(want))
+        };
+        assert!(matches!(
+            found(&s, |c| matches!(c, Clicked::SleepAgent(_))),
+            Some(Clicked::SleepAgent(1 | 2))
+        ));
+        assert!(matches!(
+            found(&s, |c| matches!(c, Clicked::Search)),
+            Some(Clicked::Search)
+        ));
+    }
+    /// `f` folds the space of the pick and `l` opens it again; `h` folds it and stands on its
+    /// rule, so the pick never sits on a row the fold hid.
+    #[test]
+    fn the_sidebar_mode_folds_and_unfolds_the_space_of_the_pick() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, false);
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Terminal(2)));
+        mode_input(&mut s, b"f", 0x01, &mut request);
+        assert!(s.shut.contains(&2));
+        mode_input(&mut s, b"l", 0x01, &mut request);
+        assert!(!s.shut.contains(&2));
+        mode_input(&mut s, b"h", 0x01, &mut request);
+        assert!(s.shut.contains(&2));
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Space(2)));
+    }
+    /// Folding from a session that the fold hides puts the pick on the rule, so the second `f`
+    /// opens the same space again instead of folding another one.
+    #[test]
+    fn folding_a_hidden_sessions_space_keeps_the_pick_on_its_rule() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, false);
+        mode_input(&mut s, b"kk", 0x01, &mut request);
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Terminal(1)));
+        mode_input(&mut s, b"f", 0x01, &mut request);
+        assert!(s.shut.contains(&1));
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Space(1)));
+        mode_input(&mut s, b"f", 0x01, &mut request);
+        assert!(s.shut.is_empty());
+    }
+
+    /// An alt chord arrives as an escape with a key behind it; a pasted line ends in its enter.
+    /// Neither runs the keys that follow.
+    #[test]
+    fn a_chord_or_a_pasted_line_never_runs_the_keys_behind_it() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, false);
+        mode_input(&mut s, b"\x1bx", 0x01, &mut request);
+        assert!(s.modes.confirm_close.is_none() && s.modes.outbox.is_empty());
+        assert!(s.modes.side.is_some(), "the chord is not an escape");
+        enter_side(&mut s, true);
+        mode_input(&mut s, b"ab\rS", 0x01, &mut request);
+        assert!(s.modes.outbox.is_empty(), "{:?}", s.modes.outbox);
+        assert!(
+            s.modes
+                .side
+                .as_ref()
+                .is_some_and(|n| !n.typing && n.query == "ab")
+        );
+    }
+
+    /// A click on the search box types into the query that is there; with no mode open it opens
+    /// the mode, typing.
+    #[test]
+    fn a_click_on_the_search_box_keeps_what_was_typed() {
+        let mut s = state();
+        let mut request = 0;
+        focus_search(&mut s);
+        assert!(s.modes.side.as_ref().is_some_and(|n| n.typing));
+        mode_input(&mut s, b"web\r", 0x01, &mut request);
+        focus_search(&mut s);
+        let nav = s.modes.side.as_ref().expect("still open");
+        assert!(nav.typing && nav.query == "web");
     }
 }

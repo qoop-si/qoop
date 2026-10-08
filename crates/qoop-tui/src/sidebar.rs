@@ -314,6 +314,8 @@ pub enum Hit {
     Tabs,
     /// The `spaces` title, with the order word and the `+` at its right.
     Title,
+    /// The search box under the title.
+    Search,
     /// The foot of the column: the brand, `menu`, and the mark that folds the column.
     Foot,
 }
@@ -350,6 +352,8 @@ pub enum Act {
     Terminal(u32),
     /// The `+` of the title: a space, named first.
     NewSpace,
+    /// The search box under the title: type to filter the column.
+    Search,
     /// The `tree` or `priority` word of the title: the order below, and its switch.
     View,
     /// Everything that is not a space, a tab or an agent.
@@ -724,6 +728,28 @@ pub struct Column<'a> {
     /// [`crate::icons::on`] by the painter and the click mapper alike, so both lay a row out
     /// the same; tests say it outright.
     pub icons: bool,
+    /// The keyboard's hold on the column, `None` while it has none: the filter, the pick.
+    pub nav: Option<&'a Nav>,
+}
+
+/// What the keyboard can stand on in the column: a space's rule, or a session's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    Space(i64),
+    Terminal(u32),
+}
+
+/// The column while the keyboard has it: what is typed in the search box, whether typing is
+/// going there, and the row the pick stands on. The filter lives exactly as long as this does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Nav {
+    pub query: String,
+    /// Keys go to the search box rather than to the rows.
+    pub typing: bool,
+    pub pick: Option<Pick>,
+    /// Where the pick stood in [`items`], so a pick that vanished (closed, filtered out)
+    /// lands on its neighbour instead of nowhere.
+    pub at: usize,
 }
 
 /// One row of the column, and what a click on it means.
@@ -816,11 +842,16 @@ pub(crate) fn rows_folded_with(
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
     let (head, feet, body) = parts(c, height, avatar);
-    let mut list = window(content(c), body, c, c.width);
+    // The keys of the column, on the last row of the list while the keyboard has it.
+    let keys = c.nav.filter(|_| body > NAV_MIN_BODY);
+    let mut list = window(content(c), list_rows(c, body), c, c.width);
     if let Some((at, role)) = rule.filter(|(at, _)| *at >= head.len() && !list.is_empty()) {
         list.pop();
         let at = (at - head.len()).min(list.len());
         list.insert(at, (drop_rule(c.width, role), None));
+    }
+    if let Some(nav) = keys {
+        list.push((keys_line(c, nav.typing), None));
     }
     let mut out = head;
     out.extend(list);
@@ -897,9 +928,21 @@ fn parts(
     if head.len() < room {
         head.push((title_line(c), Some(Hit::Title)));
     }
+    if head.len() < room {
+        head.push((search_line(c), Some(Hit::Search)));
+    }
     let body = room - head.len();
     let skip = feet.len() - foot;
     (head, feet.into_iter().skip(skip).collect(), body)
+}
+
+/// The shortest list that still has a row for the keys line while the keyboard has the column.
+const NAV_MIN_BODY: usize = 4;
+
+/// The rows of the list proper out of `body`: the last one is the keys line while the keyboard
+/// has the column and the list is long enough to spare it. Paint, hit test and wheel ask this.
+fn list_rows(c: &Column, body: usize) -> usize {
+    body - usize::from(c.nav.is_some() && body > NAV_MIN_BODY)
 }
 
 /// The first list row after one turn of the wheel over the open column, `step` rows up or
@@ -915,6 +958,7 @@ pub(crate) fn wheeled(
         return 0;
     }
     let (_, _, body) = parts(c, height, avatar);
+    let body = list_rows(c, body);
     let content = content(c);
     let at = first_row(&content, body, c);
     if up {
@@ -935,7 +979,7 @@ pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
         return false;
     }
     let room = height - STAGE_FOOT_ROWS;
-    inbox_height(c, room) + 2 + content(c).len() <= room
+    inbox_height(c, room) + 3 + content(c).len() <= room
 }
 
 /// Whether a picked pet can be drawn at all: it is half blocks in its own inks, so without
@@ -1284,18 +1328,20 @@ fn item_row(c: &Column, item: &Item) -> Line {
 }
 
 /// How many rows the inbox takes at the top of a column with `room` rows above the foot:
-/// none when the title and a row of the tree would not fit under its tab row, one when
-/// folded, else the tab row and as many list rows as were dragged that leave the title and
-/// one tree row. Never more because news came, so the tree stays where it was.
+/// none when the title, the search box and a row of the tree would not fit under its tab row,
+/// one when folded, else the tab row and as many list rows as were dragged that leave the
+/// title, the box and one tree row. Never more because news came, so the tree stays where it
+/// was.
 fn inbox_height(c: &Column, room: usize) -> usize {
-    if room < 3 {
+    if room < 4 {
         return 0;
     }
     if c.inbox.folded {
         return 1;
     }
-    // What is left once its edge, the title and one row of the tree are paid for.
-    1 + c.inbox.rows.max(1).min(room.saturating_sub(4).max(1))
+    // What is left once its edge, the title, the search box and one row of the tree are paid
+    // for.
+    1 + c.inbox.rows.max(1).min(room.saturating_sub(5).max(1))
 }
 
 /// The edge under the inbox: the column's own ember corners, turning up at each end, and its
@@ -1333,13 +1379,14 @@ fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avat
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
-/// its edge, the title and one row of the tree. Zero when the inbox has no list rows to drag.
+/// its edge, the title, the search box and one row of the tree. Zero when the inbox has no
+/// list rows to drag.
 pub(crate) fn inbox_room(
     c: &Column,
     height: usize,
     avatar: Option<&qoop_runtime::avatar::Avatar>,
 ) -> usize {
-    room_of(c, height, avatar).saturating_sub(4)
+    room_of(c, height, avatar).saturating_sub(5)
 }
 
 /// The inbox's first list row after one notch of the wheel over its list, never past
@@ -1481,6 +1528,111 @@ fn title_line(c: &Column) -> Line {
     }
 }
 
+/// The search box under the title, as the settings page draws its own: a `/`, what is typed
+/// (or `search` in the faint ink while nothing is) and, while keys go there, the caret.
+fn search_line(c: &Column) -> Line {
+    use crate::theme::Role;
+    let (query, typing) = c
+        .nav
+        .map_or(("", false), |nav| (nav.query.as_str(), nav.typing));
+    let caret = if typing { "\u{258f}" } else { "" };
+    let lead = " / ";
+    // A search longer than the room shows its end, where the typing is.
+    let room = c.width.saturating_sub(crate::width::width(lead) + 1);
+    let skip = query.chars().count().saturating_sub(room);
+    let tail: String = query.chars().skip(skip).collect();
+    let mut runs = vec![(1, 1, Role::Title)];
+    let text = if query.is_empty() {
+        let at = crate::width::width(lead);
+        if typing {
+            runs.push((at, 1, Role::Brand));
+        }
+        format!("{lead}{caret}search")
+    } else {
+        let end = crate::width::width(lead) + crate::width::width(&tail);
+        runs.push((
+            crate::width::width(lead),
+            crate::width::width(&tail),
+            Role::Focused,
+        ));
+        if typing {
+            runs.push((end, 1, Role::Brand));
+        }
+        format!("{lead}{tail}{caret}")
+    };
+    Line {
+        text: fit(&text, c.width),
+        colour: Some(Role::Faint),
+        runs,
+        ..Line::default()
+    }
+}
+
+/// The keys of the column while the keyboard has it, for the line at its foot: the key, what
+/// it does, and how soon it goes when the line is short, where zero never goes.
+const NAV_KEYS: [(&str, &str, u8); 7] = [
+    ("j/k", "move", 1),
+    ("enter", "open", 2),
+    ("q", "back", 0),
+    ("s", "sleep", 3),
+    ("/", "find", 4),
+    ("x", "close", 5),
+    ("n", "new", 6),
+];
+const TYPING_KEYS: [(&str, &str, u8); 3] = [
+    ("type", "filter", 1),
+    ("enter", "pick", 2),
+    ("esc", "clear", 0),
+];
+
+/// One line of those keys that fits the column: the latest of the highest rank goes first.
+fn keys_line(c: &Column, typing: bool) -> Line {
+    use crate::theme::Role;
+    let mut keys: Vec<(&str, &str, u8)> = if typing {
+        TYPING_KEYS.to_vec()
+    } else {
+        NAV_KEYS.to_vec()
+    };
+    let wide = |keys: &[(&str, &str, u8)]| {
+        1 + keys
+            .iter()
+            .map(|(key, what, _)| crate::width::width(key) + 1 + crate::width::width(what) + 2)
+            .sum::<usize>()
+            - 2
+    };
+    while wide(&keys) > c.width {
+        let Some(worst) = keys
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.2 > 0)
+            .max_by_key(|(at, k)| (k.2, *at))
+            .map(|(at, _)| at)
+        else {
+            break;
+        };
+        keys.remove(worst);
+    }
+    let mut text = String::from(" ");
+    let mut runs = Vec::new();
+    for (at, (key, what, _)) in keys.iter().enumerate() {
+        if at > 0 {
+            text.push_str("  ");
+        }
+        runs.push((
+            crate::width::width(&text),
+            crate::width::width(key),
+            Role::Brand,
+        ));
+        text.push_str(&format!("{key} {what}"));
+    }
+    Line {
+        text: fit(&text, c.width),
+        colour: Some(Role::Faint),
+        runs,
+        ..Line::default()
+    }
+}
+
 /// The word on the right of the title: the order the agents below are in.
 fn title_mode(view: View) -> &'static str {
     match view {
@@ -1492,7 +1644,13 @@ fn title_mode(view: View) -> &'static str {
 /// Every row under the title, before it is scrolled into the rows it gets.
 fn content(c: &Column) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
-    let listed = c.agents.iter().filter(|a| a.agent);
+    let query = query_of(c);
+    let listed = c.agents.iter().filter(|a| {
+        a.agent
+            && fits(query, || {
+                agent_text(a, c.spaces.iter().find(|s| s.id == a.workspace))
+            })
+    });
     match c.view {
         View::Priority => {
             // The same agents sorted so what wants a person is on top. Recency breaks
@@ -1521,7 +1679,14 @@ fn content(c: &Column) -> Vec<Row> {
                 // broken, one that says what would go in it reads as waiting for one.
                 out.push((
                     Line {
-                        text: fit(" no agents yet", c.width),
+                        text: fit(
+                            if query.is_empty() {
+                                " no agents yet"
+                            } else {
+                                NO_MATCH
+                            },
+                            c.width,
+                        ),
                         colour: Some(crate::theme::Role::Faint),
                         ..Line::default()
                     },
@@ -1531,14 +1696,28 @@ fn content(c: &Column) -> Vec<Row> {
         }
         View::Tree => {
             for space in c.spaces {
+                // A space whose own name matches keeps every session; otherwise only the
+                // sessions that match stay, and a space with none leaves the list.
+                let named = fits(query, || space.name.clone());
                 // The agents in the space and nothing else: the column is where agents are
                 // watched, and every tab, shell or agent, is on the bar above the terminal.
                 let tabs: Vec<&AgentRow> = c
                     .agents
                     .iter()
                     .filter(|a| a.workspace == space.id && a.agent)
+                    .filter(|a| named || fits(query, || agent_text(a, Some(space))))
                     .collect();
-                let open = !c.shut.contains(&space.id);
+                let asleep: Vec<&SleepingTab> = space
+                    .sleeping
+                    .iter()
+                    .filter(|t| t.agent.is_some())
+                    .filter(|t| named || fits(query, || sleeping_text(t, space)))
+                    .collect();
+                if !named && tabs.is_empty() && asleep.is_empty() {
+                    continue;
+                }
+                // A search shows what it found, so it opens every fold it finds things in.
+                let open = !query.is_empty() || !c.shut.contains(&space.id);
                 out.push((rule(c, space, &tabs, open), Some(Hit::Space(space.id))));
                 // The rows are laid out for the space's inside, one column in from each edge.
                 let inside = Column {
@@ -1558,7 +1737,7 @@ fn content(c: &Column) -> Vec<Row> {
                 }
                 // A sleeping space has no terminals, only the tabs a wake brings back: one
                 // faint row each, under the same fold as live tabs.
-                for tab in space.sleeping.iter().filter(|t| t.agent.is_some()) {
+                for tab in asleep {
                     if open || tab.terminal == c.focused_terminal {
                         out.push((
                             boxed(sleeping_line(&inside, tab, space), c.width),
@@ -1570,17 +1749,120 @@ fn content(c: &Column) -> Vec<Row> {
             }
             // An agent in a space the client has not heard of yet still draws, under no
             // rule, rather than vanishing until the index catches up.
-            for agent in c
-                .agents
-                .iter()
-                .filter(|a| a.agent && !c.spaces.iter().any(|s| s.id == a.workspace))
-            {
+            for agent in c.agents.iter().filter(|a| {
+                a.agent
+                    && !c.spaces.iter().any(|s| s.id == a.workspace)
+                    && fits(query, || agent_text(a, None))
+            }) {
                 out.push((flat_line(c, agent), Some(Hit::Terminal(agent.terminal))));
                 out.push(second_row(c, agent, DOT_AT + 2, None));
+            }
+            if out.is_empty() && !query.is_empty() {
+                out.push((nothing_found(c.width), None));
             }
         }
     }
     out
+}
+
+/// The row a search that found nothing leaves in the list.
+const NO_MATCH: &str = " nothing matches";
+
+fn nothing_found(width: usize) -> Line {
+    Line {
+        text: fit(NO_MATCH, width),
+        colour: Some(crate::theme::Role::Faint),
+        ..Line::default()
+    }
+}
+
+/// What is typed in the search box, without the blanks around it.
+fn query_of<'a>(c: &Column<'a>) -> &'a str {
+    c.nav.map_or("", |nav| nav.query.trim())
+}
+
+/// Whether every word of `query` is somewhere in the text, in any case. An empty query fits
+/// everything and never builds the text, which is asked on every paint and every click.
+fn fits(query: &str, text: impl FnOnce() -> String) -> bool {
+    if query.split_whitespace().next().is_none() {
+        return true;
+    }
+    let text = text().to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| text.contains(&word.to_lowercase()))
+}
+
+/// Everything the column shows of a session, and the path it runs in, as one text to search.
+fn agent_text(agent: &AgentRow, space: Option<&WorkspaceRow>) -> String {
+    [
+        space.map(|s| s.name.clone()),
+        Some(session_name(agent)),
+        Some(label(agent)),
+        agent.program.clone(),
+        Some(agent.state.clone()),
+        said(agent).map(|(what, _)| what),
+        agent.cwd.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// The same for a tab that sleeps.
+fn sleeping_text(tab: &SleepingTab, space: &WorkspaceRow) -> String {
+    [
+        space.name.as_str(),
+        tab.label(),
+        tab.agent.as_deref().unwrap_or_default(),
+        "sleeping",
+        &tab.cwd,
+    ]
+    .join("\n")
+}
+
+/// What the keyboard can stand on, top to bottom as the column lists it: a space's rule,
+/// a session. Hidden by a fold or a search, a row is not here.
+pub fn items(c: &Column) -> Vec<Pick> {
+    pick_list(&content(c))
+}
+
+fn pick_list(content: &[Row]) -> Vec<Pick> {
+    let mut out: Vec<Pick> = Vec::new();
+    for (_, hit) in content {
+        let pick = match hit {
+            Some(Hit::Space(id)) => Pick::Space(*id),
+            Some(Hit::Terminal(t)) => Pick::Terminal(*t),
+            _ => continue,
+        };
+        if out.last() != Some(&pick) {
+            out.push(pick);
+        }
+    }
+    out
+}
+
+/// Where the pick stands among `items`: where it was left, or else the row that took the
+/// place of one that went (closed, slept away, filtered out).
+pub fn resolve(nav: &Nav, items: &[Pick]) -> Option<Pick> {
+    nav.pick.filter(|pick| items.contains(pick)).or_else(|| {
+        items
+            .get(nav.at.min(items.len().saturating_sub(1)))
+            .copied()
+    })
+}
+
+/// The row the keyboard stands on in this column.
+pub fn picked(c: &Column) -> Option<Pick> {
+    resolve(c.nav?, &items(c))
+}
+
+fn pick_hit(pick: Pick) -> Hit {
+    match pick {
+        Pick::Space(id) => Hit::Space(id),
+        Pick::Terminal(t) => Hit::Terminal(t),
+    }
 }
 
 /// A space's own row: whether it folds, its name and what it holds beside the name, and
@@ -2433,14 +2715,18 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         .iter()
         .any(|s| s.id == agent.workspace && s.keep_awake);
     let at = c.width.saturating_sub(LIVE_TAIL);
-    let cup = if c.icons {
-        crate::icons::CUP.to_string()
+    let (sleep, cup) = if c.icons {
+        (
+            crate::icons::SLEEP.to_string(),
+            crate::icons::CUP.to_string(),
+        )
     } else {
-        "c".to_string()
+        ("z".to_string(), "c".to_string())
     };
-    let text = format!("{} {cup}", fit_to(&text, at));
+    let text = format!("{} {sleep} {cup}", fit_to(&text, at));
+    runs.push((at + 1, 1, crate::theme::Role::Faint));
     runs.push((
-        at + 1,
+        at + 3,
         1,
         if agent.keep_awake {
             crate::theme::Role::Brand
@@ -2465,8 +2751,9 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
 /// The columns the close at the end of an agent's row takes: a blank and the `x`.
 const CLOSE_W: usize = 2;
 
-/// The columns a live agent's row ends in: a blank and the keep awake cup, then the close.
-const LIVE_TAIL: usize = 2 + CLOSE_W;
+/// The columns a live agent's row ends in: a blank and the sleep mark, a blank and the keep
+/// awake cup, then the close.
+const LIVE_TAIL: usize = 2 + 2 + CLOSE_W;
 
 /// An agent's first row, laid out for a space's inside, with its close `x` in the last
 /// column: once boxed, the column the space's own `x` is in. In the controls' grey.
@@ -2490,6 +2777,19 @@ pub fn on_agent_close(col: usize, terminal: u32, c: &Column) -> bool {
                 .iter()
                 .any(|t| t.terminal == terminal && t.agent.is_some())
         }))
+}
+
+/// Whether a click at `col` (counted from one) on the first row of `terminal` lands on a live
+/// agent's sleep mark, two columns left of its cup: that one tab goes to sleep.
+pub fn on_agent_sleep(col: usize, terminal: u32, c: &Column) -> bool {
+    c.view == View::Tree
+        && col + 5 == c.width
+        && c.agents.iter().any(|a| {
+            a.terminal == terminal
+                && a.agent
+                && a.state != "sleeping"
+                && c.spaces.iter().any(|s| s.id == a.workspace)
+        })
 }
 
 /// Whether a click at `col` (counted from one) on the first row of `terminal` lands on a live
@@ -2579,14 +2879,22 @@ fn first_row(content: &[Row], body: usize, c: &Column) -> usize {
     if let Some(at) = c.scroll {
         return at.min(len - body);
     }
-    let target = content
-        .iter()
-        .rposition(|(_, hit)| *hit == Some(Hit::Terminal(c.focused_terminal)))
-        .or_else(|| {
-            content
-                .iter()
-                .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
-        });
+    // The keyboard's pick when it has one, else the focused terminal.
+    let stood = c
+        .nav
+        .and_then(|nav| resolve(nav, &pick_list(content)))
+        .map(|pick| Some(pick_hit(pick)));
+    let target = match stood {
+        Some(hit) => content.iter().rposition(|(_, h)| *h == hit),
+        None => content
+            .iter()
+            .rposition(|(_, hit)| *hit == Some(Hit::Terminal(c.focused_terminal)))
+            .or_else(|| {
+                content
+                    .iter()
+                    .position(|(_, hit)| *hit == Some(Hit::Space(c.focused_space)))
+            }),
+    };
     // The last row of the target goes at the foot of the window at the latest; the
     // rule above it stays on screen whenever the two fit together.
     target.map_or(0, |last| {
@@ -2672,6 +2980,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             let folds = !collapsed && c.view == View::Tree && folds(c, id);
             Some(if folds { Act::Fold(id) } else { Act::Space(id) })
         }
+        Hit::Search => Some(Act::Search),
         Hit::Title => {
             // `+` is the last cell; the order word sits before the space in front of it.
             if col == c.width {
@@ -3464,6 +3773,7 @@ mod tests {
             usage: None,
             scroll: None,
             icons: false,
+            nav: None,
             drawer: None,
         }
     }
@@ -3840,8 +4150,11 @@ mod tests {
             .nth(1)
             .is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
         match text.strip_suffix(" x") {
-            // A live agent's cup before it too.
-            Some(rest) if agent => rest.strip_suffix(" c").unwrap_or(rest).trim_end(),
+            // A live agent's cup before it too, and its sleep mark before the cup.
+            Some(rest) if agent => {
+                let rest = rest.strip_suffix(" c").unwrap_or(rest);
+                rest.strip_suffix(" z").unwrap_or(rest).trim_end()
+            }
             _ => text,
         }
     }
@@ -4278,7 +4591,7 @@ mod tests {
         // A tree that fits never scrolls: the first rule sits under the next row and the
         // title.
         let (spaces, agents) = sample();
-        assert_eq!(hit(&spaces, &agents, 3, 3, 14, 2), Some(Hit::Space(1)));
+        assert_eq!(hit(&spaces, &agents, 3, 3, 15, 3), Some(Hit::Space(1)));
     }
 
     /// The wheel moves a long list past the keyboard's agent, all the way to the last row
@@ -4392,6 +4705,8 @@ mod tests {
                         None
                     } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
                         Some(Hit::Title)
+                    } else if in_tree && text == " / search" {
+                        Some(Hit::Search)
                     } else if text.ends_with('\u{ab}') {
                         // The menu row, the foot's last: the version and `menu «`.
                         Some(Hit::Foot)
@@ -4769,7 +5084,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 9);
         assert!(
             lines.iter().any(|l| l.text.contains("behind")),
             "{:?}",
@@ -4808,7 +5123,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 8);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 9);
         assert!(
             lines.iter().any(|l| l.text.contains("behind docker")),
             "{:?}",
@@ -4825,7 +5140,7 @@ mod tests {
     fn a_wide_name_does_not_cost_the_row_a_space_the_column_put_there() {
         let agents = vec![agent(1, 1, "\u{4e2d}\u{4e2d}", "idle")];
         let spaces = vec![space(1, "\u{4e2d}\u{6587}")];
-        let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
         // The space's own rule: the space after its name is one this module wrote, and
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
@@ -4862,7 +5177,7 @@ mod tests {
             "{:?}",
             row.text
         );
-        assert!(!row.text.contains('z'));
+        assert!(!unbox(&row.text).contains('z'));
     }
 
     fn many_agents() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
@@ -6333,11 +6648,12 @@ mod tests {
     fn the_tree_opens_right_under_the_title() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "idle")];
-        let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
         assert_eq!(rows[0].1, Some(Hit::Tabs));
         assert_eq!(rows[1].1, Some(Hit::Title));
-        assert_eq!(rows[2].1, Some(Hit::Space(1)));
-        assert_eq!(rows[3].1, Some(Hit::Terminal(1)));
+        assert_eq!(rows[2].1, Some(Hit::Search));
+        assert_eq!(rows[3].1, Some(Hit::Space(1)));
+        assert_eq!(rows[4].1, Some(Hit::Terminal(1)));
     }
 
     /// A blocked agent is listed in the inbox at the top, where a person looks first,
@@ -6709,12 +7025,12 @@ mod tests {
         unseen.insert((7, 3));
         // Finished unread, which would be the done sage for a free agent.
         let agents = vec![busy.clone(), free];
-        let rows = tree_rows(&spaces, &agents, 1, 10, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents, 1, 11, &seen, &shut);
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, Role::Background))
         );
-        let rows = tree_rows(&spaces, &agents[1..], 1, 10, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents[1..], 1, 11, &seen, &shut);
         assert_eq!(tree_row(&rows, 8).indicator.map(|i| i.2), Some(Role::Idle));
 
         let column = column(
@@ -7000,18 +7316,18 @@ mod tests {
                 &shut,
             );
             c.usage = Some(&usage);
-            rows_folded(&c, 12, None)
+            rows_folded(&c, 13, None)
         };
         let wide = at(30);
         let row = tree_row(&wide, 1);
-        assert!(row.text.ends_with(" 4% 212M c x "), "{:?}", row.text);
+        assert!(row.text.ends_with(" 4% 212M z c x "), "{:?}", row.text);
         assert!(
             row.runs
                 .iter()
                 .any(|(_, _, r)| *r == crate::theme::Role::Faint)
         );
         assert!(
-            tree_row(&wide, 2).text.ends_with(" 3.0G c x "),
+            tree_row(&wide, 2).text.ends_with(" 3.0G z c x "),
             "{:?}",
             tree_row(&wide, 2).text
         );
@@ -7285,10 +7601,10 @@ mod tests {
                 .take_while(|(_, hit)| *hit != Some(Hit::Title))
                 .count();
             let room = h.saturating_sub(foot);
-            let inbox = if room < 3 {
+            let inbox = if room < 4 {
                 0
             } else {
-                1 + INBOX_ROWS.min(room.saturating_sub(4).max(1))
+                1 + INBOX_ROWS.min(room.saturating_sub(5).max(1))
             };
             // The open inbox's edge, when it and the title both fit.
             let edge = usize::from(inbox > 1 && inbox + 1 < room);
@@ -7344,7 +7660,7 @@ mod tests {
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
         let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
-        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4);
+        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 5);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
 
@@ -7755,7 +8071,7 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let mut agents = vec![agent(1, 1, "sh", "unknown")];
         agents[0].agent = true;
-        let rows = tree_rows(&spaces, &agents, 1, 10, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
         assert_eq!(unbox(&tree_row(&rows, 1).text), " \u{2810}\u{2800}sh");
     }
 
@@ -7765,7 +8081,7 @@ mod tests {
     fn an_unread_done_draws_in_its_space_with_the_done_dot() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "claude", "done")];
-        let rows = tree_rows(&spaces, &agents, 2, 10, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 2, 11, &Seen::new(), &Shut::new());
         assert_eq!(
             tree_row(&rows, 1).indicator,
             Some((BOX_LEAD, 2, crate::theme::of("done")))
@@ -8144,7 +8460,7 @@ mod tests {
         let mut row = agent(1, 1, program, "idle");
         row.cwd = cwd.map(str::to_string);
         second_of(
-            &tree_rows(&spaces, &[row], 9, 10, &Seen::new(), &Shut::new()),
+            &tree_rows(&spaces, &[row], 9, 11, &Seen::new(), &Shut::new()),
             1,
         )
         .clone()
@@ -8200,13 +8516,13 @@ mod tests {
         let rows = tree_rows(&spaces, &[a, b], 9, 16, &Seen::new(), &Shut::new());
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = unboxed(&lines);
-        assert_eq!(texts[2], rule_row(&rows, 1).text.trim_end());
-        assert_eq!(texts[3], " \u{2810}\u{2800}claude");
-        assert_eq!(texts[4], "   \u{2514} claude \u{b7} x");
-        assert!(texts[5].is_empty(), "{texts:?}");
-        assert_eq!(texts[6], rule_row(&rows, 2).text.trim_end());
-        assert_eq!(texts[7], " \u{2810}\u{2800}codex");
-        assert_eq!(texts[8], "   \u{2514} codex \u{b7} x");
+        assert_eq!(texts[3], rule_row(&rows, 1).text.trim_end());
+        assert_eq!(texts[4], " \u{2810}\u{2800}claude");
+        assert_eq!(texts[5], "   \u{2514} claude \u{b7} x");
+        assert!(texts[6].is_empty(), "{texts:?}");
+        assert_eq!(texts[7], rule_row(&rows, 2).text.trim_end());
+        assert_eq!(texts[8], " \u{2810}\u{2800}codex");
+        assert_eq!(texts[9], "   \u{2514} codex \u{b7} x");
     }
 
     /// A long worktree shortens with an ellipsis while the tab keeps every letter it
@@ -8386,7 +8702,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, None, None, HubLink::Up).len() + 2;
+        let least = foot_rows(WIDTH, false, None, None, HubLink::Up).len() + 4;
         for height in [least, least + 1, 10, 14, 30] {
             let rows = rows12(
                 &spaces,
@@ -8545,7 +8861,7 @@ mod tests {
         let idle = agent(8, 1, "claude", "idle");
         assert_eq!(priority_of(&idle, focused, &seen, &unseen), 6);
         // In the tree it wears the mauve mark, and is never next.
-        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 10, &seen, &Shut::new());
+        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 11, &seen, &Shut::new());
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, crate::theme::Role::Sleeping))
@@ -9361,5 +9677,331 @@ mod tests {
             .expect("the rule");
         let accent = rule.1.and(rule.0.accent).expect("the name's run");
         assert_eq!(accent.2, crate::theme::space_calm_of(1), "{:?}", rule.0);
+    }
+    /// A live agent's row ends in the sleep mark, then the cup, then the close; a click on the
+    /// mark's own column is the mark's and no other column of the row is.
+    #[test]
+    fn a_live_agent_row_ends_in_a_sleep_mark_that_is_its_own_click() {
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        let rows = rows_folded(&c, 20, None);
+        let row = tree_row(&rows, 1);
+        assert!(row.text.ends_with(" z c x "), "{:?}", row.text);
+        let on: Vec<usize> = (1..=WIDTH)
+            .filter(|col| on_agent_sleep(*col, 1, &c))
+            .collect();
+        assert_eq!(on, vec![WIDTH - 5]);
+        assert_eq!(row.text.chars().nth(WIDTH - 6), Some('z'));
+        // Not for a terminal that is no agent, and not in the flat order, which has no marks.
+        assert!(!on_agent_sleep(WIDTH - 5, 2, &c));
+        let flat = Column {
+            view: View::Priority,
+            ..c
+        };
+        assert!(!on_agent_sleep(WIDTH - 5, 1, &flat));
+        // With icons the mark is the moon, in the controls' grey.
+        c.icons = true;
+        let rows = rows_folded(&c, 20, None);
+        let row = tree_row(&rows, 1);
+        assert!(row.text.contains(crate::icons::SLEEP), "{:?}", row.text);
+        assert!(
+            row.runs
+                .contains(&(WIDTH - 6, 1, crate::theme::Role::Faint))
+        );
+    }
+
+    /// What the keyboard can stand on, for a search.
+    fn found(spaces: &[WorkspaceRow], agents: &[AgentRow], query: &str, shut: &Shut) -> Vec<Pick> {
+        let (seen, unseen) = (Seen::new(), Unseen::new());
+        let nav = Nav {
+            query: query.to_string(),
+            ..Nav::default()
+        };
+        let mut c = column(
+            spaces,
+            agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            shut,
+        );
+        c.nav = Some(&nav);
+        items(&c)
+    }
+
+    /// An empty search shows everything; a word finds a session, a state or a path; the name
+    /// of a space keeps all of it; every word has to be found; a fold opens to show a find.
+    #[test]
+    fn a_search_keeps_what_matches_and_a_space_whose_name_matches() {
+        use Pick::{Space, Terminal};
+        let (spaces, mut agents) = sample();
+        agents[0].cwd = Some("/home/u/app-feat-x".into());
+        let shut = Shut::new();
+        assert_eq!(
+            found(&spaces, &agents, "", &shut),
+            [Space(1), Terminal(1), Space(2), Terminal(3), Space(3)]
+        );
+        assert_eq!(
+            found(&spaces, &agents, "codex", &shut),
+            [Space(2), Terminal(3)]
+        );
+        assert_eq!(
+            found(&spaces, &agents, "CODEX", &shut),
+            [Space(2), Terminal(3)]
+        );
+        assert_eq!(
+            found(&spaces, &agents, "feat-x", &shut),
+            [Space(1), Terminal(1)]
+        );
+        assert_eq!(
+            found(&spaces, &agents, "idle", &shut),
+            [Space(2), Terminal(3)]
+        );
+        assert_eq!(
+            found(&spaces, &agents, "pers", &shut),
+            [Space(2), Terminal(3)]
+        );
+        assert_eq!(found(&spaces, &agents, "dub", &shut), [Space(3)]);
+        assert_eq!(
+            found(&spaces, &agents, "app working", &shut),
+            [Space(1), Terminal(1)]
+        );
+        assert_eq!(found(&spaces, &agents, "app idle", &shut), []);
+        assert_eq!(
+            found(&spaces, &agents, "  ", &shut).len(),
+            5,
+            "blanks are no search"
+        );
+        let mut folded = Shut::new();
+        folded.insert(2);
+        assert_eq!(
+            found(&spaces, &agents, "", &folded).len(),
+            4,
+            "a fold hides"
+        );
+        assert_eq!(
+            found(&spaces, &agents, "codex", &folded),
+            [Space(2), Terminal(3)]
+        );
+    }
+
+    /// A search that finds nothing says so in the list, in the tree and in the priority order.
+    #[test]
+    fn a_search_that_finds_nothing_says_so() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let nav = Nav {
+            query: "zzz".into(),
+            ..Nav::default()
+        };
+        for view in [View::Tree, View::Priority] {
+            let mut c = column(
+                &spaces, &agents, 1, 1, 0, view, &seen, &unseen, NOW, WIDTH, &shut,
+            );
+            c.nav = Some(&nav);
+            let rows = rows_folded(&c, 20, None);
+            assert!(
+                texts(&rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>())
+                    .iter()
+                    .any(|t| t == NO_MATCH.trim_end()),
+                "{view:?}"
+            );
+        }
+    }
+
+    /// The pick stays where it was left, and lands on the row that took the place of one that
+    /// went (closed, slept away, filtered out) rather than on nothing.
+    #[test]
+    fn the_pick_lands_on_a_neighbour_when_its_row_goes() {
+        use Pick::{Space, Terminal};
+        let items = [Space(1), Terminal(1), Space(2), Terminal(3)];
+        let nav = |pick, at| Nav {
+            pick: Some(pick),
+            at,
+            ..Nav::default()
+        };
+        assert_eq!(resolve(&nav(Terminal(3), 3), &items), Some(Terminal(3)));
+        assert_eq!(resolve(&nav(Terminal(9), 2), &items), Some(Space(2)));
+        assert_eq!(resolve(&nav(Terminal(9), 40), &items), Some(Terminal(3)));
+        assert_eq!(resolve(&nav(Terminal(9), 0), &[]), None);
+    }
+
+    /// The search box is a row under the title that a click focuses: the settings page's
+    /// `/`, the placeholder in the faint ink, the typed words with the caret while typing.
+    #[test]
+    fn the_search_box_sits_under_the_title_and_shows_the_query() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let rows = rows_folded(&c, 20, None);
+        let at = rows
+            .iter()
+            .position(|(_, h)| *h == Some(Hit::Title))
+            .expect("a title");
+        assert_eq!(rows[at + 1].1, Some(Hit::Search));
+        assert_eq!(rows[at + 1].0.text.trim_end(), " / search");
+        assert_eq!(act(Hit::Search, 3, &c, false), Some(Act::Search));
+        let nav = Nav {
+            query: "co".into(),
+            typing: true,
+            ..Nav::default()
+        };
+        c.nav = Some(&nav);
+        let line = search_line(&c);
+        assert_eq!(line.text.trim_end(), " / co\u{258f}");
+        assert_eq!(crate::width::width(&line.text), WIDTH);
+        assert!(line.runs.contains(&(3, 2, crate::theme::Role::Focused)));
+        assert!(line.runs.contains(&(5, 1, crate::theme::Role::Brand)));
+        // A query longer than the room shows its end, where the typing is.
+        let long = Nav {
+            query: "x".repeat(80) + "end",
+            typing: true,
+            ..Nav::default()
+        };
+        c.nav = Some(&long);
+        let line = search_line(&c);
+        assert_eq!(crate::width::width(&line.text), WIDTH);
+        assert!(
+            line.text.trim_end().ends_with("end\u{258f}"),
+            "{:?}",
+            line.text
+        );
+    }
+
+    /// While the keyboard has the column, the last row of the list names its keys, as many as
+    /// fit, the way out among the first; the list still ends in the same foot.
+    #[test]
+    fn the_keys_line_is_the_last_row_of_the_list_while_the_keyboard_has_the_column() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let plain = rows_folded(&c, 24, None);
+        let nav = Nav::default();
+        c.nav = Some(&nav);
+        let rows = rows_folded(&c, 24, None);
+        assert_eq!(rows.len(), plain.len());
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let line = &rows[rows.len() - foot - 1].0;
+        assert!(
+            line.text.contains("j/k move  enter open  q back"),
+            "{:?}",
+            line.text
+        );
+        assert_eq!(
+            rows[rows.len() - 1].0,
+            plain[plain.len() - 1].0,
+            "the foot is the foot"
+        );
+        for width in [SIDEBAR_MIN, 30, 60] {
+            for typing in [false, true] {
+                let line = keys_line(&Column { width, ..c }, typing);
+                assert_eq!(crate::width::width(&line.text), width);
+                let want = if typing { "esc clear" } else { "q back" };
+                assert!(line.text.contains(want), "{width}: {:?}", line.text);
+            }
+        }
+        // The keys are never drawn into a list too short to spare the row.
+        let short = rows_folded(&c, foot + 6, None);
+        assert!(!short.iter().any(|(l, _)| l.text.contains("j/k move")));
+    }
+
+    /// The pick scrolls the list: a row far down is brought into the window.
+    #[test]
+    fn the_window_follows_the_pick() {
+        let spaces: Vec<WorkspaceRow> = (1..=10).map(|n| space(n, &format!("s{n}"))).collect();
+        let agents: Vec<AgentRow> = (1..=30u32)
+            .map(|n| agent(n, i64::from((n - 1) / 3 + 1), "claude", "idle"))
+            .collect();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let nav = Nav {
+            pick: Some(Pick::Terminal(27)),
+            ..Nav::default()
+        };
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        c.nav = Some(&nav);
+        let rows = rows_folded(&c, 15, None);
+        assert!(rows.iter().any(|(_, h)| *h == Some(Hit::Terminal(27))));
+        assert!(!rows.iter().any(|(_, h)| *h == Some(Hit::Terminal(1))));
+    }
+    /// With the inbox dragged as tall as it goes, the title, the search box and a row of the
+    /// tree are still on the column.
+    #[test]
+    fn an_inbox_dragged_to_its_limit_leaves_the_search_box_and_a_tree_row() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = opened(column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        ));
+        c.inbox.rows = 99;
+        for height in [12, 14, 20, 30] {
+            let rows = rows_folded(&c, height, None);
+            assert_eq!(rows.len(), height);
+            let hits: Vec<Option<Hit>> = rows.iter().map(|(_, h)| *h).collect();
+            assert!(hits.contains(&Some(Hit::Title)), "{height}");
+            assert!(hits.contains(&Some(Hit::Search)), "{height}");
+            let tree = |hits: &[Option<Hit>]| {
+                hits.iter()
+                    .any(|h| matches!(h, Some(Hit::Space(_) | Hit::Terminal(_))))
+            };
+            assert!(tree(&hits), "{height}: no tree row");
+            let room = inbox_room(&c, height, None);
+            c.inbox.rows = room;
+            let rows = rows_folded(&c, height, None);
+            let hits: Vec<Option<Hit>> = rows.iter().map(|(_, h)| *h).collect();
+            assert!(tree(&hits), "{height}: dragged to {room}");
+            c.inbox.rows = 99;
+        }
     }
 }

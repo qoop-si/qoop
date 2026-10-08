@@ -143,6 +143,8 @@ pub struct Chrome<'a> {
     pub inbox: sidebar::Inbox,
     /// A row held by the mouse and moving, drawn while it is carried.
     pub drag: Option<&'a DragPaint>,
+    /// The keyboard's hold on the column: its filter and the row it stands on.
+    pub nav: Option<&'a sidebar::Nav>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -183,6 +185,7 @@ impl Default for Chrome<'_> {
             list_scroll: None,
             inbox: sidebar::Inbox::default(),
             drag: None,
+            nav: None,
         }
     }
 }
@@ -227,6 +230,7 @@ impl Frame<'_> {
             scroll: self.chrome.list_scroll,
             inbox: self.chrome.inbox,
             icons: crate::icons::on(),
+            nav: self.chrome.nav,
         }
     }
 }
@@ -806,6 +810,8 @@ pub fn paint(frame: &Frame) -> String {
         .map(|r| r.workspace);
     // The rows of the keyboard's agent: an ember line down their first column, in place of
     // a raised background.
+    // The row the keyboard's own pick stands on while the column has the keyboard.
+    let stood = sidebar::picked(&column);
     let picked: Vec<usize> = panel
         .iter()
         .enumerate()
@@ -855,11 +861,17 @@ pub fn paint(frame: &Frame) -> String {
             let selected = match hit {
                 // A tab with no agent has no row in the column, so the keyboard on one is
                 // shown on its space's rule instead: the column always says where it is.
+                // While the keyboard has the column, its pick is the one raised row.
+                Some(sidebar::Hit::Space(space)) if column.nav.is_some() => {
+                    stood == Some(sidebar::Pick::Space(*space))
+                }
                 Some(sidebar::Hit::Space(space)) => shell_space == Some(*space),
-                // The keyboard's agent is marked by its ember line, not a background.
-                Some(sidebar::Hit::Terminal(_))
-                | Some(
+                // The keyboard's agent is marked by its ember line, and raised only when the
+                // column's own pick stands on it.
+                Some(sidebar::Hit::Terminal(t)) => stood == Some(sidebar::Pick::Terminal(*t)),
+                Some(
                     sidebar::Hit::Title
+                    | sidebar::Hit::Search
                     | sidebar::Hit::Foot
                     | sidebar::Hit::Next(_)
                     | sidebar::Hit::Tabs,
@@ -2149,6 +2161,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree or rank"),
+            ("a", "agents column"),
         ],
     ),
     (
@@ -2450,6 +2463,24 @@ pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
     ("=", "equalize"),
     ("esc", "done"),
 ];
+
+/// The agents column's keys while the keyboard has it, for the notice row.
+pub(crate) const SIDE_HINT: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("enter", "open"),
+    ("/", "search"),
+    ("s", "sleep"),
+    ("S", "all"),
+    ("w", "wake"),
+    ("n", "new"),
+    ("x", "close"),
+    ("f", "fold"),
+    ("q", "back"),
+];
+
+/// The same while the search box has the typing.
+pub(crate) const SEARCH_HINT: &[(&str, &str)] =
+    &[("type", "filter"), ("enter", "pick"), ("esc", "clear")];
 
 /// Copy mode's keys, for the notice row while it has nothing else to say.
 pub(crate) const COPY_HINT: &[(&str, &str)] = &[
@@ -5118,7 +5149,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 39;
+    const COMMANDS: usize = 40;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5176,6 +5207,7 @@ mod tests {
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
             Action::QassPage => (const { place(38) }, Some("ctrl-a Q")),
+            Action::Agents => (const { place(39) }, Some("ctrl-a a")),
         }
     }
 
@@ -5239,6 +5271,7 @@ mod tests {
             Action::Answer,
             Action::Sleep,
             Action::UpNext,
+            Action::Agents,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -6380,6 +6413,7 @@ mod tests {
                 usage: None,
                 scroll: None,
                 icons: false,
+                nav: None,
             },
             44,
         );
