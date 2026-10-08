@@ -595,25 +595,27 @@ pub(crate) fn avatar_overlay_paint(
     out
 }
 
-/// The pet stamped in an empty inbox: its lit rows from the first list row down, two cells
-/// in from the column's edge, where the inbox's rows left room for it.
-pub(crate) fn inbox_pet_paint(
-    avatar: Option<&qoop_runtime::avatar::Avatar>,
-    lit: usize,
-    colour: bool,
-) -> String {
-    let Some(pet) = avatar else {
+/// The version on the menu row, written again as a link to the site (`OSC 8`), for the outer
+/// terminal to open on its own click. Stamped over the same cells in the same ink, so the
+/// column looks as it did; empty where the row does not show the version, the column is
+/// folded, or the target is not safe to write.
+pub(crate) fn version_link_paint(column_rows: usize, collapsed: bool, width: usize) -> String {
+    let (Some(col), false, true) = (sidebar::version_link_at(width), collapsed, column_rows > 0)
+    else {
         return String::new();
     };
-    let (_, art) = sidebar::avatar_overlay(pet, colour);
-    let skip = art.len().saturating_sub(lit);
-    let mut out = String::new();
-    for (i, row) in art.iter().skip(skip).enumerate() {
-        // The tab row is the inbox's first; the list starts under it.
-        out.push_str(&at(SIDEBAR_TOP + 1 + i, 3));
-        out.push_str(row);
-    }
-    out
+    let Some(uri) = crate::hyperlink::clean_uri(sidebar::SITE) else {
+        return String::new();
+    };
+    format!(
+        "{}{}{}{}{}{}",
+        at(SIDEBAR_TOP + column_rows - 1, col + 1),
+        theme::fg(theme::Role::Faint),
+        crate::hyperlink::open(uri),
+        sidebar::VERSION,
+        crate::hyperlink::CLOSE,
+        theme::RESET,
+    )
 }
 
 /// Where a real picture's top-left cell goes: the focused pane's first row, one based.
@@ -984,6 +986,16 @@ pub fn paint(frame: &Frame) -> String {
         }
     }
 
+    // The version links to the site: an overlay on the menu row, so the column's own rows stay
+    // plain text for every gate.
+    if wide_enough && !spotlight {
+        out.push_str(&version_link_paint(
+            column_rows,
+            frame.collapsed,
+            frame.sidebar_width,
+        ));
+    }
+
     // Two lines, not one. The keys never change and the notice always does, and one row
     // carrying both meant the key list vanished exactly when something went wrong: a person
     // who has just been told a terminal is blocked is the same person who then cannot see
@@ -1114,21 +1126,17 @@ pub fn paint(frame: &Frame) -> String {
     // floating overlays, so an open palette covers it the way it covers
     // terminal text.
     // Only where the column gave the pet its rows: the list comes first.
-    // With nothing waiting it stands in the inbox instead, whether or not the foot had room.
-    if wide_enough && !frame.collapsed {
+    if wide_enough && !frame.collapsed && sidebar::pet_shown(&column, column_rows, avatar.is_some())
+    {
         let colour = crate::colorlevel::level() != crate::colorlevel::Level::Mono && !spotlight;
-        if let Some((_, lit)) = sidebar::pet_in_inbox(&column, column_rows, avatar.as_ref()) {
-            out.push_str(&inbox_pet_paint(avatar.as_ref(), lit, colour));
-        } else if sidebar::pet_shown(&column, column_rows, avatar.is_some()) {
-            out.push_str(&avatar_overlay_paint(
-                column_rows,
-                frame.sidebar_width,
-                frame.collapsed,
-                wide_enough,
-                avatar.as_ref(),
-                colour,
-            ));
-        }
+        out.push_str(&avatar_overlay_paint(
+            column_rows,
+            frame.sidebar_width,
+            frame.collapsed,
+            wide_enough,
+            avatar.as_ref(),
+            colour,
+        ));
     }
 
     // A carried row over everything the column and the panes drew, and under every box a
@@ -3400,6 +3408,28 @@ mod tests {
         assert!(
             avatar_overlay_paint(38, sidebar::WIDTH, false, true, Some(&pet), false).is_empty()
         );
+    }
+
+    /// The version on the menu row is written again as an OSC 8 link to the site, over the
+    /// cells the column already drew it in, and nowhere else.
+    #[test]
+    fn the_version_on_the_menu_row_is_a_link_to_the_site() {
+        let out = version_link_paint(38, false, sidebar::WIDTH);
+        let row = SIDEBAR_TOP + 38 - 1;
+        assert_eq!(
+            out,
+            format!(
+                "{}{}\x1b]8;;https://qoop.si\x1b\\{}{}{}",
+                at(row, 2),
+                theme::fg(theme::Role::Faint),
+                sidebar::VERSION,
+                crate::hyperlink::CLOSE,
+                theme::RESET,
+            )
+        );
+        // Folded, or too short to have a menu row: no bytes.
+        assert!(version_link_paint(38, true, sidebar::WIDTH).is_empty());
+        assert!(version_link_paint(0, false, sidebar::WIDTH).is_empty());
     }
 
     /// A screen relayed from another machine can hold an escape in a cell. The styled path

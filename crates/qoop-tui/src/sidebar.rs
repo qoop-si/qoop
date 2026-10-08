@@ -431,9 +431,8 @@ impl InboxTab {
     }
 }
 
-/// The inbox's list rows before anyone drags its edge: as tall as the pet, so any pet can
-/// stand in an empty inbox.
-pub const INBOX_ROWS: usize = qoop_runtime::avatar::ART_ROWS;
+/// The inbox's list rows before anyone drags its edge.
+pub const INBOX_ROWS: usize = 3;
 
 /// The rows above the title of an open inbox at its first height: the tab row, its list
 /// and the edge under it.
@@ -873,14 +872,13 @@ fn parts(
 ) -> (Vec<Row>, Vec<Row>, usize) {
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
-    let pet = pet_in_foot(c, height, avatar);
+    let stage = pet_shown(c, height, avatar.is_some()).then(|| inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let feet = foot_rows(c.width, pet, update_available().as_deref());
+    let feet = foot_rows(c.width, stage, update_available().as_deref());
     let foot = feet.len().min(height);
     let room = height - foot;
-    let pet_cols = pet_in_inbox(c, height, avatar).map(|(cols, _)| cols);
-    let mut head = inbox_rows(c, inbox_height(c, room), pet_cols);
+    let mut head = inbox_rows(c, inbox_height(c, room));
     // The open inbox's edge, then the title: the edge first when both fit, so the inbox
     // reads as its own tray above the tree. Folded to its one row, it needs none.
     if head.len() > 1 && head.len() + 1 < room {
@@ -916,63 +914,18 @@ pub(crate) fn wheeled(
     }
 }
 
-/// Whether the pet stands in the foot: it fits the column, and the whole list still fits
-/// above it. The pet is decoration and the list is not: when the agents need the rows,
-/// the pet gives them up rather than push anyone off the column.
+/// Whether the pet stands in the foot, with the inbox count box above it: it fits the
+/// column, and the whole list still fits above it. The pet is decoration and the list is
+/// not: when the agents need the rows, the pet gives them up rather than push anyone off the
+/// column.
 /// The column and the painter ask this one question, so the art never lands on a row the
 /// list was given.
 pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
     if !pet_drawn(present) || !avatar_fits(height, c.width, present) {
         return false;
     }
-    let room = height - PET_FOOT_ROWS;
+    let room = height - STAGE_FOOT_ROWS;
     inbox_height(c, room) + 2 + content(c).len() <= room
-}
-
-/// Where the pet stands in an empty inbox instead of the foot: its width in cells and the
-/// rows it lights, when it does. Only on the all list with nothing waiting, and only where it
-/// fits beside `nothing needs you` in the list rows the inbox has. Whether the foot had room
-/// for it does not matter: the inbox's rows are there anyway. The foot gives back the pet's
-/// rows while the pet is up here; the foot only ever had them while the whole list fit, so
-/// the tree's rows stay where they were.
-pub(crate) fn pet_in_inbox(
-    c: &Column,
-    height: usize,
-    avatar: Option<&qoop_runtime::avatar::Avatar>,
-) -> Option<(usize, usize)> {
-    let pet = avatar?;
-    if c.inbox.folded
-        || c.inbox.tab != InboxTab::All
-        || !pet_drawn(true)
-        || !inbox_items(c, InboxTab::All).is_empty()
-    {
-        return None;
-    }
-    // Measured against the foot without the pet, which is the foot it leaves behind.
-    let foot = foot_rows(c.width, false, update_available().as_deref()).len();
-    let rows = inbox_height(c, height.saturating_sub(foot)).saturating_sub(1);
-    let (cols, _) = avatar_overlay(pet, true);
-    let lit = pet_lit_rows(pet);
-    (lit > 0 && lit <= rows && 2 + cols + 2 + NOTHING.len() < c.width).then_some((cols, lit))
-}
-
-/// Whether the pet stands in the foot: where [`pet_shown`] gives it the rows, unless it is
-/// up in an empty inbox.
-pub(crate) fn pet_in_foot(
-    c: &Column,
-    height: usize,
-    avatar: Option<&qoop_runtime::avatar::Avatar>,
-) -> bool {
-    pet_shown(c, height, avatar.is_some()) && pet_in_inbox(c, height, avatar).is_none()
-}
-
-/// The rows of the pet's art from its first lit one down: its feet are always on the last.
-pub(crate) fn pet_lit_rows(pet: &qoop_runtime::avatar::Avatar) -> usize {
-    let cells = qoop_runtime::avatar::art_cells(pet);
-    cells
-        .iter()
-        .position(|row| row.iter().any(|cell| *cell != (None, None)))
-        .map_or(0, |first| cells.len() - first)
 }
 
 /// Whether a picked pet can be drawn at all: it is half blocks in its own inks, so without
@@ -1358,8 +1311,8 @@ fn tray_line(width: usize) -> Line {
 
 /// The rows above the foot in a column of `height` rows: the inbox, the title and the list.
 fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avatar>) -> usize {
-    let pet = pet_in_foot(c, height, avatar);
-    height.saturating_sub(foot_rows(c.width, pet, update_available().as_deref()).len())
+    let stage = pet_shown(c, height, avatar.is_some()).then_some(0);
+    height.saturating_sub(foot_rows(c.width, stage, update_available().as_deref()).len())
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
@@ -1390,9 +1343,8 @@ pub(crate) fn inbox_wheeled(
     }
 }
 
-/// The inbox's rows: the tab row, then `height - 1` list rows, the pet's lead kept clear
-/// when the pet stands in an empty inbox.
-fn inbox_rows(c: &Column, height: usize, pet_cols: Option<usize>) -> Vec<Row> {
+/// The inbox's rows: the tab row, then `height - 1` list rows.
+fn inbox_rows(c: &Column, height: usize) -> Vec<Row> {
     use crate::theme::Role;
     if height == 0 {
         return Vec::new();
@@ -1407,7 +1359,7 @@ fn inbox_rows(c: &Column, height: usize, pet_cols: Option<usize>) -> Vec<Row> {
     if items.is_empty() {
         // Nothing on this list. On all, nothing waits on the person at all, which is worth
         // saying in words; any other list just has nobody on it.
-        let indent = pet_cols.map_or(1, |cols| 2 + cols + 2);
+        let indent = 1;
         let said = if c.inbox.tab == InboxTab::All {
             NOTHING
         } else {
@@ -1690,9 +1642,11 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         slots.push(String::new());
         slots
     };
-    // A space of another machine wears the remote mark before its name, in the colour of
-    // its link, where icons are drawn; not while it asks, when the question needs the room.
-    let remote = (c.icons && !armed)
+    // A space of another machine wears a dot before its name, in the colour of its link
+    // (green connected, dim parked, warm when it does not answer), and the remote mark
+    // before the dot where icons are drawn; not while it asks, when the question needs the
+    // room.
+    let remote = (!armed)
         .then_some(space.link)
         .flatten()
         .map(|link| match link {
@@ -1700,7 +1654,8 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
             qoop_runtime::control::LinkState::Parked => Role::Faint,
             _ => Role::Blocked,
         });
-    let lead = if remote.is_some() { 2 } else { 0 };
+    let glyph = if c.icons { 2 } else { 0 };
+    let lead = if remote.is_some() { glyph + 2 } else { 0 };
     // The columns a name has once the fold, the mark and the slot are paid for.
     let room = |slot: &str| {
         left_w
@@ -1726,7 +1681,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         runs.push((0, 1, Role::Faint));
     }
     if let Some(role) = remote {
-        runs.push((NAME_AT, 1, role));
+        if c.icons {
+            runs.push((NAME_AT, 1, role));
+        }
+        runs.push((NAME_AT + glyph, 1, role));
     }
     if !slot.is_empty() {
         runs.push((
@@ -1740,10 +1698,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     };
     runs = runs.into_iter().filter_map(clip).collect();
     let accent = clip((NAME_AT + lead, name_w, ink));
-    let prefix = if remote.is_some() {
-        format!("{} ", crate::icons::REMOTE)
-    } else {
-        String::new()
+    let prefix = match (remote.is_some(), c.icons) {
+        (true, true) => format!("{} {ONLINE} ", crate::icons::REMOTE),
+        (true, false) => format!("{ONLINE} "),
+        (false, _) => String::new(),
     };
     let left = fit(&format!("{fold}{prefix}{name}{slot}"), left_w);
     // The cells of the block, all in the fold's faint grey: controls are furniture, the
@@ -2975,10 +2933,10 @@ pub(crate) fn current_avatar() -> Option<qoop_runtime::avatar::Avatar> {
 }
 
 /// Whether the pet itself fits in the foot: open column, wide enough for the thick q and the
-/// widest pet beside it ([`Q_PET_WIDTH`]), tall enough that the foot still leaves six rows
-/// of list.
+/// widest pet beside it ([`Q_PET_WIDTH`]), tall enough that the foot with its count box
+/// still leaves six rows of list.
 pub(crate) fn avatar_fits(height: usize, width: usize, present: bool) -> bool {
-    present && width >= Q_PET_WIDTH && height >= PET_FOOT_ROWS + 6
+    present && width >= Q_PET_WIDTH && height >= STAGE_FOOT_ROWS + 6
 }
 
 /// The widest pet once trimmed to the columns it lights, in cells.
@@ -2986,6 +2944,10 @@ pub(crate) const PET_COLS: usize = 8;
 /// The foot with the pet in it: the pet's five half-block rows standing on the menu row.
 /// The same for every avatar, so the words sit in the same rows whatever the pet is.
 pub(crate) const PET_FOOT_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 1;
+/// The rows of the box that shows the inbox count: a border, the number, a border.
+const COUNT_BOX_ROWS: usize = 3;
+/// The foot with the pet standing: the count box over the pet's rows and the menu row.
+pub(crate) const STAGE_FOOT_ROWS: usize = COUNT_BOX_ROWS + PET_FOOT_ROWS;
 
 /// The pet as itself: its five half-block rows (a cell is two pixels, drawn as
 /// [`qoop_runtime::avatar::paint`] says), trimmed to the columns any row lights, the
@@ -3073,41 +3035,52 @@ const Q_FOOT_ROWS: usize = Q_LOGO.len() + 1;
 /// has room for the pet.
 const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 
-/// The foot of the open column, its last row always the menu row: the version at the left
-/// and `menu « ` at the right.
+/// The foot of the open column, its last row always the menu row: the version and the online
+/// dot at the left and `menu « ` at the right.
 ///
 /// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
-/// in ember. While the pet stands (`pet`) one blank row goes on top and the pet stands at the
-/// right of the foot's first five rows (stamped by the overlay), its feet on the row above
-/// the menu.
+/// in ember. While the pet stands (`stage` is the inbox count) one blank row goes on top and
+/// the pet stands at the right of the foot's first five rows (stamped by the overlay), its
+/// feet on the row above the menu. Over the pet sits a small box with the count alone.
 ///
 /// ```text
+///                  ╭───╮
+///                  │ 2 │
+///                  ╰───╯
 ///               ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///  ●   ●        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///      ●        ▀▀▀▀▀▀
-///  0.5.0  settings  menu «
+///  0.5.0 ●  settings  menu «
 /// ```
 ///
 /// A dot is a plain `●`, which every terminal draws. Whatever the pet, the words sit in the
 /// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
 /// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
 /// rows are text and answer nothing.
-fn foot_rows(width: usize, pet: bool, update: Option<&str>) -> Vec<Row> {
+fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>) -> Vec<Row> {
     use crate::theme::Role;
     let tail = foot_tail(width);
     // The menu closes the last row: `menu « ` flush right, `settings` and the version before it.
-    let lead = version_text(width, crate::width::width(&tail), update);
+    let version = version_text(width, crate::width::width(&tail), update);
+    // The interface is connected to its daemon whenever it is drawn: it ends with the stream.
+    let dotted = format!("{version} {ONLINE}");
+    let online = (!version.is_empty()
+        && crate::width::width(&dotted) + 1 + crate::width::width(&tail) <= width)
+        .then(|| crate::width::width(&version) + 1);
+    let lead = if online.is_some() { dotted } else { version };
     let gap = width.saturating_sub(crate::width::width(&lead) + crate::width::width(&tail));
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
+        runs: online.map(|at| (at, 1, Role::Done)).into_iter().collect(),
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
-    let mut out: Vec<Row> = Vec::with_capacity(PET_FOOT_ROWS);
-    if pet {
+    let mut out: Vec<Row> = Vec::with_capacity(STAGE_FOOT_ROWS);
+    if let Some(count) = stage {
+        out.extend(count_box(width, count));
         out.extend((0..PET_FOOT_ROWS - Q_FOOT_ROWS).map(|_| blank(width)));
     }
     out.extend(Q_LOGO.iter().enumerate().map(|(row, dots)| {
@@ -3128,6 +3101,67 @@ fn foot_rows(width: usize, pet: bool, update: Option<&str>) -> Vec<Row> {
     out
 }
 
+/// The `●` that says the interface is connected to its daemon.
+const ONLINE: char = '\u{25cf}';
+
+/// The box over the pet with the inbox count alone, flush right with the pet's right edge:
+/// one blank cell of margin before the column's edge, as the pet keeps. The number is warm
+/// while anything waits and quiet at zero.
+fn count_box(width: usize, count: usize) -> Vec<Row> {
+    use crate::theme::Role;
+    let inner = format!(" {count} ");
+    let across = crate::width::width(&inner);
+    let at = width.saturating_sub(across + 3);
+    let row = |text: String, runs: Vec<(usize, usize, Role)>| {
+        let line = Line {
+            text: fit(&format!("{}{text}", " ".repeat(at)), width),
+            colour: Some(Role::Faint),
+            runs,
+            ..Line::default()
+        };
+        (line, None)
+    };
+    let edge = |l: char, r: char| format!("{l}{}{r}", "\u{2500}".repeat(across));
+    let number = if count > 0 {
+        Role::Blocked
+    } else {
+        Role::Faint
+    };
+    vec![
+        row(
+            edge('\u{256d}', '\u{256e}'),
+            vec![(at, across + 2, Role::Rule)],
+        ),
+        row(
+            format!("\u{2502}{inner}\u{2502}"),
+            vec![
+                (at, 1, Role::Rule),
+                (at + 1, across, number),
+                (at + 1 + across, 1, Role::Rule),
+            ],
+        ),
+        row(
+            edge('\u{2570}', '\u{256f}'),
+            vec![(at, across + 2, Role::Rule)],
+        ),
+    ]
+}
+
+/// Where the version starts on the menu row, when the row shows it: the column its link
+/// covers. The word is [`VERSION`]; a newer version after it is not part of the link.
+pub(crate) fn version_link_at(width: usize) -> Option<usize> {
+    let tail = foot_tail(width);
+    let shown = version_text(
+        width,
+        crate::width::width(&tail),
+        update_available().as_deref(),
+    );
+    (!shown.is_empty()).then_some(1)
+}
+
+/// Where this program lives on the web, which the version links to.
+pub(crate) const SITE: &str = "https://qoop.si";
+
 /// The version as the menu row opens with it: ` 0.5.0`, or ` 0.5.0>0.6.0` when a newer
 /// one was seen, beside a tail of `tail` columns with at least a space between. A version
 /// cut short reads as another version, so each form shows whole or not at all: the notice
@@ -3142,7 +3176,7 @@ fn version_text(width: usize, tail: usize, update: Option<&str>) -> String {
 }
 
 /// Which build this is, read from the crate rather than written down twice.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A newer version `qoop update --check` saw, when it saw one, as [`refresh_files`]
 /// last read it.
@@ -4851,7 +4885,7 @@ mod tests {
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The q alone, its tail in ember, then the menu.
-        let rows = foot_rows(WIDTH, false, None);
+        let rows = foot_rows(WIDTH, None, None);
         assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
@@ -4909,21 +4943,59 @@ mod tests {
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
-    /// A standing pet only adds blank rows above the words, so the words sit in the same rows
-    /// counted from the bottom whether the pet stands or gives its rows to the list.
+    /// A standing pet only adds rows above the words (the count box and a blank one), so the
+    /// words sit in the same rows counted from the bottom whether the pet stands or gives its
+    /// rows to the list.
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, false, None);
-            let stands = foot_rows(width, true, None);
-            assert_eq!(stands.len(), PET_FOOT_ROWS);
-            let blanks = PET_FOOT_ROWS - gave_way.len();
-            for (line, hit) in &stands[..blanks] {
+            let gave_way = foot_rows(width, None, None);
+            let stands = foot_rows(width, Some(0), None);
+            assert_eq!(stands.len(), STAGE_FOOT_ROWS);
+            let added = STAGE_FOOT_ROWS - gave_way.len();
+            let blank_at = COUNT_BOX_ROWS;
+            for (line, hit) in &stands[blank_at..added] {
                 assert_eq!(line.text, " ".repeat(width), "{line:?}");
                 assert_eq!(*hit, None);
             }
-            assert_eq!(&stands[blanks..], &gave_way[..], "width {width}");
+            assert_eq!(&stands[added..], &gave_way[..], "width {width}");
         }
+    }
+
+    /// The menu row shows the version and, right after it, the green online dot, while the
+    /// tail keeps its place at the right; the link starts where the version does.
+    #[test]
+    fn the_menu_row_carries_the_version_then_the_online_dot() {
+        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+            let rows = foot_rows(width, None, None);
+            let (menu, hit) = rows.last().expect("the menu row");
+            assert_eq!(*hit, Some(Hit::Foot));
+            assert_eq!(crate::width::width(&menu.text), width);
+            assert!(
+                menu.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+                "{menu:?}"
+            );
+            let version = format!(" {VERSION}");
+            assert!(menu.text.starts_with(&version), "{menu:?}");
+            assert_eq!(version_link_at(width), Some(1));
+            let dot_at = crate::width::width(&version) + 1;
+            // The dot goes first when the row is tight: the version and the tail are kept.
+            let room = dot_at + 1 + 1 + crate::width::width(&foot_tail(width)) <= width;
+            if room {
+                assert_eq!(menu.text.chars().nth(dot_at), Some(ONLINE), "{menu:?}");
+                assert_eq!(menu.runs, vec![(dot_at, 1, crate::theme::Role::Done)]);
+            } else {
+                assert!(
+                    !menu.text.contains(ONLINE) && menu.runs.is_empty(),
+                    "{menu:?}"
+                );
+            }
+            assert!(room || width < WIDTH, "the dot shows at the default width");
+        }
+        // No room for the version, no link and no dot hanging in the air.
+        let tight = foot_rows(8, None, None);
+        assert!(!tight.last().unwrap().0.text.contains(ONLINE));
+        assert_eq!(version_link_at(8), None);
     }
 
     /// The logo is the q of `docs/brand/make.py` alone at every width: one dot a cell with a
@@ -4953,7 +5025,7 @@ mod tests {
         let brand = crate::theme::Role::Brand;
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            for pet in [false, true] {
+            for pet in [None, Some(0)] {
                 let rows = foot_rows(width, pet, None);
                 let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
                 for (i, (line, hit)) in logo.iter().enumerate() {
@@ -5114,7 +5186,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Option<&str>| {
-            foot_rows(width, false, update)
+            foot_rows(width, None, update)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -5148,10 +5220,10 @@ mod tests {
     #[test]
     fn art_fits_an_open_column_of_decent_size_only() {
         assert!(avatar_fits(30, 30, true));
-        assert!(avatar_fits(12, Q_PET_WIDTH, true));
+        assert!(avatar_fits(STAGE_FOOT_ROWS + 6, Q_PET_WIDTH, true));
         assert!(!avatar_fits(30, 30, false));
         assert!(!avatar_fits(30, Q_PET_WIDTH - 1, true));
-        assert!(!avatar_fits(11, 30, true));
+        assert!(!avatar_fits(STAGE_FOOT_ROWS + 5, 30, true));
     }
 
     /// Thirty working agents in one space: more than a thirty row column holds, so the
@@ -5165,12 +5237,13 @@ mod tests {
         )
     }
 
-    /// With a pet and a list short enough to stand above it, the foot takes its six rows
-    /// (three blank, the logo and the tail beside where the pet stamps, then the menu) and
+    /// With a pet and a list short enough to stand above it, the foot takes its nine rows
+    /// (the count box, a blank one, the logo and the tail beside where the pet stamps, then
+    /// the menu) and
     /// the column keeps its exact height. A list that needs those rows keeps them: the
     /// pet gives way, and no agent is pushed off the column for a picture.
     #[test]
-    fn a_pet_takes_six_rows_only_when_the_list_still_fits() {
+    fn a_pet_takes_its_rows_only_when_the_list_still_fits() {
         let pet = art_pet();
         let at = |(spaces, agents): (Vec<WorkspaceRow>, Vec<AgentRow>)| {
             rows12(
@@ -5190,9 +5263,9 @@ mod tests {
         };
         let rows = at(sample());
         assert_eq!(rows.len(), 30);
-        // The six rows of the foot never carry an agent: the pet's reservation, not
+        // The rows of the foot never carry an agent: the pet's reservation, not
         // the list's, whatever the overlay stamps over their trailing columns.
-        for (line, hit) in &rows[24..30] {
+        for (line, hit) in &rows[30 - STAGE_FOOT_ROWS..30] {
             assert!(!matches!(hit, Some(Hit::Terminal(_))), "{line:?}");
         }
         let (menu_row, hit) = &rows[29];
@@ -5205,8 +5278,8 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, false, None).len();
-        for row in &crowded[30 - PET_FOOT_ROWS..30 - kept] {
+        let kept = foot_rows(WIDTH, None, None).len();
+        for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
     }
@@ -5237,7 +5310,7 @@ mod tests {
             WIDTH,
             None,
         );
-        let freed = 30 - PET_FOOT_ROWS..30 - foot_rows(WIDTH, false, None).len();
+        let freed = 30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, None, None).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -7022,7 +7095,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, false, None).len();
+        let foot = foot_rows(WIDTH, None, None).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -7089,7 +7162,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, false, None).len();
+        let foot = foot_rows(WIDTH, None, None).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -7176,10 +7249,10 @@ mod tests {
         }
     }
 
-    /// With nothing waiting the pet stands in the inbox beside the words, and the foot keeps
-    /// its rows blank; a pet taller than the list, or anyone waiting, keeps it in the foot.
+    /// The pet never stands in the inbox, empty or not: the inbox keeps its words at the left
+    /// and is only as tall as it was dragged, and the pet is in the foot over the menu row.
     #[test]
-    fn an_empty_inbox_holds_the_pet_when_it_fits() {
+    fn an_empty_inbox_has_no_pet_and_the_foot_holds_it() {
         let spaces = vec![space(1, "app")];
         let calm = vec![agent(1, 1, "claude", "working")];
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
@@ -7196,43 +7269,81 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let pet = |hair: &str| qoop_runtime::avatar::Avatar {
+        let pet = qoop_runtime::avatar::Avatar {
             body: qoop_runtime::avatar::BODY.into(),
-            hair: hair.into(),
+            hair: "flat".into(),
             eyes: "squint".into(),
             hair_ink: 155,
             body_ink: 33,
         };
-        let flat = pet("flat");
-        assert_eq!(pet_lit_rows(&flat), 4);
-        let (cols, _) = avatar_overlay(&flat, true);
-        assert_eq!(pet_in_inbox(&c, 40, Some(&flat)), Some((cols, 4)));
-        let rows = rows_folded(&c, 40, Some(&flat));
-        assert_eq!(
-            rows[1].0.text.trim_end(),
-            format!("{}nothing needs you", " ".repeat(2 + cols + 2))
-        );
-        // Exactly the rows asked for, and the title where it is without a pet.
+        let rows = rows_folded(&c, 40, Some(&pet));
+        assert_eq!(rows[1].0.text.trim_end(), " nothing needs you");
         assert_eq!(rows.len(), 40);
-        assert_eq!(
-            rows.iter().position(|(_, h)| *h == Some(Hit::Title)),
-            rows_folded(&c, 40, None)
-                .iter()
-                .position(|(_, h)| *h == Some(Hit::Title))
-        );
-        // A pet taller than the rows the inbox was dragged to stays in the foot.
-        let mohawk = pet("mohawk");
-        assert_eq!(pet_lit_rows(&mohawk), 5);
-        assert!(pet_in_inbox(&c, 40, Some(&mohawk)).is_some());
-        let short = Column {
-            inbox: Inbox { rows: 4, ..c.inbox },
-            ..c
+        // The inbox is the height it is dragged to, not the pet's: the title sits right
+        // under the default three list rows and the edge.
+        assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
+        assert_eq!(TITLE_ROW, 1 + INBOX_ROWS + 1);
+        assert!(pet_shown(&c, 40, true));
+    }
+
+    /// The box over the pet shows the inbox count and nothing else, in the rows right above
+    /// the pet's, flush with the pet's right edge; warm while something waits.
+    #[test]
+    fn the_count_box_stands_over_the_pet_and_shows_only_the_count() {
+        use crate::theme::Role;
+        let spaces = vec![space(1, "app")];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let box_of = |agents: &[AgentRow]| {
+            let c = opened(column(
+                &spaces,
+                agents,
+                1,
+                99,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                WIDTH,
+                &shut,
+            ));
+            assert!(pet_shown(&c, 40, true));
+            rows_folded(&c, 40, Some(&art_pet()))
         };
-        assert_eq!(pet_in_inbox(&short, 40, Some(&mohawk)), None);
-        assert!(pet_in_inbox(&short, 40, Some(&flat)).is_some());
-        // A list too long for the pet in the foot still has the inbox's rows for it.
+        let rows = box_of(&[agent(1, 1, "claude", "working")]);
+        let top = 40 - STAGE_FOOT_ROWS;
+        let text = |at: usize| rows[at].0.text.trim_end().to_string();
+        let across = 3;
+        let pad = " ".repeat(WIDTH - across - 3);
+        assert_eq!(
+            text(top),
+            format!("{pad}\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}")
+        );
+        assert_eq!(text(top + 1), format!("{pad}\u{2502} 0 \u{2502}"));
+        assert_eq!(
+            text(top + 2),
+            format!("{pad}\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}")
+        );
+        assert!(rows[top + 1].0.runs.contains(&(WIDTH - 5, 3, Role::Faint)));
+        // The box ends on the row the pet's rows start on.
+        assert_eq!(top + COUNT_BOX_ROWS, 40 - PET_FOOT_ROWS);
+        assert!(rows[top..top + 3].iter().all(|(_, hit)| hit.is_none()));
+        // Three agents waiting is a three, in the warm ink.
+        let waiting: Vec<AgentRow> = (1..=3).map(|t| agent(t, 1, "claude", "blocked")).collect();
+        let rows = box_of(&waiting);
+        assert_eq!(
+            rows[top + 1].0.text.trim_end(),
+            format!("{pad}\u{2502} 3 \u{2502}")
+        );
+        assert!(
+            rows[top + 1]
+                .0
+                .runs
+                .contains(&(WIDTH - 5, 3, Role::Blocked))
+        );
+        // Where the pet gives the rows up, the box goes with it.
         let long: Vec<AgentRow> = (1..=20).map(|t| agent(t, 1, "claude", "working")).collect();
-        let crowded = opened(column(
+        let c = opened(column(
             &spaces,
             &long,
             1,
@@ -7245,24 +7356,12 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        assert!(!pet_shown(&crowded, 40, true));
-        assert!(pet_in_inbox(&crowded, 40, Some(&flat)).is_some());
-        assert!(!pet_in_foot(&crowded, 40, Some(&flat)));
-        let waiting = vec![agent(1, 1, "claude", "blocked")];
-        let busy = opened(column(
-            &spaces,
-            &waiting,
-            1,
-            99,
-            0,
-            View::Tree,
-            &seen,
-            &unseen,
-            NOW,
-            WIDTH,
-            &shut,
-        ));
-        assert_eq!(pet_in_inbox(&busy, 40, Some(&flat)), None);
+        assert!(!pet_shown(&c, 40, true));
+        assert!(
+            rows_folded(&c, 40, Some(&art_pet()))
+                .iter()
+                .all(|(line, _)| !line.text.contains('\u{256d}'))
+        );
     }
 
     /// A folded space hides the agents a person is not looking at, never the one the
@@ -8037,7 +8136,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, None).len() + 2;
+        let least = foot_rows(WIDTH, None, None).len() + 2;
         for height in [least, least + 1, 10, 14, 30] {
             let rows = rows12(
                 &spaces,
@@ -8798,7 +8897,8 @@ mod tests {
     }
 
     /// With icons an asleep tab wears the zzz, and a space of another machine the remote mark
-    /// in its link's colour, its name pushed over by exactly the mark and a blank.
+    /// and its link's dot in its link's colour, its name pushed over by exactly those and a
+    /// blank each.
     #[test]
     fn with_icons_asleep_tabs_and_remote_spaces_wear_their_marks() {
         let none = (Seen::new(), Unseen::new(), Shut::new());
@@ -8821,17 +8921,25 @@ mod tests {
         c.icons = true;
         let rule = first_rule(&c);
         assert!(
-            rule.text
-                .starts_with(&format!("\u{25be}{} mars:qoop", crate::icons::REMOTE)),
+            rule.text.starts_with(&format!(
+                "\u{25be}{} {ONLINE} mars:qoop",
+                crate::icons::REMOTE
+            )),
             "{:?}",
             rule.text
         );
         assert!(rule.runs.contains(&(NAME_AT, 1, crate::theme::Role::Done)));
-        assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 2));
+        assert!(
+            rule.runs
+                .contains(&(NAME_AT + 2, 1, crate::theme::Role::Done))
+        );
+        assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 4));
         c.icons = false;
         assert!(
-            first_rule(&c).text.starts_with("\u{25be}mars:qoop"),
-            "no mark without icons"
+            first_rule(&c)
+                .text
+                .starts_with(&format!("\u{25be}{ONLINE} mars:qoop")),
+            "the dot without the icon"
         );
     }
 
@@ -8910,13 +9018,15 @@ mod tests {
     }
 
     /// A space of another machine is drawn with its machine before its name and no chip,
-    /// whatever its link: the link is in the settings box.
+    /// whatever its link, behind a dot in the colour of that link: green while connected,
+    /// dim while parked, warm when it does not answer. The dot needs no icon font.
     #[test]
     fn a_remote_space_is_named_with_its_machine_and_no_chip() {
-        for (link, name) in [
-            (LinkState::Up, "ubox:webshop"),
-            (LinkState::Parked, "ubox:webshop"),
-            (LinkState::Down, "ubox:webshop (connecting)"),
+        use crate::theme::Role;
+        for (link, name, ink) in [
+            (LinkState::Up, "ubox:webshop", Role::Done),
+            (LinkState::Parked, "ubox:webshop", Role::Faint),
+            (LinkState::Down, "ubox:webshop (connecting)", Role::Blocked),
         ] {
             let mut row = space(1, name);
             row.link = Some(link);
@@ -8924,8 +9034,17 @@ mod tests {
             let none = (Seen::new(), Unseen::new(), Shut::new());
             let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
             let rule = rule_styled(&c, 1);
-            assert!(rule.text.starts_with(&format!(" {name}")), "{rule:?}");
+            assert!(
+                rule.text.starts_with(&format!(" {ONLINE} {name}")),
+                "{rule:?}"
+            );
+            assert!(rule.runs.contains(&(NAME_AT, 1, ink)), "{rule:?}");
         }
+        // A space of this machine has no link, so no dot.
+        let spaces = vec![space(1, "ubox:webshop")];
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
+        assert!(rule_styled(&c, 1).text.starts_with(" ubox:webshop"));
     }
 
     /// A control is its word alone, in every terminal: no cap glyph a
