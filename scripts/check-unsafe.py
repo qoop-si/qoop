@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate G1.23: no `unsafe` outside qoro-pty without a SAFETY comment.
+"""Gate G1.23: no `unsafe` outside qoop-pty without a SAFETY comment.
 
 `unsafe` is not banned, it is accounted for. A block with no stated reason is one nobody can
 review, and the crates that are supposed to have none say so in their own source with

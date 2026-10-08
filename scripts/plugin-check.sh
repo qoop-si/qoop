@@ -3,5 +3,5 @@
 # object, and there is no method that writes to a terminal.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo test -q -p qoro-plugin
+cargo test -q -p qoop-plugin
 echo "plugin check passed"

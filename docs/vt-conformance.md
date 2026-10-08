@@ -5,13 +5,13 @@ Gate G1.24 requires the corpus to exist with at least
 
 Engine: `alacritty_terminal` 0.26.0 (see `Cargo.lock`).
 Date: 2026-09-10.
-Runner: `crates/qoro-terminal/tests/vt_conformance.rs`.
-Corpus: `crates/qoro-terminal/tests/fixtures/vt_corpus/` (57 cases).
+Runner: `crates/qoop-terminal/tests/vt_conformance.rs`.
+Corpus: `crates/qoop-terminal/tests/fixtures/vt_corpus/` (57 cases).
 
 Run with:
 
 ```
-cargo test -p qoro-terminal --test vt_conformance
+cargo test -p qoop-terminal --test vt_conformance
 ```
 
 ## Methodology
@@ -22,7 +22,7 @@ never from running this engine and recording whatever it produced. A case is dro
 rather than kept if no specification justifies its expected value. The citation for
 each case's expected values is in its fixture file, under `tests/fixtures/vt_corpus/`.
 
-`Snapshot` (`crates/qoro-terminal/src/engine.rs`) carries only plain per-row text and
+`Snapshot` (`crates/qoop-terminal/src/engine.rs`) carries only plain per-row text and
 a cursor position, no color or attribute state. The SGR (character attribute) cases
 are scoped to what that snapshot can actually observe: that an SGR sequence is
 absorbed as a non-printing control function rather than leaking parameter digits into
@@ -72,7 +72,7 @@ unsupported graphics sequences. All are covered above.
 Two things named alongside them are deliberately not corpus cases.
 
 **Captured traces from real applications** are in a separate test,
-`crates/qoro-terminal/tests/real_traces.rs`, because their expected values cannot come
+`crates/qoop-terminal/tests/real_traces.rs`, because their expected values cannot come
 from a specification: no document says what `vim` prints when it opens a file. What
 that test asserts instead is everything that must hold whatever the trace contains.
 The program's own screen is on the screen halfway through, so nothing below it is

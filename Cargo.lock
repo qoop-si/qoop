@@ -446,24 +446,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-attention"
+name = "qoop-attention"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "serde",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-bench"
+name = "qoop-bench"
 version = "0.7.0"
 dependencies = [
  "bytes",
  "libc",
- "qoro-pty",
- "qoro-runtime",
- "qoro-testkit",
+ "qoop-pty",
+ "qoop-runtime",
+ "qoop-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -471,20 +471,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-cli"
+name = "qoop-cli"
 version = "0.7.0"
 dependencies = [
  "bytes",
  "libc",
- "qoro-history",
- "qoro-proto",
- "qoro-pty",
- "qoro-remote",
- "qoro-runtime",
- "qoro-setup",
- "qoro-store",
- "qoro-testkit",
- "qoro-tui",
+ "qoop-history",
+ "qoop-proto",
+ "qoop-pty",
+ "qoop-remote",
+ "qoop-runtime",
+ "qoop-setup",
+ "qoop-store",
+ "qoop-testkit",
+ "qoop-tui",
  "serde",
  "serde_json",
  "tempfile",
@@ -492,19 +492,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-collab"
+name = "qoop-collab"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "serde",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-detect"
+name = "qoop-detect"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "regex",
  "serde",
  "tempfile",
@@ -512,7 +512,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-domain"
+name = "qoop-domain"
 version = "0.7.0"
 dependencies = [
  "proptest",
@@ -521,10 +521,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-events"
+name = "qoop-events"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "rusqlite",
  "serde",
  "serde_json",
@@ -533,10 +533,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-history"
+name = "qoop-history"
 version = "0.7.0"
 dependencies = [
- "qoro-detect",
+ "qoop-detect",
  "rusqlite",
  "serde",
  "serde_json",
@@ -545,7 +545,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-move"
+name = "qoop-move"
 version = "0.7.0"
 dependencies = [
  "serde",
@@ -554,42 +554,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-plugin"
+name = "qoop-plugin"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "serde",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-proto"
+name = "qoop-proto"
 version = "0.7.0"
 dependencies = [
  "bytes",
  "proptest",
- "qoro-domain",
+ "qoop-domain",
  "serde",
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-pty"
+name = "qoop-pty"
 version = "0.7.0"
 dependencies = [
  "bytes",
  "libc",
  "proptest",
- "qoro-domain",
+ "qoop-domain",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-remote"
+name = "qoop-remote"
 version = "0.7.0"
 dependencies = [
- "qoro-proto",
+ "qoop-proto",
  "serde",
  "serde_json",
  "tempfile",
@@ -597,19 +597,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-runtime"
+name = "qoop-runtime"
 version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
  "libc",
- "qoro-detect",
- "qoro-domain",
- "qoro-proto",
- "qoro-pty",
- "qoro-store",
- "qoro-terminal",
- "qoro-testkit",
+ "qoop-detect",
+ "qoop-domain",
+ "qoop-proto",
+ "qoop-pty",
+ "qoop-store",
+ "qoop-terminal",
+ "qoop-testkit",
  "rusqlite",
  "serde",
  "serde_json",
@@ -621,10 +621,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-setup"
+name = "qoop-setup"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "serde",
  "tempfile",
  "thiserror",
@@ -632,10 +632,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-store"
+name = "qoop-store"
 version = "0.7.0"
 dependencies = [
- "qoro-domain",
+ "qoop-domain",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -643,10 +643,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-support"
+name = "qoop-support"
 version = "0.7.0"
 dependencies = [
- "qoro-events",
+ "qoop-events",
  "serde",
  "serde_json",
  "tempfile",
@@ -654,40 +654,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "qoro-terminal"
+name = "qoop-terminal"
 version = "0.7.0"
 dependencies = [
  "alacritty_terminal",
  "bytes",
  "proptest",
- "qoro-domain",
+ "qoop-domain",
  "thiserror",
 ]
 
 [[package]]
-name = "qoro-testkit"
+name = "qoop-testkit"
 version = "0.7.0"
 dependencies = [
  "bytes",
  "libc",
- "qoro-proto",
- "qoro-runtime",
+ "qoop-proto",
+ "qoop-runtime",
  "serde_json",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
-name = "qoro-tui"
+name = "qoop-tui"
 version = "0.7.0"
 dependencies = [
  "bytes",
- "qoro-attention",
- "qoro-domain",
- "qoro-history",
- "qoro-proto",
- "qoro-remote",
- "qoro-runtime",
+ "qoop-attention",
+ "qoop-domain",
+ "qoop-history",
+ "qoop-proto",
+ "qoop-remote",
+ "qoop-runtime",
  "serde",
  "serde_json",
  "tempfile",

@@ -266,7 +266,7 @@ on this machine, master 251658270 and slave 268435486. Every enumeration matched
 containment was empty at every teardown. It is now read from the slave in `spawn_terminal`,
 while that descriptor is still held, and passed to the terminal task.
 
-Evidence: `sys::tty_dev` in `crates/qoro-pty/src/sys.rs`, and
+Evidence: `sys::tty_dev` in `crates/qoop-pty/src/sys.rs`, and
 `a_fresh_pty_has_a_distinct_controlling_device`.
 
 **Reaping the child ended teardown.** `next_step` returned `CloseMaster` as soon as the
@@ -276,8 +276,8 @@ containment set exists for exactly those processes, so it is what decides when t
 finished: `child_reaped && !containment.any_alive(still_alive)`.
 
 Evidence: `a_reaped_child_does_not_end_teardown_while_an_escaped_job_runs` in
-`crates/qoro-pty/src/teardown.rs`.
-Reproduce: `cargo test -p qoro-pty teardown`
+`crates/qoop-pty/src/teardown.rs`.
+Reproduce: `cargo test -p qoop-pty teardown`
 
 ### Five more, found by reviewing the code against this document
 

@@ -41,7 +41,7 @@ case "$(uname -s) $MACHINE" in
     "Linux aarch64" | "Linux arm64") TRIPLE="aarch64-unknown-linux-gnu" ;;
     *)
         echo "qoro install: no prebuilt binary for $(uname -s) $(uname -m);" \
-            "build from source: cargo build --release -p qoro-cli" >&2
+            "build from source: cargo build --release -p qoop-cli" >&2
         exit 1
         ;;
 esac
@@ -49,7 +49,7 @@ esac
 # here rather than after a download that could never run.
 if [ "$(uname -s)" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
     echo "qoro install: this is a musl system; the prebuilt Linux binary needs glibc." \
-        "Build from source: cargo build --release -p qoro-cli" >&2
+        "Build from source: cargo build --release -p qoop-cli" >&2
     exit 1
 fi
 ASSET="qoro-$TRIPLE.tar.gz"

@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-09-10
-Evidence: `crates/qoro-runtime/src/daemon.rs` and `crates/qoro-remote/src/lib.rs`
+Evidence: `crates/qoop-runtime/src/daemon.rs` and `crates/qoop-remote/src/lib.rs`
 Reproduce: `./scripts/replay-check.sh`
 
 ## Context

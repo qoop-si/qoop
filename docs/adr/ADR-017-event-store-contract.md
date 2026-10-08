@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-09-10
 Amended: 2026-09-29, the daemon stopped writing the log. See "Who writes this" below.
-Evidence: `crates/qoro-events/src/lib.rs` and its tests
+Evidence: `crates/qoop-events/src/lib.rs` and its tests
 Reproduce: `./scripts/replay-check.sh`
 
 ## Who writes this

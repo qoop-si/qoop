@@ -1,7 +1,7 @@
 # Brand: palette, logo, marks
 
 The one place the product's colours and its dot language are written down. The terminal
-interface (`crates/qoro-tui/src/theme.rs`), the phone (`mobile/src/ui/theme.ts`) and anything
+interface (`crates/qoop-tui/src/theme.rs`), the phone (`mobile/src/ui/theme.ts`) and anything
 drawn for the site take their colours from here.
 
 ## Palette

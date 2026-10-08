@@ -260,7 +260,7 @@ envelope is not reversible, which is the point of freezing it.
 
 ### The normative artifact is the code
 
-`crates/qoro-proto` is the definition; this ADR is the reasoning and the rejected
+`crates/qoop-proto` is the definition; this ADR is the reasoning and the rejected
 alternatives. Where the two disagree, the code and its tests are right and this document is
 a bug. That is not a dodge: three review rounds each found another decision an implementer
 would have had to invent while reading this ADR, which is evidence about prose rather than

@@ -1,0 +1,31 @@
+[package]
+name = "qoop-runtime"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+qoop-store = { path = "../qoop-store" }
+bytes = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+qoop-domain = { path = "../qoop-domain" }
+qoop-proto = { path = "../qoop-proto" }
+qoop-pty = { path = "../qoop-pty" }
+qoop-terminal = { path = "../qoop-terminal" }
+qoop-detect = { path = "../qoop-detect" }
+rusqlite = { workspace = true }
+# config.toml, the same file and crate the interface reads it with.
+toml = { workspace = true }
+unicode-width = "0.2"
+tempfile = { workspace = true }
+
+[dev-dependencies]
+qoop-store = { path = "../qoop-store" }
+qoop-testkit = { path = "../qoop-testkit" }

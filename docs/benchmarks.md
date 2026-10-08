@@ -1,13 +1,13 @@
 # Benchmark record
 
-The milestone 1 benchmark harness is `crates/qoro-bench`. It measures the scenarios in
+The milestone 1 benchmark harness is `crates/qoop-bench`. It measures the scenarios in
 section 7 of the master plan and prints both a table and one JSON line per scenario, so a
 run can be diffed against an earlier one without anyone retyping a number.
 
 Run with:
 
 ```
-cargo run --release -p qoro-bench
+cargo run --release -p qoop-bench
 ```
 
 Every figure below came from that command. Nothing here is a target.

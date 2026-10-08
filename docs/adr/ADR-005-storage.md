@@ -39,7 +39,7 @@ retry.
 
 ## The log is not written
 
-The event log described by ADR-017 is implemented in `qoro-events`, and its tests still
+The event log described by ADR-017 is implemented in `qoop-events`, and its tests still
 prove that a projection is a pure fold over a log. **The daemon does not write it.** Before
 this change a running daemon had written hundreds of observations and commands and read
 none of them: the only query was the ledger, and no crate in the workspace opened the log
@@ -61,13 +61,13 @@ What was lost, and what it was not:
   only an `Outcome` ever wrote the ledger row. The intent changed nothing at any point in
   that trace.
 - **Replay, projections, the gap that tells a reader to re-read, lossy observations.** Real
-  once, all unwired. `qoro-events` still holds the fold and the `Gap` body, and its tests
+  once, all unwired. `qoop-events` still holds the fold and the `Gap` body, and its tests
   still replay a log it built in memory. What is gone with it: the bounded buffer that
   dropped under pressure, the counting of what was dropped, the code that appended the
   `gap`, and the waiter that re-read rather than folded forward. None of that is covered
   anywhere now, and the first reader of the log decides whether any of it is written again.
 - **A support bundle from a running daemon** (ADR-016), which is a log slice. It could not
-  be produced from one before this change either: `qoro-support` had no callers at all. The
+  be produced from one before this change either: `qoop-support` had no callers at all. The
   crate and its tests remain.
 
 The `Command` intent is the one that needs a second reader to believe it was load-bearing,
@@ -122,7 +122,7 @@ who exports `QORO_RUNTIME_DIR` themselves keeps the old, cleared location.
 What follows is why, as it was measured before the move.
 
 `qoro.db` and `history/` were both opened in the runtime directory. On macOS
-`XDG_RUNTIME_DIR` is unset, so `runtime_base()` (`crates/qoro-runtime/src/paths.rs:71-86`)
+`XDG_RUNTIME_DIR` is unset, so `runtime_base()` (`crates/qoop-runtime/src/paths.rs:71-86`)
 falls back to `std::env::temp_dir()` and both land in `$TMPDIR/qoro-<uid>`, which macOS
 clears: measured on a machine that had been up three days, none of the files at depth 2 of
 that `TMPDIR` predated its boot, while the sibling cache directory beside it had the large
@@ -137,7 +137,7 @@ sockets and wrong about databases.
 ## Consequences
 - The daemon keeps one SQLite file instead of two, one WAL, and one set of schema,
   migration and busy-timeout handling.
-- A durable, replayable event log exists in `qoro-events` and is exercised by its own tests.
+- A durable, replayable event log exists in `qoop-events` and is exercised by its own tests.
   It is not what this daemon runs on.
 - Build cost: SQLite is compiled in via a bundled feature so there is no system
   dependency.
@@ -222,7 +222,7 @@ restore read, which the next sentence of that version already said.
 `qoro.db` gains a table and `SCHEMA_VERSION` does not move, so a build that predates this
 one still opens the file and ignores the table. That older build reads its ledger from
 `events.db`, which this one no longer writes, so a retry that spans a downgrade opens a
-second tab; nothing else is lost. `events.db` is left on disk unread. `qoro-store` has no
+second tab; nothing else is lost. `events.db` is left on disk unread. `qoop-store` has no
 replacement, and its schema is a ladder rather than a version check.
 
 A build from before the stores moved looks for them in the runtime directory, finds none,

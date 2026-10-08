@@ -3,5 +3,5 @@
 # any point, exactly one machine answers "I own this workspace".
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo test -q -p qoro-move
+cargo test -q -p qoop-move
 echo "move check passed"

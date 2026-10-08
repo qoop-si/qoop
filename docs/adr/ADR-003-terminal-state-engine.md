@@ -48,7 +48,7 @@ pub trait TerminalEngine: Send {
 }
 ```
 
-No type outside `qoro-terminal` may name a concrete engine type. That is what keeps this
+No type outside `qoop-terminal` may name a concrete engine type. That is what keeps this
 decision reversible.
 
 ### The engine seam must carry effects, not only damage
@@ -218,16 +218,16 @@ bytes with it, so the parser never enters the string state and there is nothing 
 terminator to close; the scanner resynchronises at the terminator and counts what it
 dropped, because the plan bans a silent discard as firmly as a silent truncation.
 
-The scanner is the one in `qoro-domain`, the same resumable state machine that decides
+The scanner is the one in `qoop-domain`, the same resumable state machine that decides
 where a paste may be split. Sharing it is deliberate: two scanners would eventually
 disagree about what a sequence is, and the direction that disagreed would be the one
 nobody tested.
 
-Evidence: `crates/qoro-terminal/src/control_string.rs`, and
-`an_unterminated_control_string_is_bounded` in `crates/qoro-terminal/src/alacritty.rs`,
+Evidence: `crates/qoop-terminal/src/control_string.rs`, and
+`an_unterminated_control_string_is_bounded` in `crates/qoop-terminal/src/alacritty.rs`,
 which fails with "the parser retained 4194304 bytes of a 4194304 byte control string" when
 the filter is removed.
-Reproduce: `cargo test -p qoro-terminal an_unterminated`
+Reproduce: `cargo test -p qoop-terminal an_unterminated`
 
 ### A character split across two reads never reaches the parser
 
@@ -265,8 +265,8 @@ deterministic regression test is the guard here, not the property test.
 
 Evidence: `incomplete_utf8_tail` and
 `a_character_split_across_two_reads_does_not_lose_the_one_after_it` in
-`crates/qoro-terminal/src/alacritty.rs`.
-Reproduce: `cargo test -p qoro-terminal a_character_split_across_two_reads`
+`crates/qoop-terminal/src/alacritty.rs`.
+Reproduce: `cargo test -p qoop-terminal a_character_split_across_two_reads`
 
 ### The engine's scrollback is a staging buffer, not a scrollback
 
@@ -298,7 +298,7 @@ adapter counts it, because the one thing it must never do is stay quiet about a 
 
 Evidence: `every_scrolled_row_is_handed_over_however_many_there_are` and
 `a_feed_that_scrolls_more_than_the_ring_holds_is_counted_rather_than_silently_lost`.
-Reproduce: `cargo test -p qoro-terminal --lib alacritty`
+Reproduce: `cargo test -p qoop-terminal --lib alacritty`
 
 ### The bound is only as good as the scanner in front of it
 

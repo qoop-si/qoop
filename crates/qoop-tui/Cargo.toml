@@ -1,0 +1,32 @@
+[package]
+name = "qoop-tui"
+version = "0.7.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qoop-proto = { path = "../qoop-proto" }
+# What a state change is worth interrupting a person for, and how loudly: the same
+# classification the push path uses, so the desktop and a phone never disagree.
+qoop-attention = { path = "../qoop-attention" }
+qoop-domain = { path = "../qoop-domain" }
+qoop-runtime = { path = "../qoop-runtime" }
+qoop-history = { path = "../qoop-history" }
+qoop-remote = { path = "../qoop-remote" }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pinned exact, not floating: desktop column counts must never drift under a
+# `cargo update`. Bump only with a VT corpus re-run, because the engine has
+# its own width table and the two must agree on every wide character.
+unicode-width = "=0.2.2"
+# Already in the lock file by way of qoop-detect and qoop-setup. config.toml is read as
+# TOML, so dotted keys, inline tables and quoting behave the way the format says.
+toml = { workspace = true }
+# Already in the lock file under `toml`. Writing one setting keeps the person's comments.
+toml_edit = "0.22"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time", "io-util", "process", "sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

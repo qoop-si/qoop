@@ -284,7 +284,7 @@ tabs running where it can. How a release is cut and how an update lands:
 
 ## What is measured
 
-Numbers, from `cargo run --release -p qoro-bench` and the scale gates, on a twelve core
+Numbers, from `cargo run --release -p qoop-bench` and the scale gates, on a twelve core
 machine, measured on 2026-09-27 in one release run with other builds sharing the machine
 (load average 8 to 17). Nothing here is a target.
 
@@ -323,7 +323,7 @@ names itself in the test's own doc comment.
 cargo test --workspace     # the gates that do not need a wall clock
 
 # what a person does, driven through tmux, against the release binary
-cargo build --release -p qoro-cli && ./scripts/acceptance-m1.sh
+cargo build --release -p qoop-cli && ./scripts/acceptance-m1.sh
 ```
 
 ## Licence

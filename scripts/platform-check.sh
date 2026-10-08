@@ -10,10 +10,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "--- the pty layer builds for this platform"
-cargo build -q -p qoro-pty
+cargo build -q -p qoop-pty
 
 echo "--- nothing user-facing claims Windows"
-claims=$(grep -rniE 'windows' README.md docs/*.md crates/qoro-cli/src 2>/dev/null \
+claims=$(grep -rniE 'windows' README.md docs/*.md crates/qoop-cli/src 2>/dev/null \
   | grep -viE 'not supported|under wsl|adr-021|windows has|windows analogue' || true)
 if [ -n "$claims" ]; then
   echo "$claims" >&2

@@ -1,6 +1,6 @@
 # The command line surface
 
-Owned by `qoro-cli` and grown with it from milestone 1 onward, so that the enumeration
+Owned by `qoop-cli` and grown with it from milestone 1 onward, so that the enumeration
 exists before a gate needs it rather than being invented when one does.
 
 Gate G9.1 reads this file: with the control-plane host blackholed, every subcommand here

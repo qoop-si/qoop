@@ -105,7 +105,7 @@ withdrawn counter.
 Caveat that the number must carry: this is a bare `poll` on one descriptor in a process
 with no tokio runtime, no blocking pools, no store and no clients. It is a floor for one
 syscall, not a prediction for the daemon. The plan's 100-terminal budgets are targets
-pending the first `qoro-bench` run.
+pending the first `qoop-bench` run.
 
 ### Finding 5, corrected
 

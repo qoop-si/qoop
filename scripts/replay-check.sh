@@ -15,13 +15,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "--- event store and projection tests, including replay determinism"
-cargo test -q -p qoro-events
+cargo test -q -p qoop-events
 
 echo "--- the ledger, as the daemon uses it"
-cargo test -q -p qoro-store
-cargo test -q -p qoro-runtime --test gates_m4
+cargo test -q -p qoop-store
+cargo test -q -p qoop-runtime --test gates_m4
 
 echo "--- the ledger under the packaged binary, across a restart"
-cargo test -q -p qoro-cli --test ledger
+cargo test -q -p qoop-cli --test ledger
 
 echo "event store and ledger checks passed"

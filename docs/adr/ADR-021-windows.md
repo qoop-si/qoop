@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-09-10
-Evidence: `crates/qoro-pty/src/sys.rs`, `crates/qoro-pty/src/procwatch.rs`
+Evidence: `crates/qoop-pty/src/sys.rs`, `crates/qoop-pty/src/procwatch.rs`
 Reproduce: `./scripts/platform-check.sh`
 
 ## Context
@@ -50,7 +50,7 @@ that would need its own review.
 
 ### What it would take
 
-A `qoro-pty-windows` crate implementing the same seams, a fourth platform arm in the process
+A `qoop-pty-windows` crate implementing the same seams, a fourth platform arm in the process
 watcher, a named pipe transport with its own trust ADR, and a Windows arm for every gate that
 currently asserts against `ps`, `lsof`, `/proc` or `proc_pidinfo`. The gates are the larger
 half: they are what make the Unix implementation trustworthy, and a Windows implementation

@@ -6,7 +6,7 @@
 # same-shell check asks the shell for a variable only that process could still hold, so a
 # fresh shell cannot pass by looking similar.
 #
-# usage: cargo build --release -p qoro-cli && ./scripts/acceptance-m1.sh
+# usage: cargo build --release -p qoop-cli && ./scripts/acceptance-m1.sh
 #
 # End to end, driven the way a person drives it: a real terminal, real keystrokes, a real
 # shell, and the OS as the source of truth for what survived.
@@ -17,7 +17,7 @@ QORO=${QORO:-"$(cd "$(dirname "$0")/.." && pwd)/target/release/qoro"}
 # gates, which reads as a product regression and is a missing build.
 if [ ! -x "$QORO" ]; then
     echo "no binary at $QORO" >&2
-    echo "build it first: cargo build --release -p qoro-cli" >&2
+    echo "build it first: cargo build --release -p qoop-cli" >&2
     exit 2
 fi
 RT=$(mktemp -d /tmp/qoro-e2e-XXXXXX); chmod 700 "$RT"

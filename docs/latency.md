@@ -8,10 +8,10 @@ and the story of why is more useful than the number.
 Run it with:
 
 ```
-cargo test --release -p qoro-cli --test scale_m2 -- --ignored --nocapture --test-threads=1
+cargo test --release -p qoop-cli --test scale_m2 -- --ignored --nocapture --test-threads=1
 ```
 
-Release is required and the harness refuses a debug build: `CARGO_BIN_EXE_qoro` points at
+Release is required and the harness refuses a debug build: `CARGO_BIN_EXE_qoop` points at
 whatever profile the test was built with, and a debug daemon is slow enough to make the
 number a statement about the build.
 

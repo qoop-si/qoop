@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["fonttools==4.66.1"]
 # ///
-"""Build crates/qoro-tui/assets/QoroSymbols.ttf, the few icons the interface draws.
+"""Build crates/qoop-tui/assets/QoroSymbols.ttf, the few icons the interface draws.
 
 Run with `uv run scripts/build-icon-font.py`. It downloads the pinned Nerd Fonts symbols
 release, checks its hash and keeps only the glyphs named in GLYPHS. The symbol sets were drawn
@@ -11,7 +11,7 @@ cup: every glyph is fitted here into one box about the height of a capital, on o
 line, scaled by an optical factor for the tall shapes, one cell wide. They are put at our own
 codepoints in the supplementary private use plane, never at the Nerd ones: Terminal falls
 back to an installed font only for those, and a Nerd font a person has installed can then
-never draw its own glyph in place of ours. It prints the table `crates/qoro-tui/src/icons.rs`
+never draw its own glyph in place of ours. It prints the table `crates/qoop-tui/src/icons.rs`
 holds; a test there checks the two agree.
 """
 
@@ -33,7 +33,7 @@ URL = f"https://github.com/ryanoasis/nerd-fonts/releases/download/{VERSION}/Nerd
 SHA256 = "fdca3682534f6f65e1ccb2345b0362ccf67d9b8eca7c8025330946e93e2473bc"
 MEMBER = "SymbolsNerdFontMono-Regular.ttf"
 FAMILY = "Qoro Symbols"
-OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/qoro-tui/assets/QoroSymbols.ttf"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/qoop-tui/assets/QoroSymbols.ttf"
 
 # The Nerd glyph names, in the order icons.rs lists them, and each one's optical factor:
 # a crescent or a cog fills its box more than a cup does and reads larger at the same size.

@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-09-10
-Evidence: `crates/qoro-move/src/lib.rs` and its tests
+Evidence: `crates/qoop-move/src/lib.rs` and its tests
 Reproduce: `./scripts/move-check.sh`
 
 ## Context

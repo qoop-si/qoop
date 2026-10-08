@@ -22,7 +22,7 @@ Alpine the script says so and stops: build from source there.
 ## From source
 
 ```
-cargo build --release -p qoro-cli
+cargo build --release -p qoop-cli
 ./target/release/qoro
 ```
 

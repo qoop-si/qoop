@@ -8,7 +8,7 @@ rebuilding.
 
 ## The bundled set
 
-`crates/qoro-detect/manifests/`: `claude`, `codex`, `opencode`, `cursor`,
+`crates/qoop-detect/manifests/`: `claude`, `codex`, `opencode`, `cursor`,
 `gemini`, `amp`, `copilot`, `droid`, `grok`, `qwen`, `devin`, `kiro`, `kimi`,
 `kilo`, `hermes`, `cline`, `antigravity` (run as `agy`), `muse`, `pi`, `maki`,
 `qodercli`, plus `generic` for everything without its own manifest (a bare

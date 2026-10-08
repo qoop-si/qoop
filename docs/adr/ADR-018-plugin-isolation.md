@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-09-10
-Evidence: `crates/qoro-plugin/src/lib.rs` and its tests
+Evidence: `crates/qoop-plugin/src/lib.rs` and its tests
 Reproduce: `./scripts/plugin-check.sh`
 
 ## Context
@@ -33,14 +33,14 @@ a process failure, which the daemon already knows how to survive.
 
 ### A plugin sees what it was granted, and the grant is per object
 
-Capabilities are the shape `qoro-collab` already uses: granted to a pair, never held by a
+Capabilities are the shape `qoop-collab` already uses: granted to a pair, never held by a
 participant alone. "This plugin may read that terminal" is the only form that means
 something. A role, a scope or a tier is how something ends up including what nobody
 intended, and the person granting it cannot tell what it includes without reading the
 implementation.
 
 The set is small and closed, and the absence of a write capability is deliberate in exactly
-the way it is in `qoro-collab`: a plugin cannot type into a terminal, because there is no
+the way it is in `qoop-collab`: a plugin cannot type into a terminal, because there is no
 method that takes a terminal and some bytes.
 
 ### A plugin never sees a secret, and never sees a token
