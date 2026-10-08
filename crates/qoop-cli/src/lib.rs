@@ -28,6 +28,7 @@ mod onboard;
 mod page;
 mod places;
 mod qass;
+mod qass_page;
 mod remote;
 mod settings;
 mod skills;
@@ -245,7 +246,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop config set <key> <value>  change one, keeping the rest of the file\n\
                   \x20 qoop settings   every setting on one page, with your pet\n\
                   \x20 qoop onboard    the first start: pet, sounds, look, keys, sleep, qass\n\
-                  \x20 qoop qass       open qass, the assistant over your agents\n\
+                  \x20 qoop qass [page]  open qass, the assistant over your agents, or its page\n\
                   \x20 qoop sound      hear the notification sounds and keep one each\n\
                   \x20 qoop notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\

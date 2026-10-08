@@ -7023,6 +7023,23 @@ where
                                     dirty = true;
                                 }
                             }
+                            // A page of its own like settings: `qoop qass page`, `exec` so the
+                            // tab goes when the page closes. Not a menu row: the menu has no
+                            // room for a twentieth row on an 80 by 24 window.
+                            Action::QassPage => {
+                                request += 1;
+                                let space = state.space;
+                                let ask = start_agent_terminal(
+                                    &mut state,
+                                    request,
+                                    "exec qoop qass page",
+                                    space,
+                                    Some("qass page".to_string()),
+                                );
+                                wr.write_all(&client::encode_control_seq(&ask, &mut control_seq)?)
+                                    .await?;
+                                dirty = true;
+                            }
 
                             // A busy agent is asked about first: one stray `x` after the
                             // prefix must not end an hour of its work.

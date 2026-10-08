@@ -2145,6 +2145,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("w", "new space"),
             ("W", "close empty"),
             ("R", "settings"),
+            ("Q", "qass page"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree or rank"),
@@ -5117,7 +5118,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 38;
+    const COMMANDS: usize = 39;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5174,6 +5175,7 @@ mod tests {
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
+            Action::QassPage => (const { place(38) }, Some("ctrl-a Q")),
         }
     }
 
@@ -5215,6 +5217,7 @@ mod tests {
             Action::CloseSpace,
             Action::Rename,
             Action::SpaceSettings,
+            Action::QassPage,
             Action::Collapse,
             Action::Update,
             Action::Menu,

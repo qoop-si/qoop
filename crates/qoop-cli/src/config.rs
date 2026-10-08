@@ -56,6 +56,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.alert_sound": c.alert_sound,
                 "notch.enabled": c.notch,
                 "sleep.idle_minutes": c.lifecycle.idle_minutes,
+                "sleep.qass_idle_minutes": c.lifecycle.qass_idle_minutes.unwrap_or(c.lifecycle.idle_minutes),
                 "daemon.exit_when_asleep": c.lifecycle.exit_when_asleep,
                 "qass.agent": read.qass_agent,
             },
@@ -90,6 +91,12 @@ fn show(json: bool) -> std::io::Result<()> {
     println!("notify.alert_sound = \"{}\"", c.alert_sound);
     println!("notch.enabled = {}", c.notch);
     println!("sleep.idle_minutes = {}", c.lifecycle.idle_minutes);
+    println!(
+        "sleep.qass_idle_minutes = {}",
+        c.lifecycle
+            .qass_idle_minutes
+            .unwrap_or(c.lifecycle.idle_minutes)
+    );
     println!("daemon.exit_when_asleep = {}", c.lifecycle.exit_when_asleep);
     println!("qass.agent = \"{}\"", read.qass_agent);
     for a in &read.agents {

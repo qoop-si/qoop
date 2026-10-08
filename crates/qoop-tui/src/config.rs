@@ -12,6 +12,7 @@
 //! enabled = true      # macOS: the agents in the notch
 //! [sleep]
 //! idle_minutes = 0
+//! qass_idle_minutes = 30
 //! [daemon]
 //! exit_when_asleep = true
 //! [qass]
@@ -610,7 +611,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 11] = [
+pub const KEYS: [&str; 12] = [
     "prefix",
     "theme",
     "icons",
@@ -620,6 +621,7 @@ pub const KEYS: [&str; 11] = [
     "notify.alert_sound",
     "notch.enabled",
     "sleep.idle_minutes",
+    "sleep.qass_idle_minutes",
     "daemon.exit_when_asleep",
     "qass.agent",
 ];
@@ -647,7 +649,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
                 QASS_AGENTS.join(", ")
             ));
         }
-        "sleep.idle_minutes" => match value.parse::<i64>() {
+        "sleep.idle_minutes" | "sleep.qass_idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
         },

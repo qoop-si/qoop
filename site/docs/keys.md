@@ -17,6 +17,7 @@ program.
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
+| `ctrl-a Q` | the qass page: its state, its sleep mode, wake and sleep |
 | `ctrl-a W` | close the space when it is empty |
 
 ## Panes

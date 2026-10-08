@@ -138,6 +138,11 @@ pub enum Action {
     /// have been called after.
     Rename,
     SpaceSettings,
+    /// ctrl-a Q, the qass page: how qass stands, its sleep mode, wake and sleep.
+    ///
+    /// Uppercase, like the other pages and boxes on the capitals; the lowercase letter stays
+    /// free.
+    QassPage,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
@@ -410,6 +415,7 @@ impl Keys {
                     b'm' => Action::Menu,
                     b'?' => Action::Keybinds,
                     b'R' => Action::SpaceSettings,
+                    b'Q' => Action::QassPage,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
@@ -701,6 +707,7 @@ mod tests {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01r"), vec![Action::Rename]);
         assert_eq!(keys.feed(b"\x01R"), vec![Action::SpaceSettings]);
+        assert_eq!(keys.feed(b"\x01Q"), vec![Action::QassPage]);
     }
 
     #[test]

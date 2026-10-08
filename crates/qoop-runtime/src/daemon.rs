@@ -1436,11 +1436,13 @@ impl Daemon {
                 crate::idle::IDLE_TIMEOUT_ENV
             );
         }
-        let minutes = crate::config::read().idle_minutes;
-        if minutes == 0 {
+        let lifecycle = crate::config::read();
+        let minutes = lifecycle.idle_minutes;
+        let qass_minutes = crate::idle::minutes_for(true, minutes, lifecycle.qass_idle_minutes);
+        if minutes == 0 && qass_minutes == 0 {
             eprintln!("qoopd: idle sleep: off");
         } else {
-            eprintln!("qoopd: idle sleep: after {minutes}m");
+            eprintln!("qoopd: idle sleep: after {minutes}m, qass after {qass_minutes}m");
             tokio::spawn(idle_sleep_loop(
                 Restore {
                     terminals: self.terminals.clone(),
@@ -1452,7 +1454,10 @@ impl Daemon {
                     agents: self.agents.clone(),
                 },
                 self.watched.clone(),
-                std::time::Duration::from_secs(minutes.saturating_mul(60)),
+                IdleTimeouts {
+                    general: minutes.saturating_mul(60).min(i64::MAX as u64) as i64,
+                    qass: qass_minutes.saturating_mul(60).min(i64::MAX as u64) as i64,
+                },
             ));
         }
 
@@ -2930,6 +2935,38 @@ fn state_name(state: qoop_domain::AgentRuntimeState) -> &'static str {
     }
 }
 
+/// Seconds a tab idles before it sleeps by itself: for every tab, and for the tab of qass's
+/// space. `0` is never.
+#[derive(Clone, Copy)]
+struct IdleTimeouts {
+    general: i64,
+    qass: i64,
+}
+
+impl IdleTimeouts {
+    /// The timeout of a tab in `space`, given the space qass lives in.
+    fn of(self, space: Option<i64>, qass: Option<i64>) -> i64 {
+        if space.is_some() && space == qass {
+            self.qass
+        } else {
+            self.general
+        }
+    }
+}
+
+/// The id of the space named `qass`: `Ok(None)` when there is none, `Err` when the store did
+/// not answer in time.
+async fn qass_space(into: &Restore) -> Result<Option<i64>, ()> {
+    let all = Box::pin(tokio::time::timeout(
+        PROBE_DEADLINE,
+        into.books.store.workspaces(),
+    ))
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    Ok(all.into_iter().find(|w| w.name == "qass").map(|w| w.id))
+}
+
 /// The idle reaper: close terminals idle past the configured timeout.
 ///
 /// One task for the whole daemon, spawned only when armed. It parks while
@@ -2938,11 +2975,7 @@ fn state_name(state: qoop_domain::AgentRuntimeState) -> &'static str {
 /// Each pass snapshots eligibility for every terminal, applies waiter-edge
 /// vetoes against that snapshot (never pass order), then puts to sleep each
 /// space all of whose tabs are ready, the way a person would ask for it.
-async fn idle_sleep_loop(
-    into: Restore,
-    watched: crate::idle::WatchCounts,
-    timeout: std::time::Duration,
-) {
+async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts, timeouts: IdleTimeouts) {
     // One startup delay under 30 seconds, from the wall clock rather than a
     // new dependency, so a fleet armed together does not sleep in one herd.
     let jitter = std::time::SystemTime::now()
@@ -2950,8 +2983,13 @@ async fn idle_sleep_loop(
         .map(|d| d.subsec_nanos() % 30)
         .unwrap_or(0);
     tokio::time::sleep(std::time::Duration::from_secs(jitter as u64)).await;
-    let tick = crate::idle::reap_tick(timeout);
-    let timeout_secs = timeout.as_secs().min(i64::MAX as u64) as i64;
+    // The tick follows the shortest timeout that is on.
+    let shortest = [timeouts.general, timeouts.qass]
+        .into_iter()
+        .filter(|s| *s > 0)
+        .min()
+        .unwrap_or(0);
+    let tick = crate::idle::reap_tick(std::time::Duration::from_secs(shortest as u64));
     let mut changes = into.agents.subscribe();
     loop {
         if into
@@ -2979,20 +3017,36 @@ async fn idle_sleep_loop(
         {
             break;
         }
-        idle_sleep_pass(&into, &watched, timeout_secs).await;
+        idle_sleep_pass(&into, &watched, timeouts).await;
     }
 }
 
 /// One pass: every tab whose panes have all been idle and unwatched past the timeout goes
 /// to sleep, through the same sleep a person asks for, which vets each pane again in full.
-async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, timeout_secs: i64) {
+async fn idle_sleep_pass(
+    into: &Restore,
+    watched: &crate::idle::WatchCounts,
+    timeouts: IdleTimeouts,
+) {
     // Edges older than a day are over by definition; swept over all edges,
     // every pass, before anything evaluates.
     into.agents.sweep_expectations(crate::agents::now_unix());
-    for ((space, tab), all) in idle_tabs(into, watched, timeout_secs) {
+    // The space qass lives in, looked up by name once a pass: it is a name a person can
+    // rename, and no id is kept for it anywhere.
+    // Only when qass has a number of its own; a store that does not answer skips the pass,
+    // so a qass kept awake is never put to sleep on the general number by a failed look.
+    let qass = if timeouts.general == timeouts.qass {
+        None
+    } else {
+        match qass_space(into).await {
+            Ok(space) => space,
+            Err(()) => return,
+        }
+    };
+    for ((space, tab), all) in idle_tabs(into, watched, timeouts, qass) {
         // Asked again for this tab alone, just before it sleeps: the tabs before it took
         // seconds each, and in them a person may have come back to this one.
-        if !all || idle_tabs(into, watched, timeout_secs).get(&(space, tab)) != Some(&true) {
+        if !all || idle_tabs(into, watched, timeouts, qass).get(&(space, tab)) != Some(&true) {
             continue;
         }
         match sleep_space(into, space, Some(tab)).await {
@@ -3012,7 +3066,8 @@ async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, tim
 fn idle_tabs(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
-    timeout_secs: i64,
+    timeouts: IdleTimeouts,
+    qass: Option<i64>,
 ) -> BTreeMap<(i64, u32), bool> {
     let agents = &into.agents;
     let now = crate::agents::now_unix();
@@ -3039,6 +3094,12 @@ fn idle_tabs(
         // Idle since the agent went quiet or since a person last looked, whichever is later.
         let since = since.max(watched.left_at(*stream).unwrap_or(since));
         let idle_secs = now.saturating_sub(since);
+        // 0 is never: the check below would read it as "idle for 0 seconds is enough".
+        let timeout_secs = timeouts.of(into.terminals.workspace_of(*stream), qass);
+        if timeout_secs == 0 {
+            eligible.insert(*stream, false);
+            continue;
+        }
         let foreground = crate::idle::classify_program(snap.program.as_deref(), snap.agent);
         let verdict = crate::idle::eligible_for_reap(
             snap.state,
@@ -10973,6 +11034,19 @@ mod flush_tests {
 
 #[cfg(test)]
 mod stale_socket_tests {
+    #[test]
+    fn idle_timeouts_pick_qass_s_own_for_its_space_only() {
+        let t = super::IdleTimeouts {
+            general: 1800,
+            qass: 0,
+        };
+        assert_eq!(t.of(Some(2), Some(2)), 0);
+        assert_eq!(t.of(Some(1), Some(2)), 1800);
+        // No qass space, or a terminal with no space: the general one.
+        assert_eq!(t.of(Some(1), None), 1800);
+        assert_eq!(t.of(None, None), 1800);
+    }
+
     use super::remove_stale_socket;
 
     /// The old socket link of an earlier daemon dangles once that daemon is gone: it is

@@ -24,6 +24,12 @@ pub fn reap_tick(timeout: std::time::Duration) -> std::time::Duration {
     std::time::Duration::from_secs(quarter.clamp(60, 300))
 }
 
+/// Minutes a tab waits before it sleeps by itself: qass's own number for the tab in qass's
+/// space (`None` follows the general one), the general one for every other. `0` is never.
+pub fn minutes_for(in_qass: bool, idle: u64, qass: Option<u64>) -> u64 {
+    if in_qass { qass.unwrap_or(idle) } else { idle }
+}
+
 /// Shells a person sits in, by basename, lowercase.
 ///
 /// Compared against what `identify()` returns, which is already the name a
@@ -715,6 +721,16 @@ mod tests {
             "only the unmarked one blocks"
         );
         assert!(sleep_blockers(&t, 10, Some(20), 5, &|pid| pid == 30 || pid == 40).is_empty());
+    }
+
+    #[test]
+    fn qass_sleeps_on_its_own_number_and_follows_the_general_one_without() {
+        assert_eq!(minutes_for(false, 30, Some(5)), 30);
+        assert_eq!(minutes_for(true, 30, Some(5)), 5);
+        assert_eq!(minutes_for(true, 30, None), 30);
+        // 0 is never, for qass too, whatever the others do.
+        assert_eq!(minutes_for(true, 30, Some(0)), 0);
+        assert_eq!(minutes_for(false, 0, Some(5)), 0);
     }
 
     fn screen(rows: &[&str]) -> Vec<String> {

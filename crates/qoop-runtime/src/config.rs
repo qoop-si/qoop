@@ -4,6 +4,7 @@
 //! ```toml
 //! [sleep]
 //! idle_minutes = 0          # 0 = a tab never sleeps by itself
+//! qass_idle_minutes = 30    # the same for qass's own space; left out, it follows idle_minutes
 //!
 //! [daemon]
 //! exit_when_asleep = true   # leave when nothing is awake and nobody is attached
@@ -22,6 +23,9 @@ use std::path::Path;
 pub struct Lifecycle {
     /// Minutes a tab is idle and unwatched before it sleeps by itself. `0` is never.
     pub idle_minutes: u64,
+    /// The same for the tab in qass's space: `0` is never, and `None` (not in the file) is
+    /// whatever `idle_minutes` says, as it was before this key.
+    pub qass_idle_minutes: Option<u64>,
     /// Leave when nothing is awake and nobody is attached.
     pub exit_when_asleep: bool,
 }
@@ -30,6 +34,7 @@ impl Default for Lifecycle {
     fn default() -> Self {
         Lifecycle {
             idle_minutes: 0,
+            qass_idle_minutes: None,
             exit_when_asleep: true,
         }
     }
@@ -61,6 +66,15 @@ pub fn lifecycle_from(table: &toml::Table) -> (Lifecycle, Vec<(String, String)>)
                 ("sleep", "idle_minutes", _) => problems.push((
                     name,
                     format!("idle_minutes = {value} is not a whole number of minutes, 0 or more"),
+                )),
+                ("sleep", "qass_idle_minutes", toml::Value::Integer(n)) if *n >= 0 => {
+                    settings.qass_idle_minutes = Some(*n as u64);
+                }
+                ("sleep", "qass_idle_minutes", _) => problems.push((
+                    name,
+                    format!(
+                        "qass_idle_minutes = {value} is not a whole number of minutes, 0 or more"
+                    ),
                 )),
                 ("daemon", "exit_when_asleep", toml::Value::Boolean(on)) => {
                     settings.exit_when_asleep = *on;
@@ -118,9 +132,20 @@ mod tests {
             settings,
             Lifecycle {
                 idle_minutes: 30,
+                qass_idle_minutes: None,
                 exit_when_asleep: false
             }
         );
+    }
+
+    #[test]
+    fn qass_has_its_own_idle_minutes() {
+        let (settings, problems) = parse("[sleep]\nidle_minutes = 30\nqass_idle_minutes = 0\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(settings.qass_idle_minutes, Some(0));
+        let (settings, problems) = parse("[sleep]\nqass_idle_minutes = -1\n");
+        assert_eq!(settings.qass_idle_minutes, None);
+        assert_eq!(problems[0].0, "sleep.qass_idle_minutes");
     }
 
     #[test]
