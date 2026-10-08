@@ -520,9 +520,11 @@ fn install(args: &[String]) -> std::io::Result<()> {
         let shown = config.strip_prefix(&home).unwrap_or(&config).display();
         let edited = edit(&config, &target, &script, at_root);
         // The entries of the script it replaces, so an agent does not report twice.
+        let mut replaced_old = false;
         for (file, outcome) in remove_everywhere(&target, &home, &old_script(&target), false) {
-            if let Err(e) = outcome {
-                println!("  {:<10} {} not cleaned: {e}", target.agent, file.display());
+            match outcome {
+                Ok(changed) => replaced_old |= changed,
+                Err(e) => println!("  {:<10} {} not cleaned: {e}", target.agent, file.display()),
             }
         }
         match edited {
@@ -539,6 +541,15 @@ fn install(args: &[String]) -> std::io::Result<()> {
             println!(
                 "  {:<10} Codex runs these hooks only once trusted: start Codex and pick \
                  \"Trust all\" when it lists them, or use /hooks",
+                ""
+            );
+        }
+        // The hook of before the rename was trusted by its path; this one is a new path, so
+        // new Codex sessions run without hooks until it is trusted once.
+        if target.agent == "codex" && replaced_old {
+            println!(
+                "  {:<10} the hook moved to a new path, which Codex has not trusted yet: until \
+                 you pick \"Trust all\" (or /hooks) in a new Codex session, it runs without",
                 ""
             );
         }

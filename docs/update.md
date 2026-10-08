@@ -40,9 +40,13 @@ deleted once no 0.7.x daemon or agent started before the rename is left:
   goes with `hooks uninstall`.
 - `QOOP_*` variables fall back to the `QORO_*` of a shell, a service or a tab that predates
   the rename, and a tab gets both.
+- Codex trusts a hook by its path, and the hook has a new one: after the update, pick "Trust all" (or
+  `/hooks`) once in a new Codex session, or it runs without hooks. `hooks install` says so when it
+  replaces the old entry.
 - The notch's login item moves from `qoro.notch` to `si.qoop.notch`.
 
-To go back to a 0.7.x build, put its binary at `~/.local/bin/qoro` (replacing the link) and make the
+To go back to a 0.7.x build, put its binary at `~/.local/bin/qoro` with `mv -f` (a `cp` would write
+through the link into `qoop`) and make the
 data directory a real one again first: a 0.7.x daemon refuses a data directory that is a link.
 
 With the data directory shown by `qoop paths data` (say `D/qoop`) and its old name `D/qoro`, that is

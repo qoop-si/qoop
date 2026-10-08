@@ -275,11 +275,12 @@ impl Screen {
                     }
                 }
             }
-            match letter {
-                'q' => self.put(x + at + 4, y + 3, "●", &brand),
-                'p' => self.put(x + at, y + 3, "●", &brand),
-                _ => x,
-            };
+            if letter == 'q' {
+                self.put(x + at + 4, y + 3, "●", &brand);
+            }
+            if letter == 'p' {
+                self.put(x + at, y + 3, "●", &brand);
+            }
         }
     }
 

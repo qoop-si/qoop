@@ -40,14 +40,17 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 pub fn restart_if_installed() {
     #[cfg(target_os = "macos")]
     {
-        // A login item from before the rename becomes one under the new label, with
-        // nothing left under the old (see `legacy`).
-        let had_old = qoop_runtime::legacy::retire_launchd_agent(mac::OLD_LABEL);
+        // A login item from before the rename becomes one under the new label: written and
+        // loaded first, and only then is the old one taken down (see `legacy`).
+        let had_old = qoop_runtime::legacy::old_launchd_plist(mac::OLD_LABEL).is_some();
         if let Some(plist) = mac::plist_path().filter(|p| p.exists() || had_old) {
-            if had_old {
-                let _ = mac::write_plist(&plist);
+            if had_old && mac::write_plist(&plist).is_err() {
+                return;
             }
-            let _ = crate::launchd::reload(mac::LABEL, &plist);
+            let loaded = crate::launchd::reload(mac::LABEL, &plist).is_ok();
+            if had_old && loaded {
+                qoop_runtime::legacy::retire_launchd_agent(mac::OLD_LABEL);
+            }
         }
     }
 }
@@ -236,7 +239,6 @@ mod mac {
         }
         let plist_path = plist_path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
         write_plist(&plist_path)?;
-        qoop_runtime::legacy::retire_launchd_agent(OLD_LABEL);
         // A notch already loaded is taken down first, so a second install picks up a
         // moved binary rather than failing on a label that is taken.
         crate::launchd::reload(LABEL, &plist_path).map_err(|e| {
@@ -245,6 +247,8 @@ mod mac {
                 plist_path.display()
             ))
         })?;
+        // The old login item goes only now that the new one is running.
+        qoop_runtime::legacy::retire_launchd_agent(OLD_LABEL);
         println!("the notch is on, and starts at login; qoop notch uninstall takes it out");
         Ok(())
     }
@@ -260,6 +264,7 @@ mod mac {
             std::fs::remove_file(&p)?;
             removed = true;
         }
+        removed |= qoop_runtime::legacy::retire_launchd_agent(OLD_LABEL);
         if let Ok(dir) = cache_dir()
             && let Ok(entries) = std::fs::read_dir(&dir)
         {
@@ -282,6 +287,10 @@ mod mac {
 
     pub fn status() -> std::io::Result<()> {
         let Some(path) = plist_path().filter(|p| p.exists()) else {
+            if qoop_runtime::legacy::old_launchd_plist(OLD_LABEL).is_some() {
+                println!("installed under its old name ({OLD_LABEL}): qoop notch install moves it");
+                return Ok(());
+            }
             println!("not installed: qoop notch install puts your agents in the notch");
             return Ok(());
         };

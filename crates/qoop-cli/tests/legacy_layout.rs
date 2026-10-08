@@ -308,3 +308,34 @@ fn an_unsandboxed_spawn_under_cargo_cannot_migrate() {
     }
     assert!(!m.path("config/qoop").exists() && !m.path("data/qoop").exists());
 }
+
+/// Codex trusts a hook by its path: replacing the old entry says the new one is not trusted yet.
+#[test]
+fn replacing_a_codex_hook_says_it_must_be_trusted_again() {
+    let m = Machine::new();
+    m.old_files();
+    let old_script = m.path("config/qoro/hooks/qoro-codex-hook.sh");
+    std::fs::create_dir_all(old_script.parent().unwrap()).expect("hooks dir");
+    std::fs::write(&old_script, "#!/bin/sh\n").expect("old script");
+    std::fs::create_dir_all(m.path("home/.codex")).expect("codex");
+    let entry = serde_json::json!({"hooks": [{"type": "command", "command": old_script.display().to_string()}]});
+    std::fs::write(
+        m.path("home/.codex/hooks.json"),
+        serde_json::json!({"hooks": {"Stop": [entry]}}).to_string(),
+    )
+    .expect("hooks.json");
+    let out = m
+        .qoop()
+        .args(["hooks", "install", "codex"])
+        .output()
+        .expect("install");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("has not trusted yet"), "{said}");
+    // Run again: nothing was replaced this time, so that sentence is not repeated.
+    let out = m
+        .qoop()
+        .args(["hooks", "install", "codex"])
+        .output()
+        .expect("install");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("has not trusted yet"));
+}
