@@ -54,8 +54,17 @@ pub const SANDBOX_ENV: &str = "QOOP_TEST_SANDBOX";
 /// Stop a binary that cargo started (a test, `cargo run`) with nobody's sandbox: its first
 /// command would move the home's `qoro` directories, and the person running the suite
 /// never asked for that. Loud, and before anything is touched.
+///
+/// Only a binary that lies under a `target` directory: an installed one keeps working in an
+/// environment that inherited `CARGO_MANIFEST_DIR` (an IDE, a daemon started by `cargo run`
+/// and the tabs it starts).
 fn refuse_unsandboxed() {
-    if std::env::var_os("CARGO_MANIFEST_DIR").is_some() && std::env::var_os(SANDBOX_ENV).is_none() {
+    let exe = std::env::current_exe().ok();
+    if should_refuse(
+        exe.as_deref(),
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        std::env::var_os(SANDBOX_ENV).is_some(),
+    ) {
         eprintln!(
             "qoop: refusing to run under cargo with a real home: it would move its qoro \
              directories. Start it from a test through qoop_testkit::sandboxed, or set \
@@ -63,6 +72,12 @@ fn refuse_unsandboxed() {
         );
         std::process::exit(70);
     }
+}
+
+fn should_refuse(exe: Option<&Path>, under_cargo: bool, sandboxed: bool) -> bool {
+    under_cargo
+        && !sandboxed
+        && exe.is_some_and(|exe| exe.components().any(|part| part.as_os_str() == "target"))
 }
 
 /// Move the person's directories to the new name, once: the configuration, the data and
@@ -89,24 +104,59 @@ pub fn move_home() {
     }
 }
 
+/// Left inside a directory just before it is renamed, so a start that died between the
+/// rename and the link is found and finished by the next command.
+const MOVED_MARK: &str = ".moved-from-qoro";
+
+/// Left in the new directory when an old one is there beside it, so that is said once.
+const BOTH_NOTE: &str = ".qoro-left-alone";
+
 /// `<parent>/qoro` to `<parent>/qoop`, leaving a link at the old name. A link at the old
 /// name (a dotfiles checkout) is followed by a link at the new one, not copied.
 fn move_dir(new: &Path) -> io::Result<()> {
     let old = new.with_file_name(OLD);
-    if new.file_name().is_none_or(|name| name != NEW) || new.symlink_metadata().is_ok() {
+    if new.file_name().is_none_or(|name| name != NEW) {
         return Ok(());
     }
-    let Ok(meta) = old.symlink_metadata() else {
-        return Ok(());
-    };
-    if meta.file_type().is_symlink() {
-        return symlink(&old, new);
+    let real_dir = |meta: &std::fs::Metadata| meta.is_dir() && !meta.file_type().is_symlink();
+    match (new.symlink_metadata(), old.symlink_metadata()) {
+        (Err(_), Err(_)) => Ok(()),
+        // The new name is there and the old is not: a link gone missing is put back only when
+        // this build's own move was cut short (the mark is inside), never on a fresh install.
+        (Ok(now), Err(_)) => {
+            if real_dir(&now) && new.join(MOVED_MARK).exists() {
+                symlink(new, &old)?;
+            }
+            Ok(())
+        }
+        // Both are real directories: the new one is used and the old one is left as it is,
+        // said once.
+        (Ok(now), Ok(was)) => {
+            if real_dir(&now) && real_dir(&was) && !new.join(BOTH_NOTE).exists() {
+                eprintln!(
+                    "qoop: {} and {} both exist; {} is used and {} is left as it is. Move what \
+                     you need from the old one by hand.",
+                    old.display(),
+                    new.display(),
+                    new.display(),
+                    old.display()
+                );
+                let _ = std::fs::write(new.join(BOTH_NOTE), "");
+            }
+            Ok(())
+        }
+        (Err(_), Ok(was)) => {
+            if was.file_type().is_symlink() {
+                return symlink(&old, new);
+            }
+            if !was.is_dir() {
+                return Ok(());
+            }
+            std::fs::write(old.join(MOVED_MARK), "")?;
+            std::fs::rename(&old, new)?;
+            symlink(new, &old)
+        }
     }
-    if !meta.is_dir() {
-        return Ok(());
-    }
-    std::fs::rename(&old, new)?;
-    symlink(new, &old)
 }
 
 /// The database file in `state`: this build's name for a new one, and the name it already
@@ -135,6 +185,16 @@ fn old_session_dir(dir: &Path) -> Option<PathBuf> {
     )
 }
 
+/// Whether `dir` and its `parents` ancestors pass the checks the runtime directory does
+/// (ADR-012): ours, private, not a link. An old runtime directory that does not is not
+/// connected to or linked: on a machine without `XDG_RUNTIME_DIR` it is a name in a shared
+/// temp directory that another user could have made first.
+fn trusted_chain(dir: &Path, parents: usize) -> bool {
+    dir.ancestors()
+        .take(parents + 1)
+        .all(|d| paths::verify_private_dir(d).is_ok())
+}
+
 /// A command of this build, before any daemon of it is up: when a 0.7.x daemon is
 /// listening, make this build's socket path reach it. The daemon moves onto this build
 /// when it is next idle, and is asked to by a command that finds it here.
@@ -143,9 +203,10 @@ pub fn reach_old_daemon(dir: &Path) {
     if new.symlink_metadata().is_ok() {
         return;
     }
-    let Some(old) = old_session_dir(dir).map(|d| d.join(OLD_SOCKET)) else {
+    let Some(old_dir) = old_session_dir(dir).filter(|d| trusted_chain(d, 2)) else {
         return;
     };
+    let old = old_dir.join(OLD_SOCKET);
     if UnixStream::connect(&old).is_ok() {
         let _ = symlink(&old, &new);
     }
@@ -161,6 +222,9 @@ pub fn reach_old_bridge(base: &Path) {
         base.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().replacen(NEW, OLD, 1)),
     );
+    if old == base || !trusted_chain(&old, 0) {
+        return;
+    }
     let old = old.join("bridge.sock");
     if old != new && UnixStream::connect(&old).is_ok() {
         let _ = symlink(&old, &new);
@@ -172,7 +236,7 @@ pub fn reach_old_bridge(base: &Path) {
 /// point it here. Nothing is made when there never was an old install.
 pub fn point_old_path_at(socket: &Path) {
     let Some(dir) = socket.parent() else { return };
-    let Some(old_dir) = old_session_dir(dir) else {
+    let Some(old_dir) = old_session_dir(dir).filter(|d| !d.exists() || trusted_chain(d, 2)) else {
         return;
     };
     let old = old_dir.join(OLD_SOCKET);
@@ -239,28 +303,43 @@ pub fn keep_old_name(exe: &Path) -> io::Result<()> {
     })
 }
 
-/// Take down the launchd agent that went by `label` before the rename and delete its
-/// plist, once the caller has put the agent back under its new label. Answers whether there
-/// was one. macOS only; nothing happens elsewhere.
+/// The plist of the launchd agent that went by `label` before the rename, when it is there.
+/// macOS only.
+pub fn old_launchd_plist(label: &str) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        home.join("Library/LaunchAgents")
+            .join(format!("{label}.plist")),
+    )
+    .filter(|p| p.exists())
+}
+
+/// Take down the launchd agent that went by `label` before the rename and delete its plist,
+/// once the caller has put the agent back under its new label and it loaded. Answers whether
+/// there was one. Nothing happens off macOS.
 ///
 /// Both labels would otherwise run side by side, each with its own copy of the program.
 pub fn retire_launchd_agent(label: &str) -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(plist) = old_launchd_plist(label) else {
         return false;
     };
-    let plist = home
-        .join("Library/LaunchAgents")
-        .join(format!("{label}.plist"));
-    if !plist.exists() {
-        return false;
-    }
     let _ = std::process::Command::new("launchctl")
         .args(["bootout", &format!("gui/{}/{label}", paths::current_uid())])
         .output();
     std::fs::remove_file(plist).is_ok()
+}
+
+/// The lock `ensure-awake` takes in session directory `dir`. A 0.7.x `ensure-awake` takes it
+/// in the old runtime directory, so while that exists both builds take that one and exclude
+/// each other.
+pub fn awake_lock(dir: &Path) -> PathBuf {
+    match old_session_dir(dir) {
+        Some(old) if old.is_dir() && trusted_chain(&old, 2) => old.join("awake.lock"),
+        _ => dir.join("awake.lock"),
+    }
 }
 
 /// What `--version` says: `qoro` when the name this binary was started by contains `qoro`,
@@ -293,6 +372,15 @@ fn version_name(started_as: Option<&str>) -> &'static str {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    /// `dir` and every directory between it and `root` made private, as the runtime's are.
+    fn private_tree(root: &Path, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        for d in dir.ancestors().take_while(|d| *d != root) {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
 
     #[test]
     fn an_old_directory_moves_and_leaves_a_link() {
@@ -359,8 +447,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let old_dir = tmp.path().join("qoro-1/sessions/default");
         let new_dir = tmp.path().join("qoop-1/sessions/default");
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::create_dir_all(&new_dir).unwrap();
+        private_tree(tmp.path(), &old_dir);
+        private_tree(tmp.path(), &new_dir);
         let old_listener = UnixListener::bind(old_dir.join("qorod.sock")).unwrap();
 
         reach_old_daemon(&new_dir);
@@ -379,7 +467,7 @@ mod tests {
     fn nothing_is_made_when_there_never_was_an_old_install() {
         let tmp = tempfile::tempdir().unwrap();
         let new_dir = tmp.path().join("qoop-1/sessions/default");
-        std::fs::create_dir_all(&new_dir).unwrap();
+        private_tree(tmp.path(), &new_dir);
         let _listener = UnixListener::bind(paths::socket_path(&new_dir)).unwrap();
         point_old_path_at(&paths::socket_path(&new_dir));
         reach_old_daemon(&new_dir);
@@ -391,7 +479,7 @@ mod tests {
     fn an_explicit_directory_holds_both_socket_names() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("rt/sessions/default");
-        std::fs::create_dir_all(&dir).unwrap();
+        private_tree(tmp.path(), &dir);
         let _old = UnixListener::bind(dir.join("qorod.sock")).unwrap();
         reach_old_daemon(&dir);
         assert!(UnixStream::connect(paths::socket_path(&dir)).is_ok());
@@ -447,5 +535,87 @@ mod tests {
             assert_eq!(version_name(Some(new)), "qoop", "{new}");
         }
         assert_eq!(version_name(None), "qoop");
+    }
+
+    #[test]
+    fn the_guard_fires_only_for_a_cargo_built_binary_without_the_mark() {
+        let built = Path::new("/w/target/debug/qoop");
+        let installed = Path::new("/Users/a/.local/bin/qoop");
+        // Under cargo, in a target directory, with no mark: refused.
+        assert!(should_refuse(Some(built), true, false));
+        // The mark, or no cargo around, or an installed binary that inherited the variable
+        // (an IDE, the tabs of a daemon cargo started): never.
+        assert!(!should_refuse(Some(built), true, true));
+        assert!(!should_refuse(Some(built), false, false));
+        assert!(!should_refuse(Some(installed), true, false));
+        assert!(!should_refuse(None, true, false));
+    }
+
+    #[test]
+    fn a_move_cut_short_is_finished_and_a_fresh_install_gets_no_old_name() {
+        let home = tempfile::tempdir().unwrap();
+        let (old, new) = (home.path().join("qoro"), home.path().join("qoop"));
+        std::fs::create_dir(&old).unwrap();
+        move_dir(&new).unwrap();
+        // Cut after the rename: the link is gone, the mark is in the directory.
+        std::fs::remove_file(&old).unwrap();
+        assert!(old.symlink_metadata().is_err());
+        move_dir(&new).unwrap();
+        assert!(old.symlink_metadata().unwrap().file_type().is_symlink());
+
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fresh.path().join("qoop")).unwrap();
+        move_dir(&fresh.path().join("qoop")).unwrap();
+        assert!(fresh.path().join("qoro").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn two_real_directories_are_left_alone_and_said_once() {
+        let home = tempfile::tempdir().unwrap();
+        for name in ["qoro", "qoop"] {
+            std::fs::create_dir(home.path().join(name)).unwrap();
+        }
+        let new = home.path().join("qoop");
+        move_dir(&new).unwrap();
+        assert!(new.join(BOTH_NOTE).exists(), "said, and remembered");
+        assert!(
+            home.path()
+                .join("qoro")
+                .symlink_metadata()
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    /// An old runtime directory another user could have made (not private) is neither
+    /// connected to nor linked.
+    #[test]
+    fn an_old_runtime_directory_that_is_not_private_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let old_dir = tmp.path().join("qoro-1/sessions/default");
+        let new_dir = tmp.path().join("qoop-1/sessions/default");
+        private_tree(tmp.path(), &old_dir);
+        private_tree(tmp.path(), &new_dir);
+        let _listener = UnixListener::bind(old_dir.join("qorod.sock")).unwrap();
+        std::fs::set_permissions(
+            tmp.path().join("qoro-1"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        reach_old_daemon(&new_dir);
+        assert!(paths::socket_path(&new_dir).symlink_metadata().is_err());
+    }
+
+    /// `ensure-awake` of both builds take the same lock while the old runtime directory exists.
+    #[test]
+    fn both_builds_take_the_awake_lock_where_the_old_one_looks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_dir = tmp.path().join("qoro-1/sessions/default");
+        let new_dir = tmp.path().join("qoop-1/sessions/default");
+        private_tree(tmp.path(), &new_dir);
+        assert_eq!(awake_lock(&new_dir), new_dir.join("awake.lock"));
+        private_tree(tmp.path(), &old_dir);
+        assert_eq!(awake_lock(&new_dir), old_dir.join("awake.lock"));
     }
 }
