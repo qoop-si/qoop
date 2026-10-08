@@ -42,8 +42,12 @@ deleted once no 0.7.x daemon or agent started before the rename is left:
   the rename, and a tab gets both.
 - The notch's login item moves from `qoro.notch` to `si.qoop.notch`.
 
-To go back to a 0.7.x build, put its binary at `~/.local/bin/qoro` (replacing the link) and
-start it: it finds its database, config and data through the links.
+To go back to a 0.7.x build, put its binary at `~/.local/bin/qoro` (replacing the link) and make the
+data directory a real one again first: a 0.7.x daemon refuses a data directory that is a link.
+
+With the data directory shown by `qoop paths data` (say `D/qoop`) and its old name `D/qoro`, that is
+`qoop stop; rm D/qoro; mv D/qoop D/qoro`. Config and logs can stay links. The database kept its old
+name, so the old build finds its tabs.
 
 ## Checking and installing
 
