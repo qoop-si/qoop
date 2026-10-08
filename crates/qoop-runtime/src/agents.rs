@@ -1896,6 +1896,49 @@ mod tests {
         );
     }
 
+    /// A draft typed into the composer is weak working evidence. It must not start a turn
+    /// after the screen has taken the belief over from a hook (a fresh session, or one that
+    /// finished a turn), and must keep one that is running.
+    #[test]
+    fn a_draft_does_not_start_a_turn_but_keeps_one_running() {
+        let hook = |r: &AgentRegistry, token: &CapabilityToken, state| {
+            r.observe_hook(1, &TerminalId::new("1"), token, state, false, false, NOW)
+                .expect("applies");
+        };
+        let composer = qoop_detect::Verdict {
+            visible_idle: true,
+            ..screen_verdict(AgentRuntimeState::Idle, false)
+        };
+        let draft = screen_verdict(AgentRuntimeState::Working, false);
+
+        // Cases 1 and 2: a session that was never prompted, and one whose turn ended.
+        for before_draft in [AgentRuntimeState::Starting, AgentRuntimeState::Idle] {
+            let r = registry();
+            let token = mint_token(1);
+            r.register(1, TerminalId::new("1"), token.clone());
+            hook(&r, &token, before_draft);
+            r.observe_screen(1, "test-manifest", &composer, NOW);
+            r.observe_screen(1, "test-manifest", &draft, NOW);
+            assert_eq!(
+                r.agent(1).expect("agent").belief.state,
+                AgentRuntimeState::Idle,
+                "{before_draft:?}"
+            );
+        }
+
+        // Case 3: the prompt was sent, so the hook says working, and the draft under the
+        // streaming answer keeps it so.
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        hook(&r, &token, AgentRuntimeState::Working);
+        r.observe_screen(1, "test-manifest", &draft, NOW);
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            AgentRuntimeState::Working
+        );
+    }
+
     /// A permission prompt answered while a long tool runs: the hook said `blocked`
     /// and has nothing more to say until the tool ends, so only the screen sees the
     /// agent work again. A screen that positively shows work clears the hook's

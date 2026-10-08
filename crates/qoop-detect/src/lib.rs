@@ -107,7 +107,8 @@ pub struct Verdict {
     pub visible_blocker: bool,
     /// An idle prompt is positively on screen.
     pub visible_idle: bool,
-    /// Work in progress is positively on screen.
+    /// Work in progress is positively on screen. A `working` rule without it only keeps a
+    /// turn going; it cannot start one from idle.
     pub visible_working: bool,
     /// The matched rule is a startup gate: answering it is what creates the
     /// session rather than what continues one. A trust dialog on first run,

@@ -81,7 +81,9 @@ pub struct AgentObservation {
     /// override.
     pub visible_idle: bool,
     /// True only for a screen observation that positively saw work in progress. It clears
-    /// a held `Blocked` and nothing else: a prompt that was answered leaves no hook event
+    /// a held `Blocked`, and it is what lets a screen reading start a turn from `Idle`: a
+    /// working reading without it (a draft in the composer) only keeps a turn going. Nothing
+    /// else: a prompt that was answered leaves no hook event
     /// until the tool ends, and a spinner on screen cannot lie about the prompt being gone.
     pub visible_working: bool,
 }
@@ -135,6 +137,18 @@ impl AgentBelief {
         }
         if obs.source == self.source && obs.sequence <= self.sequence {
             return ObservationVerdict::OutOfOrder;
+        }
+        // A weak working reading (no spinner or interrupt hint behind it, such as a draft in
+        // the composer) keeps a turn that is going; it never starts one. Otherwise a draft
+        // typed before the first prompt, or after a turn ended, reads as work once the screen
+        // holds the belief. A turn starts with a hook report or a visible spinner. An unknown
+        // belief is left out on purpose: a restarted daemon adopting a running agent needs it.
+        if obs.source == ObservationSource::ScreenHeuristic
+            && obs.state == AgentRuntimeState::Working
+            && !obs.visible_working
+            && self.state == AgentRuntimeState::Idle
+        {
+            return ObservationVerdict::Outranked;
         }
         // Comparable strength and a different answer. Neither source is far enough above
         // the other for its rank to settle it, so the honest state is that they disagree.
@@ -473,6 +487,29 @@ mod tests {
             )),
             ObservationVerdict::Outranked
         );
+    }
+
+    #[test]
+    fn a_weak_working_screen_reading_never_starts_a_turn() {
+        // A draft in the composer reads as weak working. It keeps a turn that is going
+        // (same state), but over an idle or starting belief held by the screen it must not
+        // start one: no prompt was sent.
+        let b = belief(
+            1,
+            AgentRuntimeState::Idle,
+            ObservationSource::ScreenHeuristic,
+            5,
+        );
+        let draft = obs(
+            1,
+            AgentRuntimeState::Working,
+            ObservationSource::ScreenHeuristic,
+            6,
+        );
+        assert_eq!(b.evaluate(&draft), ObservationVerdict::Outranked);
+        let mut spinner = draft.clone();
+        spinner.visible_working = true;
+        assert_eq!(b.evaluate(&spinner), ObservationVerdict::Accept);
     }
 
     #[test]
