@@ -54,6 +54,16 @@ impl Daemon {
         stderr.push_str(&String::from_utf8_lossy(&out.stdout));
         (out.status.success(), stderr)
     }
+
+    fn qoop(&self, args: &[&str]) -> String {
+        let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
+            .args(args)
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .output()
+            .expect("run qoop");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
 }
 
 impl Drop for Daemon {
@@ -299,5 +309,54 @@ fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
         started.elapsed() < Duration::from_secs(8),
         "took {:?}",
         started.elapsed()
+    );
+}
+
+/// A `starting` report can land after a program drew its composer and went quiet: the
+/// screen is only read after output, so without a read asked for by the report the row
+/// stayed `starting` (a working animation in the sidebar) until the first prompt.
+#[test]
+fn a_starting_report_after_the_composer_is_drawn_settles_to_idle() {
+    let daemon = Daemon::start();
+    let dir = daemon.dir.path();
+    let reported = dir.join("reported");
+    let rule = "\u{2500}".repeat(40);
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nprintf '{rule}\\n{prompt} Try \"fix it\"\\n{rule}\\n  ? for shortcuts\\n'\n\
+             sleep 1\n'{qoop}' hook-report --state starting\ntouch '{reported}'\nsleep 60\n",
+            prompt = "\u{276f}",
+            qoop = env!("CARGO_BIN_EXE_qoop"),
+            reported = reported.display(),
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let number = daemon
+        .qoop(&["new", "--", agent.to_str().unwrap()])
+        .trim()
+        .to_string();
+    let line = |daemon: &Daemon| {
+        daemon
+            .qoop(&["agents"])
+            .lines()
+            .find(|l| l.starts_with(&format!("term={number} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !reported.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(reported.exists(), "the stand in never reported");
+    while Instant::now() < deadline && !line(&daemon).contains("state=idle") {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        line(&daemon).contains("state=idle"),
+        "a composer on screen must end the starting claim: {}",
+        line(&daemon)
     );
 }

@@ -75,6 +75,12 @@ pub enum ClientCommand {
     /// until the next output happens to arrive. Internal only: it carries no bytes
     /// for the child and takes none, so it is not a write path.
     Refresh,
+    /// Read the screen for what the agent is doing, as if output had just arrived.
+    ///
+    /// The screen is otherwise read only after output, so a belief a hook set while the
+    /// program sat quiet (a `starting` report that landed after the first frame) would
+    /// never meet the composer already on screen. Internal only, like `Refresh`.
+    Look,
     /// The owner has agreed to hand the geometry to this client. The only path that moves
     /// ownership other than the owner's connection ending (ADR-007).
     GrantOwnership {
@@ -4392,6 +4398,16 @@ async fn handle_control(
                     reason: format!("the report for terminal {terminal} was refused"),
                 },
                 Ok(_) => {
+                    // `starting` is the one claim that says nothing about the screen, and it
+                    // can land after the program drew its composer and went quiet. Output
+                    // is what normally triggers a read, so ask for one: a composer on the
+                    // screen then ends the claim instead of the row waiting for output
+                    // that never comes.
+                    if reported == qoop_domain::AgentRuntimeState::Starting
+                        && let Some(handle) = terminals.get(terminal)
+                    {
+                        let _ = handle.commands.try_send(ClientCommand::Look);
+                    }
                     // A focus event is display only: recorded after admission,
                     // so a forged token cannot write it, and kept out of
                     // the belief, the push payload and the store. An absent
@@ -9189,6 +9205,11 @@ async fn terminal_task(
                                 let _ = updates.send(TerminalUpdate::Image(image));
                             }
                             let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+                        }
+                        ClientCommand::Look => {
+                            let now = tokio::time::Instant::now();
+                            let began = *detect_since.get_or_insert(now);
+                            detect_at = Some((now + DETECT_SETTLE).min(began + DETECT_CEILING));
                         }
                     ClientCommand::GrantOwnership { from, to } => {
                         // Only the owner can give it away, and it is checked here rather
