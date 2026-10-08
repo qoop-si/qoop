@@ -137,7 +137,7 @@ fn hello(client_id: &str, observer: bool, replaces: Option<&str>) -> ClientHello
         codec_generation_min: qoop_proto::CODEC_GENERATION,
         codec_generation_max: qoop_proto::CODEC_GENERATION,
         client_id: client_id.to_string(),
-        client_name: "qoro".into(),
+        client_name: "qoop".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),
         codecs: CodecOffers {
             control: vec!["control.json.v1".into()],
@@ -197,18 +197,18 @@ fn not_running(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => io::Error::new(
             e.kind(),
-            "nothing is awake: `qoro` or `qoro wake` starts it",
+            "nothing is awake: `qoop` or `qoop wake` starts it",
         ),
         _ => e,
     }
 }
 
 /// The handshake over any byte stream: a local socket, or the stdin and stdout of an `ssh`
-/// running `qoro relay` on another machine. The relay does not change the protocol, so
+/// running `qoop relay` on another machine. The relay does not change the protocol, so
 /// nothing after this point needs to know which one it is.
 ///
 /// The welcome comes back with the stream: it names the version the daemon is running, which
-/// over a relay can be older than the qoro on that machine's disk.
+/// over a relay can be older than the qoop on that machine's disk.
 /// `replaces` is the key of the link this connection belongs to ([`REPLACES`]).
 pub async fn handshake<S>(
     stream: S,

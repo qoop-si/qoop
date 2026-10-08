@@ -1,4 +1,4 @@
-//! `qoro update` leaves the hooks and skills current, the way `scripts/install.sh` does.
+//! `qoop update` leaves the hooks and skills current, the way `scripts/install.sh` does.
 //!
 //! The whole chain runs for real inside one temp dir: an installed copy of this build, a
 //! fake release served from `file://`, and a home with one agent in it. Nothing reaches the
@@ -9,30 +9,30 @@ use std::path::Path;
 use std::process::Command;
 
 const ASSETS: [&str; 4] = [
-    "qoro-aarch64-apple-darwin.tar.gz",
-    "qoro-x86_64-apple-darwin.tar.gz",
-    "qoro-x86_64-unknown-linux-gnu.tar.gz",
-    "qoro-aarch64-unknown-linux-gnu.tar.gz",
+    "qoop-aarch64-apple-darwin.tar.gz",
+    "qoop-x86_64-apple-darwin.tar.gz",
+    "qoop-x86_64-unknown-linux-gnu.tar.gz",
+    "qoop-aarch64-unknown-linux-gnu.tar.gz",
 ];
 
-/// `qoro` as installed on the fake machine, with its environment.
-fn qoro(root: &Path, exe: &Path, args: &[&str]) -> std::process::Output {
+/// `qoop` as installed on the fake machine, with its environment.
+fn qoop(root: &Path, exe: &Path, args: &[&str]) -> std::process::Output {
     Command::new(exe)
         .args(args)
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
-        .env("QORO_RUNTIME_DIR", root.join("rt"))
+        .env("QOOP_RUNTIME_DIR", root.join("rt"))
         // An update walks the saved remotes: this one is empty, never the person's own.
-        .env("QORO_REMOTES", root.join("remotes.json"))
+        .env("QOOP_REMOTES", root.join("remotes.json"))
         .env(
-            "QORO_RELEASE_BASE",
+            "QOOP_RELEASE_BASE",
             format!("file://{}", root.join("rel").display()),
         )
         // No agent binary on the path: an agent is present only by its directory.
         .env("PATH", "/usr/bin:/bin")
         .output()
-        .expect("run qoro")
+        .expect("run qoop")
 }
 
 fn line_of(status: &std::process::Output, agent: &str) -> String {
@@ -59,13 +59,13 @@ fn an_update_leaves_hooks_and_skills_current() {
     std::fs::write(root.join("remotes.json"), "[]").expect("remotes");
 
     // The installed build, and the "newer release": says 9.9.9, then is this build.
-    let exe = root.join("bin/qoro");
+    let exe = root.join("bin/qoop");
     std::fs::copy(env!("CARGO_BIN_EXE_qoop"), &exe).expect("install");
-    let fresh = root.join("pack/qoro");
+    let fresh = root.join("pack/qoop");
     std::fs::write(
         &fresh,
         format!(
-            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'qoro 9.9.9'; exit 0; }}\n\
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'qoop 9.9.9'; exit 0; }}\n\
              exec '{}' \"$@\"\n",
             env!("CARGO_BIN_EXE_qoop")
         ),
@@ -76,7 +76,7 @@ fn an_update_leaves_hooks_and_skills_current() {
     let tar = Command::new("tar")
         .arg("-czf")
         .arg(&tarball)
-        .arg("qoro")
+        .arg("qoop")
         .current_dir(root.join("pack"))
         .status()
         .expect("tar");
@@ -91,17 +91,17 @@ fn an_update_leaves_hooks_and_skills_current() {
     )
     .expect("release");
 
-    let hooks = qoro(root, &exe, &["hooks", "status"]);
+    let hooks = qoop(root, &exe, &["hooks", "status"]);
     assert_eq!(line_of(&hooks, "claude"), "claude     not installed");
     assert_eq!(line_of(&hooks, "codex"), "codex      not present");
 
-    let update = qoro(root, &exe, &["update"]);
+    let update = qoop(root, &exe, &["update"]);
     let said = String::from_utf8_lossy(&update.stdout).into_owned()
         + &String::from_utf8_lossy(&update.stderr);
     assert!(update.status.success(), "{said}");
-    assert!(said.contains("updated qoro"), "{said}");
+    assert!(said.contains("updated qoop"), "{said}");
     assert!(
-        said.contains("this machine: no daemon running, the next qoro starts 9.9.9"),
+        said.contains("this machine: no daemon running, the next qoop starts 9.9.9"),
         "{said}"
     );
     assert!(
@@ -109,14 +109,14 @@ fn an_update_leaves_hooks_and_skills_current() {
         "its output is shown: {said}"
     );
 
-    let hooks = qoro(root, &exe, &["hooks", "status"]);
+    let hooks = qoop(root, &exe, &["hooks", "status"]);
     assert_eq!(line_of(&hooks, "claude"), "claude     installed");
     assert_eq!(line_of(&hooks, "codex"), "codex      not present");
     assert!(
         !root.join("home/.codex").exists(),
         "an absent agent got files"
     );
-    let skills = qoro(root, &exe, &["skills", "status"]);
+    let skills = qoop(root, &exe, &["skills", "status"]);
     assert!(
         line_of(&skills, "claude").starts_with("claude     installed;"),
         "{}",

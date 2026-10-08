@@ -1,15 +1,15 @@
 //! What a supervising agent drives through the real socket: `wait`, `new`,
 //! `close`, `send --key` and the `--generation` refusal.
 //!
-//! Every run clears the `QORO_*` variables it inherited, so a test started
-//! from inside a qoro terminal neither reaches that terminal's session nor
+//! Every run clears the `QOOP_*` variables it inherited, so a test started
+//! from inside a qoop terminal neither reaches that terminal's session nor
 //! reads as running in it.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const INHERITED: &[&str] = &["QORO_TERMINAL", "QORO_TOKEN", "QORO_SESSION"];
+const INHERITED: &[&str] = &["QOOP_TERMINAL", "QOOP_TOKEN", "QOOP_SESSION"];
 
 struct Daemon {
     child: Child,
@@ -23,7 +23,7 @@ impl Daemon {
             .expect("chmod");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         cmd.arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
@@ -50,7 +50,7 @@ impl Daemon {
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         cmd.args(args)
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"));
         for var in INHERITED {
             cmd.env_remove(var);
@@ -59,7 +59,7 @@ impl Daemon {
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        self.command(args).output().expect("run qoro")
+        self.command(args).output().expect("run qoop")
     }
 
     fn run(&self, args: &[&str]) -> (bool, String, String) {
@@ -98,7 +98,7 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -276,8 +276,8 @@ fn close_ends_a_terminal_but_never_its_own() {
     // Run as if from inside terminal 1 of this session.
     let out = daemon
         .command(&["close", "1"])
-        .env("QORO_TERMINAL", "1")
-        .env("QORO_SESSION", "default")
+        .env("QOOP_TERMINAL", "1")
+        .env("QOOP_SESSION", "default")
         .output()
         .expect("run close");
     assert!(!out.status.success());
@@ -287,8 +287,8 @@ fn close_ends_a_terminal_but_never_its_own() {
     // The same number in another session is somebody else's tab.
     let out = daemon
         .command(&["--session", "elsewhere", "close", "1"])
-        .env("QORO_TERMINAL", "1")
-        .env("QORO_SESSION", "default")
+        .env("QOOP_TERMINAL", "1")
+        .env("QOOP_SESSION", "default")
         .output()
         .expect("run close");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("refusing to close"));

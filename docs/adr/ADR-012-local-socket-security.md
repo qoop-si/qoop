@@ -16,9 +16,9 @@ stale, unlink it and bind its own, leaving two daemons and one unreachable works
 ## Decision
 
 ### Socket location and permissions
-- Path: `$XDG_RUNTIME_DIR/qoro/qorod.sock` when `XDG_RUNTIME_DIR` is set, owned by the
+- Path: `$XDG_RUNTIME_DIR/qoop/qoopd.sock` when `XDG_RUNTIME_DIR` is set, owned by the
   user with mode `0700` on the directory.
-- Fallback when it is not set: `$TMPDIR/qoro-<uid>/qorod.sock`, where the directory is
+- Fallback when it is not set: `$TMPDIR/qoop-<uid>/qoopd.sock`, where the directory is
   created with mode `0700` and then **verified after creation**: it must be a real
   directory, not a symlink, owned by our uid, with no group or other permission bits. If
   verification fails the daemon refuses to start. It never chmods someone else's
@@ -29,7 +29,7 @@ stale, unlink it and bind its own, leaving two daemons and one unreachable works
 
 ### Test and debugging override
 
-`QORO_RUNTIME_DIR` overrides the runtime directory, and every check above applies to the
+`QOOP_RUNTIME_DIR` overrides the runtime directory, and every check above applies to the
 overridden path exactly as it does to the default one. This is not the optional session
 namespace ADR-006 rejects: it exists so that integration tests, which run in parallel, each
 get their own daemon and socket, and so a contributor running the suite does not attach to
@@ -55,7 +55,7 @@ Real isolation between agents requires a different uid, a container or a VM, whi
 marketing must not claim otherwise.
 
 ### Singleton election
-Startup takes an exclusive `flock` on `<runtime dir>/qorod.lock` and holds it for the
+Startup takes an exclusive `flock` on `<runtime dir>/qoopd.lock` and holds it for the
 entire sequence: stale socket check, unlink, bind, listen, initialise, signal readiness.
 A second launcher blocks on the lock, and when it acquires it, finds a live socket and
 simply connects. There is no window in which two daemons can both bind.

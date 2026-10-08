@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn one_connection_is_reused_when_a_control_path_is_given() {
         let argv = SshTransport::new("host")
-            .with_control_path("/tmp/qoro-%r@%h:%p")
+            .with_control_path("/tmp/qoop-%r@%h:%p")
             .argv("true");
         assert!(argv.iter().any(|a| a == "ControlMaster=auto"));
         assert!(argv.iter().any(|a| a.starts_with("ControlPath=")));

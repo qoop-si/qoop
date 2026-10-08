@@ -88,7 +88,7 @@ async fn a_client_attaches_and_a_real_shell_answers_a_real_command() {
 
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
-            bytes: b"echo QORO_READY_$((6*7))\n".to_vec(),
+            bytes: b"echo QOOP_READY_$((6*7))\n".to_vec(),
             from_terminal: None,
             from_token: None,
         })
@@ -100,7 +100,7 @@ async fn a_client_attaches_and_a_real_shell_answers_a_real_command() {
     let got = wait_for_screen(
         &mut rd,
         &mut inbuf,
-        |s| screen(s).contains("QORO_READY_42"),
+        |s| screen(s).contains("QOOP_READY_42"),
         Duration::from_secs(10),
     )
     .await;
@@ -173,7 +173,7 @@ async fn a_client_disconnect_does_not_kill_the_shell() {
     // same shell rather than a fresh one.
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
-            bytes: b"QORO_SURVIVOR=alive; echo SET_$QORO_SURVIVOR\n".to_vec(),
+            bytes: b"QOOP_SURVIVOR=alive; echo SET_$QOOP_SURVIVOR\n".to_vec(),
             from_terminal: None,
             from_token: None,
         })
@@ -201,7 +201,7 @@ async fn a_client_disconnect_does_not_kill_the_shell() {
     let (mut rd, mut wr) = stream.into_split();
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
-            bytes: b"echo STILL_$QORO_SURVIVOR\n".to_vec(),
+            bytes: b"echo STILL_$QOOP_SURVIVOR\n".to_vec(),
             from_terminal: None,
             from_token: None,
         })

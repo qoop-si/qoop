@@ -1,6 +1,6 @@
 //! The person's picked terminal pet: what it is, where it lives, and nothing else.
 //!
-//! The picker (`qoro avatar pick` in qoop-cli) writes one small JSON file under the
+//! The picker (`qoop avatar pick` in qoop-cli) writes one small JSON file under the
 //! person's own configuration, beside the hooks and the agent-detection overrides.
 //! The sidebar reads it back to sign its foot with the avatar's two inks. Reading
 //! is fail-closed like the setup ledger: a missing file, garbage in it, or values
@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 /// Override for tests and scripts: read and write this path instead of the default.
-pub const AVATAR_ENV: &str = "QORO_AVATAR_FILE";
+pub const AVATAR_ENV: &str = "QOOP_AVATAR_FILE";
 
 /// The one body. There was a builder with five bodies once; the choice that
 /// survived is the darko box, and the setup screen offers no body picker.
@@ -222,7 +222,7 @@ pub fn rects(pet: &Avatar) -> Vec<(u8, u8, u8, u8, String)> {
         .collect()
 }
 
-/// What `qoro avatar pick` writes and the sidebar reads.
+/// What `qoop avatar pick` writes and the sidebar reads.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Avatar {
     pub body: String,
@@ -263,7 +263,7 @@ impl Avatar {
     }
 }
 
-/// Where the avatar lives: the override when set, else `qoro/avatar.json`
+/// Where the avatar lives: the override when set, else `qoop/avatar.json`
 /// under the person's own configuration, beside the hooks directory.
 pub fn avatar_path() -> PathBuf {
     match std::env::var(AVATAR_ENV) {

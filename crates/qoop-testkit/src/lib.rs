@@ -64,7 +64,7 @@ pub async fn wait_until_unlistened(socket: &Path) {
 }
 
 /// A daemon with its own private runtime directory.
-/// Where a daemon started with `QORO_RUNTIME_DIR = dir` puts its socket.
+/// Where a daemon started with `QOOP_RUNTIME_DIR = dir` puts its socket.
 ///
 /// One place, because six tests had written the join themselves and all six broke the day
 /// a session became a directory of its own. A test that builds a product path by hand is
@@ -73,7 +73,7 @@ pub fn socket_in(dir: &Path) -> std::path::PathBuf {
     paths::socket_path(&paths::session_dir(dir, paths::DEFAULT_SESSION))
 }
 
-/// Open terminal 1 in a daemon started as `qoro daemon`, which binds with none.
+/// Open terminal 1 in a daemon started as `qoop daemon`, which binds with none.
 ///
 /// Blocking, for the harnesses that start the real binary from synchronous code. The
 /// shell starts where the test runs, which is what the daemon's own first tab did.

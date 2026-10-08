@@ -187,7 +187,7 @@ impl std::fmt::Display for Screen {
 
 impl Drop for Interface {
     fn drop(&mut self) {
-        // This one's daemon, by its own handle. Never `pkill qoro daemon`: the first
+        // This one's daemon, by its own handle. Never `pkill qoop daemon`: the first
         // version did exactly that, and every interface test that finished killed every
         // other test's daemon on the machine. Three of five of these gates failed with a
         // broken pipe as soon as the suite ran in parallel, and the daemon they were
@@ -410,11 +410,11 @@ impl Interface {
         let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         daemon_cmd
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir)
+            .env("QOOP_RUNTIME_DIR", dir)
             .env("XDG_CONFIG_HOME", dir.join("config"))
-            // A test run from inside a qoro terminal inherits that terminal's session, which
+            // A test run from inside a qoop terminal inherits that terminal's session, which
             // moves the socket to a path this harness never looks at.
-            .env_remove("QORO_SESSION")
+            .env_remove("QOOP_SESSION")
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
@@ -447,10 +447,10 @@ impl Interface {
         let stdout = slave.try_clone().expect("dup");
         let stderr = slave.try_clone().expect("dup");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
-        cmd.env("QORO_RUNTIME_DIR", dir)
-            .env_remove("QORO_SESSION")
-            .env_remove("QORO_TERMINAL")
-            .env_remove("QORO_TOKEN")
+        cmd.env("QOOP_RUNTIME_DIR", dir)
+            .env_remove("QOOP_SESSION")
+            .env_remove("QOOP_TERMINAL")
+            .env_remove("QOOP_TOKEN")
             // Not the terminal running the tests: in iTerm2 or Terminal the interface would
             // install its icon font into the developer's own font folder, and the markers of
             // the others would turn icons on for the first frames of a pty that never answers.
@@ -463,7 +463,7 @@ impl Interface {
             .env_remove("SSH_TTY")
             // No remote from the machine running the tests: a real one would put ssh
             // connections under every gate here.
-            .env("QORO_REMOTES", dir.join("remotes.json"))
+            .env("QOOP_REMOTES", dir.join("remotes.json"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
             // Pinned for the same reason the scale gates pin it: an interactive shell
             // with a configured prompt is somebody's machine, not this program.
@@ -2383,12 +2383,12 @@ fn radar_dragging_the_divider_resizes_the_panel() {
     );
 }
 
-/// A daemon on another machine waiting to move onto a newer qoro: the line saying what it
+/// A daemon on another machine waiting to move onto a newer qoop: the line saying what it
 /// waits on stays on screen while the terminal in front of the person keeps drawing. Said
 /// where a render clears it, it was painted for one frame and never seen.
 ///
 /// The machine is reached the way the product reaches it: `ssh` here is a script running
-/// the remote command through `sh` in a home of its own, whose qoro already says it is this
+/// the remote command through `sh` in a home of its own, whose qoop already says it is this
 /// version (so nothing is downloaded) and relays to a daemon this test plays, one that
 /// welcomes as an older version and answers the ask to move with what it waits on.
 #[test]
@@ -2400,7 +2400,7 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     let bin = old.join(".local/bin");
     std::fs::create_dir_all(&bin).expect("bin");
     std::fs::write(
-        bin.join("qoro"),
+        bin.join("qoop"),
         format!(
             "#!/bin/sh\ncase \"$*\" in\n\
              *--hello*) echo '{{\"version\":\"{}\",\"codec_generation\":{},\"platform\":\"linux\"}}' ;;\n\
@@ -2410,8 +2410,8 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
             env!("CARGO_BIN_EXE_qoop")
         ),
     )
-    .expect("old qoro");
-    std::fs::set_permissions(bin.join("qoro"), std::fs::Permissions::from_mode(0o755))
+    .expect("old qoop");
+    std::fs::set_permissions(bin.join("qoop"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     let run = old.join("run");
     let sessions = run.join("sessions/default");
@@ -2424,7 +2424,7 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
     let listener =
-        std::os::unix::net::UnixListener::bind(sessions.join("qorod.sock")).expect("bind");
+        std::os::unix::net::UnixListener::bind(sessions.join("qoopd.sock")).expect("bind");
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             std::thread::spawn(move || waiting_daemon(stream));
@@ -2435,8 +2435,8 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     std::fs::write(
         ssh_bin.join("ssh"),
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QORO_SESSION\n\
-             HOME={} PATH=/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\n\
+             HOME={} PATH=/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             old.display(),
             run.display()
         ),

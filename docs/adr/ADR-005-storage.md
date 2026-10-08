@@ -29,7 +29,7 @@ attention client and any audit or replay use case require.
 A mutating command writes down its answer before the client is told, keyed by the client's
 idempotency key. A retry of that key returns the recorded answer instead of doing the work
 again. This is the whole of what the daemon read from the event log, and it is what
-`applied` in `qoro.db` is for. The first answer stands: a second write is ignored, because a
+`applied` in `qoop.db` is for. The first answer stands: a second write is ignored, because a
 command that answers twice has already done the work twice by the time the second write
 lands.
 
@@ -93,9 +93,9 @@ daemon and checks that a create is refused with no tab left behind.
 
 ## Where the stores live
 
-Amended 2026-09-30: `qoro.db` and `history/` live in the data directory
-(`paths::state_dir`: `$XDG_DATA_HOME/qoro`, `~/Library/Application Support/qoro` on macOS,
-`~/.local/share/qoro` elsewhere), private like the runtime directory, beside the machine
+Amended 2026-09-30: `qoop.db` and `history/` live in the data directory
+(`paths::state_dir`: `$XDG_DATA_HOME/qoop`, `~/Library/Application Support/qoop` on macOS,
+`~/.local/share/qoop` elsewhere), private like the runtime directory, beside the machine
 key. The runtime directory keeps what should die with a reboot: the socket, the locks, the
 bridge's doorbell and the phone's uploads, which are a day's scratch and whose path is
 pasted into a terminal as is, so it must not have a space in it.
@@ -107,23 +107,23 @@ reads it with its write-ahead log applied. The copy is synced before the old fil
 deleted, and the database arriving is the mark that the move is done, so an interrupted
 start is finished by the next. A database already in the data directory that has held a tab
 is never overwritten, and the old one is left and named on stderr; one that never held a
-tab is set aside as `qoro.db.empty`, so a daemon that started first with nothing to move
+tab is set aside as `qoop.db.empty`, so a daemon that started first with nothing to move
 cannot shadow the real one. The lifetime lock also stops a second daemon under another
 runtime directory (an ssh relay with no `XDG_RUNTIME_DIR`) from opening the same database
 and sweeping this one's history; it waits two seconds for a daemon of the same runtime
-directory to finish exiting, then refuses before binding, and says why in `qorod.failed`,
+directory to finish exiting, then refuses before binding, and says why in `qoopd.failed`,
 which the client that started it prints.
 
-With `QORO_RUNTIME_DIR` set, the state stays beside the socket, as before: every test
+With `QOOP_RUNTIME_DIR` set, the state stays beside the socket, as before: every test
 isolates its daemon through that variable, and a test must never write into a person's
 home. So does a daemon with no home to resolve a data directory from. The cost: a person
-who exports `QORO_RUNTIME_DIR` themselves keeps the old, cleared location.
+who exports `QOOP_RUNTIME_DIR` themselves keeps the old, cleared location.
 
 What follows is why, as it was measured before the move.
 
-`qoro.db` and `history/` were both opened in the runtime directory. On macOS
+`qoop.db` and `history/` were both opened in the runtime directory. On macOS
 `XDG_RUNTIME_DIR` is unset, so `runtime_base()` (`crates/qoop-runtime/src/paths.rs:71-86`)
-falls back to `std::env::temp_dir()` and both land in `$TMPDIR/qoro-<uid>`, which macOS
+falls back to `std::env::temp_dir()` and both land in `$TMPDIR/qoop-<uid>`, which macOS
 clears: measured on a machine that had been up three days, none of the files at depth 2 of
 that `TMPDIR` predated its boot, while the sibling cache directory beside it had the large
 majority of its files older. The measurement is scoped to that depth and that machine, and
@@ -219,12 +219,12 @@ restore read, which the next sentence of that version already said.
 
 ## Rollback
 
-`qoro.db` gains a table and `SCHEMA_VERSION` does not move, so a build that predates this
+`qoop.db` gains a table and `SCHEMA_VERSION` does not move, so a build that predates this
 one still opens the file and ignores the table. That older build reads its ledger from
 `events.db`, which this one no longer writes, so a retry that spans a downgrade opens a
 second tab; nothing else is lost. `events.db` is left on disk unread. `qoop-store` has no
 replacement, and its schema is a ladder rather than a version check.
 
 A build from before the stores moved looks for them in the runtime directory, finds none,
-and starts with no spaces. Nothing is deleted: moving `qoro.db` and `history/` from the
-data directory back beside the socket, with qoro stopped, restores them.
+and starts with no spaces. Nothing is deleted: moving `qoop.db` and `history/` from the
+data directory back beside the socket, with qoop stopped, restores them.

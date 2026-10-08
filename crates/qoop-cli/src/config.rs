@@ -1,4 +1,4 @@
-//! `qoro config`: the settings in `config.toml`, read and written from the command line.
+//! `qoop config`: the settings in `config.toml`, read and written from the command line.
 //!
 //! The file stays the one place settings live; the interface, the notch's settings window
 //! and a person at a shell all go through here. Writing is one key at a time, so a
@@ -6,9 +6,9 @@
 
 use qoop_tui::config;
 
-/// `qoro config ...`
+/// `qoop config ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro config [--json]\n       qoro config set <key> <value>";
+    let help = "usage: qoop config [--json]\n       qoop config set <key> <value>";
     match args.get(2).map(String::as_str) {
         None => show(false),
         Some("--json") if args.len() == 3 => show(true),
@@ -17,10 +17,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 config::set(&config::path(), key, value).map_err(std::io::Error::other)?;
                 // The notch reads it when it starts, or at once from its own window.
                 if key == "notch.enabled" && value == "true" {
-                    println!("{key} = {value}; qoro notch install starts it now");
+                    println!("{key} = {value}; qoop notch install starts it now");
                 } else if key == "notch.enabled" {
                     println!(
-                        "{key} = {value}; the notch goes at its next start, or now with qoro notch uninstall"
+                        "{key} = {value}; the notch goes at its next start, or now with qoop notch uninstall"
                     );
                 } else {
                     println!("{key} = {value}");

@@ -1,7 +1,7 @@
 //! A thin client over the real protocol, built directly on `qoop_runtime::client`.
 //!
 //! `qoop-testkit`'s `TestClient` cannot be reused here: it is only ever constructed by a
-//! `TestDaemon`, which runs the daemon in-process. The memory scenario needs a real `qorod`
+//! `TestDaemon`, which runs the daemon in-process. The memory scenario needs a real `qoopd`
 //! subprocess so its resident size can be read from the OS, so this talks to that
 //! subprocess's socket directly. The decode and framing logic is not duplicated: both this
 //! and `TestClient` sit on top of `qoop_runtime::client`'s `connect`, `encode_command_seq`

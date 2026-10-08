@@ -228,7 +228,7 @@ pub const HISTORY_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// biggest terminal.
 pub struct ConnectionRegistry {
     inner: std::sync::Mutex<Vec<Connection>>,
-    /// `qoro focus`, fanned out to every connection's event task. Bounded and lossy on
+    /// `qoop focus`, fanned out to every connection's event task. Bounded and lossy on
     /// purpose: a focus nobody drained in time is a click the person has moved past.
     focus: tokio::sync::broadcast::Sender<u32>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
@@ -264,7 +264,7 @@ pub struct Connection {
     /// The peer process, from the kernel rather than from anything it said.
     pid: Option<u32>,
     /// Whether the peer introduced itself as an interface, the one kind of client that
-    /// shows a terminal to a person and so the one `qoro focus` is for.
+    /// shows a terminal to a person and so the one `qoop focus` is for.
     interface: std::sync::atomic::AtomicBool,
     /// The terminals this connection last said are news for its person (`News`).
     news: std::sync::Mutex<BTreeSet<u32>>,
@@ -329,7 +329,7 @@ impl ConnectionRegistry {
     /// A welcomed peer, and whether it only watches. A peer that names its link (`replaces`)
     /// ends the connections that link made before it, and says which.
     ///
-    /// Over ssh a dropped network leaves the far `qoro relay` holding its socket here: the
+    /// Over ssh a dropped network leaves the far `qoop relay` holding its socket here: the
     /// remote sshd has not noticed, so this daemon never sees the close that ADR-007 moves a
     /// size on, and the reconnected link is refused every size until the no-ack sweep. The
     /// link reconnecting is the proof that its old connection is dead. Only connections
@@ -530,7 +530,7 @@ pub enum Said {
     /// The agent program of this generation said it, through its hook, or is the one a
     /// resume started.
     By(String, u64),
-    /// A resume of this agent program, typed by qoro, names it, and no agent of that
+    /// A resume of this agent program, typed by qoop, names it, and no agent of that
     /// program has appeared in the terminal since.
     Resumed(String),
 }
@@ -576,7 +576,7 @@ pub struct TerminalHandle {
     /// Memory only, like the name: the store keeps a copy for resume, but
     /// the index reads this so every poll stays off the disk.
     pub session: Option<String>,
-    /// Who vouches for `session`: the agent generation that said it, or a resume qoro
+    /// Who vouches for `session`: the agent generation that said it, or a resume qoop
     /// typed that names it and whose agent has not started yet.
     pub session_said: Option<Said>,
     /// Where this terminal is, last known. Written by the terminal's own
@@ -707,7 +707,7 @@ impl TerminalRegistry {
 
     /// Keep a conversation id only while the agent that has it is in the terminal (see
     /// `Said::settle`): a conversation is not in a tab its agent left. An id reported from
-    /// a program qoro does not know as an agent has no agent to go with, and stays. The id
+    /// a program qoop does not know as an agent has no agent to go with, and stays. The id
     /// the disk holds for it, if one was forgotten, so the caller forgets that one there.
     fn settle_session(&self, stream: u32, agent: Option<(&str, u64)>) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
@@ -1057,7 +1057,7 @@ pub struct Daemon {
     /// terminal and connection.
     books: Bookkeeping,
     /// Whether this daemon leaves when nothing is awake and nobody is attached. Set by the
-    /// binary that runs one on its own (`qoro daemon`); a daemon embedded in something
+    /// binary that runs one on its own (`qoop daemon`); a daemon embedded in something
     /// else, a test, stays until it is dropped.
     leaves: bool,
     /// What the last restart brought back, counted by kind. Kept so a gate, a
@@ -1129,12 +1129,12 @@ impl Daemon {
         // a few seconds after its socket goes, and the bind is what proves it has gone.
         if state != dir {
             crate::state::migrate(dir, state)?;
-            eprintln!("qorod: state in {}", state.display());
+            eprintln!("qoopd: state in {}", state.display());
         }
         // In a verified private directory: the runtime one, or `paths::state_dir`, which
         // is checked the same way.
         let store = crate::store::StoreHandle::new(
-            qoop_store::Store::open(&state.join("qoro.db")).map_err(io::Error::other)?,
+            qoop_store::Store::open(&state.join("qoop.db")).map_err(io::Error::other)?,
         );
         let workspace = match store.open_workspace().await {
             Ok(id) => id,
@@ -1143,7 +1143,7 @@ impl Daemon {
 
         let terminals = Arc::new(TerminalRegistry::default());
         // The idempotency ledger keeps a window (ADR-017), trimmed once a start: it grows by
-        // what people and agents asked for, and without this it grew for as long as qoro was
+        // what people and agents asked for, and without this it grew for as long as qoop was
         // installed. A retry is seconds behind the answer it missed, so the window is about
         // forensics on a reap, not about the retry.
         let _ = store.prune_applied().await;
@@ -1172,7 +1172,7 @@ impl Daemon {
                 awake.spaces = spaces;
                 awake.panes = panes.into_iter().map(|t| t as u32).collect();
             }
-            Err(e) => eprintln!("qorod: what is kept awake could not be read: {e}"),
+            Err(e) => eprintln!("qoopd: what is kept awake could not be read: {e}"),
         }
         // Which tabs are asleep, read before anything is restored: they stay down, and
         // their rows must keep their place from the first teardown on.
@@ -1185,7 +1185,7 @@ impl Daemon {
             // lost, and a wake brings each back. Restoring them all instead would bring back
             // a sleeping tab under its mark, where no agent write lands.
             Err(e) => {
-                eprintln!("qorod: which tabs are asleep could not be read: {e}");
+                eprintln!("qoopd: which tabs are asleep could not be read: {e}");
                 for space in store.workspaces().await.unwrap_or_default() {
                     let rows = store.open_terminals(space.id).await.unwrap_or_default();
                     books.mark(
@@ -1211,7 +1211,7 @@ impl Daemon {
         // first time it is recognised rather than the first time it changes.
         spawn_agent_recorder(agents.clone(), terminals.clone(), books.clone());
 
-        // What the last daemon was holding when it stopped. A person who closed qoro and
+        // What the last daemon was holding when it stopped. A person who closed qoop and
         // opened it again asked for their work back, not for an empty screen.
         let into = Restore {
             terminals: terminals.clone(),
@@ -1225,7 +1225,7 @@ impl Daemon {
         if let Some(handoff) = handoff {
             let carried = handoff.terminals.len();
             let adopted = adopt_terminals(&into, handoff).await;
-            eprintln!("qorod: took over {adopted} of {carried} running tabs");
+            eprintln!("qoopd: took over {adopted} of {carried} running tabs");
         }
         let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
@@ -1270,14 +1270,14 @@ impl Daemon {
         self.workspace
     }
 
-    /// Leave when nothing is awake and nobody is attached, as `qoro daemon` does (see
+    /// Leave when nothing is awake and nobody is attached, as `qoop daemon` does (see
     /// `leave_when_idle`). Off unless asked for, because leaving is `process::exit`.
     pub fn leaving_when_idle(mut self) -> Self {
         self.leaves = true;
         self
     }
 
-    /// The binary this daemon runs as `qoro daemon`, read by the caller at its very start.
+    /// The binary this daemon runs as `qoop daemon`, read by the caller at its very start.
     /// What `ControlRequest::RestartWhenSafe` checks the version of and becomes; without
     /// it the request is refused.
     pub fn restarting_into(self, exe: PathBuf) -> Self {
@@ -1291,7 +1291,7 @@ impl Daemon {
     /// Open one terminal in the default workspace, where the daemon is, before serving.
     ///
     /// A bind no longer opens one by itself: a daemon with nothing awake is one that is
-    /// about to leave, and the client that started it says what it wants (`qoro` asks
+    /// about to leave, and the client that started it says what it wants (`qoop` asks
     /// for a shell where the person is). This is for an embedder with no client, which
     /// is the tests.
     pub async fn open_first_terminal(&self) -> io::Result<u32> {
@@ -1377,7 +1377,7 @@ impl Daemon {
                 while outbound.load(Ordering::Relaxed) > MAX_OUTBOUND_BYTES {
                     match watched.evict_worst(now) {
                         Some(evicted) => eprintln!(
-                            "qorod: disconnecting {} to stay within the outbound budget",
+                            "qoopd: disconnecting {} to stay within the outbound budget",
                             evicted.as_str()
                         ),
                         None => break,
@@ -1386,7 +1386,7 @@ impl Daemon {
 
                 for client in watched.wedged(now, NO_ACK_DEADLINE) {
                     eprintln!(
-                        "qorod: disconnecting {} after {NO_ACK_DEADLINE:?} with no acknowledgement",
+                        "qoopd: disconnecting {} after {NO_ACK_DEADLINE:?} with no acknowledgement",
                         client.as_str()
                     );
                     watched.disconnect(&client);
@@ -1421,16 +1421,16 @@ impl Daemon {
         // otherwise wakes on an adaptive tick to put to sleep a space idle past the time.
         if std::env::var_os(crate::idle::IDLE_TIMEOUT_ENV).is_some() {
             eprintln!(
-                "qorod: {} is no longer read: idle spaces sleep after `[sleep] idle_minutes` in \
+                "qoopd: {} is no longer read: idle spaces sleep after `[sleep] idle_minutes` in \
                  config.toml",
                 crate::idle::IDLE_TIMEOUT_ENV
             );
         }
         let minutes = crate::config::read().idle_minutes;
         if minutes == 0 {
-            eprintln!("qorod: idle sleep: off");
+            eprintln!("qoopd: idle sleep: off");
         } else {
-            eprintln!("qorod: idle sleep: after {minutes}m");
+            eprintln!("qoopd: idle sleep: after {minutes}m");
             tokio::spawn(idle_sleep_loop(
                 Restore {
                     terminals: self.terminals.clone(),
@@ -1457,7 +1457,7 @@ impl Daemon {
             if qoop_pty::procwatch::is_subscription() {
                 let fd = watched_agents.raw_fd();
                 let Ok(afd) = AsyncFd::with_interest(WatchFd(fd), Interest::READABLE) else {
-                    eprintln!("qorod: cannot watch for process changes");
+                    eprintln!("qoopd: cannot watch for process changes");
                     return;
                 };
                 loop {
@@ -1524,7 +1524,7 @@ impl Daemon {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("qorod: accept failed: {e}");
+                    eprintln!("qoopd: accept failed: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -1545,7 +1545,7 @@ impl Daemon {
                 && let Some(evicted) = self.connections.evict_worst(std::time::Instant::now())
             {
                 eprintln!(
-                    "qorod: evicted {} to admit {}",
+                    "qoopd: evicted {} to admit {}",
                     evicted.as_str(),
                     client.as_str()
                 );
@@ -1612,7 +1612,7 @@ impl Daemon {
                 )
                 .await;
                 if let Err(e) = result {
-                    eprintln!("qorod: client ended: {e}");
+                    eprintln!("qoopd: client ended: {e}");
                 }
                 // What it held as news is news no more: every index looks again.
                 for terminal in registry.remove(&registered) {
@@ -1631,7 +1631,7 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            "a qoro daemon is already listening on this socket",
+            "a qoop daemon is already listening on this socket",
         )),
         Err(e)
             if matches!(
@@ -1655,7 +1655,7 @@ pub fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
 /// daemon is to serve. Anything else is closed and the socket is bound as usual.
 fn inherited_listener(fd: std::os::fd::RawFd, socket: &Path) -> Option<UnixListener> {
     if !fd_is_open(fd) {
-        eprintln!("qorod: the socket passed on is not open; binding a new one");
+        eprintln!("qoopd: the socket passed on is not open; binding a new one");
         return None;
     }
     // SAFETY: the daemon before this one passed this descriptor on as its listener, and
@@ -1667,7 +1667,7 @@ fn inherited_listener(fd: std::os::fd::RawFd, socket: &Path) -> Option<UnixListe
         .and_then(|addr| addr.as_pathname().map(|path| path == socket))
         .unwrap_or(false);
     if !ours {
-        eprintln!("qorod: the socket passed on is not this daemon's; binding a new one");
+        eprintln!("qoopd: the socket passed on is not this daemon's; binding a new one");
         return None;
     }
     // Close-on-exec again: the shells this daemon starts must not hold the socket open.
@@ -1683,7 +1683,7 @@ pub fn peer_is_ours(uid: u32) -> bool {
     uid == paths::current_uid()
 }
 
-/// The peer's pid, which is how `qoro focus` names the interfaces it moved: a launcher
+/// The peer's pid, which is how `qoop focus` names the interfaces it moved: a launcher
 /// raises the window the process runs in. `None` when the kernel will not say.
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
     let fd = stream.as_raw_fd();
@@ -1825,7 +1825,7 @@ pub struct RenderQueue {
 /// there is its own measurement error.
 fn trace_latency() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QORO_TRACE_LATENCY").is_ok())
+    *ON.get_or_init(|| std::env::var("QOOP_TRACE_LATENCY").is_ok())
 }
 
 /// Roughly what a snapshot costs to hold. The line text dominates; the exact figure does
@@ -2108,7 +2108,7 @@ async fn serve_client(
     Frame::new(Channel::Handshake, 0, Bytes::from(body))
         .encode(&mut out)
         .map_err(to_io)?;
-    // Known as an interface, and listening for `qoro focus`, before the welcome goes out:
+    // Known as an interface, and listening for `qoop focus`, before the welcome goes out:
     // a focus sent the moment the interface is in must neither miss it nor leave its pid
     // out of the answer.
     let mut focus = connections.focus.subscribe();
@@ -2126,7 +2126,7 @@ async fn serve_client(
             .filter(|key| !key.is_empty() && key.len() <= 64);
         for ended in connections.mark_welcomed(&client, observer, replaces) {
             eprintln!(
-                "qorod: {} replaces {}, the same link reconnected",
+                "qoopd: {} replaces {}, the same link reconnected",
                 client.as_str(),
                 ended.as_str()
             );
@@ -2984,12 +2984,12 @@ async fn idle_sleep_pass(into: &Restore, watched: &crate::idle::WatchCounts, tim
         }
         match sleep_space(into, space, Some(tab)).await {
             Ok((ended, _)) => eprintln!(
-                "qorod: idle sleep: tab {tab} of space {space} asleep, {} panes ended",
+                "qoopd: idle sleep: tab {tab} of space {space} asleep, {} panes ended",
                 ended.len()
             ),
             // Said once per pass and tried again on the next: a refusal here is a tab that
             // is not what it looked like from its screen alone.
-            Err(why) => eprintln!("qorod: idle sleep: {why}"),
+            Err(why) => eprintln!("qoopd: idle sleep: {why}"),
         }
     }
 }
@@ -3229,7 +3229,7 @@ async fn handle_control(
             if books.restart.gated() {
                 return ControlResponse::Failed {
                     id,
-                    reason: "qoro is moving onto a new version; try again in a moment".into(),
+                    reason: "qoop is moving onto a new version; try again in a moment".into(),
                 };
             }
             // A requested working directory is validated here rather than trusted. It has
@@ -3515,7 +3515,7 @@ async fn handle_control(
                 // exit waits for the terminals to actually go and for the asker to hang
                 // up, which it does once it has read the answer: with no terminals the
                 // first check used to pass at once and the process could end before the
-                // answer was written, failing `qoro stop` on a stop that worked. It gives
+                // answer was written, failing `qoop stop` on a stop that worked. It gives
                 // up on both at the deadline: a stop that leaves a daemon running because
                 // one shell ignored a hangup is not a stop.
                 let deadline = tokio::time::Instant::now() + SHUTDOWN_PATIENCE;
@@ -3943,7 +3943,7 @@ async fn handle_control(
         ControlRequest::CreateWorkspace { .. } if books.restart.gated() => {
             ControlResponse::Failed {
                 id,
-                reason: "qoro is moving onto a new version; try again in a moment".into(),
+                reason: "qoop is moving onto a new version; try again in a moment".into(),
             }
         }
         ControlRequest::CreateWorkspace { name, .. } => match store.create_workspace(name).await {
@@ -4140,7 +4140,7 @@ async fn handle_control(
                         .or_else(|| titles.get(&terminal).cloned());
                     // The explanation rides the row: what holds the belief,
                     // and what the screen last matched. A client that does
-                    // not know these fields ignores them; `qoro agents
+                    // not know these fields ignores them; `qoop agents
                     // explain` reads them.
                     let (source, rule, manifest) = agent
                         .as_ref()
@@ -4513,7 +4513,7 @@ async fn handle_control(
             token,
             before,
         } => {
-            // The asking terminal's space name, read in time or not at all: `qoro task rules`
+            // The asking terminal's space name, read in time or not at all: `qoop task rules`
             // stays quiet in qass's own space.
             let space = match terminal.and_then(|t| terminals.workspace_of(t)) {
                 Some(space) => space_name(store, space).await,
@@ -4561,12 +4561,12 @@ async fn handle_control(
             let Some(exe) = restart.exe.get().cloned() else {
                 return ControlResponse::Failed {
                     id,
-                    reason: "this daemon was not started as `qoro daemon` and cannot move".into(),
+                    reason: "this daemon was not started as `qoop daemon` and cannot move".into(),
                 };
             };
             // Asked of the file every time: a move is only ever onto the version the asker
             // put there, never onto whatever happens to be on disk later.
-            let wanted = format!("qoro {version}");
+            let wanted = format!("qoop {version}");
             match version_on_disk(&exe).await {
                 Ok(found) if found == wanted => {}
                 Ok(found) => {
@@ -4599,7 +4599,7 @@ async fn handle_control(
                 // what this one is waiting on.
                 restart.waiting.send_replace(None);
                 waiting.mark_unchanged();
-                eprintln!("qorod: {wanted} is on disk; moving onto it once nothing is working");
+                eprintln!("qoopd: {wanted} is on disk; moving onto it once nothing is working");
                 tokio::spawn(restart_when_safe(restore(), exe));
                 // The first look's answer, so the asker hears what is in the way. A look
                 // that found nothing ends this daemon, and with it this connection.
@@ -4699,7 +4699,7 @@ fn save_upload(dir: &Path, ext: &str, data: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     if !UPLOAD_KINDS.contains(&ext) {
         return Err(format!(
-            "qoro keeps only {} pictures",
+            "qoop keeps only {} pictures",
             UPLOAD_KINDS.join(", ")
         ));
     }
@@ -5122,7 +5122,7 @@ pub enum ClientWire {
     Input {
         bytes: Vec<u8>,
         /// Which terminal the sender runs in, if it runs in one. Filled by
-        /// the CLI from `QORO_TERMINAL`/`QORO_TOKEN` for send/prompt, so the
+        /// the CLI from `QOOP_TERMINAL`/`QOOP_TOKEN` for send/prompt, so the
         /// daemon keeps the waiter awake while its target is busy.
         /// Defaulted: older clients send no claim and get today's behavior.
         /// TUI typing and attach never fill it: only CLI send/prompt mints
@@ -5645,7 +5645,7 @@ async fn hold_state(state: &Path) -> io::Result<crate::lock::StartupLock> {
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "another qoro daemon is using {}; stop it first",
+                "another qoop daemon is using {}; stop it first",
                 state.display()
             )));
         }
@@ -5706,7 +5706,7 @@ impl KeptAwake {
 pub struct Restart {
     /// The binary this daemon started from, resolved before anything could replace it: on
     /// Linux the running path reads `<path> (deleted)` once a new file is renamed over it.
-    /// Unset for a daemon embedded in something else, which has no `qoro daemon` to become.
+    /// Unset for a daemon embedded in something else, which has no `qoop daemon` to become.
     exe: std::sync::OnceLock<PathBuf>,
     /// The runtime directory, where what a move hands over is written. Set with `exe`.
     dir: std::sync::OnceLock<PathBuf>,
@@ -5927,7 +5927,7 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
             Err(refused) if refused.ended => {
                 // The shell ended while the daemon moved: the tab is closed, as it would
                 // have been had nobody been moving.
-                eprintln!("qorod: tab {id} ended while the daemon moved; closing it");
+                eprintln!("qoopd: tab {id} ended while the daemon moved; closing it");
                 let closed = into.books.store.close_terminal(id as i64).await;
                 if closed.is_ok()
                     && let Some(dir) = into.history_dir.as_ref().map(|d| d.join(id.to_string()))
@@ -5936,10 +5936,10 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
                 }
             }
             Err(refused) => {
-                eprintln!("qorod: tab {id} could not be taken over: {}", refused.why);
+                eprintln!("qoopd: tab {id} could not be taken over: {}", refused.why);
                 if refused.ours {
                     let seen = fallback_teardown(&into.scanner, tty_dev, child as u32, start).await;
-                    eprintln!("qorod: tab {id}: stopped {seen} tracked processes");
+                    eprintln!("qoopd: tab {id}: stopped {seen} tracked processes");
                 } else {
                     // Closed without a terminal, its shell is hung up: waited for, so it
                     // does not stay as a zombie of this process.
@@ -6251,7 +6251,7 @@ async fn restore_rows(
             sent = handle
                 .commands
                 .send(ClientCommand::Input {
-                    from: ClientId::new("qoro-restore"),
+                    from: ClientId::new("qoop-restore"),
                     bytes: Bytes::from(line),
                 })
                 .await
@@ -6299,7 +6299,7 @@ fn vet_for_sleep(
         .reap_snapshot(stream)
         .ok_or("it has not been read yet")?;
     if snap.boundary {
-        return Err("qoro cannot see what runs in it".into());
+        return Err("qoop cannot see what runs in it".into());
     }
     if snap.setup_gate {
         return Err("it is waiting on its setup".into());
@@ -6342,7 +6342,7 @@ fn vet_for_sleep(
                     .clone()
                     .filter(|_| said == Some(Said::By(name.clone(), snap.generation.0)))
                     .ok_or(format!(
-                        "{name} has not said which conversation it is in (`qoro hooks install`)"
+                        "{name} has not said which conversation it is in (`qoop hooks install`)"
                     ))?;
                 if !qoop_detect::resumes_by_id(&name) {
                     return Err(format!(
@@ -6370,7 +6370,7 @@ fn vet_for_sleep(
             .iter()
             .any(|arg| {
                 arg.split_whitespace()
-                    .any(|w| w.trim_matches('\'') == "QORO_SLEEP_SAFE=1")
+                    .any(|w| w.trim_matches('\'') == "QOOP_SLEEP_SAFE=1")
             })
     };
     let blockers = crate::idle::sleep_blockers(table, leader, foreground, tty, &sleep_safe);
@@ -6454,7 +6454,7 @@ async fn sleep_space(
         .stopping
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        return Err("qoro is stopping".into());
+        return Err("qoop is stopping".into());
     }
     let known = into
         .books
@@ -6542,7 +6542,7 @@ async fn sleep_tab(
         .collect();
     if fresh.is_empty() {
         if let Err(why) = end_tabs(into, &live).await {
-            eprintln!("qorod: sleep of tab {tab}: {why}");
+            eprintln!("qoopd: sleep of tab {tab}: {why}");
         }
         return Ok(live);
     }
@@ -6591,7 +6591,7 @@ async fn sleep_tab(
     // Asleep from here, marks and all, whether or not every pane has ended yet: one still
     // running is ended by the next sleep of this tab, or waited out by its wake.
     if let Err(why) = end_tabs(into, &live).await {
-        eprintln!("qorod: sleep of tab {tab}: {why}");
+        eprintln!("qoopd: sleep of tab {tab}: {why}");
     }
     Ok(live)
 }
@@ -6620,7 +6620,7 @@ async fn end_tabs(into: &Restore, streams: &[u32]) -> Result<(), String> {
     }
     for stream in streams {
         if !into.books.writer_done(*stream, SHUTDOWN_PATIENCE).await {
-            eprintln!("qorod: the history of tab {stream} was still being written at its sleep");
+            eprintln!("qoopd: the history of tab {stream} was still being written at its sleep");
         }
     }
     Ok(())
@@ -6703,12 +6703,12 @@ async fn wake_locked(
         .stopping
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        return Err("qoro is stopping".into());
+        return Err("qoop is stopping".into());
     }
     // Under the lock, as for a tab made: a tab that came back during a move's look would
     // be ended by it without having been looked at.
     if into.books.restart.gated() {
-        return Err("qoro is moving onto a new version; try again in a moment".into());
+        return Err("qoop is moving onto a new version; try again in a moment".into());
     }
     let rows = into
         .books
@@ -6804,7 +6804,7 @@ async fn wake_locked(
 /// Close every descriptor the daemon was started with past stdin, stdout and stderr.
 ///
 /// The daemon outlives whoever started it, and every tab's shell inherits what it holds, so
-/// a pipe that leaked into the starter (a `$(qoro ...)` in a script, or another thread's
+/// a pipe that leaked into the starter (a `$(qoop ...)` in a script, or another thread's
 /// pipe caught mid-spawn) would otherwise never see its end and its reader waits forever.
 /// Call it first thing, before anything of the daemon's own is open.
 ///
@@ -6928,7 +6928,7 @@ async fn leave(watch: &Leaving) -> bool {
         .stopping
         .store(true, std::sync::atomic::Ordering::SeqCst);
     crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
-    eprintln!("qorod: nothing is awake and nobody is attached; leaving");
+    eprintln!("qoopd: nothing is awake and nobody is attached; leaving");
     // The lock goes with the process, and with it the next daemon may bind.
     std::process::exit(0);
 }
@@ -7039,7 +7039,7 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                     // descriptors closed, and every paused tab carries on as it was.
                     let e = handed.exec(&exe);
                     eprintln!(
-                        "qorod: {} could not be started: {e}; staying on this version",
+                        "qoopd: {} could not be started: {e}; staying on this version",
                         exe.display()
                     );
                     drop(handed);
@@ -7061,11 +7061,11 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                     if let Some(asked) = replaced
                         && call_off(&into.books.restart, asked)
                     {
-                        eprintln!("qorod: the move onto the new version is called off: {why}");
+                        eprintln!("qoopd: the move onto the new version is called off: {why}");
                         return;
                     }
                     if before.as_ref() != Some(&why) {
-                        eprintln!("qorod: the move onto the new version waits: {why}");
+                        eprintln!("qoopd: the move onto the new version waits: {why}");
                     }
                 }
             }
@@ -7192,7 +7192,7 @@ async fn restart_look(
             // Nothing is ended, so nothing says the daemon is going: a tab ending now is
             // still an ordinary close, and the next daemon records what it finds.
             if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("qoro is stopping".into());
+                return Err("qoop is stopping".into());
             }
             return Ok(());
         }
@@ -7201,12 +7201,12 @@ async fn restart_look(
         if vet_tabs(into, &streams, &table)? != checkpoints {
             return Err("a tab changed while the tabs were written down".into());
         }
-        // A `qoro stop` that landed during the look wins: it stops rather than moves.
+        // A `qoop stop` that landed during the look wins: it stops rather than moves.
         if books
             .stopping
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err("qoro is stopping".into());
+            return Err("qoop is stopping".into());
         }
         Ok(())
     }
@@ -7249,7 +7249,7 @@ async fn restart_look(
                         .restart
                         .no_handoff
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    eprintln!("qorod: {failed} hand overs failed in a row, the last because {why}");
+                    eprintln!("qoopd: {failed} hand overs failed in a row, the last because {why}");
                 }
                 books
                     .restart
@@ -7262,7 +7262,7 @@ async fn restart_look(
                     .no_handoff
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    eprintln!("qorod: {why}");
+                    eprintln!("qoopd: {why}");
                     drop(held);
                     return Box::pin(restart_look(into, exe, replaced)).await;
                 }
@@ -7274,7 +7274,7 @@ async fn restart_look(
     // open, as at a stop.
     if let Err(e) = end_tabs(into, &into.terminals.streams()).await {
         // Its pty is closed by the exec, which hangs its shell up.
-        eprintln!("qorod: {e}; moving anyway");
+        eprintln!("qoopd: {e}; moving anyway");
     }
     crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
     Ok(Moving {
@@ -7323,7 +7323,7 @@ impl HandedOver {
                 self.nonce.clone(),
             ],
         );
-        eprintln!("qorod: moving onto {}", exe.display());
+        eprintln!("qoopd: moving onto {}", exe.display());
         // Inheritable only now: a child started in between would carry every tab's master.
         let fds = self
             .kept
@@ -7392,7 +7392,7 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
         .get()
         .cloned()
         .ok_or("this daemon does not know its runtime directory")?;
-    eprintln!("qorod: taking the startup lock to hand the tabs over");
+    eprintln!("qoopd: taking the startup lock to hand the tabs over");
     let startup =
         take_startup_lock(&dir, tokio::time::Instant::now() + STARTUP_LOCK_PATIENCE).await?;
     // From here tabs are parked, so one deadline for everything that follows.
@@ -7405,7 +7405,7 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
         .is_ok()
     });
     if !left.is_empty() {
-        eprintln!("qorod: tabs {left:?} cannot be handed over and are ended by the move");
+        eprintln!("qoopd: tabs {left:?} cannot be handed over and are ended by the move");
         let table = fresh_process_table().await?;
         let checkpoints = vet_tabs(into, &left, &table)?;
         into.books
@@ -7495,7 +7495,7 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
     if !checkpoints.is_empty()
         && let Err(e) = into.books.store.checkpoint(checkpoints).await
     {
-        eprintln!("qorod: the agents could not be written down before the move: {e}");
+        eprintln!("qoopd: the agents could not be written down before the move: {e}");
     }
     // The socket and the state lock, as further descriptors of the same open files.
     let mut pass_on =
@@ -7567,14 +7567,14 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
         ));
     }
     crate::store::settle_stores(tokio::time::Instant::now() + HANDOVER_PATIENCE).await;
-    // A `qoro stop` that landed meanwhile is waiting in each tab's queue behind the pause:
+    // A `qoop stop` that landed meanwhile is waiting in each tab's queue behind the pause:
     // it wins, and the tabs carry on to hear it.
     if into
         .books
         .stopping
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        return Err("qoro is stopping".into());
+        return Err("qoop is stopping".into());
     }
     Ok(handed)
 }
@@ -7602,7 +7602,7 @@ async fn lock_spaces(
     Ok(())
 }
 
-/// Become `exe` as `qoro daemon`, in this process, ending every tab first as the caller did.
+/// Become `exe` as `qoop daemon`, in this process, ending every tab first as the caller did.
 ///
 /// Rather than leaving for a client to start the next one: after an exit every tab stays
 /// down until a client comes, which may be never while the machine that would come sleeps.
@@ -7612,7 +7612,7 @@ async fn lock_spaces(
 fn exec_daemon(exe: &Path) -> ! {
     let e = exec_into(exe, &[]);
     eprintln!(
-        "qorod: {} could not be started: {e}; leaving, and the next start brings the tabs back",
+        "qoopd: {} could not be started: {e}; leaving, and the next start brings the tabs back",
         exe.display()
     );
     std::process::exit(1);
@@ -7621,7 +7621,7 @@ fn exec_daemon(exe: &Path) -> ! {
 /// `exe daemon <args>` in place of this process. Returns the error when it did not happen.
 fn exec_into(exe: &Path, args: &[String]) -> io::Error {
     let mut command = daemon_command(exe, args);
-    eprintln!("qorod: moving onto {}", exe.display());
+    eprintln!("qoopd: moving onto {}", exe.display());
     run_exec(&mut command)
 }
 
@@ -7699,7 +7699,7 @@ pub(crate) fn unparsable(error: &str) -> String {
     if error.contains("unknown variant") {
         return format!(
             "this daemon is older than the client that called it: it does not know the \
-             method that was asked for ({error}). `qoro stop`, then `qoro`, picks up the new \
+             method that was asked for ({error}). `qoop stop`, then `qoop`, picks up the new \
              daemon; what is open comes back."
         );
     }
@@ -8028,7 +8028,7 @@ pub fn find_in_row(row: &str, query: &str, bound: Option<usize>, backward: bool)
 /// How long a shutdown waits for its terminals to end before going anyway.
 ///
 /// Long enough for a shell to run its own exit, short enough that a person who typed
-/// `qoro stop` gets their prompt back. A terminal still there at the end of it loses its
+/// `qoop stop` gets their prompt back. A terminal still there at the end of it loses its
 /// teardown and gets the hangup the closing pty sends, which is what would have happened
 /// anyway had the daemon been killed.
 const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -8060,7 +8060,7 @@ fn spawn_history_writer(
         {
             Ok(Ok(h)) => h,
             _ => {
-                eprintln!("qorod: history for {} is unavailable", dir.display());
+                eprintln!("qoopd: history for {} is unavailable", dir.display());
                 return;
             }
         };
@@ -8111,7 +8111,7 @@ fn spawn_history_writer(
                 // Recorded, never silent. The rows are gone; saying how many and when is
                 // the difference between lossy and wrong.
                 eprintln!(
-                    "qorod: history for {} lost {} rows between {} and {}",
+                    "qoopd: history for {} lost {} rows between {} and {}",
                     dir.display(),
                     gap.rows,
                     gap.first_unix,
@@ -8160,7 +8160,7 @@ fn spawn_history_writer(
             if later.rows > 0 {
                 // The same record as above: a loss inside the window is still a loss.
                 eprintln!(
-                    "qorod: history for {} lost {} rows between {} and {}",
+                    "qoopd: history for {} lost {} rows between {} and {}",
                     dir.display(),
                     later.rows,
                     later.first_unix,
@@ -8183,7 +8183,7 @@ fn spawn_history_writer(
                     rows_behind.store(history.len(), std::sync::atomic::Ordering::Relaxed);
                     if truncated > 0 {
                         eprintln!(
-                            "qorod: history for {} truncated {truncated} bytes of an \
+                            "qoopd: history for {} truncated {truncated} bytes of an \
                              oversized row",
                             dir.display()
                         );
@@ -8195,7 +8195,7 @@ fn spawn_history_writer(
                     // directory, and losing them there is the point, not a failure.
                     let gone = finished && !dir.exists();
                     if !gone {
-                        eprintln!("qorod: history write failed: {e}");
+                        eprintln!("qoopd: history write failed: {e}");
                     }
                 }
                 Err(_) => return,
@@ -8312,8 +8312,8 @@ fn start_shell(
     // the terminal and not the generation, because a child's environment cannot be rewritten
     // when the generation changes and a generation bound token would be stale from the
     // first command onward.
-    cmd.env("QORO_TERMINAL", stream.to_string());
-    cmd.env("QORO_TOKEN", token.as_str());
+    cmd.env("QOOP_TERMINAL", stream.to_string());
+    cmd.env("QOOP_TOKEN", token.as_str());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -8422,7 +8422,7 @@ fn spawn_terminal(
         match classify_task_end(outcome) {
             TaskEnd::Clean => {}
             TaskEnd::Ended { error } => {
-                eprintln!("qorod: terminal ended: {error}");
+                eprintln!("qoopd: terminal ended: {error}");
             }
             TaskEnd::Panicked => {
                 agents.announce(stream);
@@ -8433,7 +8433,7 @@ fn spawn_terminal(
                     fallback_teardown(&fallback_scanner, tty_dev, fallback_pid, fallback_start)
                         .await;
                 eprintln!(
-                    "qorod: terminal {stream} task panicked; contained ({seen} tracked processes)"
+                    "qoopd: terminal {stream} task panicked; contained ({seen} tracked processes)"
                 );
             }
         }
@@ -8540,7 +8540,7 @@ async fn fallback_teardown(
     // our own just-spawned child, which is how rarely this fires.
     if child.is_some() && child_start.is_none() {
         eprintln!(
-            "qorod: fallback teardown for pid {child_pid} has no start time; direct signal skipped"
+            "qoopd: fallback teardown for pid {child_pid} has no start time; direct signal skipped"
         );
     }
     let mut set = Containment::new();
@@ -8581,7 +8581,7 @@ async fn fallback_teardown(
         .groups_to_signal(round, &qoop_pty::sys::still_alive, &qoop_pty::sys::in_group)
         .is_empty()
     {
-        eprintln!("qorod: fallback teardown for pid {child_pid} left processes behind");
+        eprintln!("qoopd: fallback teardown for pid {child_pid} left processes behind");
     }
     seen
 }
@@ -8646,9 +8646,9 @@ fn wait_once(pid: i32) -> Waited {
 
 /// What a coding agent sets for the processes it runs, and nothing the person set.
 ///
-/// A daemon first started from inside an agent's shell (Claude Code running `qoro`) holds
+/// A daemon first started from inside an agent's shell (Claude Code running `qoop`) holds
 /// these, and every tab would inherit them: a Claude started in a tab then believes it is a
-/// child session and stops saving its transcript, so `qoro history` reads a stale one. User
+/// child session and stops saving its transcript, so `qoop history` reads a stale one. User
 /// settings of the same family (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
 /// `CLAUDE_CODE_USE_BEDROCK`, ...) are the person's and stay, which is why this is a list and
 /// not a prefix.
@@ -8941,7 +8941,7 @@ async fn terminal_task(
     for chunk in qoop_pty::chunk_paste(&seed.pending) {
         if writes.push(chunk, WritePriority::UserInput).is_err() {
             eprintln!(
-                "qorod: tab {stream}: input carried over the move did not fit and was dropped"
+                "qoopd: tab {stream}: input carried over the move did not fit and was dropped"
             );
             break;
         }
@@ -8959,7 +8959,7 @@ async fn terminal_task(
     // When to read the directory once more, because the throttle below skipped a read.
     // A `cd` prints its prompt within the throttle window of the output before it, and
     // with nothing printed after that a quiet tab kept its old directory for good: the
-    // index, the place line and `qoro worktree` all read the stale one. Armed only by
+    // index, the place line and `qoop worktree` all read the stale one. Armed only by
     // output, so an idle terminal still has no timer (ADR-009).
     let mut cwd_at: Option<tokio::time::Instant> = None;
     // When to read the screen for what the agent is doing. `None` while nothing has
@@ -9654,7 +9654,7 @@ async fn terminal_task(
     }
     .await;
     if let Err(e) = &outcome {
-        eprintln!("qorod: terminal for pid {child_pid} failed: {e}");
+        eprintln!("qoopd: terminal for pid {child_pid} failed: {e}");
     }
     // Output held back for the next frame is the child's last screen when the loop ends
     // here, and the ended update repeats whatever was published last.
@@ -9834,7 +9834,7 @@ pub const DETECT_CEILING: std::time::Duration = std::time::Duration::from_millis
 /// the moment it clears, so terminals without a blocker schedule nothing.
 pub const BLOCKER_REANNOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
 
-/// Where user agent-detection overrides live: `<config>/qoro/agent-detection/`.
+/// Where user agent-detection overrides live: `<config>/qoop/agent-detection/`.
 ///
 /// The user's own config directory, like their shell rc: same trust, no
 /// daemon-managed permissions. A missing directory simply means no overrides.
@@ -9876,7 +9876,7 @@ async fn tear_down(
     containment.absorb(session);
     if opaque > 0 {
         eprintln!(
-            "qorod: teardown for pid {child_pid}: {opaque} processes in its session could not \
+            "qoopd: teardown for pid {child_pid}: {opaque} processes in its session could not \
              be inspected and may still hold this terminal"
         );
     }
@@ -9903,7 +9903,7 @@ async fn tear_down(
             Step::Failed { reason } => {
                 // Reported, never silently ignored. An orphaned tree is a real outcome and
                 // the operator has to be able to see it.
-                eprintln!("qorod: teardown for pid {child_pid} failed: {reason}");
+                eprintln!("qoopd: teardown for pid {child_pid} failed: {reason}");
                 break;
             }
             Step::SignalGroups { signal, groups } => {
@@ -9938,7 +9938,7 @@ async fn tear_down(
     }
     if dropped > 0 {
         eprintln!(
-            "qorod: teardown for pid {child_pid} kept the last {} bytes and dropped {dropped}",
+            "qoopd: teardown for pid {child_pid} kept the last {} bytes and dropped {dropped}",
             tail.len()
         );
     }

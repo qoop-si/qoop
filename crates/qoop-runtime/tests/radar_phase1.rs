@@ -141,7 +141,7 @@ async fn the_row_carries_where_the_terminal_is_and_never_blank() {
     let d = TestDaemon::start().await;
     let mut client = d.attach("places").await;
 
-    let dir = std::env::temp_dir().join(format!("qoro-radar-cwd-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("qoop-radar-cwd-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let wanted = dir
         .canonicalize()
@@ -184,7 +184,7 @@ async fn the_row_carries_where_the_terminal_is_and_never_blank() {
 
 /// A terminal started with no directory is where the daemon is, and says so
 /// from birth. Unseeded, a tab that never moved stayed `cwd: None` for good,
-/// which `qoro worktree rm` has to read as "may be inside" and refuse.
+/// which `qoop worktree rm` has to read as "may be inside" and refuse.
 #[tokio::test]
 async fn a_terminal_started_without_a_directory_is_where_the_daemon_is() {
     let d = TestDaemon::start().await;
@@ -219,7 +219,7 @@ async fn a_terminal_started_without_a_directory_is_where_the_daemon_is() {
 /// A `cd` on a quiet prompt reaches the row. The shell prints its prompt within the
 /// throttle window of the echo before it, and nothing after that: a read skipped by the
 /// throttle has to happen once the window lapses, or the row keeps the old directory for
-/// good, which is what let `qoro worktree rm` believe a worktree was empty.
+/// good, which is what let `qoop worktree rm` believe a worktree was empty.
 #[tokio::test]
 async fn a_fast_cd_on_a_quiet_prompt_reaches_the_row() {
     let d = TestDaemon::start().await;

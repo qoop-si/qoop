@@ -1,6 +1,6 @@
 //! Scenario 5: resident memory per terminal.
 //!
-//! The harness opens exactly one terminal per daemon, the way `qoro` does against a fresh
+//! The harness opens exactly one terminal per daemon, the way `qoop` does against a fresh
 //! one. Measured with that one open, there is no reading of a daemon with zero terminals
 //! to subtract from, and no way to build the many-terminal daemon section 7's 100-terminal
 //! budget is ultimately about.
@@ -27,7 +27,7 @@ const REPEATS: usize = 3;
 /// Comfortably past the engine's 1000-row scrollback chunk (section 7) at either terminal
 /// height below.
 const SCROLL_LINES: usize = 3000;
-const SCROLL_MARKER: &str = "QORO_BENCH_SCROLL_DONE";
+const SCROLL_MARKER: &str = "QOOP_BENCH_SCROLL_DONE";
 
 struct Config {
     label: &'static str,

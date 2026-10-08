@@ -1,4 +1,4 @@
-//! `qoro avatar`: pick the terminal pet, show it, nothing else.
+//! `qoop avatar`: pick the terminal pet, show it, nothing else.
 //!
 //! The body is fixed (the darko box) and so are the colours: every option wears
 //! product tokens only, which is why this screen offers no colour picker. A batch
@@ -32,9 +32,9 @@ const CURATED: [(&str, u8, &str); BATCH] = [
     ("beacon", 35, "small"),
 ];
 
-/// `qoro avatar ...`
+/// `qoop avatar ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro avatar [pick|show [--json]|options --json|set [--hair H] [--hair-ink N] [--eyes E]]";
+    let help = "usage: qoop avatar [pick|show [--json]|options --json|set [--hair H] [--hair-ink N] [--eyes E]]";
     match args.get(2).map(String::as_str) {
         Some("pick") => pick(),
         Some("show") if args.get(3).map(String::as_str) == Some("--json") => show_json(),
@@ -104,7 +104,7 @@ fn set(args: &[String]) -> Result<(), String> {
     }
     if !pet.valid() {
         return Err(
-            "that is not a part the picker offers (qoro avatar options --json)".to_string(),
+            "that is not a part the picker offers (qoop avatar options --json)".to_string(),
         );
     }
     avatar::save(&pet).map_err(|e| e.to_string())?;
@@ -121,7 +121,7 @@ fn show() -> std::io::Result<()> {
             std::io::stdout().flush()
         }
         None => {
-            println!("no avatar picked yet (qoro avatar pick to choose one)");
+            println!("no avatar picked yet (qoop avatar pick to choose one)");
             Ok(())
         }
     }

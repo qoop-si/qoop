@@ -102,7 +102,7 @@ async fn a_terminals_child_is_launched_with_that_terminals_token() {
     let terminal = d.terminals().streams()[0];
     let mut c = d.attach("tokened").await;
 
-    c.input_to(terminal, b"echo TOKEN_IS_$QORO_TOKEN\n").await;
+    c.input_to(terminal, b"echo TOKEN_IS_$QOOP_TOKEN\n").await;
     let expected = d.agent(terminal).expect("an agent record").capability.token;
     assert!(
         c.wait_for_text_on(

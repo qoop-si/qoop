@@ -1,6 +1,6 @@
 # Notifications
 
-When an agent needs you (blocked on a question, failed) or finishes, qoro tells you, so you
+When an agent needs you (blocked on a question, failed) or finishes, qoop tells you, so you
 do not have to watch its tab:
 
 - its row in the agents panel lights up;
@@ -10,13 +10,13 @@ do not have to watch its tab:
   once.
 
 A notification is sent only when you are not already looking: the agent is not the pane
-you are typing in, or the terminal window running qoro has lost focus. It waits a second and checks
+you are typing in, or the terminal window running qoop has lost focus. It waits a second and checks
 again first, so an agent that flickers through a state does not ping you, and several
 agents finishing together make one notification.
 
 ## How it reaches the desktop
 
-qoro uses the fastest way the terminal you run it in understands:
+qoop uses the fastest way the terminal you run it in understands:
 
 | Where | How |
 |---|---|
@@ -28,7 +28,7 @@ qoro uses the fastest way the terminal you run it in understands:
 | anywhere else on Linux | `notify-send` |
 | over ssh | only the terminal escapes above, which reach the terminal on your side; a system program would show it on the far machine, so none is used |
 
-`qoro settings` shows which one a note from that terminal takes (its desktop row), or why
+`qoop settings` shows which one a note from that terminal takes (its desktop row), or why
 there is none.
 
 Names in a notification are passed as data, never as code: a tab named like a command
@@ -39,15 +39,15 @@ cannot run anything.
 Off by default. With `sound = true` in `[notify]`, macOS plays `Funk` when an agent needs
 you and `Glass` when one finished (through `afplay`); Linux plays freedesktop sounds,
 `dialog-warning` and `complete` by default, through `paplay` or `pw-play` when both are there. No
-sound is played from a qoro running over ssh. A name from the other system (a Mac name read
+sound is played from a qoop running over ssh. A name from the other system (a Mac name read
 on Linux) plays that default.
 
-To hear them and choose, open `qoro settings` (the sound rows play as left and right change
-them) or run `qoro sound`: macOS lists its own sounds, Linux the
+To hear them and choose, open `qoop settings` (the sound rows play as left and right change
+them) or run `qoop sound`: macOS lists its own sounds, Linux the
 freedesktop ones installed. The arrows move through them and play each one, space plays it
 again, enter keeps it, first for a finished agent, then for one that waits on you. Piped,
 it reads lines instead: a number or a name plays one, an empty line keeps it. Keeping one turns
-`sound` on, `o` (`off` piped) turns it off. A running qoro takes the change within two
+`sound` on, `o` (`off` piped) turns it off. A running qoop takes the change within two
 seconds.
 
 ## Turning it off
@@ -57,12 +57,12 @@ seconds.
 desktop = false
 ```
 
-in `~/.config/qoro/config.toml`. See [Configuration](#configuration).
+in `~/.config/qoop/config.toml`. See [Configuration](#configuration).
 
 ## Troubleshooting
 
 - **Nothing appears inside tmux:** run `tmux set -g allow-passthrough on`, or install
-  `terminal-notifier` (macOS) so qoro can go around tmux.
+  `terminal-notifier` (macOS) so qoop can go around tmux.
 - **On macOS, notifications from `osascript` are credited to Script Editor:** install
   `terminal-notifier` (`brew install terminal-notifier`).
 - **Nothing appears at all:** check that your terminal app is allowed to send notifications

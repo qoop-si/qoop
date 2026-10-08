@@ -69,11 +69,11 @@ async fn changed(
 async fn news_is_on_the_row_while_its_interface_is_attached() {
     let d = TestDaemon::start().await;
     let terminal = d.terminals().streams()[0];
-    let (index, mut index_in) = client::connect(d.socket(), "qoro-watch")
+    let (index, mut index_in) = client::connect(d.socket(), "qoop-watch")
         .await
         .expect("connect");
     let (mut index_rd, _index_wr) = index.into_split();
-    let mut asker = d.attach("qoro-agents").await;
+    let mut asker = d.attach("qoop-agents").await;
     assert!(!news(&mut asker, terminal).await, "nothing said yet");
 
     let mut ui = d.attach("qoop-tui").await;

@@ -68,7 +68,7 @@ It claims it was captured on "laptop-a1" by "alice". That claim is unverified.
                 docker compose -f docker-compose.yml up
 ```
 
-followed by the question itself, `Run this? [y/N]`, asked by `qoro setup trust`, which
+followed by the question itself, `Run this? [y/N]`, asked by `qoop setup trust`, which
 records the confirmation only on `y` or `yes`.
 
 Confirmation is recorded in the ledger against the content hash. Editing the Setup
@@ -94,7 +94,7 @@ run-on-server acceptance flow. A Setup that needs confirmation and has no intera
 **fails with a typed error naming the hash**. It never treats an absent human as consent,
 which is what an implementer under deadline would otherwise choose.
 
-`qoro setup trust <hash>` records the confirmation ahead of time, which is the out-of-band
+`qoop setup trust <hash>` records the confirmation ahead of time, which is the out-of-band
 step the portability flow now includes.
 
 ### The executable is always an absolute path

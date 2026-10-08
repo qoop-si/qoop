@@ -1,15 +1,15 @@
 # Coming from tmux
 
-qoro keeps what tmux gets right: one server that outlives the window, a prefix key, splits,
+qoop keeps what tmux gets right: one server that outlives the window, a prefix key, splits,
 detach and attach. What it adds is that it knows which terminals are agents and what each
 one is doing.
 
 ## Words
 
-| tmux | qoro |
+| tmux | qoop |
 |---|---|
 | server | daemon, one per session |
-| session | session (`qoro --session work`) |
+| session | session (`qoop --session work`) |
 | window | tab |
 | pane | pane |
 | (none) | space: a named group of tabs, usually one per project |
@@ -19,7 +19,7 @@ one is doing.
 Set `prefix = "ctrl-b"` in [Configuration](#configuration) and most of your hands carry
 over:
 
-| tmux | qoro |
+| tmux | qoop |
 |---|---|
 | `c` new window | `c` new tab |
 | `n`, `p`, `0` .. `9` | `n`, `p`, `1` .. `9` |
@@ -36,24 +36,24 @@ over:
 
 ## Commands
 
-| tmux | qoro |
+| tmux | qoop |
 |---|---|
-| `tmux ls` | `qoro ls` |
-| `tmux attach -t work` | `qoro --session work` |
-| `tmux kill-server` | `qoro stop` |
-| `tmux send-keys -t 3 'y' Enter` | `qoro send 3 y --enter` |
-| `tmux capture-pane -p -t 3` | `qoro read 3` |
-| `tmux new-window 'cmd'` | `qoro new -- cmd` |
+| `tmux ls` | `qoop ls` |
+| `tmux attach -t work` | `qoop --session work` |
+| `tmux kill-server` | `qoop stop` |
+| `tmux send-keys -t 3 'y' Enter` | `qoop send 3 y --enter` |
+| `tmux capture-pane -p -t 3` | `qoop read 3` |
+| `tmux new-window 'cmd'` | `qoop new -- cmd` |
 
-Beyond these, `qoro agents`, `qoro wait` and `qoro prompt --wait` let a script or another
+Beyond these, `qoop agents`, `qoop wait` and `qoop prompt --wait` let a script or another
 agent work with an agent by its state rather than by polling its screen: see
 [Automation](#automation).
 
-## Running qoro inside tmux
+## Running qoop inside tmux
 
 It works. Two things to know:
 
-- tmux takes the prefix first: pick a different one for each (`ctrl-a` for qoro and tmux's
+- tmux takes the prefix first: pick a different one for each (`ctrl-a` for qoop and tmux's
   own `ctrl-b` is the default pairing).
 - Desktop notifications from inside tmux need `tmux set -g allow-passthrough on`, or
   `terminal-notifier` on macOS: see [Notifications](#notifications).

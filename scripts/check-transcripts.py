@@ -160,9 +160,9 @@ def main() -> int:
             f"{baseline.relative_to(root)} is missing. It is a committed artefact, not "
             "something this gate creates: a self-seeding baseline makes the gate green "
             "against any content. Regenerate it deliberately with "
-            "QORO_WRITE_BASELINE=1 python3 scripts/check-transcripts.py"
+            "QOOP_WRITE_BASELINE=1 python3 scripts/check-transcripts.py"
         )
-        if __import__("os").environ.get("QORO_WRITE_BASELINE") == "1":
+        if __import__("os").environ.get("QOOP_WRITE_BASELINE") == "1":
             baseline.write_text(current)
             print(f"wrote {baseline.relative_to(root)}; commit it")
             fail.pop()

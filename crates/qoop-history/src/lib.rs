@@ -57,7 +57,7 @@ pub enum Error {
     NoHome,
     #[error("refusing: session id for {product} is not an id shape")]
     BadId { product: &'static str },
-    #[error("no session id reported for this {product} terminal: `qoro hooks install` reports it")]
+    #[error("no session id reported for this {product} terminal: `qoop hooks install` reports it")]
     MissingId { product: &'static str },
     #[error("no transcript detection for program {program:?}")]
     UnknownProgram { program: String },

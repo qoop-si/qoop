@@ -1,4 +1,4 @@
-//! The qoro daemon runtime.
+//! The qoop daemon runtime.
 
 #![cfg(unix)]
 

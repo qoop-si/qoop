@@ -42,7 +42,7 @@ fn threads() -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_database_holds_only_the_store_pool() {
     let dir = tempfile::tempdir().expect("a directory");
-    let path = dir.path().join("qoro.db");
+    let path = dir.path().join("qoop.db");
     let handle = StoreHandle::new(qoop_store::Store::open(&path).expect("open"));
     handle.create_workspace("w".into()).await.expect("a write");
 

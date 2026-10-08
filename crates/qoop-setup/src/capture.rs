@@ -27,7 +27,7 @@ pub enum CaptureError {
 /// shown as user authored overrides and are excluded from capture. Capturing them would put
 /// one terminal's token into another terminal's Setup, which is the one value in the
 /// environment that must not travel.
-pub const DAEMON_INJECTED: &[&str] = &["QORO_TOKEN", "QORO_TERMINAL"];
+pub const DAEMON_INJECTED: &[&str] = &["QOOP_TOKEN", "QOOP_TERMINAL"];
 
 /// Build a Setup from a launch intent.
 pub fn capture_from(
@@ -219,10 +219,10 @@ mod tests {
         )
         .expect("intent");
         i.env = EnvPlan {
-            inherit: vec!["HOME".into(), "PATH".into(), "QORO_TOKEN".into()],
+            inherit: vec!["HOME".into(), "PATH".into(), "QOOP_TOKEN".into()],
             overrides: vec![
                 ("NODE_OPTIONS".into(), "--require /tmp/x.js".into()),
-                ("QORO_TERMINAL".into(), "7".into()),
+                ("QOOP_TERMINAL".into(), "7".into()),
             ],
             env_refs: vec![EnvRef {
                 name: "STRIPE_ACCOUNT".into(),
@@ -287,10 +287,10 @@ mod tests {
         let setup = capture_from("app", &intent(), Origin::default()).expect("capture");
         let text = setup.to_toml().expect("encode");
         assert!(
-            !text.contains("QORO_TOKEN"),
+            !text.contains("QOOP_TOKEN"),
             "a terminal's capability token was captured into a Setup"
         );
-        assert!(!text.contains("QORO_TERMINAL"));
+        assert!(!text.contains("QOOP_TERMINAL"));
         assert!(
             text.contains("NODE_OPTIONS"),
             "an ordinary override was dropped"

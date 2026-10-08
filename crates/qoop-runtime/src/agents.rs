@@ -83,7 +83,7 @@ pub struct TerminalAgent {
     pub background_tasks: usize,
     /// The rule the screen last matched in this generation, if any.
     ///
-    /// What `qoro agents explain` reports. Recorded on every evaluation,
+    /// What `qoop agents explain` reports. Recorded on every evaluation,
     /// accepted or outranked: it says what the screen claimed, while the
     /// belief says what was concluded. Cleared with the belief on every
     /// generation change, because it described a process that is gone.
@@ -205,7 +205,7 @@ pub struct AgentRegistry {
     focus: Mutex<BTreeMap<u32, VecDeque<crate::control::FocusEvent>>>,
     /// The newest prompt head each terminal's hook reported (redacted and cut like every
     /// focus label) and when, kept apart from the focus log because that log is capped and a
-    /// few dozen tool calls push the prompt out of it. What a task opened by qoro is named
+    /// few dozen tool calls push the prompt out of it. What a task opened by qoop is named
     /// after, and how it tells a new request from the one a done claim answered.
     prompts: Mutex<BTreeMap<u32, (String, i64)>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
@@ -220,7 +220,7 @@ pub struct AgentRegistry {
     /// mark.
     closed: Mutex<BTreeSet<u32>>,
     /// Who waits on whom: waiter stream → (target stream, edge since, unix
-    /// seconds). Set when a verified `qoro send/prompt` arrives from one
+    /// seconds). Set when a verified `qoop send/prompt` arrives from one
     /// terminal to another. The waiter is vetoed while its target is busy;
     /// both idle together sleep together. `since` only ages the edge out.
     expectations: Mutex<BTreeMap<u32, (u32, i64)>>,
@@ -1172,7 +1172,7 @@ impl AgentRegistry {
     ///
     /// Labels, not the prompt: a `user` event reads as the word `thinking`, so what a
     /// person typed is not shown as activity. Its redacted head is kept apart (`prompts`)
-    /// and becomes the goal of a task qoro opens at an edit, which is stored and listed with
+    /// and becomes the goal of a task qoop opens at an edit, which is stored and listed with
     /// that terminal's row. Empty labels are skipped rather than
     /// taken, because a labelled permission request is followed by a label-less
     /// notification that says the same thing with less.
@@ -1278,7 +1278,7 @@ pub fn mint_token(stream: u32) -> CapabilityToken {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
         .unwrap_or(0);
-    CapabilityToken::new(format!("qoro-{stream}-{nonce:016x}"))
+    CapabilityToken::new(format!("qoop-{stream}-{nonce:016x}"))
 }
 
 #[cfg(test)]

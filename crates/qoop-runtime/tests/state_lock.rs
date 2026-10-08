@@ -26,11 +26,11 @@ async fn a_second_daemon_on_the_same_state_is_refused_before_it_binds() {
         panic!("a second daemon opened the same state");
     };
     assert!(
-        refused.to_string().contains("another qoro daemon is using"),
+        refused.to_string().contains("another qoop daemon is using"),
         "refused without saying why: {refused}"
     );
     assert!(
-        !second_dir.path().join("qorod.sock").exists(),
+        !second_dir.path().join("qoopd.sock").exists(),
         "the refused daemon bound a socket clients would wait on"
     );
 }

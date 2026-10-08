@@ -1,4 +1,4 @@
-//! A daemon asked to move onto the qoro on disk becomes it with every tab still running,
+//! A daemon asked to move onto the qoop on disk becomes it with every tab still running,
 //! when the new binary can take them over; and otherwise does it only once nothing is
 //! working, and every tab comes back on the new binary as it was.
 //!
@@ -15,7 +15,7 @@
 //!
 //! The agent is a stand-in: a shell script named `droid` (an agent the detection table
 //! knows, resumable by id, and with no screen rules to second-guess its hook) that reports
-//! its state and conversation through `qoro hook-report` the way a real agent's hook does.
+//! its state and conversation through `qoop hook-report` the way a real agent's hook does.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -61,18 +61,18 @@ impl Daemon {
         d
     }
 
-    /// Start `qoro daemon` from a copy of this build of its own, still this version.
+    /// Start `qoop daemon` from a copy of this build of its own, still this version.
     fn start_installed() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
         let installed = dir.path().join("installed");
         std::fs::create_dir_all(&installed).expect("installed");
-        let exe = installed.join("qoro");
+        let exe = installed.join("qoop");
         stage(&exe);
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        let log = dir.path().join("qorod.log");
+        let log = dir.path().join("qoopd.log");
         let path = format!(
             "{}:{}",
             bin.display(),
@@ -80,13 +80,13 @@ impl Daemon {
         );
         let child = Command::new(&exe)
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .env("PATH", path)
-            .env_remove("QORO_SESSION")
-            .env_remove("QORO_TERMINAL")
-            .env_remove("QORO_TOKEN")
+            .env_remove("QOOP_SESSION")
+            .env_remove("QOOP_TERMINAL")
+            .env_remove("QOOP_TOKEN")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).expect("log"))
             .spawn()
@@ -114,13 +114,13 @@ impl Daemon {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .env_remove("QORO_SESSION")
-            .env_remove("QORO_TERMINAL")
-            .env_remove("QORO_TOKEN")
+            .env_remove("QOOP_SESSION")
+            .env_remove("QOOP_TERMINAL")
+            .env_remove("QOOP_TOKEN")
             .output()
-            .expect("run qoro")
+            .expect("run qoop")
     }
 
     fn send(&self, terminal: u32, line: &str) {
@@ -235,7 +235,7 @@ impl Daemon {
     fn starts(&self) -> usize {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
-            .matches("qorod: listening on")
+            .matches("qoopd: listening on")
             .count()
     }
 
@@ -590,7 +590,7 @@ fn a_binary_replaced_after_arming_is_not_moved_onto() {
     let log = std::fs::read_to_string(&d.log).unwrap_or_default();
     assert_eq!(log.matches("is called off").count(), 1, "{log}");
     let after = log.split("is called off").nth(1).unwrap_or_default();
-    assert!(!after.contains("qorod: the move"), "it looked again: {log}");
+    assert!(!after.contains("qoopd: the move"), "it looked again: {log}");
 }
 
 /// A tab put to sleep on its own stays asleep across a move: not looked at, not ended,
@@ -908,7 +908,7 @@ fn a_daemon_started_during_the_move_finds_the_old_one_serving() {
                 started.push(
                     Command::new(env!("CARGO_BIN_EXE_qoop"))
                         .arg("daemon")
-                        .env("QORO_RUNTIME_DIR", &dir)
+                        .env("QOOP_RUNTIME_DIR", &dir)
                         .env("XDG_CONFIG_HOME", dir.join("config"))
                         .env("SHELL", "/bin/sh")
                         .stdin(Stdio::null())
@@ -1270,12 +1270,12 @@ fn a_handover_that_cannot_be_adopted_starts_a_daemon_as_usual() {
     )
     .expect("file");
     std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let log = dir.path().join("qorod.log");
+    let log = dir.path().join("qoopd.log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(["daemon", "--adopt"])
         .arg(&stale)
         .args(["--nonce", "n"])
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("SHELL", "/bin/sh")
         .stdout(Stdio::null())
@@ -1325,7 +1325,7 @@ fn a_relay_ends_when_its_daemon_goes_though_its_input_stays_open() {
     let d = Daemon::start();
     let mut relay = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .arg("relay")
-        .env("QORO_RUNTIME_DIR", d.dir.path())
+        .env("QOOP_RUNTIME_DIR", d.dir.path())
         .env("XDG_CONFIG_HOME", d.dir.path().join("config"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1357,7 +1357,7 @@ fn a_relay_ends_when_its_daemon_goes_though_its_input_stays_open() {
 }
 
 /// A release of `NEXT` in a `file://` base under the daemon's directory: a script saying so,
-/// and running this build for anything else, for every platform `qoro update` may ask for.
+/// and running this build for anything else, for every platform `qoop update` may ask for.
 /// With `handoff` false it says nothing when asked which handover layouts it reads, as a build
 /// from before the handover does.
 fn serve_release(d: &Daemon, handoff: bool) -> PathBuf {
@@ -1366,11 +1366,11 @@ fn serve_release(d: &Daemon, handoff: bool) -> PathBuf {
     for dir in [&base, &pack] {
         std::fs::create_dir_all(dir).expect("dir");
     }
-    let fresh = pack.join("qoro");
+    let fresh = pack.join("qoop");
     std::fs::write(
         &fresh,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoro {NEXT}'; exit 0; fi\n{}exec '{}' \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoop {NEXT}'; exit 0; fi\n{}exec '{}' \"$@\"\n",
             if handoff {
                 ""
             } else {
@@ -1385,16 +1385,16 @@ fn serve_release(d: &Daemon, handoff: bool) -> PathBuf {
     let tar = Command::new("tar")
         .arg("-czf")
         .arg(&tarball)
-        .arg("qoro")
+        .arg("qoop")
         .current_dir(&pack)
         .status()
         .expect("tar");
     assert!(tar.success());
     let assets: Vec<_> = [
-        "qoro-aarch64-apple-darwin.tar.gz",
-        "qoro-x86_64-apple-darwin.tar.gz",
-        "qoro-x86_64-unknown-linux-gnu.tar.gz",
-        "qoro-aarch64-unknown-linux-gnu.tar.gz",
+        "qoop-aarch64-apple-darwin.tar.gz",
+        "qoop-x86_64-apple-darwin.tar.gz",
+        "qoop-x86_64-unknown-linux-gnu.tar.gz",
+        "qoop-aarch64-unknown-linux-gnu.tar.gz",
     ]
     .iter()
     .map(|name| serde_json::json!({"name": name, "url": format!("file://{}", tarball.display())}))
@@ -1407,7 +1407,7 @@ fn serve_release(d: &Daemon, handoff: bool) -> PathBuf {
     base
 }
 
-/// `qoro update` as the daemon's own installed copy, in a home and a list of remotes that
+/// `qoop update` as the daemon's own installed copy, in a home and a list of remotes that
 /// are empty, so it can reach nothing but this daemon.
 fn update(d: &Daemon, handoff: bool) -> Output {
     let release = serve_release(d, handoff);
@@ -1417,20 +1417,20 @@ fn update(d: &Daemon, handoff: bool) -> Output {
     Command::new(&d.exe)
         .arg("update")
         .env("HOME", &home)
-        .env("QORO_RUNTIME_DIR", d.dir.path())
+        .env("QOOP_RUNTIME_DIR", d.dir.path())
         .env("XDG_CONFIG_HOME", d.dir.path().join("config"))
-        .env("QORO_REMOTES", d.dir.path().join("remotes.json"))
-        .env("QORO_RELEASE_BASE", format!("file://{}", release.display()))
+        .env("QOOP_REMOTES", d.dir.path().join("remotes.json"))
+        .env("QOOP_RELEASE_BASE", format!("file://{}", release.display()))
         .env("PATH", "/usr/bin:/bin")
         .output()
-        .expect("run qoro update")
+        .expect("run qoop update")
 }
 
-/// `qoro update` with every tab at its prompt installs the newest release, and the daemon
+/// `qoop update` with every tab at its prompt installs the newest release, and the daemon
 /// moves onto it on the same process, which is the only way to tell it from a stop.
 ///
 /// The release here is a stand-in that runs this very build, so the daemon that comes back
-/// still says it is `VERSION`, not `NEXT`: `qoro update` looks for the new daemon, finds one
+/// still says it is `VERSION`, not `NEXT`: `qoop update` looks for the new daemon, finds one
 /// that does not say it is the version it was told to move to, and reports exactly that,
 /// and fails. It is the one honest answer to a daemon that closed its connection and came
 /// back as something else; a real release would say `NEXT` and read "moving to NEXT now".
@@ -1453,7 +1453,7 @@ fn an_update_moves_an_idle_daemon_onto_the_new_binary() {
     assert!(d.running(), "the daemon was stopped, not moved");
 }
 
-/// With the new binary able to take tabs over, `qoro update` does not wait for a running
+/// With the new binary able to take tabs over, `qoop update` does not wait for a running
 /// command: the daemon moves at once, the shell and the command are the same processes, and
 /// the command is still running.
 #[test]
@@ -1477,7 +1477,7 @@ fn an_update_keeps_a_running_command_running_when_the_tabs_can_be_handed_over() 
     d.wait_for_row(1, "kept its command", running_sleep);
 }
 
-/// A command running in a tab does not stop `qoro update`; it is named, left alone, and the
+/// A command running in a tab does not stop `qoop update`; it is named, left alone, and the
 /// move comes once the command is done, when the new binary cannot take the tabs over.
 #[test]
 fn an_update_names_a_running_command_and_moves_when_it_ends() {
@@ -1511,7 +1511,7 @@ fn an_update_names_a_running_command_and_moves_when_it_ends() {
     assert!(d.running(), "the daemon was stopped, not moved");
 }
 
-/// Put a script saying `qoro <version>` where `exe` is, the way an update renames a file in.
+/// Put a script saying `qoop <version>` where `exe` is, the way an update renames a file in.
 /// Asked anything else, it runs this build: what a move onto it starts.
 fn replace_with_version(exe: &Path, version: &str) {
     install_script(exe, version, "");
@@ -1528,9 +1528,9 @@ fn replace_without_handoff(exe: &Path, version: &str) {
 }
 
 fn install_script(exe: &Path, version: &str, extra: &str) {
-    let next = exe.with_file_name("qoro.next");
+    let next = exe.with_file_name("qoop.next");
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoro {version}'; exit 0; fi\n{extra}exec '{}' \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'qoop {version}'; exit 0; fi\n{extra}exec '{}' \"$@\"\n",
         env!("CARGO_BIN_EXE_qoop")
     );
     std::fs::write(&next, script).expect("script");

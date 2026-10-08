@@ -1,4 +1,4 @@
-//! Local only: qoro, never paired, does everything the interface does with an ssh remote, and
+//! Local only: qoop, never paired, does everything the interface does with an ssh remote, and
 //! nothing of it reaches a hub.
 //!
 //! The machine has a saved hub (a `hub.json`, as after a pairing that never finished) that
@@ -8,7 +8,7 @@
 //! interface also starts, in a terminal of its own, with that remote saved. Afterwards no
 //! service file and no machine key may exist.
 //!
-//! The qoro app's release build runs this same file against its own binary (a `#[path]` module
+//! The qoop app's release build runs this same file against its own binary (a `#[path]` module
 //! in its tests), so the build every user installs is held to it, not only this repository's.
 
 use std::os::unix::fs::PermissionsExt;
@@ -26,7 +26,7 @@ use qoop_runtime::daemon::ClientWire;
 use qoop_tui::mux::is_remote_workspace;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn qoro() -> &'static str {
+fn qoop() -> &'static str {
     env!("CARGO_BIN_EXE_qoop")
 }
 
@@ -144,7 +144,7 @@ impl Tui {
 }
 
 #[test]
-fn an_unpaired_qoro_works_locally_and_never_reaches_a_hub() {
+fn an_unpaired_qoop_works_locally_and_never_reaches_a_hub() {
     // A big future in a debug build: a thread with room for it, as remote_spaces.rs does.
     let ran = std::thread::Builder::new()
         .stack_size(64 << 20)
@@ -162,25 +162,25 @@ fn scenario() {
     let remote = private_dir();
     let (hub_port, hub_hits) = counting_hub();
 
-    // A saved hub, as if `qoro pair --hub` had once been asked and never finished.
+    // A saved hub, as if `qoop pair --hub` had once been asked and never finished.
     let config = home.path().join("config");
-    std::fs::create_dir_all(config.join("qoro")).expect("config");
+    std::fs::create_dir_all(config.join("qoop")).expect("config");
     std::fs::write(
-        config.join("qoro/hub.json"),
+        config.join("qoop/hub.json"),
         format!("{{\"url\": \"ws://127.0.0.1:{hub_port}\"}}"),
     )
     .expect("hub.json");
 
-    // `ssh` runs the remote command against the remote's runtime directory, with the qoro under
+    // `ssh` runs the remote command against the remote's runtime directory, with the qoop under
     // test first on PATH.
     let bin = home.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    std::os::unix::fs::symlink(qoro(), bin.join("qoro")).expect("link qoro");
+    std::os::unix::fs::symlink(qoop(), bin.join("qoop")).expect("link qoop");
     let ssh = bin.join("ssh");
     std::fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QORO_SESSION\nQORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             remote.path().display()
         ),
     )
@@ -189,9 +189,9 @@ fn scenario() {
     // SAFETY: set before the runtime or any other thread but the listener's exists; the
     // listener reads no environment.
     unsafe {
-        // Nothing of a qoro or an agent this test may itself run inside reaches what it starts.
+        // Nothing of a qoop or an agent this test may itself run inside reaches what it starts.
         for (key, _) in std::env::vars() {
-            if key.starts_with("QORO_") || key.starts_with("CLAUDE") {
+            if key.starts_with("QOOP_") || key.starts_with("CLAUDE") {
                 std::env::remove_var(key);
             }
         }
@@ -200,18 +200,18 @@ fn scenario() {
         std::env::set_var("XDG_CONFIG_HOME", &config);
         std::env::set_var("XDG_DATA_HOME", home.path().join("data"));
         std::env::set_var("XDG_CACHE_HOME", home.path().join("cache"));
-        std::env::set_var("QORO_REMOTES", home.path().join("remotes.json"));
+        std::env::set_var("QOOP_REMOTES", home.path().join("remotes.json"));
         std::env::set_var("SHELL", "/bin/sh");
     }
 
-    let mut daemon = Command::new(qoro())
+    let mut daemon = Command::new(qoop())
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", local.path())
+        .env("QOOP_RUNTIME_DIR", local.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("local daemon");
-    let socket = local.path().join("sessions/default/qorod.sock");
+    let socket = local.path().join("sessions/default/qoopd.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         if Instant::now() > deadline {
@@ -323,25 +323,25 @@ fn scenario() {
 
     // The real interface, in a terminal of its own, with the remote saved: it starts and links
     // the remote, whose daemon (stopped first) its relay brings back up, and stays a while.
-    let saved = Command::new(qoro())
+    let saved = Command::new(qoop())
         .args(["remote", "add", "devbox", "devbox.example"])
         .output()
         .expect("remote add");
-    let _ = Command::new(qoro())
+    let _ = Command::new(qoop())
         .arg("stop")
-        .env("QORO_RUNTIME_DIR", remote.path())
+        .env("QOOP_RUNTIME_DIR", remote.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let remote_socket = remote.path().join("sessions/default/qorod.sock");
+    let remote_socket = remote.path().join("sessions/default/qoopd.sock");
     let pty: Vec<&str> = if cfg!(target_os = "macos") {
-        vec!["script", "-q", "/dev/null", qoro()]
+        vec!["script", "-q", "/dev/null", qoop()]
     } else {
-        vec!["script", "-qec", qoro(), "/dev/null"]
+        vec!["script", "-qec", qoop(), "/dev/null"]
     };
     let mut interface = Command::new(pty[0])
         .args(&pty[1..])
-        .env("QORO_RUNTIME_DIR", local.path())
+        .env("QOOP_RUNTIME_DIR", local.path())
         .env("TERM", "xterm-256color")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -362,20 +362,20 @@ fn scenario() {
     let _ = interface.wait();
 
     // What install and every update run, and a look at the phones: quiet, and nothing written.
-    let reload = Command::new(qoro())
+    let reload = Command::new(qoop())
         .args(["bridge", "reload"])
-        .env("QORO_RUNTIME_DIR", local.path())
+        .env("QOOP_RUNTIME_DIR", local.path())
         .output()
         .expect("bridge reload");
-    let devices = Command::new(qoro())
+    let devices = Command::new(qoop())
         .args(["devices", "ls"])
-        .env("QORO_RUNTIME_DIR", local.path())
+        .env("QOOP_RUNTIME_DIR", local.path())
         .output()
         .expect("devices ls");
     for runtime in [local.path(), remote.path()] {
-        let _ = Command::new(qoro())
+        let _ = Command::new(qoop())
             .arg("stop")
-            .env("QORO_RUNTIME_DIR", runtime)
+            .env("QOOP_RUNTIME_DIR", runtime)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -394,11 +394,11 @@ fn scenario() {
     );
     // Answered by a build with the phone part, refused by one without: neither writes anything.
     // A build with the phone part answers with its (empty) list; one without says so, and its
-    // `qoro pair` must fail without a connection to the saved hub either.
+    // `qoop pair` must fail without a connection to the saved hub either.
     let answer = String::from_utf8_lossy(&devices.stdout).into_owned()
         + &String::from_utf8_lossy(&devices.stderr);
-    // The app's build runs this file too (its package is qoro-app): there the phone part must be.
-    let app_build = env!("CARGO_PKG_NAME") == "qoro-app";
+    // The app's build runs this file too (its package is qoop-app): there the phone part must be.
+    let app_build = env!("CARGO_PKG_NAME") == "qoop-app";
     if app_build || answer.contains("no phones paired") {
         assert!(
             devices.status.success() && answer.contains("no phones paired"),
@@ -409,7 +409,7 @@ fn scenario() {
             answer.contains("no phone support"),
             "devices ls: {devices:?}"
         );
-        let pair = Command::new(qoro())
+        let pair = Command::new(qoop())
             .args(["pair", "--hub", &format!("ws://127.0.0.1:{hub_port}")])
             .stdin(Stdio::null())
             .output()
@@ -425,10 +425,10 @@ fn scenario() {
         "something reached the saved hub on an unpaired machine"
     );
     let left: Vec<&Path> = [
-        Path::new("Library/LaunchAgents/dev.qoro.bridge.plist"),
-        Path::new(".config/systemd/user/qoro-bridge.service"),
-        Path::new("config/systemd/user/qoro-bridge.service"),
-        Path::new("data/qoro/machine.key"),
+        Path::new("Library/LaunchAgents/dev.qoop.bridge.plist"),
+        Path::new(".config/systemd/user/qoop-bridge.service"),
+        Path::new("config/systemd/user/qoop-bridge.service"),
+        Path::new("data/qoop/machine.key"),
     ]
     .into_iter()
     .filter(|p| home.path().join(p).exists())

@@ -127,14 +127,14 @@ enum FromLink {
         conn: u64,
         reason: String,
     },
-    /// An answer a task of the mux's own worked out: that a machine has no qoro, that qoro
+    /// An answer a task of the mux's own worked out: that a machine has no qoop, that qoop
     /// is now there, or why not.
     Reply(ControlResponse),
-    /// A machine asked to be connected answered with a qoro this build can talk to: add it.
+    /// A machine asked to be connected answered with a qoop this build can talk to: add it.
     Probed { id: String, target: String },
     /// The time a remote with nothing awake is given before its link is let go.
     ParkCheck { link: usize, conn: u64 },
-    /// A newer qoro is on the disk of this remote, `version`: its daemon is asked to move to
+    /// A newer qoop is on the disk of this remote, `version`: its daemon is asked to move to
     /// it, at once with its tabs running when it can hand them over, else when nothing there
     /// is working.
     Arm { link: usize, version: String },
@@ -144,10 +144,10 @@ enum FromLink {
 /// daemon, held by nothing else, can leave the way this machine's does.
 const PARK_AFTER: Duration = Duration::from_secs(10);
 
-/// The id of the mux's own ask that a remote's daemon move to the newer qoro on its disk.
+/// The id of the mux's own ask that a remote's daemon move to the newer qoop on its disk.
 const RESTART_ID: &str = "mux-restart";
 
-/// The id of a status line the mux says about putting a newer qoro on a remote. Nobody
+/// The id of a status line the mux says about putting a newer qoop on a remote. Nobody
 /// asked for it, and the interface shows a refusal it cannot place as a line, like any other.
 pub(crate) const UPDATE_NOTICE: &str = "remote-update";
 
@@ -177,15 +177,15 @@ struct Link {
     pending: Vec<ControlRequest>,
     /// Whether this machine's own list may give its spaces' order among themselves: not
     /// while its part of a new order is unanswered (a list already on its way is older),
-    /// and not once it missed or refused one (a qoro from before the ask, or away): its
+    /// and not once it missed or refused one (a qoop from before the ask, or away): its
     /// list would put a different space in the place a person dragged one to.
     order_owed: usize,
     order_off: bool,
-    /// The version a newer qoro on this remote's disk says it is, while its daemon has not
+    /// The version a newer qoop on this remote's disk says it is, while its daemon has not
     /// been asked to move to it yet: the link was down when the push finished. Asked on the
     /// next connection, unless that daemon already runs it.
     arm: Option<String>,
-    /// The version the daemon on the connection now up runs, from its welcome. Only a qoro
+    /// The version the daemon on the connection now up runs, from its welcome. Only a qoop
     /// newer than this is asked for: a daemon already on it, moved there by another window
     /// or another Mac, would otherwise end and resume every tab a second time.
     server_version: String,
@@ -356,7 +356,7 @@ struct Mux<W> {
     order_file: Option<std::path::PathBuf>,
     /// For the tasks the mux starts itself: a new link's supervisor, a session list.
     events: mpsc::Sender<FromLink>,
-    /// `qoro --space`: the one local space this interface shows. Every other space, and
+    /// `qoop --space`: the one local space this interface shows. Every other space, and
     /// every tab in one, is left out of the lists it is given.
     only: Option<i64>,
     /// The remotes, by target, a push of a version was started for, with that version. A
@@ -646,7 +646,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     }
 
     /// Start a link for every saved remote that has none: a machine added from a shell
-    /// (`qoro remote add`) after this interface started. A list that does not read is left
+    /// (`qoop remote add`) after this interface started. A list that does not read is left
     /// for the next look; the start already said so.
     async fn adopt_saved(&mut self) -> io::Result<()> {
         let Ok(saved) = qoop_remote::saved::load() else {
@@ -678,7 +678,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         }
     }
 
-    /// A remote just came up running `server_version`: when this qoro is newer, put it on
+    /// A remote just came up running `server_version`: when this qoop is newer, put it on
     /// that machine's disk in the background and ask its daemon to move to it, once per
     /// remote and version. Whatever goes wrong is one line on the status bar, never a retry.
     fn update_remote(&mut self, link: usize, server_version: &str) {
@@ -703,7 +703,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         let _ = events
                             .send(FromLink::Reply(ControlResponse::Failed {
                                 id: UPDATE_NOTICE.into(),
-                                reason: format!("qoro {here} is on {name}, but {warning}"),
+                                reason: format!("qoop {here} is on {name}, but {warning}"),
                             }))
                             .await;
                     }
@@ -712,7 +712,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Ok(crate::link::Update::NoRelease) => return,
                 Err(e) => FromLink::Reply(ControlResponse::Failed {
                     id: UPDATE_NOTICE.into(),
-                    reason: format!("qoro {here} could not be put on {name}: {e}"),
+                    reason: format!("qoop {here} could not be put on {name}: {e}"),
                 }),
             };
             let _ = events.send(message).await;
@@ -721,7 +721,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 
     /// Add the machine at `target` from the interface, keep it in the list of remotes,
     /// and say under what name it will appear. A machine already kept is taken there; a
-    /// new one is asked first whether it has a qoro, in a task, since ssh can take seconds.
+    /// new one is asked first whether it has a qoop, in a task, since ssh can take seconds.
     async fn connect_remote(&mut self, id: String, target: String) -> io::Result<()> {
         if !qoop_remote::saved::valid_target(&target) {
             return self
@@ -764,7 +764,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         Ok(())
     }
 
-    /// Keep a machine that answered with a qoro, and start its link.
+    /// Keep a machine that answered with a qoop, and start its link.
     async fn add_new_remote(&mut self, id: String, target: String) -> io::Result<()> {
         // Before anything is kept: a machine saved that this interface cannot show would
         // appear only on the next start, as if added then.
@@ -953,7 +953,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 .await
             }
             R::CreateWorkspace { id, .. } if self.only.is_some() => {
-                self.failed(id, "this shows one space; `qoro` shows them all".into())
+                self.failed(id, "this shows one space; `qoop` shows them all".into())
                     .await
             }
             R::CreateWorkspace { id, name } => {
@@ -1087,7 +1087,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     return self
                         .failed(
                             id,
-                            format!("{name} runs an older qoro: it places tabs once it updates"),
+                            format!("{name} runs an older qoop: it places tabs once it updates"),
                         )
                         .await;
                 }
@@ -1308,11 +1308,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 let Some(l) = self.link(link) else {
                     return Ok(());
                 };
-                // Back on a newer qoro than before, which is the move a waiting line said
+                // Back on a newer qoop than before, which is the move a waiting line said
                 // would come: that line is replaced by this one.
                 let moved = (!l.server_version.is_empty()
                     && qoop_runtime::paths::is_newer_version(&server_version, &l.server_version))
-                .then(|| format!("{} now runs qoro {server_version}", l.name));
+                .then(|| format!("{} now runs qoop {server_version}", l.name));
                 l.conn = Some((conn, writer));
                 l.server_version = server_version;
                 l.control_seq = 0;
@@ -1428,7 +1428,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Ok(())
             }
             FromLink::Reply(reply) => {
-                // A machine that just got its qoro: any link already kept for it tries now
+                // A machine that just got its qoop: any link already kept for it tries now
                 // rather than at the end of its wait.
                 if let ControlResponse::RemoteInstalled { target, .. } = &reply {
                     let waiting: Vec<usize> = self
@@ -1615,15 +1615,15 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 self.push_lists(&id).await
             }
-            // The answer to the ask to move to the newer qoro, ahead of the first lists' arm
+            // The answer to the ask to move to the newer qoop, ahead of the first lists' arm
             // below: a refusal of it is not a list that failed. Said once, as one line.
             C::RestartArmed { waiting_on, .. } if id == RESTART_ID => {
                 let line = match waiting_on {
                     Some(reason) => format!(
-                        "{name} moves to the new qoro once nothing there is working; now \
+                        "{name} moves to the new qoop once nothing there is working; now \
                          waiting on {reason}"
                     ),
-                    None => format!("{name} moves to the new qoro once nothing there is working"),
+                    None => format!("{name} moves to the new qoop once nothing there is working"),
                 };
                 self.respond(&C::RestartArmed {
                     id: UPDATE_NOTICE.into(),
@@ -1639,11 +1639,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             {
                 let line = if too_old_for(&reason, None) {
                     format!(
-                        "{name} runs a qoro from before updates moved on their own: the new one \
-                         is on disk there and takes over when {name} next restarts its qoro"
+                        "{name} runs a qoop from before updates moved on their own: the new one \
+                         is on disk there and takes over when {name} next restarts its qoop"
                     )
                 } else {
-                    format!("{name} keeps its qoro for now: {reason}")
+                    format!("{name} keeps its qoop for now: {reason}")
                 };
                 self.failed(UPDATE_NOTICE.into(), line).await
             }
@@ -1701,15 +1701,15 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 None => Ok(()),
             },
-            // A machine running a qoro from before an ask existed says so in its own words,
+            // A machine running a qoop from before an ask existed says so in its own words,
             // which name a fix for itself. Over ssh that fix is on the other machine, and a
-            // newer qoro there may be on its way from here already: said as it is, no more.
+            // newer qoop there may be on its way from here already: said as it is, no more.
             C::Failed { id, reason }
                 if !name.is_empty() && reason.contains("older than the client") =>
             {
                 self.failed(
                     id,
-                    format!("{name} runs an older qoro that cannot do this yet"),
+                    format!("{name} runs an older qoop that cannot do this yet"),
                 )
                 .await
             }
@@ -2489,7 +2489,7 @@ mod tests {
         .expect("answered");
         assert!(remote_rx.try_recv().is_err(), "an old remote was asked");
         let said = String::from_utf8_lossy(&mux.down).to_string();
-        assert!(said.contains("older qoro"), "{said}");
+        assert!(said.contains("older qoop"), "{said}");
         mux.down.clear();
         mux.link(1).expect("remote").server_version = "0.6.0".into();
         mux.control(ControlRequest::MoveTerminal {
@@ -2562,7 +2562,7 @@ mod tests {
         };
         let far = workspace_out(1, 3).expect("fits");
         for (link, rows) in [
-            (0, vec![row(1, "qoro"), row(2, "app")]),
+            (0, vec![row(1, "qoop"), row(2, "app")]),
             (1, vec![row(far, "devbox:api")]),
         ] {
             let l = mux.link(link).expect("link");
@@ -2616,7 +2616,7 @@ mod tests {
         );
         // Home lists its own in that order now; a new space there lands after the one it
         // lists before it, not at the top.
-        mux.link(0).expect("home").spaces = vec![row(2, "app"), row(1, "qoro"), row(5, "new")];
+        mux.link(0).expect("home").spaces = vec![row(2, "app"), row(1, "qoop"), row(5, "new")];
         assert_eq!(ids(&mux), vec![far, 2, 1, 5]);
     }
 
@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     /// A machine's closed space gives up only its own place, wherever it sat; and a machine
-    /// that refused its part of a new order (a qoro from before the ask) does not get to put
+    /// that refused its part of a new order (a qoop from before the ask) does not get to put
     /// its old order back over the one a person dragged.
     #[tokio::test]
     async fn a_closed_space_and_a_refused_order_keep_every_other_place() {
@@ -2773,7 +2773,7 @@ mod tests {
     async fn a_new_tab_naming_its_space_keeps_its_directory() {
         let (mut mux, mut home_rx, _remote_rx, _events) = two_links();
         mux.last_link = 1;
-        let dir = "/Users/me/coding/qoro".to_string();
+        let dir = "/Users/me/coding/qoop".to_string();
         let mut tab: AgentRow = serde_json::from_value(serde_json::json!({
             "terminal": 4, "workspace": 1, "agent": true, "state": "idle",
             "readiness": "ready", "cwd": dir,
@@ -2886,7 +2886,7 @@ mod tests {
         assert_eq!(links(&home), [None]);
     }
 
-    /// The ask to move to a newer qoro: kept while its link is down and sent when it is up
+    /// The ask to move to a newer qoop: kept while its link is down and sent when it is up
     /// again to a daemon still older than it. A pre-feature daemon's refusal of it is one
     /// actionable line, not a first list that failed, and a waiting reason is worded once.
     #[tokio::test]
@@ -2947,7 +2947,7 @@ mod tests {
         let said: ControlResponse = body_of(&std::mem::take(&mut mux.down));
         assert!(
             matches!(&said, ControlResponse::Failed { id, reason }
-                if id == UPDATE_NOTICE && reason.contains("next restarts its qoro")),
+                if id == UPDATE_NOTICE && reason.contains("next restarts its qoop")),
             "{said:?}"
         );
         assert!(
@@ -3029,7 +3029,7 @@ mod tests {
         assert!(
             said.contains(&ControlResponse::RestartArmed {
                 id: UPDATE_NOTICE.into(),
-                waiting_on: Some("devbox now runs qoro 0.6.0".into()),
+                waiting_on: Some("devbox now runs qoop 0.6.0".into()),
             }),
             "{said:?}"
         );
@@ -3076,7 +3076,7 @@ mod tests {
         assert_eq!(restarts(&mut rx3), 1);
     }
 
-    /// `qoro --space`: the interface is given the one space and its tabs, and a tab asked
+    /// `qoop --space`: the interface is given the one space and its tabs, and a tab asked
     /// for with no space named is made in that space rather than the daemon's default.
     #[tokio::test]
     async fn a_scoped_mux_passes_one_space_and_its_tabs() {

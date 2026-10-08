@@ -111,7 +111,7 @@ entries rather than trusting either interpretation.
 
 `proc_pidinfo` answers for processes we own and returns `EPERM` for others, roughly 110 of
 174 in one measurement. Most of that remainder belongs to other users. Some of it does not:
-a user who runs `sudo vim` in a qoro terminal creates a root-owned process on our
+a user who runs `sudo vim` in a qoop terminal creates a root-owned process on our
 controlling terminal that we can neither enumerate nor signal. Teardown reports that case
 rather than silently succeeding. It is a documented limit of same-uid containment, in the
 same spirit as ADR-012's refusal to claim isolation it does not enforce.

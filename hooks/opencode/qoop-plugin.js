@@ -1,10 +1,10 @@
-// qoro hook for OpenCode (plugin).
+// qoop hook for OpenCode (plugin).
 //
-// Install: `qoro hooks install opencode`, or copy this file into
-// `~/.config/opencode/plugin/`, with `qoro` on PATH. Do not also list it in
+// Install: `qoop hooks install opencode`, or copy this file into
+// `~/.config/opencode/plugin/`, with `qoop` on PATH. Do not also list it in
 // `opencode.json`, which would load it twice. Reports go through
-// `qoro hook-report`, which reads the terminal and token the daemon put in
-// the environment. Outside a qoro terminal every report is a silent no-op and
+// `qoop hook-report`, which reads the terminal and token the daemon put in
+// the environment. Outside a qoop terminal every report is a silent no-op and
 // the screen reading keeps working with no hooks installed.
 //
 // Event reference: https://opencode.ai/docs/plugins/ and the event types in
@@ -58,7 +58,7 @@ function clean(text) {
 }
 
 function report(state, { sessionID, event, label } = {}) {
-  if (!process.env.QORO_TERMINAL || !process.env.QORO_TOKEN) {
+  if (!process.env.QOOP_TERMINAL || !process.env.QOOP_TOKEN) {
     return;
   }
   if (state === "working" && pending.size > 0) state = "blocked";
@@ -76,7 +76,7 @@ function report(state, { sessionID, event, label } = {}) {
   queue = queue.then(
     () =>
       new Promise((done) =>
-        execFile("qoro", args, { timeout: 5000 }, () => done()),
+        execFile("qoop", args, { timeout: 5000 }, () => done()),
       ),
   );
 }
@@ -107,7 +107,7 @@ function toolLabel(tool, args) {
     .join(" ");
 }
 
-export const QoroPlugin = async () => ({
+export const QoopPlugin = async () => ({
   event: async ({ event }) => {
     const p = event?.properties ?? {};
     switch (event?.type) {

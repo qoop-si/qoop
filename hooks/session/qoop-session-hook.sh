@@ -1,5 +1,5 @@
 #!/bin/sh
-# qoro session hook, shared by GitHub Copilot CLI, Factory Droid, Qwen Code and
+# qoop session hook, shared by GitHub Copilot CLI, Factory Droid, Qwen Code and
 # Qoder CLI.
 #
 # Reports one thing: the agent's own id for its conversation, on SessionStart.
@@ -7,7 +7,7 @@
 # the newest one in the directory. It reports no state: the screen reading
 # stays the only source of what the agent is doing.
 #
-# `qoro hooks install copilot droid qwen qodercli` writes this file once per
+# `qoop hooks install copilot droid qwen qodercli` writes this file once per
 # agent and adds one SessionStart entry to that agent's user configuration:
 #
 #   copilot   ~/.copilot/settings.json
@@ -33,12 +33,12 @@
 
 set -eu
 
-[ -n "${QORO_TERMINAL:-}" ] || exit 0
-[ -n "${QORO_TOKEN:-}" ] || exit 0
-# The installer puts qoro in ~/.local/bin, which a stock Mac does not have on PATH until
+[ -n "${QOOP_TERMINAL:-}" ] || exit 0
+[ -n "${QOOP_TOKEN:-}" ] || exit 0
+# The installer puts qoop in ~/.local/bin, which a stock Mac does not have on PATH until
 # the person adds it: looked for there too, rather than every hook going quiet.
-command -v qoro >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
-command -v qoro >/dev/null 2>&1 || exit 0
+command -v qoop >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
+command -v qoop >/dev/null 2>&1 || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 # Refused unless it looks like an id and nothing else: it ends up on a
@@ -66,5 +66,5 @@ if (
 ' 2>/dev/null)" || session=""
 
 [ -n "$session" ] || exit 0
-qoro hook-report --session-id "$session" >/dev/null 2>&1 || true
+qoop hook-report --session-id "$session" >/dev/null 2>&1 || true
 exit 0

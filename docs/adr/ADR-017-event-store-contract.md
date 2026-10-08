@@ -14,7 +14,7 @@ all tested, and `scripts/replay-check.sh` runs them. The daemon does not open
 `Gap`, and it reads the log for nothing.
 
 What it does keep is the one part of the log it ever read, the idempotency ledger, and that
-now lives in `qoro.db` as an `applied` table. ADR-005 covers where it went and what was
+now lives in `qoop.db` as an `applied` table. ADR-005 covers where it went and what was
 lost. The rest of this ADR describes a contract nothing currently depends on, kept intact
 for whoever writes the first reader.
 

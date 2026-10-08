@@ -29,7 +29,7 @@ pub struct GraphicsCap {
     pub kitty: bool,
     pub iterm2: bool,
     /// Sixel is never in the default allowlist: no outer sixel support is
-    /// verified on a device yet. `QORO_GRAPHICS=sixel` or `all` turns it on,
+    /// verified on a device yet. `QOOP_GRAPHICS=sixel` or `all` turns it on,
     /// and then envelopes pass through verbatim like the other two.
     pub sixel: bool,
 }
@@ -54,7 +54,7 @@ impl GraphicsCap {
 
 /// What the outer terminal speaks, read once at startup.
 ///
-/// An explicit override first (`QORO_GRAPHICS=kitty|iterm2|sixel|all|off`), because
+/// An explicit override first (`QOOP_GRAPHICS=kitty|iterm2|sixel|all|off`), because
 /// terminal identification lies: under ssh or tmux the variables name the outer
 /// multiplexer rather than the emulator behind it, and a wrong positive prints raw
 /// base64. Without an override, a conservative allowlist: Kitty where the
@@ -66,7 +66,7 @@ impl GraphicsCap {
 /// config; a WezTerm that swallows the envelope still shows the picture's
 /// absence rather than garbage, and one variable turns the whole thing off.)
 pub fn detect() -> GraphicsCap {
-    match std::env::var("QORO_GRAPHICS")
+    match std::env::var("QOOP_GRAPHICS")
         .unwrap_or_default()
         .to_lowercase()
         .as_str()
@@ -689,7 +689,7 @@ mod tests {
     /// in one test because both mutate the process environment.
     #[test]
     fn capability_detection_honours_override_then_allowlist() {
-        let key = "QORO_GRAPHICS";
+        let key = "QOOP_GRAPHICS";
         for (value, want) in [
             ("off", GraphicsCap::off()),
             (
@@ -725,7 +725,7 @@ mod tests {
                 },
             ),
         ] {
-            // SAFETY: only this test reads or writes QORO_GRAPHICS, TERM and
+            // SAFETY: only this test reads or writes QOOP_GRAPHICS, TERM and
             // TERM_PROGRAM in this binary, so no other thread sees them change.
             unsafe { std::env::set_var(key, value) };
             assert_eq!(detect(), want, "override {value}");

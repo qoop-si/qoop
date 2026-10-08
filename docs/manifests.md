@@ -1,6 +1,6 @@
 # Agent-detection manifests
 
-qoro reads what an agent is doing from its screen (and its OSC title) through
+qoop reads what an agent is doing from its screen (and its OSC title) through
 TOML rule files called manifests: one per agent, compiled into the binary,
 matched highest-priority-first. This page covers the file format, the bundled
 set, and the override directory that lets you fix a misreading without
@@ -127,14 +127,14 @@ or an `rm` would run it again on every start.
 
 ## Overrides
 
-Put `<agent>.toml` files in `<config>/qoro/agent-detection/` (`$XDG_CONFIG_HOME`
+Put `<agent>.toml` files in `<config>/qoop/agent-detection/` (`$XDG_CONFIG_HOME`
 or `~/.config`), one per agent, with the filename matching the `id` inside.
 An override replaces the bundled manifest for its id entirely, including ids
 no bundled manifest has (a verified `aider.toml` written from a real capture
 works the same way). Then tell the running daemon:
 
 ```text
-qoro reload-manifests
+qoop reload-manifests
 ```
 
 It prints `loaded <id>` per applied file and `error <file>: <reason>` per

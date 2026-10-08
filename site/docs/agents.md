@@ -1,6 +1,6 @@
 # Supported agents
 
-qoro recognises an agent by what is running in the terminal, even when it runs through a
+qoop recognises an agent by what is running in the terminal, even when it runs through a
 runtime (`node`, `bun`, `python`): an agent installed as a node package reads as itself, not
 as `node`. It then reads what the agent is doing from its screen, and from its hook when one
 is installed.
@@ -43,5 +43,5 @@ recognised yet.
 ## Overriding a rule
 
 Rules live in manifests you can override without a release: put a manifest with the same id
-in `~/.config/qoro/agent-detection/` and run `qoro reload-manifests`. `qoro agents explain
+in `~/.config/qoop/agent-detection/` and run `qoop reload-manifests`. `qoop agents explain
 <terminal>` says which rule last matched and which source holds the state.

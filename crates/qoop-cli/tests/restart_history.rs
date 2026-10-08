@@ -2,7 +2,7 @@
 //!
 //! Only rows that scrolled off used to be written down, so the last command's output was
 //! lost on every stop, and what was on disk was out of reach until something new scrolled.
-//! Driven through the real binary: a daemon, `qoro send`, `qoro stop`, a second daemon over
+//! Driven through the real binary: a daemon, `qoop send`, `qoop stop`, a second daemon over
 //! the same directory, and the same `Scrollback` question the interface asks.
 
 use std::os::unix::fs::PermissionsExt;
@@ -25,7 +25,7 @@ impl Drop for Running {
 fn spawn_daemon(dir: &Path) -> Running {
     let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", dir)
+        .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("SHELL", "/bin/sh")
         .stdout(Stdio::null())
@@ -44,16 +44,16 @@ fn spawn_daemon(dir: &Path) -> Running {
     Running(child)
 }
 
-fn qoro(dir: &Path, args: &[&str]) -> (bool, String) {
+fn qoop(dir: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(args)
-        .env("QORO_RUNTIME_DIR", dir)
+        .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
-        .env_remove("QORO_SESSION")
-        .env_remove("QORO_TERMINAL")
-        .env_remove("QORO_TOKEN")
+        .env_remove("QOOP_SESSION")
+        .env_remove("QOOP_TERMINAL")
+        .env_remove("QOOP_TOKEN")
         .output()
-        .expect("run qoro");
+        .expect("run qoop");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -69,21 +69,21 @@ fn a_stopped_tab_comes_back_with_its_last_screen_in_reach() {
     let mut first = spawn_daemon(dir.path());
     qoop_testkit::open_first_terminal(&socket);
     // Typed with arithmetic so the echoed command line is not itself the marker.
-    let (sent, _) = qoro(
+    let (sent, _) = qoop(
         dir.path(),
         &["send", "1", "--enter", "--", "echo QRMARK-$((6*7))"],
     );
     assert!(sent, "the command was not sent");
     let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline && !qoro(dir.path(), &["read", "1"]).1.contains("QRMARK-42") {
+    while Instant::now() < deadline && !qoop(dir.path(), &["read", "1"]).1.contains("QRMARK-42") {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        qoro(dir.path(), &["read", "1"]).1.contains("QRMARK-42"),
+        qoop(dir.path(), &["read", "1"]).1.contains("QRMARK-42"),
         "the marker never reached the screen"
     );
-    let (stopped, _) = qoro(dir.path(), &["stop"]);
-    assert!(stopped, "qoro stop failed");
+    let (stopped, _) = qoop(dir.path(), &["stop"]);
+    assert!(stopped, "qoop stop failed");
     let _ = first.0.wait();
 
     let second = spawn_daemon(dir.path());

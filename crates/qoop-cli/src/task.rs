@@ -1,8 +1,8 @@
-//! `qoro task`: the work this terminal's agent is doing, recorded where qoro keeps it.
+//! `qoop task`: the work this terminal's agent is doing, recorded where qoop keeps it.
 //!
 //! An agent opens its task, writes its plan and evidence, and says when it believes it is
-//! done; qass or the person checks and closes it. Inside a qoro terminal `QORO_TERMINAL`
-//! and `QORO_TOKEN` say which terminal is asking, so no id is typed for "my task".
+//! done; qass or the person checks and closes it. Inside a qoop terminal `QOOP_TERMINAL`
+//! and `QOOP_TOKEN` say which terminal is asking, so no id is typed for "my task".
 
 use std::io::Read;
 
@@ -13,16 +13,16 @@ use qoop_runtime::paths;
 
 use crate::usage;
 
-/// What every agent opened in qoro is told at the start of a session, by its own hook.
+/// What every agent opened in qoop is told at the start of a session, by its own hook.
 /// Short on purpose: it is in every session's context.
-pub(crate) const RULES: &str = "You are running inside qoro, which keeps a task record per \
-terminal. It may open one by itself when you edit a file; `qoro task show` says whether there is \
-one, and `qoro task new \"<outcome>\"` opens it. For real work (changing files, a multi-step investigation), give it a plan \
-with `qoro task plan -` (acceptance, steps, how you will verify it), move it with `qoro task \
+pub(crate) const RULES: &str = "You are running inside qoop, which keeps a task record per \
+terminal. It may open one by itself when you edit a file; `qoop task show` says whether there is \
+one, and `qoop task new \"<outcome>\"` opens it. For real work (changing files, a multi-step investigation), give it a plan \
+with `qoop task plan -` (acceptance, steps, how you will verify it), move it with `qoop task \
 stage <stage>` (investigating, planning, implementing, reviewing, verifying, waiting-human), add \
-`qoro task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
-finish with `qoro task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
-or stop as usual. If a `qoro task` command fails, carry on with the work.";
+`qoop task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
+finish with `qoop task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
+or stop as usual. If a `qoop task` command fails, carry on with the work.";
 
 /// How long `rules` waits for the daemon. A hook waits on it at every session start and
 /// every request, and gives it 2 s before going quiet; a daemon answers in milliseconds.
@@ -35,25 +35,25 @@ const STDIN_MAX: usize = 16_000;
 const QASS_SPACE: &str = crate::qass::SPACE;
 
 const USAGE: &str = "usage:
-  qoro task new [--replace] <goal>     open this terminal's task
-  qoro task stage <stage>              investigating|planning|implementing|reviewing|verifying|waiting-human
-  qoro task plan <text|->              acceptance, plan, how it will be verified, risks
-  qoro task evidence <text|->          a check that proves an acceptance point, and its result
-  qoro task done [summary]             claim it is done; it is checked outside the agent
-  qoro task close <id> --verified|--failed [reason]
-  qoro task ls [--json]                open tasks
-  qoro task show [id] [--before E] [--json]   no id: this terminal's open task
-  qoro task begin                      this terminal's open task, opened now if none (hooks)
-  qoro task rules [--turn]             what an agent in qoro is told at session start
+  qoop task new [--replace] <goal>     open this terminal's task
+  qoop task stage <stage>              investigating|planning|implementing|reviewing|verifying|waiting-human
+  qoop task plan <text|->              acceptance, plan, how it will be verified, risks
+  qoop task evidence <text|->          a check that proves an acceptance point, and its result
+  qoop task done [summary]             claim it is done; it is checked outside the agent
+  qoop task close <id> --verified|--failed [reason]
+  qoop task ls [--json]                open tasks
+  qoop task show [id] [--before E] [--json]   no id: this terminal's open task
+  qoop task begin                      this terminal's open task, opened now if none (hooks)
+  qoop task rules [--turn]             what an agent in qoop is told at session start
                                        (--turn: the line it is given with each request)
   <text> may be `-` to read it from standard input";
 
-/// This terminal and its token, when run inside a qoro terminal.
+/// This terminal and its token, when run inside a qoop terminal.
 fn here() -> (Option<u32>, Option<String>) {
-    let terminal = std::env::var("QORO_TERMINAL")
+    let terminal = std::env::var("QOOP_TERMINAL")
         .ok()
         .and_then(|t| t.parse().ok());
-    let token = std::env::var("QORO_TOKEN").ok().filter(|t| !t.is_empty());
+    let token = std::env::var("QOOP_TOKEN").ok().filter(|t| !t.is_empty());
     match (terminal, token) {
         (Some(t), Some(k)) => (Some(t), Some(k)),
         _ => (None, None),
@@ -83,7 +83,7 @@ fn text(words: &[String]) -> std::io::Result<String> {
 fn explain(reason: String) -> std::io::Error {
     if reason.starts_with("this daemon is older") {
         return std::io::Error::other(
-            "the running qoro daemon is older than this command and has no tasks; it picks \
+            "the running qoop daemon is older than this command and has no tasks; it picks \
              them up the next time it restarts on its own",
         );
     }
@@ -97,7 +97,7 @@ fn ask(request: ControlRequest, patience: std::time::Duration) -> std::io::Resul
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        tokio::time::timeout(patience, crate::ask_daemon(&socket, "qoro-task", &request))
+        tokio::time::timeout(patience, crate::ask_daemon(&socket, "qoop-task", &request))
             .await
             .map_err(|_| std::io::Error::other("the daemon did not answer in time"))?
     })
@@ -113,7 +113,7 @@ fn write(task: Option<i64>, action: TaskOp) -> std::io::Result<i64> {
     };
     if task.is_none() && terminal.is_none() {
         return Err(std::io::Error::other(
-            "QORO_TERMINAL and QORO_TOKEN are not set: run this in a qoro terminal, or name the task",
+            "QOOP_TERMINAL and QOOP_TOKEN are not set: run this in a qoop terminal, or name the task",
         ));
     }
     let request = ControlRequest::TaskWrite {
@@ -321,7 +321,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 }
             }
             if task.is_none() && here().0.is_none() {
-                return Err(usage("not inside a qoro terminal: qoro task show <id>"));
+                return Err(usage("not inside a qoop terminal: qoop task show <id>"));
             }
             let found = read(
                 task,
@@ -357,7 +357,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             if found.more
                 && let Some(last) = found.events.last()
             {
-                println!("  older: qoro task show {} --before {}", t.id, last.id);
+                println!("  older: qoop task show {} --before {}", t.id, last.id);
             }
             Ok(())
         }
@@ -376,15 +376,15 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             if has("--turn") {
                 match open {
                     Some(t) => println!(
-                        "qoro: this terminal's task #{} is open (stage {}). Record each check \
-                         that proves it with `qoro task evidence`, and `qoro task done` when \
+                        "qoop: this terminal's task #{} is open (stage {}). Record each check \
+                         that proves it with `qoop task evidence`, and `qoop task done` when \
                          finished.",
                         t.id, t.stage
                     ),
                     None => println!(
-                        "qoro: if this request is real work, qoro opens its task when you edit \
-                         a file; give it a plan with `qoro task plan -` and record checks with \
-                         `qoro task evidence`."
+                        "qoop: if this request is real work, qoop opens its task when you edit \
+                         a file; give it a plan with `qoop task plan -` and record checks with \
+                         `qoop task evidence`."
                     ),
                 }
                 return Ok(());
@@ -413,12 +413,12 @@ mod tests {
     fn an_older_daemon_is_never_restarted_on_its_own_advice() {
         let said = explain(
             "this daemon is older than the client that called it: it does not know the method \
-             that was asked for (unknown variant). `qoro stop`, then `qoro`, picks up the new \
+             that was asked for (unknown variant). `qoop stop`, then `qoop`, picks up the new \
              daemon; what is open comes back."
                 .into(),
         )
         .to_string();
-        assert!(!said.contains("qoro stop"), "{said}");
+        assert!(!said.contains("qoop stop"), "{said}");
         assert!(said.contains("older than this command"), "{said}");
         assert_eq!(explain("no task #4".into()).to_string(), "no task #4");
     }

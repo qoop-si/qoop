@@ -1,4 +1,4 @@
-//! `qoro update`: replace this binary with the newest GitHub Release.
+//! `qoop update`: replace this binary with the newest GitHub Release.
 //!
 //! The one subcommand that needs the network, and it says so in
 //! `docs/cli-surface.md`. Everything else behaves the same offline; this one fails
@@ -57,8 +57,8 @@ fn translated() -> bool {
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
 }
 
-/// `qoro update` checks GitHub Releases, installs the newest binary and moves every machine
-/// onto it; `qoro update --check` only leaves what it saw in the notice file the interface
+/// `qoop update` checks GitHub Releases, installs the newest binary and moves every machine
+/// onto it; `qoop update --check` only leaves what it saw in the notice file the interface
 /// reads.
 pub fn run(args: &[String]) -> std::io::Result<()> {
     // Anything else is refused before the network: a mistyped `--check` read as no
@@ -69,15 +69,15 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         .find(|a| !matches!(a.as_str(), "--check" | "--help" | "-h"))
     {
         return Err(std::io::Error::other(format!(
-            "unknown argument {other}; usage: qoro update [--check]"
+            "unknown argument {other}; usage: qoop update [--check]"
         )));
     }
     let check_only = args.iter().any(|a| a == "--check");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!(
             "usage:\n\
-             \x20 qoro update           install the newest release and move every machine onto it\n\
-             \x20 qoro update --check   only note what the newest release is\n"
+             \x20 qoop update           install the newest release and move every machine onto it\n\
+             \x20 qoop update --check   only note what the newest release is\n"
         );
         return Ok(());
     }
@@ -102,7 +102,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         let latest = latest?;
         if !paths::is_newer_version(&latest.version, current) {
             clear_notice();
-            println!("qoro {current} is the newest release");
+            println!("qoop {current} is the newest release");
             return Ok(());
         }
         if let Err(e) = write_notice(&latest.version) {
@@ -112,7 +112,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             )));
         }
         println!(
-            "update available: {current} -> {}: run `qoro update` to install it",
+            "update available: {current} -> {}: run `qoop update` to install it",
             latest.version
         );
         return Ok(());
@@ -128,10 +128,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
         Ok(_) => {
             clear_notice();
-            println!("qoro {current} is the newest release");
+            println!("qoop {current} is the newest release");
         }
         Err(_) => {
-            eprintln!("qoro: no release could be read; moving every machine onto {current} anyway")
+            eprintln!("qoop: no release could be read; moving every machine onto {current} anyway")
         }
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -180,7 +180,7 @@ async fn hello(socket: &Path) -> std::io::Result<(tokio::net::UnixStream, BytesM
         .await
         .map_err(|_| timed_out("the daemon did not accept the connection"))??;
     let (stream, inbuf, welcome) =
-        tokio::time::timeout(ASK_TO_MOVE, client::handshake(stream, "qoro-update", None))
+        tokio::time::timeout(ASK_TO_MOVE, client::handshake(stream, "qoop-update", None))
             .await
             .map_err(|_| timed_out("the daemon did not answer the handshake"))??;
     Ok((stream, inbuf, welcome.server_version))
@@ -205,7 +205,7 @@ async fn this_machine(version: &str) -> Line {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            Ok(format!("no daemon running, the next qoro starts {version}"))
+            Ok(format!("no daemon running, the next qoop starts {version}"))
         }
         Err(e) => Err(format!("not asked to move: {e}")),
     }
@@ -260,10 +260,10 @@ where
         }
         Err(e) => return format!("not updated: {}", plain(&e.to_string())),
     };
-    // What the machine says its qoro is reaches this terminal in every line below, so it
+    // What the machine says its qoop is reaches this terminal in every line below, so it
     // has to be a version before it is used as one.
     if paths::parse_version(&on_disk).is_none() {
-        return "not updated: the machine reported a version this qoro cannot read".to_string();
+        return "not updated: the machine reported a version this qoop cannot read".to_string();
     }
     let (Ok(line) | Err(line)) = move_it(on_disk).await;
     match warning {
@@ -302,7 +302,7 @@ where
     loop {
         match attempt().await {
             Err(e)
-                if busy < BUSY_TRIES && e.to_string().contains("update of qoro is in progress") =>
+                if busy < BUSY_TRIES && e.to_string().contains("update of qoop is in progress") =>
             {
                 busy += 1;
                 tokio::time::sleep(BUSY_WAIT).await;
@@ -401,15 +401,15 @@ fn arm_line(answer: std::io::Result<ControlResponse>, version: &str) -> Line {
             if qoop_runtime::control::too_old_for(&reason, None) =>
         {
             Err(
-                "runs a qoro from before updates moved on their own; the new one takes over \
+                "runs a qoop from before updates moved on their own; the new one takes over \
                  when it next restarts"
                     .to_string(),
             )
         }
         Ok(ControlResponse::Failed { reason, .. }) => {
-            Err(format!("keeps its qoro for now: {}", plain(&reason)))
+            Err(format!("keeps its qoop for now: {}", plain(&reason)))
         }
-        Ok(_) => Err("gave an answer this qoro does not understand".to_string()),
+        Ok(_) => Err("gave an answer this qoop does not understand".to_string()),
         Err(e) => Err(format!("not asked to move: {}", plain(&e.to_string()))),
     }
 }
@@ -430,7 +430,7 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
         .stdout(std::process::Stdio::null())
         .status();
     if !reload.is_ok_and(|status| status.success()) {
-        eprintln!("qoro: the bridge service was not reloaded; run `qoro bridge reload`");
+        eprintln!("qoop: the bridge service was not reloaded; run `qoop bridge reload`");
     }
     Ok(())
 }
@@ -446,7 +446,7 @@ fn refresh_integrations(exe: &Path) {
             .status()
             .is_ok_and(|status| status.success())
         {
-            eprintln!("qoro: the {what} were not refreshed; run `qoro {what} install`");
+            eprintln!("qoop: the {what} were not refreshed; run `qoop {what} install`");
         }
     }
 }
@@ -506,16 +506,16 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
             "cannot unpack the release: tar exited {tar}"
         )));
     }
-    let fresh = work.join("qoro");
+    let fresh = work.join("qoop");
     let reported = Command::new(&fresh)
         .arg("--version")
         .output()
         .map_err(|e| failed(format!("the downloaded binary does not run: {e}")))?;
     let reported = String::from_utf8_lossy(&reported.stdout).trim().to_string();
-    if reported != format!("qoro {}", latest.version) {
+    if reported != format!("qoop {}", latest.version) {
         return Err(failed(format!(
             "refusing to update: the download reports {reported:?}, want {:?}",
-            format!("qoro {}", latest.version)
+            format!("qoop {}", latest.version)
         )));
     }
     // Staged under a name of its own, beside the file so the rename stays on one filesystem:
@@ -523,7 +523,7 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
     let dir = exe.parent().unwrap_or(Path::new("."));
     sweep_stale_stages(dir);
     let staged = tempfile::Builder::new()
-        .prefix(".qoro-update.")
+        .prefix(".qoop-update.")
         .tempfile_in(dir)?;
     std::fs::copy(&fresh, staged.path())?;
     std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o755))?;
@@ -534,7 +534,7 @@ fn install_to(latest: &Release, current: &str, exe: &Path) -> std::io::Result<()
     clear_notice();
     writeln!(
         std::io::stdout(),
-        "updated qoro {current} -> {} at {}",
+        "updated qoop {current} -> {} at {}",
         latest.version,
         exe.display()
     )?;
@@ -552,7 +552,7 @@ fn sweep_stale_stages(dir: &Path) {
         let stale = entry
             .file_name()
             .to_string_lossy()
-            .starts_with(".qoro-update.")
+            .starts_with(".qoop-update.")
             && entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -592,20 +592,20 @@ mod tests {
         put_on_with, remote_line_with, retry_busy,
     };
 
-    const MAC_ARM: &str = "qoro-aarch64-apple-darwin.tar.gz";
+    const MAC_ARM: &str = "qoop-aarch64-apple-darwin.tar.gz";
 
     /// A stand-in release tarball: a script answering `--version` the way the
     /// real binary does, packed the way the release script packs it.
     fn fake_release(dir: &std::path::Path, reported: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("qoro");
-        std::fs::write(&script, format!("#!/bin/sh\necho \"qoro {reported}\"\n")).expect("script");
+        let script = dir.join("qoop");
+        std::fs::write(&script, format!("#!/bin/sh\necho \"qoop {reported}\"\n")).expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let tarball = dir.join("qoro-aarch64-apple-darwin.tar.gz");
+        let tarball = dir.join("qoop-aarch64-apple-darwin.tar.gz");
         let status = std::process::Command::new("tar")
             .args(["-czf"])
             .arg(&tarball)
-            .arg("qoro")
+            .arg("qoop")
             .current_dir(dir)
             .status()
             .expect("tar");
@@ -618,7 +618,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("pack");
         std::fs::create_dir(&pack).expect("pack dir");
-        let exe = dir.path().join("qoro");
+        let exe = dir.path().join("qoop");
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
@@ -633,7 +633,7 @@ mod tests {
             .expect("run the swapped binary");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            "qoro 9.9.9",
+            "qoop 9.9.9",
             "the file at the old path is the new release now"
         );
     }
@@ -645,7 +645,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("pack");
         std::fs::create_dir(&pack).expect("pack dir");
-        let exe = dir.path().join("qoro");
+        let exe = dir.path().join("qoop");
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
@@ -669,9 +669,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("pack");
         std::fs::create_dir(&pack).expect("pack dir");
-        let real = dir.path().join("real-qoro");
+        let real = dir.path().join("real-qoop");
         std::fs::write(&real, "old binary").expect("old");
-        let link = dir.path().join("qoro");
+        let link = dir.path().join("qoop");
         std::os::unix::fs::symlink(&real, &link).expect("link");
         let latest = Release {
             version: "9.9.9".to_string(),
@@ -691,7 +691,7 @@ mod tests {
             .arg("--version")
             .output()
             .expect("run the swapped binary");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "qoro 9.9.9");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "qoop 9.9.9");
     }
 
     #[test]
@@ -699,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("pack");
         std::fs::create_dir(&pack).expect("pack dir");
-        let exe = dir.path().join("qoro");
+        let exe = dir.path().join("qoop");
         std::fs::write(&exe, "old binary").expect("old");
         let latest = Release {
             version: "9.9.9".to_string(),
@@ -745,13 +745,13 @@ mod tests {
             Ok("moves to 0.7.0 once nothing is working".to_string())
         );
         assert_eq!(
-            arm_line(failed("not started as `qoro daemon`"), "0.7.0"),
-            Err("keeps its qoro for now: not started as `qoro daemon`".to_string())
+            arm_line(failed("not started as `qoop daemon`"), "0.7.0"),
+            Err("keeps its qoop for now: not started as `qoop daemon`".to_string())
         );
         assert!(
             arm_line(failed("unknown variant `RestartWhenSafe`"), "0.7.0")
                 .expect_err("old daemon")
-                .starts_with("runs a qoro from before updates moved")
+                .starts_with("runs a qoop from before updates moved")
         );
         assert_eq!(
             arm_line(Err(std::io::Error::other("timed out")), "0.7.0"),
@@ -856,7 +856,7 @@ mod tests {
         .await;
         assert_eq!(
             line,
-            "not updated: the machine reported a version this qoro cannot read"
+            "not updated: the machine reported a version this qoop cannot read"
         );
         assert!(
             !asked.load(std::sync::atomic::Ordering::SeqCst),
@@ -922,7 +922,7 @@ mod tests {
                     assert_eq!((target.as_str(), version.as_str()), ("box", "0.7.0"));
                     if n < 2 {
                         Err(std::io::Error::other(
-                            "another update of qoro is in progress there; try again later",
+                            "another update of qoop is in progress there; try again later",
                         ))
                     } else {
                         Ok(Update::OnDisk("0.7.0".into(), None))
@@ -940,7 +940,7 @@ mod tests {
         let done = put_on_with(
             |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                async { Err(std::io::Error::other("no qoro file to replace")) }
+                async { Err(std::io::Error::other("no qoop file to replace")) }
             },
             "box",
             "0.7.0",
@@ -967,7 +967,7 @@ mod tests {
     async fn a_busy_swap_lock_is_retried_and_nothing_else_is() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let busy = || {
-            std::io::Error::other("another update of qoro is in progress there; try again later")
+            std::io::Error::other("another update of qoop is in progress there; try again later")
         };
         let calls = AtomicU32::new(0);
         let done = retry_busy(|| async {
@@ -993,7 +993,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         let done = retry_busy(|| async {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err(std::io::Error::other("no qoro file to replace"))
+            Err(std::io::Error::other("no qoop file to replace"))
         })
         .await;
         assert!(done.is_err());
@@ -1007,10 +1007,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = dir.path().join("pack");
         std::fs::create_dir(&pack).expect("pack dir");
-        let exe = dir.path().join("qoro");
+        let exe = dir.path().join("qoop");
         std::fs::write(&exe, "old binary").expect("old");
-        let stale = dir.path().join(".qoro-update.stale");
-        let fresh = dir.path().join(".qoro-update.fresh");
+        let stale = dir.path().join(".qoop-update.stale");
+        let fresh = dir.path().join(".qoop-update.fresh");
         for file in [&stale, &fresh] {
             std::fs::write(file, "half").expect("staged");
         }

@@ -11,7 +11,7 @@
 //! An agent's row opens with its state dot, painted in the state's own colour through
 //! [`Line::indicator`]; while it works and the column moves, the dot turns a spinner.
 //! The caller paints the raised background over the keyboard's rows, so the dot never
-//! marks selection. At frame zero, which is what a test, a pipe and `QORO_MOTION=0` get,
+//! marks selection. At frame zero, which is what a test, a pipe and `QOOP_MOTION=0` get,
 //! the rows are the same static text every time.
 
 use qoop_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
@@ -516,7 +516,7 @@ pub struct Cost {
     pub rss: u64,
 }
 
-/// Costs by terminal. Empty unless `QORO_USAGE=1`, and never holding another machine's
+/// Costs by terminal. Empty unless `QOOP_USAGE=1`, and never holding another machine's
 /// terminals: their process groups mean nothing here.
 pub type Usage = std::collections::BTreeMap<u32, Cost>;
 
@@ -538,7 +538,7 @@ pub type Seen = std::collections::BTreeSet<(u32, u64)>;
 /// agent that goes working to idle while unfocused reads as plain `idle`
 /// without this. The daemon never produces it, the client derives it from the
 /// transition, and it stays client-local like `Seen`. Colours and headers
-/// stay qoro's own; only the distinction is shared.
+/// stay qoop's own; only the distinction is shared.
 pub type Unseen = std::collections::BTreeSet<(u32, u64)>;
 
 /// The generation that identifies this row's agent, or zero when the daemon
@@ -1618,7 +1618,7 @@ fn content(c: &Column) -> Vec<Row> {
 /// four controls in fixed columns at the right, bare words one blank apart.
 ///
 /// ```text
-/// ▾qoro (4)                + sleep ⋯ x
+/// ▾qoop (4)                + sleep ⋯ x
 /// ▸wend (1)               + wake  ⋯ x
 /// ```
 ///
@@ -2309,7 +2309,7 @@ pub fn moves(c: &Column, strip: bool) -> Option<Motion> {
 /// The mark an agent's row opens with: its state dot, or, while it works and the
 /// column moves, the spinner's frame in the working colour.
 ///
-/// Frame zero is the still column: hit testing, `QORO_MOTION=0` and a column with
+/// Frame zero is the still column: hit testing, `QOOP_MOTION=0` and a column with
 /// nothing working all paint at zero, where every mark is its dot.
 fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
     if c.icons && role == crate::theme::Role::Sleeping {
@@ -2942,7 +2942,7 @@ type Files = (Option<qoop_runtime::avatar::Avatar>, Option<String>);
 ///
 /// Held, not read per paint: two file reads and a JSON parse on every frame was
 /// the render thread's cost while an agent streamed. Both files are written by
-/// processes outside the interface (`qoro avatar pick`, `qoro update --check`),
+/// processes outside the interface (`qoop avatar pick`, `qoop update --check`),
 /// so the run loop re-reads them on the acknowledgement tick it already has,
 /// and a new pet or notice shows up to one tick late.
 // ponytail: process-wide, the interface has one render loop; a State field would
@@ -3144,7 +3144,7 @@ fn version_text(width: usize, tail: usize, update: Option<&str>) -> String {
 /// Which build this is, read from the crate rather than written down twice.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A newer version `qoro update --check` saw, when it saw one, as [`refresh_files`]
+/// A newer version `qoop update --check` saw, when it saw one, as [`refresh_files`]
 /// last read it.
 fn update_available() -> Option<String> {
     FILES.read().unwrap_or_else(|e| e.into_inner()).1.clone()
@@ -3354,7 +3354,7 @@ mod tests {
     /// down by one.
     #[test]
     fn a_drop_rule_opens_inside_the_list_and_keeps_the_foot() {
-        let spaces = [space(1, "qoro"), space(2, "app")];
+        let spaces = [space(1, "qoop"), space(2, "app")];
         let agents = [
             agent(1, 1, "claude", "working"),
             agent(2, 1, "codex", "idle"),
@@ -5683,8 +5683,8 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let row = second_row(&moving, &working, BOX_LEAD + 2, Some("qoro".into()));
-        assert_eq!(row.0.text.trim_end(), "   \u{2514} claude \u{b7} qoro");
+        let row = second_row(&moving, &working, BOX_LEAD + 2, Some("qoop".into()));
+        assert_eq!(row.0.text.trim_end(), "   \u{2514} claude \u{b7} qoop");
         assert!(
             !row.0
                 .runs
@@ -6280,7 +6280,7 @@ mod tests {
     fn humanize_puts_every_agents_tools_in_a_persons_words() {
         for (raw, said) in [
             (
-                "Edit /Users/me/qoro/crates/qoop-tui/src/sidebar.rs",
+                "Edit /Users/me/qoop/crates/qoop-tui/src/sidebar.rs",
                 "editing sidebar.rs",
             ),
             ("Write src/new.rs", "editing new.rs"),
@@ -6306,7 +6306,7 @@ mod tests {
                 "Resubmit prompt, type a draft, capture frames",
             ),
             // Without one, the set-up in front of a command is not what it runs.
-            ("Bash cd /Users/me/qoro && cargo test", "cargo test"),
+            ("Bash cd /Users/me/qoop && cargo test", "cargo test"),
             (
                 "Bash S=/private/tmp/x; tmux send-keys -t spin",
                 "tmux send-keys -t spin",
@@ -8445,14 +8445,14 @@ mod tests {
     #[test]
     fn a_name_with_no_room_is_left_out_rather_than_over_running() {
         assert_eq!(
-            shorten_middle("qoro", 0),
+            shorten_middle("qoop", 0),
             "",
             "an ellipsis is a column of its own"
         );
-        assert_eq!(crate::width::width(&shorten_middle("qoro", 0)), 0);
-        assert_eq!(shorten_middle("qoro", 1), "\u{2026}");
-        assert_eq!(shorten_middle("qoro", 4), "qoro");
-        assert_eq!(shorten_middle("qoro", 3), "qo\u{2026}");
+        assert_eq!(crate::width::width(&shorten_middle("qoop", 0)), 0);
+        assert_eq!(shorten_middle("qoop", 1), "\u{2026}");
+        assert_eq!(shorten_middle("qoop", 4), "qoop");
+        assert_eq!(shorten_middle("qoop", 3), "qo\u{2026}");
         // The narrowest column the interface draws pays for the fold column, the block and
         // the blank last column, and still leaves a name the columns it needs to stay one.
         assert!(SIDEBAR_MIN.saturating_sub(BLOCK_TAIL_MAX) >= MIN_NAME_COLS);
@@ -8470,7 +8470,7 @@ mod tests {
     fn the_rule_holds_its_columns_at_every_width_and_count() {
         let names = [
             "q",
-            "qoro",
+            "qoop",
             "dub",
             "shop-api",
             "shop-core",
@@ -8520,17 +8520,17 @@ mod tests {
     /// no word for it, since its wake control already says so.
     #[test]
     fn a_rule_says_what_it_holds_beside_its_name() {
-        let row = rule_at(WIDTH, "qoro", 4, false, true);
-        assert!(row.contains("qoro (4)"), "{row:?}");
+        let row = rule_at(WIDTH, "qoop", 4, false, true);
+        assert!(row.contains("qoop (4)"), "{row:?}");
         // Asleep, the same count and no word.
-        let row = rule_at(WIDTH, "qoro", 3, true, true);
-        assert!(row.contains("qoro (3)"), "{row:?}");
+        let row = rule_at(WIDTH, "qoop", 3, true, true);
+        assert!(row.contains("qoop (3)"), "{row:?}");
         assert!(!row.contains("sleeping"), "{row:?}");
         // Narrower, where the word no longer fits, the count stays, so the name never
         // starves for a state; at the narrowest column the name is cut and the count stays.
-        let row = rule_at(30, "qoro", 3, true, true);
-        assert!(row.contains("qoro (3)"), "{row:?}");
-        let row = rule_at(SIDEBAR_MIN, "qoro-mobile", 3, true, true);
+        let row = rule_at(30, "qoop", 3, true, true);
+        assert!(row.contains("qoop (3)"), "{row:?}");
+        let row = rule_at(SIDEBAR_MIN, "qoop-mobile", 3, true, true);
         assert!(row.contains("\u{2026} (3)"), "{row:?}");
     }
 
@@ -8539,14 +8539,14 @@ mod tests {
     /// keeps its columns.
     #[test]
     fn a_partly_sleeping_space_gives_up_its_slot_a_part_at_a_time() {
-        let (mut spaces, agents) = space_in_state("qoro-mobile", 3, false, true);
-        spaces[0].sleeping = space_in_state("qoro-mobile", 2, true, true).0[0]
+        let (mut spaces, agents) = space_in_state("qoop-mobile", 3, false, true);
+        spaces[0].sleeping = space_in_state("qoop-mobile", 2, true, true).0[0]
             .sleeping
             .clone();
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let at = |width| first_rule(&clicks(&spaces, &agents, View::Tree, width, &none)).text;
         assert!(
-            at(SIDEBAR_MAX).contains("qoro-mobile (3, 2z)"),
+            at(SIDEBAR_MAX).contains("qoop-mobile (3, 2z)"),
             "{:?}",
             at(60)
         );
@@ -8754,7 +8754,7 @@ mod tests {
             }
         }
         // A sleeping space's full moon peeks while the drawer is closed, and wakes it.
-        let (spaces, agents) = space_in_state("qoro", 2, true, true);
+        let (spaces, agents) = space_in_state("qoop", 2, true, true);
         let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
         c.icons = true;
         let row = first_rule(&c).text;
@@ -8802,7 +8802,7 @@ mod tests {
     #[test]
     fn with_icons_asleep_tabs_and_remote_spaces_wear_their_marks() {
         let none = (Seen::new(), Unseen::new(), Shut::new());
-        let (spaces, agents) = space_in_state("qoro", 1, true, true);
+        let (spaces, agents) = space_in_state("qoop", 1, true, true);
         let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
         c.icons = true;
         let asleep = rows_folded(&c, 20, None)
@@ -8815,14 +8815,14 @@ mod tests {
             Some(crate::icons::ASLEEP),
             "{asleep:?}"
         );
-        let (mut spaces, agents) = space_in_state("mars:qoro", 1, false, true);
+        let (mut spaces, agents) = space_in_state("mars:qoop", 1, false, true);
         spaces[0].link = Some(qoop_runtime::control::LinkState::Up);
         let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
         c.icons = true;
         let rule = first_rule(&c);
         assert!(
             rule.text
-                .starts_with(&format!("\u{25be}{} mars:qoro", crate::icons::REMOTE)),
+                .starts_with(&format!("\u{25be}{} mars:qoop", crate::icons::REMOTE)),
             "{:?}",
             rule.text
         );
@@ -8830,7 +8830,7 @@ mod tests {
         assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 2));
         c.icons = false;
         assert!(
-            first_rule(&c).text.starts_with("\u{25be}mars:qoro"),
+            first_rule(&c).text.starts_with("\u{25be}mars:qoop"),
             "no mark without icons"
         );
     }
@@ -8868,7 +8868,7 @@ mod tests {
     /// an awake space, waking every tab of it.
     #[test]
     fn a_sleeping_space_keeps_the_only_way_back() {
-        let (spaces, agents) = space_in_state("qoro", 3, true, true);
+        let (spaces, agents) = space_in_state("qoop", 3, true, true);
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
         let rule = first_rule(&c);
@@ -8952,7 +8952,7 @@ mod tests {
         let spaces = vec![WorkspaceRow {
             keep_awake: false,
             id: 1,
-            name: "qoro".into(),
+            name: "qoop".into(),
             terminals: 3,
             asleep: true,
             sleeping: (0..3)

@@ -1,8 +1,8 @@
 #!/bin/bash
 # qass watch: one line per agent change that may need the assistant.
 #
-# Reads `qoro agents --watch --json` (the whole row array on every change) of this Mac and
-# of every remote in `qoro remote ls`, and prints a line only when an agent reaches a
+# Reads `qoop agents --watch --json` (the whole row array on every change) of this Mac and
+# of every remote in `qoop remote ls`, and prints a line only when an agent reaches a
 # state that waits on somebody (idle, blocked, failed, done, sleeping), or sleeps, or
 # closes. A row also changes on every tool call (activity, cwd), so only terminal,
 # generation and state are compared. Its own terminal is skipped.
@@ -20,20 +20,20 @@
 # `hands off until <unix time>` on its goals.md line. Once that time passes and
 # it still waits, it is printed once more, as `hands-off->idle`.
 #
-# Started as `QORO_SLEEP_SAFE=1 watch.sh`: that mark on the command line lets qoro put the
+# Started as `QOOP_SLEEP_SAFE=1 watch.sh`: that mark on the command line lets qoop put the
 # tab to sleep while this runs, and this ends by itself once the agent that started it is
 # gone (asleep or closed), within the 10 s tick.
 #
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
-# A row with an open task (`qoro task`) ends with its id and stage, and `:claimed` once the
+# A row with an open task (`qoop task`) ends with its id and stage, and `:claimed` once the
 # agent said done: ... /home/me/src/app task:12:verifying:claimed
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
-dir="@QASS_DATA@"   # filled in by `qoro skills install`
+dir="@QASS_DATA@"   # filled in by `qoop skills install`
 mkdir -p "$dir"
-self="${QORO_TERMINAL:-0}"
+self="${QOOP_TERMINAL:-0}"
 settle="${QASS_SETTLE:-20}"
 
 defs='
@@ -61,7 +61,7 @@ diff="$defs"'
    | . as $r | ($sleeping | index($r.terminal)) as $asleep
    | line($r + {state: (if $asleep != null then "sleeping" else "closed" end)}; $r.state))
 '
-# Whether a row of $a is gone from $b: only then is `qoro ls` worth asking.
+# Whether a row of $a is gone from $b: only then is `qoop ls` worth asking.
 vanished="$defs"'(($a | rows | keys) - ($b | rows | keys)) | length > 0'
 
 # $b is a row array; prints the held line for terminal $t when it still is generation $g
@@ -127,7 +127,7 @@ at_of() { if [ -z "$1" ]; then echo ""; else echo "$1/"; fi; }
 sleeping_on() {
     local s
     if [ -z "$1" ]; then
-        s="$(qoro ls --json 2>/dev/null | jq -c '[.[].sleeping[]?]' 2>/dev/null | head -1 || true)"
+        s="$(qoop ls --json 2>/dev/null | jq -c '[.[].sleeping[]?]' 2>/dev/null | head -1 || true)"
     else
         s="$("$here/on.sh" "$1" ls --json 2>/dev/null | jq -c '[.[].sleeping[]?]' 2>/dev/null | head -1 || true)"
     fi
@@ -160,7 +160,7 @@ follow() {
             sleeping='[]'
             if jq -en --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
                 --arg at "$at" "$vanished" >/dev/null 2>&1; then
-                # A tab that slept leaves the agent rows too; `qoro ls` still names it.
+                # A tab that slept leaves the agent rows too; `qoop ls` still names it.
                 sleeping="$(sleeping_on "$label")"
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
@@ -269,11 +269,11 @@ rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null; rmdir "$dir/settle.lock" 2>/dev
 ) &
 kids=$!
 
-for name in $(qoro remote ls 2>/dev/null | awk '$1 ~ /^[A-Za-z0-9_-]+$/ { print $1 }'); do
+for name in $(qoop remote ls 2>/dev/null | awk '$1 ~ /^[A-Za-z0-9_-]+$/ { print $1 }'); do
     follow_remote "$name" &
     kids="$kids $!"
 done
-# On the way out, each stream's reader (qoro, ssh) goes with the loop that reads it. IFS
+# On the way out, each stream's reader (qoop, ssh) goes with the loop that reads it. IFS
 # is set here because a signal can arrive inside `IFS= read`, where it is empty.
 trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || true; done
       kill $kids 2>/dev/null || true' EXIT
@@ -281,4 +281,4 @@ trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || t
 trap 'exit 143' TERM INT HUP
 
 rm -f "$(gone_file "")"   # a mark left by an earlier run says nothing about this one
-follow "" < <(qoro agents --watch --json)
+follow "" < <(qoop agents --watch --json)

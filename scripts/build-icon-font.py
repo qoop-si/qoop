@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["fonttools==4.66.1"]
 # ///
-"""Build crates/qoop-tui/assets/QoroSymbols.ttf, the few icons the interface draws.
+"""Build crates/qoop-tui/assets/QoopSymbols.ttf, the few icons the interface draws.
 
 Run with `uv run scripts/build-icon-font.py`. It downloads the pinned Nerd Fonts symbols
 release, checks its hash and keeps only the glyphs named in GLYPHS. The symbol sets were drawn
@@ -32,8 +32,8 @@ VERSION = "v3.5.1"
 URL = f"https://github.com/ryanoasis/nerd-fonts/releases/download/{VERSION}/NerdFontsSymbolsOnly.zip"
 SHA256 = "fdca3682534f6f65e1ccb2345b0362ccf67d9b8eca7c8025330946e93e2473bc"
 MEMBER = "SymbolsNerdFontMono-Regular.ttf"
-FAMILY = "Qoro Symbols"
-OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/qoop-tui/assets/QoroSymbols.ttf"
+FAMILY = "Qoop Symbols"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/qoop-tui/assets/QoopSymbols.ttf"
 
 # The Nerd glyph names, in the order icons.rs lists them, and each one's optical factor:
 # a crescent or a cog fills its box more than a cup does and reads larger at the same size.

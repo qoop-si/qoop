@@ -33,7 +33,7 @@ pub enum StoreError {
     #[error("{0}")]
     Task(#[from] task::TaskError),
     #[error(
-        "this database was written by a newer qoro (schema {found}, this build understands \
+        "this database was written by a newer qoop (schema {found}, this build understands \
          {understood}); use that build or move the file aside"
     )]
     FromTheFuture { found: i64, understood: i64 },
@@ -106,7 +106,7 @@ fn migrate(conn: &Connection, found: i64) -> Result<(), StoreError> {
             understood: SCHEMA_VERSION,
         });
     }
-    // Written only when it changes: every open writing it made a read-only `qoro ls` a
+    // Written only when it changes: every open writing it made a read-only `qoop ls` a
     // writer, racing the daemon's own writes for the lock.
     if found >= SCHEMA_VERSION {
         return Ok(());
@@ -156,7 +156,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         let store = Self::prepare(conn)?;
-        // Turned by the opener that writes, the daemon, and never by a reader: a `qoro ls`
+        // Turned by the opener that writes, the daemon, and never by a reader: a `qoop ls`
         // beside an older daemon that still sleeps whole spaces must not take its marks.
         mark_asleep_spaces(&store.conn)?;
         Ok(store)
@@ -192,7 +192,7 @@ impl Store {
 
     fn prepare(conn: Connection) -> Result<Self, StoreError> {
         // Wait for a lock the daemon holds rather than failing at once, before anything
-        // below can need one: a `qoro ls` landing on a daemon write printed "0 tabs".
+        // below can need one: a `qoop ls` landing on a daemon write printed "0 tabs".
         // Five seconds, the runtime's own deadline for a store call.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL so a reader never blocks the writer, and `foreign_keys` because a layout row
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn metadata_survives_reopening_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         let ws;
         let t;
         {
@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn split_trees_are_replaced_as_a_set_and_survive_a_reopen() {
         let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         {
             let mut s = Store::open(&path).unwrap();
             s.set_splits(&["a".into(), "b".into()]).unwrap();
@@ -1190,7 +1190,7 @@ mod tests {
     #[test]
     fn a_version_two_database_gains_the_ledger_table_on_open() {
         let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         {
             let conn = Connection::open(&path).expect("open");
             conn.execute_batch(
@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn the_ledger_survives_a_reopen() {
         let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         {
             let s = Store::open(&path).expect("open");
             s.record_applied("k1", true, &serde_json::json!({ "terminal": 7 }), 100)
@@ -1567,7 +1567,7 @@ mod tests {
             "the refusal has to say what it is: {err}"
         );
         assert!(
-            err.to_string().contains("newer qoro"),
+            err.to_string().contains("newer qoop"),
             "and say it to a person: {err}"
         );
     }
@@ -1894,7 +1894,7 @@ mod tests {
     #[test]
     fn a_space_slept_whole_by_an_older_daemon_becomes_marks_on_its_tabs_once() {
         let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         let ws;
         {
             let mut s = Store::open(&path).expect("open");
@@ -1981,7 +1981,7 @@ mod openable_tests {
     #[test]
     fn a_dry_run_reads_the_database_and_changes_nothing() {
         let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         assert!(
             Store::check_openable(&path).is_err(),
             "a missing file is not openable"
@@ -1996,7 +1996,7 @@ mod openable_tests {
     #[test]
     fn a_database_from_a_newer_build_is_not_openable() {
         let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("qoro.db");
+        let path = dir.path().join("qoop.db");
         drop(Store::open(&path).expect("a database"));
         Connection::open(&path)
             .expect("open")

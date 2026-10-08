@@ -1,14 +1,14 @@
-// The notch: qoro's agents at the top of the screen.
+// The notch: qoop's agents at the top of the screen.
 //
 // Closed, it is the camera housing grown two ears: the person's pet on the left with
 // a badge counting the agents that need them, and on the right how many are
 // working and idle. Clicked, it drops an inbox of every agent, grouped by what it is
-// doing; clicking a row switches the qoro interface to that terminal and brings its
-// window forward. With no qoro running, or no agents in it, the notch is left alone.
+// doing; clicking a row switches the qoop interface to that terminal and brings its
+// window forward. With no qoop running, or no agents in it, the notch is left alone.
 //
-// Everything it knows comes from the `qoro` binary that started it, named as the
-// first argument by `qoro notch run`: `agents --watch` for the rows, `avatar show
-// --json` for the pet, `focus` for a click. It links no qoro code and reads no qoro
+// Everything it knows comes from the `qoop` binary that started it, named as the
+// first argument by `qoop notch run`: `agents --watch` for the rows, `avatar show
+// --json` for the pet, `focus` for a click. It links no qoop code and reads no qoop
 // file, so the command line stays the one contract. It shows every running session:
 // each command about a row names that row's session.
 
@@ -16,7 +16,7 @@ import AppKit
 import Combine
 import SwiftUI
 
-let qoro = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "qoro"
+let qoop = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "qoop"
 
 // MARK: model
 
@@ -25,8 +25,8 @@ struct Tab: Hashable {
     let session: String
     let terminal: Int
 
-    /// A qoro command about this terminal, run in its session.
-    func qoro(_ rest: String...) -> [String] { ["--session", session] + rest }
+    /// A qoop command about this terminal, run in its session.
+    func qoop(_ rest: String...) -> [String] { ["--session", session] + rest }
 }
 
 struct Row: Decodable, Equatable, Identifiable {
@@ -39,15 +39,15 @@ struct Row: Decodable, Equatable, Identifiable {
     let agent: Bool
     let agent_title: String?
     let cwd: String?
-    /// The space it belongs to (`qoro agents --json`, `AgentRow.workspace`), so its rows
+    /// The space it belongs to (`qoop agents --json`, `AgentRow.workspace`), so its rows
     /// can carry the same rail the sidebar draws down a space's left edge.
     let workspace: Int64
 
     var tab: Tab { Tab(session: session, terminal: terminal) }
     var id: Tab { tab }
 
-    /// Set when the qoro interface shows this row as done: it finished while the person
-    /// was on another tab. Absent from a qoro that predates it.
+    /// Set when the qoop interface shows this row as done: it finished while the person
+    /// was on another tab. Absent from a qoop that predates it.
     let news: Bool?
 
     enum Kind { case waiting, done, working, idle }
@@ -93,7 +93,7 @@ struct Pet: Decodable {
     let pixels: [[String?]]
 }
 
-/// A stretch of one terminal row sharing a style, as `qoro read --json` prints it.
+/// A stretch of one terminal row sharing a style, as `qoop read --json` prints it.
 struct Run: Decodable {
     var t: String
     var fg: String? = nil
@@ -185,7 +185,7 @@ final class Store: ObservableObject {
     var needInk: Color { DotMark.ink(needKind) }
     var working: Int { rows.filter { $0.kind == .working }.count }
     var idle: Int { rows.filter { $0.kind == .idle }.count }
-    /// Finished while the person was elsewhere, as the qoro interface shows it.
+    /// Finished while the person was elsewhere, as the qoop interface shows it.
     var finished: Int { rows.filter { $0.kind == .done }.count }
     /// Whether the rows come from more than one session, so each says which.
     var mixed: Bool { Set(rows.map(\.session)).count > 1 }
@@ -204,19 +204,19 @@ final class Store: ObservableObject {
     }
 }
 
-// MARK: qoro
+// MARK: qoop
 
-/// Run qoro once: what it printed when it worked, else what it said went wrong. `what`
+/// Run qoop once: what it printed when it worked, else what it said went wrong. `what`
 /// names the command, for the rare refusal that printed nothing to say: every command
 /// about a row starts with `--session`, so the first argument is no use as a name.
-func runQoroFull(_ args: [String], _ what: String) -> Result<Data, QoroFailed> {
+func runQoopFull(_ args: [String], _ what: String) -> Result<Data, QoopFailed> {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: qoro)
+    p.executableURL = URL(fileURLWithPath: qoop)
     p.arguments = args
     let out = Pipe(), err = Pipe()
     p.standardOutput = out
     p.standardError = err
-    do { try p.run() } catch { return .failure(QoroFailed(why: Refusal.noQoro)) }
+    do { try p.run() } catch { return .failure(QoopFailed(why: Refusal.noQoop)) }
     // Stderr on its own thread, so neither pipe can fill while the other is read.
     var said = Data()
     let drained = DispatchSemaphore(value: 0)
@@ -228,39 +228,39 @@ func runQoroFull(_ args: [String], _ what: String) -> Result<Data, QoroFailed> {
     drained.wait()
     p.waitUntilExit()
     guard p.terminationStatus != 0 else { return .success(printed) }
-    let text = qoroSaid(said)
-    return .failure(QoroFailed(why: text.isEmpty ? "\(what) failed" : text))
+    let text = qoopSaid(said)
+    return .failure(QoopFailed(why: text.isEmpty ? "\(what) failed" : text))
 }
 
-/// What qoro said, said for a person: its own sentence with the `qoro: ` that starts
+/// What qoop said, said for a person: its own sentence with the `qoop: ` that starts
 /// every line of it taken off, and nothing of its own when it said nothing.
-func qoroSaid(_ raw: Data) -> String {
+func qoopSaid(_ raw: Data) -> String {
     String(decoding: raw, as: UTF8.self)
-        .replacingOccurrences(of: "qoro: ", with: "")
+        .replacingOccurrences(of: "qoop: ", with: "")
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-struct QoroFailed: Error {
+struct QoopFailed: Error {
     let why: String
 }
 
-/// The sentences the notch writes itself, for what qoro left unsaid. `noQoro` is a qoro
-/// that would not start at all. The other two are a read qoro answered and this build
-/// could not: the qoro behind the notch is newer than the notch, which is what a notch
-/// left running across an update is, and `qoro update` brings the notch up with it.
+/// The sentences the notch writes itself, for what qoop left unsaid. `noQoop` is a qoop
+/// that would not start at all. The other two are a read qoop answered and this build
+/// could not: the qoop behind the notch is newer than the notch, which is what a notch
+/// left running across an update is, and `qoop update` brings the notch up with it.
 enum Refusal {
-    static let noQoro = "cannot run qoro"
-    static let screen = "not a screen this notch can read: qoro update brings the notch up with it"
-    static let page = "not a page this notch can read: qoro update brings the notch up with it"
+    static let noQoop = "cannot run qoop"
+    static let screen = "not a screen this notch can read: qoop update brings the notch up with it"
+    static let page = "not a page this notch can read: qoop update brings the notch up with it"
 }
 
-/// Run qoro once for its effect: nil when it worked, else what it said went wrong.
-func runQoroChecked(_ args: [String], _ what: String) -> String? {
-    if case .failure(let f) = runQoroFull(args, what) { return f.why }
+/// Run qoop once for its effect: nil when it worked, else what it said went wrong.
+func runQoopChecked(_ args: [String], _ what: String) -> String? {
+    if case .failure(let f) = runQoopFull(args, what) { return f.why }
     return nil
 }
 
-/// Each line a running qoro prints, handed over as it arrives, until it exits.
+/// Each line a running qoop prints, handed over as it arrives, until it exits.
 func readLines(_ handle: FileHandle, _ line: (Data) -> Void) {
     var buffer = Data()
     while case let chunk = autoreleasepool(invoking: { handle.availableData }), !chunk.isEmpty {
@@ -272,10 +272,10 @@ func readLines(_ handle: FileHandle, _ line: (Data) -> Void) {
     }
 }
 
-/// Run qoro once and hand back what it printed, or nil when it failed.
-func runQoro(_ args: [String]) -> Data? {
+/// Run qoop once and hand back what it printed, or nil when it failed.
+func runQoop(_ args: [String]) -> Data? {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: qoro)
+    p.executableURL = URL(fileURLWithPath: qoop)
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
@@ -295,7 +295,7 @@ func hex(_ s: String) -> Color? {
 /// inbox opens, so a pet picked meanwhile shows without a restart.
 func loadPet(into store: Store) {
     DispatchQueue.global().async {
-        guard let data = runQoro(["avatar", "show", "--json"]),
+        guard let data = runQoop(["avatar", "show", "--json"]),
               let pet = try? JSONDecoder().decode(Pet.self, from: data) else { return }
         var grid = pet.pixels.map { $0.map { $0.flatMap(hex) } }
         grid.removeAll { $0.allSatisfy { $0 == nil } }
@@ -305,7 +305,7 @@ func loadPet(into store: Store) {
     }
 }
 
-/// Follow `qoro agents --watch --all --json`: one JSON array per line of every running
+/// Follow `qoop agents --watch --all --json`: one JSON array per line of every running
 /// session's rows, a line each time anything a row shows changes. It hears sessions start
 /// and end itself; should it ever exit, it is started again a few seconds later.
 func watch(into store: Store) {
@@ -320,10 +320,10 @@ func watch(into store: Store) {
     }
 }
 
-/// One run of the watch, until qoro closes it.
+/// One run of the watch, until qoop closes it.
 func watchOnce(into store: Store) {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: qoro)
+    p.executableURL = URL(fileURLWithPath: qoop)
     p.arguments = ["agents", "--watch", "--all", "--json"]
     let out = Pipe()
     p.standardOutput = out
@@ -345,7 +345,7 @@ struct PeekRow: Identifiable {
 }
 
 /// One terminal, seen from the notch: the same grid the interface draws, from the same
-/// daemon, through `qoro read --watch`. Watching sends no size, so the agent's screen is
+/// daemon, through `qoop read --watch`. Watching sends no size, so the agent's screen is
 /// untouched. Above the screen, what came before it: the terminal's own history, or for
 /// a program on the alternate screen (Claude Code, a full screen agent) its conversation,
 /// which is the only record of what scrolled away.
@@ -355,7 +355,7 @@ final class Mirror: ObservableObject {
     @Published var screen: [PeekRow] = []
     @Published var older: [PeekRow] = []
     @Published var more = true
-    /// What qoro would not read, said in place of the rows it would not read: a terminal
+    /// What qoop would not read, said in place of the rows it would not read: a terminal
     /// that cannot be read and a terminal with nothing in it look the same otherwise, and
     /// only one of them is a bug. The screen and the past are read by different commands
     /// and each clears only its own, so a live screen cannot wipe a refused page.
@@ -384,17 +384,17 @@ final class Mirror: ObservableObject {
 
     func start() {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: qoro)
-        p.arguments = tab.qoro("read", String(tab.terminal), "--watch", "--json")
+        p.executableURL = URL(fileURLWithPath: qoop)
+        p.arguments = tab.qoop("read", String(tab.terminal), "--watch", "--json")
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
         guard (try? p.run()) != nil else {
-            screenRefusal = Refusal.noQoro
+            screenRefusal = Refusal.noQoop
             return
         }
         process = p
-        // Stderr on its own thread, as in runQoroFull, so a qoro that refuses with a long
+        // Stderr on its own thread, as in runQoopFull, so a qoop that refuses with a long
         // sentence and a screen that never comes cannot fill one pipe while the other is
         // read. A thread of its own rather than a task on the shared queue: this one lives
         // as long as the row is open, and that queue is where the pet, a click to focus and
@@ -421,8 +421,8 @@ final class Mirror: ObservableObject {
             }
             drained.wait()
             p.waitUntilExit()
-            let why = qoroSaid(said)
-            // A qoro that failed is worth a sentence whether or not screens came first: a
+            let why = qoopSaid(said)
+            // A qoop that failed is worth a sentence whether or not screens came first: a
             // watch that dies on a dropped link leaves the last screen on the box for as long
             // as the row is listed. A child that ended without failing has nothing to explain,
             // its terminal is what ended, and the row goes with it. The hop is from this one
@@ -515,7 +515,7 @@ final class Mirror: ObservableObject {
                 // The conversation is read newest first and cut; asking for more is asking
                 // for a longer tail, bounded so one agent cannot fill the notch's memory.
                 let want = min(have + 20, 200)
-                switch runQoroFull(t.qoro("history", String(t.terminal), "--last", String(want), "--json"), "qoro history") {
+                switch runQoopFull(t.qoop("history", String(t.terminal), "--last", String(want), "--json"), "qoop history") {
                 case .success(let data):
                     if let tr = try? JSONDecoder().decode(Transcript.self, from: data) {
                         let lines = conversation(tr.messages)
@@ -523,7 +523,7 @@ final class Mirror: ObservableObject {
                         count = tr.messages.count
                         more = tr.messages.count >= want && want < 200
                     } else {
-                        // An old notch against a newer qoro: the answer is there and unreadable.
+                        // An old notch against a newer qoop: the answer is there and unreadable.
                         refusal = Refusal.page
                         more = true
                     }
@@ -648,14 +648,14 @@ final class Mirror: ObservableObject {
     }
 }
 
-/// History rows from `qoro read --back`, or what it said would not come.
-func readBack(_ tab: Tab, up: Int, rows: Int) -> Result<Back, QoroFailed> {
-    let args = tab.qoro("read", String(tab.terminal), "--back", String(up), "--lines", String(rows), "--json")
-    switch runQoroFull(args, "qoro read") {
+/// History rows from `qoop read --back`, or what it said would not come.
+func readBack(_ tab: Tab, up: Int, rows: Int) -> Result<Back, QoopFailed> {
+    let args = tab.qoop("read", String(tab.terminal), "--back", String(up), "--lines", String(rows), "--json")
+    switch runQoopFull(args, "qoop read") {
     case .failure(let f): return .failure(f)
     case .success(let data):
         guard let back = try? JSONDecoder().decode(Back.self, from: data) else {
-            return .failure(QoroFailed(why: Refusal.page))
+            return .failure(QoopFailed(why: Refusal.page))
         }
         return .success(back)
     }
@@ -686,20 +686,20 @@ func conversation(_ messages: [Transcript.Message]) -> [[Run]] {
 func jump(to tab: Tab, store: Store) {
     DispatchQueue.global().async {
         let pids: [Int]
-        switch runQoroFull(tab.qoro("focus", String(tab.terminal), "--json"), "qoro focus") {
+        switch runQoopFull(tab.qoop("focus", String(tab.terminal), "--json"), "qoop focus") {
         case .success(let data):
             let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             pids = reply?["clients"] as? [Int] ?? []
         case .failure(let f):
             // Said rather than doing nothing: most often a session started before this
-            // qoro, whose daemon does not know the request yet.
+            // qoop, whose daemon does not know the request yet.
             DispatchQueue.main.async {
-                store.say(f.why.contains("older") ? "restart qoro to jump there: qoro stop, then qoro" : f.why)
+                store.say(f.why.contains("older") ? "restart qoop to jump there: qoop stop, then qoop" : f.why)
             }
             return
         }
         if pids.isEmpty {
-            DispatchQueue.main.async { store.say("no qoro window is open to show it in") }
+            DispatchQueue.main.async { store.say("no qoop window is open to show it in") }
             return
         }
         DispatchQueue.main.async {
@@ -874,7 +874,7 @@ struct QMark: View {
             ctx.fill(Path(ellipseIn: CGRect(x: tx - r, y: ty - r, width: r * 2, height: r * 2)), with: .color(tailInk))
         }
         .frame(width: size, height: size)
-        .accessibilityLabel("qoro")
+        .accessibilityLabel("qoop")
     }
 }
 
@@ -1065,7 +1065,7 @@ struct RowView: View {
     }
 }
 
-/// What qoro would not read, in the interface's blocked ink. Prose, not terminal runs,
+/// What qoop would not read, in the interface's blocked ink. Prose, not terminal runs,
 /// so it wraps at the width of the box's own text rather than scrolling off to the right
 /// with the rest of the screen.
 struct RefusalLine: View {
@@ -1199,12 +1199,12 @@ final class Keys {
         sending = true
         let args: [String]
         switch queue.removeFirst() {
-        case .text(let text): args = tab.qoro("send", String(tab.terminal), "--", text)
-        case .key(let name): args = tab.qoro("send", String(tab.terminal), "--key", name)
+        case .text(let text): args = tab.qoop("send", String(tab.terminal), "--", text)
+        case .key(let name): args = tab.qoop("send", String(tab.terminal), "--key", name)
         }
         let store = self.store
         DispatchQueue.global().async { [weak self] in
-            let why = runQoroChecked(args, "qoro send")
+            let why = runQoopChecked(args, "qoop send")
             DispatchQueue.main.async {
                 if let why { store.say(why) }
                 self?.sending = false
@@ -1214,7 +1214,7 @@ final class Keys {
     }
 }
 
-/// A key press as the terminal should get it: a named key `qoro send --key` knows, or
+/// A key press as the terminal should get it: a named key `qoop send --key` knows, or
 /// the text it types. Nothing is read into it: arrows move through an agent's menu, Enter
 /// picks, Esc cancels, the way they would in the terminal itself.
 func keyOp(_ press: KeyPress) -> Keys.Op? {
@@ -1278,7 +1278,7 @@ struct TermPeek: View {
                             .foregroundStyle(.white.opacity(0.3))
                             .onAppear { m.loadOlder() }
                     }
-                    // What qoro would not read stands where the past is, and a read that
+                    // What qoop would not read stands where the past is, and a read that
                     // answers takes its place: a sentence and the rows it is about are never
                     // both on the box. A watch that died leaves the last screen standing for
                     // a terminal nobody is reading any more, so it gives the screen up.
@@ -1329,7 +1329,7 @@ struct TermPeek: View {
                 }
                 Spacer(minLength: 8)
                 Button { open(row.tab) } label: {
-                    Label("open in qoro", systemImage: "arrow.up.right")
+                    Label("open in qoop", systemImage: "arrow.up.right")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.plain)
@@ -1425,7 +1425,7 @@ struct Island: View {
 
 // MARK: settings
 
-/// `qoro config --json`: every setting in effect, keyed as `qoro config set` takes them.
+/// `qoop config --json`: every setting in effect, keyed as `qoop config set` takes them.
 struct ConfigRead: Decodable {
     struct Values: Decodable {
         var prefix: String
@@ -1450,7 +1450,7 @@ struct ConfigRead: Decodable {
     let problems: [String]
 }
 
-/// `qoro avatar options --json`: every part a pet may have.
+/// `qoop avatar options --json`: every part a pet may have.
 struct PetOptions: Decodable {
     struct Named: Decodable {
         let id: String
@@ -1465,7 +1465,7 @@ struct PetOptions: Decodable {
     let eyes: [Named]
 }
 
-/// The parts of the pet now, from `qoro avatar show --json`.
+/// The parts of the pet now, from `qoop avatar show --json`.
 struct PetParts: Decodable {
     var hair: String
     var hair_ink: Int
@@ -1473,10 +1473,10 @@ struct PetParts: Decodable {
 }
 
 func readConfig() -> ConfigRead? {
-    runQoro(["config", "--json"]).flatMap { try? JSONDecoder().decode(ConfigRead.self, from: $0) }
+    runQoop(["config", "--json"]).flatMap { try? JSONDecoder().decode(ConfigRead.self, from: $0) }
 }
 
-/// What the settings window shows, read from qoro and written back through it one
+/// What the settings window shows, read from qoop and written back through it one
 /// setting at a time, in the order they were changed.
 @MainActor
 final class Settings: ObservableObject {
@@ -1488,7 +1488,7 @@ final class Settings: ObservableObject {
     /// Told when the notch is turned on or off here, so it shows or hides at once.
     var notch: ((Bool) -> Void)?
     /// One write at a time: two quick changes must not read the file before the other wrote.
-    private let writes = DispatchQueue(label: "qoro.settings")
+    private let writes = DispatchQueue(label: "qoop.settings")
 
     init(store: Store) { self.store = store }
 
@@ -1496,8 +1496,8 @@ final class Settings: ObservableObject {
     func load() {
         writes.async { [weak self] in
             let config = readConfig()
-            let options = runQoro(["avatar", "options", "--json"]).flatMap { try? JSONDecoder().decode(PetOptions.self, from: $0) }
-            let parts = runQoro(["avatar", "show", "--json"]).flatMap { try? JSONDecoder().decode(PetParts.self, from: $0) }
+            let options = runQoop(["avatar", "options", "--json"]).flatMap { try? JSONDecoder().decode(PetOptions.self, from: $0) }
+            let parts = runQoop(["avatar", "show", "--json"]).flatMap { try? JSONDecoder().decode(PetParts.self, from: $0) }
             DispatchQueue.main.async {
                 self?.config = config
                 self?.options = options
@@ -1524,7 +1524,7 @@ final class Settings: ObservableObject {
 
     private func write(_ args: [String], then: ((Bool) -> Void)? = nil) {
         writes.async { [weak self] in
-            let why = runQoroChecked(args, "qoro config set")
+            let why = runQoopChecked(args, "qoop config set")
             DispatchQueue.main.async {
                 self?.error = why
                 then?(why == nil)
@@ -1578,7 +1578,7 @@ struct SettingsView: View {
         } header: {
             Text("Keyboard")
         } footer: {
-            Text("The key that starts every qoro command.")
+            Text("The key that starts every qoop command.")
         }
         if let o = m.options {
             Section("Pet") {
@@ -1647,7 +1647,7 @@ struct SettingsView: View {
             })
     }
 
-    /// A part of the pet; with none picked yet, the picker starts where `qoro avatar set` does.
+    /// A part of the pet; with none picked yet, the picker starts where `qoop avatar set` does.
     private func part(_ path: WritableKeyPath<PetParts, String>, _ flag: String, _ none: String) -> Binding<String> {
         Binding(
             get: { m.parts?[keyPath: path] ?? none },
@@ -1801,7 +1801,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Turned off in its settings: nothing to draw, and an exit that launchd leaves down
-        // until `qoro notch install` or the setting turns it back on.
+        // until `qoop notch install` or the setting turns it back on.
         if readConfig()?.settings.notch == false { exit(0) }
         settings.notch = { [weak self] on in self?.show(on) }
         panel = NotchPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -1924,7 +1924,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.open = false
         if settingsWindow == nil {
             let window = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(m: settings, store: store)))
-            window.title = "qoro Settings"
+            window.title = "qoop Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.delegate = self
@@ -1963,7 +1963,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 // One notch per person: a second copy, started by hand beside the one launchd keeps,
 // leaves at once rather than drawing over it.
-let lockPath = NSTemporaryDirectory() + "qoro-notch.lock"
+let lockPath = NSTemporaryDirectory() + "qoop-notch.lock"
 let lock = open(lockPath, O_CREAT | O_RDWR, 0o600)
 if lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0 {
     exit(0)

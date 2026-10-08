@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// What armed the old idle reaper. No longer read; a daemon that finds it set says where
 /// the setting moved.
-pub const IDLE_TIMEOUT_ENV: &str = "QORO_IDLE_TIMEOUT_MINUTES";
+pub const IDLE_TIMEOUT_ENV: &str = "QOOP_IDLE_TIMEOUT_MINUTES";
 
 /// How often idle sleep looks while on: a quarter of the timeout,
 /// floored at a minute and capped at five, so a 30 minute timeout wakes
@@ -164,7 +164,7 @@ pub fn group_holds_task(master: std::os::fd::RawFd) -> bool {
 /// the foreground that is still on the terminal is the program's own, MCP servers in groups
 /// of their own included (measured under codex): teardown ends them and the program starts
 /// them again when it resumes. A process that says it may be lost (`sleep_safe`: the
-/// `QORO_SLEEP_SAFE=1` mark on its command line, which a watcher that ends with its agent
+/// `QOOP_SLEEP_SAFE=1` mark on its command line, which a watcher that ends with its agent
 /// carries) blocks nothing, nor does anything under it. Pure, so the measured trees are its
 /// tests.
 pub fn sleep_blockers(
@@ -212,8 +212,8 @@ pub fn sleep_blockers(
 /// agent's row ends in its counter (`4s · ↓ 35.8k tokens`); a finished teammate that stays
 /// listed says `idle` instead and holds nothing. The shell and monitor counts in the footer
 /// are left out on purpose: they are processes, judged by `sleep_blockers`, which lets a
-/// `QORO_SLEEP_SAFE` watcher go. The footer, the lead row and the glyph are all required,
-/// so a panel quoted in an answer (a `qoro read` of another tab) is not mistaken for one.
+/// `QOOP_SLEEP_SAFE` watcher go. The footer, the lead row and the glyph are all required,
+/// so a panel quoted in an answer (a `qoop read` of another tab) is not mistaken for one.
 /// Measured on Claude Code 2.1.284. Pure, so the measured screens are its tests.
 pub fn running_background_agents(screen: &[String]) -> usize {
     let Some(footer) = screen
@@ -273,11 +273,11 @@ pub fn running_background_tasks(screen: &[String]) -> usize {
 
 /// Whether input from this sender counts as live traffic.
 ///
-/// Restore replay arrives as `Input` from `qoro-restore`: transcript bytes
+/// Restore replay arrives as `Input` from `qoop-restore`: transcript bytes
 /// re-typed after a restart, not a person doing something. Stamping it
 /// would hand every restored tab a fresh full timeout on every restart.
 pub fn is_live_input(from: &str) -> bool {
-    from != "qoro-restore"
+    from != "qoop-restore"
 }
 
 /// Apply waiter→target edges to a snapshot eligibility map.
@@ -292,7 +292,7 @@ pub fn is_live_input(from: &str) -> bool {
 /// nothing, because nothing is being waited on any more.
 ///
 /// The waiter's own activity since asking does not end the wait: an agent
-/// always renders after its `qoro send/prompt` returns, so that clock moves
+/// always renders after its `qoop send/prompt` returns, so that clock moves
 /// past the ask in every real delegation. The edge ends when the target is
 /// reaped or closed, when the waiter asks someone else (the edge moves), or
 /// at the edge TTL.
@@ -572,8 +572,8 @@ mod tests {
 
     #[test]
     fn only_restore_replay_is_not_live_input() {
-        assert!(!is_live_input("qoro-restore"));
-        for live in ["c1", "", "qoro-restore2", "QORO-RESTORE"] {
+        assert!(!is_live_input("qoop-restore"));
+        for live in ["c1", "", "qoop-restore2", "QOOP-RESTORE"] {
             assert!(is_live_input(live), "{live:?} is live");
         }
     }
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn a_whole_panel_quoted_in_an_answer_is_not_a_running_agent() {
-        // A `qoro read` of another tab, pasted into an answer: the footer is quoted too,
+        // A `qoop read` of another tab, pasted into an answer: the footer is quoted too,
         // but no lead row follows it, and the real footer below has no panel.
         let s = screen(&[
             "⏺ the other tab shows:",

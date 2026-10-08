@@ -1,4 +1,4 @@
-# QoroSymbols.ttf
+# QoopSymbols.ttf
 
 A subset of Symbols Nerd Font Mono from Nerd Fonts v3.5.1, built by
 `scripts/build-icon-font.py`, holding six glyphs at their Nerd Fonts codepoints:

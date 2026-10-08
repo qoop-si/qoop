@@ -1,4 +1,4 @@
-//! One remote daemon, reached through the system `ssh` running `qoro relay` over there.
+//! One remote daemon, reached through the system `ssh` running `qoop relay` over there.
 //!
 //! The relay speaks the same protocol as a local socket, so what this returns is a byte
 //! stream that has already done its handshake. Everything above it treats the remote as a
@@ -31,7 +31,7 @@ pub struct Link {
     /// The last line ssh wrote to stderr, which is the best account there is of why a
     /// connection ended. Empty when stderr goes to the terminal instead.
     pub said: Arc<Mutex<String>>,
-    /// The version the daemon over there is running, from its welcome. Not the qoro on its
+    /// The version the daemon over there is running, from its welcome. Not the qoop on its
     /// disk, which a push can have replaced while this daemon keeps running the old file.
     pub server_version: String,
 }
@@ -51,7 +51,7 @@ pub fn control_path() -> Option<String> {
                 .map(|h| std::path::PathBuf::from(h).join(".cache"))
                 .ok()
         })?
-        .join("qoro");
+        .join("qoop");
     let dir = base.to_str()?.to_string();
     // cm-, 40 hex characters, and the 17 byte suffix ssh adds while binding.
     if dir.len() + 1 + 3 + 40 + 17 > 100 {
@@ -148,16 +148,16 @@ pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
     }
 }
 
-/// What a machine said when asked whether qoro is there.
+/// What a machine said when asked whether qoop is there.
 #[derive(Debug)]
 pub enum Probe {
-    /// A qoro this build can talk to, and the version the binary on its disk says it is.
+    /// A qoop this build can talk to, and the version the binary on its disk says it is.
     Ready { version: String },
-    /// No qoro there, on a machine qoro is built for.
+    /// No qoop there, on a machine qoop is built for.
     Missing(Platform),
 }
 
-/// A machine qoro can be installed on, as its own `uname` and `id` describe it. Only the
+/// A machine qoop can be installed on, as its own `uname` and `id` describe it. Only the
 /// fixed names come back: nothing the remote printed is ever shown as it was printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Platform {
@@ -172,7 +172,7 @@ impl Platform {
     }
 }
 
-/// Whether the machine at `target` has a qoro this build can talk to, and which version
+/// Whether the machine at `target` has a qoop this build can talk to, and which version
 /// that binary says it is; or which machine it is when it has none.
 ///
 /// Asked from inside the interface, where nobody can answer a prompt: it never asks, and
@@ -181,21 +181,21 @@ impl Platform {
 pub async fn probe(target: &str) -> io::Result<Probe> {
     let hello = run(target, &remote_command("--hello"), None).await?;
     // Told apart by what happened, not by what was said: the remote command prints the
-    // marker and exits 127 when it finds no qoro, and nothing else does both.
+    // marker and exits 127 when it finds no qoop, and nothing else does both.
     if hello.marked.is_some() && hello.status == Some(127) {
         return Ok(Probe::Missing(platform_of(target).await?));
     }
     // Its codec first: a machine this build cannot talk to is said so now, rather than
     // added and then shown offline for good.
     let hello: qoop_remote::RemoteHello = serde_json::from_str(&hello.answer()?)
-        .map_err(|_| io::Error::other(format!("{target} answered something that is not qoro")))?;
+        .map_err(|_| io::Error::other(format!("{target} answered something that is not qoop")))?;
     qoop_remote::compatibility(&hello).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(Probe::Ready {
         version: hello.version,
     })
 }
 
-/// Which platform the machine at `target` is, refusing one no build of qoro runs on.
+/// Which platform the machine at `target` is, refusing one no build of qoop runs on.
 async fn platform_of(target: &str) -> io::Result<Platform> {
     let script = format!(
         "printf '%s\\n' {RELAY_MARKER}; uname -s; uname -m; id -u; \
@@ -210,12 +210,12 @@ async fn platform_of(target: &str) -> io::Result<Platform> {
     };
     let Some((os, arch)) = qoop_runtime::release::platform(system, machine) else {
         return Err(io::Error::other(
-            "the machine is not one qoro is built for; build it from source there",
+            "the machine is not one qoop is built for; build it from source there",
         ));
     };
     if *libc == "musl" {
         return Err(io::Error::other(
-            "the machine uses musl, which the qoro builds do not run on; build it from source there",
+            "the machine uses musl, which the qoop builds do not run on; build it from source there",
         ));
     }
     Ok(Platform {
@@ -225,21 +225,21 @@ async fn platform_of(target: &str) -> io::Result<Platform> {
     })
 }
 
-/// Put this version of qoro into `~/.local/bin` on the machine at `target`, and say which
+/// Put this version of qoop into `~/.local/bin` on the machine at `target`, and say which
 /// version is there now.
 ///
 /// In two steps over the same connection. The first writes the binary under a temporary
 /// name, checks every byte arrived, and runs it; only an answer this build calls
 /// compatible gets the second step, which links it into place. Anything short of that
-/// leaves no `qoro` behind, because a broken or foreign one there would be found by every
-/// later connection and never replaced: an existing qoro is never overwritten.
+/// leaves no `qoop` behind, because a broken or foreign one there would be found by every
+/// later connection and never replaced: an existing qoop is never overwritten.
 pub async fn install(target: &str) -> io::Result<String> {
     let platform = platform_of(target).await?;
     let binary = binary_for(platform).await?;
     let staged = run(
         target,
         &format!(
-            "sh -c {} qoro {}",
+            "sh -c {} qoop {}",
             shell_quote(&STAGE.replace("MARKER", RELAY_MARKER)),
             shell_quote(&binary.len().to_string())
         ),
@@ -259,7 +259,7 @@ pub async fn install(target: &str) -> io::Result<String> {
     if !fits {
         let _ = run(target, &guarded(ABORT, &path), None).await;
         return Err(io::Error::other(
-            "the copied qoro does not speak this one's codec; nothing was installed",
+            "the copied qoop does not speak this one's codec; nothing was installed",
         ));
     }
     run(target, &guarded(COMMIT, &path), None).await?.answer()?;
@@ -282,10 +282,10 @@ umask 022
 d="$HOME/.local/bin"
 mkdir -p "$d"
 [ -O "$d" ] || { echo "$d belongs to another user" >&2; exit 3; }
-find "$d" -maxdepth 1 -name '.qoro-install.*' -mmin +30 -exec rm -f {} + 2>/dev/null || true
-if [ -L "$d/qoro" ] && [ ! -e "$d/qoro" ]; then echo "$d/qoro is a link to nothing; remove it" >&2; exit 4; fi
-if [ -e "$d/qoro" ]; then echo "there is already a qoro in $d" >&2; exit 4; fi
-t=$(mktemp "$d/.qoro-install.XXXXXX")
+find "$d" -maxdepth 1 -name '.qoop-install.*' -mmin +30 -exec rm -f {} + 2>/dev/null || true
+if [ -L "$d/qoop" ] && [ ! -e "$d/qoop" ]; then echo "$d/qoop is a link to nothing; remove it" >&2; exit 4; fi
+if [ -e "$d/qoop" ]; then echo "there is already a qoop in $d" >&2; exit 4; fi
+t=$(mktemp "$d/.qoop-install.XXXXXX")
 trap 'rm -f "$t"' EXIT
 cat > "$t"
 [ "$(wc -c < "$t" | tr -d ' ')" = "$1" ] || { echo "the copy arrived incomplete" >&2; exit 5; }
@@ -295,9 +295,9 @@ printf '%s\n' MARKER "$t"
 trap - EXIT
 "#;
 
-/// Commit: link the staged file into place, unless a qoro appeared there meanwhile, which
+/// Commit: link the staged file into place, unless a qoop appeared there meanwhile, which
 /// counts as done.
-const COMMIT: &str = r#"ln "$1" "$d/qoro" 2>/dev/null || [ -e "$d/qoro" ]
+const COMMIT: &str = r#"ln "$1" "$d/qoop" 2>/dev/null || [ -e "$d/qoop" ]
 rm -f "$1"
 printf '%s\n' MARKER
 "#;
@@ -311,16 +311,16 @@ fn guarded(step: &str, path: &str) -> String {
     let step = step.replace("MARKER", RELAY_MARKER);
     let script = format!(
         "set -eu\nd=\"$HOME/.local/bin\"\n\
-         case $1 in \"$d\"/.qoro-install.*) ;; *) echo 'not a staged install' >&2; exit 2;; esac\n\
-         case ${{1#\"$d\"/.qoro-install.}} in ''|*/*) echo 'not a staged install' >&2; exit 2;; esac\n{step}"
+         case $1 in \"$d\"/.qoop-install.*) ;; *) echo 'not a staged install' >&2; exit 2;; esac\n\
+         case ${{1#\"$d\"/.qoop-install.}} in ''|*/*) echo 'not a staged install' >&2; exit 2;; esac\n{step}"
     );
-    format!("sh -c {} qoro {}", shell_quote(&script), shell_quote(path))
+    format!("sh -c {} qoop {}", shell_quote(&script), shell_quote(path))
 }
 
-/// What putting this version of qoro on a machine came to.
+/// What putting this version of qoop on a machine came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Update {
-    /// The version the qoro on its disk says it is now, which its daemon is asked to move
+    /// The version the qoop on its disk says it is now, which its daemon is asked to move
     /// to: this one after a swap, or whatever was there when it was already as new. The
     /// second is what went wrong refreshing its hooks and skills there, when anything did.
     OnDisk(String, Option<String>),
@@ -329,26 +329,26 @@ pub enum Update {
     NoRelease,
 }
 
-/// Put the release of `version` in place of the older qoro at `target`, for its daemon
+/// Put the release of `version` in place of the older qoop at `target`, for its daemon
 /// to move onto. The interface asks for the version it is;
-/// `qoro update` for the one it has just installed.
+/// `qoop update` for the one it has just installed.
 ///
 /// Only a tagged release goes, never the running binary: a same-platform Mac would
-/// otherwise be handed whatever was built here last. The qoro replaced is the one
+/// otherwise be handed whatever was built here last. The qoop replaced is the one
 /// `remote_command` runs, swapped atomically beside itself, and only while it still says it
 /// is the version this asked about; one that changed meanwhile (another window or another
-/// Mac swapped first) counts as done. A qoro there as new as this one, or newer, is left
+/// Mac swapped first) counts as done. A qoop there as new as this one, or newer, is left
 /// alone: nothing is ever moved backwards.
 pub async fn update(target: &str, version: &str) -> io::Result<Update> {
     let Probe::Ready { version: disk } = probe(target).await? else {
-        return Err(io::Error::other("no qoro is there any more"));
+        return Err(io::Error::other("no qoop is there any more"));
     };
     if !qoop_runtime::paths::is_newer_version(version, &disk) {
         return Ok(Update::OnDisk(disk, None));
     }
     let platform = platform_of(target).await?;
     let asset = qoop_runtime::release::asset_for(platform.os, platform.arch)
-        .ok_or_else(|| io::Error::other("no qoro is built for that machine"))?;
+        .ok_or_else(|| io::Error::other("no qoop is built for that machine"))?;
     let tag = version.to_string();
     let release =
         tokio::task::spawn_blocking(move || qoop_runtime::release::fetch_tagged(&tag, asset))
@@ -384,7 +384,7 @@ pub async fn update(target: &str, version: &str) -> io::Result<Update> {
     // what is on disk now is asked again, and that is what its daemon moves to.
     if swapped.status == Some(SWAPPED_MEANWHILE) {
         let Probe::Ready { version } = probe(target).await? else {
-            return Err(io::Error::other("no qoro is there any more"));
+            return Err(io::Error::other("no qoop is there any more"));
         };
         return Ok(Update::OnDisk(version, None));
     }
@@ -422,64 +422,64 @@ fn no_release(error: String, anonymous: bool) -> io::Result<Update> {
     Err(io::Error::other(error))
 }
 
-/// The exit status `SWAP` gives when the qoro there is no longer the one asked about.
+/// The exit status `SWAP` gives when the qoop there is no longer the one asked about.
 const SWAPPED_MEANWHILE: i32 = 6;
 
-/// Swap: find the qoro `remote_command` runs, as the real file behind any link; stage stdin
+/// Swap: find the qoop `remote_command` runs, as the real file behind any link; stage stdin
 /// beside it, so the rename is on one filesystem; check the size against `$3` and that the
 /// copy says it is `$2`; then rename it over the original, but only while the original
 /// still says it is `$1`. The check and the rename hold a lock beside the file, a
 /// directory made or not in one step, so two swaps never both pass the check. Exits 3
-/// when the place is not this user's to write, 4 when the file there is not qoro at all,
-/// 5 when the copy is wrong, 6 only when another version of qoro is there now, 7 when
+/// when the place is not this user's to write, 4 when the file there is not qoop at all,
+/// 5 when the copy is wrong, 6 only when another version of qoop is there now, 7 when
 /// another swap holds the lock (said, not quiet: a lock left by a swap that was killed
 /// would otherwise hide every update), and leaves nothing staged and no lock of its own
 /// behind. A lock older than half an hour is from a swap that was killed, and is swept.
-/// Once swapped, the new qoro refreshes its hooks and skills there (it skips an agent that
+/// Once swapped, the new qoop refreshes its hooks and skills there (it skips an agent that
 /// is not on that machine); what fails is said after the marker and never fails the swap.
 /// It also puts the bridge service there back on the new file: launchd refuses to start a
 /// service whose program file was replaced, so a macOS machine's bridge would otherwise die
 /// at its next start. That reload gets `BRIDGE_WAIT` seconds, kept by a watcher since not
 /// every machine has `timeout`, and a reload that fails or runs out is said like the others.
-/// `qoro update` waits out exit 7 by matching its sentence ("update of qoro is in progress"),
+/// `qoop update` waits out exit 7 by matching its sentence ("update of qoop is in progress"),
 /// so the two are reworded together.
 const SWAP: &str = r#"set -eu
 trap 'exit 1' HUP INT TERM PIPE
 umask 022
 r=
-for q in qoro "$HOME/.local/bin/qoro" "$HOME/.cargo/bin/qoro"; do
+for q in qoop "$HOME/.local/bin/qoop" "$HOME/.cargo/bin/qoop"; do
   p=$(command -v "$q") && { r=$(readlink -f "$p") || { echo "cannot resolve $p" >&2; exit 3; }; break; }
 done
-[ -n "$r" ] && [ -f "$r" ] || { echo "no qoro file to replace" >&2; exit 3; }
+[ -n "$r" ] && [ -f "$r" ] || { echo "no qoop file to replace" >&2; exit 3; }
 d=$(dirname "$r")
 [ -O "$d" ] && [ -w "$d" ] || { echo "$d is not this user's to write" >&2; exit 3; }
-l="$d/.qoro-swap.lock"
-find "$d" -maxdepth 1 -name .qoro-swap.lock -mmin +30 -exec rmdir {} + 2>/dev/null || true
+l="$d/.qoop-swap.lock"
+find "$d" -maxdepth 1 -name .qoop-swap.lock -mmin +30 -exec rmdir {} + 2>/dev/null || true
 t=
 h=
 trap '[ -z "$t" ] || rm -f "$t"; [ -z "$h" ] || rmdir "$l"' EXIT
-mkdir "$l" 2>/dev/null || { echo "another update of qoro is in progress there; try again later" >&2; exit 7; }
+mkdir "$l" 2>/dev/null || { echo "another update of qoop is in progress there; try again later" >&2; exit 7; }
 h=1
 v=$("$r" --version 2>/dev/null) || v=
-case $v in "qoro $1") ;; "qoro "*) echo "qoro changed meanwhile" >&2; exit 6;; *) echo "$r is not qoro" >&2; exit 4;; esac
-t=$(mktemp "$d/.qoro-install.XXXXXX")
+case $v in "qoop $1") ;; "qoop "*) echo "qoop changed meanwhile" >&2; exit 6;; *) echo "$r is not qoop" >&2; exit 4;; esac
+t=$(mktemp "$d/.qoop-install.XXXXXX")
 cat > "$t"
 [ "$(wc -c < "$t" | tr -d ' ')" = "$3" ] || { echo "the copy arrived incomplete" >&2; exit 5; }
 chmod 755 "$t"
-[ "$("$t" --version 2>/dev/null)" = "qoro $2" ] || { echo "the copy is not qoro $2" >&2; exit 5; }
+[ "$("$t" --version 2>/dev/null)" = "qoop $2" ] || { echo "the copy is not qoop $2" >&2; exit 5; }
 mv -f "$t" "$r"
 t=
 h=
 rmdir "$l" || true
 printf '%s\n' MARKER
 for w in hooks skills; do
-  "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoro $w install on it"
+  "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoop $w install on it"
 done
 "$r" bridge reload </dev/null >/dev/null 2>&1 &
 b=$!
 ( sleep BRIDGE_WAIT; kill "$b" ) >/dev/null 2>&1 &
 k=$!
-wait "$b" || echo "the bridge there was not reloaded: run qoro bridge reload on it"
+wait "$b" || echo "the bridge there was not reloaded: run qoop bridge reload on it"
 kill "$k" 2>/dev/null || true
 "#;
 
@@ -490,7 +490,7 @@ const BRIDGE_WAIT: u32 = if cfg!(test) { 1 } else { 15 };
 /// The ssh command for `SWAP`, from the version on disk to `new`, `size` bytes on stdin.
 fn swap_command(disk: &str, new: &str, size: usize) -> String {
     format!(
-        "sh -c {} qoro {} {} {}",
+        "sh -c {} qoop {} {} {}",
         shell_quote(
             &SWAP
                 .replace("MARKER", RELAY_MARKER)
@@ -511,7 +511,7 @@ async fn binary_for(p: Platform) -> io::Result<Vec<u8>> {
         return running_binary();
     }
     let asset = qoop_runtime::release::asset_for(p.os, p.arch)
-        .ok_or_else(|| io::Error::other("no qoro is built for that machine"))?;
+        .ok_or_else(|| io::Error::other("no qoop is built for that machine"))?;
     let version = env!("CARGO_PKG_VERSION");
     let release =
         tokio::task::spawn_blocking(move || qoop_runtime::release::fetch_tagged(version, asset))
@@ -580,7 +580,7 @@ impl Answer {
                 None => "ssh failed".to_string(),
             })),
             (Some(_), Some(0)) => Ok(self.marked.clone().unwrap_or_default()),
-            (Some(_), _) => Err(said("qoro there did not answer")),
+            (Some(_), _) => Err(said("qoop there did not answer")),
         }
     }
 }
@@ -701,7 +701,7 @@ where
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "the remote closed the connection before qoro started",
+                "the remote closed the connection before qoop started",
             ));
         }
         seen += n;
@@ -711,7 +711,7 @@ where
         if seen > MARKER_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the remote shell printed too much before qoro started",
+                "the remote shell printed too much before qoop started",
             ));
         }
     }
@@ -741,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn a_banner_is_skipped_and_the_protocol_after_it_is_kept() {
         let (result, rest) =
-            skip(b"Welcome to devbox\nlast login: never\n-----qoro-relay-----\n\x00\x01binary")
+            skip(b"Welcome to devbox\nlast login: never\n-----qoop-relay-----\n\x00\x01binary")
                 .await;
         result.expect("marker found");
         assert_eq!(rest, b"\x00\x01binary");
@@ -749,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_marker_inside_a_longer_line_is_not_the_marker() {
-        let (result, _) = skip(b"echo -----qoro-relay----- later\n").await;
+        let (result, _) = skip(b"echo -----qoop-relay----- later\n").await;
         assert_eq!(
             result.expect_err("eof").kind(),
             io::ErrorKind::UnexpectedEof
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shell_that_never_starts_qoro_is_cut_off() {
+    async fn a_shell_that_never_starts_qoop_is_cut_off() {
         let flood: &'static [u8] = Box::leak(vec![b'x'; MARKER_LIMIT * 2].into_boxed_slice());
         let (result, _) = skip(flood).await;
         assert_eq!(
@@ -790,7 +790,7 @@ mod tests {
 
     fn stage(home: &std::path::Path, binary: &[u8], claimed: usize) -> std::process::Output {
         let command = format!(
-            "sh -c {} qoro {}",
+            "sh -c {} qoop {}",
             shell_quote(&STAGE.replace("MARKER", RELAY_MARKER)),
             shell_quote(&claimed.to_string())
         );
@@ -824,10 +824,10 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout);
         let after = text.split_once(RELAY_MARKER).expect("marker").1.trim();
         let (path, hello) = after.split_once('\n').expect("path then hello");
-        assert!(path.contains("/.local/bin/.qoro-install."), "{path}");
+        assert!(path.contains("/.local/bin/.qoop-install."), "{path}");
         assert!(hello.contains("\"version\":\"9.9.9\""), "{hello}");
         assert!(
-            !home.path().join(".local/bin/qoro").exists(),
+            !home.path().join(".local/bin/qoop").exists(),
             "linked before commit"
         );
 
@@ -838,10 +838,10 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            std::fs::read(home.path().join(".local/bin/qoro")).expect("qoro"),
+            std::fs::read(home.path().join(".local/bin/qoop")).expect("qoop"),
             FAKE
         );
-        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+        assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
     }
 
     /// A copy that arrived short is never run and never left behind.
@@ -872,19 +872,19 @@ mod tests {
         );
     }
 
-    /// An existing qoro is never replaced, and a link to nothing is named for what it is.
+    /// An existing qoop is never replaced, and a link to nothing is named for what it is.
     #[test]
-    fn an_existing_qoro_is_never_touched() {
+    fn an_existing_qoop_is_never_touched() {
         let home = tempfile::tempdir().expect("home");
         let bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        std::fs::write(bin.join("qoro"), b"theirs").expect("theirs");
+        std::fs::write(bin.join("qoop"), b"theirs").expect("theirs");
         let out = stage(home.path(), FAKE, FAKE.len());
         assert!(!out.status.success());
-        assert_eq!(std::fs::read(bin.join("qoro")).expect("qoro"), b"theirs");
+        assert_eq!(std::fs::read(bin.join("qoop")).expect("qoop"), b"theirs");
 
-        std::fs::remove_file(bin.join("qoro")).expect("rm");
-        std::os::unix::fs::symlink("/nonexistent/qoro", bin.join("qoro")).expect("link");
+        std::fs::remove_file(bin.join("qoop")).expect("rm");
+        std::os::unix::fs::symlink("/nonexistent/qoop", bin.join("qoop")).expect("link");
         let out = stage(home.path(), FAKE, FAKE.len());
         assert!(String::from_utf8_lossy(&out.stderr).contains("link to nothing"));
     }
@@ -914,13 +914,13 @@ mod tests {
         assert_eq!(said(None, ""), "ssh failed");
     }
 
-    /// A qoro that says it is `version`, as a script.
+    /// A qoop that says it is `version`, as a script.
     fn says(version: &str) -> Vec<u8> {
-        format!("#!/bin/sh\necho 'qoro {version}'\n").into_bytes()
+        format!("#!/bin/sh\necho 'qoop {version}'\n").into_bytes()
     }
 
     /// Run `SWAP` from `disk` to `new` with `binary` on stdin, in a home of its own and on a
-    /// PATH with no qoro on it: the one found is the home's, never one of this machine's.
+    /// PATH with no qoop on it: the one found is the home's, never one of this machine's.
     fn swap(home: &std::path::Path, disk: &str, new: &str, binary: &[u8]) -> std::process::Output {
         use std::io::Write;
         let mut child = std::process::Command::new("/bin/sh")
@@ -941,18 +941,18 @@ mod tests {
     fn installed(home: &std::path::Path, what: &[u8]) -> std::path::PathBuf {
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        let qoro = bin.join("qoro");
-        std::fs::write(&qoro, what).expect("qoro");
-        std::fs::set_permissions(&qoro, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        let qoop = bin.join("qoop");
+        std::fs::write(&qoop, what).expect("qoop");
+        std::fs::set_permissions(&qoop, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
-        qoro
+        qoop
     }
 
-    /// An older qoro is replaced by the new one, in place, with nothing else left there.
+    /// An older qoop is replaced by the new one, in place, with nothing else left there.
     #[test]
-    fn swap_replaces_an_older_qoro() {
+    fn swap_replaces_an_older_qoop() {
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
         assert!(
             out.status.success(),
@@ -960,16 +960,16 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
-        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
     }
 
-    /// A qoro that says it is `version`, notes each `hooks`, `skills` or `bridge` call in
+    /// A qoop that says it is `version`, notes each `hooks`, `skills` or `bridge` call in
     /// `$HOME/ran`, fails `skills` when `$HOME/skills-fail` exists, and `bridge` when
     /// `$HOME/bridge-fail` does or hangs it when `$HOME/bridge-hang` does.
     fn noting(version: &str) -> Vec<u8> {
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoro {version}';;\n\
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop {version}';;\n\
              hooks|skills|bridge) echo \"$*\" >> \"$HOME/ran\"; \
              [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; \
              [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-hang\" ] && exec sleep 30; \
@@ -978,12 +978,12 @@ mod tests {
         .into_bytes()
     }
 
-    /// The qoro just put there refreshes its hooks and skills and reloads its bridge, and a
+    /// The qoop just put there refreshes its hooks and skills and reloads its bridge, and a
     /// failure of any is said after the marker without failing the swap.
     #[test]
     fn swap_refreshes_hooks_and_skills_and_says_what_failed() {
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
         assert!(out.status.success());
         let said = String::from_utf8_lossy(&out.stdout);
@@ -992,7 +992,7 @@ mod tests {
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
             "hooks install\nskills install\nbridge reload\n"
         );
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), noting("0.0.2"));
 
         installed(home.path(), &says("0.0.1"));
         std::fs::write(home.path().join("skills-fail"), "").expect("flag");
@@ -1004,7 +1004,7 @@ mod tests {
         assert!(after.contains("skills there were not refreshed"), "{after}");
         assert!(after.contains("bridge there was not reloaded"), "{after}");
         assert!(!after.contains("hooks"), "{after}");
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), noting("0.0.2"));
     }
 
     /// The swap lock is let go as soon as the file is replaced, not after the hooks, the skills
@@ -1013,22 +1013,22 @@ mod tests {
     #[test]
     fn swap_lets_go_of_its_lock_before_it_refreshes_anything() {
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         // Notes, each time it is asked for hooks, skills or the bridge, whether the lock
         // directory beside the file is still there.
-        let probing = "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoro 0.0.2';;\n\
-             hooks|skills|bridge) [ -d \"$HOME/.local/bin/.qoro-swap.lock\" ] \
+        let probing = "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop 0.0.2';;\n\
+             hooks|skills|bridge) [ -d \"$HOME/.local/bin/.qoop-swap.lock\" ] \
              && echo \"held during $1\" >> \"$HOME/held\"; exit 0;;\nesac\n";
         let out = swap(home.path(), "0.0.1", "0.0.2", probing.as_bytes());
         assert!(out.status.success());
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), probing.as_bytes());
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), probing.as_bytes());
         assert!(
             !home.path().join("held").exists(),
-            "the lock was held while the new qoro refreshed things: {:?}",
+            "the lock was held while the new qoop refreshed things: {:?}",
             std::fs::read_to_string(home.path().join("held"))
         );
         assert!(
-            !home.path().join(".local/bin/.qoro-swap.lock").exists(),
+            !home.path().join(".local/bin/.qoop-swap.lock").exists(),
             "the lock was left behind"
         );
     }
@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn swap_cuts_off_a_bridge_reload_that_hangs() {
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         std::fs::write(home.path().join("bridge-hang"), "").expect("flag");
         let started = std::time::Instant::now();
         let out = swap(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"));
@@ -1048,22 +1048,22 @@ mod tests {
         );
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(said.contains("bridge there was not reloaded"), "{said}");
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), noting("0.0.2"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), noting("0.0.2"));
     }
 
-    /// A qoro that is a link has the file behind it replaced, and stays a link.
+    /// A qoop that is a link has the file behind it replaced, and stays a link.
     #[test]
     fn swap_follows_a_link_and_keeps_it_a_link() {
         let home = tempfile::tempdir().expect("home");
         let real = home.path().join("opt");
         std::fs::create_dir_all(&real).expect("opt");
-        let target = real.join("qoro");
-        std::fs::write(&target, says("0.0.1")).expect("qoro");
+        let target = real.join("qoop");
+        std::fs::write(&target, says("0.0.1")).expect("qoop");
         std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        std::os::unix::fs::symlink(&target, bin.join("qoro")).expect("link");
+        std::os::unix::fs::symlink(&target, bin.join("qoop")).expect("link");
         let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
         assert!(
             out.status.success(),
@@ -1071,18 +1071,18 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            std::fs::symlink_metadata(bin.join("qoro"))
+            std::fs::symlink_metadata(bin.join("qoop"))
                 .expect("link")
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(std::fs::read(&target).expect("qoro"), says("0.0.2"));
+        assert_eq!(std::fs::read(&target).expect("qoop"), says("0.0.2"));
         let left: Vec<_> = std::fs::read_dir(&real).expect("opt").flatten().collect();
         assert_eq!(left.len(), 1, "something was left staged beside the file");
     }
 
     /// Whatever it refuses, the file there is untouched and nothing is left staged: another
-    /// program (an error, never read as a swap done elsewhere), a qoro of another version
+    /// program (an error, never read as a swap done elsewhere), a qoop of another version
     /// than asked about (which another swap put there meanwhile), a link to nothing, a place
     /// this user cannot write, and a copy that is not the version it claims.
     #[test]
@@ -1097,23 +1097,23 @@ mod tests {
             assert!(!String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
             let left = leftovers(home);
             assert!(
-                left.iter().all(|name| !name.starts_with(".qoro-")),
+                left.iter().all(|name| !name.starts_with(".qoop-")),
                 "{left:?}"
             );
         };
 
         let home = tempfile::tempdir().expect("home");
         let other = b"#!/bin/sh\necho hello\n";
-        let qoro = installed(home.path(), other);
+        let qoop = installed(home.path(), other);
         check(
             home.path(),
             swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2")),
             4,
         );
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), other);
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), other);
 
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         check(
             home.path(),
             swap(home.path(), "0.0.0", "0.0.2", &says("0.0.2")),
@@ -1124,12 +1124,12 @@ mod tests {
             swap(home.path(), "0.0.1", "0.0.2", &says("0.0.3")),
             5,
         );
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.1"));
 
         let home = tempfile::tempdir().expect("home");
         let bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        std::os::unix::fs::symlink("/nonexistent/qoro", bin.join("qoro")).expect("link");
+        std::os::unix::fs::symlink("/nonexistent/qoop", bin.join("qoop")).expect("link");
         check(
             home.path(),
             swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2")),
@@ -1139,7 +1139,7 @@ mod tests {
         // Owned by another user cannot be made here without root; a directory this user
         // may not write is refused by the same line.
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         let bin = home.path().join(".local/bin");
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o555))
             .expect("chmod");
@@ -1147,18 +1147,18 @@ mod tests {
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         check(home.path(), out, 3);
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.1"));
 
         // Another swap holds the lock: refused as one under way, and its lock is its own.
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
-        let lock = home.path().join(".local/bin/.qoro-swap.lock");
+        let qoop = installed(home.path(), &says("0.0.1"));
+        let lock = home.path().join(".local/bin/.qoop-swap.lock");
         std::fs::create_dir(&lock).expect("lock");
         let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
         assert_eq!(out.status.code(), Some(7));
         assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
         assert!(lock.is_dir(), "another swap's lock was taken away");
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.1"));
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.1"));
         // One left by a swap killed long ago is swept, and the swap goes ahead.
         let touched = std::process::Command::new("touch")
             .args(["-t", "200001010000"])
@@ -1172,22 +1172,22 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
-        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
     }
 
     /// Only a release that is not there is the quiet case; a 404 asked without a token says
     /// how to get one, and every other failure is said as it is.
     #[test]
     fn only_a_missing_release_is_quiet() {
-        let missing = "no release of qoro 9.9.9 could be read: curl: (22) The requested URL \
+        let missing = "no release of qoop 9.9.9 could be read: curl: (22) The requested URL \
                        returned error: 404";
         assert_eq!(
             no_release(missing.into(), false).expect("quiet"),
             Update::NoRelease
         );
         assert_eq!(
-            no_release("the release carries no qoro-x.tar.gz".into(), true).expect("quiet"),
+            no_release("the release carries no qoop-x.tar.gz".into(), true).expect("quiet"),
             Update::NoRelease
         );
         let said = no_release(missing.into(), true)
@@ -1198,8 +1198,8 @@ mod tests {
             "{said}"
         );
         for other in [
-            "no release of qoro 9.9.9 could be read: curl: (6) Could not resolve host",
-            "no release of qoro 9.9.9 could be read: curl: (22) The requested URL returned \
+            "no release of qoop 9.9.9 could be read: curl: (6) Could not resolve host",
+            "no release of qoop 9.9.9 could be read: curl: (22) The requested URL returned \
              error: 403",
             "the releases API answered what is not JSON: expected value",
         ] {
@@ -1210,13 +1210,13 @@ mod tests {
         }
     }
 
-    /// Two swaps racing at one qoro leave one valid new binary: exactly one swaps, the other
+    /// Two swaps racing at one qoop leave one valid new binary: exactly one swaps, the other
     /// is refused as another swap in progress (7) or done (6), and nothing is left staged
     /// or locked.
     #[test]
-    fn two_swaps_at_once_leave_one_valid_qoro() {
+    fn two_swaps_at_once_leave_one_valid_qoop() {
         let home = tempfile::tempdir().expect("home");
-        let qoro = installed(home.path(), &says("0.0.1"));
+        let qoop = installed(home.path(), &says("0.0.1"));
         let path = home.path().to_path_buf();
         let racers: Vec<_> = (0..2)
             .map(|_| {
@@ -1233,11 +1233,11 @@ mod tests {
             matches!(codes.as_slice(), [Some(0), Some(SWAPPED_MEANWHILE | 7)]),
             "{codes:?}"
         );
-        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
-        assert_eq!(leftovers(home.path()), vec!["qoro".to_string()]);
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
     }
 
-    /// Commit and abort act only on a stage's own names, and a qoro that appeared between
+    /// Commit and abort act only on a stage's own names, and a qoop that appeared between
     /// the two steps is left alone and counted as done.
     #[test]
     fn commit_touches_only_its_own_staged_file() {
@@ -1246,7 +1246,7 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("bin");
         let victim = home.path().join("keep");
         std::fs::write(&victim, b"keep").expect("keep");
-        let sneaky = format!("{}/.qoro-install.x/../../keep", bin.display());
+        let sneaky = format!("{}/.qoop-install.x/../../keep", bin.display());
         // A bare name has no prefix to strip, and ssh runs in the home, where `keep` is.
         for path in [sneaky.as_str(), "keep"] {
             for script in [COMMIT, ABORT] {
@@ -1259,9 +1259,9 @@ mod tests {
             "a path outside the stage's names was removed"
         );
 
-        let staged = bin.join(".qoro-install.abc123");
+        let staged = bin.join(".qoop-install.abc123");
         std::fs::write(&staged, FAKE).expect("staged");
-        std::fs::write(bin.join("qoro"), b"arrived meanwhile").expect("theirs");
+        std::fs::write(bin.join("qoop"), b"arrived meanwhile").expect("theirs");
         let out = step(
             home.path(),
             &guarded(COMMIT, &staged.to_string_lossy()),
@@ -1273,7 +1273,7 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            std::fs::read(bin.join("qoro")).expect("qoro"),
+            std::fs::read(bin.join("qoop")).expect("qoop"),
             b"arrived meanwhile"
         );
         assert!(!staged.exists());

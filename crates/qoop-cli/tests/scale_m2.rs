@@ -57,7 +57,7 @@ fn start_daemon() -> Daemon {
 
 /// A daemon that reports its own segment timings into `trace.log` in its runtime directory.
 ///
-/// The daemon writes them when `QORO_TRACE_LATENCY` is set, and a gate that needs a segment
+/// The daemon writes them when `QOOP_TRACE_LATENCY` is set, and a gate that needs a segment
 /// the client cannot see reads them back from there. Per daemon rather than a fixed path,
 /// so two gates running in sequence cannot read each other's numbers.
 fn start_traced_daemon() -> Daemon {
@@ -71,7 +71,7 @@ fn start_daemon_with(trace: bool) -> Daemon {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qoop"));
     command
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         // The shell is pinned, and it is the single most important line in this file.
         //
@@ -81,12 +81,12 @@ fn start_daemon_with(trace: bool) -> Daemon {
         // load at all, keystroke to echo p50 5.14 ms and p95 14.76 ms. The same measurement
         // with `sh` is p50 0.29 ms and p95 0.36 ms, and with `bash` p50 0.29 ms. What was
         // being timed was a line editor redrawing a prompt, and it exceeded the whole
-        // budget before qoro did anything at all.
+        // budget before qoop did anything at all.
         .env("SHELL", "/bin/sh")
         .stdout(std::process::Stdio::null());
     if trace {
         command
-            .env("QORO_TRACE_LATENCY", "1")
+            .env("QOOP_TRACE_LATENCY", "1")
             .stderr(std::process::Stdio::from(
                 std::fs::File::create(dir.path().join("trace.log")).expect("trace file"),
             ));
@@ -306,7 +306,7 @@ const SAMPLES: usize = 120;
 #[ignore = "wall-clock measurement under a load that saturates the machine; see docs/latency.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn g2_3_typing_stays_fast_while_twenty_terminals_stream() {
-    let streamers: usize = std::env::var("QORO_STREAMERS")
+    let streamers: usize = std::env::var("QOOP_STREAMERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
@@ -337,14 +337,14 @@ async fn g2_3_typing_stays_fast_while_twenty_terminals_stream() {
     );
     // Two shapes, because a megabyte a second is not one workload. `paced`, the default, is
     // eighty column lines at a steady rate, which is what a build log or a server log looks
-    // like. `burst`, under `QORO_LOAD=burst`, is the old one: `seq` numbers, so about seven
+    // like. `burst`, under `QOOP_LOAD=burst`, is the old one: `seq` numbers, so about seven
     // bytes a line and fourteen times the row rate for the same byte rate, arriving all at
     // once. Rows are what the scrollback costs, so the second shape is the expensive one and
     // it is kept measurable rather than deleted.
     let paced = r#"exec perl -e '$|=1; my $c = ("x" x 79 . "\n") x 665; while (1) { print $c; select(undef, undef, undef, 0.05); }'
 "#;
     let burst = "while true; do seq 1 200000; sleep 1; done\n";
-    let short_lines = std::env::var("QORO_LOAD").as_deref() == Ok("burst");
+    let short_lines = std::env::var("QOOP_LOAD").as_deref() == Ok("burst");
     let load = if short_lines { burst } else { paced };
     for stream in &streams[1..] {
         client.input_to(*stream, load.as_bytes()).await;

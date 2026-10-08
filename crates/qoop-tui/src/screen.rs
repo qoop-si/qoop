@@ -123,7 +123,7 @@ pub struct Chrome<'a> {
     pub shut: &'a sidebar::Shut,
     /// Where the keyboard's attention is, for the key row.
     pub keys: KeyContext,
-    /// What each local agent costs, sampled while `QORO_USAGE=1`.
+    /// What each local agent costs, sampled while `QOOP_USAGE=1`.
     pub usage: &'a sidebar::Usage,
     /// An agent's last answer is open over the pane, and the key row says how to read it.
     pub answer: bool,
@@ -3106,7 +3106,7 @@ pub fn paint_focus_list(
 ) -> Vec<(String, theme::Role)> {
     if events.is_empty() {
         return vec![(
-            "no hook reports yet: F closes, qoro hooks install".to_string(),
+            "no hook reports yet: F closes, qoop hooks install".to_string(),
             theme::Role::Faint,
         )];
     }
@@ -6665,7 +6665,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, theme::Role::Faint);
         assert!(rows[0].0.contains("no hook reports yet"), "{rows:?}");
-        assert!(rows[0].0.contains("qoro hooks install"), "{rows:?}");
+        assert!(rows[0].0.contains("qoop hooks install"), "{rows:?}");
     }
 
     #[test]

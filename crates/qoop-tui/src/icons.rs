@@ -2,7 +2,7 @@
 //! gets them.
 //!
 //! A terminal draws characters from fonts, never pictures, so an icon is a glyph: eight from
-//! the Nerd Fonts symbol sets in `assets/QoroSymbols.ttf`, built by
+//! the Nerd Fonts symbol sets in `assets/QoopSymbols.ttf`, built by
 //! `scripts/build-icon-font.py`, which fits every one to one box and one centre line (the
 //! sets were drawn apart and stood at different heights) and puts them at our own codepoints
 //! in the supplementary private use plane. iTerm2, Terminal, Ghostty and kitty draw a glyph
@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::colorlevel::Env;
 
-/// The font, embedded so every install path (the script, `qoro update`, a copied binary)
+/// The font, embedded so every install path (the script, `qoop update`, a copied binary)
 /// carries it.
-pub const FONT: &[u8] = include_bytes!("../assets/QoroSymbols.ttf");
+pub const FONT: &[u8] = include_bytes!("../assets/QoopSymbols.ttf");
 
 /// The file name this build's font is installed under: the name and a hash of the bytes. A
 /// changed font is a new file, which macOS hands to running terminals at once; the same name
@@ -37,7 +37,7 @@ fn font_file() -> String {
     let hash = FONT.iter().fold(0x811c_9dc5_u32, |h, b| {
         (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
     });
-    format!("QoroSymbols-{hash:08x}.ttf")
+    format!("QoopSymbols-{hash:08x}.ttf")
 }
 
 /// An asleep tab's mark (Material Design `sleep`).
@@ -215,7 +215,7 @@ pub fn install(env: &Env) -> bool {
         Ok(()) => true,
         Err(e) => {
             eprintln!(
-                "qoro: the icon font was not installed in {}: {e}",
+                "qoop: the icon font was not installed in {}: {e}",
                 dir.display()
             );
             false
@@ -235,7 +235,7 @@ fn write_font(dir: &Path) -> std::io::Result<()> {
     }
     // Older fonts go: the unhashed name of the first builds, and the font of a build no
     // interface has started for a week. A newer build's font is left alone, since another
-    // qoro, a release beside a build from source, may be drawing from it right now.
+    // qoop, a release beside a build from source, may be drawing from it right now.
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
@@ -245,8 +245,8 @@ fn write_font(dir: &Path) -> std::io::Result<()> {
             .ok()
             .and_then(|at| at.elapsed().ok())
             .is_some_and(|age| age > week);
-        let ours = file.starts_with("QoroSymbols-") && file.ends_with(".ttf");
-        if file != name && (file == "QoroSymbols.ttf" || (ours && stale)) {
+        let ours = file.starts_with("QoopSymbols-") && file.ends_with(".ttf");
+        if file != name && (file == "QoopSymbols.ttf" || (ours && stale)) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -431,18 +431,18 @@ mod tests {
     /// file alone.
     #[test]
     fn the_font_installs_once_into_the_font_folder() {
-        let dir = std::env::temp_dir().join(format!("qoro-font-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qoop-font-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_font(&dir).expect("write");
         // The first builds' unhashed font goes; a newer build's, in use, stays.
-        std::fs::write(dir.join("QoroSymbols.ttf"), b"old").expect("old");
-        std::fs::write(dir.join("QoroSymbols-0000beef.ttf"), b"other").expect("other");
+        std::fs::write(dir.join("QoopSymbols.ttf"), b"old").expect("old");
+        std::fs::write(dir.join("QoopSymbols-0000beef.ttf"), b"other").expect("other");
         write_font(&dir).expect("again");
         assert!(
-            dir.join("QoroSymbols-0000beef.ttf").exists(),
+            dir.join("QoopSymbols-0000beef.ttf").exists(),
             "another build's font stays"
         );
-        std::fs::remove_file(dir.join("QoroSymbols-0000beef.ttf")).expect("tidy");
+        std::fs::remove_file(dir.join("QoopSymbols-0000beef.ttf")).expect("tidy");
         assert_eq!(std::fs::read(dir.join(font_file())).expect("read"), FONT);
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir")

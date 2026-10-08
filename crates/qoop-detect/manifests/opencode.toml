@@ -2,7 +2,7 @@
 #
 # The strings below are from sst/opencode at 3f393d78 (2026-10-06, version 1.18.34), the
 # session view in `packages/tui/src`. The busy spinner's glyphs (`■` and `⬝`) and the cut
-# and fullscreen permission rows are from screens recorded in qoro's own opencode sessions
+# and fullscreen permission rows are from screens recorded in qoop's own opencode sessions
 # (the captures in this crate's tests). Panels carry a border on their left side, so line
 # patterns allow any non-word glyphs before the text. OpenCode's window title does not
 # change with its state, so nothing here reads it.

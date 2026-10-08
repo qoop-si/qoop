@@ -1,4 +1,4 @@
-//! `qoro remote`: the machines whose spaces the interface shows beside this one's.
+//! `qoop remote`: the machines whose spaces the interface shows beside this one's.
 //!
 //! Adding one is the only step that talks to a person: it runs ssh in the foreground, so a
 //! password, a passphrase, a new host key or a hardware key touch is answered where it is
@@ -18,16 +18,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
         Some("ls") | None => ls(),
         _ => {
             eprintln!(
-                "usage: qoro remote add <name> <ssh-target>\n\
-                 \x20      qoro remote rm <name>\n\
-                 \x20      qoro remote ls"
+                "usage: qoop remote add <name> <ssh-target>\n\
+                 \x20      qoop remote rm <name>\n\
+                 \x20      qoop remote ls"
             );
             std::process::exit(2);
         }
     };
     // Said as a sentence: these are answers to a person at a prompt, not a trace.
     if let Err(e) = done {
-        eprintln!("qoro: {e}");
+        eprintln!("qoop: {e}");
         std::process::exit(1);
     }
     Ok(())
@@ -39,7 +39,7 @@ fn refuse(message: String) -> io::Error {
 
 fn add(rest: &[String]) -> io::Result<()> {
     let [name, target] = rest else {
-        return Err(refuse("usage: qoro remote add <name> <ssh-target>".into()));
+        return Err(refuse("usage: qoop remote add <name> <ssh-target>".into()));
     };
     if !saved::valid_name(name) {
         return Err(refuse(format!(
@@ -53,7 +53,7 @@ fn add(rest: &[String]) -> io::Result<()> {
     let mut list = saved::load_from(&file)?;
     if list.iter().any(|r| &r.name == name) {
         return Err(refuse(format!(
-            "{name} is already added; `qoro remote rm {name}` first to change it"
+            "{name} is already added; `qoop remote rm {name}` first to change it"
         )));
     }
     // The same machine under a second name would list every one of its spaces twice, once
@@ -72,13 +72,13 @@ fn add(rest: &[String]) -> io::Result<()> {
     list.push(remote);
     saved::save_to(&file, &list)?;
     println!(
-        "added {name}: qoro {} on {}. its spaces show in `qoro` as {name}:<space>",
+        "added {name}: qoop {} on {}. its spaces show in `qoop` as {name}:<space>",
         hello.version, hello.platform
     );
     Ok(())
 }
 
-/// Reach the remote in the foreground and ask its qoro what it is, refusing one this
+/// Reach the remote in the foreground and ask its qoop what it is, refusing one this
 /// build cannot talk to.
 pub fn check(remote: &Remote) -> io::Result<RemoteHello> {
     let hello = match probe(remote) {
@@ -91,7 +91,7 @@ pub fn check(remote: &Remote) -> io::Result<RemoteHello> {
     match compatibility(&hello) {
         Ok(Compatibility::AsIs) => {}
         Ok(Compatibility::NeedsRestart) => eprintln!(
-            "qoro on {} is {}, older than this one: its spaces show as offline until it is \
+            "qoop on {} is {}, older than this one: its spaces show as offline until it is \
              updated there",
             remote.name, hello.version
         ),
@@ -100,8 +100,8 @@ pub fn check(remote: &Remote) -> io::Result<RemoteHello> {
     Ok(hello)
 }
 
-/// Wake the machine's last space, or open its first tab, as a bare `qoro` does here. Best
-/// effort: an older qoro there does not know the verb, and its spaces are shown as they are.
+/// Wake the machine's last space, or open its first tab, as a bare `qoop` does here. Best
+/// effort: an older qoop there does not know the verb, and its spaces are shown as they are.
 pub fn wake(remote: &Remote) {
     let mut transport = SshTransport::new(&remote.target);
     if let Some(path) = qoop_tui::link::control_path() {
@@ -135,28 +135,28 @@ fn probe(remote: &Remote) -> io::Result<RemoteHello> {
         .map(|(_, after)| after.trim())
         .unwrap_or_default();
     // Told apart by what happened: the remote command prints the marker and exits 127 when
-    // it finds no qoro, and nothing else does both.
+    // it finds no qoop, and nothing else does both.
     if out.status.code() == Some(127) && text.contains(RELAY_MARKER) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("qoro is not installed on {}", remote.target),
+            format!("qoop is not installed on {}", remote.target),
         ));
     }
     if !out.status.success() {
         return Err(io::Error::other(format!(
-            "could not reach qoro on {} (ssh exited with {})",
+            "could not reach qoop on {} (ssh exited with {})",
             remote.target, out.status
         )));
     }
     serde_json::from_str(answer).map_err(|_| {
         io::Error::other(format!(
-            "{} answered something that is not qoro: {answer:?}",
+            "{} answered something that is not qoop: {answer:?}",
             remote.target
         ))
     })
 }
 
-/// Offer to put this version of qoro on a machine that has none, and do it on a yes.
+/// Offer to put this version of qoop on a machine that has none, and do it on a yes.
 ///
 /// Asked only of a person at a terminal, after ssh has finished with it: a pipe answering
 /// on their behalf is not a yes, and a script gets the way to do it instead.
@@ -165,12 +165,12 @@ fn offer_install(remote: &Remote) -> io::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     if !std::io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
-            "qoro is not installed on {}; run this from a terminal to install it there",
+            "qoop is not installed on {}; run this from a terminal to install it there",
             remote.target
         )));
     }
     print!(
-        "qoro is not installed on {}. install qoro {version} there, in ~/.local/bin? [y/N] ",
+        "qoop is not installed on {}. install qoop {version} there, in ~/.local/bin? [y/N] ",
         remote.target
     );
     std::io::stdout().flush()?;
@@ -181,13 +181,13 @@ fn offer_install(remote: &Remote) -> io::Result<()> {
     }
     let runtime = tokio::runtime::Runtime::new()?;
     let installed = runtime.block_on(qoop_tui::link::install(&remote.target))?;
-    println!("installed qoro {installed} on {}", remote.target);
+    println!("installed qoop {installed} on {}", remote.target);
     Ok(())
 }
 
 fn rm(name: Option<&str>) -> io::Result<()> {
     let Some(name) = name else {
-        return Err(refuse("usage: qoro remote rm <name>".into()));
+        return Err(refuse("usage: qoop remote rm <name>".into()));
     };
     let file = saved::path();
     let mut list = saved::load_from(&file)?;
@@ -206,7 +206,7 @@ fn ls() -> io::Result<()> {
     // On stderr: standard output is the list, and a script reading it (qass's watch) took the
     // first word of this sentence for a machine called `no`.
     if list.is_empty() {
-        eprintln!("no remotes. `qoro remote add <name> <ssh-target>` adds one");
+        eprintln!("no remotes. `qoop remote add <name> <ssh-target>` adds one");
     }
     for r in list {
         println!("{}  {}", r.name, r.target);

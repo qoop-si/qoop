@@ -1,4 +1,4 @@
-//! `wait --match`, `new --space NAME`, `prompt --wait` and `qoro worktree` against a
+//! `wait --match`, `new --space NAME`, `prompt --wait` and `qoop worktree` against a
 //! real daemon. What `wait`, `new` and `close` share with a supervising agent is in
 //! `supervisor.rs`.
 //!
@@ -29,7 +29,7 @@ impl Daemon {
             .expect("chmod");
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -49,12 +49,12 @@ impl Daemon {
         Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .current_dir(cwd)
-            .env("QORO_RUNTIME_DIR", self.dir.path())
-            .env_remove("QORO_TERMINAL")
-            .env_remove("QORO_TOKEN")
-            .env_remove("QORO_SESSION")
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
+            .env_remove("QOOP_TERMINAL")
+            .env_remove("QOOP_TOKEN")
+            .env_remove("QOOP_SESSION")
             .output()
-            .expect("run qoro")
+            .expect("run qoop")
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -208,14 +208,14 @@ fn verbs_refuse_without_a_daemon_and_start_none() {
     for args in [&["new", "--", "true"][..], &["read", "1"]] {
         let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .output()
-            .expect("run qoro");
+            .expect("run qoop");
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         // One line, the same shape for every command, never Rust's debug form.
         assert_eq!(
             text(&out.stderr),
-            "qoro: nothing is awake: `qoro` or `qoro wake` starts it\n",
+            "qoop: nothing is awake: `qoop` or `qoop wake` starts it\n",
             "{args:?}"
         );
     }
@@ -269,7 +269,7 @@ fn a_prompt_wait_chained_in_the_second_of_a_done_does_not_return_at_once() {
     let n = new_terminal(&daemon, &[]);
     let q = env!("CARGO_BIN_EXE_qoop");
     let script = format!(
-        "sh -c '\"{q}\" hook-report --state done; \"{q}\" prompt \"$QORO_TERMINAL\" --wait --timeout 3 x; echo CHAINED_RC=$?; sleep 60'"
+        "sh -c '\"{q}\" hook-report --state done; \"{q}\" prompt \"$QOOP_TERMINAL\" --wait --timeout 3 x; echo CHAINED_RC=$?; sleep 60'"
     );
     assert!(
         daemon
@@ -285,10 +285,10 @@ fn a_misspelt_prompt_flag_is_refused_rather_than_typed() {
     let daemon = Daemon::start();
     let out = daemon.run(&["prompt", "1", "--wiat", "echo NEVER_TYPED"]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-    assert!(text(&out.stderr).starts_with("qoro: unknown flag --wiat"));
+    assert!(text(&out.stderr).starts_with("qoop: unknown flag --wiat"));
     let late = daemon.run(&["prompt", "1", "echo NEVER_TYPED", "--wait"]);
     assert_eq!(late.status.code(), Some(2), "{}", text(&late.stderr));
-    assert!(text(&late.stderr).starts_with("qoro: flags go right after the target"));
+    assert!(text(&late.stderr).starts_with("qoop: flags go right after the target"));
     for args in [&["read", "1", "--bogus"][..], &["agents", "--bogus"]] {
         let out = daemon.run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -393,7 +393,7 @@ fn worktree_new_ls_rm_round_trip_in_a_path_with_a_space() {
     let kept = daemon.run_in(&repo, &["worktree", "rm", "feat/one"]);
     assert_eq!(kept.status.code(), Some(1));
     assert!(
-        text(&kept.stderr).contains(&format!("qoro terminal {terminal}")),
+        text(&kept.stderr).contains(&format!("qoop terminal {terminal}")),
         "{}",
         text(&kept.stderr)
     );
@@ -422,7 +422,7 @@ fn worktree_rm_refuses_while_any_process_is_inside_even_with_force() {
     let (checkout, terminal) = new_worktree(&daemon, &repo, "feat/busy");
     daemon.close(&terminal);
 
-    // A process qoro never started, in a directory below the worktree.
+    // A process qoop never started, in a directory below the worktree.
     let below = checkout.join("deep dir");
     std::fs::create_dir(&below).unwrap();
     let mut outsider = Command::new("sleep")
@@ -458,7 +458,7 @@ fn worktree_rm_refuses_while_any_process_is_inside_even_with_force() {
     let refused = daemon.run_in(&repo, &["worktree", "rm", "feat/busy", "--force"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(
-        text(&refused.stderr).contains("qoro terminal 1"),
+        text(&refused.stderr).contains("qoop terminal 1"),
         "{}",
         text(&refused.stderr)
     );
@@ -468,30 +468,30 @@ fn worktree_rm_refuses_while_any_process_is_inside_even_with_force() {
 }
 
 #[test]
-fn worktree_rm_ignores_qoro_itself_and_tells_a_caller_inside_to_step_out() {
+fn worktree_rm_ignores_qoop_itself_and_tells_a_caller_inside_to_step_out() {
     let daemon = Daemon::start();
     let root = tempfile::tempdir().expect("tempdir");
     let repo = repo(root.path());
     let (checkout, terminal) = new_worktree(&daemon, &repo, "feat/self");
     daemon.close(&terminal);
 
-    // A qoro client started from inside holds no work there.
+    // A qoop client started from inside holds no work there.
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(["wait", "1", "--until", "blocked", "--timeout", PATIENCE_ARG])
         .current_dir(&checkout)
-        .env("QORO_RUNTIME_DIR", daemon.dir.path())
+        .env("QOOP_RUNTIME_DIR", daemon.dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn a qoro client inside");
+        .expect("spawn a qoop client inside");
 
     // Run from a shell standing inside: the shell is the caller's own, and the answer is
-    // to step out rather than to close it. `; true` keeps the shell from exec-ing qoro.
+    // to step out rather than to close it. `; true` keeps the shell from exec-ing qoop.
     let inside = Command::new("/bin/sh")
         .args(["-c", "\"$0\" worktree rm feat/self; true"])
         .arg(env!("CARGO_BIN_EXE_qoop"))
         .current_dir(&checkout)
-        .env("QORO_RUNTIME_DIR", daemon.dir.path())
+        .env("QOOP_RUNTIME_DIR", daemon.dir.path())
         .output()
         .expect("run from inside");
     assert!(
@@ -504,7 +504,7 @@ fn worktree_rm_ignores_qoro_itself_and_tells_a_caller_inside_to_step_out() {
     let removed = daemon.run_in(&repo, &["worktree", "rm", "feat/self"]);
     assert!(
         removed.status.success(),
-        "a qoro client inside blocked it: {}",
+        "a qoop client inside blocked it: {}",
         text(&removed.stderr)
     );
     let _ = watcher.kill();
@@ -512,7 +512,7 @@ fn worktree_rm_ignores_qoro_itself_and_tells_a_caller_inside_to_step_out() {
 }
 
 #[test]
-fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
+fn worktree_rm_names_a_qoop_daemon_running_from_inside() {
     let daemon = Daemon::start();
     let root = tempfile::tempdir().expect("tempdir");
     let repo = repo(root.path());
@@ -526,7 +526,7 @@ fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
     let mut inside = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(["daemon"])
         .current_dir(&checkout)
-        .env("QORO_RUNTIME_DIR", other.path())
+        .env("QOOP_RUNTIME_DIR", other.path())
         .env("SHELL", "/bin/sh")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -543,7 +543,7 @@ fn worktree_rm_names_a_qoro_daemon_running_from_inside() {
     assert_eq!(refused.status.code(), Some(1));
     assert!(
         text(&refused.stderr).contains(&format!(
-            "a qoro daemon (pid {}) runs from inside",
+            "a qoop daemon (pid {}) runs from inside",
             inside.id()
         )),
         "{}",
@@ -588,11 +588,11 @@ fn worktree_mistakes_exit_two_and_a_vanished_one_names_prune() {
     let repo = repo(root.path());
     let help = daemon.run_in(&repo, &["worktree", "help"]);
     assert_eq!(help.status.code(), Some(0));
-    assert!(text(&help.stdout).contains("qoro worktree rm"));
+    assert!(text(&help.stdout).contains("qoop worktree rm"));
     for args in [&["worktree"][..], &["worktree", "bogus"]] {
         let out = daemon.run_in(&repo, args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
-        assert!(text(&out.stderr).contains("qoro worktree rm"), "{args:?}");
+        assert!(text(&out.stderr).contains("qoop worktree rm"), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}");
     }
 

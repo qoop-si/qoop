@@ -1,4 +1,4 @@
-# Terminal support: what qoro expects from the outer terminal
+# Terminal support: what qoop expects from the outer terminal
 
 The interface adapts to the terminal it runs in instead of demanding a
 particular one. This page says what each terminal gets, what degrades, and
@@ -23,7 +23,7 @@ which switch overrides the detection when it guesses wrong.
 
 Placeholder means the picture's stand-in line (`[image 800x600, 123KB]`),
 never raw bytes. Sixel pictures are captured and named but placed only with
-`QORO_GRAPHICS=sixel` or `all`: no outer sixel support is verified on a
+`QOOP_GRAPHICS=sixel` or `all`: no outer sixel support is verified on a
 device yet.
 
 ## Attribute degradation
@@ -44,7 +44,7 @@ then, per style:
 
 ## Detection and overrides
 
-Colour level order: `QORO_COLOR` (`none`, `256`, `true`), the safety floor
+Colour level order: `QOOP_COLOR` (`none`, `256`, `true`), the safety floor
 (`dumb`, `linux`, legacy conhost), `NO_COLOR`, `COLORTERM`, a conservative
 Apple Terminal default, `TERM` suffix hints, then 256. A leaked `COLORTERM`
 never lifts the floor.
@@ -56,10 +56,10 @@ passthrough; without an answer the config wins.
 | switch | effect |
 |---|---|
 | `theme = "dark"` or `"light"` in config.toml | pins the palette, skips detection |
-| `QORO_COLOR=none` | attributes only, honours `NO_COLOR` everywhere |
-| `QORO_COLOR=256` | never truecolour, even when advertised |
-| `QORO_COLOR=true` | forces truecolour passthrough |
-| `QORO_GRAPHICS=kitty`, `iterm2`, `sixel`, `all`, `off` | pins image placement |
-| `QORO_MOTION=0` | still column, independent of colour |
+| `QOOP_COLOR=none` | attributes only, honours `NO_COLOR` everywhere |
+| `QOOP_COLOR=256` | never truecolour, even when advertised |
+| `QOOP_COLOR=true` | forces truecolour passthrough |
+| `QOOP_GRAPHICS=kitty`, `iterm2`, `sixel`, `all`, `off` | pins image placement |
+| `QOOP_MOTION=0` | still column, independent of colour |
 | `NO_COLOR` | no colour anywhere; motion keeps its own switch |
-| `qoro reset` | restores a terminal left in a bad mode |
+| `qoop reset` | restores a terminal left in a bad mode |

@@ -1,7 +1,7 @@
 //! The database and the history move out of the runtime directory, under the packaged
 //! binary, the way an existing install meets this build.
 //!
-//! A daemon started with `QORO_RUNTIME_DIR` keeps its state beside its socket, which is
+//! A daemon started with `QOOP_RUNTIME_DIR` keeps its state beside its socket, which is
 //! exactly the layout every build before this one wrote, so that is how the old layout is
 //! made here: by a real daemon, with a real tab and real history. Then a daemon started the
 //! way a person starts one, with no override, finds it and moves it to the data directory.
@@ -30,9 +30,9 @@ impl Machine {
         Self { root }
     }
 
-    /// `$XDG_RUNTIME_DIR/qoro`, the runtime base both kinds of start resolve to.
+    /// `$XDG_RUNTIME_DIR/qoop`, the runtime base both kinds of start resolve to.
     fn runtime(&self) -> PathBuf {
-        self.root.path().join("rt/qoro")
+        self.root.path().join("rt/qoop")
     }
 
     fn session(&self) -> PathBuf {
@@ -40,26 +40,26 @@ impl Machine {
     }
 
     fn data(&self) -> PathBuf {
-        self.root.path().join("data/qoro")
+        self.root.path().join("data/qoop")
     }
 
-    /// `qoro` with this machine's environment. `old` starts it the way every build before
+    /// `qoop` with this machine's environment. `old` starts it the way every build before
     /// this one kept its files: runtime directory named, state beside the socket.
-    fn qoro(&self, old: bool) -> Command {
+    fn qoop(&self, old: bool) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_qoop"));
         c.env("HOME", self.root.path().join("home"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("rt"))
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("SHELL", "/bin/sh")
-            .env_remove("QORO_RUNTIME_DIR")
-            .env_remove("QORO_SESSION")
-            .env_remove("QORO_TOKEN")
-            .env_remove("QORO_TERMINAL")
+            .env_remove("QOOP_RUNTIME_DIR")
+            .env_remove("QOOP_SESSION")
+            .env_remove("QOOP_TOKEN")
+            .env_remove("QOOP_TERMINAL")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if old {
-            c.env("QORO_RUNTIME_DIR", self.runtime());
+            c.env("QOOP_RUNTIME_DIR", self.runtime());
         }
         c
     }
@@ -67,9 +67,9 @@ impl Machine {
     /// Started, and answering a handshake: a connect alone succeeds as soon as the socket
     /// is bound, which is before the move has run.
     fn start(&self, old: bool) -> Daemon {
-        let child = self.qoro(old).arg("daemon").spawn().expect("spawn");
+        let child = self.qoop(old).arg("daemon").spawn().expect("spawn");
         let daemon = Daemon(child);
-        let socket = self.session().join("qorod.sock");
+        let socket = self.session().join("qoopd.sock");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -92,9 +92,9 @@ impl Machine {
     }
 
     fn stop(&self, old: bool) {
-        let ok = self.qoro(old).arg("stop").status().expect("stop");
-        assert!(ok.success(), "qoro stop refused");
-        let socket = self.session().join("qorod.sock");
+        let ok = self.qoop(old).arg("stop").status().expect("stop");
+        assert!(ok.success(), "qoop stop refused");
+        let socket = self.session().join("qoopd.sock");
         let deadline = Instant::now() + PATIENCE;
         while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             assert!(Instant::now() < deadline, "the daemon did not stop");
@@ -104,12 +104,12 @@ impl Machine {
 
     fn spaces(&self) -> serde_json::Value {
         let out = self
-            .qoro(false)
+            .qoop(false)
             .args(["ls", "--json"])
             .stdout(Stdio::piped())
             .output()
-            .expect("qoro ls");
-        serde_json::from_slice(&out.stdout).expect("qoro ls --json")
+            .expect("qoop ls");
+        serde_json::from_slice(&out.stdout).expect("qoop ls --json")
     }
 }
 
@@ -129,11 +129,11 @@ fn an_existing_install_has_its_state_moved_out_of_the_runtime_directory() {
 
     // The old layout, made by a real daemon: one tab, recorded, with history on disk.
     let old = m.start(true);
-    qoop_testkit::open_first_terminal(&m.session().join("qorod.sock"));
+    qoop_testkit::open_first_terminal(&m.session().join("qoopd.sock"));
     m.stop(true);
     drop(old);
     assert!(
-        m.session().join("qoro.db").exists(),
+        m.session().join("qoop.db").exists(),
         "no old layout to move"
     );
     assert!(m.session().join("history").exists(), "no history to move");
@@ -145,21 +145,21 @@ fn an_existing_install_has_its_state_moved_out_of_the_runtime_directory() {
     // Started the way a person starts it.
     let new = m.start(false);
     assert!(
-        m.data().join("qoro.db").exists(),
+        m.data().join("qoop.db").exists(),
         "the database did not move"
     );
     assert!(
         m.data().join("history").exists(),
         "the history did not move"
     );
-    for gone in ["qoro.db", "qoro.db-wal", "qoro.db-shm", "history"] {
+    for gone in ["qoop.db", "qoop.db-wal", "qoop.db-shm", "history"] {
         assert!(
             !m.session().join(gone).exists(),
             "{gone} was left in the runtime directory"
         );
     }
     // The socket stays where it was, and the data directory is private.
-    assert!(m.session().join("qorod.sock").exists());
+    assert!(m.session().join("qoopd.sock").exists());
     let mode = std::fs::metadata(m.data())
         .expect("data dir")
         .permissions()
@@ -178,7 +178,7 @@ fn an_existing_install_has_its_state_moved_out_of_the_runtime_directory() {
     let spaces = m.spaces();
     assert_eq!(spaces[0]["tabs"], 1, "no daemon: {spaces}");
     assert!(
-        !m.session().join("qoro.db").exists(),
+        !m.session().join("qoop.db").exists(),
         "a listing left a database in the runtime directory"
     );
 }

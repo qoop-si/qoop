@@ -1,6 +1,6 @@
 //! What the screen says an agent is doing.
 //!
-//! `qoro` knows which program runs in a terminal from the process table, and that is a fact.
+//! `qoop` knows which program runs in a terminal from the process table, and that is a fact.
 //! It does not know whether that program is thinking, waiting for an answer, or finished,
 //! because no such fact exists outside the program. Until an agent reports its own state
 //! over a protocol, the only evidence available is the pixels it drew, so this crate reads
@@ -1305,7 +1305,7 @@ contains = "esc to interrupt"
     #[test]
     fn the_codex_manifest_reads_its_composer_as_idle() {
         for composer in ["› Ask Codex to do anything", "› write me a test"] {
-            let v = verdict("codex", &[composer, "  gpt-6-astra medium · ~/coding/qoro"])
+            let v = verdict("codex", &[composer, "  gpt-6-astra medium · ~/coding/qoop"])
                 .unwrap_or_else(|| panic!("codex is idle: {composer}"));
             assert_eq!(v.state, AgentRuntimeState::Idle, "{composer}");
             assert!(v.visible_idle);
@@ -1372,7 +1372,7 @@ contains = "esc to interrupt"
                 "  1. the parser keeps the trailing byte",
                 "  2. a test covers the split read",
                 "\u{203A} Ask Codex to do anything",
-                "  gpt-6-astra medium \u{b7} ~/coding/qoro",
+                "  gpt-6-astra medium \u{b7} ~/coding/qoop",
             ],
         )
         .expect("codex is idle");
@@ -1414,7 +1414,7 @@ contains = "esc to interrupt"
                 &"\u{2500}".repeat(60),
                 "\u{203A} Ask Codex to do anything",
                 "",
-                "  gpt-5.6-sol high \u{b7} ~/coding/qoro \u{b7} Count 1 to 40 slowly",
+                "  gpt-5.6-sol high \u{b7} ~/coding/qoop \u{b7} Count 1 to 40 slowly",
             ],
         )
         .expect("codex is working");
@@ -1428,7 +1428,7 @@ contains = "esc to interrupt"
         assert_eq!(
             verdict(
                 "codex",
-                &["Allow command?", "  Yes  No", "user@host ~/coding/qoro $ "],
+                &["Allow command?", "  Yes  No", "user@host ~/coding/qoop $ "],
             ),
             None
         );
@@ -1436,7 +1436,7 @@ contains = "esc to interrupt"
 
     #[test]
     fn the_generic_manifest_reads_a_bare_shell_prompt_as_idle() {
-        let v = verdict("generic", &["user@host ~/coding/qoro %"]).expect("a bare prompt");
+        let v = verdict("generic", &["user@host ~/coding/qoop %"]).expect("a bare prompt");
         assert_eq!(v.state, AgentRuntimeState::Idle);
         assert!(v.visible_idle);
     }
@@ -1921,7 +1921,7 @@ contains = "esc to interrupt"
         assert_eq!(v.state, AgentRuntimeState::Idle, "{v:?}");
     }
 
-    /// A real opencode 1.18.32 start, captured from a qoro terminal: the key hints sit
+    /// A real opencode 1.18.32 start, captured from a qoop terminal: the key hints sit
     /// above a tip and the directory, so the idle row is third from the bottom.
     #[test]
     fn a_real_opencode_home_screen_reads_idle() {
@@ -2297,7 +2297,7 @@ contains = "esc to interrupt"
     #[test]
     fn reloading_a_missing_directory_is_an_empty_success() {
         with_clean_overrides(|| {
-            let outcome = reload_overrides(std::path::Path::new("/nonexistent-qoro-dir"));
+            let outcome = reload_overrides(std::path::Path::new("/nonexistent-qoop-dir"));
             assert!(outcome.loaded.is_empty());
             assert!(outcome.errors.is_empty());
         });

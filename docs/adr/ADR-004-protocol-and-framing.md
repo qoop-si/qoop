@@ -171,7 +171,7 @@ Failure behaviour is explicit rather than implied:
   the connection does, and a stable identity would survive a crash and strand the geometry.
 
   Amended 2026-09-30: what is built is narrower. The ledger is keyed by the request id
-  alone, not by that identity, and lives in `qoro.db`'s `applied` table with the outcome,
+  alone, not by that identity, and lives in `qoop.db`'s `applied` table with the outcome,
   kept for 30 days (ADR-005). A create writes its row in the same transaction as the
   terminal, so a key already answered cannot open a second tab.
 

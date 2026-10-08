@@ -1,14 +1,14 @@
-# qoro
+# qoop
 
 A portable runtime for human and coding-agent workspaces.
 
 ```
 cd my-project
-qoro
+qoop
 ```
 
 That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
-no manifest. Press `ctrl-q` and the shell keeps running; run `qoro` again and you are back in
+no manifest. Press `ctrl-q` and the shell keeps running; run `qoop` again and you are back in
 the same one.
 
 ## What it is for
@@ -19,7 +19,7 @@ nobody noticed, the session came back with the right command line and the wrong
 conversation, a background job outlived the window that started it, and an update restarted
 everything.
 
-So the parts that usually get bolted on are the parts qoro is built out of:
+So the parts that usually get bolted on are the parts qoop is built out of:
 
 - **Every terminal knows its agent.** The index says which agent is in which terminal and
   what it is doing: working, blocked on a question, done, failed or idle. An agent that

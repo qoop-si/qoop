@@ -1,4 +1,4 @@
-//! `qoro sound`: hear the notification sounds and keep one for a finished agent, then one
+//! `qoop sound`: hear the notification sounds and keep one for a finished agent, then one
 //! for an agent that waits on you.
 //!
 //! On a terminal it is a grid: the arrows (or `hjkl`) move and play the sound under the
@@ -25,10 +25,10 @@ enum Pick {
     Quit,
 }
 
-/// `qoro sound`
+/// `qoop sound`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
-        return Err(std::io::Error::other("usage: qoro sound"));
+        return Err(std::io::Error::other("usage: qoop sound"));
     }
     let macos = cfg!(target_os = "macos");
     let list: Vec<&'static str> = config::sounds_here()
@@ -99,7 +99,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         println!("{line}");
     }
     if said.iter().any(|line| line.ends_with('"')) {
-        println!("a running qoro takes it within two seconds");
+        println!("a running qoop takes it within two seconds");
     }
     result
 }

@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 /// Overrides the runtime directory: where this user's daemon lives. It exists so
 /// integration tests, which run in parallel, each get their own daemon and socket, and so a
 /// contributor running the suite does not attach to their own working daemon.
-pub const RUNTIME_DIR_ENV: &str = "QORO_RUNTIME_DIR";
+pub const RUNTIME_DIR_ENV: &str = "QOOP_RUNTIME_DIR";
 
 /// What named a session, when there were several. Still read, so a shell or a login item
 /// left from then is told where its session went instead of reaching the wrong daemon.
-pub const SESSION_ENV: &str = "QORO_SESSION";
+pub const SESSION_ENV: &str = "QOOP_SESSION";
 
 /// The one daemon's directory under `sessions/`, the name the default session had, so the
 /// state of everyone who used it is where it always was.
@@ -29,7 +29,7 @@ pub enum PathError {
     NotADirectory(PathBuf),
     #[error(
         "named sessions were replaced by spaces, so {name:?} is not opened any more; its \
-         files are at {dir}, and to use them instead of the default, stop qoro and swap \
+         files are at {dir}, and to use them instead of the default, stop qoop and swap \
          that directory with {default}",
         dir = .dir.display(),
         default = .default.display()
@@ -64,14 +64,14 @@ pub fn runtime_dir() -> Result<PathBuf, PathError> {
     Ok(dir)
 }
 
-/// Where the runtime directory is when `QORO_RUNTIME_DIR` does not name one:
-/// `$XDG_RUNTIME_DIR/qoro`, else `qoro-<uid>` in the temp directory. Nothing is created or
-/// checked. A service that pins `QORO_RUNTIME_DIR` compares against this to know whether the
+/// Where the runtime directory is when `QOOP_RUNTIME_DIR` does not name one:
+/// `$XDG_RUNTIME_DIR/qoop`, else `qoop-<uid>` in the temp directory. Nothing is created or
+/// checked. A service that pins `QOOP_RUNTIME_DIR` compares against this to know whether the
 /// pin only repeats it (a pinned one also moves the daemon's state, see `state_location`).
 pub fn default_runtime_base() -> PathBuf {
     match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(xdg) => Path::new(&xdg).join("qoro"),
-        Err(_) => std::env::temp_dir().join(format!("qoro-{}", current_uid())),
+        Ok(xdg) => Path::new(&xdg).join("qoop"),
+        Err(_) => std::env::temp_dir().join(format!("qoop-{}", current_uid())),
     }
 }
 
@@ -91,8 +91,8 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
     Ok(dir)
 }
 
-/// The person's own qoro configuration directory: `$XDG_CONFIG_HOME/qoro`, else
-/// `~/.config/qoro`.
+/// The person's own qoop configuration directory: `$XDG_CONFIG_HOME/qoop`, else
+/// `~/.config/qoop`.
 ///
 /// One resolver, because the hooks, the agent-detection overrides, the avatar, the saved
 /// remotes and the interface's own settings all live here, and three copies of this lookup
@@ -102,7 +102,7 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
 ///
 /// The XDG spec's rule, which the hand-copied lookups skipped: an empty or relative
 /// `XDG_CONFIG_HOME` is ignored. Taken as is, a relative one put the hook scripts under
-/// whatever directory `qoro hooks install` ran in, and registered a relative command that
+/// whatever directory `qoop hooks install` ran in, and registered a relative command that
 /// broke from every other directory.
 pub fn config_dir() -> PathBuf {
     config_dir_from(
@@ -117,11 +117,11 @@ fn config_dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsStr
         .filter(|p| p.is_absolute())
         .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("qoro")
+        .join("qoop")
 }
 
 pub fn socket_path(dir: &Path) -> PathBuf {
-    dir.join("qorod.sock")
+    dir.join("qoopd.sock")
 }
 
 /// The same directory as `config_dir`, for the files a key depends on: the paired devices
@@ -131,7 +131,7 @@ pub fn socket_path(dir: &Path) -> PathBuf {
 pub fn strict_config_dir() -> Option<PathBuf> {
     let base =
         absolute_env("XDG_CONFIG_HOME").or_else(|| Some(absolute_env("HOME")?.join(".config")))?;
-    Some(base.join("qoro"))
+    Some(base.join("qoop"))
 }
 
 /// An environment variable naming a directory, only when it is absolute. An empty or
@@ -144,54 +144,54 @@ fn absolute_env(var: &str) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
-/// `$XDG_DATA_HOME/qoro`, else `~/Library/Application Support/qoro` on macOS and
-/// `~/.local/share/qoro` elsewhere: where this machine's own key lives.
+/// `$XDG_DATA_HOME/qoop`, else `~/Library/Application Support/qoop` on macOS and
+/// `~/.local/share/qoop` elsewhere: where this machine's own key lives.
 ///
 /// Not the config directory on purpose. Config directories end up in dotfiles repositories,
 /// and a machine key that lands in one is a key anyone who reads the repository can use to
 /// pose as this Mac.
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(xdg) = absolute_env("XDG_DATA_HOME") {
-        return Some(xdg.join("qoro"));
+        return Some(xdg.join("qoop"));
     }
     let home = absolute_env("HOME")?;
     Some(if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/qoro")
+        home.join("Library/Application Support/qoop")
     } else {
-        home.join(".local/share/qoro")
+        home.join(".local/share/qoop")
     })
 }
 
-/// `$XDG_CACHE_HOME/qoro`, else `~/Library/Caches/qoro` on macOS and `~/.cache/qoro`
-/// elsewhere: what qoro can build again (the notch app), so backups may skip it.
+/// `$XDG_CACHE_HOME/qoop`, else `~/Library/Caches/qoop` on macOS and `~/.cache/qoop`
+/// elsewhere: what qoop can build again (the notch app), so backups may skip it.
 pub fn cache_dir() -> Option<PathBuf> {
     if let Some(xdg) = absolute_env("XDG_CACHE_HOME") {
-        return Some(xdg.join("qoro"));
+        return Some(xdg.join("qoop"));
     }
     let home = absolute_env("HOME")?;
     Some(if cfg!(target_os = "macos") {
-        home.join("Library/Caches/qoro")
+        home.join("Library/Caches/qoop")
     } else {
-        home.join(".cache/qoro")
+        home.join(".cache/qoop")
     })
 }
 
-/// Where qoro's own services write their logs: `~/Library/Logs/qoro` on macOS, where
-/// Console finds them; elsewhere `$XDG_STATE_HOME/qoro/log`, else `~/.local/state/qoro/log`.
+/// Where qoop's own services write their logs: `~/Library/Logs/qoop` on macOS, where
+/// Console finds them; elsewhere `$XDG_STATE_HOME/qoop/log`, else `~/.local/state/qoop/log`.
 pub fn logs_dir() -> Option<PathBuf> {
     let home = absolute_env("HOME")?;
     if cfg!(target_os = "macos") {
-        return Some(home.join("Library/Logs/qoro"));
+        return Some(home.join("Library/Logs/qoop"));
     }
     Some(
         absolute_env("XDG_STATE_HOME")
             .unwrap_or_else(|| home.join(".local/state"))
-            .join("qoro/log"),
+            .join("qoop/log"),
     )
 }
 
 /// qass, the assistant over the other agents: the files its owner writes (its `policy`,
-/// the `lessons` it keeps from him), beside the rest of his qoro settings.
+/// the `lessons` it keeps from him), beside the rest of his qoop settings.
 pub fn qass_config_dir() -> PathBuf {
     config_dir().join("qass")
 }
@@ -209,7 +209,7 @@ pub fn qass_data_dir() -> Option<PathBuf> {
 /// cleared at logout: a sleeping space kept there did not survive either. So it is
 /// `data_dir()`, beside this machine's key.
 ///
-/// With `QORO_RUNTIME_DIR` set it is the session directory itself, as before. Every test
+/// With `QOOP_RUNTIME_DIR` set it is the session directory itself, as before. Every test
 /// isolates its daemon through that variable, and a test daemon must never write into the
 /// person's real data directory. Also the session directory when there is no home to
 /// resolve a data directory from.
@@ -242,7 +242,7 @@ pub fn state_dir(session: &Path) -> Result<PathBuf, PathError> {
 }
 
 /// Where `state_dir` is, without creating or checking anything, for a reader such as
-/// `qoro ls` that must not leave a directory behind.
+/// `qoop ls` that must not leave a directory behind.
 pub fn state_location(session: &Path) -> PathBuf {
     state_location_from(
         std::env::var_os(RUNTIME_DIR_ENV).is_some(),
@@ -296,10 +296,10 @@ pub fn only_default(name: &str, base: &Path) -> Result<(), PathError> {
 }
 
 pub fn lock_path(dir: &Path) -> PathBuf {
-    dir.join("qorod.lock")
+    dir.join("qoopd.lock")
 }
 
-/// Where `qoro update --check` leaves the newest version it saw on GitHub Releases.
+/// Where `qoop update --check` leaves the newest version it saw on GitHub Releases.
 ///
 /// A plain file holding a version like `0.4.0`, so the interface can show it without
 /// touching the network: the TUI never fetches, it only reads this file. Built without
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn state_stays_in_an_explicit_runtime_directory() {
         let session = Path::new("/tmp/rt/sessions/default");
-        let data = PathBuf::from("/Users/a/Library/Application Support/qoro");
+        let data = PathBuf::from("/Users/a/Library/Application Support/qoop");
         assert_eq!(
             state_location_from(true, Some(data.clone()), session),
             session
@@ -517,17 +517,17 @@ mod tests {
     #[test]
     fn an_empty_or_relative_config_home_falls_back_to_home() {
         let home = Some(std::ffi::OsString::from("/Users/a"));
-        let fallback = PathBuf::from("/Users/a/.config/qoro");
+        let fallback = PathBuf::from("/Users/a/.config/qoop");
         assert_eq!(config_dir_from(Some("".into()), home.clone()), fallback);
         assert_eq!(config_dir_from(Some("cfg".into()), home.clone()), fallback);
         assert_eq!(config_dir_from(None, home.clone()), fallback);
         assert_eq!(
             config_dir_from(Some("/x/cfg".into()), home),
-            PathBuf::from("/x/cfg/qoro")
+            PathBuf::from("/x/cfg/qoop")
         );
         assert_eq!(
             config_dir_from(None, None),
-            std::env::temp_dir().join("qoro")
+            std::env::temp_dir().join("qoop")
         );
     }
 

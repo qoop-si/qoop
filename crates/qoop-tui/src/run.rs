@@ -192,15 +192,15 @@ const CONNECTING: &str = "connecting";
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
 /// Said, not fetched: the interface never touches the network, it only reads the notice
-/// `qoro update --check` left beside the sessions. The install itself runs outside, as
-/// `qoro update`, which also moves every machine's daemon onto it.
+/// `qoop update --check` left beside the sessions. The install itself runs outside, as
+/// `qoop update`, which also moves every machine's daemon onto it.
 fn update_message() -> String {
     match qoop_runtime::paths::read_update_notice() {
         Some(seen) if qoop_runtime::paths::is_newer_version(&seen, env!("CARGO_PKG_VERSION")) => {
-            format!("update {seen} is ready: run `qoro update`")
+            format!("update {seen} is ready: run `qoop update`")
         }
         _ => format!(
-            "qoro {} is current: `qoro update --check` looks for more",
+            "qoop {} is current: `qoop update --check` looks for more",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -233,7 +233,7 @@ const STUCK_TRIES: usize = 3;
 /// second, enough for a sweep across thirty columns to read as motion rather than jumps.
 const MOTION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
 
-/// How often agent costs are sampled while `QORO_USAGE=1`: often enough to follow a
+/// How often agent costs are sampled while `QOOP_USAGE=1`: often enough to follow a
 /// build, seldom enough that the percent is a real average and not noise.
 const USAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -242,7 +242,7 @@ const USAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the terminal under the keyboard is waited for after it went from the index. A
-/// remote daemon moving onto a newer qoro ends its tabs and brings them back with the same
+/// remote daemon moving onto a newer qoop ends its tabs and brings them back with the same
 /// numbers a few seconds later, and the keyboard goes back to the same one rather than to
 /// the first tab of the space.
 const FOCUS_RETURN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -255,9 +255,9 @@ const DOUBLE_CLICK_MS: u64 = 500;
 /// short enough to never be in the way.
 const TOAST_MS: u64 = 2500;
 
-/// Whether the person asked to see what agents cost: `QORO_USAGE=1`, and nothing else.
+/// Whether the person asked to see what agents cost: `QOOP_USAGE=1`, and nothing else.
 fn usage_on() -> bool {
-    std::env::var("QORO_USAGE").is_ok_and(|v| v.trim() == "1")
+    std::env::var("QOOP_USAGE").is_ok_and(|v| v.trim() == "1")
 }
 
 /// Work done off the loop's own thread, handed back when it is done.
@@ -297,7 +297,7 @@ fn last_answer(program: &str, session: Option<&str>) -> Result<String, String> {
     )
     .map_err(|e| match e {
         qoop_history::Error::MissingId { .. } => {
-            "this agent has not reported a session yet: qoro hooks install makes it".to_string()
+            "this agent has not reported a session yet: qoop hooks install makes it".to_string()
         }
         other => other.to_string(),
     })?;
@@ -362,12 +362,12 @@ fn apply_usage(
     state.usage = next;
 }
 
-/// Whether the column may move at all: yes, unless `QORO_MOTION=0` is set.
+/// Whether the column may move at all: yes, unless `QOOP_MOTION=0` is set.
 /// Motion has its own flag on purpose. `NO_COLOR` stops colour, not movement;
 /// the shimmer that needs colour already degrades to a still marker through
 /// the colour level, so the two switches never fight.
 fn motion_on() -> bool {
-    std::env::var("QORO_MOTION").map_or(true, |v| v.trim() != "0")
+    std::env::var("QOOP_MOTION").map_or(true, |v| v.trim() != "0")
 }
 
 /// Whether the outer terminal reports the mouse usefully, decided from the
@@ -500,7 +500,7 @@ struct State {
     split_origin: std::collections::BTreeMap<String, (i64, u32)>,
     /// Agent commands waiting for their tab, by request id: the line to type once
     /// the shell is there. The daemon only starts a shell (ADR-015), so an agent
-    /// is typed the way `qoro new -- <agent>` types it. Consumed by the
+    /// is typed the way `qoop new -- <agent>` types it. Consumed by the
     /// `TerminalCreated`/`Failed` answer, with the name the person gave the tab, if
     /// any, which waits for its conversation.
     pending_agents: std::collections::BTreeMap<String, (String, Option<String>)>,
@@ -526,7 +526,7 @@ struct State {
     pending_focus: Option<u32>,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
-    /// A terminal to show once an index lists it, and until when: one `qoro focus` named
+    /// A terminal to show once an index lists it, and until when: one `qoop focus` named
     /// before this interface listed it (a launcher that opens one and shows it at once gets
     /// there first), or the focused one that went from the index and may come back. Past
     /// its deadline, a terminal that never came is forgotten rather than jumped to.
@@ -583,7 +583,7 @@ struct State {
     /// The id of the install last asked for. Its success is always said; only while it is
     /// still standing does the list of the machine's sessions follow on its own.
     installing: Option<String>,
-    /// A machine to ask about its sessions again, once the loop can write: qoro was just
+    /// A machine to ask about its sessions again, once the loop can write: qoop was just
     /// installed there.
     reprobe: Option<String>,
     /// A machine just connected from here, whose first tab the screen moves to when it
@@ -632,7 +632,7 @@ struct State {
     prefix_pending: bool,
     /// An agent's last answer, open as a page over the pane.
     answer: Option<crate::answer::Answer>,
-    /// What each local agent costs, as last sampled. Empty unless `QORO_USAGE=1`.
+    /// What each local agent costs, as last sampled. Empty unless `QOOP_USAGE=1`.
     usage: sidebar::Usage,
     /// Each sampled terminal's group, when it was read, and each member's CPU nanoseconds
     /// then, for the next sample's percent.
@@ -2292,7 +2292,7 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "",
         "re-read the agent detection overrides",
     ),
-    ("connect a machine", "", "another machine's qoro, over ssh"),
+    ("connect a machine", "", "another machine's qoop, over ssh"),
     ("detach", "d", "leave, and keep everything running"),
 ];
 
@@ -2313,7 +2313,7 @@ pub enum MenuKind {
         name: String,
         agents: Vec<crate::config::Launcher>,
     },
-    /// A machine being connected has no qoro: put this version there, or not.
+    /// A machine being connected has no qoop: put this version there, or not.
     Install {
         target: String,
         platform: String,
@@ -2363,7 +2363,7 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             .collect(),
         MenuKind::Install { platform, .. } => vec![
             (
-                format!("install qoro {} there", env!("CARGO_PKG_VERSION")),
+                format!("install qoop {} there", env!("CARGO_PKG_VERSION")),
                 platform.clone(),
             ),
             ("cancel".to_string(), String::new()),
@@ -2391,7 +2391,7 @@ pub fn menu_title(kind: &MenuKind) -> String {
         // As root said out loud: every agent started there will run as root.
         MenuKind::Install { target, root, .. } => {
             let who = if *root { " as root" } else { "" };
-            format!(" no qoro on {target}{who}")
+            format!(" no qoop on {target}{who}")
         }
     }
 }
@@ -2509,7 +2509,7 @@ fn agents_on(
 /// type once the tab opens.
 ///
 /// The daemon only starts a shell (ADR-015): the command is typed, never spawned,
-/// the same path `qoro new -- <agent>` takes. The tab takes the command's first
+/// the same path `qoop new -- <agent>` takes. The tab takes the command's first
 /// word as its name, so it reads as the agent until renamed, unless the person
 /// gave it one: that goes on the tab now and on its conversation once the agent
 /// says which one it is in. Empty commands never reach here: the prompt treats
@@ -2664,7 +2664,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             *request += 1;
             let id = format!("install-{request}");
             state.installing = Some(id.clone());
-            state.message = Some(format!("installing qoro on {target}"));
+            state.message = Some(format!("installing qoop on {target}"));
             return MenuSend::Control(ControlRequest::InstallRemote { id, target });
         }
     }
@@ -2797,15 +2797,15 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             MenuSend::Nothing
         }
         "settings" => {
-            // The page is its own program, `qoro settings`, in a tab of its own: `exec`, so
+            // The page is its own program, `qoop settings`, in a tab of its own: `exec`, so
             // the tab goes when the page closes. By name, so a remote space runs that
-            // machine's qoro on that machine's file.
+            // machine's qoop on that machine's file.
             *request += 1;
             let space = state.space;
             MenuSend::Control(start_agent_terminal(
                 state,
                 *request,
-                "exec qoro settings",
+                "exec qoop settings",
                 space,
                 Some("settings".to_string()),
             ))
@@ -3156,7 +3156,7 @@ fn answer_prompt(
             name: name.unwrap_or_else(|| next_space_name(state)),
         }],
         // An address is what the box is for: empty is a cancel, as with a space's name.
-        // Asked of the machine first, by the mux: one with no qoro answers with an offer
+        // Asked of the machine first, by the mux: one with no qoop answers with an offer
         // to put it there.
         Naming::Remote => name
             .map(|target| {
@@ -3765,7 +3765,7 @@ impl State {
         };
     }
 
-    /// Where the drawer is going, at once: for `QORO_MOTION=0`, which has no frames.
+    /// Where the drawer is going, at once: for `QOOP_MOTION=0`, which has no frames.
     fn settle_drawer(&mut self) {
         self.drawer = self.drawer.filter(|d| d.open).map(|d| Drawer {
             shown: sidebar::DRAWER,
@@ -3865,7 +3865,7 @@ fn wake(state: &mut State, space: i64, tab: u32, request: &mut u64) {
     });
 }
 
-/// Whether an index says a space was put to sleep or woken somewhere else (`qoro sleep`,
+/// Whether an index says a space was put to sleep or woken somewhere else (`qoop sleep`,
 /// another client): nothing announces it but its tabs leaving or coming back, so an awake
 /// space that held tabs and now lists none, or a sleeping one with tabs listed, asks for
 /// the space list again.
@@ -5052,7 +5052,7 @@ impl LastFocus {
 }
 
 /// The interface over a connection that has already done its handshake: a local socket,
-/// an `ssh` running `qoro relay`, or the mux that puts several daemons behind one stream.
+/// an `ssh` running `qoop relay`, or the mux that puts several daemons behind one stream.
 pub async fn run_stream<S>(
     stream: S,
     leftover: BytesMut,
@@ -5064,7 +5064,7 @@ where
 {
     let guard = TerminalGuard::enter_raw()?;
     // A panic must not leave the outer terminal raw either, which is the one failure a
-    // person cannot recover from without knowing that `qoro reset` exists.
+    // person cannot recover from without knowing that `qoop reset` exists.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         TerminalGuard::restore();
@@ -5359,7 +5359,7 @@ where
     // can be answered once per machine, and a late answer must not open the gate early.
     let mut index_id = String::new();
     let mut index_owed = false;
-    // The column moves only while something works and motion is on: `QORO_MOTION=0`
+    // The column moves only while something works and motion is on: `QOOP_MOTION=0`
     // keeps it still. The next frame's deadline, when one is armed.
     let motion = motion_on();
     let mut motion_at: Option<tokio::time::Instant> = None;
@@ -7445,7 +7445,7 @@ where
                                 // client did, and re-reading the index converges it.
                                 refresh = true;
                             }
-                            // `qoro focus`, from a notch or a launcher: the same switch a
+                            // `qoop focus`, from a notch or a launcher: the same switch a
                             // click on the row makes. A terminal this interface does not
                             // list yet waits for the index that names it.
                             Incoming::Event(EventMessage::Focus { terminal }) => {
@@ -7497,7 +7497,7 @@ where
                                         | ControlResponse::WorkspaceAwake { .. }
                                 );
                                 // A row in a space this client does not list: another
-                                // client (`qoro new --space`) made it, and no answer
+                                // client (`qoop new --space`) made it, and no answer
                                 // here said so. Asked for once the first list is in,
                                 // so the bootstrap does not ask twice. A slept row can
                                 // outlive its space, and would ask on every refresh.
@@ -7556,7 +7556,7 @@ where
                             &mut control_seq,
                         )?).await?;
                     }
-                    // qoro was just put on a machine the person is connecting: connect it now,
+                    // qoop was just put on a machine the person is connecting: connect it now,
                     // as if it had been there all along.
                     if let Some(target) = state.reprobe.take() {
                         request += 1;
@@ -7715,7 +7715,7 @@ where
                     state.toast = None;
                     dirty = true;
                 }
-                // The next cost sample, armed only while `QORO_USAGE=1`.
+                // The next cost sample, armed only while `QOOP_USAGE=1`.
                 _ = async {
                     match usage_at {
                         Some(at) => tokio::time::sleep_until(at).await,
@@ -7845,7 +7845,7 @@ fn exit_trailer_with(drops: bool) -> Vec<u8> {
 }
 
 /// Whether `config.toml` changed since it was last seen, by its modified time: a change from
-/// `qoro settings` in a tab, `qoro sound`, `qoro config set` or an editor. A file that is
+/// `qoop settings` in a tab, `qoop sound`, `qoop config set` or an editor. A file that is
 /// gone, or comes back, counts as a change too.
 fn config_moved(state: &mut State) -> bool {
     let now = config_stamp();
@@ -9596,7 +9596,7 @@ fn unfocus(state: &mut State, why: &str, control_seq: &mut u32) -> io::Result<Op
 }
 
 /// Open the list an answer about another machine brings (its sessions, or the offer to
-/// install qoro there), but only as the answer to the question still standing and only
+/// install qoop there), but only as the answer to the question still standing and only
 /// over nothing else. An answer can take seconds, and a list that opened over a box the
 /// person has moved on to, or one too big to be painted, would still take their keys.
 fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
@@ -9845,7 +9845,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         } if id.starts_with("sleep-tab-") => {
             state.message = None;
             state.hint = Some(
-                "the running daemon is older: the whole space slept; restart it (qoro stop) \
+                "the running daemon is older: the whole space slept; restart it (qoop stop) \
                  to sleep one tab"
                     .to_string(),
             );
@@ -9968,7 +9968,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         }
         // A sleep or wake the daemon refused: the reason names the tab and why, and it stays
         // on the hint row until the person does something, rather than one frame.
-        // What came of putting a newer qoro on a remote, said by the mux unasked: the same
+        // What came of putting a newer qoop on a remote, said by the mux unasked: the same
         // row as its waiting line, for the same reason.
         ControlResponse::Failed { id, reason } if id == crate::mux::UPDATE_NOTICE => {
             state.hint = Some(reason);
@@ -10113,7 +10113,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             state.sized.retain(|t, _| live.contains(t));
             if state.focused != 0 && !agents.iter().any(|r| r.terminal == state.focused) {
                 // Kept for a while in case it comes back under the same number, which a
-                // remote daemon moving onto a newer qoro does. One that is gone for good is
+                // remote daemon moving onto a newer qoop does. One that is gone for good is
                 // never listed again and is forgotten. A terminal asked for by name is an
                 // ask of the person's own, and stays the one waited for; an earlier tab of
                 // theirs that went (one they closed) gives way to this one.
@@ -10635,7 +10635,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             state.split_saving = state.split_saving.saturating_sub(1);
         }
 
-        // No qoro on the machine being connected: a list offering to put it there. Opened only
+        // No qoop on the machine being connected: a list offering to put it there. Opened only
         // as the answer to the question still standing, and only over nothing else: an answer
         // can take seconds, and a list that opened over a box the person has moved on to
         // would take their keys.
@@ -10663,14 +10663,14 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             target,
             version,
         } => {
-            state.message = Some(format!("installed qoro {version} on {target}"));
+            state.message = Some(format!("installed qoop {version} on {target}"));
             if state.installing.as_deref() == Some(id.as_str()) {
                 state.installing = None;
                 state.reprobe = Some(target);
             }
             *dirty = true;
         }
-        // A remote that will move onto a newer qoro once nothing there is working, and what
+        // A remote that will move onto a newer qoop once nothing there is working, and what
         // it waits on, or that it has moved: the mux words it, and says it once. On the
         // hint row, which stays until the person does something: the notice row is
         // cleared by the next render of the tab in front of them, which a working agent
@@ -11513,7 +11513,7 @@ mod tests {
             agent(1, 1, "claude", "working"),
             agent(2, 1, "codex", "idle"),
         ];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         s.armed = Some(1);
         armed_key(&mut s, 1, b"y", &mut request);
@@ -11591,7 +11591,7 @@ mod tests {
     fn a_second_close_does_not_overwrite_the_first() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "working")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let asked = s.modes.outbox.len();
@@ -11608,7 +11608,7 @@ mod tests {
     fn a_close_of_somebody_elses_space_leaves_ours_alone() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "working")];
-        s.spaces = vec![space(1, "qoro"), space(2, "other")];
+        s.spaces = vec![space(1, "qoop"), space(2, "other")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let mut dirty = false;
@@ -11635,7 +11635,7 @@ mod tests {
     fn a_tab_that_refuses_the_close_is_asked_again() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "working")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let id = match &s.modes.outbox[0] {
@@ -11705,7 +11705,7 @@ mod tests {
     fn the_space_is_asked_to_close_exactly_once() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "working")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let mut dirty = false;
@@ -11767,7 +11767,7 @@ mod tests {
     fn a_sleeping_space_is_asked_to_close_when_its_tabs_are_gone() {
         let mut s = state();
         s.rows.clear();
-        s.spaces = vec![asleep(1, "qoro", &[4, 5, 6])];
+        s.spaces = vec![asleep(1, "qoop", &[4, 5, 6])];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let mut dirty = false;
@@ -11809,7 +11809,7 @@ mod tests {
             &mut s,
             ControlResponse::Workspaces {
                 id: "spaces".into(),
-                workspaces: vec![asleep(1, "qoro", &[])],
+                workspaces: vec![asleep(1, "qoop", &[])],
             },
             &mut request,
             &mut dirty,
@@ -11867,7 +11867,7 @@ mod tests {
     fn a_refused_ctrl_a_w_does_not_re_ask_our_space() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "working")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         apply(
@@ -11946,7 +11946,7 @@ mod tests {
     fn a_sleeping_space_is_counted_by_its_store_rows_and_not_by_the_index() {
         let mut s = state();
         s.rows.clear();
-        s.spaces = vec![asleep(1, "qoro", &[4, 5, 6])];
+        s.spaces = vec![asleep(1, "qoop", &[4, 5, 6])];
         assert!(!space_is_empty(&s, 1), "a sleeping space is not empty");
         assert_eq!(tabs_left(&s, 1), 3, "the index has none of them");
         let mut request = 0u64;
@@ -11983,7 +11983,7 @@ mod tests {
             agent(2, 1, "claude", "working"),
             agent(3, 1, "claude", "working"),
         ];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         assert!(start_close(&mut s, 1, &mut request), "the close started");
         let mut asked: Vec<u32> = Vec::new();
@@ -12042,7 +12042,7 @@ mod tests {
             agent(1, 1, "claude", "working"),
             agent(2, 1, "codex", "idle"),
         ];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let mut dirty = false;
@@ -12115,7 +12115,7 @@ mod tests {
         s.rows = vec![agent(4, 1, "claude", "idle")];
         // A space that fell asleep between this client's last index and the click: the
         // store still lists tab 4 and the index still lists it too.
-        s.spaces = vec![asleep(1, "qoro", &[4, 5])];
+        s.spaces = vec![asleep(1, "qoop", &[4, 5])];
         arm_close(&mut s, 1);
         let asked = s.message.clone().unwrap_or_default();
         assert!(asked.contains("2 tabs"), "{asked:?}");
@@ -12139,7 +12139,7 @@ mod tests {
     fn a_click_that_changes_the_view_puts_the_question_down() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         assert_eq!(s.armed, Some(1), "the question never went up");
         // The row and the columns the paint actually drew, read out of the column the
@@ -12183,7 +12183,7 @@ mod tests {
             let asked = put_question_down(&mut s, hit);
             assert_eq!(asked, Some(1), "{what}: there was no question to put down");
             assert_eq!(s.armed, None, "{what}: {about} left the question asking");
-            assert_eq!(s.message.as_deref(), Some("kept qoro"), "{what}: {about}");
+            assert_eq!(s.message.as_deref(), Some("kept qoop"), "{what}: {about}");
         }
         // And the three clicks that are about the question keep it, because the arm
         // behind them is what puts it back up.
@@ -12211,7 +12211,7 @@ mod tests {
     fn a_tab_behind_a_given_up_one_gets_its_own_retries() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle"), agent(2, 1, "codex", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         start_close(&mut s, 1, &mut request);
         let mut dirty = false;
@@ -12268,7 +12268,7 @@ mod tests {
     fn half_a_mouse_report_is_not_an_answer() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         assert_eq!(s.armed, Some(1));
         assert!(
@@ -12314,7 +12314,7 @@ mod tests {
     fn a_close_arms_the_give_up_timer_where_it_is_created() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         let mut request = 0u64;
         let prefix = s.config.prefix;
@@ -12327,7 +12327,7 @@ mod tests {
         // The click path needs no flag: it is in scope where the close begins.
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         let mut request = 0u64;
         assert!(
@@ -12341,7 +12341,7 @@ mod tests {
     fn a_close_from_the_key_arms_the_give_up_timer() {
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         let mut request = 0u64;
         let prefix = s.config.prefix;
@@ -12354,7 +12354,7 @@ mod tests {
         // And the click path does it without the flag at all, because it is in scope.
         let mut s = state();
         s.rows = vec![agent(1, 1, "claude", "idle")];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         let mut request = 0u64;
         assert!(
@@ -12370,11 +12370,11 @@ mod tests {
             agent(1, 1, "claude", "working"),
             agent(2, 1, "codex", "idle"),
         ];
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         arm_close(&mut s, 1);
         assert_eq!(s.armed, Some(1));
         let asked = s.message.clone().unwrap_or_default();
-        assert!(asked.contains("close qoro?"), "{asked:?}");
+        assert!(asked.contains("close qoop?"), "{asked:?}");
         assert!(asked.contains("2 tabs"), "{asked:?}");
         assert!(asked.contains("claude in tab 1 is working"), "{asked:?}");
     }
@@ -12383,12 +12383,12 @@ mod tests {
     #[test]
     fn any_key_answers_a_space_question() {
         let mut s = state();
-        s.spaces = vec![space(1, "qoro")];
+        s.spaces = vec![space(1, "qoop")];
         let mut request = 0u64;
         s.armed = Some(1);
         armed_key(&mut s, 1, b"n", &mut request);
         assert_eq!(s.armed, None);
-        assert_eq!(s.message.as_deref(), Some("kept qoro"));
+        assert_eq!(s.message.as_deref(), Some("kept qoop"));
         assert!(s.closing.is_none(), "nothing was sent");
     }
 
@@ -12548,7 +12548,7 @@ mod tests {
             .expect("focused row")
             .cwd = Some(
             std::env::temp_dir()
-                .join("qoro-no-such-dir")
+                .join("qoop-no-such-dir")
                 .display()
                 .to_string(),
         );
@@ -15397,7 +15397,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "4\n");
     }
 
-    /// `qoro focus` for a terminal not listed yet: waited for, shown once an index names
+    /// `qoop focus` for a terminal not listed yet: waited for, shown once an index names
     /// it, and not jumped to when it arrives long after the ask.
     #[test]
     fn a_focus_ahead_of_the_index_lands_when_the_index_catches_up() {
@@ -15837,9 +15837,9 @@ mod tests {
         assert_eq!(state.pending_focus, None);
     }
 
-    /// A remote daemon moving onto a newer qoro ends its tabs and brings them back with the
+    /// A remote daemon moving onto a newer qoop ends its tabs and brings them back with the
     /// same numbers. The keyboard goes back to the tab it was on, not to the first tab of
-    /// the space, and an interface showing only that remote (`qoro --remote`) stays open
+    /// the space, and an interface showing only that remote (`qoop --remote`) stays open
     /// across the gap rather than ending with nothing listed.
     #[test]
     fn the_focused_tab_takes_the_keyboard_back_after_its_remote_restarts() {
@@ -16012,7 +16012,7 @@ mod tests {
         assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(9));
     }
 
-    /// The answer to the ask that a remote move to a newer qoro is one line on the bar.
+    /// The answer to the ask that a remote move to a newer qoop is one line on the bar.
     #[test]
     fn a_remote_waiting_to_move_says_why_once() {
         let mut state = state();
@@ -16021,7 +16021,7 @@ mod tests {
             &mut state,
             ControlResponse::RestartArmed {
                 id: crate::mux::UPDATE_NOTICE.into(),
-                waiting_on: Some("devbox moves to the new qoro once nothing there is working; now waiting on tab 3".into()),
+                waiting_on: Some("devbox moves to the new qoop once nothing there is working; now waiting on tab 3".into()),
             },
             &mut 0,
             &mut dirty,
@@ -16833,10 +16833,10 @@ mod tests {
         );
     }
 
-    /// A machine with no qoro opens the offer to install it, under the same rules as the
+    /// A machine with no qoop opens the offer to install it, under the same rules as the
     /// session list, with the platform on the row and root said in the title.
     #[test]
-    fn a_machine_without_qoro_offers_the_install() {
+    fn a_machine_without_qoop_offers_the_install() {
         let mut state = bare_state();
         state.probing = Some("probe-1".into());
         let mut dirty = false;
@@ -16853,7 +16853,7 @@ mod tests {
         );
         assert_eq!(state.menu, Some(0));
         let rows = menu_rows(&state.menu_kind);
-        assert!(rows[0].0.starts_with("install qoro "), "{rows:?}");
+        assert!(rows[0].0.starts_with("install qoop "), "{rows:?}");
         assert_eq!(rows[0].1, "linux x86_64");
         assert_eq!(rows[1].0, "cancel");
         assert!(menu_title(&state.menu_kind).contains("as root"));
@@ -17281,7 +17281,7 @@ mod tests {
         assert!(state.shut.contains(&2), "a space falling asleep folds");
         assert!(!state.done);
 
-        // `qoro sleep app` from a shell: the index loses its tabs first, the space list
+        // `qoop sleep app` from a shell: the index loses its tabs first, the space list
         // follows. A sleeping remote space keeps nothing open either.
         state.pending_focus = None;
         index(&mut state, vec![]);

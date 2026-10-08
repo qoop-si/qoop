@@ -48,7 +48,7 @@ ground, or ground on cream.
 - `brand/q-mark-dark.svg`, `brand/q-mark-light.svg`: the q alone as an app icon, the nine
   dots dead centre and the tail below them, outside the centring.
 - `brand/q-mark-bare-on-dark.svg`, `brand/q-mark-bare-on-light.svg`: the same with no tile.
-- `brand/qoro-word-*.svg`: the word; the three rows centred on the height, the q's tail under
+- `brand/qoop-word-*.svg`: the word; the three rows centred on the height, the q's tail under
   the line, the r's first dot in ember too.
 
 `brand/make.py` draws all of them (`uv run --no-project python docs/brand/make.py`).
@@ -76,7 +76,7 @@ and the widest pet side by side, fewer than the narrowest the column drags to.
 A column too narrow for that falls back to the word in braille (`⣖⡆⣖⡆⡖⠀⣖⡆`), cream letters on
 the lower three dot rows of its row, and the q's tail as one ember dot (`⠁`) alone on the row
 under it; there the r's first dot shares its cell with the r's stem and stays cream. Where
-braille is not drawn that small word is `● qoro` in ember.
+braille is not drawn that small word is `● qoop` in ember.
 
 ## State marks
 

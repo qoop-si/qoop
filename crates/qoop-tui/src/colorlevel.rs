@@ -6,7 +6,7 @@
 //! environment, maps truecolour pane content down to the 256 palette when the
 //! terminal cannot take it, and wraps queries for tmux passthrough.
 //!
-//! Detection order, most certain first: an explicit `QORO_COLOR` override, the
+//! Detection order, most certain first: an explicit `QOOP_COLOR` override, the
 //! safety floor (`dumb`, the `linux` console, legacy conhost), `NO_COLOR`,
 //! `COLORTERM`, a conservative Apple Terminal default, `TERM` suffix hints,
 //! then the 256 default. The floor comes before `COLORTERM` on purpose: a
@@ -121,7 +121,7 @@ pub struct Env {
     /// Explicit override. `none`, `mono` or `0` mean mono, `256` or `palette`
     /// mean the palette, `true`, `truecolor` or `24bit` mean truecolour.
     /// Anything else is ignored. Beats `NO_COLOR`, per the no-color.org FAQ.
-    pub qoro_color: Option<String>,
+    pub qoop_color: Option<String>,
     pub term: Option<String>,
     pub colorterm: Option<String>,
     pub term_program: Option<String>,
@@ -149,7 +149,7 @@ pub fn current_env() -> Env {
     let var = |name: &str| std::env::var(name).ok();
     let set = |name: &str| std::env::var_os(name).is_some();
     Env {
-        qoro_color: var("QORO_COLOR"),
+        qoop_color: var("QOOP_COLOR"),
         term: var("TERM"),
         colorterm: var("COLORTERM"),
         term_program: var("TERM_PROGRAM"),
@@ -170,7 +170,7 @@ pub fn current_env() -> Env {
 
 /// Decide the level from the environment. Pure, so the precedence is tested.
 pub fn detect_from(env: &Env) -> Level {
-    if let Some(level) = parse_override(env.qoro_color.as_deref()) {
+    if let Some(level) = parse_override(env.qoop_color.as_deref()) {
         return level;
     }
     if floor_is_mono(env) {
@@ -340,13 +340,13 @@ mod tests {
     fn an_explicit_override_beats_everything_including_no_color() {
         let mut full = env();
         full.no_color = true;
-        full.qoro_color = Some("true".to_string());
+        full.qoop_color = Some("true".to_string());
         assert_eq!(detect_from(&full), Level::True);
-        full.qoro_color = Some("256".to_string());
+        full.qoop_color = Some("256".to_string());
         assert_eq!(detect_from(&full), Level::Palette);
-        full.qoro_color = Some("none".to_string());
+        full.qoop_color = Some("none".to_string());
         assert_eq!(detect_from(&full), Level::Mono);
-        full.qoro_color = Some("nonsense".to_string());
+        full.qoop_color = Some("nonsense".to_string());
         assert_eq!(detect_from(&full), Level::Mono);
     }
 

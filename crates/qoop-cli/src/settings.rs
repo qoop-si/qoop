@@ -1,4 +1,4 @@
-//! `qoro settings`: every setting on one page, with the pet.
+//! `qoop settings`: every setting on one page, with the pet.
 //!
 //! The left column is the pet, twice as big, and its three parts. The right half is a
 //! search line with filter chips on its right, then every setting as a row under its
@@ -139,7 +139,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         } else {
             format!("{idle} min")
         },
-        "takes effect after qoro stop",
+        "takes effect after qoop stop",
         Kind::Idle,
     ));
     out.push(row(
@@ -153,7 +153,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         "qass",
         "qass runs on",
         read.qass_agent.clone(),
-        "the agent `qoro qass` opens: yours from [agents] too",
+        "the agent `qoop qass` opens: yours from [agents] too",
         Kind::Choice("qass.agent", qass_agents(&read)),
     ));
     for agent in &read.agents {
@@ -199,10 +199,10 @@ pub(crate) fn listed(group: &'static str, args: &[&str], by_two_spaces: bool) ->
     };
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        // Not the usage lines a command prints under its list (`qoro hooks install ...`).
+        // Not the usage lines a command prints under its list (`qoop hooks install ...`).
         .filter(|line| {
             let line = line.trim_start();
-            !line.is_empty() && !line.starts_with(&format!("qoro {} ", args[0]))
+            !line.is_empty() && !line.starts_with(&format!("qoop {} ", args[0]))
         })
         .map(|line| {
             let line = line.trim();
@@ -299,7 +299,7 @@ pub(crate) fn write(row: &Row, value: &str) -> Result<(), String> {
     let path = config::path();
     match &row.kind {
         Kind::Toggle(key) => config::set(&path, key, if value == "on" { "true" } else { "false" }),
-        // Choosing a sound is wanting to hear it, as in `qoro sound`.
+        // Choosing a sound is wanting to hear it, as in `qoop sound`.
         Kind::Sound(key, _) => {
             config::set(&path, key, value).and_then(|()| config::set(&path, "notify.sound", "true"))
         }
@@ -705,14 +705,14 @@ impl Page {
     }
 }
 
-/// `qoro settings`
+/// `qoop settings`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
-        return Err(std::io::Error::other("usage: qoro settings"));
+        return Err(std::io::Error::other("usage: qoop settings"));
     }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        // No one to look at a page: the settings as text, as `qoro config` prints them.
-        return crate::config::run(&["qoro".to_string(), "config".to_string()]);
+        // No one to look at a page: the settings as text, as `qoop config` prints them.
+        return crate::config::run(&["qoop".to_string(), "config".to_string()]);
     }
     let mut lists = listed("machines", &["remote", "ls"], false);
     lists.extend(listed("phones", &["devices", "ls"], true));

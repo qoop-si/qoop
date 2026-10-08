@@ -1,7 +1,7 @@
 #!/bin/sh
 # qass escalate: make the owner's phone ring for one question.
 #
-# qass's own tab reports `blocked`, which the qoro bridge pushes as Urgent and
+# qass's own tab reports `blocked`, which the qoop bridge pushes as Urgent and
 # the notch shows as "wants". The state has to last long enough for the
 # bridge to list it: while this Bash call runs, no tool hook and no idle
 # composer can take it away, so it holds for 3 s. The bridge sends one push
@@ -56,7 +56,7 @@ fi
 last="$(cat "$dir/last-escalation" 2>/dev/null || echo 0)"
 wait=$((last + 31 - $(date +%s)))
 [ "$wait" -le 0 ] || sleep "$wait"
-qoro hook-report --state blocked --visible-blocker --event blocked --label "needs you: $handle"
+qoop hook-report --state blocked --visible-blocker --event blocked --label "needs you: $handle"
 date +%s > "$dir/last-escalation"
 sleep 3
 echo "escalated $id"

@@ -1,9 +1,9 @@
-//! `qoro qass`: open qass, the assistant over every agent, in one step.
+//! `qoop qass`: open qass, the assistant over every agent, in one step.
 //!
 //! The one already running is shown; one asleep in the `qass` space is woken; otherwise a
-//! new one starts in its own folder (`qoro paths qass-data`) on the agent `config.toml`
+//! new one starts in its own folder (`qoop paths qass-data`) on the agent `config.toml`
 //! names (`[qass] agent`: claude, codex, gemini, opencode, or a person's own `[agents]`
-//! line), told to start its qass skill. Closing it is the `x` on its row, or `qoro close`.
+//! line), told to start its qass skill. Closing it is the `x` on its row, or `qoop close`.
 
 use std::path::Path;
 use std::process::Command;
@@ -36,14 +36,14 @@ fn program_of(line: &str) -> &str {
         .map_or("", |w| w.rsplit('/').next().unwrap_or(w))
 }
 
-/// Another qoro command's JSON, from this same binary.
+/// Another qoop command's JSON, from this same binary.
 fn json(args: &[&str]) -> Option<serde_json::Value> {
     let me = std::env::current_exe().ok()?;
     let out = Command::new(me).args(args).output().ok()?;
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Another qoro command run for its effect, failing with what it said.
+/// Another qoop command run for its effect, failing with what it said.
 fn run(args: &[&str]) -> std::io::Result<()> {
     let out = Command::new(std::env::current_exe()?).args(args).output()?;
     if out.status.success() {
@@ -117,7 +117,7 @@ fn launch(agent: &str, read: &config::Read) -> std::io::Result<(Option<String>, 
     let (line, words, program) = launch_line(agent, &read.agents).map_err(std::io::Error::other)?;
     if !crate::skills::qass_installed_for(&program) {
         return Err(std::io::Error::other(format!(
-            "qass is not installed for {program}; run `qoro skills install {program}` first"
+            "qass is not installed for {program}; run `qoop skills install {program}` first"
         )));
     }
     Ok((line, words))
@@ -125,7 +125,7 @@ fn launch(agent: &str, read: &config::Read) -> std::io::Result<(Option<String>, 
 
 pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
-        return Err(crate::usage("usage: qoro qass"));
+        return Err(crate::usage("usage: qoop qass"));
     }
     let folder = paths::qass_data_dir()
         .ok_or_else(|| std::io::Error::other("no HOME to keep qass's folder under"))?;

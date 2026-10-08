@@ -1,8 +1,8 @@
 //! GitHub Releases: which tarball a platform uses, how to find it and fetch it, and
 //! whether what arrived is what was published.
 //!
-//! Shared by `qoro update`, which replaces this binary, and by the interface when it puts
-//! qoro on a machine being connected. Both go through the same token handling and the
+//! Shared by `qoop update`, which replaces this binary, and by the interface when it puts
+//! qoop on a machine being connected. Both go through the same token handling and the
 //! same checksum, so neither can be the weaker way in.
 
 use std::io::Write;
@@ -12,12 +12,12 @@ use std::process::Command;
 use crate::paths;
 
 /// The repository whose Releases carry the binaries.
-pub const RELEASES: &str = "https://api.github.com/repos/pat/qoro/releases";
+pub const RELEASES: &str = "https://api.github.com/repos/pat/qoop/releases";
 
 /// Where the releases are read from instead, when set: a mirror, or a directory given as a
 /// `file://` URL holding a `latest` file in the API's own shape. The same variable
 /// `scripts/install.sh` reads, so a platform pick can be tested with no network at all.
-pub const RELEASE_BASE_ENV: &str = "QORO_RELEASE_BASE";
+pub const RELEASE_BASE_ENV: &str = "QOOP_RELEASE_BASE";
 
 /// The tarball the release script packs for a platform, named by its target triple.
 ///
@@ -25,10 +25,10 @@ pub const RELEASE_BASE_ENV: &str = "QORO_RELEASE_BASE";
 /// one rather than with a download that could never run.
 pub fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
-        ("macos", "aarch64") => "qoro-aarch64-apple-darwin.tar.gz",
-        ("macos", "x86_64") => "qoro-x86_64-apple-darwin.tar.gz",
-        ("linux", "x86_64") => "qoro-x86_64-unknown-linux-gnu.tar.gz",
-        ("linux", "aarch64") => "qoro-aarch64-unknown-linux-gnu.tar.gz",
+        ("macos", "aarch64") => "qoop-aarch64-apple-darwin.tar.gz",
+        ("macos", "x86_64") => "qoop-x86_64-apple-darwin.tar.gz",
+        ("linux", "x86_64") => "qoop-x86_64-unknown-linux-gnu.tar.gz",
+        ("linux", "aarch64") => "qoop-aarch64-unknown-linux-gnu.tar.gz",
         _ => return None,
     })
 }
@@ -53,7 +53,7 @@ pub fn fetch_latest(asset: &str) -> Result<Release, String> {
 /// this binary is, so the two speak the same codec, rather than whatever is newest.
 pub fn fetch_tagged(version: &str, asset: &str) -> Result<Release, String> {
     fetch_release(&format!("tags/v{version}"), asset)
-        .map_err(|e| format!("no release of qoro {version} could be read: {e}"))
+        .map_err(|e| format!("no release of qoop {version} could be read: {e}"))
 }
 
 fn fetch_release(which: &str, asset: &str) -> Result<Release, String> {
@@ -82,10 +82,10 @@ pub fn platform(system: &str, machine: &str) -> Option<(&'static str, &'static s
     }
 }
 
-/// The `qoro` binary out of a release's tarball, as bytes, checked against the release's
+/// The `qoop` binary out of a release's tarball, as bytes, checked against the release's
 /// own checksum first.
 ///
-/// The checksum is required here, unlike for `qoro update`: this binary goes to a machine
+/// The checksum is required here, unlike for `qoop update`: this binary goes to a machine
 /// where nothing else will look at it. What it proves is that the bytes are the ones the
 /// release lists (no corruption, no truncation, no swapped answer on the way), not who made
 /// the release. Everything happens in a private directory that is removed on return, and
@@ -106,21 +106,21 @@ pub fn fetch_binary(release: &Release) -> Result<Vec<u8>, String> {
     let unpacked = Command::new("tar")
         .arg("-xzf")
         .arg(&tarball)
-        .arg("qoro")
+        .arg("qoop")
         .current_dir(dir.path())
         .status()
         .map_err(|e| format!("cannot unpack the release: {e}"))?;
     if !unpacked.success() {
         return Err(format!("cannot unpack the release: tar exited {unpacked}"));
     }
-    // A plain file, not a link: a tarball whose `qoro` points at `../../.ssh/id_ed25519` would
+    // A plain file, not a link: a tarball whose `qoop` points at `../../.ssh/id_ed25519` would
     // otherwise send this machine's key to the other one as the binary.
-    let binary = dir.path().join("qoro");
+    let binary = dir.path().join("qoop");
     let plain = std::fs::symlink_metadata(&binary).is_ok_and(|m| m.file_type().is_file());
     if !plain {
-        return Err("the release holds no plain qoro file".to_string());
+        return Err("the release holds no plain qoop file".to_string());
     }
-    std::fs::read(&binary).map_err(|e| format!("the release holds no qoro: {e}"))
+    std::fs::read(&binary).map_err(|e| format!("the release holds no qoop: {e}"))
 }
 
 /// The version and the asset URL out of one releases API answer, so the parsing is
@@ -328,22 +328,22 @@ pub fn check_sha256(tarball: &Path, checksum_file: &Path) -> Result<(), String> 
 mod tests {
     use super::*;
 
-    const MAC_ARM: &str = "qoro-aarch64-apple-darwin.tar.gz";
+    const MAC_ARM: &str = "qoop-aarch64-apple-darwin.tar.gz";
 
     #[test]
     fn every_platform_a_binary_is_built_for_names_its_own_tarball() {
         assert_eq!(asset_for("macos", "aarch64"), Some(MAC_ARM));
         assert_eq!(
             asset_for("macos", "x86_64"),
-            Some("qoro-x86_64-apple-darwin.tar.gz")
+            Some("qoop-x86_64-apple-darwin.tar.gz")
         );
         assert_eq!(
             asset_for("linux", "x86_64"),
-            Some("qoro-x86_64-unknown-linux-gnu.tar.gz")
+            Some("qoop-x86_64-unknown-linux-gnu.tar.gz")
         );
         assert_eq!(
             asset_for("linux", "aarch64"),
-            Some("qoro-aarch64-unknown-linux-gnu.tar.gz")
+            Some("qoop-aarch64-unknown-linux-gnu.tar.gz")
         );
         assert_eq!(asset_for("windows", "x86_64"), None);
         assert_eq!(asset_for("freebsd", "x86_64"), None);
@@ -355,11 +355,11 @@ mod tests {
             "tag_name": "v0.4.0",
             "assets": [
                 {"name": MAC_ARM, "url": "https://example.invalid/mac.tgz"},
-                {"name": "qoro-x86_64-unknown-linux-gnu.tar.gz", "url": "https://example.invalid/linux.tgz"},
+                {"name": "qoop-x86_64-unknown-linux-gnu.tar.gz", "url": "https://example.invalid/linux.tgz"},
             ],
         });
         let release =
-            fetch_latest_parsing(&body, "qoro-x86_64-unknown-linux-gnu.tar.gz").expect("linux");
+            fetch_latest_parsing(&body, "qoop-x86_64-unknown-linux-gnu.tar.gz").expect("linux");
         assert_eq!(release.asset_url, "https://example.invalid/linux.tgz");
         assert!(
             release.checksum_url.is_none(),
@@ -372,12 +372,12 @@ mod tests {
         let body = serde_json::json!({
             "tag_name": "v0.4.0",
             "assets": [
-                {"name": "qoro-aarch64-apple-darwin.tar.gz",
-                 "url": "https://api.github.com/repos/pat/qoro/releases/assets/1",
-                 "browser_download_url": "https://example.invalid/qoro.tgz"},
-                {"name": "qoro-aarch64-apple-darwin.tar.gz.sha256",
-                 "url": "https://api.github.com/repos/pat/qoro/releases/assets/2",
-                 "browser_download_url": "https://example.invalid/qoro.tgz.sha256"},
+                {"name": "qoop-aarch64-apple-darwin.tar.gz",
+                 "url": "https://api.github.com/repos/pat/qoop/releases/assets/1",
+                 "browser_download_url": "https://example.invalid/qoop.tgz"},
+                {"name": "qoop-aarch64-apple-darwin.tar.gz.sha256",
+                 "url": "https://api.github.com/repos/pat/qoop/releases/assets/2",
+                 "browser_download_url": "https://example.invalid/qoop.tgz.sha256"},
             ],
         });
         let release = fetch_latest_parsing(&body, MAC_ARM).expect("the fixture is well formed");
@@ -386,11 +386,11 @@ mod tests {
         // with a token.
         assert_eq!(
             release.asset_url,
-            "https://api.github.com/repos/pat/qoro/releases/assets/1"
+            "https://api.github.com/repos/pat/qoop/releases/assets/1"
         );
         assert_eq!(
             release.checksum_url.as_deref(),
-            Some("https://api.github.com/repos/pat/qoro/releases/assets/2")
+            Some("https://api.github.com/repos/pat/qoop/releases/assets/2")
         );
     }
 
@@ -422,12 +422,12 @@ mod tests {
     fn packed(dir: &Path, content: &[u8], sums_for: Option<&[u8]>) -> Release {
         let src = dir.join("src");
         std::fs::create_dir_all(&src).expect("src");
-        std::fs::write(src.join("qoro"), content).expect("binary");
-        let tarball = dir.join("qoro-x86_64-unknown-linux-gnu.tar.gz");
+        std::fs::write(src.join("qoop"), content).expect("binary");
+        let tarball = dir.join("qoop-x86_64-unknown-linux-gnu.tar.gz");
         let status = Command::new("tar")
             .arg("-czf")
             .arg(&tarball)
-            .arg("qoro")
+            .arg("qoop")
             .current_dir(&src)
             .status()
             .expect("tar");
@@ -445,13 +445,13 @@ mod tests {
                 .arg(&hashed)
                 .output()
                 .expect("shasum");
-            let sums = dir.join("qoro-x86_64-unknown-linux-gnu.tar.gz.sha256");
+            let sums = dir.join("qoop-x86_64-unknown-linux-gnu.tar.gz.sha256");
             std::fs::write(&sums, &out.stdout).expect("sums");
             format!("file://{}", sums.display())
         });
         Release {
             version: "0.2.0".into(),
-            asset: "qoro-x86_64-unknown-linux-gnu.tar.gz".into(),
+            asset: "qoop-x86_64-unknown-linux-gnu.tar.gz".into(),
             asset_url: format!("file://{}", tarball.display()),
             checksum_url,
         }
@@ -480,20 +480,20 @@ mod tests {
         assert!(err.contains("checksum"), "{err}");
     }
 
-    /// A tarball whose `qoro` is a link would have whatever it points at read and sent as
+    /// A tarball whose `qoop` is a link would have whatever it points at read and sent as
     /// the binary. Refused, checksum or not.
     #[test]
-    fn a_release_whose_qoro_is_a_link_is_refused() {
+    fn a_release_whose_qoop_is_a_link_is_refused() {
         let dir = tempfile::tempdir().expect("dir");
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).expect("src");
         std::fs::write(dir.path().join("secret"), b"a private key").expect("secret");
-        std::os::unix::fs::symlink("../secret", src.join("qoro")).expect("link");
-        let tarball = dir.path().join("qoro-x86_64-unknown-linux-gnu.tar.gz");
+        std::os::unix::fs::symlink("../secret", src.join("qoop")).expect("link");
+        let tarball = dir.path().join("qoop-x86_64-unknown-linux-gnu.tar.gz");
         let status = Command::new("tar")
             .arg("-czf")
             .arg(&tarball)
-            .arg("qoro")
+            .arg("qoop")
             .current_dir(&src)
             .status()
             .expect("tar");
@@ -507,7 +507,7 @@ mod tests {
         std::fs::write(&sums, &out.stdout).expect("sums");
         let release = Release {
             version: "0.2.0".into(),
-            asset: "qoro-x86_64-unknown-linux-gnu.tar.gz".into(),
+            asset: "qoop-x86_64-unknown-linux-gnu.tar.gz".into(),
             asset_url: format!("file://{}", tarball.display()),
             checksum_url: Some(format!("file://{}", sums.display())),
         };

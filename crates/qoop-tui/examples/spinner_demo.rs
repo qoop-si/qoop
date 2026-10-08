@@ -56,7 +56,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
 }
 
 fn main() {
-    let spaces = vec![space(1, "qoro"), space(2, "task")];
+    let spaces = vec![space(1, "qoop"), space(2, "task")];
     let rows = vec![
         agent(1, 1, "opencode", "working"),
         agent(2, 1, "claude", "starting"),

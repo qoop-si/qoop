@@ -25,7 +25,7 @@
 //!
 //! Two policies run over the same frames:
 //!
-//! - qoro: output settles 80ms after the last frame of a burst (a gap over
+//! - qoop: output settles 80ms after the last frame of a burst (a gap over
 //!   80ms splits bursts); the last frame of each burst is evaluated once and
 //!   published on change. This mirrors `DETECT_SETTLE` in the daemon.
 //! - the polled schedule: the screen is read every 100ms; a Working-to-plain-Idle step
@@ -116,8 +116,8 @@ fn raw_of(manifest: &Manifest, frame: &Frame) -> Option<qoop_detect::Verdict> {
     )
 }
 
-/// qoro: one evaluation per burst at 80ms past its last frame.
-fn run_qoro(manifest: &Manifest, frames: &[Frame]) -> Vec<(u64, AgentRuntimeState)> {
+/// qoop: one evaluation per burst at 80ms past its last frame.
+fn run_qoop(manifest: &Manifest, frames: &[Frame]) -> Vec<(u64, AgentRuntimeState)> {
     const SETTLE: u64 = 80;
     let mut published: Vec<(u64, AgentRuntimeState)> = Vec::new();
     let mut burst_last = 0usize;
@@ -229,14 +229,14 @@ fn replay_every_transition_fixture_through_both_debounce_rules() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let fixture = parse_fixture(path);
         let manifest = manifest_for(&fixture.agent);
-        let qoro = run_qoro(&manifest, &fixture.frames);
+        let qoop = run_qoop(&manifest, &fixture.frames);
         let reference = run_reference(&manifest, &fixture.frames);
-        let (qf, hf) = (flaps(&qoro), flaps(&reference));
+        let (qf, hf) = (flaps(&qoop), flaps(&reference));
         println!(
-            "{name}: agent={} qoro_flaps={qf} reference_flaps={hf}",
+            "{name}: agent={} qoop_flaps={qf} reference_flaps={hf}",
             fixture.agent
         );
-        println!("  qoro : {qoro:?}");
+        println!("  qoop : {qoop:?}");
         println!("  reference: {reference:?}");
         if hf < qf {
             reference_fewer.push(name);

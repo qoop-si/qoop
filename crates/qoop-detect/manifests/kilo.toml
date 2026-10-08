@@ -4,7 +4,7 @@
 # 7.8.3): the session view in `packages/tui/src` and the Kilo code in
 # `packages/opencode/src/kilocode`. Kilo draws the OpenCode session view, so the busy
 # spinner's glyphs and the cut and fullscreen permission rows follow screens recorded in
-# qoro's own OpenCode sessions. Panels carry a border on their left side, so line
+# qoop's own OpenCode sessions. Panels carry a border on their left side, so line
 # patterns allow any non-word glyphs before the text.
 
 id = "kilo"

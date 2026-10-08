@@ -1,4 +1,4 @@
-//! The few things a person sets for the interface: `config.toml` in the qoro config
+//! The few things a person sets for the interface: `config.toml` in the qoop config
 //! directory.
 //!
 //! ```toml
@@ -22,7 +22,7 @@
 //! ```
 //!
 //! Read by the interface at start and again within two seconds of a change (its modified
-//! time, checked with the ack), so an edit takes effect without a restart; `qoro bridge`
+//! time, checked with the ack), so an edit takes effect without a restart; `qoop bridge`
 //! reads `[agents]` the same way whenever a phone asks for the list. `[sleep]` and
 //! `[daemon]` are the daemon's: it reads them itself when it decides, and their rules live
 //! beside it in `qoop_runtime::config`, which this file asks rather than repeating them.
@@ -83,13 +83,13 @@ pub struct Config {
     pub done_sound: &'static str,
     /// The sound for one that waits on a person or failed, one of [`sounds_here`].
     pub alert_sound: &'static str,
-    /// Show the agents in the macOS notch. Read by the notch app, through `qoro config`.
+    /// Show the agents in the macOS notch. Read by the notch app, through `qoop config`.
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
     pub lifecycle: qoop_runtime::config::Lifecycle,
 }
 
-/// The agents qass's skill installs beside, and so the ones `qoro qass` can start by name.
+/// The agents qass's skill installs beside, and so the ones `qoop qass` can start by name.
 pub const QASS_AGENTS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
 
 impl Default for Config {
@@ -207,7 +207,7 @@ pub struct Read {
     pub config: Config,
     /// `[agents]`, in the order the file lists them.
     pub agents: Vec<Launcher>,
-    /// `[qass] agent`: what `qoro qass` starts, one of [`QASS_AGENTS`] or an `[agents]` name.
+    /// `[qass] agent`: what `qoop qass` starts, one of [`QASS_AGENTS`] or an `[agents]` name.
     pub qass_agent: String,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
@@ -672,7 +672,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
     };
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|_| {
         format!(
-            "{} is not TOML; fix it first (qoro config says where)",
+            "{} is not TOML; fix it first (qoop config says where)",
             path.display()
         )
     })?;

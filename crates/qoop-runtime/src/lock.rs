@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn the_lock_is_exclusive_while_held_and_free_afterwards() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qorod.lock");
+        let path = dir.path().join("qoopd.lock");
         let held = StartupLock::acquire(&path).unwrap();
         assert!(
             StartupLock::try_acquire(&path).unwrap().is_none(),
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn a_lock_passed_on_as_a_descriptor_stays_held_by_whoever_takes_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qorod.lock");
+        let path = dir.path().join("qoopd.lock");
         let held = StartupLock::acquire(&path).unwrap();
         // What an `exec` does to a descriptor that is not close-on-exec: the same open file,
         // at a number of its own, in whatever becomes of the process.
@@ -138,7 +138,7 @@ mod tests {
         // The lock lives on the open file description, so there is no stale lock to clean
         // up after a launcher that died mid-sequence. Modelled with a real child process.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("qorod.lock");
+        let path = dir.path().join("qoopd.lock");
         let p = path.to_string_lossy().to_string();
         let mut child = std::process::Command::new("/usr/bin/env")
             .args([

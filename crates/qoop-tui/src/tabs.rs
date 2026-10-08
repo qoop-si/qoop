@@ -227,7 +227,7 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
 ///
 /// ```text
 /// ╭ 1 claude     ×   ╭ 2 codex
-/// ╰ ~/coding/wend    ╰ …/qoro-wt-events-log
+/// ╰ ~/coding/wend    ╰ …/qoop-wt-events-log
 /// ```
 ///
 /// Only the inks and the close differ between a focused tab and the same tab unfocused,
@@ -597,8 +597,8 @@ mod tests {
         assert_eq!(path_of(Some("/"), home), "/");
         assert_eq!(path_of(None, home), "");
         assert_eq!(path_of(Some("  "), home), "");
-        let long = path_of(Some("/Users/me/coding/qoro-wt-events-log"), home);
-        assert_eq!(long, "\u{2026}/qoro-wt-events-log");
+        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home);
+        assert_eq!(long, "\u{2026}/qoop-wt-events-log");
         assert_eq!(crate::width::width(&long), MAX_PATH);
     }
 

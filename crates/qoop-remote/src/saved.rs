@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Overrides where the list is kept, so tests never touch a home.
-pub const REMOTES_ENV: &str = "QORO_REMOTES";
+pub const REMOTES_ENV: &str = "QOOP_REMOTES";
 
-/// The line the remote command prints right before qoro starts. Everything before it is
+/// The line the remote command prints right before qoop starts. Everything before it is
 /// whatever the remote's shell startup printed, and a banner read as a frame is a
 /// connection that fails on every attempt with a message about frame lengths.
-pub const RELAY_MARKER: &str = "-----qoro-relay-----";
+pub const RELAY_MARKER: &str = "-----qoop-relay-----";
 
 /// How much a remote shell may print before the marker. A login banner is a few lines; a
-/// megabyte is a shell that is not going to start qoro.
+/// megabyte is a shell that is not going to start qoop.
 pub const MARKER_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub struct Remote {
     pub target: String,
 }
 
-/// Where the list lives: the override when set, else `qoro/remotes.json` under the
+/// Where the list lives: the override when set, else `qoop/remotes.json` under the
 /// person's own configuration, beside the avatar.
 pub fn path() -> PathBuf {
     match std::env::var(REMOTES_ENV) {
@@ -46,7 +46,7 @@ pub fn path() -> PathBuf {
                 .ok()
         })
         .unwrap_or_else(std::env::temp_dir);
-    base.join("qoro").join("remotes.json")
+    base.join("qoop").join("remotes.json")
 }
 
 /// The list, or an empty one when there is no file. A file that does not parse is an
@@ -114,26 +114,26 @@ pub fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-/// The command ssh runs on the remote: print the marker, then run qoro's `verb`
+/// The command ssh runs on the remote: print the marker, then run qoop's `verb`
 /// (`relay`, or `--hello`).
 ///
-/// `--session default` is passed on purpose: a qoro from before sessions were folded into
+/// `--session default` is passed on purpose: a qoop from before sessions were folded into
 /// spaces opens the last session opened there when given none, and this machine's spaces
-/// are the default one's. A newer qoro accepts and ignores it.
+/// are the default one's. A newer qoop accepts and ignores it.
 ///
 /// Run through `sh -c` so a fish login shell runs it as well, and the verb is a positional
 /// parameter rather than part of the script: data spliced into a script is a script
-/// somebody else wrote. qoro is looked for on the PATH and in the two places an install
+/// somebody else wrote. qoop is looked for on the PATH and in the two places an install
 /// puts it, because a non-interactive ssh command gets a PATH without whatever the
 /// person's interactive profile adds.
 pub fn remote_command(verb: &str) -> String {
     let script = format!(
         "printf '%s\\n' {RELAY_MARKER}; \
-         for q in qoro \"$HOME/.local/bin/qoro\" \"$HOME/.cargo/bin/qoro\"; do \
+         for q in qoop \"$HOME/.local/bin/qoop\" \"$HOME/.cargo/bin/qoop\"; do \
          if command -v \"$q\" >/dev/null 2>&1; then exec \"$q\" --session default \"$1\"; fi; \
-         done; echo 'qoro is not installed on this host' >&2; exit 127"
+         done; echo 'qoop is not installed on this host' >&2; exit 127"
     );
-    format!("sh -c {} qoro {}", shell_quote(&script), shell_quote(verb))
+    format!("sh -c {} qoop {}", shell_quote(&script), shell_quote(verb))
 }
 
 /// A name for a machine added by its address: the host, without the user, with anything a
@@ -151,7 +151,7 @@ pub fn name_for(target: &str, taken: &[&str]) -> String {
         })
         .take(20)
         .collect();
-    // Never a leading dash: the name is typed after `qoro remote rm`, where it would read
+    // Never a leading dash: the name is typed after `qoop remote rm`, where it would read
     // as a flag.
     let mut base = base.trim_start_matches('-').to_string();
     if base.is_empty() {
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn a_saved_list_reads_back_and_an_old_one_names_each_machine_once() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("qoro").join("remotes.json");
+        let file = dir.path().join("qoop").join("remotes.json");
         let list = vec![Remote {
             name: "devbox".into(),
             target: "me@devbox".into(),
@@ -242,7 +242,7 @@ mod tests {
         );
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        let fake = bin.join("qoro");
+        let fake = bin.join("qoop");
         std::fs::write(&fake, "#!/bin/sh\nprintf '%s|' \"$@\"\n").expect("fake");
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_without_qoro_says_so() {
+    fn a_host_without_qoop_says_so() {
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(remote_command("relay"))

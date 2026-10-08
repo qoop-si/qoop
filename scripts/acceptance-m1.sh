@@ -11,17 +11,17 @@
 # End to end, driven the way a person drives it: a real terminal, real keystrokes, a real
 # shell, and the OS as the source of truth for what survived.
 set -uo pipefail
-QORO=${QORO:-"$(cd "$(dirname "$0")/.." && pwd)/target/release/qoro"}
+QOOP=${QOOP:-"$(cd "$(dirname "$0")/.." && pwd)/target/release/qoop"}
 # Checked before anything runs, because the alternative is what this script actually did
 # once: with no binary there, every step ran against nothing and it reported four failed
 # gates, which reads as a product regression and is a missing build.
-if [ ! -x "$QORO" ]; then
-    echo "no binary at $QORO" >&2
+if [ ! -x "$QOOP" ]; then
+    echo "no binary at $QOOP" >&2
     echo "build it first: cargo build --release -p qoop-cli" >&2
     exit 2
 fi
-RT=$(mktemp -d /tmp/qoro-e2e-XXXXXX); chmod 700 "$RT"
-S=qoro-e2e-$$
+RT=$(mktemp -d /tmp/qoop-e2e-XXXXXX); chmod 700 "$RT"
+S=qoop-e2e-$$
 PASS=0; FAIL=0
 ok(){ echo "    PASS: $1"; PASS=$((PASS+1)); }
 no(){ echo "    FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -45,19 +45,19 @@ cleanup(){ tmux kill-session -t "$S" 2>/dev/null; [ -n "${DPID:-}" ] && kill "$D
 trap cleanup EXIT
 
 echo "runtime dir: $RT"
-# A plain shell owns the session, and qoro is launched from inside it. Otherwise detaching
+# A plain shell owns the session, and qoop is launched from inside it. Otherwise detaching
 # ends the session's only process and tmux tears the whole server down, which reads as a
 # product failure and is not one.
 tmux new-session -d -s "$S" -x 90 -y 26
-tmux send-keys -t "$S" "export QORO_RUNTIME_DIR=$RT; clear" Enter
+tmux send-keys -t "$S" "export QOOP_RUNTIME_DIR=$RT; clear" Enter
 sleep 1
 # A subshell writes its own pid and then replaces itself with the client, so the pid in the
 # file is the client's, and the shell that owns the tmux session is left alone: replacing
 # that one would end the session the moment the client detached. Reading it is the only way to be sure which process this run
-# started: a pattern like `pgrep -f release/qoro` matches every one on the machine, and it
+# started: a pattern like `pgrep -f release/qoop` matches every one on the machine, and it
 # once matched a demo session left running in another terminal, after which this script
 # reported four failed gates about somebody else's process.
-tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>$RT/client.log" Enter
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QOOP' 2>$RT/client.log" Enter
 # Waited for, not slept for. A fixed three seconds was long enough on a quiet machine and
 # not on a busy one, and when it was not, `pgrep` answered nothing and every step after it
 # failed for a reason that had nothing to do with the product: `expected 1 ptmx, saw 51` is
@@ -94,7 +94,7 @@ starts(){
 }
 
 # This run's client, found by the runtime directory it was given, and this run's daemon,
-# found as that client's child. `pgrep -f "release/qoro daemon"` matched any daemon on the
+# found as that client's child. `pgrep -f "release/qoop daemon"` matched any daemon on the
 # machine: measured, a demo session left running in another terminal, and the script then
 # reported four failed gates about somebody else's process.
 CPID=$(started) || { echo "the client never started" >&2; exit 3; }
@@ -102,8 +102,8 @@ DPID=$(starts_child "$CPID") || { echo "the daemon never started" >&2; exit 3; }
 echo "client=$CPID daemon=$DPID"
 
 echo "--- 1. a real shell answers a real command"
-tmux send-keys -t "$S" 'echo QORO_WORKS_$((6*7))' Enter
-appears "QORO_WORKS_42" && ok "the shell computed 6*7" || { no "no marker"; tmux capture-pane -t "$S" -p | head -5 | sed 's/^/      /'; }
+tmux send-keys -t "$S" 'echo QOOP_WORKS_$((6*7))' Enter
+appears "QOOP_WORKS_42" && ok "the shell computed 6*7" || { no "no marker"; tmux capture-pane -t "$S" -p | head -5 | sed 's/^/      /'; }
 
 echo "--- 2. the daemon holds exactly one pty master, read from the OS"
 M=$(lsof -p "$DPID" -Fn 2>/dev/null | grep -c "ptmx")
@@ -115,16 +115,16 @@ ps -o pid=,ppid=,stat=,command= -p "$CHILD" 2>/dev/null | sed 's/^/      /'
 [ -n "$CHILD" ] && ok "child $CHILD exists" || no "no child shell"
 
 echo "--- 4. record state in the shell, then detach with ctrl-q"
-tmux send-keys -t "$S" 'QORO_STATE=kept' Enter
+tmux send-keys -t "$S" 'QOOP_STATE=kept' Enter
 sleep 1
 tmux send-keys -t "$S" C-q
 sleep 2
 kill -0 "$CHILD" 2>/dev/null && ok "shell $CHILD alive after detach" || no "shell died on detach"
 
 echo "--- 5. reattach and prove it is the SAME shell, not a new one"
-tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>>$RT/client.log" Enter
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QOOP' 2>>$RT/client.log" Enter
 sleep 3
-tmux send-keys -t "$S" 'echo STATE_IS_$QORO_STATE' Enter
+tmux send-keys -t "$S" 'echo STATE_IS_$QOOP_STATE' Enter
 appears "STATE_IS_kept" && ok "same shell: it still has its variable" || { no "state lost, so it is a different shell"; tmux capture-pane -t "$S" -p | head -6 | sed 's/^/      /'; }
 
 echo "--- 6. SIGKILL the client; the shell must survive (invariant I1)"
@@ -136,9 +136,9 @@ sleep 1
 kill -0 "$CHILD" 2>/dev/null && ok "shell survived a SIGKILLed client" || no "a client kill took the shell"
 
 echo "--- 7. reattach once more after the kill and check the shell still answers"
-tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QORO' 2>>$RT/client.log" Enter
+tmux send-keys -t "$S" "sh -c 'echo \$\$ > $RT/client.pid; exec $QOOP' 2>>$RT/client.log" Enter
 sleep 3
-tmux send-keys -t "$S" 'echo AFTER_KILL_$QORO_STATE' Enter
+tmux send-keys -t "$S" 'echo AFTER_KILL_$QOOP_STATE' Enter
 appears "AFTER_KILL_kept" && ok "the shell is still the same one" || no "the shell did not survive the kill intact"
 
 echo

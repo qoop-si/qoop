@@ -1,5 +1,5 @@
 #!/bin/bash
-# Checks skills/qass/watch.sh against recorded snapshots: a fake `qoro` prints
+# Checks skills/qass/watch.sh against recorded snapshots: a fake `qoop` prints
 # them, and the lines watch.sh prints must be exactly the expected ones.
 set -euo pipefail
 # Lines at once unless a case asks for the settle time.
@@ -10,7 +10,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home"
 
-# The skill as `qoro skills install` writes it: its place names filled in. qass keeps its
+# The skill as `qoop skills install` writes it: its place names filled in. qass keeps its
 # state and the owner's files in one folder here, `<home>/.qass`.
 render() { # home -> the skill's dir
     local to="$tmp/skill-$(basename "$1")"
@@ -40,12 +40,12 @@ cat > "$tmp/snapshots" <<EOF
 [$(row 5 1 failed),$(row 7 1 blocked)]
 [$(row 5 1 failed)]
 EOF
-cat > "$tmp/bin/qoro" <<EOF
+cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 cat "$tmp/snapshots"
 EOF
-chmod +x "$tmp/bin/qoro"
+chmod +x "$tmp/bin/qoop"
 
 expected='T6 g1 claude new->idle "task" /w
 T5 g1 claude working->idle "task" /w
@@ -55,13 +55,13 @@ daemon-gone
 T5 g1 claude working->failed "task" /w
 T7 g1 claude blocked->closed "task" /w'
 
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
 if [ "$got" != "$expected" ]; then
     echo "watch.sh printed:"; echo "$got"; echo "expected:"; echo "$expected"; exit 1
 fi
 
 # A restart diffs against the saved snapshot: nothing changed, nothing printed.
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" bash -c "
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" bash -c "
     printf '%s\n' '[$(row 5 1 failed)]' > '$tmp/snapshots'
     '$skill_w/watch.sh'")"
 [ -z "$got" ] || { echo "restart printed: $got"; exit 1; }
@@ -69,7 +69,7 @@ got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" bash -c "
 # Its own terminal is never reported.
 printf '%s\n' "[$(row 5 1 working)]" "[$(row 5 1 idle)]" > "$tmp/snapshots"
 rm -f "$tmp/home/.qass/last.json"
-got="$(HOME="$tmp/home" QORO_TERMINAL=5 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=5 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
 [ -z "$got" ] || { echo "own terminal printed: $got"; exit 1; }
 
 # A hands-off mark raises its worker once more when it passes, once, and only
@@ -81,24 +81,24 @@ printf '%s\n' "[$(row 5 1 idle),$(row 6 1 working)]" > "$tmp/home/.qass/last.jso
 # T5 in the line shape of a worker with a task, T6 and T7 in the older one: both are read.
 printf -- '- T5 g1 0a1b2c3d "fix x" task:12; hands off until %s\n- T6 g1 y: task; hands off until %s\n- T7 g1 z: task; hands off until %s\n' \
     $((now + 3)) $((now - 1)) $((now + 999)) > "$tmp/home/.qass/goals.md"
-cat > "$tmp/bin/qoro" <<EOF
+cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 22 2>/dev/null
 EOF
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$skill_w/watch.sh" || true)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$skill_w/watch.sh" || true)"
 [ "$got" = 'T5 g1 claude hands-off->idle "task" /w' ] || { echo "hands-off printed: $got"; exit 1; }
 
 # A tab that slept is not a tab that closed.
 printf '%s\n' "[$(row 5 1 idle)]" "[$(row 6 1 working)]" > "$tmp/snapshots"
 echo '[{"name":"a","sleeping":[5]}]' > "$tmp/ls"
-cat > "$tmp/bin/qoro" <<EOF
+cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { cat "$tmp/ls"; exit 0; }
 cat "$tmp/snapshots"
 EOF
 rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/goals.md"
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
 [ "$got" = 'T5 g1 claude new->idle "task" /w
 T5 g1 claude idle->sleeping "task" /w' ] || { echo "sleep printed: $got"; exit 1; }
 rm -f "$tmp/ls"
@@ -106,7 +106,7 @@ rm -f "$tmp/ls"
 # A remote's stream comes in beside this Mac's, its lines named after the remote.
 printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
 printf '%s\n' "[$(row 2 3 working)]" "[$(row 2 3 idle)]" > "$tmp/remote-snapshots"
-cat > "$tmp/bin/qoro" <<EOF
+cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = remote ] && { echo "ubox  fake-host"; exit 0; }
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
@@ -118,7 +118,7 @@ case "\$*" in *watch*) cat "$tmp/remote-snapshots" ;; *) echo '[]' ;; esac
 EOF
 chmod +x "$tmp/bin/ssh"
 rm -f "$tmp/home/.qass/"*.json "$tmp/home/.qass/goals.md"
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | sort)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | sort)"
 want="$(printf '%s\n' 'T5 g1 claude new->idle "task" /w' 'ubox/T2 g3 claude working->idle "task" /w' 'ubox/link-down' | sort)"
 [ "$got" = "$want" ] || { echo "remote printed: $got"; exit 1; }
 rm -f "$tmp/bin/ssh"
@@ -129,20 +129,20 @@ printf '%s\n' "[$(row 5 1 idle),$(row 6 1 idle)]" "[$(row 5 1 working),$(row 6 1
     "[$(row 5 1 idle),$(row 6 1 working)]" "[$(row 5 1 working),$(row 6 1 working)]" \
     "[$(row 5 1 idle),$(row 6 1 working)]" > "$tmp/snapshots"
 : > "$tmp/home/.qass/goals.md"
-cat > "$tmp/bin/qoro" <<EOF
+cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 [ "\$1" = remote ] && exit 0
 cat "$tmp/snapshots"; exec sleep 14 2>/dev/null
 EOF
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
 [ "$got" = 'T5 g1 claude working->idle "task" /w' ] || { echo "settle printed: $got"; exit 1; }
 
 # A row with a task carries it at the end of its line, claim and all.
 task_row='{"terminal":8,"generation":1,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"verifying","claimed":true}}'
 printf '%s\n' "[$(printf "$task_row" working)]" "[$(printf "$task_row" idle)]" > "$tmp/snapshots"
 rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/settle"*
-got="$(HOME="$tmp/home" QORO_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
 [ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] \
     || { echo "task line printed: $got"; exit 1; }
 

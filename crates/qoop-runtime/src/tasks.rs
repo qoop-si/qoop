@@ -1,4 +1,4 @@
-//! The daemon's side of `qoro task`: which task a request means, the write, and an answer
+//! The daemon's side of `qoop task`: which task a request means, the write, and an answer
 //! that fits one frame.
 //!
 //! A terminal names its own task through its token, checked like a hook report: a token
@@ -48,7 +48,7 @@ fn store_failed(id: String, error: HandleError) -> ControlResponse {
         // The deadline does not cancel the write, so it may still land.
         HandleError::Timeout => failed(
             id,
-            "qoro did not confirm in time; it may have been recorded, check qoro task show",
+            "qoop did not confirm in time; it may have been recorded, check qoop task show",
         ),
         HandleError::Store(e) => failed(id, e.to_string()),
     }
@@ -85,7 +85,7 @@ pub(crate) async fn write(
     let now = now();
     if let TaskOp::Begin = action {
         let Some(terminal) = speaker else {
-            return failed(id, "a task is begun from inside a qoro terminal");
+            return failed(id, "a task is begun from inside a qoop terminal");
         };
         // qass edits its own files; it never has a task of its own.
         // An unread name could be qass's: nothing is opened on a guess, the next edit asks again.
@@ -111,7 +111,7 @@ pub(crate) async fn write(
     }
     if let TaskOp::New { goal, replace } = action {
         let Some(terminal) = speaker else {
-            return failed(id, "a task is opened from inside a qoro terminal");
+            return failed(id, "a task is opened from inside a qoop terminal");
         };
         return match store
             .run(move |s| s.open_task(i64::from(terminal), &goal, replace, now))
@@ -125,7 +125,7 @@ pub(crate) async fn write(
         };
     }
     if matches!(action, TaskOp::Close { .. }) && task.is_none() {
-        return failed(id, "close names its task: qoro task close <id>");
+        return failed(id, "close names its task: qoop task close <id>");
     }
     // The task meant: the one named, which must be the speaker's own when a speaker came
     // with it, or the speaker's open one.
@@ -151,9 +151,9 @@ pub(crate) async fn write(
                     (Some(task), Some(t)) => format!("task #{task} is not terminal {t}'s"),
                     (Some(task), None) => format!("no task #{task}"),
                     (None, Some(_)) => {
-                        "this terminal has no open task: qoro task new <goal>".into()
+                        "this terminal has no open task: qoop task new <goal>".into()
                     }
-                    (None, None) => "no task named, and not inside a qoro terminal".into(),
+                    (None, None) => "no task named, and not inside a qoop terminal".into(),
                 },
             );
         }

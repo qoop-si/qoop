@@ -1,18 +1,18 @@
-//! `qoro notch`: on a Mac, the agents in the camera housing at the top of the screen.
+//! `qoop notch`: on a Mac, the agents in the camera housing at the top of the screen.
 //!
 //! The app itself is Swift (`notch/main.swift`), built into this binary by `build.rs`
-//! and written out on first run, so it is always the version of the qoro that starts it
+//! and written out on first run, so it is always the version of the qoop that starts it
 //! and needs no download of its own. It asks for no permission and carries no signature
-//! beyond the one its linker gives every Apple silicon binary: a file qoro writes has no
+//! beyond the one its linker gives every Apple silicon binary: a file qoop writes has no
 //! quarantine flag, so Gatekeeper has nothing to stop.
 //!
-//! `install` makes it a login item through a LaunchAgent that runs `qoro notch run`,
+//! `install` makes it a login item through a LaunchAgent that runs `qoop notch run`,
 //! the hooks and skills shape: `status` says what is there, `uninstall` takes out
 //! exactly what was put in.
 
-/// `qoro notch ...`.
+/// `qoop notch ...`.
 pub fn run(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro notch install|uninstall|status\n       qoro notch run";
+    let help = "usage: qoop notch install|uninstall|status\n       qoop notch run";
     #[cfg(target_os = "macos")]
     {
         match args.get(2).map(String::as_str) {
@@ -35,7 +35,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 }
 
 /// Put the notch back on the binary now on disk, through a fresh launchd registration (a
-/// kickstart is refused for an agent whose file was replaced). What `qoro update` calls once
+/// kickstart is refused for an agent whose file was replaced). What `qoop update` calls once
 /// it has swapped the binary: silent, and nothing when the notch was never installed.
 pub fn restart_if_installed() {
     #[cfg(target_os = "macos")]
@@ -69,9 +69,9 @@ mod mac {
     use std::path::PathBuf;
     use std::process::Command;
 
-    static APP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qoro-notch"));
+    static APP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qoop-notch"));
 
-    pub const LABEL: &str = "qoro.notch";
+    pub const LABEL: &str = "qoop.notch";
 
     fn home() -> std::io::Result<PathBuf> {
         std::env::var_os("HOME")
@@ -98,7 +98,7 @@ mod mac {
     /// Write the app out when this build's copy is not there yet, and become it.
     pub fn run_app() -> std::io::Result<()> {
         // A login item installed when a machine had named sessions carries one in its
-        // environment, and every `qoro` the notch starts would refuse it. There is one
+        // environment, and every `qoop` the notch starts would refuse it. There is one
         // daemon now: the notch follows it.
         // SAFETY: before the app, or anything else here, starts a thread.
         unsafe { std::env::remove_var(qoop_runtime::paths::SESSION_ENV) };
@@ -159,7 +159,7 @@ mod mac {
         // The launchd environment has none of the shell's. What moves where the daemon's
         // socket lives and where the pet was picked is carried over, or the notch would
         // look somewhere the install did not.
-        let env: String = ["QORO_RUNTIME_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+        let env: String = ["QOOP_RUNTIME_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
             .iter()
             .filter_map(|k| {
                 std::env::var(k)
@@ -209,7 +209,7 @@ mod mac {
         if !read.config.notch
             && let Err(why) = qoop_tui::config::set(&read.path, "notch.enabled", "true")
         {
-            eprintln!("qoro: notch.enabled stays false ({why}); fix it with qoro config");
+            eprintln!("qoop: notch.enabled stays false ({why}); fix it with qoop config");
         }
         let exe = std::env::current_exe()?;
         let plist_path = plist_path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
@@ -226,7 +226,7 @@ mod mac {
                 plist_path.display()
             ))
         })?;
-        println!("the notch is on, and starts at login; qoro notch uninstall takes it out");
+        println!("the notch is on, and starts at login; qoop notch uninstall takes it out");
         Ok(())
     }
 
@@ -263,7 +263,7 @@ mod mac {
 
     pub fn status() -> std::io::Result<()> {
         let Some(path) = plist_path().filter(|p| p.exists()) else {
-            println!("not installed: qoro notch install puts your agents in the notch");
+            println!("not installed: qoop notch install puts your agents in the notch");
             return Ok(());
         };
         let running = Command::new("launchctl")
@@ -297,9 +297,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_plist_runs_the_notch_and_names_no_session() {
-        let plist = mac::plist("/bin/qoro");
-        assert!(plist.contains("<string>/bin/qoro</string><string>notch</string>"));
-        assert!(!plist.contains("QORO_SESSION"), "{plist}");
+        let plist = mac::plist("/bin/qoop");
+        assert!(plist.contains("<string>/bin/qoop</string><string>notch</string>"));
+        assert!(!plist.contains("QOOP_SESSION"), "{plist}");
     }
 
     #[test]

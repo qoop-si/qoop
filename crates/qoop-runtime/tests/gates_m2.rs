@@ -370,7 +370,7 @@ async fn terminal_metadata_survives_a_restart() {
     }
 
     // A second daemon over the same directory reads what the first one recorded.
-    let store = qoop_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+    let store = qoop_store::Store::open(&dir.path().join("qoop.db")).expect("open");
     let workspaces = store.workspaces().expect("workspaces");
     assert_eq!(workspaces.len(), 1, "the workspace was not persisted");
     let terminals = store.open_terminals(workspaces[0].id).expect("terminals");
@@ -482,7 +482,7 @@ async fn a_start_removes_history_that_no_open_terminal_owns() {
     qoop_runtime::paths::ensure_private_dir(dir.path()).expect("private dir");
 
     {
-        let mut store = qoop_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+        let mut store = qoop_store::Store::open(&dir.path().join("qoop.db")).expect("open");
         let space = store.create_workspace("w", 1).expect("workspace");
         store
             .create_terminal(5, space, &dir.path().display().to_string(), "/bin/sh", 1)
@@ -995,7 +995,7 @@ async fn g2_9_a_hung_syscall_under_one_terminal_leaves_the_rest_working() {
 /// this a test of the subscription rather than of the screen.
 #[tokio::test(flavor = "multi_thread")]
 async fn g2_13_a_hundred_terminals_quiesce_within_the_stated_bound() {
-    let terminals: usize = std::env::var("QORO_QUIESCE_N")
+    let terminals: usize = std::env::var("QOOP_QUIESCE_N")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);

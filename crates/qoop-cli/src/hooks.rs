@@ -20,7 +20,7 @@
 //!   because every entry is recognised by the path it points at.
 //!
 //! The file is copied before it is written, every time, because this edits a configuration
-//! a person did not write and may care about more than they care about qoro.
+//! a person did not write and may care about more than they care about qoop.
 
 use std::path::{Path, PathBuf};
 
@@ -86,8 +86,8 @@ fn targets() -> Vec<Target> {
     vec![
         Target {
             agent: "claude",
-            body: include_str!("../../../hooks/claude/qoro-hook.sh"),
-            file: "qoro-hook.sh",
+            body: include_str!("../../../hooks/claude/qoop-hook.sh"),
+            file: "qoop-hook.sh",
             config: ".claude/settings.json",
             instead: None,
             home_env: None,
@@ -111,8 +111,8 @@ fn targets() -> Vec<Target> {
         },
         Target {
             agent: "codex",
-            body: include_str!("../../../hooks/codex/qoro-hook.sh"),
-            file: "qoro-codex-hook.sh",
+            body: include_str!("../../../hooks/codex/qoop-hook.sh"),
+            file: "qoop-codex-hook.sh",
             config: ".codex/hooks.json",
             instead: None,
             home_env: None,
@@ -133,8 +133,8 @@ fn targets() -> Vec<Target> {
         },
         Target {
             agent: "gemini",
-            body: include_str!("../../../hooks/gemini/qoro-hook.sh"),
-            file: "qoro-gemini-hook.sh",
+            body: include_str!("../../../hooks/gemini/qoop-hook.sh"),
+            file: "qoop-gemini-hook.sh",
             config: ".gemini/settings.json",
             instead: None,
             home_env: None,
@@ -151,8 +151,8 @@ fn targets() -> Vec<Target> {
         },
         Target {
             agent: "cursor",
-            body: include_str!("../../../hooks/cursor/qoro-hook.sh"),
-            file: "qoro-cursor-hook.sh",
+            body: include_str!("../../../hooks/cursor/qoop-hook.sh"),
+            file: "qoop-cursor-hook.sh",
             config: ".cursor/hooks.json",
             instead: None,
             home_env: None,
@@ -167,8 +167,8 @@ fn targets() -> Vec<Target> {
         },
         Target {
             agent: "opencode",
-            body: include_str!("../../../hooks/opencode/qoro-plugin.js"),
-            file: "qoro-plugin.js",
+            body: include_str!("../../../hooks/opencode/qoop-plugin.js"),
+            file: "qoop-plugin.js",
             config: ".config/opencode/plugin",
             instead: None,
             home_env: None,
@@ -184,7 +184,7 @@ fn targets() -> Vec<Target> {
         Target {
             agent: "copilot",
             body: SESSION_HOOK,
-            file: "qoro-copilot-session.sh",
+            file: "qoop-copilot-session.sh",
             config: ".copilot/settings.json",
             instead: None,
             home_env: Some("COPILOT_HOME"),
@@ -196,7 +196,7 @@ fn targets() -> Vec<Target> {
         Target {
             agent: "droid",
             body: SESSION_HOOK,
-            file: "qoro-droid-session.sh",
+            file: "qoop-droid-session.sh",
             config: ".factory/settings.json",
             instead: Some(".factory/hooks.json"),
             home_env: None,
@@ -208,7 +208,7 @@ fn targets() -> Vec<Target> {
         Target {
             agent: "qwen",
             body: SESSION_HOOK,
-            file: "qoro-qwen-session.sh",
+            file: "qoop-qwen-session.sh",
             config: ".qwen/settings.json",
             instead: None,
             home_env: Some("QWEN_HOME"),
@@ -220,7 +220,7 @@ fn targets() -> Vec<Target> {
         Target {
             agent: "qodercli",
             body: SESSION_HOOK,
-            file: "qoro-qodercli-session.sh",
+            file: "qoop-qodercli-session.sh",
             config: ".qoder/settings.json",
             instead: None,
             home_env: Some("QODER_CONFIG_DIR"),
@@ -233,7 +233,7 @@ fn targets() -> Vec<Target> {
 }
 
 /// The session-only hook, installed once per agent that uses it.
-const SESSION_HOOK: &str = include_str!("../../../hooks/session/qoro-session-hook.sh");
+const SESSION_HOOK: &str = include_str!("../../../hooks/session/qoop-session-hook.sh");
 
 /// The file this agent reads its hooks from, and whether the event map sits at its root.
 ///
@@ -287,7 +287,7 @@ fn config_path_in(target: &Target, home: &Path, moved: Option<PathBuf>) -> PathB
 /// Whether a person has this agent: its binary on `PATH`, or its configuration directory.
 ///
 /// An install that names no agent installs only for these, rather than creating a
-/// directory for every agent qoro knows of on a machine that has two of them.
+/// directory for every agent qoop knows of on a machine that has two of them.
 fn present(target: &Target, home: &Path) -> bool {
     present_in(target, home, &std::env::var("PATH").unwrap_or_default())
 }
@@ -401,14 +401,14 @@ fn on_path_in(agent: &str, path: &str) -> bool {
         .any(|dir| Path::new(dir).join(binary).exists())
 }
 
-/// `qoro hooks ...`
+/// `qoop hooks ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("install") => install(&args[3..]),
         Some("uninstall") => uninstall(&args[3..]),
         Some("status") | None => status(),
         Some(other) => Err(std::io::Error::other(format!(
-            "unknown command {other}; usage: qoro hooks <install|uninstall|status> [agent...]"
+            "unknown command {other}; usage: qoop hooks <install|uninstall|status> [agent...]"
         ))),
     }
 }
@@ -423,7 +423,7 @@ fn wanted(args: &[String]) -> std::io::Result<Vec<Target>> {
         let Some(target) = targets().into_iter().find(|t| t.agent == name.as_str()) else {
             let known: Vec<&str> = targets().iter().map(|t| t.agent).collect();
             return Err(std::io::Error::other(format!(
-                "no hook for {name}; qoro ships one for {}",
+                "no hook for {name}; qoop ships one for {}",
                 known.join(", ")
             )));
         };
@@ -460,8 +460,8 @@ fn status() -> std::io::Result<()> {
         };
         println!("  {:<10} {state}", target.agent);
     }
-    println!("\n  qoro hooks install [agent...]    add them, beside whatever is already there");
-    println!("  qoro hooks uninstall [agent...]  remove exactly what was added");
+    println!("\n  qoop hooks install [agent...]    add them, beside whatever is already there");
+    println!("  qoop hooks uninstall [agent...]  remove exactly what was added");
     Ok(())
 }
 
@@ -479,7 +479,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
             continue;
         }
         // Dropped hooks have no configuration to edit: the file itself goes
-        // into the agent's plugin directory. The file is qoro's own and the
+        // into the agent's plugin directory. The file is qoop's own and the
         // person never edits it, so missing or different means install.
         if matches!(target.shape, Shape::Dropped) {
             match install_dropped(&home, &target) {
@@ -527,9 +527,9 @@ fn install(args: &[String]) -> std::io::Result<()> {
         });
         if target.agent == "codex" && !reachable {
             println!(
-                "  {:<10} its workspace-write sandbox keeps qoro's socket out of reach; set \
+                "  {:<10} its workspace-write sandbox keeps qoop's socket out of reach; set \
                  sandbox_workspace_write.network_access = true in ~/.codex/config.toml, or run \
-                 it with full access, for qoro commands from inside Codex",
+                 it with full access, for qoop commands from inside Codex",
                 ""
             );
         }
@@ -542,7 +542,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
 ///
 /// True when written, false when the file on disk already carries this
 /// build's body. Missing parents are made. Before this existed, install
-/// wrote the script to qoro's own hooks directory and then failed editing
+/// wrote the script to qoop's own hooks directory and then failed editing
 /// the plugin *directory* as a file, so `install opencode` reported the
 /// script written and installed nothing at all.
 fn install_dropped(home: &Path, target: &Target) -> std::io::Result<bool> {
@@ -675,7 +675,7 @@ fn write(config: &Path, value: &serde_json::Value) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temp = real.with_file_name(format!(".{name}.qoro-{}", std::process::id()));
+    let temp = real.with_file_name(format!(".{name}.qoop-{}", std::process::id()));
     // The mode the file already has, when it exists. A new file gets whatever the umask
     // gives any new file, so a person with `umask 077` gets 0600 and not a mode of ours.
     let existing = std::fs::metadata(&real).ok().map(|m| m.permissions());
@@ -725,14 +725,14 @@ fn link_target(config: &Path) -> PathBuf {
 }
 
 /// What a kept copy is called after the file's stem.
-const BACKUP: &str = "qoro-backup-";
+const BACKUP: &str = "qoop-backup-";
 
 /// How many of the newest kept copies stay, beside the oldest.
 const KEPT_NEWEST: usize = 3;
 
 /// Copy a configuration aside before it is changed, then prune the copies.
 ///
-/// The oldest copy is always kept, because it is the file as the person had it before qoro
+/// The oldest copy is always kept, because it is the file as the person had it before qoop
 /// first touched it, which is what an uninstall gives back. Past that only the newest few
 /// stay: a copy per write, unpruned, is a directory that fills up with them.
 fn keep_copy(config: &Path) -> std::io::Result<()> {
@@ -881,26 +881,26 @@ fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io
     Ok(changed || allowed)
 }
 
-/// The Claude permissions that let an agent run `qoro task` without asking each time: the
+/// The Claude permissions that let an agent run `qoop task` without asking each time: the
 /// rules its hook gives it ask for several per task. Every subcommand an agent uses on its
 /// own task, and not `close`, which ends somebody's task and stays a question.
 const ALLOW: [&str; 8] = [
-    "Bash(qoro task new:*)",
-    "Bash(qoro task stage:*)",
-    "Bash(qoro task plan:*)",
-    "Bash(qoro task evidence:*)",
-    "Bash(qoro task done:*)",
-    "Bash(qoro task show:*)",
-    "Bash(qoro task ls:*)",
-    "Bash(qoro task rules:*)",
+    "Bash(qoop task new:*)",
+    "Bash(qoop task stage:*)",
+    "Bash(qoop task plan:*)",
+    "Bash(qoop task evidence:*)",
+    "Bash(qoop task done:*)",
+    "Bash(qoop task show:*)",
+    "Bash(qoop task ls:*)",
+    "Bash(qoop task rules:*)",
 ];
 
 /// Rules the person may already have that cover all of `ALLOW`.
 const COVERING: [&str; 4] = [
-    "Bash(qoro task:*)",
-    "Bash(qoro task *)",
-    "Bash(qoro:*)",
-    "Bash(qoro *)",
+    "Bash(qoop task:*)",
+    "Bash(qoop task *)",
+    "Bash(qoop:*)",
+    "Bash(qoop *)",
 ];
 
 /// What says the permissions are ours: written beside the scripts once the install added
@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     /// A dropped hook lands in the agent's own directory: install used to
-    /// write the script to qoro's directory and then fail editing the plugin
+    /// write the script to qoop's directory and then fail editing the plugin
     /// directory as a file, so opencode never got its hook at all.
     #[test]
     fn installing_a_dropped_hook_writes_the_plugin_directory() {
@@ -1170,7 +1170,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
         std::fs::write(&config, serde_json::to_string(&existing()).expect("json")).expect("write");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
 
         assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         let after: serde_json::Value =
@@ -1193,7 +1193,7 @@ mod tests {
             pre[1]["command"]
                 .as_str()
                 .expect("a command")
-                .contains("qoro-hook.sh")
+                .contains("qoop-hook.sh")
         );
         // Every event the target names is registered.
         for event in ["SessionStart", "Stop", "SessionEnd", "Notification"] {
@@ -1206,7 +1206,7 @@ mod tests {
         let backups: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("qoro-backup"))
+            .filter(|e| e.file_name().to_string_lossy().contains("qoop-backup"))
             .collect();
         assert_eq!(backups.len(), 1, "no copy was kept before writing");
     }
@@ -1216,7 +1216,7 @@ mod tests {
     fn installing_again_changes_nothing() {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         let once = std::fs::read_to_string(&config).expect("read");
         assert!(
@@ -1232,7 +1232,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
         std::fs::write(&config, serde_json::to_string(&existing()).expect("json")).expect("write");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         edit(&config, &target("claude"), &script, false).expect("install");
 
         assert!(remove(&config, &script, false).expect("uninstall"));
@@ -1256,7 +1256,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
         std::fs::write(&config, r#"{"model":"opus","env":{"B":"1","A":"2"}}"#).expect("write");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         let text = std::fs::read_to_string(&config).expect("read");
         let at = |k: &str| text.find(&format!("\"{k}\"")).expect(k);
@@ -1277,7 +1277,7 @@ mod tests {
             .expect("a list")
             .insert(0, serde_json::json!({ "matcher": "Bash", "hooks": [] }));
         std::fs::write(&config, serde_json::to_string(&before).expect("json")).expect("write");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         edit(&config, &target("claude"), &script, false).expect("install");
 
         assert!(remove(&config, &script, false).expect("uninstall"));
@@ -1299,20 +1299,20 @@ mod tests {
     /// A hooks directory a command line cannot carry as is is refused, not quoted.
     #[test]
     fn a_hooks_directory_with_a_space_is_refused() {
-        let err = safe_hook_dir(Path::new("/Users/a/my config/qoro/hooks")).expect_err("space");
+        let err = safe_hook_dir(Path::new("/Users/a/my config/qoop/hooks")).expect_err("space");
         assert!(err.to_string().contains("XDG_CONFIG_HOME"), "{err}");
-        safe_hook_dir(Path::new("/Users/a.b/.config/qoro/hooks")).expect("a plain path");
+        safe_hook_dir(Path::new("/Users/a.b/.config/qoop/hooks")).expect("a plain path");
         // A directory-joined Linux home, and a non-ASCII name: both carried fine unquoted.
-        safe_hook_dir(Path::new("/home/jo@corp.example/.config/qoro/hooks")).expect("an @");
-        safe_hook_dir(Path::new("/home/çağrı/.config/qoro/hooks")).expect("non-ASCII");
-        safe_hook_dir(Path::new("/tmp/$(x)/qoro/hooks")).expect_err("shell syntax");
+        safe_hook_dir(Path::new("/home/jo@corp.example/.config/qoop/hooks")).expect("an @");
+        safe_hook_dir(Path::new("/home/çağrı/.config/qoop/hooks")).expect("non-ASCII");
+        safe_hook_dir(Path::new("/tmp/$(x)/qoop/hooks")).expect_err("shell syntax");
     }
 
     /// The flat shape and the plugin shape are written the way their agent reads them.
     #[test]
     fn each_agent_gets_the_shape_its_own_configuration_uses() {
         let dir = tempfile::tempdir().expect("a directory");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
 
         // Cursor: a version, and entries with nothing around them.
         let cursor = dir.path().join("cursor.json");
@@ -1359,7 +1359,7 @@ mod tests {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         let config = dir.path().join("settings.json");
         std::os::unix::fs::symlink(&real, &config).expect("link");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
 
         assert!(edit(&config, &target("claude"), &script, false).expect("install"));
         assert!(
@@ -1372,7 +1372,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&real)
                 .expect("read")
-                .contains("qoro-hook.sh"),
+                .contains("qoop-hook.sh"),
             "the file behind the link was not edited"
         );
         let mode = std::fs::metadata(&real).expect("stat").permissions().mode() & 0o777;
@@ -1386,11 +1386,11 @@ mod tests {
     fn the_claude_hook_reports_blocked_only_for_notifications_that_wait_on_the_person() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         std::fs::write(&script, target("claude").body).expect("write");
-        // A stand-in `qoro` that writes down what it was asked to report.
+        // A stand-in `qoop` that writes down what it was asked to report.
         let log = dir.path().join("reports");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         std::fs::write(
             &fake,
             format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
@@ -1402,8 +1402,8 @@ mod tests {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&script)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env("QORO_TERMINAL", "1")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
@@ -1450,7 +1450,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("reports");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         // The rules a session start also asks for are not a report.
         std::fs::write(
             &fake,
@@ -1469,8 +1469,8 @@ mod tests {
                 .arg(&script)
                 .arg(arg)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env("QORO_TERMINAL", "1")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
@@ -1522,10 +1522,10 @@ mod tests {
     fn the_claude_hook_reports_nothing_for_a_subagent() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         std::fs::write(&script, target("claude").body).expect("write");
         let log = dir.path().join("reports");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         std::fs::write(
             &fake,
             format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
@@ -1537,8 +1537,8 @@ mod tests {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&script)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env("QORO_TERMINAL", "1")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
@@ -1571,7 +1571,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
         std::fs::write(&config, "{ this is not json").expect("write");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         let err = edit(&config, &target("claude"), &script, false).expect_err("not JSON");
         assert!(err.to_string().contains("valid JSON"), "{err}");
         assert_eq!(
@@ -1592,7 +1592,7 @@ mod tests {
                 target.agent
             );
             assert!(
-                target.body.contains("qoro"),
+                target.body.contains("qoop"),
                 "{} ships something that is not the hook",
                 target.agent
             );
@@ -1719,7 +1719,7 @@ mod tests {
     #[test]
     fn each_session_hook_lands_where_and_how_its_agent_reads_it() {
         let dir = tempfile::tempdir().expect("a directory");
-        let script = dir.path().join("qoro-session.sh");
+        let script = dir.path().join("qoop-session.sh");
         let installed = |agent: &str| {
             let config = dir.path().join(format!("{agent}.json"));
             edit(&config, &target(agent), &script, false).expect("install");
@@ -1811,15 +1811,15 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).expect("dir");
         let log = dir.path().join("argv");
-        // A stand-in qoro that records its argv.
-        let qoro = bin.join("qoro");
+        // A stand-in qoop that records its argv.
+        let qoop = bin.join("qoop");
         std::fs::write(
-            &qoro,
+            &qoop,
             format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
         )
         .expect("write");
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&qoro, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&qoop, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let hook = dir.path().join("hook.sh");
         std::fs::write(&hook, SESSION_HOOK).expect("write");
 
@@ -1828,8 +1828,8 @@ mod tests {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&hook)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env("QORO_TERMINAL", "3")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "3")
+                .env("QOOP_TOKEN", "t")
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn");
@@ -1964,7 +1964,7 @@ mod tests {
         let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        let script = dir.path().join("qoro.sh");
+        let script = dir.path().join("qoop.sh");
         assert!(edit(&link, &target("qwen"), &script, false).expect("install"));
         assert!(
             std::fs::symlink_metadata(&link)
@@ -1976,14 +1976,14 @@ mod tests {
         assert!(
             std::fs::read_to_string(&real)
                 .expect("read")
-                .contains("qoro.sh")
+                .contains("qoop.sh")
         );
         let mode = std::fs::metadata(&real).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
     /// Kept copies are pruned to the oldest plus the newest few, and the oldest (the
-    /// file as it was before qoro first touched it) is the one that survives.
+    /// file as it was before qoop first touched it) is the one that survives.
     #[test]
     fn kept_copies_are_pruned_to_the_oldest_and_the_newest_three() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -2010,7 +2010,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("a directory");
             let config = dir.path().join("hooks.json");
             std::fs::write(&config, original).expect("write");
-            let script = dir.path().join("qoro.sh");
+            let script = dir.path().join("qoop.sh");
             let droid = target("droid");
             assert!(edit(&config, &droid, &script, true).expect("install"));
             assert!(remove(&config, &script, true).expect("uninstall"));
@@ -2028,7 +2028,7 @@ mod tests {
     fn a_cursor_file_the_install_created_is_removed_by_the_uninstall() {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("hooks.json");
-        let script = dir.path().join("qoro.sh");
+        let script = dir.path().join("qoop.sh");
         assert!(edit(&config, &target("cursor"), &script, false).expect("install"));
         assert!(remove(&config, &script, false).expect("uninstall"));
         assert!(!config.exists(), "{:?}", std::fs::read_to_string(&config));
@@ -2040,7 +2040,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let link = dir.path().join("settings.json");
         std::os::unix::fs::symlink("dotfiles/qwen/settings.json", &link).expect("symlink");
-        let script = dir.path().join("qoro.sh");
+        let script = dir.path().join("qoop.sh");
         assert!(edit(&link, &target("qwen"), &script, false).expect("install"));
         assert!(
             std::fs::symlink_metadata(&link)
@@ -2053,7 +2053,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&real)
                 .expect("the target was created")
-                .contains("qoro.sh")
+                .contains("qoop.sh")
         );
         // Uninstalled, it is as it was: the link still there, dangling again.
         assert!(remove(&link, &script, false).expect("uninstall"));
@@ -2094,7 +2094,7 @@ mod tests {
         let config = dir.path().join("settings.json");
         std::fs::write(&config, "{\"mine\": true}\n").expect("write");
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444)).expect("chmod");
-        let script = dir.path().join("qoro.sh");
+        let script = dir.path().join("qoop.sh");
         let err = edit(&config, &target("qwen"), &script, false).expect_err("read-only");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(
@@ -2114,7 +2114,7 @@ mod tests {
     }
 
     /// A configuration the install creates gets the mode the person's umask gives any new
-    /// file, not a mode of qoro's choosing: with `umask 077` it is 0600.
+    /// file, not a mode of qoop's choosing: with `umask 077` it is 0600.
     ///
     /// The umask is process-wide, so the check runs in a child of this test binary with
     /// the umask set there, rather than changing it under every other test running now.
@@ -2145,7 +2145,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
-        let script = dir.path().join("qoro.sh");
+        let script = dir.path().join("qoop.sh");
         assert!(edit(&config, &target("qwen"), &script, false).expect("install"));
         let mode = std::fs::metadata(&config)
             .expect("meta")
@@ -2157,13 +2157,13 @@ mod tests {
 
     /// A session start hands the agent the task rules on its standard output, which is
     /// what Claude and Codex add to its context; Gemini only reads JSON there. Every other
-    /// event prints nothing, outside qoro nothing prints, and a `qoro` without tasks (an
+    /// event prints nothing, outside qoop nothing prints, and a `qoop` without tasks (an
     /// older one on a remote) leaves the hook quiet and successful.
     #[test]
     fn a_session_start_prints_the_task_rules_and_nothing_else_does() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         let set_fake = |rules: &str| {
             std::fs::write(
                 &fake,
@@ -2179,12 +2179,12 @@ mod tests {
             cmd.arg(&script)
                 .arg("working")
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env_remove("QORO_TERMINAL")
-                .env_remove("QORO_TOKEN")
+                .env_remove("QOOP_TERMINAL")
+                .env_remove("QOOP_TOKEN")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped());
             if inside {
-                cmd.env("QORO_TERMINAL", "1").env("QORO_TOKEN", "t");
+                cmd.env("QOOP_TERMINAL", "1").env("QOOP_TOKEN", "t");
             }
             let mut child = cmd.spawn().expect("run the hook");
             use std::io::Write;
@@ -2202,7 +2202,7 @@ mod tests {
         let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
         for agent in ["claude", "codex"] {
             assert_eq!(run(agent, start, true).trim(), "RULES LINE", "{agent}");
-            assert_eq!(run(agent, start, false), "", "{agent} outside qoro");
+            assert_eq!(run(agent, start, false), "", "{agent} outside qoop");
             assert_eq!(
                 run(
                     agent,
@@ -2261,10 +2261,10 @@ mod tests {
             ""
         );
 
-        // A qoro that does not know `task` answers 2 and says so on stderr.
+        // A qoop that does not know `task` answers 2 and says so on stderr.
         set_fake("echo 'unknown command' >&2; exit 2");
         for agent in ["claude", "codex", "gemini"] {
-            assert_eq!(run(agent, start, true), "", "{agent} with an older qoro");
+            assert_eq!(run(agent, start, true), "", "{agent} with an older qoop");
         }
         // And one that prints nothing (qass's own space) prints nothing.
         set_fake("exit 0");
@@ -2273,13 +2273,13 @@ mod tests {
         }
     }
 
-    /// The Claude permission for `qoro task` is added once, never over a rule that already
+    /// The Claude permission for `qoop task` is added once, never over a rule that already
     /// covers it, and an uninstall takes back only one it added.
     #[test]
     fn the_task_permission_is_ours_to_add_and_ours_to_remove() {
         let dir = tempfile::tempdir().expect("a directory");
         let config = dir.path().join("settings.json");
-        let script = dir.path().join("qoro-hook.sh");
+        let script = dir.path().join("qoop-hook.sh");
         let marker = dir.path().join(ALLOW_MARKER);
         let allow = |config: &Path| -> serde_json::Value {
             serde_json::from_str::<serde_json::Value>(
@@ -2317,21 +2317,21 @@ mod tests {
         assert!(remove(&config, &script, false).expect("remove"));
         assert_eq!(allow(&config), serde_json::json!(["Read"]));
 
-        // A person who already allows all of qoro keeps exactly their rule.
+        // A person who already allows all of qoop keeps exactly their rule.
         let theirs = dir.path().join("theirs.json");
-        std::fs::write(&theirs, r#"{"permissions":{"allow":["Bash(qoro:*)"]}}"#).expect("write");
+        std::fs::write(&theirs, r#"{"permissions":{"allow":["Bash(qoop:*)"]}}"#).expect("write");
         let elsewhere = tempfile::tempdir().expect("a directory");
-        let their_script = elsewhere.path().join("qoro-hook.sh");
+        let their_script = elsewhere.path().join("qoop-hook.sh");
         assert!(edit(&theirs, &target("claude"), &their_script, false).expect("install"));
         assert!(
             !elsewhere.path().join(ALLOW_MARKER).exists(),
             "covered, so not ours"
         );
-        assert_eq!(allow(&theirs), serde_json::json!(["Bash(qoro:*)"]));
+        assert_eq!(allow(&theirs), serde_json::json!(["Bash(qoop:*)"]));
         assert!(remove(&theirs, &their_script, false).expect("remove"));
         assert_eq!(
             allow(&theirs),
-            serde_json::json!(["Bash(qoro:*)"]),
+            serde_json::json!(["Bash(qoop:*)"]),
             "their rule stays"
         );
 
@@ -2339,30 +2339,30 @@ mod tests {
         let mine = dir.path().join("mine.json");
         std::fs::write(
             &mine,
-            r#"{"permissions":{"allow":["Bash(qoro task show:*)"]}}"#,
+            r#"{"permissions":{"allow":["Bash(qoop task show:*)"]}}"#,
         )
         .expect("write");
         let third = tempfile::tempdir().expect("a directory");
-        let third_script = third.path().join("qoro-hook.sh");
+        let third_script = third.path().join("qoop-hook.sh");
         assert!(edit(&mine, &target("claude"), &third_script, false).expect("install"));
         assert_eq!(allow(&mine).as_array().map(Vec::len), Some(ALLOW.len()));
         assert!(remove(&mine, &third_script, false).expect("remove"));
         assert_eq!(
             allow(&mine),
-            serde_json::json!(["Bash(qoro task show:*)"]),
+            serde_json::json!(["Bash(qoop task show:*)"]),
             "theirs stays"
         );
     }
 
     /// An edit attempt, by the agent or one of its subagents, opens the terminal's task
-    /// through `qoro task begin`; nothing else does. Codex edits through `apply_patch`,
+    /// through `qoop task begin`; nothing else does. Codex edits through `apply_patch`,
     /// Gemini through `write_file` and `replace`. Codex and Gemini send the prompt head.
     #[test]
     fn an_edit_attempt_begins_the_task_and_nothing_else_does() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("calls");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         std::fs::write(
             &fake,
             format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
@@ -2377,8 +2377,8 @@ mod tests {
                 .arg(&script)
                 .arg(arg)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env("QORO_TERMINAL", "1")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .spawn()
@@ -2480,7 +2480,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("calls");
-        let fake = dir.path().join("qoro");
+        let fake = dir.path().join("qoop");
         std::fs::write(
             &fake,
             format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
@@ -2524,8 +2524,8 @@ mod tests {
                 .arg(&script)
                 .arg("working")
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-                .env("QORO_TERMINAL", "1")
-                .env("QORO_TOKEN", "t")
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
                 .env("TMPDIR", &turns)
                 .env_remove("XDG_RUNTIME_DIR")
                 .stdin(std::process::Stdio::piped())

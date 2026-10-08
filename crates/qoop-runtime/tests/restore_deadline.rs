@@ -68,7 +68,7 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
     let stuck = Duration::from_secs(8);
     for _ in 0..blocking::PROBE_THREADS {
         tokio::spawn(blocking::probe(
-            "/qoro-test-hung-mount",
+            "/qoop-test-hung-mount",
             Duration::from_millis(100),
             move || std::thread::sleep(stuck),
         ));
@@ -107,7 +107,7 @@ async fn restore_with_every_directory_unanswered_waits_one_deadline_not_one_per_
     let serving = tokio::spawn(async move { daemon.serve().await });
     tokio::time::sleep(Duration::from_secs(3)).await;
     serving.abort();
-    let store = qoop_store::Store::open(&dir.path().join("qoro.db")).expect("open");
+    let store = qoop_store::Store::open(&dir.path().join("qoop.db")).expect("open");
     let workspace = store.workspaces().expect("workspaces")[0].id;
     let rows = store.open_terminals(workspace).expect("rows");
     for i in 0..TABS {

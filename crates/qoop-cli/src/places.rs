@@ -1,8 +1,8 @@
-//! `qoro paths`: where qoro keeps each kind of file on this machine, and how big it is.
+//! `qoop paths`: where qoop keeps each kind of file on this machine, and how big it is.
 //!
 //! One folder per kind, each where the platform expects it: settings a person edits
 //! (config), what must survive (data), what a restart makes again (runtime), what can be
-//! rebuilt (cache), and logs. Asked by name (`qoro paths qass-data`) it prints only that
+//! rebuilt (cache), and logs. Asked by name (`qoop paths qass-data`) it prints only that
 //! path, for a script or a `--cwd`.
 
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ fn places() -> Vec<Place> {
         },
         Place {
             name: "data",
-            what: "what must survive: spaces and tabs (qoro.db), screen history, this Mac's key",
+            what: "what must survive: spaces and tabs (qoop.db), screen history, this Mac's key",
             path: runtime
                 .as_deref()
                 .map(paths::state_location)
@@ -39,7 +39,7 @@ fn places() -> Vec<Place> {
         },
         Place {
             name: "cache",
-            what: "what qoro can build again: the notch app",
+            what: "what qoop can build again: the notch app",
             path: paths::cache_dir(),
         },
         Place {

@@ -1,6 +1,6 @@
-//! What the full-page screens share (`qoro sound`, `qoro settings`, `qoro onboard`): the
+//! What the full-page screens share (`qoop sound`, `qoop settings`, `qoop onboard`): the
 //! terminal held raw on the alternate screen, the keys read off it, the sound playing, and a
-//! grid of cells painted in qoro's own inks with the logo and the pet drawn the way the
+//! grid of cells painted in qoop's own inks with the logo and the pet drawn the way the
 //! sidebar draws them.
 
 use std::io::{Read, Write};
@@ -327,7 +327,7 @@ impl Screen {
         let y = self.h - 1;
         let bar = theme::status();
         self.put(0, y, &" ".repeat(self.w), &bar);
-        let mut x = self.put(1, y, " qoro ", &theme::button(true));
+        let mut x = self.put(1, y, " qoop ", &theme::button(true));
         x += 2;
         for (key, what) in keys {
             x = self.put(x, y, key, &format!("{}\x1b[1m", theme::status_key()));

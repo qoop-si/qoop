@@ -19,7 +19,7 @@ pub enum Item {
     NewTerminal,
     NewSpace,
     /// A new terminal running this agent: the command is typed into the new
-    /// shell once the tab opens, the same path `qoro new -- <agent>` takes.
+    /// shell once the tab opens, the same path `qoop new -- <agent>` takes.
     NewAgent(String),
     /// A new terminal running an agent the table does not know: the palette
     /// asks which command to type, so any agent works, not just the listed ones.

@@ -1,31 +1,31 @@
 #!/bin/sh
 # Fresh-machine install: binary, hooks, skills. One command, no questions.
 #
-# Complementary to `qoro update`, not a copy of it: update replaces a live
+# Complementary to `qoop update`, not a copy of it: update replaces a live
 # binary in place and refuses while sessions run; this lays a machine out
 # from nothing. An existing binary that is older is not touched here;
-# `qoro update` owns that path.
+# `qoop update` owns that path.
 #
 # Fail closed: no network, no install. Rerunning changes nothing.
 #
 # Into the person's home, never as root: `/usr/local/bin` needs sudo on a stock
 # Mac and on Linux, and under sudo the hooks and skill land root-owned where the
-# person's agents cannot run them, and every later `qoro update` needs sudo too.
+# person's agents cannot run them, and every later `qoop update` needs sudo too.
 
 set -eu
 
 # Only under sudo: root on its own box (a container, a server) installing into its own
 # home is the person, and gets what anyone else gets.
 [ -z "${SUDO_USER:-}" ] || [ "$(id -u)" -ne 0 ] || {
-    echo "qoro install: run it as yourself, not with sudo: the binary, hooks and skill all go into your home" >&2
+    echo "qoop install: run it as yourself, not with sudo: the binary, hooks and skill all go into your home" >&2
     exit 1
 }
 
-REPO="pat/qoro"
-DEST="${QORO_DEST:-$HOME/.local/bin/qoro}"
+REPO="pat/qoop"
+DEST="${QOOP_DEST:-$HOME/.local/bin/qoop}"
 # A mirror, or a local directory as file:///path holding a `latest` file in the API's own
-# shape: how the platform pick is tested with no network. `qoro update` reads the same.
-BASE="${QORO_RELEASE_BASE:-https://api.github.com/repos/$REPO/releases}"
+# shape: how the platform pick is tested with no network. `qoop update` reads the same.
+BASE="${QOOP_RELEASE_BASE:-https://api.github.com/repos/$REPO/releases}"
 
 # The tarball the release script packs for this machine, by target triple.
 MACHINE="$(uname -m)"
@@ -40,7 +40,7 @@ case "$(uname -s) $MACHINE" in
     "Linux x86_64") TRIPLE="x86_64-unknown-linux-gnu" ;;
     "Linux aarch64" | "Linux arm64") TRIPLE="aarch64-unknown-linux-gnu" ;;
     *)
-        echo "qoro install: no prebuilt binary for $(uname -s) $(uname -m);" \
+        echo "qoop install: no prebuilt binary for $(uname -s) $(uname -m);" \
             "build from source: cargo build --release -p qoop-cli" >&2
         exit 1
         ;;
@@ -48,27 +48,27 @@ esac
 # The Linux binaries link glibc. On musl (Alpine) they cannot start at all, so say that
 # here rather than after a download that could never run.
 if [ "$(uname -s)" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
-    echo "qoro install: this is a musl system; the prebuilt Linux binary needs glibc." \
+    echo "qoop install: this is a musl system; the prebuilt Linux binary needs glibc." \
         "Build from source: cargo build --release -p qoop-cli" >&2
     exit 1
 fi
-ASSET="qoro-$TRIPLE.tar.gz"
+ASSET="qoop-$TRIPLE.tar.gz"
 
-if command -v qoro >/dev/null 2>&1; then
-    echo "qoro is already on PATH: $(command -v qoro)" >&2
-    echo "for a newer release run: qoro update" >&2
+if command -v qoop >/dev/null 2>&1; then
+    echo "qoop is already on PATH: $(command -v qoop)" >&2
+    echo "for a newer release run: qoop update" >&2
     exit 0
 fi
 # Not on PATH but already there, a link to a dev build for one: left exactly as it is.
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-    echo "qoro is already at $DEST, not on PATH; nothing replaced" >&2
+    echo "qoop is already at $DEST, not on PATH; nothing replaced" >&2
     echo "for a newer release run: $DEST update" >&2
     exit 0
 fi
 
 for tool in curl tar awk sed; do
     command -v "$tool" >/dev/null 2>&1 || {
-        echo "qoro install: missing required tool: $tool" >&2
+        echo "qoop install: missing required tool: $tool" >&2
         exit 1
     }
 done
@@ -78,7 +78,7 @@ if command -v shasum >/dev/null 2>&1; then
 elif command -v sha256sum >/dev/null 2>&1; then
     SHA256="sha256sum"
 else
-    echo "qoro install: missing required tool: shasum or sha256sum" >&2
+    echo "qoop install: missing required tool: shasum or sha256sum" >&2
     exit 1
 fi
 
@@ -90,10 +90,10 @@ if [ -z "$TOKEN" ] && command -v gh >/dev/null 2>&1; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$DEST.qoro-new"' EXIT INT TERM
+trap 'rm -rf "$WORK" "$DEST.qoop-new"' EXIT INT TERM
 
 # GET a URL into a file: accept type, max seconds, file, URL.
-# The token goes only to api.github.com, never to a mirror named by QORO_RELEASE_BASE, and
+# The token goes only to api.github.com, never to a mirror named by QOOP_RELEASE_BASE, and
 # only on stdin as a curl config line (`-K -`, printf is a shell builtin), never in an argv
 # any process listing shows; `-K` is understood by every curl, unlike `-H @-` (7.55). A
 # redirect to the storage host is followed by hand and without the token, because curl
@@ -115,7 +115,7 @@ api_get() {
 
 release_json="$WORK/release.json"
 api_get application/vnd.github+json 25 "$release_json" "$BASE/latest" || {
-    echo "qoro install: cannot reach GitHub Releases" >&2
+    echo "qoop install: cannot reach GitHub Releases" >&2
     exit 1
 }
 
@@ -142,50 +142,50 @@ asset_url_of() {
         }'
 }
 [ -n "$version" ] || {
-    echo "qoro install: the newest release names no version" >&2
+    echo "qoop install: the newest release names no version" >&2
     exit 1
 }
 asset_url="$(asset_url_of "$ASSET")"
 checksum_url="$(asset_url_of "$ASSET.sha256")"
 [ -n "$asset_url" ] || {
-    echo "qoro install: the newest release carries no $ASSET" >&2
+    echo "qoop install: the newest release carries no $ASSET" >&2
     exit 1
 }
 [ -n "$checksum_url" ] || {
-    echo "qoro install: the newest release carries no $ASSET.sha256" >&2
+    echo "qoop install: the newest release carries no $ASSET.sha256" >&2
     exit 1
 }
 
 api_get application/octet-stream 120 "$WORK/$ASSET" "$asset_url" || {
-    echo "qoro install: cannot download $ASSET" >&2
+    echo "qoop install: cannot download $ASSET" >&2
     exit 1
 }
 api_get application/octet-stream 120 "$WORK/$ASSET.sha256" "$checksum_url" || {
-    echo "qoro install: cannot download $ASSET.sha256" >&2
+    echo "qoop install: cannot download $ASSET.sha256" >&2
     exit 1
 }
 
 (cd "$WORK" && $SHA256 -c "$ASSET.sha256") || {
-    echo "qoro install: checksum mismatch" >&2
+    echo "qoop install: checksum mismatch" >&2
     exit 1
 }
 tar -xzf "$WORK/$ASSET" -C "$WORK"
-got="$("$WORK/qoro" --version 2>/dev/null)" || {
-    echo "qoro install: the downloaded binary does not run" >&2
+got="$("$WORK/qoop" --version 2>/dev/null)" || {
+    echo "qoop install: the downloaded binary does not run" >&2
     exit 1
 }
-[ "$got" = "qoro $version" ] || {
-    echo "qoro install: refusing: the download reports $got, want qoro $version" >&2
+[ "$got" = "qoop $version" ] || {
+    echo "qoop install: refusing: the download reports $got, want qoop $version" >&2
     exit 1
 }
 
 # Atomic into place, executable.
-tmp="$DEST.qoro-new"
+tmp="$DEST.qoop-new"
 mkdir -p "$(dirname "$DEST")" || {
-    echo "qoro install: cannot create $(dirname "$DEST")" >&2
+    echo "qoop install: cannot create $(dirname "$DEST")" >&2
     exit 1
 }
-cp "$WORK/qoro" "$tmp"
+cp "$WORK/qoop" "$tmp"
 chmod 0755 "$tmp"
 mv "$tmp" "$DEST"
 echo "installed $($DEST --version) to $DEST"
@@ -200,29 +200,29 @@ fi
 
 # The rest is the CLI's own verbs, never a copy of their logic. Each one on its own: a
 # hooks directory the CLI refuses is no reason to leave the skill and the PATH hint out.
-"$DEST" hooks install || echo "qoro install: hooks were not installed; see the message above" >&2
-"$DEST" skills install || echo "qoro install: the skill was not installed; see the message above" >&2
+"$DEST" hooks install || echo "qoop install: hooks were not installed; see the message above" >&2
+"$DEST" skills install || echo "qoop install: the skill was not installed; see the message above" >&2
 # On a Mac, the agents in the notch, started at login. Never the reason an install
 # fails: a Mac older than 14 says so, and everything above stays installed.
 if [ "$(uname -s)" = "Darwin" ]; then
-    "$DEST" notch install || echo "the notch was not turned on; the rest of qoro is installed"
+    "$DEST" notch install || echo "the notch was not turned on; the rest of qoop is installed"
 fi
 # A phone's bridge service, when there is one, back on the file just put in place: launchd
 # will not start an agent whose file was replaced, and a running one is the old build.
-"$DEST" bridge reload || echo "qoro install: the bridge service was not reloaded; run: qoro bridge reload" >&2
+"$DEST" bridge reload || echo "qoop install: the bridge service was not reloaded; run: qoop bridge reload" >&2
 
 # On a first install, and only when there is a person to answer, the onboarding steps:
 # the pet, the sounds, light or dark, the command key, notifications, sleep. Piped runs and
 # CI stay non-interactive by construction, and quitting keeps the install just done.
-if [ -n "$first" ] && [ -t 0 ] && [ -z "${QORO_NONINTERACTIVE:-}" ]; then
+if [ -n "$first" ] && [ -t 0 ] && [ -z "${QOOP_NONINTERACTIVE:-}" ]; then
     "$DEST" onboard || true
 else
-    echo "the pet, the sounds and every other setting: qoro settings"
+    echo "the pet, the sounds and every other setting: qoop settings"
 fi
 
-# The hooks call `qoro` by name, so it has to be on PATH. Said, not done: an rc
+# The hooks call `qoop` by name, so it has to be on PATH. Said, not done: an rc
 # file is the person's own.
-if ! command -v qoro >/dev/null 2>&1; then
+if ! command -v qoop >/dev/null 2>&1; then
     case "${SHELL:-}" in
         */zsh) rc=.zshrc ;;
         */bash) rc=.bashrc ;;

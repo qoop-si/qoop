@@ -184,7 +184,7 @@ mod tests {
             codec_generation_min: 1,
             codec_generation_max: 1,
             client_id: "c1".into(),
-            client_name: "qoro".into(),
+            client_name: "qoop".into(),
             client_version: "0".into(),
             codecs: CodecOffers {
                 control: vec!["control.json.v1".into()],

@@ -1,6 +1,6 @@
 //! Session-to-session messaging through the real socket.
 //!
-//! Two separate `qoro` invocations talk to one live daemon: one writes into a
+//! Two separate `qoop` invocations talk to one live daemon: one writes into a
 //! terminal it is not attached to, the other reads the screen back. That is
 //! the whole feature: an addressed terminal-channel input with a name, an
 //! existence check and a prompt variant that refuses a blocked session.
@@ -21,7 +21,7 @@ impl Daemon {
             .expect("chmod");
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
@@ -43,10 +43,10 @@ impl Daemon {
     fn run(&self, args: &[&str]) -> (bool, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .output()
-            .expect("run qoro");
+            .expect("run qoop");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -59,7 +59,7 @@ impl Daemon {
         ok.then_some(stdout)
     }
 
-    /// Poll `qoro read` until the marker shows up on the target's screen.
+    /// Poll `qoop read` until the marker shows up on the target's screen.
     fn wait_for_screen(&self, terminal: &str, needle: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -76,7 +76,7 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

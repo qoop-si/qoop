@@ -1,24 +1,24 @@
 #!/bin/sh
-# qoro hook for goose.
+# qoop hook for goose.
 #
 # Install: create a plugin directory with a `hooks/hooks.json` mapping the
 # lifecycle events to this script, project scope at
-# `.agents/plugins/qoro/hooks/hooks.json` or user scope at
-# `~/.agents/plugins/qoro/hooks/hooks.json`:
+# `.agents/plugins/qoop/hooks/hooks.json` or user scope at
+# `~/.agents/plugins/qoop/hooks/hooks.json`:
 #
 #   { "hooks": {
 #       "SessionStart": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }],
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }],
 #       "UserPromptSubmit": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }],
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }],
 #       "PreToolUse": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }],
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }],
 #       "PostToolUse": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }],
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }],
 #       "Stop": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }],
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }],
 #       "SessionEnd": [{ "hooks": [{ "type": "command",
-#         "command": "${PLUGIN_ROOT}/qoro-hook.sh" }] }]
+#         "command": "${PLUGIN_ROOT}/qoop-hook.sh" }] }]
 #   } }
 #
 # goose pipes the event payload as JSON on stdin (`event`, `session_id`,
@@ -30,12 +30,12 @@
 
 set -eu
 
-[ -n "${QORO_TERMINAL:-}" ] || exit 0
-[ -n "${QORO_TOKEN:-}" ] || exit 0
-# The installer puts qoro in ~/.local/bin, which a stock Mac does not have on PATH until
+[ -n "${QOOP_TERMINAL:-}" ] || exit 0
+[ -n "${QOOP_TOKEN:-}" ] || exit 0
+# The installer puts qoop in ~/.local/bin, which a stock Mac does not have on PATH until
 # the person adds it: looked for there too, rather than every hook going quiet.
-command -v qoro >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
-command -v qoro >/dev/null 2>&1 || exit 0
+command -v qoop >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
+command -v qoop >/dev/null 2>&1 || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 report="$(python3 -c '
@@ -65,5 +65,5 @@ print(state)
 ' 2>/dev/null)" || exit 0
 
 # shellcheck disable=SC2086
-qoro hook-report --state $report >/dev/null 2>&1 || true
+qoop hook-report --state $report >/dev/null 2>&1 || true
 exit 0

@@ -69,11 +69,11 @@ async fn an_index_hears_what_a_row_shows_and_nothing_else() {
         .expect("a token")
         .as_str()
         .to_string();
-    let (index, mut inbuf) = client::connect(d.socket(), "qoro-watch")
+    let (index, mut inbuf) = client::connect(d.socket(), "qoop-watch")
         .await
         .expect("connect");
     let (mut rd, _wr) = index.into_split();
-    let mut c = d.attach("qoro-task").await;
+    let mut c = d.attach("qoop-task").await;
     // Whatever the start of the terminal said, said before anything is asked.
     while changed(&mut rd, &mut inbuf, terminal, Duration::from_millis(500)).await {}
 
@@ -199,7 +199,7 @@ async fn an_index_hears_what_a_row_shows_and_nothing_else() {
 async fn only_the_terminals_own_token_speaks_for_it() {
     let d = TestDaemon::start().await;
     let terminal = d.terminals().streams()[0];
-    let mut c = d.attach("qoro-task").await;
+    let mut c = d.attach("qoop-task").await;
     let refused = write(
         &mut c,
         Some(terminal),
@@ -242,11 +242,11 @@ async fn a_begin_opens_once_and_is_heard_once() {
         .expect("a token")
         .as_str()
         .to_string();
-    let (index, mut inbuf) = client::connect(d.socket(), "qoro-watch")
+    let (index, mut inbuf) = client::connect(d.socket(), "qoop-watch")
         .await
         .expect("connect");
     let (mut rd, _wr) = index.into_split();
-    let mut c = d.attach("qoro-task").await;
+    let mut c = d.attach("qoop-task").await;
     while changed(&mut rd, &mut inbuf, terminal, Duration::from_millis(500)).await {}
     let me = (Some(terminal), Some(token));
     let first = write(&mut c, me.0, me.1.clone(), None, TaskOp::Begin).await;

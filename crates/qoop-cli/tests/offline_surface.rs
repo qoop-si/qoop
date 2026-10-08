@@ -6,7 +6,7 @@
 
 use std::process::Command;
 
-fn qoro() -> &'static str {
+fn qoop() -> &'static str {
     env!("CARGO_BIN_EXE_qoop")
 }
 
@@ -21,7 +21,7 @@ const SURFACE: &str = include_str!("../../../docs/cli-surface.md");
 fn runnable_from_the_document() -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for line in SURFACE.lines() {
-        let Some(rest) = line.strip_prefix("| `qoro") else {
+        let Some(rest) = line.strip_prefix("| `qoop") else {
             continue;
         };
         // A row marked yes in the network column is the declared exception: it reaches
@@ -91,18 +91,18 @@ fn scratch() -> tempfile::TempDir {
 }
 
 /// Each run in a fresh directory of its own, so a run never sees what another left behind.
-/// A row that names where its files are (`qoro config`) names that directory, which is the
+/// A row that names where its files are (`qoop config`) names that directory, which is the
 /// one difference allowed: it is read back as `<scratch>`.
 fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
     let dir = scratch();
-    let mut command = Command::new(qoro());
+    let mut command = Command::new(qoop());
     // Run from the scratch directory too, so a row that reads where it runs (`worktree
     // ls` lists the repository it is in) answers the same thing on every machine rather
     // than whatever worktrees this checkout has at the moment.
     command
         .args(args)
         .current_dir(dir.path())
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"));
     if offline {
         // Blackholed: no proxy, no resolver, nowhere to reach. A subcommand that consulted
@@ -111,18 +111,18 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
             .env("http_proxy", "http://127.0.0.1:1")
             .env("https_proxy", "http://127.0.0.1:1")
             .env("all_proxy", "http://127.0.0.1:1")
-            .env("QORO_CONTROL_PLANE", "http://127.0.0.1:1")
+            .env("QOOP_CONTROL_PLANE", "http://127.0.0.1:1")
             .env("RES_OPTIONS", "timeout:1 attempts:1");
     }
-    let out = command.output().expect("run qoro");
+    let out = command.output().expect("run qoop");
     // A row that starts a daemon on demand (`ensure-awake` opens a first tab) leaves it
     // running, and the scratch directory is deleted under it: one orphan per such row per
     // run. Stopped here, for every row, so a row added later cannot leak one either.
-    let _ = Command::new(qoro())
+    let _ = Command::new(qoop())
         .arg("stop")
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env_remove("QORO_SESSION")
+        .env_remove("QOOP_SESSION")
         .output();
     let here = dir.path().display().to_string();
     (
@@ -146,19 +146,19 @@ fn every_documented_subcommand_is_identical_with_the_network_gone() {
         assert_eq!(
             online_out,
             offline_out,
-            "`qoro {}` printed something different with the network gone",
+            "`qoop {}` printed something different with the network gone",
             args.join(" ")
         );
         assert_eq!(
             online_code,
             offline_code,
-            "`qoro {}` exited differently with the network gone",
+            "`qoop {}` exited differently with the network gone",
             args.join(" ")
         );
     }
 }
 
-/// The one yes row: `qoro update` fails closed with the network gone, having touched
+/// The one yes row: `qoop update` fails closed with the network gone, having touched
 /// nothing. It names GitHub in the failure, exits nonzero, and leaves no notice behind.
 #[test]
 fn update_fails_closed_with_the_network_gone() {
@@ -168,25 +168,25 @@ fn update_fails_closed_with_the_network_gone() {
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )
     .expect("chmod");
-    let mut command = Command::new(qoro());
+    let mut command = Command::new(qoop());
     command
         .args(["update", "--check"])
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("http_proxy", "http://127.0.0.1:1")
         .env("https_proxy", "http://127.0.0.1:1")
         .env("all_proxy", "http://127.0.0.1:1")
-        .env("QORO_CONTROL_PLANE", "http://127.0.0.1:1")
+        .env("QOOP_CONTROL_PLANE", "http://127.0.0.1:1")
         .env("RES_OPTIONS", "timeout:1 attempts:1");
-    let out = command.output().expect("run qoro");
+    let out = command.output().expect("run qoop");
     assert!(
         !out.status.success(),
-        "`qoro update --check` succeeded with the network gone, so the failure is silent"
+        "`qoop update --check` succeeded with the network gone, so the failure is silent"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("GitHub"),
-        "`qoro update --check` failed without saying what it could not reach: {stderr}"
+        "`qoop update --check` failed without saying what it could not reach: {stderr}"
     );
     assert!(
         !dir.path().join("update-available").exists(),
@@ -195,15 +195,15 @@ fn update_fails_closed_with_the_network_gone() {
 }
 
 /// Built from this repository alone, a phone command says the phone part is missing, a bridge
-/// reload (what install and update run) does nothing and says nothing, and `qoro bridge` fails.
+/// reload (what install and update run) does nothing and says nothing, and `qoop bridge` fails.
 #[test]
 fn a_build_without_the_phone_part_says_so() {
     let run = |args: &[&str]| {
-        Command::new(qoro())
+        Command::new(qoop())
             .args(args)
             .env("PATH", "/usr/bin:/bin")
             .output()
-            .expect("run qoro")
+            .expect("run qoop")
     };
     // A hub that counts: this build must not reach it, not even to fail.
     let hub = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -212,11 +212,11 @@ fn a_build_without_the_phone_part_says_so() {
     let out = run(&["pair", "--hub", &url]);
     assert!(
         hub.accept().is_err(),
-        "`qoro pair` without the phone part reached the hub"
+        "`qoop pair` without the phone part reached the hub"
     );
     assert!(
         !out.status.success(),
-        "`qoro pair` succeeded with no bridge"
+        "`qoop pair` succeeded with no bridge"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -226,11 +226,11 @@ fn a_build_without_the_phone_part_says_so() {
     let out = run(&["bridge", "reload"]);
     assert!(
         out.status.success() && out.stderr.is_empty() && out.stdout.is_empty(),
-        "`qoro bridge reload` was not a quiet no-op: {out:?}"
+        "`qoop bridge reload` was not a quiet no-op: {out:?}"
     );
     assert!(
         !run(&["bridge"]).status.success(),
-        "`qoro bridge` succeeded"
+        "`qoop bridge` succeeded"
     );
 }
 
@@ -256,13 +256,13 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
     let not_a_dir = dir.path().join("file");
     std::fs::write(&not_a_dir, "").expect("write");
     let run = |args: &[&str]| {
-        let out = Command::new(qoro())
+        let out = Command::new(qoop())
             .args(args)
-            .env("QORO_RUNTIME_DIR", &not_a_dir)
+            .env("QOOP_RUNTIME_DIR", &not_a_dir)
             .env("XDG_CONFIG_HOME", not_a_dir.join("config"))
             .stdin(std::process::Stdio::null())
             .output()
-            .expect("run qoro");
+            .expect("run qoop");
         (
             String::from_utf8_lossy(&out.stderr).into_owned(),
             out.status.code(),
@@ -272,7 +272,7 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
     let (stderr, code) = run(&["send"]);
     assert_eq!(code, Some(2));
     assert!(
-        stderr.starts_with("qoro: ") && !stderr.contains("Custom {"),
+        stderr.starts_with("qoop: ") && !stderr.contains("Custom {"),
         "an error printed as a debug dump: {stderr:?}"
     );
     let (stderr, code) = run(&["upadte"]);
@@ -285,11 +285,11 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
     assert_eq!(code, Some(2), "a setup typo exited as success: {stderr:?}");
     assert!(stderr.contains("unknown command shwo"), "{stderr:?}");
     let (_, code) = run(&["setup"]);
-    assert_eq!(code, Some(0), "bare `qoro setup` is its usage");
+    assert_eq!(code, Some(0), "bare `qoop setup` is its usage");
 }
 
 /// A session other than the default was a space's worth of tabs: it is refused, as the
-/// flag or as `qoro stop <name>`, with where it went, and a flag with nothing after it is a
+/// flag or as `qoop stop <name>`, with where it went, and a flag with nothing after it is a
 /// mistake rather than the default.
 #[test]
 fn a_named_session_is_refused_with_where_it_went() {
@@ -337,11 +337,11 @@ fn the_setup_subcommands_are_identical_with_the_network_gone() {
         let (offline_out, _, offline_code) = run(&args, true);
         assert_eq!(
             online_out, offline_out,
-            "`qoro setup {verb}` differed offline"
+            "`qoop setup {verb}` differed offline"
         );
         assert_eq!(
             online_code, offline_code,
-            "`qoro setup {verb}` differed offline"
+            "`qoop setup {verb}` differed offline"
         );
     }
 }
@@ -351,23 +351,23 @@ fn the_setup_subcommands_are_identical_with_the_network_gone() {
 /// Both sides are parsed rather than listed, and that is the whole point of the assertion
 /// below. The first version of this test walked a hardcoded `["daemon", "reset", "setup"]`
 /// while its own doc comment claimed that a subcommand missing from the table is a
-/// subcommand nobody checks. It was not true: `qoro relay` was added for milestone 6, was
+/// subcommand nobody checks. It was not true: `qoop relay` was added for milestone 6, was
 /// printed by `--help`, was absent from the table, and this test stayed green because
 /// `relay` was not one of the three words it knew about. A list in a test stops covering the
 /// surface the first time somebody adds to it, which is the reason the document exists.
 fn verbs(text: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for line in text.lines() {
-        // The help prints `  qoro <verb>` and the table prints `| `qoro <verb>` |`.
+        // The help prints `  qoop <verb>` and the table prints `| `qoop <verb>` |`.
         let line = line.trim_start().trim_start_matches("| ");
         let Some(rest) = line
-            .strip_prefix("qoro ")
-            .or_else(|| line.strip_prefix("`qoro "))
+            .strip_prefix("qoop ")
+            .or_else(|| line.strip_prefix("`qoop "))
         else {
             continue;
         };
         // Exactly one space, because the help aligns its description column: the bare
-        // `qoro` row is `qoro` followed by twelve spaces and then the sentence "attach to a
+        // `qoop` row is `qoop` followed by twelve spaces and then the sentence "attach to a
         // terminal", and taking the first word after the name would read "attach" as a
         // subcommand that does not exist.
         if rest.starts_with(' ') {
@@ -396,7 +396,7 @@ fn the_new_rows_are_enumerated_as_their_bare_forms() {
     let commands = runnable_from_the_document();
     assert!(
         commands.contains(&vec!["agents".to_string()]),
-        "bare `qoro agents` is not enumerated: {commands:?}"
+        "bare `qoop agents` is not enumerated: {commands:?}"
     );
     assert!(
         !commands.iter().any(|c| c.iter().any(|a| a.contains('['))),
@@ -419,11 +419,11 @@ fn the_document_and_the_help_output_describe_the_same_surface() {
     );
     assert_eq!(
         from_help, from_document,
-        "`qoro --help` and docs/cli-surface.md name different subcommands"
+        "`qoop --help` and docs/cli-surface.md name different subcommands"
     );
     for flag in ["--hello", "--version", "--help"] {
         assert!(
-            SURFACE.contains(&format!("`qoro {flag}`")),
+            SURFACE.contains(&format!("`qoop {flag}`")),
             "{flag} is not in the document"
         );
     }

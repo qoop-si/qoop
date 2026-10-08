@@ -62,13 +62,13 @@ half done.
 So: a session is a named directory under the runtime directory, holding one daemon's
 socket, database and history, and the unnamed default is one of them rather than a special
 case. (Amended 2026-09-30: the default session's database and history now live in the data
-directory; ADR-005.) `qoro ls` lists the spaces of the one daemon there is per machine, and
+directory; ADR-005.) `qoop ls` lists the spaces of the one daemon there is per machine, and
 ADR-005 says what its directory holds and where that directory is.
 
-Amended 2026-09-29. There is one daemon per machine now and `qoro --session` takes only
-`default`; spaces are the only grouping. `qoro stop <name>` still takes a name and still
+Amended 2026-09-29. There is one daemon per machine now and `qoop --session` takes only
+`default`; spaces are the only grouping. `qoop stop <name>` still takes a name and still
 stops a daemon of that name left running from before this decision, because nothing else
-reaches it. `qoro ls` lists spaces rather than sessions. ADR-005 covers the stores.
+reaches it. `qoop ls` lists spaces rather than sessions. ADR-005 covers the stores.
 
 The path duplication the Context warns about is the real risk and is answered directly:
 every session path is built by `paths::session_dir`, and there is no second place that
@@ -90,8 +90,8 @@ use anyone had.
 
 So the original decision stands again: one daemon per machine per user. The runtime
 directory is the one the default session had, so nothing moves. `--session default` is
-still accepted, because an older qoro on the far side of ssh sends it; any other name, as
-the flag or as `QORO_SESSION`, is refused with where that session's files are. They are
+still accepted, because an older qoop on the far side of ssh sends it; any other name, as
+the flag or as `QOOP_SESSION`, is refused with where that session's files are. They are
 left on disk, never deleted and never imported.
 
 The requirement is met per space instead. A space sleeps: every tab in it ends, its rows

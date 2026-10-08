@@ -1,6 +1,6 @@
 //! Tasks: the work an agent in a terminal said it is doing, and what it recorded on the way.
 //!
-//! The agent opens and updates its own task with `qoro task ...`; qoro keeps it here rather
+//! The agent opens and updates its own task with `qoop task ...`; qoop keeps it here rather
 //! than in a file in the repo or in anyone's memory, so a crash, a restart or a compaction
 //! loses nothing and every reader (qass, the phone, the notch) sees the same record.
 //!
@@ -332,7 +332,7 @@ impl Store {
             &tx,
             id,
             "opened",
-            &format!("opened by qoro when the agent changed files: {goal}"),
+            &format!("opened by qoop when the agent changed files: {goal}"),
             now,
         )?;
         tx.commit()?;

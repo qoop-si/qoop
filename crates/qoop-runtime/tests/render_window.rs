@@ -17,7 +17,7 @@ async fn paced(d: &TestDaemon) -> TestClient {
         "codec_generation_min": qoop_proto::CODEC_GENERATION,
         "codec_generation_max": qoop_proto::CODEC_GENERATION,
         "client_id": "paced",
-        "client_name": "qoro-mobile",
+        "client_name": "qoop-mobile",
         "client_version": "0",
         "codecs": {
             "control": ["control.json.v1"],

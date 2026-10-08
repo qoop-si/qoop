@@ -91,7 +91,7 @@ async fn wait_for(deadline: tokio::time::Instant, owed: impl Fn() -> usize) {
     }
     let left = owed();
     if left > 0 {
-        eprintln!("qorod: exiting with {left} writes to disk unfinished");
+        eprintln!("qoopd: exiting with {left} writes to disk unfinished");
     }
 }
 
@@ -123,7 +123,7 @@ impl StoreHandle {
         // Owed from here until the closure is done, whether or not this caller is still
         // waiting: a call past its deadline still runs, and an exit must wait for it.
         let owed = Owed::new();
-        // On the store pool, not a raw blocking thread: a hung `qoro.db` then holds the
+        // On the store pool, not a raw blocking thread: a hung `qoop.db` then holds the
         // pool's threads and no more, where every call used to add one blocked thread.
         let work = crate::blocking::run_within(STORE_DEADLINE, move || {
             let _owed = owed;

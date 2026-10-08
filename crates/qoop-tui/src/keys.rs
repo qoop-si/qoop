@@ -143,8 +143,8 @@ pub enum Action {
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
     ///
     /// Said, not fetched: the interface never touches the network, it only reads the
-    /// notice `qoro update --check` left, and the install itself runs outside, as
-    /// `qoro update`.
+    /// notice `qoop update --check` left, and the install itself runs outside, as
+    /// `qoop update`.
     Update,
     /// ctrl-a m, the menu.
     Menu,

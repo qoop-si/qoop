@@ -367,7 +367,7 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
-            name: "install qoro on a machine that has none",
+            name: "install qoop on a machine that has none",
             method: || {
                 Method::Control(ControlRequest::InstallRemote {
                     id: "a".into(),
@@ -376,7 +376,7 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
-            name: "move a machine onto the newer qoro put there",
+            name: "move a machine onto the newer qoop put there",
             method: || {
                 Method::Control(ControlRequest::RestartWhenSafe {
                     id: "a".into(),

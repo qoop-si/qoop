@@ -2,7 +2,7 @@
 
 ```
 cd my-project
-qoro
+qoop
 ```
 
 You are in a shell, with the index of terminals on the left.
@@ -22,6 +22,6 @@ Start an agent in any terminal (`claude`, `codex`, `gemini`, ...). Its row in th
 what it is doing. When it needs you, the row lights up and you get a notification, even if
 you are in another tab or another app.
 
-Come back later with `qoro`. The terminals are where you left them.
+Come back later with `qoop`. The terminals are where you left them.
 
 The prefix is `ctrl-a` unless you set another in [Configuration](#configuration).

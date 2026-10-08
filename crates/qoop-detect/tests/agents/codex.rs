@@ -69,21 +69,21 @@ fn the_action_required_title_is_a_blocker() {
     assert_rule_titled(
         "codex",
         &["› Ask Codex to do anything"],
-        "[ ! ] Action Required | qoro",
+        "[ ! ] Action Required | qoop",
         "title_action_required",
         Blocked,
     );
     assert_rule_titled(
         "codex",
         &[""],
-        "[ . ] Action Required | qoro",
+        "[ . ] Action Required | qoop",
         "title_action_required",
         Blocked,
     );
     assert_not_rule_titled(
         "codex",
         &["  Would you like to run the following command?"],
-        "qoro",
+        "qoop",
         "title_action_required",
     );
 }
@@ -173,11 +173,11 @@ fn the_spinner_title_is_working() {
     assert_rule_titled(
         "codex",
         &[""],
-        "⠹ fix the tests | qoro",
+        "⠹ fix the tests | qoop",
         "title_spinner",
         Working,
     );
-    assert_not_rule_titled("codex", &[""], "fix the tests | qoro", "title_spinner");
+    assert_not_rule_titled("codex", &[""], "fix the tests | qoop", "title_spinner");
 }
 
 #[test]

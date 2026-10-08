@@ -7,7 +7,7 @@
 //! deleted as it is read.
 //!
 //! Three things keep a file that was left behind from ever being adopted. Adoption is only
-//! entered by `qoro daemon --adopt <file> --nonce <n>`; the file names the pid that wrote it,
+//! entered by `qoop daemon --adopt <file> --nonce <n>`; the file names the pid that wrote it,
 //! which an `exec` keeps and no other process has; and the nonce on the command line has to
 //! be the one in the file. The nonce is on a command line, which any local user can read, so
 //! it only guards against a stale file and not against another process: what keeps others out is
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// is (its descriptor, its shell, its token): what later builds carry beside that is read
 /// with a default, so the first layout keeps being readable as it grows.
 ///
-/// It is also what `qoro --handoff-formats` says: the layout this build reads and writes. The
+/// It is also what `qoop --handoff-formats` says: the layout this build reads and writes. The
 /// daemon that is about to move asks the binary it will become, and hands over only in a
 /// layout that one reads; a binary that says nothing (every build before this one) gets the
 /// move that waits for the tabs to be idle and brings them back.
@@ -141,7 +141,7 @@ pub fn read(path: &Path, nonce: &str) -> io::Result<Handoff> {
 
 /// What `read` checks, without deleting the file and without asking whose it is: the dry
 /// run the daemon that is about to move makes of the binary it is about to become
-/// (`qoro daemon --adopt-check`), which is another process than the one that will read it.
+/// (`qoop daemon --adopt-check`), which is another process than the one that will read it.
 pub fn check(path: &Path, nonce: &str) -> io::Result<()> {
     parse(path, nonce, false).map(|_| ())
 }
@@ -259,7 +259,7 @@ mod tests {
                 workspace: 1,
                 name: Some("build".into()),
                 cwd: Some("/tmp".into()),
-                token: "qoro-3-x".into(),
+                token: "qoop-3-x".into(),
                 cols: 100,
                 rows: 30,
                 pending: b"ls\r".to_vec(),
@@ -361,7 +361,7 @@ mod tests {
             .path()
             .join(format!("handoff-{}.json", std::process::id()));
         std::fs::write(&mine, "{}").unwrap();
-        let other = dir.path().join("qorod.sock");
+        let other = dir.path().join("qoopd.sock");
         std::fs::write(&other, "").unwrap();
         // The parent of this test process is alive and is not this process.
         let alive = dir.path().join(format!(
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn the_command_line_names_the_file_and_the_nonce() {
-        let args: Vec<String> = ["qoro", "daemon", "--adopt", "/run/h.json", "--nonce", "n1"]
+        let args: Vec<String> = ["qoop", "daemon", "--adopt", "/run/h.json", "--nonce", "n1"]
             .map(String::from)
             .to_vec();
         assert_eq!(

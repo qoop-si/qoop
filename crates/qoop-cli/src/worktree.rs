@@ -1,4 +1,4 @@
-//! `qoro worktree`: a git worktree beside the repository, with a terminal in it.
+//! `qoop worktree`: a git worktree beside the repository, with a terminal in it.
 //!
 //! Git is only ever run with an argv, never through a shell, and every path is compared
 //! by component after resolving symlinks, so `/tmp` and `/private/tmp` are one place and
@@ -159,7 +159,7 @@ fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// This machine's rows, or none when qoro is not running: with no daemon there are no
+/// This machine's rows, or none when qoop is not running: with no daemon there are no
 /// terminals, which is the true answer and not a failure.
 fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
@@ -172,7 +172,7 @@ fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
     let rt = tokio::runtime::Runtime::new()?;
     let answer = rt.block_on(crate::ask_daemon(
         &socket,
-        "qoro-worktree",
+        "qoop-worktree",
         &ControlRequest::ListAgents {
             id: crate::request_id("worktree"),
         },
@@ -186,7 +186,7 @@ fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
     }
 }
 
-/// `qoro worktree`: a git worktree beside the repository, with a terminal in it.
+/// `qoop worktree`: a git worktree beside the repository, with a terminal in it.
 pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("new") => worktree_new(args),
@@ -201,12 +201,12 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
 }
 
 const WORKTREE_USAGE: &str = "usage:\n\
-     \x20 qoro worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
-     \x20 qoro worktree ls [--json]\n\
-     \x20 qoro worktree rm <branch|path> [--force]";
+     \x20 qoop worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
+     \x20 qoop worktree ls [--json]\n\
+     \x20 qoop worktree rm <branch|path> [--force]";
 
-/// Parsed `qoro worktree new` arguments. Its own two flags come out first and the rest
-/// is `qoro new`'s own parse, so the two cannot drift apart about `--space` or `--`.
+/// Parsed `qoop worktree new` arguments. Its own two flags come out first and the rest
+/// is `qoop new`'s own parse, so the two cannot drift apart about `--space` or `--`.
 struct WorktreeNewOpts {
     branch: String,
     base: Option<String>,
@@ -224,7 +224,7 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
         .ok_or_else(|| WORKTREE_USAGE.to_string())?;
     let mut base = None;
     let mut path = None;
-    let mut rest = vec!["qoro".to_string(), "new".to_string()];
+    let mut rest = vec!["qoop".to_string(), "new".to_string()];
     let mut it = args.iter().skip(4);
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -268,7 +268,7 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
     })
 }
 
-/// `qoro worktree new`: add the worktree, then open a terminal in it named after the
+/// `qoop worktree new`: add the worktree, then open a terminal in it named after the
 /// branch. A branch already checked out elsewhere is refused with where, because git's
 /// own refusal is about a path the person did not type. A branch that exists only on a
 /// remote is handed to git by name, so git makes the local branch tracking it rather than
@@ -280,11 +280,11 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
         path,
         mut new,
     } = parse_worktree_new_args(args).map_err(crate::usage)?;
-    // Checked before git runs, so qoro not running does not leave a worktree behind.
+    // Checked before git runs, so qoop not running does not leave a worktree behind.
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
         return Err(std::io::Error::other(
-            "nothing is awake: `qoro` or `qoro wake` starts it",
+            "nothing is awake: `qoop` or `qoop wake` starts it",
         ));
     }
     let list = worktrees()?;
@@ -340,7 +340,7 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     supervise::open_terminal(&new, |terminal| println!("terminal={terminal}"))
 }
 
-/// `qoro worktree ls`: every worktree, and this machine's terminals inside each.
+/// `qoop worktree ls`: every worktree, and this machine's terminals inside each.
 fn worktree_ls(args: &[String]) -> std::io::Result<()> {
     let json = match args.get(3).map(String::as_str) {
         None => false,
@@ -399,7 +399,7 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
 struct Occupant {
     pid: i32,
     program: String,
-    /// Whether it is a qoro daemon.
+    /// Whether it is a qoop daemon.
     daemon: bool,
 }
 
@@ -407,10 +407,10 @@ struct Occupant {
 ///
 /// Read from the processes themselves, never from the index: the index learns a
 /// terminal's directory on a throttle, misses an agent a subshell started somewhere else,
-/// and knows nothing of a shell outside qoro. A process
-/// of another user is not readable and is not ours to protect. qoro's own clients are left
+/// and knows nothing of a shell outside qoop. A process
+/// of another user is not readable and is not ours to protect. qoop's own clients are left
 /// out, this one included: an interface or a `wait` started from inside holds no work
-/// there. A qoro daemon is kept, because its directory is where every terminal it opens
+/// there. A qoop daemon is kept, because its directory is where every terminal it opens
 /// without one starts. Fails closed when the scan cannot even see this process, because
 /// an empty answer from a scan that does not work reads exactly like "nobody is inside".
 fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
@@ -439,7 +439,7 @@ fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
                 })
                 .unwrap_or_else(|| "?".to_string());
             let mut daemon = false;
-            if program == "qoro" {
+            if program == "qoop" {
                 let argv = sys::argv_of(qoop_pty::Pid(pid));
                 if !argv.iter().any(|a| a == "daemon") {
                     return None;
@@ -455,10 +455,10 @@ fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
         .collect())
 }
 
-/// `qoro worktree rm`: remove a linked worktree, keeping its branch.
+/// `qoop worktree rm`: remove a linked worktree, keeping its branch.
 ///
 /// Refused while any process of this user stands inside it, whatever started it; the
-/// index only names which of those are qoro terminals. `--force` is for a dirty tree and
+/// index only names which of those are qoop terminals. `--force` is for a dirty tree and
 /// never for a live process: removing the directory under a running agent loses its work
 /// just as surely. A dirty tree is refused without `--force` before git is asked, so the
 /// message names the fix.
@@ -505,7 +505,7 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
     let live = processes_inside(&root)?;
     if let Some(Occupant { pid, .. }) = live.iter().find(|o| o.daemon) {
         return Err(std::io::Error::other(format!(
-            "a qoro daemon (pid {pid}) runs from inside {}: stop it or start it elsewhere, \
+            "a qoop daemon (pid {pid}) runs from inside {}: stop it or start it elsewhere, \
              because new terminals start in its directory",
             tree.path.display()
         )));
@@ -533,7 +533,7 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
         let named = if terminals.is_empty() {
             String::new()
         } else {
-            format!(" (qoro terminal {})", terminals.join(", "))
+            format!(" (qoop terminal {})", terminals.join(", "))
         };
         return Err(std::io::Error::other(format!(
             "{} is in use by pid {}{named}: close them first; --force does not override a \
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn worktree_new_shares_the_new_parse_and_keeps_its_own_flags() {
         let opts = parse_worktree_new_args(&argv(&[
-            "qoro", "worktree", "new", "feat/x", "--base", "main", "--space", "work", "--path",
+            "qoop", "worktree", "new", "feat/x", "--base", "main", "--space", "work", "--path",
             "../x", "--", "claude", "--resume",
         ]))
         .unwrap();
@@ -663,12 +663,12 @@ mod tests {
         assert_eq!(opts.new.space.as_deref(), Some("work"));
         assert_eq!(opts.new.command, vec!["claude", "--resume"]);
         for bad in [
-            &["qoro", "worktree", "new"][..],
-            &["qoro", "worktree", "new", "-b"],
-            &["qoro", "worktree", "new", "x", "--base", "-evil"],
-            &["qoro", "worktree", "new", "x", "--cwd", "/tmp"],
-            &["qoro", "worktree", "new", "x", "--json"],
-            &["qoro", "worktree", "new", "x", "--bogus"],
+            &["qoop", "worktree", "new"][..],
+            &["qoop", "worktree", "new", "-b"],
+            &["qoop", "worktree", "new", "x", "--base", "-evil"],
+            &["qoop", "worktree", "new", "x", "--cwd", "/tmp"],
+            &["qoop", "worktree", "new", "x", "--json"],
+            &["qoop", "worktree", "new", "x", "--bogus"],
         ] {
             assert!(
                 parse_worktree_new_args(&argv(bad)).is_err(),

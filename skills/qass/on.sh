@@ -1,10 +1,10 @@
 #!/bin/bash
-# qass on: run a qoro command on one of the remotes this Mac's qoro links to.
+# qass on: run a qoop command on one of the remotes this Mac's qoop links to.
 #
-#   on.sh <remote> <qoro subcommand> [args...]      e.g. on.sh ubox context 2 --last 1
+#   on.sh <remote> <qoop subcommand> [args...]      e.g. on.sh ubox context 2 --last 1
 #   on.sh --master <remote> agents --watch --json   (watch.sh only: the long stream)
 #
-# The remote is a name from `qoro remote ls`; its ssh target comes from there, never from
+# The remote is a name from `qoop remote ls`; its ssh target comes from there, never from
 # the caller. Every argument goes single-quoted to the remote shell (an argument holding a
 # quote is refused), so prompt text arrives as one argument whatever it holds, in any
 # script. The stream watch.sh keeps open is the shared connection the other calls ride on
@@ -18,18 +18,18 @@ if [ "${1:-}" = --master ]; then
     master=yes
     shift
 fi
-name="${1:?usage: on.sh <remote> <qoro subcommand> [args...]}"
+name="${1:?usage: on.sh <remote> <qoop subcommand> [args...]}"
 shift
-[ "$#" -gt 0 ] || { echo "usage: on.sh <remote> <qoro subcommand> [args...]" >&2; exit 2; }
-target="$(qoro remote ls | awk -v n="$name" '$1 == n { print $2; exit }')"
+[ "$#" -gt 0 ] || { echo "usage: on.sh <remote> <qoop subcommand> [args...]" >&2; exit 2; }
+target="$(qoop remote ls | awk -v n="$name" '$1 == n { print $2; exit }')"
 [[ "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || { echo "on.sh: no usable remote $name" >&2; exit 2; }
-cmd='"$HOME/.local/bin/qoro"'
+cmd='"$HOME/.local/bin/qoop"'
 for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
     cmd="$cmd '$a'"
 done
 # Short and private: a socket path past 104 bytes is refused on macOS.
-sock="/tmp/qoro-$(id -u)-ssh"
+sock="/tmp/qoop-$(id -u)-ssh"
 mkdir -p "$sock"
 chmod 700 "$sock"
 exec ssh -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 \

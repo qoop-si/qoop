@@ -1,10 +1,10 @@
-//! `qoro`: attach to a terminal, starting the daemon if there is not one.
+//! `qoop`: attach to a terminal, starting the daemon if there is not one.
 //!
 //! The promise this milestone exists to keep is the small one:
 //!
 //! ```text
 //! cd my-project
-//! qoro
+//! qoop
 //! ```
 //!
 //! reaches a real shell, with no account, no wizard and no manifest, and detaching leaves
@@ -52,17 +52,17 @@ fn shell() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/bin/sh"))
 }
 
-/// What runs `qoro pair`, `qoro devices` and `qoro bridge`: the phone app's part, in the
-/// release build of qoro and not in this repository.
+/// What runs `qoop pair`, `qoop devices` and `qoop bridge`: the phone app's part, in the
+/// release build of qoop and not in this repository.
 pub type Phone = fn(&[String]) -> std::io::Result<()>;
 
-/// `qoro`, with the phone app's part when the binary carries it.
+/// `qoop`, with the phone app's part when the binary carries it.
 pub fn main_with(phone: Option<Phone>) {
     // One sentence and a failing exit, never the `Error: Custom { kind: .. }` dump that
     // returning the error from `main` prints: every refusal below is worded for a person.
     // Exit 2 when the command was called wrong, 1 when it failed.
     if let Err(e) = run(phone) {
-        eprintln!("qoro: {e}");
+        eprintln!("qoop: {e}");
         std::process::exit(if is_usage(&e) { 2 } else { 1 });
     }
 }
@@ -92,7 +92,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
     // `--session` is taken out of the arguments wherever it was written, so every command's
     // own parsing sees what it expects: one daemon now, and only `default` names it.
     if let Err(e) = take_session(&mut args) {
-        eprintln!("qoro: {e}");
+        eprintln!("qoop: {e}");
         std::process::exit(2);
     }
     match args.get(1).map(String::as_str) {
@@ -121,8 +121,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         }
         Some("attach") => run_attach(),
         Some("relay") => run_relay(),
-        // What `qoro <remote>` asks of the machine before its interface opens: the space
-        // that slept last back, or a first tab, as a bare `qoro` does here.
+        // What `qoop <remote>` asks of the machine before its interface opens: the space
+        // that slept last back, or a first tab, as a bare `qoop` does here.
         Some("ensure-awake") => supervise::ensure_awake(),
         Some("remote") => remote::run(&args),
         Some("--remote") => run_remote(&args),
@@ -160,104 +160,104 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
-            println!("qoro {}", env!("CARGO_PKG_VERSION"));
+            println!("qoop {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--help" | "-h") => {
             print!(
-                "qoro, the portable runtime for human and coding-agent workspaces\n\
+                "qoop, the portable runtime for human and coding-agent workspaces\n\
                  \n\
                  usage:\n\
-                 \x20 qoro            attach to a terminal, starting the daemon if needed\n\
-                 \x20 qoro attach     attach to one terminal, with no interface around it\n\
-                 \x20 qoro daemon     run the daemon in the foreground\n\
-                 \x20 qoro reset      restore a terminal left in raw mode by a killed client\n\
-                 \x20 qoro relay      pipe stdin and stdout to this machine's daemon\n\
-                 \x20 qoro ensure-awake  wake the space that slept last, or open a first tab\n\
-                 \x20 qoro --remote <name|ssh-target>  the interface for another machine's qoro\n\
-                 \x20 qoro --space <id|name>  the interface with that one space in it, made\n\
-                 \x20                 when the name is new; `qoro` still shows them all\n\
-                 \x20 qoro remote add <name> <ssh-target>  show that\n\
-                 \x20                 machine's spaces in `qoro`, beside this one's\n\
-                 \x20 qoro remote rm <name>  stop showing them\n\
-                 \x20 qoro remote ls  the remotes added\n\
-                 \x20 qoro setup ...  capture, inspect, trust and run a Setup\n\
-                   \x20 qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
-                  \x20 qoro hook-report --session-id S  report only the agent's conversation id\n\
-                  \x20 qoro task new|stage|plan|evidence|done|close|ls|show|rules  the work this\n\
-                  \x20                 terminal's agent is doing, kept by qoro; `qoro task` for more\n\
-                  \x20 qoro send <terminal> <text> [--enter]  type into another terminal\n\
-                  \x20 qoro send <terminal> --key NAME...  press named keys: enter esc tab\n\
+                 \x20 qoop            attach to a terminal, starting the daemon if needed\n\
+                 \x20 qoop attach     attach to one terminal, with no interface around it\n\
+                 \x20 qoop daemon     run the daemon in the foreground\n\
+                 \x20 qoop reset      restore a terminal left in raw mode by a killed client\n\
+                 \x20 qoop relay      pipe stdin and stdout to this machine's daemon\n\
+                 \x20 qoop ensure-awake  wake the space that slept last, or open a first tab\n\
+                 \x20 qoop --remote <name|ssh-target>  the interface for another machine's qoop\n\
+                 \x20 qoop --space <id|name>  the interface with that one space in it, made\n\
+                 \x20                 when the name is new; `qoop` still shows them all\n\
+                 \x20 qoop remote add <name> <ssh-target>  show that\n\
+                 \x20                 machine's spaces in `qoop`, beside this one's\n\
+                 \x20 qoop remote rm <name>  stop showing them\n\
+                 \x20 qoop remote ls  the remotes added\n\
+                 \x20 qoop setup ...  capture, inspect, trust and run a Setup\n\
+                   \x20 qoop hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
+                  \x20 qoop hook-report --session-id S  report only the agent's conversation id\n\
+                  \x20 qoop task new|stage|plan|evidence|done|close|ls|show|rules  the work this\n\
+                  \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
+                  \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
+                  \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
                   \x20                 pageup pagedown ctrl-a..ctrl-z\n\
-                  \x20 qoro read <terminal> [--lines N] [--json] [--watch]  print another\n\
+                  \x20 qoop read <terminal> [--lines N] [--json] [--watch]  print another\n\
                   \x20                 terminal's screen; --back UP reads its history\n\
-                  \x20 qoro prompt <target> [--wait] [--timeout SECS] [--] <text>  send text\n\
+                  \x20 qoop prompt <target> [--wait] [--timeout SECS] [--] <text>  send text\n\
                   \x20                 plus Enter, unless blocked; --wait returns once the\n\
                   \x20                 agent took the turn and stopped\n\
                   \x20                 send, prompt and close take --generation G: refused\n\
                   \x20                 when the process is no longer the one that was read\n\
-                  \x20 qoro wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
+                  \x20 qoop wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
                   \x20                 block until a terminal reaches a state, or TEXT is on\n\
                   \x20                 its live screen; exits 124 on timeout\n\
-                  \x20 qoro sleep <space> | --tab N  end a space's tabs, or one tab, and keep them: nothing of it runs until it wakes\n\
-                  \x20 qoro wake [space] | --tab N  bring a sleeping tab back, a space's, or the one that slept last\n\
-                  \x20 qoro new [--name N] [--cwd DIR] [--space ID|NAME] [-- command...]  open a\n\
+                  \x20 qoop sleep <space> | --tab N  end a space's tabs, or one tab, and keep them: nothing of it runs until it wakes\n\
+                  \x20 qoop wake [space] | --tab N  bring a sleeping tab back, a space's, or the one that slept last\n\
+                  \x20 qoop new [--name N] [--cwd DIR] [--space ID|NAME] [-- command...]  open a\n\
                   \x20                 terminal, print its number, type the command into it\n\
-                  \x20 qoro worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
+                  \x20 qoop worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
                   \x20                 a git worktree beside the repo, with a terminal in it\n\
-                  \x20 qoro worktree ls [--json]  every worktree and the terminals inside\n\
-                  \x20 qoro worktree rm <branch|path> [--force]  remove one, keeping the\n\
+                  \x20 qoop worktree ls [--json]  every worktree and the terminals inside\n\
+                  \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
-                  \x20 qoro space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
-                  \x20 qoro close <terminal>  end a terminal and what it started\n\
-                  \x20 qoro history <target> [--last N] [--role user|assistant] [--json]\n\
+                  \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
+                  \x20 qoop close <terminal>  end a terminal and what it started\n\
+                  \x20 qoop history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
                   \x20                 local files only; --json prints the full window\n\
-                  \x20 qoro history --dir <repo> [--last N] [--json]\n\
+                  \x20 qoop history --dir <repo> [--last N] [--json]\n\
                   \x20                 what you typed to your agents in a repo and its\n\
                   \x20                 worktrees (Claude Code, Codex, opencode; not Gemini)\n\
-                  \x20 qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
+                  \x20 qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
                   \x20                 understand another agent before writing to it:\n\
                   \x20                 who it is, whether it is writable, its live screen\n\
                   \x20                 and its recent transcript window\n\
-                  \x20 qoro agents [--json]  list every terminal and what it is doing\n\
-                  \x20 qoro agents --watch [--json]  the list again each time it changes\n\
-                  \x20 qoro agents explain <target> [--json]  say why one terminal reads\n\
+                  \x20 qoop agents [--json]  list every terminal and what it is doing\n\
+                  \x20 qoop agents --watch [--json]  the list again each time it changes\n\
+                  \x20 qoop agents explain <target> [--json]  say why one terminal reads\n\
                   \x20                 the way it does: state, authority, matched rule\n\
-                  \x20 qoro focus <terminal> [--json]  show that terminal in every\n\
+                  \x20 qoop focus <terminal> [--json]  show that terminal in every\n\
                   \x20                 attached interface\n\
-                 \x20 qoro reload-manifests  re-read agent-detection overrides\n\
-                  \x20 qoro hooks ...  install an agent's own hook, so it says what it is\n\
+                 \x20 qoop reload-manifests  re-read agent-detection overrides\n\
+                  \x20 qoop hooks ...  install an agent's own hook, so it says what it is\n\
                   \x20                 doing and which conversation it is having\n\
-                  \x20 qoro skills ...  teach an agent what qoro is for, so it looks\n\
+                  \x20 qoop skills ...  teach an agent what qoop is for, so it looks\n\
                   \x20                 before it writes\n\
-                  \x20 qoro ls [--json]  list the spaces and say which are asleep\n\
-                  \x20 qoro paths [name] [--json]  where qoro keeps each kind of file, and how big\n\
-                  \x20 qoro avatar pick  choose a terminal pet from a batch\n\
-                  \x20 qoro avatar show [--json]  print the picked pet\n\
-                  \x20 qoro avatar options|set ...  the parts a pet may have, or set some\n\
-                  \x20 qoro config [--json]  the settings in config.toml and where it is\n\
-                  \x20 qoro config set <key> <value>  change one, keeping the rest of the file\n\
-                  \x20 qoro settings   every setting on one page, with your pet\n\
-                  \x20 qoro onboard    the first start: pet, sounds, look, keys, sleep, qass\n\
-                  \x20 qoro qass       open qass, the assistant over your agents\n\
-                  \x20 qoro sound      hear the notification sounds and keep one each\n\
-                  \x20 qoro notch install|uninstall|status  on a Mac, your agents in\n\
+                  \x20 qoop ls [--json]  list the spaces and say which are asleep\n\
+                  \x20 qoop paths [name] [--json]  where qoop keeps each kind of file, and how big\n\
+                  \x20 qoop avatar pick  choose a terminal pet from a batch\n\
+                  \x20 qoop avatar show [--json]  print the picked pet\n\
+                  \x20 qoop avatar options|set ...  the parts a pet may have, or set some\n\
+                  \x20 qoop config [--json]  the settings in config.toml and where it is\n\
+                  \x20 qoop config set <key> <value>  change one, keeping the rest of the file\n\
+                  \x20 qoop settings   every setting on one page, with your pet\n\
+                  \x20 qoop onboard    the first start: pet, sounds, look, keys, sleep, qass\n\
+                  \x20 qoop qass       open qass, the assistant over your agents\n\
+                  \x20 qoop sound      hear the notification sounds and keep one each\n\
+                  \x20 qoop notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
-                 \x20 qoro stop       end the daemon and every tab; `qoro` brings them back\n\
-                 \x20 qoro pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
-                 \x20 qoro devices ls  the phones paired with this machine\n\
-                 \x20 qoro devices rm <name>  unpair one; its open streams close at once\n\
-                 \x20 qoro bridge     run the phones' end in the foreground (the service\n\
+                 \x20 qoop stop       end the daemon and every tab; `qoop` brings them back\n\
+                 \x20 qoop pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
+                 \x20 qoop devices ls  the phones paired with this machine\n\
+                 \x20 qoop devices rm <name>  unpair one; its open streams close at once\n\
+                 \x20 qoop bridge     run the phones' end in the foreground (the service\n\
                  \x20                 that pairing installs runs exactly this)\n\
-                 \x20 qoro bridge reload  put that service back on the installed binary\n\
-                 \x20 qoro update [--check]  fetch the newest release, install it, and move every\n\
+                 \x20 qoop bridge reload  put that service back on the installed binary\n\
+                 \x20 qoop update [--check]  fetch the newest release, install it, and move every\n\
                  \x20                 machine onto it, keeping running tabs running where it can\n\
-                 \x20 qoro --version\n\
+                 \x20 qoop --version\n\
                  \n\
                  detach with ctrl-q. the shell keeps running.\n\
-                 a space with nothing awake costs nothing: `qoro sleep` it, and `qoro wake` brings it back.\n"
+                 a space with nothing awake costs nothing: `qoop sleep` it, and `qoop wake` brings it back.\n"
             );
             Ok(())
         }
@@ -274,7 +274,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         None => run_client(),
         // A typo is named, not answered with a daemon and the full-screen interface.
         Some(other) => Err(usage(format!(
-            "unknown command {other}; usage: qoro [command], see qoro --help"
+            "unknown command {other}; usage: qoop [command], see qoop --help"
         ))),
     }
 }
@@ -293,7 +293,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let db = paths::state_dir(&dir)
             .map_err(std::io::Error::other)?
-            .join("qoro.db");
+            .join("qoop.db");
         if db.exists() {
             qoop_store::Store::check_openable(&db).map_err(std::io::Error::other)?;
         }
@@ -308,7 +308,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
         let named = handoff::children_in(&file);
         handoff::read(&file, &nonce)
             .map_err(|e| {
-                eprintln!("qorod: the handover was refused: {e}");
+                eprintln!("qoopd: the handover was refused: {e}");
                 orphans = named;
             })
             .ok()
@@ -339,7 +339,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                 None => {
                     // Said, because a daemon that waits here for long is a different
                     // thing from one that is not running, and nothing else tells them apart.
-                    eprintln!("qorod: waiting for the startup lock, another daemon holds it");
+                    eprintln!("qoopd: waiting for the startup lock, another daemon holds it");
                     lock::StartupLock::acquire(&path)?
                 }
             }
@@ -353,7 +353,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // Why a start failed, left where `ensure_daemon` looks: a daemon started on demand has
     // no terminal to say it on, and "the daemon did not start" alone sent people to the
     // socket when the cause was the data directory.
-    let failed = dir.join("qorod.failed");
+    let failed = dir.join("qoopd.failed");
     let _ = std::fs::remove_file(&failed);
     let state = match paths::state_dir(&dir) {
         Ok(state) => state,
@@ -368,7 +368,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
             Ok(d) => match exe {
                 Ok(exe) => d.leaving_when_idle().restarting_into(exe),
                 Err(e) => {
-                    eprintln!("qorod: where this binary is could not be read: {e}");
+                    eprintln!("qoopd: where this binary is could not be read: {e}");
                     d.leaving_when_idle()
                 }
             },
@@ -384,10 +384,10 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                         "another daemon is serving this socket; {carried_tabs} tabs carried \
                          here are left to it and restart from their rows"
                     );
-                    eprintln!("qorod: {why}");
+                    eprintln!("qoopd: {why}");
                     return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, why));
                 }
-                eprintln!("qorod: another daemon is already serving this socket");
+                eprintln!("qoopd: another daemon is already serving this socket");
                 return Ok(());
             }
             Err(e) => {
@@ -395,7 +395,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                 return Err(e);
             }
         };
-        eprintln!("qorod: listening on {}", daemon.socket().display());
+        eprintln!("qoopd: listening on {}", daemon.socket().display());
         if !orphans.is_empty() {
             tokio::spawn(qoop_runtime::daemon::reap_children(orphans));
         }
@@ -424,17 +424,17 @@ fn run_client() -> std::io::Result<()> {
     supervise::ensure_awake()?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    // The interface, not the bare attach. `qoro attach` is still there for the one terminal
+    // The interface, not the bare attach. `qoop attach` is still there for the one terminal
     // case and for anything driving this program from a script, because a full screen
     // interface is the wrong thing to hand a pipe.
     // An agent on this machine with no hook installed is worth one line, once. It is not
     // an error and nothing waits on it: an agent is read from its screen either way, and a
-    // hook makes that reading immediate and tells qoro which conversation the tab is
+    // hook makes that reading immediate and tells qoop which conversation the tab is
     // having, which is what a restart needs.
     let notice = match hooks::missing().as_slice() {
         [] => None,
         agents => Some(format!(
-            "{} here without a qoro hook: `qoro hooks install` reads them better",
+            "{} here without a qoop hook: `qoop hooks install` reads them better",
             agents.join(", ")
         )),
     };
@@ -455,12 +455,12 @@ fn run_client() -> std::io::Result<()> {
     rt.block_on(qoop_tui::mux::run(Some(&socket), remotes, notice, None))
 }
 
-/// `qoro --space <id|name>`: the interface with one space in it and nothing else. The
+/// `qoop --space <id|name>`: the interface with one space in it and nothing else. The
 /// space is made when the name is new, and woken, or given a tab, when there is nothing in
 /// it to show. Remotes are left out: their spaces would be filtered away anyway.
 fn run_space(args: &[String]) -> std::io::Result<()> {
     let [_, _, wanted] = args else {
-        return Err(usage("usage: qoro --space <id|name>"));
+        return Err(usage("usage: qoop --space <id|name>"));
     };
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
@@ -475,14 +475,14 @@ fn run_space(args: &[String]) -> std::io::Result<()> {
     ))
 }
 
-/// `qoro --remote <name|target>`: the interface for another machine's qoro alone.
+/// `qoop --remote <name|target>`: the interface for another machine's qoop alone.
 ///
-/// A name added with `qoro remote add` brings its own target; anything else is an ssh
+/// A name added with `qoop remote add` brings its own target; anything else is an ssh
 /// target. It goes through the same connection the interface keeps for added remotes, so a
 /// dropped connection comes back on its own rather than ending the interface.
 fn run_remote(args: &[String]) -> std::io::Result<()> {
     let Some(what) = args.get(2) else {
-        eprintln!("usage: qoro --remote <name|ssh-target>");
+        eprintln!("usage: qoop --remote <name|ssh-target>");
         std::process::exit(2);
     };
     let added = qoop_remote::saved::load()?
@@ -495,14 +495,14 @@ fn run_remote(args: &[String]) -> std::io::Result<()> {
             target: what.clone(),
         },
         None => {
-            eprintln!("qoro: {what:?} is neither an added remote nor an ssh target");
+            eprintln!("qoop: {what:?} is neither an added remote nor an ssh target");
             std::process::exit(2);
         }
     };
     // In the foreground first, where ssh can ask whatever it needs to, and where a remote
-    // without qoro says so before the screen is taken over.
+    // without qoop says so before the screen is taken over.
     if let Err(e) = remote::check(&remote) {
-        eprintln!("qoro: {e}");
+        eprintln!("qoop: {e}");
         std::process::exit(1);
     }
     remote::wake(&remote);
@@ -641,7 +641,7 @@ async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `qoro setup`: capture, inspect, trust and run.
+/// `qoop setup`: capture, inspect, trust and run.
 ///
 /// Trust is a separate verb on purpose. A Setup that arrives from another machine is
 /// executable input (ADR-015), and the person who runs it has to have seen what it will do.
@@ -660,7 +660,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("show") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| usage("usage: qoro setup show <file>"))?;
+                .ok_or_else(|| usage("usage: qoop setup show <file>"))?;
             let setup = read_setup(path)?;
             let (level, gaps) = level_of(&setup);
             print!("{}", setup.confirmation_text());
@@ -674,7 +674,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("trust") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| usage("usage: qoro setup trust <file>"))?;
+                .ok_or_else(|| usage("usage: qoop setup trust <file>"))?;
             let setup = read_setup(path)?;
             // Shown before it is trusted, in full. The value of the prompt is that it is
             // rare enough to read, so there is no way to trust something without seeing it.
@@ -700,7 +700,7 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         Some("check") => {
             let path = args
                 .get(3)
-                .ok_or_else(|| usage("usage: qoro setup check <file>"))?;
+                .ok_or_else(|| usage("usage: qoop setup check <file>"))?;
             let setup = read_setup(path)?;
             let ledger = ConfirmationLedger::open(&ledger_path()?);
             match qoop_setup::ledger::admit(&setup, &ledger, true) {
@@ -722,14 +722,14 @@ fn run_setup(args: &[String]) -> std::io::Result<()> {
         None | Some("--help" | "-h") => {
             print!(
                 "usage:\n\
-                 \x20 qoro setup show <file>    what it will run, its hash and its level\n\
-                 \x20 qoro setup trust <file>   confirm it on this machine\n\
-                 \x20 qoro setup check <file>   whether it may run here\n"
+                 \x20 qoop setup show <file>    what it will run, its hash and its level\n\
+                 \x20 qoop setup trust <file>   confirm it on this machine\n\
+                 \x20 qoop setup check <file>   whether it may run here\n"
             );
             Ok(())
         }
         Some(other) => Err(usage(format!(
-            "unknown command {other}; usage: qoro setup <show|trust|check> <file>"
+            "unknown command {other}; usage: qoop setup <show|trust|check> <file>"
         ))),
     }
 }
@@ -739,7 +739,7 @@ fn read_setup(path: &str) -> std::io::Result<qoop_setup::Setup> {
     qoop_setup::Setup::from_toml(&text).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// `qoro hook-report`: what agent hook scripts call.
+/// `qoop hook-report`: what agent hook scripts call.
 ///
 /// Reads the terminal and token the daemon put in the environment, posts one
 /// `ReportAgentState` request, and waits for the answer. Quiet on success: a
@@ -750,10 +750,10 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
 
     let mut state: Option<String> = None;
-    let mut terminal: Option<u32> = std::env::var("QORO_TERMINAL")
+    let mut terminal: Option<u32> = std::env::var("QOOP_TERMINAL")
         .ok()
         .and_then(|v| v.parse().ok());
-    let mut token: Option<String> = std::env::var("QORO_TOKEN").ok();
+    let mut token: Option<String> = std::env::var("QOOP_TOKEN").ok();
     let mut visible_blocker = false;
     let mut visible_idle = false;
     let mut visible_working = false;
@@ -769,7 +769,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
@@ -779,7 +779,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
@@ -789,7 +789,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
@@ -801,7 +801,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 };
                 if terminal.is_none() {
                     return Err(usage(
-                        "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                        "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                     ));
                 }
             }
@@ -810,7 +810,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
@@ -823,7 +823,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
@@ -836,26 +836,26 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     Some(v) => Some(v.clone()),
                     None => {
                         return Err(usage(
-                            "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                            "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                         ));
                     }
                 }
             }
             other => {
                 return Err(usage(format!(
-                    "unknown flag {other}; usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]"
+                    "unknown flag {other}; usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]"
                 )));
             }
         }
     }
     let Some(terminal) = terminal else {
         return Err(std::io::Error::other(
-            "no terminal: pass --terminal or run inside a qoro terminal (QORO_TERMINAL)",
+            "no terminal: pass --terminal or run inside a qoop terminal (QOOP_TERMINAL)",
         ));
     };
     let Some(token) = token else {
         return Err(std::io::Error::other(
-            "no token: pass --token or run inside a qoro terminal (QORO_TOKEN)",
+            "no token: pass --token or run inside a qoop terminal (QOOP_TOKEN)",
         ));
     };
     let nanos = std::time::SystemTime::now()
@@ -870,12 +870,12 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
         None => {
             if event.is_some() || label.is_some() {
                 return Err(usage(
-                    "usage: --event/--label need --state; or qoro hook-report --session-id S [--terminal N] [--token T]",
+                    "usage: --event/--label need --state; or qoop hook-report --session-id S [--terminal N] [--token T]",
                 ));
             }
             let Some(session) = session.filter(|s| !s.trim().is_empty()) else {
                 return Err(usage(
-                    "usage: qoro hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoro hook-report --session-id S [--terminal N] [--token T]",
+                    "usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]",
                 ));
             };
             let id = id.unwrap_or_else(|| format!("hook-session-{terminal}-{nanos}"));
@@ -896,7 +896,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 && !qoop_runtime::control::parse_focus_event(kind)
             {
                 return Err(usage(format!(
-                    "unknown focus event {kind:?}; usage: qoro hook-report --state <state> [--event user|tool|blocked|done] [--label ...]"
+                    "unknown focus event {kind:?}; usage: qoop hook-report --state <state> [--event user|tool|blocked|done] [--label ...]"
                 )));
             }
             if label.is_some() && event.is_none() {
@@ -935,7 +935,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
             let socket = paths::socket_path(&dir);
-            let (stream, mut inbuf) = client::connect(&socket, "qoro-hook").await?;
+            let (stream, mut inbuf) = client::connect(&socket, "qoop-hook").await?;
             let (mut rd, mut wr) = stream.into_split();
             let mut seq = 0u32;
             wr.write_all(&client::encode_control_seq(&request, &mut seq)?)
@@ -974,7 +974,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro reload-manifests`: re-read agent-detection overrides without restarting.
+/// `qoop reload-manifests`: re-read agent-detection overrides without restarting.
 ///
 /// Prints what loaded and what did not. A bad file keeps the previous rules,
 /// so this is safe to run blindly after editing the override directory.
@@ -1135,14 +1135,14 @@ fn request_id(what: &str) -> String {
     )
 }
 
-/// `qoro relay`: the far end of a remote attach.
+/// `qoop relay`: the far end of a remote attach.
 ///
 /// Started over ssh, it connects to this machine's daemon socket and copies bytes between
 /// that socket and its own stdin and stdout. The protocol does not change: a remote client
 /// speaks exactly what a local one speaks, and the transport is a pipe rather than a
 /// socket.
 ///
-/// It starts the daemon if there is not one, for the same reason `qoro` does: a person
+/// It starts the daemon if there is not one, for the same reason `qoop` does: a person
 /// attaching to a machine expects a workspace, not an error telling them to log in and start
 /// something first.
 fn run_relay() -> std::io::Result<()> {
@@ -1250,7 +1250,7 @@ async fn control_roundtrip(
     Ok((answer, stashed))
 }
 
-/// `qoro send`: type into another terminal's session.
+/// `qoop send`: type into another terminal's session.
 ///
 /// This travels on the terminal channel's addressed input, the same lane every
 /// keystroke uses, and adds no control method that takes bytes for a child.
@@ -1261,7 +1261,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let help = "usage: qoro send <terminal> [--enter] [--generation G] [--] <text...>\n       qoro send <terminal> --key NAME [--key NAME...] [--generation G]";
+    let help = "usage: qoop send <terminal> [--enter] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
@@ -1310,7 +1310,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-send").await?;
+        let (stream, mut inbuf) = client::connect(&socket, "qoop-send").await?;
         let (mut rd, mut wr) = stream.into_split();
         let mut connection = client::Connection::new();
         let mut seq = 0u32;
@@ -1360,7 +1360,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// Who this CLI call runs as, when it runs inside a qoro terminal: the
+/// Who this CLI call runs as, when it runs inside a qoop terminal: the
 /// terminal number plus its token, for binding a send/prompt's
 /// `from_terminal` claim to its sender. Both come from the environment the
 /// daemon put around everything the session starts; a half claim (number
@@ -1368,8 +1368,8 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
 /// and the daemon treats the input as unattributed, exactly like before.
 fn cli_sender() -> (Option<u32>, Option<String>) {
     cli_sender_from(
-        std::env::var("QORO_TERMINAL").ok(),
-        std::env::var("QORO_TOKEN").ok(),
+        std::env::var("QOOP_TERMINAL").ok(),
+        std::env::var("QOOP_TOKEN").ok(),
     )
 }
 
@@ -1505,7 +1505,7 @@ fn trim_rows(mut rows: Vec<String>, lines: Option<usize>) -> Vec<String> {
     rows
 }
 
-/// `qoro read`: print another terminal's current screen.
+/// `qoop read`: print another terminal's current screen.
 ///
 /// Subscribes, takes the first snapshot for that terminal and prints it.
 /// Trailing blank rows are trimmed; `--lines N` keeps the last N rows. `--json` prints
@@ -1513,8 +1513,8 @@ fn trim_rows(mut rows: Vec<String>, lines: Option<usize>) -> Vec<String> {
 /// and `--back UP` reads history instead: `--lines` rows (200 when not said), the first
 /// of them UP rows before the newest one written.
 fn run_read(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro read <terminal> [--lines N] [--json] [--watch]\n       \
-                qoro read <terminal> --back UP [--lines N] [--json]";
+    let help = "usage: qoop read <terminal> [--lines N] [--json] [--watch]\n       \
+                qoop read <terminal> --back UP [--lines N] [--json]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
@@ -1570,7 +1570,7 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let snapshot = fetch_snapshot(terminal, "qoro-read").await?;
+        let snapshot = fetch_snapshot(terminal, "qoop-read").await?;
         if json {
             println!("{}", mirror::screen(&snapshot));
             return Ok(());
@@ -1582,12 +1582,12 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro focus <terminal> [--json]`: every attached interface shows that terminal.
+/// `qoop focus <terminal> [--json]`: every attached interface shows that terminal.
 ///
 /// `--json` answers `{"clients":[pid,...]}`, the interface processes that were asked,
 /// which is what a notch or a launcher needs to raise the window one of them runs in.
 fn run_focus(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro focus <terminal> [--json]";
+    let help = "usage: qoop focus <terminal> [--json]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
@@ -1679,7 +1679,7 @@ fn prompt_refusal(row: &qoop_runtime::control::AgentRow) -> Option<String> {
     None
 }
 
-/// `qoro prompt`: send text plus Enter to another session, unless it is blocked.
+/// `qoop prompt`: send text plus Enter to another session, unless it is blocked.
 ///
 /// Not limited to agents: a
 /// shell session accepts a prompt too, it just runs it as a command. The
@@ -1689,7 +1689,7 @@ fn prompt_refusal(row: &qoop_runtime::control::AgentRow) -> Option<String> {
 /// before the newline submits it.
 ///
 /// `--wait` then waits for the turn the prompt caused (`supervise::Turn`), with the
-/// exit status of `qoro wait`.
+/// exit status of `qoop wait`.
 fn run_prompt(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
@@ -1706,7 +1706,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-prompt").await?;
+        let (stream, mut inbuf) = client::connect(&socket, "qoop-prompt").await?;
         let (mut rd, mut wr) = stream.into_split();
         let mut connection = client::Connection::new();
         let mut seq = 0u32;
@@ -1789,7 +1789,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// Parsed `qoro prompt` arguments, pure so the refusals are testable.
+/// Parsed `qoop prompt` arguments, pure so the refusals are testable.
 struct PromptOpts {
     target: String,
     text: String,
@@ -1804,7 +1804,7 @@ struct PromptOpts {
 /// same way. A text that ends in `--wait` or `--timeout N` is refused as a misplaced flag
 /// rather than typed into the agent, unless it follows `--`.
 fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
-    let help = "usage: qoro prompt <target> [--wait] [--timeout SECS] [--generation G] [--] <text...> [--generation G]";
+    let help = "usage: qoop prompt <target> [--wait] [--timeout SECS] [--generation G] [--] <text...> [--generation G]";
     let mut args = args.to_vec();
     let mut generation = supervise::take_generation(&mut args);
     let target = args.get(2).cloned().ok_or_else(|| help.to_string())?;
@@ -1845,7 +1845,7 @@ fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
         || (words.len() >= 2 && words[words.len() - 2] == "--timeout");
     if trailing && !literal {
         return Err(format!(
-            "flags go right after the target: qoro prompt <target> --wait <text>; {help}"
+            "flags go right after the target: qoop prompt <target> --wait <text>; {help}"
         ));
     }
     let text = words.join(" ");
@@ -1861,7 +1861,7 @@ fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
     })
 }
 
-/// `qoro history`: print another agent's recent transcript window.
+/// `qoop history`: print another agent's recent transcript window.
 ///
 /// Resolution reuses `resolve_target` and the single `ListAgents` round
 /// trip, like `prompt`. The transcript itself is read from the agent
@@ -1941,7 +1941,7 @@ fn run_history(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro history --dir <repo>`: what the person typed to their agents in a repository and
+/// `qoop history --dir <repo>`: what the person typed to their agents in a repository and
 /// its worktrees, across every session there, oldest first. No daemon: only the products'
 /// own stores are read.
 fn run_history_dir(args: &[String]) -> std::io::Result<()> {
@@ -1954,7 +1954,7 @@ fn run_history_dir(args: &[String]) -> std::io::Result<()> {
         unread,
     } = qoop_history::typed_in(&repo, &base, opts.last);
     for gap in unread {
-        eprintln!("qoro: not read: {gap}");
+        eprintln!("qoop: not read: {gap}");
     }
     if opts.json {
         println!(
@@ -1967,7 +1967,7 @@ fn run_history_dir(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Parsed `qoro history --dir` arguments.
+/// Parsed `qoop history --dir` arguments.
 struct HistoryDirOpts {
     dir: PathBuf,
     last: usize,
@@ -1979,7 +1979,7 @@ struct HistoryDirOpts {
 const HISTORY_DIR_LAST_MAX: usize = 2_000;
 
 fn parse_history_dir_args(args: &[String]) -> Result<HistoryDirOpts, String> {
-    let usage = "usage: qoro history --dir <repo> [--last N] [--json]";
+    let usage = "usage: qoop history --dir <repo> [--last N] [--json]";
     let mut dir = None;
     let mut last = 200usize;
     let mut json = false;
@@ -2023,7 +2023,7 @@ fn render_typed(typed: &[qoop_history::Typed]) -> String {
     out
 }
 
-/// Parsed `qoro history` arguments, pure so the refusals are testable.
+/// Parsed `qoop history` arguments, pure so the refusals are testable.
 struct HistoryOpts {
     target: String,
     last: usize,
@@ -2035,7 +2035,7 @@ struct HistoryOpts {
 const HISTORY_LAST_MAX: usize = 200;
 
 fn parse_history_args(args: &[String]) -> Result<HistoryOpts, String> {
-    let usage = "usage: qoro history <target> [--last N] [--role user|assistant] [--json]";
+    let usage = "usage: qoop history <target> [--last N] [--role user|assistant] [--json]";
     let target = args.get(2).cloned().ok_or_else(|| usage.to_string())?;
     let mut last = 20usize;
     let mut role = None;
@@ -2115,7 +2115,7 @@ fn truncate_text(text: &str) -> String {
     text.to_string()
 }
 
-/// `qoro context`: understand another agent before writing to it.
+/// `qoop context`: understand another agent before writing to it.
 ///
 /// One `ListAgents` round trip resolves the target and answers who it is
 /// and whether it is writable; the live screen comes down the same lane
@@ -2134,7 +2134,7 @@ fn run_context(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = client::connect(&socket, "qoro-context").await?;
+        let (stream, mut inbuf) = client::connect(&socket, "qoop-context").await?;
         let (mut rd, mut wr) = stream.into_split();
         let mut connection = client::Connection::new();
         let mut seq = 0u32;
@@ -2172,7 +2172,7 @@ fn run_context(args: &[String]) -> std::io::Result<()> {
             .clone();
         let refusal = prompt_refusal(&row);
         let screen = trim_rows(
-            fetch_snapshot(row.terminal, "qoro-context").await?.lines,
+            fetch_snapshot(row.terminal, "qoop-context").await?.lines,
             opts.lines,
         );
         let program = row.program.clone().unwrap_or_default();
@@ -2209,7 +2209,7 @@ fn run_context(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// Parsed `qoro context` arguments, pure so the refusals are testable.
+/// Parsed `qoop context` arguments, pure so the refusals are testable.
 struct ContextOpts {
     target: String,
     last: usize,
@@ -2220,7 +2220,7 @@ struct ContextOpts {
 
 fn parse_context_args(args: &[String]) -> Result<ContextOpts, String> {
     let usage =
-        "usage: qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]";
+        "usage: qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]";
     let target = args.get(2).cloned().ok_or_else(|| usage.to_string())?;
     let mut last = 20usize;
     let mut role = None;
@@ -2376,7 +2376,7 @@ fn render_context_text(
     out
 }
 
-/// `qoro agents`: the live index, one row per terminal.
+/// `qoop agents`: the live index, one row per terminal.
 ///
 /// Read only: one `ListAgents` round trip, no subscription, no input. The
 /// text form is one `key=value` row per terminal for a person skimming; the
@@ -2385,7 +2385,7 @@ fn render_context_text(
 fn run_agents(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
 
-    let help = "usage: qoro agents [--json]\n       qoro agents --watch [--all] [--json]\n       qoro agents explain <target> [--json]";
+    let help = "usage: qoop agents [--json]\n       qoop agents --watch [--all] [--json]\n       qoop agents explain <target> [--json]";
     enum Mode<'a> {
         List { json: bool },
         Explain { target: &'a str, json: bool },
@@ -2436,7 +2436,7 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
         let socket = paths::socket_path(&dir);
-        let (stream, mut inbuf) = match client::connect(&socket, "qoro-agents").await {
+        let (stream, mut inbuf) = match client::connect(&socket, "qoop-agents").await {
             Ok(connected) => connected,
             // No daemon is nothing awake, which is an answer: an empty list. An
             // explanation of one agent still needs that agent, and says so.
@@ -2519,7 +2519,7 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// One terminal on one line, for a person skimming `qoro agents`.
+/// One terminal on one line, for a person skimming `qoop agents`.
 ///
 /// `key=value` rather than columns, because a chosen name can hold a space
 /// and columns would then stop lining up exactly when they are needed.
@@ -2569,7 +2569,7 @@ fn agent_line(row: &qoop_runtime::control::AgentRow) -> String {
     )
 }
 
-/// Why one terminal reads the way it does, for `qoro agents explain`.
+/// Why one terminal reads the way it does, for `qoop agents explain`.
 ///
 /// The belief first (state plus the source that holds it), then what the
 /// screen last matched in this generation. A missing rule is an answer, not
@@ -2614,7 +2614,7 @@ fn explain_row(row: &qoop_runtime::control::AgentRow) -> String {
 
 /// The phone commands. Built from this repository alone there is no phone part: a bridge
 /// reload (what install and update run) has nothing to put back, and the rest says so. A
-/// `qoro bridge` that a release build's service still runs fails, so its log says why.
+/// `qoop bridge` that a release build's service still runs fails, so its log says why.
 fn phone_command(phone: Option<Phone>, args: &[String]) -> std::io::Result<()> {
     if let Some(phone) = phone {
         return phone(args);
@@ -2623,7 +2623,7 @@ fn phone_command(phone: Option<Phone>, args: &[String]) -> std::io::Result<()> {
         return Ok(());
     }
     Err(std::io::Error::other(format!(
-        "`qoro {}` is part of the qoro release; this build has no phone support",
+        "`qoop {}` is part of the qoop release; this build has no phone support",
         args[1]
     )))
 }
@@ -2652,7 +2652,7 @@ pub(crate) fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     // Only a reason written by the daemon just started, not one left by an earlier start.
-    let failed = socket.with_file_name("qorod.failed");
+    let failed = socket.with_file_name("qoopd.failed");
     let fresh = std::fs::metadata(&failed)
         .and_then(|m| m.modified())
         .is_ok_and(|at| at >= spawned);
@@ -2670,7 +2670,7 @@ pub(crate) fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
 /// Pull `--session <name>` out of the arguments, wherever it was written.
 ///
 /// Removed rather than left in place, so every command's own argument parsing sees the
-/// arguments it expects. Accepted only as `default`: that is what an older qoro on the
+/// arguments it expects. Accepted only as `default`: that is what an older qoop on the
 /// other end of ssh sends, and any other name belonged to a session that is a space now,
 /// refused with where its files went.
 fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
@@ -2715,7 +2715,7 @@ fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
 fn existing_store(dir: &std::path::Path) -> std::io::Result<Option<qoop_store::Store>> {
     [paths::state_location(dir), dir.to_path_buf()]
         .into_iter()
-        .map(|d| d.join("qoro.db"))
+        .map(|d| d.join("qoop.db"))
         .find(|db| db.exists())
         .map(|db| qoop_store::Store::open_existing(&db).map_err(std::io::Error::other))
         .transpose()
@@ -2730,7 +2730,7 @@ fn sleeping_agent(target: &str) -> Option<(String, Option<String>)> {
     existing_store(&dir).ok()??.sleeping_agent(terminal).ok()?
 }
 
-/// `qoro ls`: this machine's spaces, and which of them are asleep.
+/// `qoop ls`: this machine's spaces, and which of them are asleep.
 ///
 /// Read off the store rather than from a daemon when none is running, which is when the
 /// question is most often asked: a daemon that left because nothing was awake still has
@@ -2745,7 +2745,7 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
             if json {
                 "[]"
             } else {
-                "no spaces yet. `qoro` starts one."
+                "no spaces yet. `qoop` starts one."
             }
         );
         return Ok(());
@@ -2789,7 +2789,7 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
         return Ok(());
     }
     if rows.is_empty() {
-        println!("no spaces yet. `qoro` starts one.");
+        println!("no spaces yet. `qoop` starts one.");
     }
     for (id, name, state, tabs, sleeping) in rows {
         let tabs = match tabs {
@@ -2807,15 +2807,15 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `qoro stop`: end the daemon, and with it everything it was running.
+/// `qoop stop`: end the daemon, and with it everything it was running.
 ///
 /// The tabs are not lost by this and are not meant to be: what was open stays recorded, so
-/// the next `qoro` brings back the same spaces, the same tabs, the same directories, and
+/// the next `qoop` brings back the same spaces, the same tabs, the same directories, and
 /// carries on the conversation of any agent that was in one, and a space that was asleep
 /// stays asleep. What does not survive is the processes, and that is not a choice: a
 /// terminal is a pty this daemon owns, and its children get a hangup when it goes.
 fn run_stop(args: &[String]) -> std::io::Result<()> {
-    // `qoro stop work` named a session once; there is one daemon now, so a name other than
+    // `qoop stop work` named a session once; there is one daemon now, so a name other than
     // the default is pointed at where that session's files are. A daemon of that name still
     // running from before is stopped by it, since nothing else reaches it now.
     let dir = match args.get(2) {
@@ -2836,7 +2836,7 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
     };
     let socket = paths::socket_path(&dir);
     if std::os::unix::net::UnixStream::connect(&socket).is_err() {
-        println!("qoro is not running");
+        println!("qoop is not running");
         return Ok(());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2847,7 +2847,7 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 
         let answer = ask_daemon(
             &socket,
-            "qoro-stop",
+            "qoop-stop",
             &ControlRequest::Shutdown {
                 id: request_id("stop"),
             },
@@ -2867,7 +2867,7 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 println!(
-                    "qoro stopped, {terminals} {} ended. `qoro` brings the tabs back.",
+                    "qoop stopped, {terminals} {} ended. `qoop` brings the tabs back.",
                     if terminals == 1 {
                         "terminal"
                     } else {
@@ -3006,20 +3006,20 @@ mod tests {
         // SAFETY: no other test in this binary touches this variable, and the override
         // keeps every read inside the tempdir.
         unsafe { std::env::set_var(paths::RUNTIME_DIR_ENV, base.path()) };
-        // What an older qoro across ssh sends: taken out, and the command still reads.
-        let mut args: Vec<String> = ["qoro", "--session", "default", "relay"]
+        // What an older qoop across ssh sends: taken out, and the command still reads.
+        let mut args: Vec<String> = ["qoop", "--session", "default", "relay"]
             .map(String::from)
             .to_vec();
         take_session(&mut args).expect("the default is accepted");
-        assert_eq!(args, vec!["qoro".to_string(), "relay".to_string()]);
-        let mut args: Vec<String> = ["qoro", "send", "--session=default", "2", "x"]
+        assert_eq!(args, vec!["qoop".to_string(), "relay".to_string()]);
+        let mut args: Vec<String> = ["qoop", "send", "--session=default", "2", "x"]
             .map(String::from)
             .to_vec();
         take_session(&mut args).expect("the default is accepted");
-        assert_eq!(args, ["qoro", "send", "2", "x"].map(String::from).to_vec());
+        assert_eq!(args, ["qoop", "send", "2", "x"].map(String::from).to_vec());
         // A session of its own was a space's worth of tabs: refused, with where it went.
         let refused = take_session(
-            &mut ["qoro", "--session", "work", "ls"]
+            &mut ["qoop", "--session", "work", "ls"]
                 .map(String::from)
                 .to_vec(),
         )
@@ -3029,9 +3029,9 @@ mod tests {
             "{refused}"
         );
         // A flag with nothing after it is a mistake, not the default.
-        assert!(take_session(&mut ["qoro", "--session"].map(String::from).to_vec()).is_err());
+        assert!(take_session(&mut ["qoop", "--session"].map(String::from).to_vec()).is_err());
         // Past `--` it is text to send, not a flag.
-        let mut sent: Vec<String> = ["qoro", "send", "3", "--", "--session", "play"]
+        let mut sent: Vec<String> = ["qoop", "send", "3", "--", "--session", "play"]
             .map(String::from)
             .into();
         take_session(&mut sent).expect("text past `--` is not a session");
@@ -3126,7 +3126,7 @@ mod tests {
 
     #[test]
     fn history_defaults_to_twenty_newest() {
-        let opts = parse_history_args(&history_argv(&["qoro", "history", "2"])).unwrap();
+        let opts = parse_history_args(&history_argv(&["qoop", "history", "2"])).unwrap();
         assert_eq!(opts.target, "2");
         assert_eq!(opts.last, 20);
         assert!(opts.role.is_none());
@@ -3136,7 +3136,7 @@ mod tests {
     #[test]
     fn history_parses_last_role_and_json() {
         let opts = parse_history_args(&history_argv(&[
-            "qoro", "history", "claude", "--last", "5", "--role", "user", "--json",
+            "qoop", "history", "claude", "--last", "5", "--role", "user", "--json",
         ]))
         .unwrap();
         assert_eq!(opts.last, 5);
@@ -3147,39 +3147,39 @@ mod tests {
     #[test]
     fn history_rejects_zero_over_max_bad_role_and_unknown_flags() {
         assert!(
-            parse_history_args(&history_argv(&["qoro", "history", "2", "--last", "0"])).is_err()
+            parse_history_args(&history_argv(&["qoop", "history", "2", "--last", "0"])).is_err()
         );
         assert!(
-            parse_history_args(&history_argv(&["qoro", "history", "2", "--last", "201"])).is_err()
+            parse_history_args(&history_argv(&["qoop", "history", "2", "--last", "201"])).is_err()
         );
-        assert!(parse_history_args(&history_argv(&["qoro", "history", "2", "--last"])).is_err());
+        assert!(parse_history_args(&history_argv(&["qoop", "history", "2", "--last"])).is_err());
         assert!(
-            parse_history_args(&history_argv(&["qoro", "history", "2", "--role", "tool"])).is_err()
+            parse_history_args(&history_argv(&["qoop", "history", "2", "--role", "tool"])).is_err()
         );
-        assert!(parse_history_args(&history_argv(&["qoro", "history", "2", "--bogus"])).is_err());
-        assert!(parse_history_args(&history_argv(&["qoro", "history"])).is_err());
+        assert!(parse_history_args(&history_argv(&["qoop", "history", "2", "--bogus"])).is_err());
+        assert!(parse_history_args(&history_argv(&["qoop", "history"])).is_err());
     }
 
     #[test]
     fn history_of_a_repo_parses_and_prints_one_line_each() {
         let opts = parse_history_dir_args(&history_argv(&[
-            "qoro", "history", "--dir", "/r", "--last", "2000", "--json",
+            "qoop", "history", "--dir", "/r", "--last", "2000", "--json",
         ]))
         .unwrap();
         assert_eq!(opts.dir, PathBuf::from("/r"));
         assert_eq!(opts.last, 2_000);
         assert!(opts.json);
         assert_eq!(
-            parse_history_dir_args(&history_argv(&["qoro", "history", "--dir", "/r"]))
+            parse_history_dir_args(&history_argv(&["qoop", "history", "--dir", "/r"]))
                 .unwrap()
                 .last,
             200
         );
         for bad in [
-            &["qoro", "history", "--dir"][..],
-            &["qoro", "history", "--last", "5"],
-            &["qoro", "history", "--dir", "/r", "--last", "2001"],
-            &["qoro", "history", "--dir", "/r", "--role", "user"],
+            &["qoop", "history", "--dir"][..],
+            &["qoop", "history", "--last", "5"],
+            &["qoop", "history", "--dir", "/r", "--last", "2001"],
+            &["qoop", "history", "--dir", "/r", "--role", "user"],
         ] {
             assert!(
                 parse_history_dir_args(&history_argv(bad)).is_err(),
@@ -3266,7 +3266,7 @@ mod tests {
 
     #[test]
     fn context_defaults_to_twenty_newest_and_full_screen() {
-        let opts = parse_context_args(&context_argv(&["qoro", "context", "2"])).unwrap();
+        let opts = parse_context_args(&context_argv(&["qoop", "context", "2"])).unwrap();
         assert_eq!(opts.target, "2");
         assert_eq!(opts.last, 20);
         assert!(opts.role.is_none());
@@ -3277,7 +3277,7 @@ mod tests {
     #[test]
     fn context_parses_last_role_lines_and_json() {
         let opts = parse_context_args(&context_argv(&[
-            "qoro", "context", "claude", "--last", "5", "--role", "user", "--lines", "10", "--json",
+            "qoop", "context", "claude", "--last", "5", "--role", "user", "--lines", "10", "--json",
         ]))
         .unwrap();
         assert_eq!(opts.last, 5);
@@ -3289,21 +3289,21 @@ mod tests {
     #[test]
     fn context_rejects_zero_over_max_bad_role_and_unknown_flags() {
         assert!(
-            parse_context_args(&context_argv(&["qoro", "context", "2", "--last", "0"])).is_err()
+            parse_context_args(&context_argv(&["qoop", "context", "2", "--last", "0"])).is_err()
         );
         assert!(
-            parse_context_args(&context_argv(&["qoro", "context", "2", "--last", "201"])).is_err()
+            parse_context_args(&context_argv(&["qoop", "context", "2", "--last", "201"])).is_err()
         );
-        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--last"])).is_err());
+        assert!(parse_context_args(&context_argv(&["qoop", "context", "2", "--last"])).is_err());
         assert!(
-            parse_context_args(&context_argv(&["qoro", "context", "2", "--role", "tool"])).is_err()
+            parse_context_args(&context_argv(&["qoop", "context", "2", "--role", "tool"])).is_err()
         );
-        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--bogus"])).is_err());
-        assert!(parse_context_args(&context_argv(&["qoro", "context"])).is_err());
+        assert!(parse_context_args(&context_argv(&["qoop", "context", "2", "--bogus"])).is_err());
+        assert!(parse_context_args(&context_argv(&["qoop", "context"])).is_err());
         // --lines takes a number, like read.
-        assert!(parse_context_args(&context_argv(&["qoro", "context", "2", "--lines"])).is_err());
+        assert!(parse_context_args(&context_argv(&["qoop", "context", "2", "--lines"])).is_err());
         assert!(
-            parse_context_args(&context_argv(&["qoro", "context", "2", "--lines", "x"])).is_err()
+            parse_context_args(&context_argv(&["qoop", "context", "2", "--lines", "x"])).is_err()
         );
     }
 
@@ -3408,7 +3408,7 @@ mod tests {
     #[test]
     fn prompt_flags_come_right_after_the_target_and_text_is_never_eaten() {
         let opts = parse_prompt_args(&argv(&[
-            "qoro",
+            "qoop",
             "prompt",
             "2",
             "--wait",
@@ -3426,16 +3426,16 @@ mod tests {
             "flags inside the text are text"
         );
         for quoted in ["--- notes from review", "--resume please"] {
-            let text = parse_prompt_args(&argv(&["qoro", "prompt", "2", quoted])).unwrap();
+            let text = parse_prompt_args(&argv(&["qoop", "prompt", "2", quoted])).unwrap();
             assert_eq!(text.text, quoted, "a quoted text is text");
         }
         let dashed =
-            parse_prompt_args(&argv(&["qoro", "prompt", "2", "--", "--help", "me"])).unwrap();
+            parse_prompt_args(&argv(&["qoop", "prompt", "2", "--", "--help", "me"])).unwrap();
         assert_eq!(dashed.text, "--help me");
         assert!(!dashed.wait);
         for late in [
-            &["qoro", "prompt", "2", "fix the bug", "--wait"][..],
-            &["qoro", "prompt", "2", "fix", "--wait", "--timeout", "9"],
+            &["qoop", "prompt", "2", "fix the bug", "--wait"][..],
+            &["qoop", "prompt", "2", "fix", "--wait", "--timeout", "9"],
         ] {
             let refused = parse_prompt_args(&argv(late));
             assert!(
@@ -3447,20 +3447,20 @@ mod tests {
             );
         }
         let on_purpose =
-            parse_prompt_args(&argv(&["qoro", "prompt", "2", "--", "say", "--wait"])).unwrap();
+            parse_prompt_args(&argv(&["qoop", "prompt", "2", "--", "say", "--wait"])).unwrap();
         assert_eq!(on_purpose.text, "say --wait");
-        let typo = parse_prompt_args(&argv(&["qoro", "prompt", "2", "--wiat", "go"]));
+        let typo = parse_prompt_args(&argv(&["qoop", "prompt", "2", "--wiat", "go"]));
         assert!(
             typo.as_ref()
                 .is_err_and(|e| e.starts_with("unknown flag --wiat")),
             "{:?}",
             typo.err()
         );
-        assert!(parse_prompt_args(&argv(&["qoro", "prompt", "2", "--timeout", "5", "x"])).is_err());
-        assert!(parse_prompt_args(&argv(&["qoro", "prompt", "2", "--wait"])).is_err());
+        assert!(parse_prompt_args(&argv(&["qoop", "prompt", "2", "--timeout", "5", "x"])).is_err());
+        assert!(parse_prompt_args(&argv(&["qoop", "prompt", "2", "--wait"])).is_err());
         // `--generation` both ways, and never mistaken for a misplaced flag.
         let trailing = parse_prompt_args(&argv(&[
-            "qoro",
+            "qoop",
             "prompt",
             "2",
             "--wait",
@@ -3475,7 +3475,7 @@ mod tests {
         );
         assert!(trailing.wait);
         let leading = parse_prompt_args(&argv(&[
-            "qoro",
+            "qoop",
             "prompt",
             "2",
             "--generation",
@@ -3490,7 +3490,7 @@ mod tests {
         );
         assert!(
             parse_prompt_args(&argv(&[
-                "qoro",
+                "qoop",
                 "prompt",
                 "2",
                 "--generation",
@@ -3505,7 +3505,7 @@ mod tests {
 
     #[test]
     fn a_usage_mistake_is_told_apart_from_a_failure() {
-        assert!(is_usage(&usage("usage: qoro wait <target>")));
+        assert!(is_usage(&usage("usage: qoop wait <target>")));
         assert!(!is_usage(&std::io::Error::other("terminal 3 closed")));
         assert_eq!(usage("usage: x").to_string(), "usage: x");
     }

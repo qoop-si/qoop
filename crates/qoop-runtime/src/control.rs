@@ -351,14 +351,14 @@ pub enum ControlRequest {
     ///
     /// Answered by the interface's own connection to its daemons, never by a daemon: a
     /// daemon has no business opening ssh connections on a client's behalf. A machine with
-    /// no qoro is answered `RemoteMissing` rather than added.
+    /// no qoop is answered `RemoteMissing` rather than added.
     ConnectRemote {
         id: String,
         target: String,
     },
-    /// Put this version of qoro on a machine that has none, into `~/.local/bin` over ssh.
+    /// Put this version of qoop on a machine that has none, into `~/.local/bin` over ssh.
     /// Answered by the interface's connection, like `ConnectRemote`; it never replaces a
-    /// qoro that is already there.
+    /// qoop that is already there.
     InstallRemote {
         id: String,
         target: String,
@@ -399,7 +399,7 @@ pub enum ControlRequest {
         id: String,
         tree: Pane,
     },
-    /// Move onto the qoro now on disk, `version`, at the first moment nothing here is
+    /// Move onto the qoop now on disk, `version`, at the first moment nothing here is
     /// working: every awake tab is one a sleep would take (a shell at its prompt, or an
     /// agent idle in a conversation it has named), and no agent waits on another.
     ///
@@ -496,7 +496,7 @@ pub struct TaskRef {
 /// How much of a goal an agents row carries.
 pub const TASK_REF_GOAL: usize = 100;
 
-/// A task as `qoro task` shows it.
+/// A task as `qoop task` shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskInfo {
     pub id: i64,
@@ -762,7 +762,7 @@ pub enum ControlResponse {
         id: String,
         name: String,
     },
-    /// The machine has no qoro, and is one qoro is built for: `platform` as shown to a
+    /// The machine has no qoop, and is one qoop is built for: `platform` as shown to a
     /// person ("linux x86_64"), and whether the connection logs in as root.
     RemoteMissing {
         id: String,
@@ -770,7 +770,7 @@ pub enum ControlResponse {
         platform: String,
         root: bool,
     },
-    /// qoro `version` is now on the machine.
+    /// qoop `version` is now on the machine.
     RemoteInstalled {
         id: String,
         target: String,
@@ -1074,7 +1074,7 @@ pub struct AgentRow {
     pub generation: Option<u64>,
     /// Which source holds the belief: `Hook`, `ScreenHeuristic`, `ProcessIdentity`.
     ///
-    /// What `qoro agents explain` shows as the authority behind the state. Absent
+    /// What `qoop agents explain` shows as the authority behind the state. Absent
     /// when no observation has been accepted yet, and absent on rows from a
     /// daemon that predates the field.
     #[serde(default)]
@@ -1137,7 +1137,7 @@ pub struct AgentRow {
     /// What this terminal's engine threw away rather than parsed or kept, counted since
     /// the terminal started: control strings over their bound, image envelopes over theirs,
     /// feeds that may have lost scrollback unseen. Present only once something was, which
-    /// is what lets `qoro agents explain` say a screen is missing something rather than
+    /// is what lets `qoop agents explain` say a screen is missing something rather than
     /// leave the discard silent. Absent on rows from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discards: Option<Discards>,
@@ -1159,7 +1159,7 @@ pub struct AgentRow {
     /// and zero from a daemon that predates it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background: u32,
-    /// The task the agent in this terminal opened and has not had closed (`qoro task`).
+    /// The task the agent in this terminal opened and has not had closed (`qoop task`).
     /// Absent when there is none, and from a daemon that predates tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRef>,
@@ -1278,7 +1278,7 @@ pub fn parse_focus_event(kind: &str) -> bool {
 /// A label with the secrets a command line tends to carry masked: the word after
 /// `Bearer`, the value of a `NAME=value` whose name says key, token, secret, pass or auth,
 /// and words that start like a provider's token. A label travels further than the hook
-/// that wrote it (the sidebar, `qoro agents --json`, another machine's client), so this
+/// that wrote it (the sidebar, `qoop agents --json`, another machine's client), so this
 /// runs once, where every label enters.
 /// ponytail: a word list, not a scanner; a secret in a shape not listed here passes.
 fn redact(single: &str) -> String {
@@ -1316,7 +1316,7 @@ fn redact(single: &str) -> String {
 
 pub fn truncate_focus_label(label: &str) -> String {
     // Control characters out first: a label is shown on screens and printed by
-    // `qoro agents --json`, and an escape in a command must not travel as one.
+    // `qoop agents --json`, and an escape in a command must not travel as one.
     let clean: String = label
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1625,7 +1625,7 @@ mod tests {
             ControlRequest::ReportAgentState {
                 id: "d".into(),
                 terminal: 3,
-                token: "qoro-3-abc".into(),
+                token: "qoop-3-abc".into(),
                 state: "working".into(),
                 visible_blocker: false,
                 visible_idle: false,
@@ -1853,7 +1853,7 @@ pub enum EventMessage {
     /// of truth that can arrive out of order with the first. This says where to look, and
     /// `ListAgents` says what is there.
     AgentChanged { terminal: TerminalStream },
-    /// Show this terminal, asked for by `qoro focus`. An interface switches to it as if
+    /// Show this terminal, asked for by `qoop focus`. An interface switches to it as if
     /// its row were clicked; every other client ignores it, and so does an older
     /// interface, the event lane being lenient.
     Focus { terminal: TerminalStream },
@@ -1882,7 +1882,7 @@ mod version_message_tests {
         );
         assert!(said.contains("older"), "{said}");
         assert!(
-            said.contains("`qoro stop`"),
+            said.contains("`qoop stop`"),
             "the fix has to be in the message: {said}"
         );
         assert!(

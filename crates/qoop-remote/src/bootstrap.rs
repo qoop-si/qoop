@@ -52,8 +52,8 @@ impl RemoteShell {
 /// Everything the bootstrap reads is between two markers it chose, because a login shell
 /// prints a banner, a framework prints its startup, and a corporate profile prints a legal
 /// notice. Reading the first line of output is reading somebody's message of the day.
-pub const MARKER_BEGIN: &str = "-----qoro-begin-----";
-pub const MARKER_END: &str = "-----qoro-end-----";
+pub const MARKER_BEGIN: &str = "-----qoop-begin-----";
+pub const MARKER_END: &str = "-----qoop-end-----";
 
 /// Wrap a command so its output can be found in whatever else the shell says.
 pub fn marker_command(command: &str) -> String {
@@ -182,12 +182,12 @@ mod tests {
     #[test]
     fn setting_a_variable_uses_the_shells_own_syntax() {
         assert_eq!(
-            RemoteShell::PosixLike.with_env("A", "1", "qorod"),
-            "A='1' qorod"
+            RemoteShell::PosixLike.with_env("A", "1", "qoopd"),
+            "A='1' qoopd"
         );
         assert_eq!(
-            RemoteShell::Fish.with_env("A", "1", "qorod"),
-            "env A='1' qorod"
+            RemoteShell::Fish.with_env("A", "1", "qoopd"),
+            "env A='1' qoopd"
         );
     }
 
@@ -195,20 +195,20 @@ mod tests {
     #[test]
     fn a_value_is_quoted_so_it_runs_nothing() {
         assert_eq!(
-            RemoteShell::PosixLike.with_env("A", "1; touch x", "qorod"),
-            "A='1; touch x' qorod"
+            RemoteShell::PosixLike.with_env("A", "1; touch x", "qoopd"),
+            "A='1; touch x' qoopd"
         );
         assert_eq!(
-            RemoteShell::Fish.with_env("A", "it's", "qorod"),
-            r"env A='it'\''s' qorod"
+            RemoteShell::Fish.with_env("A", "it's", "qoopd"),
+            r"env A='it'\''s' qoopd"
         );
     }
 
     #[test]
     fn an_unknown_shell_is_treated_as_posix_like_rather_than_refused() {
         assert_eq!(
-            RemoteShell::Unknown.with_env("A", "1", "qorod"),
-            "A='1' qorod"
+            RemoteShell::Unknown.with_env("A", "1", "qoopd"),
+            "A='1' qoopd"
         );
     }
 }

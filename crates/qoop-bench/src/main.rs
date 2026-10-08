@@ -2,14 +2,14 @@
 //!
 //! Not a criterion-style microbenchmark suite. Every number this prints comes from driving
 //! the real daemon: through `qoop-testkit` where an in-process daemon is enough, and through
-//! the real `qoro` binary where a separate process is the thing being measured. A scenario
+//! the real `qoop` binary where a separate process is the thing being measured. A scenario
 //! that cannot be measured says so and the run exits non-zero for it; it never prints a
 //! plausible number in its place. A missed budget, by contrast, is reported and does not by
 //! itself fail the run: section 7 states the budgets are targets pending this harness's
 //! first run, not gates yet.
 //!
 //! Scenarios, in the plan's section 7 order:
-//! 1. `qoro --version` wall time.
+//! 1. `qoop --version` wall time.
 //! 2. attach latency: real client process start to first rendered frame.
 //! 3. input latency, local and quiet.
 //! 4. input latency while the terminal streams about 1 MiB/s to itself.
@@ -28,7 +28,7 @@ use report::ScenarioOutcome;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
     let bin = proc::bin_path();
-    println!("qoro binary under test: {}", bin.display());
+    println!("qoop binary under test: {}", bin.display());
     let git_rev = git_rev();
     match &git_rev {
         Some(rev) => println!("git rev: {rev}"),

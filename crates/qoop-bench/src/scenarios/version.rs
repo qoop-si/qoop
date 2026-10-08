@@ -1,8 +1,8 @@
-//! Scenario 1: `qoro --version` wall time.
+//! Scenario 1: `qoop --version` wall time.
 //!
 //! Runs the real binary because there is nothing else this scenario could measure: process
 //! spawn overhead, argument parsing and the write to stdout are exactly what a user pays for
-//! `qoro --version`, and a criterion-style in-process call would measure a different thing
+//! `qoop --version`, and a criterion-style in-process call would measure a different thing
 //! wearing this scenario's name.
 
 use std::path::Path;
@@ -16,7 +16,7 @@ const WARMUP: usize = 5;
 const SAMPLES: usize = 50;
 
 pub fn run(bin: &Path) -> ScenarioOutcome {
-    let name = "qoro --version".to_string();
+    let name = "qoop --version".to_string();
     if !bin.is_file() {
         return ScenarioOutcome::failed(
             name,

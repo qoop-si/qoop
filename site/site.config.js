@@ -1,5 +1,5 @@
 export default {
-  name: "qoro",
+  name: "qoop",
   description: "a portable runtime for human and coding-agent workspaces",
   author: {
     name: "us",
@@ -51,7 +51,7 @@ export default {
   defaultPage: "introduction",
   footer: {
     left: "AGPL-3.0-or-later",
-    right: "qoro",
+    right: "qoop",
   },
   theme: {
     light: { "--accent-gold": "#FF6600", "--accent-gold-dim": "rgba(255, 102, 0, .15)", "--accent-blue": "#FD4B03" },

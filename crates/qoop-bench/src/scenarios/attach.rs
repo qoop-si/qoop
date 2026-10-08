@@ -2,8 +2,8 @@
 //!
 //! Section 7's "attach to a small workspace" budget is a client joining an already running
 //! daemon, not a cold daemon start: G1.1 already covers cold start, on a 2 second budget two
-//! orders of magnitude looser than this one. So one real `qorod` is spawned once and kept
-//! warm, and each sample spawns a fresh real `qoro` client process under its own PTY,
+//! orders of magnitude looser than this one. So one real `qoopd` is spawned once and kept
+//! warm, and each sample spawns a fresh real `qoop` client process under its own PTY,
 //! timing from that process's spawn to the first bytes of a rendered frame reaching the
 //! outer terminal.
 //!
@@ -69,14 +69,14 @@ fn attach_once(bin: &Path, runtime_dir: &Path) -> std::io::Result<Duration> {
 
     let start = Instant::now();
     let mut child = Command::new(bin)
-        .env("QORO_RUNTIME_DIR", runtime_dir)
+        .env("QOOP_RUNTIME_DIR", runtime_dir)
         // Same session pinning as the daemon spawn above: the client must
         // attach the session the warm daemon actually holds.
         .env_remove(qoop_runtime::paths::SESSION_ENV)
-        // And the same token hygiene: a bench run inside a qoro terminal
+        // And the same token hygiene: a bench run inside a qoop terminal
         // must not leak that terminal's identity into the client.
-        .env_remove("QORO_TOKEN")
-        .env_remove("QORO_TERMINAL")
+        .env_remove("QOOP_TOKEN")
+        .env_remove("QOOP_TERMINAL")
         .stdin(dup_slave(&pty)?)
         .stdout(dup_slave(&pty)?)
         .stderr(Stdio::null())

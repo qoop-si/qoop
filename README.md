@@ -1,14 +1,14 @@
-# qoro
+# qoop
 
 A portable runtime for human and coding-agent workspaces.
 
 ```
 cd my-project
-qoro
+qoop
 ```
 
 That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
-no manifest. Press ctrl-q and the shell keeps running; run `qoro` again and you are back in
+no manifest. Press ctrl-q and the shell keeps running; run `qoop` again and you are back in
 the same one, on the terminal you left: the same space, the same tab, the same pane of a split.
 
 ```
@@ -63,11 +63,11 @@ corners in the column.
 bottom row names the keys that work where you are, and every command while `ctrl-a` waits
 for its letter. Under a working agent the column says what it is doing (`editing
 sidebar.rs`, `cargo test`), from the agent's own hook. `ctrl-a M` opens the focused agent's
-last answer as a page, and `QORO_USAGE=1` shows what each agent costs in CPU and memory.
+last answer as a page, and `QOOP_USAGE=1` shows what each agent costs in CPU and memory.
 Nothing polls: eight terminals open and nobody typing costs 105 microseconds of client CPU a
 minute, and the state is read off a terminal's screen only once it stops changing. The one
 motion is the filling ring and sweep beside an agent that is working and on screen: about 0.3
-percent of a core while they turn, nothing once the agent stops, and `QORO_MOTION=0` or
+percent of a core while they turn, nothing once the agent stops, and `QOOP_MOTION=0` or
 `NO_COLOR` keeps them still.
 
 On a Mac the same news sits in the notch, with no window open: your pet, an amber badge
@@ -78,14 +78,14 @@ colours, the same grid the interface draws and never resized for it. Scrolling u
 back past the screen: into the terminal's history, or for an agent on the full screen,
 into its conversation. A click on it types into it: every key goes to that terminal as
 pressed, so arrows move through an agent's menu, Enter picks, Esc cancels, and a click
-outside stops. When qoro cannot read a terminal, the box says what qoro said about it, or
-that it could not read it, instead of sitting empty. "open in qoro" switches the interface
+outside stops. When qoop cannot read a terminal, the box says what qoop said about it, or
+that it could not read it, instead of sitting empty. "open in qoop" switches the interface
 there and brings its app forward
 (inside tmux the switch happens and nothing is raised, since the tmux server has no app to
 find). The gear in the list opens a settings window: the notch on or off, notifications,
-theme, prefix key and pet, all written to `~/.config/qoro/config.toml`, which `qoro
-config` prints and `qoro config set` changes. The installer turns the notch on; `qoro notch
-uninstall` turns it off, and `qoro notch install` back on. It is built into the macOS binary, so it needs no download or signature
+theme, prefix key and pet, all written to `~/.config/qoop/config.toml`, which `qoop
+config` prints and `qoop config set` changes. The installer turns the notch on; `qoop notch
+uninstall` turns it off, and `qoop notch install` back on. It is built into the macOS binary, so it needs no download or signature
 of its own.
 
 Runs on macOS and Linux. On Windows, under WSL. There is no native Windows build, and
@@ -107,14 +107,14 @@ rows. Closing a terminal contains what it started.
 
 ```
 cargo build --release
-./target/release/qoro
+./target/release/qoop
 ```
 
 Put it somewhere on your path and install the hooks and the skill for the agents you use:
 
 ```
-qoro hooks install
-qoro skills install
+qoop hooks install
+qoop skills install
 ```
 
 That writes each agent's hook and adds one entry to that agent's own configuration, beside
@@ -123,9 +123,9 @@ Both are optional: every agent is read from its screen without a hook, and the s
 only teaches an agent what the commands are for. What a hook buys is a state known
 the moment it changes rather than after it is drawn, and the agent's own id for its
 conversation, which is what lets a tab that slept or stopped come back to that
-conversation rather than to whichever one in the directory is newest. `qoro hooks status` says
-what is installed and `qoro hooks uninstall` takes out exactly what was added;
-`qoro skills status` and `qoro skills uninstall` do the same for the skill.
+conversation rather than to whichever one in the directory is newest. `qoop hooks status` says
+what is installed and `qoop hooks uninstall` takes out exactly what was added;
+`qoop skills status` and `qoop skills uninstall` do the same for the skill.
 How a screen is read, and how to override a misreading, is in
 [docs/manifests.md](docs/manifests.md); what each hook installs is in
 [docs/hooks.md](docs/hooks.md).
@@ -137,26 +137,26 @@ needs your word. You answer it in its own tab, and it passes your answer on. Sta
 its own space:
 
 ```
-qoro qass
+qoop qass
 ```
 
-It opens qass in its own space on the agent `qoro settings` names (`qass runs on`: claude by
+It opens qass in its own space on the agent `qoop settings` names (`qass runs on`: claude by
 default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
 `claudes = "claude --model sonnet"`), or shows or wakes the one you have. Close it with the
 `x` on its row.
 Its rules live in the skill itself: what it answers alone, what it asks you, and what it
 never does. Your file
-`$(qoro paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
+`$(qoop paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
 your "ok <name>") or `mode auto`, and per repository grants such as
 `grant /path/to/repo commit`. When you correct it, it keeps the rule in
-`$(qoro paths qass-config)/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
-make it more careful, never let it act alone where it would have asked you. `qoro paths`
-lists every folder qoro writes to and how big each is.
+`$(qoop paths qass-config)/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
+make it more careful, never let it act alone where it would have asked you. `qoop paths`
+lists every folder qoop writes to and how big each is.
 
 On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
-skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoro` (or
-`QORO_DEST`), and it says so if that directory is not on your PATH. The releases are
-private, so it and `qoro update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
+skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
+`QOOP_DEST`), and it says so if that directory is not on your PATH. The releases are
+private, so it and `qoop update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
 `gh` login.
 
 A tab you are not using can sleep: it ends, nothing of it takes CPU or memory, and waking
@@ -173,7 +173,7 @@ agent that is working or has not told its conversation yet, or a job left in the
 keeps it awake, and the refusal says which pane and why. Putting a space to sleep sleeps
 each tab that can and says which stayed awake. When nothing is awake and no interface is
 attached, the daemon itself leaves ten seconds later, so a machine with everything asleep
-runs nothing of qoro; the next `qoro` starts it and wakes the tab that slept last.
+runs nothing of qoop; the next `qoop` starts it and wakes the tab that slept last.
 
 A space's row shows `+` and `⋯`; the `⋯` slides out the rest of its controls (sleep or
 wake, keep awake, settings, close) and turns into `›` to put them back. With `[sleep]
@@ -184,18 +184,18 @@ sleeps it.
 
 ```
 ctrl-a Z                sleep the tab you are in, or wake the sleeping one you are on
-qoro sleep --tab 7      the same from a shell, by tab number
-qoro sleep api          every tab of a space, by name or id
-qoro wake --tab 7       wake one tab; `qoro wake api` every tab of a space
-qoro wake               wake the tab that slept last
-qoro ls                 every space, awake, asleep, partly asleep or stopped, and its tabs
-qoro --space api        the interface with that one space in it; `qoro` shows them all
-qoro stop               end everything now: what was awake comes back on the next open
+qoop sleep --tab 7      the same from a shell, by tab number
+qoop sleep api          every tab of a space, by name or id
+qoop wake --tab 7       wake one tab; `qoop wake api` every tab of a space
+qoop wake               wake the tab that slept last
+qoop ls                 every space, awake, asleep, partly asleep or stopped, and its tabs
+qoop --space api        the interface with that one space in it; `qoop` shows them all
+qoop stop               end everything now: what was awake comes back on the next open
 ```
 
-The interface reads `~/.config/qoro/config.toml` (or `$XDG_CONFIG_HOME/qoro/config.toml`)
-when it starts, and again within two seconds of any change to it (`qoro settings`, also on
-`ctrl-a m`, settings; `qoro config set`; an editor). Every key is optional:
+The interface reads `~/.config/qoop/config.toml` (or `$XDG_CONFIG_HOME/qoop/config.toml`)
+when it starts, and again within two seconds of any change to it (`qoop settings`, also on
+`ctrl-a m`, settings; `qoop config set`; an editor). Every key is optional:
 
 ```toml
 prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
@@ -210,28 +210,28 @@ idle_minutes = 0    # 0 = never; else a tab idle and unwatched this long sleeps
 exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 ```
 
-A value it cannot use keeps its default and is named on the hint row. `qoro settings`
+A value it cannot use keeps its default and is named on the hint row. `qoop settings`
 shows every setting with your pet and changes it as you go, and where a notification would
-go; `qoro onboard` walks through the main ones on a first start. `[sleep]` and `[daemon]` are
+go; `qoop onboard` walks through the main ones on a first start. `[sleep]` and `[daemon]` are
 the daemon's own, read by it from the same file; every key is in
 [docs/config.md](docs/config.md).
 
 ### Other machines
 
-A qoro on a server keeps running when you log out, like the one here does. Add it once and
+A qoop on a server keeps running when you log out, like the one here does. Add it once and
 its spaces are listed beside this machine's. From the interface, the `+` beside "spaces"
 offers `connect a machine`: type its ssh address and the screen moves to it. From a
 shell:
 
 ```
-qoro remote add devbox me@devbox      runs ssh in the foreground, checks the qoro there
-qoro                                  devbox:api, devbox:web under this machine's spaces
-qoro --remote devbox                  only that machine
+qoop remote add devbox me@devbox      runs ssh in the foreground, checks the qoop there
+qoop                                  devbox:api, devbox:web under this machine's spaces
+qoop --remote devbox                  only that machine
 ```
 
 It is the system `ssh` with your own `~/.ssh/config`, so jump hosts, keys and agent
 forwarding work as they do for `ssh devbox`. The interface itself never asks for anything:
-a key in your ssh agent just works, and after `qoro remote add` or `qoro --remote`, which
+a key in your ssh agent just works, and after `qoop remote add` or `qoop --remote`, which
 can ask, ssh keeps that connection shared for ten minutes. A host that would need a password
 or a touch outside that shows as offline with ssh's reason. Everything in a remote space runs
 over there: a new tab, a split, a space made with `ctrl-a w` while you are in one. Naming a
@@ -239,46 +239,46 @@ new space `devbox:tests` from anywhere makes it on devbox. If the connection dro
 spaces read as offline within about fifteen seconds and come back on their own, with the same
 tabs, at most ten seconds after the network does, or at once when you reach for one of them.
 Spaces over there sleep the same way, and a machine with everything asleep is let go: its
-qoro leaves as this one would, its spaces read as asleep rather than offline, and waking
+qoop leaves as this one would, its spaces read as asleep rather than offline, and waking
 one connects again.
-A machine with no qoro is offered one: this version, for its platform, put in its
+A machine with no qoop is offered one: this version, for its platform, put in its
 `~/.local/bin` over the same ssh and run once there before it is kept. A release downloaded
 for another platform is checked against its checksum first. Connecting never replaces a
-qoro already there. `qoro agents`, `send` and `read` still
+qoop already there. `qoop agents`, `send` and `read` still
 speak only to this machine's daemon.
 
-A machine whose qoro is older than this one follows it on its own. When a release of this
+A machine whose qoop is older than this one follows it on its own. When a release of this
 version exists for that machine's platform, the interface puts that release's binary in place
 of the old one over the same ssh, in the background, and the daemon over there moves onto it
-and its tabs keep running through it where both qoros can hand them over. Otherwise it
+and its tabs keep running through it where both qoops can hand them over. Otherwise it
 moves at the first moment nothing there is working: a running command, a busy agent or a
 background job holds it, and the interface says once what it is waiting on. Tabs keep their
 numbers and agents come back in their own conversations. A build from main between releases
 is never sent anywhere, a private release needs `gh auth login` or `GH_TOKEN` on this Mac,
-and a machine whose qoro is from before this needs one update by hand there (`qoro stop`,
-then the install script or `qoro update`) and follows on its own after that.
+and a machine whose qoop is from before this needs one update by hand there (`qoop stop`,
+then the install script or `qoop update`) and follows on its own after that.
 
 ### Your phone
 
-`qoro pair --hub wss://your-hub` prints a QR code; the qoro app scans it, shows the six
+`qoop pair --hub wss://your-hub` prints a QR code; the qoop app scans it, shows the six
 digits you type back on the Mac, and from then on lists every agent on that Mac with the one
 waiting for you first. You can answer it, type into any terminal, open or close one, start an
-agent in a space, put a space to sleep or wake one of its tabs, and start the Mac's qoro again
+agent in a space, put a space to sleep or wake one of its tabs, and start the Mac's qoop again
 once everything slept, and the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
-end encrypted through a relay, `qoro-hub`, that sees neither the screens nor the keys, and a
+end encrypted through a relay, `qoop-hub`, that sees neither the screens nor the keys, and a
 push carries a fixed sentence and four numbers, nothing from a screen. The phone side (the
-app, the hub, and the part of the release that runs `qoro pair`, `qoro devices` and `qoro
+app, the hub, and the part of the release that runs `qoop pair`, `qoop devices` and `qoop
 bridge`) is not part of this repository.
 
-`qoro --help` lists the whole command surface, which is also written down in
+`qoop --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
 Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc
-2.17 and newer) live on GitHub Releases, all built on one Mac by the release script of the qoro app (it builds
+2.17 and newer) live on GitHub Releases, all built on one Mac by the release script of the qoop app (it builds
 this repository's crates with the phone part): GitHub only hosts the files, nothing is compiled
-there. `qoro update --check` notes
+there. `qoop update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
-how it installs, and `qoro update` installs it and moves every machine onto it, keeping running
+how it installs, and `qoop update` installs it and moves every machine onto it, keeping running
 tabs running where it can. How a release is cut and how an update lands:
 [docs/update.md](docs/update.md).
 
@@ -295,7 +295,7 @@ machine, measured on 2026-09-27 in one release run with other builds sharing the
 | attach to a terminal with 7.1 million rows of history | 145 microseconds |
 | keystroke to echo, quiet | 0.06 ms at the median |
 | keystroke to echo, twenty terminals each streaming 1 MiB/s | 1.4 ms at the ninety fifth percentile, against an 8 ms budget |
-| `qoro --version` | 3.1 ms at the ninety fifth percentile |
+| `qoop --version` | 3.1 ms at the ninety fifth percentile |
 
 That last row was the hard one, and for most of this project it read 38 to 99 milliseconds.
 None of that was the code. The measurement started whatever shell the person running it

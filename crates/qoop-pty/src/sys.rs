@@ -717,7 +717,7 @@ mod argv_tests {
         // A real process with arguments nobody could guess, read back through the same
         // path the daemon uses. A unit test with a fixture would prove the parser and not
         // the syscall, and the syscall is the part that differs by platform.
-        let marker = "qoro-argv-marker";
+        let marker = "qoop-argv-marker";
         let child = std::process::Command::new("/bin/sh")
             .args(["-c", &format!("sleep 5 # {marker}")])
             .spawn()
@@ -1372,7 +1372,7 @@ mod identity_chain {
         // The whole chain as the daemon runs it: the executable the kernel reports, the
         // argv it was given, and the name a person would say. A stand in agent, because a
         // real one cannot be installed by a test.
-        let dir = std::env::temp_dir().join(format!("qoro-ident-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qoop-ident-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let script = dir.join("claude");
         std::fs::write(&script, "#!/bin/sh\nsleep 5\n").expect("write");

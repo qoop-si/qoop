@@ -1,5 +1,5 @@
 #!/bin/sh
-# qoro hook for cursor-agent (Cursor CLI).
+# qoop hook for cursor-agent (Cursor CLI).
 #
 # The CLI supports a subset of the IDE's hook events; `sessionStart`, `stop`
 # and `postToolUse` fire on recent builds, older builds only fire shell hooks
@@ -8,9 +8,9 @@
 # `~/.cursor/hooks.json` (user) or `.cursor/hooks.json` (project):
 #
 #   { "version": 1, "hooks": {
-#       "sessionStart": [{ "command": "qoro-hook.sh starting" }],
-#       "postToolUse": [{ "command": "qoro-hook.sh working" }],
-#       "stop": [{ "command": "qoro-hook.sh idle" }]
+#       "sessionStart": [{ "command": "qoop-hook.sh starting" }],
+#       "postToolUse": [{ "command": "qoop-hook.sh working" }],
+#       "stop": [{ "command": "qoop-hook.sh idle" }]
 #   } }
 #
 # Put this script's directory on PATH or use an absolute command path.
@@ -25,12 +25,12 @@
 
 set -eu
 
-[ -n "${QORO_TERMINAL:-}" ] || exit 0
-[ -n "${QORO_TOKEN:-}" ] || exit 0
-# The installer puts qoro in ~/.local/bin, which a stock Mac does not have on PATH until
+[ -n "${QOOP_TERMINAL:-}" ] || exit 0
+[ -n "${QOOP_TOKEN:-}" ] || exit 0
+# The installer puts qoop in ~/.local/bin, which a stock Mac does not have on PATH until
 # the person adds it: looked for there too, rather than every hook going quiet.
-command -v qoro >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
-command -v qoro >/dev/null 2>&1 || exit 0
+command -v qoop >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
+command -v qoop >/dev/null 2>&1 || exit 0
 
 state="${1:-}"
 case "$state" in
@@ -58,5 +58,5 @@ if session and len(session) <= 128 and all(
 fi
 
 # shellcheck disable=SC2086
-qoro hook-report --state "$state" $flags $session >/dev/null 2>&1 || true
+qoop hook-report --state "$state" $flags $session >/dev/null 2>&1 || true
 exit 0

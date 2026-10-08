@@ -72,9 +72,9 @@ with this.
 - A remote daemon keeps its agents through client updates for as long as the codec holds,
   which is the case where a restart costs the most.
 - The upgrade path is whatever installed the binary, and the daemon has no opinion about it.
-- For the prebuilt macOS arm64 binary that path is `qoro update`: explicit, refused
+- For the prebuilt macOS arm64 binary that path is `qoop update`: explicit, refused
   while a session runs, checksum verified, and installed over the file while every
-  running process keeps serving from its old image. `qoro update --check` only leaves
+  running process keeps serving from its old image. `qoop update --check` only leaves
   a notice the sidebar reads, so the interface advertises an update without ever
   touching the network.
 
@@ -100,10 +100,10 @@ take tabs over, for a tab that cannot be carried, and for a daemon that predates
 second shape named under Rollback (a second daemon accepting masters over the socket) is not
 the one built.
 
-"The daemon does not restart itself" is superseded by `RestartWhenSafe` (0.5.2): `qoro
+"The daemon does not restart itself" is superseded by `RestartWhenSafe` (0.5.2): `qoop
 update` no longer refuses while a session runs and no longer stops the daemon. It installs
 the file, then asks each daemon, this machine's and every saved remote's, to move onto it. A
 daemon that can hand its tabs to the new binary does it at once and they keep running; any
 other waits for the first moment nothing there is working. The refusals quoted above are
-history. The daemon still downloads nothing: `qoro update` does, and the daemon only checks that the
+history. The daemon still downloads nothing: `qoop update` does, and the daemon only checks that the
 file on disk is the version it was asked to move onto.

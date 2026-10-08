@@ -14,7 +14,7 @@ events, so there is nothing for it to slice. `qoop-support` and its tests are he
 `Bundle::build`, so it is a proof about the format and about nothing else.
 
 To be exact about what this change cost, it cost nothing. `qoop-support` had no callers
-before it and has none now, and no `qoro support` command exists. A bundle could not be
+before it and has none now, and no `qoop support` command exists. A bundle could not be
 produced from a running daemon before this change either. What the log's removal forecloses
 is the first one ever being written.
 

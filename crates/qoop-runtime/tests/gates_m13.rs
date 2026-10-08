@@ -42,7 +42,7 @@ where
     let daemon = Daemon::bind(dir, Path::new("/bin/sh"))
         .await
         .expect("the daemon binds");
-    // What `qoro` does against a daemon that restored nothing: open a shell. These gates
+    // What `qoop` does against a daemon that restored nothing: open a shell. These gates
     // were written against the daemon doing it itself.
     if daemon.terminals().streams().is_empty() {
         daemon
@@ -255,7 +255,7 @@ async fn g13_5_an_agent_is_continued_and_a_saved_command_is_never_re_run() {
     .await;
 
     // The override table is process wide, so it is put back before another test reads it.
-    qoop_detect::reload_overrides(std::path::Path::new("/nonexistent-qoro-overrides"));
+    qoop_detect::reload_overrides(std::path::Path::new("/nonexistent-qoop-overrides"));
 }
 
 /// G13.3: a stop ends the daemon and its terminals, and does not close the tabs.
@@ -483,7 +483,7 @@ async fn a_restart_leaves_a_blank_stored_session_blank_in_memory() {
 ///
 /// Not run against a daemon that would exit the test process: what is asserted is that the
 /// request exists, is answered, and names its count. The exit itself is the last line of
-/// the handler and is what the `qoro stop` command waits on.
+/// the handler and is what the `qoop stop` command waits on.
 #[test]
 fn a_shutdown_request_is_part_of_the_protocol_and_carries_an_id() {
     let request = ControlRequest::Shutdown {
@@ -938,7 +938,7 @@ async fn two_tabs_in_one_directory_resume_distinct_conversations() {
     })
     .await;
 
-    qoop_detect::reload_overrides(std::path::Path::new("/nonexistent-qoro-overrides"));
+    qoop_detect::reload_overrides(std::path::Path::new("/nonexistent-qoop-overrides"));
 }
 
 fn leaf(terminal: u32) -> qoop_runtime::control::Pane {

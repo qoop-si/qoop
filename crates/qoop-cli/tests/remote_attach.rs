@@ -1,6 +1,6 @@
 //! Gates G6.3 and G6.6: attaching across a transport, and what a disconnect leaves behind.
 //!
-//! The transport here is `sh -c 'qoro relay'` rather than `ssh host 'qoro relay'`. That is
+//! The transport here is `sh -c 'qoop relay'` rather than `ssh host 'qoop relay'`. That is
 //! the same relay, the same protocol and the same pipe: what is missing is the network and
 //! the remote's login shell, and both of those are covered in `qoop-remote` against real
 //! login shells. What is covered here is what the network cannot change: whether a
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use qoop_proto::{Channel, Frame};
 
-fn qoro() -> &'static str {
+fn qoop() -> &'static str {
     env!("CARGO_BIN_EXE_qoop")
 }
 
@@ -30,9 +30,9 @@ struct Machine {
 /// existed, so nothing could ever reach them again.
 impl Drop for Machine {
     fn drop(&mut self) {
-        let _ = Command::new(qoro())
+        let _ = Command::new(qoop())
             .arg("stop")
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -51,8 +51,8 @@ impl Machine {
     /// A relay, as ssh would start one on the far side.
     fn relay(&self) -> Child {
         Command::new("/bin/sh")
-            .args(["-c", &format!("exec {} relay", qoro())])
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .args(["-c", &format!("exec {} relay", qoop())])
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -126,7 +126,7 @@ fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String,
 
 /// Stop a relay, and the daemon it started with it.
 ///
-/// `qoro relay` starts a daemon if there is not one, as a child of itself, and does not
+/// `qoop relay` starts a daemon if there is not one, as a child of itself, and does not
 /// wait on it. Killing only the relay therefore leaves a daemon running against a runtime
 /// directory that the test is about to delete: harmless once, and thirteen orphans holding
 /// eighty megabytes after an afternoon of running the suite. The children are listed before

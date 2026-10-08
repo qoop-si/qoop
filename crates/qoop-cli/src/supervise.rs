@@ -324,7 +324,7 @@ fn stashed_touches(stashed: Vec<client::Incoming>, watched: &[u32]) -> bool {
 /// one entry, `default`, kept so a reader of `--all` still finds its rows under a name.
 pub(crate) type Sessions = BTreeMap<String, Vec<AgentRow>>;
 
-/// `qoro agents --watch`: the index now, then again each time it reads differently.
+/// `qoop agents --watch`: the index now, then again each time it reads differently.
 ///
 /// Woken by the daemon's own news on this connection, never by a timer: a watcher over
 /// a quiet session costs nothing. What it prints is the whole index each time, since a
@@ -358,7 +358,7 @@ pub(crate) fn run_watch(
             Ok(true)
         };
         loop {
-            let ended = match Link::open_observer("qoro-watch").await {
+            let ended = match Link::open_observer("qoop-watch").await {
                 Ok(mut link) => match follow(&mut link, &line, &mut say).await {
                     Ok(()) => return Ok(()),
                     Err(e) => e,
@@ -483,7 +483,7 @@ async fn wait_for_daemon() -> std::io::Result<bool> {
 /// renders far faster than anyone reads; a viewer gets the newest screen at this pace.
 const WATCH_GAP: Duration = Duration::from_millis(150);
 
-/// `qoro read <terminal> --watch`: the screen now, then again each time it changes.
+/// `qoop read <terminal> --watch`: the screen now, then again each time it changes.
 ///
 /// A viewer of the same grid the interface draws, on one connection subscribed to that
 /// terminal alone. It never sends a size: the grid belongs to its owner (ADR-007), so
@@ -496,7 +496,7 @@ pub(crate) fn run_read_watch(
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let mut link = Link::open_observer("qoro-read").await?;
+        let mut link = Link::open_observer("qoop-read").await?;
         let (agents, _) = link.agents().await?;
         // The daemon subscribes a new connection to its lowest terminal; any other one
         // goes back before its renders cost anything.
@@ -628,7 +628,7 @@ fn note(
     }
 }
 
-/// `qoro read <terminal> --back UP --lines N`: history rows, the first of them `up` rows
+/// `qoop read <terminal> --back UP --lines N`: history rows, the first of them `up` rows
 /// before the newest one written, with where they start and how many there are.
 pub(crate) fn read_back(
     terminal: u32,
@@ -637,7 +637,7 @@ pub(crate) fn read_back(
 ) -> std::io::Result<(u64, u64, Vec<String>)> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let mut link = Link::open("qoro-read").await?;
+        let mut link = Link::open("qoop-read").await?;
         match link
             .ask(&ControlRequest::Scrollback {
                 id: super::request_id("back"),
@@ -657,12 +657,12 @@ pub(crate) fn read_back(
     })
 }
 
-/// `qoro focus <terminal>`: every attached interface shows that terminal, and the pids of
+/// `qoop focus <terminal>`: every attached interface shows that terminal, and the pids of
 /// the ones that were asked are handed back for whoever wants to raise their windows.
 pub(crate) fn run_focus(terminal: u32) -> std::io::Result<Vec<u32>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let mut link = Link::open("qoro-focus").await?;
+        let mut link = Link::open("qoop-focus").await?;
         match link
             .ask(&ControlRequest::Focus {
                 id: super::request_id("focus"),
@@ -701,7 +701,7 @@ pub(crate) fn generation_refusal(rows: &[AgentRow], terminal: u32, want: u64) ->
 /// Take a trailing `--generation N` off a command's arguments.
 ///
 /// Only as the last two words: a prompt's text is arguments too, and
-/// `qoro prompt 3 explain --generation 5 to me` is a sentence about the flag,
+/// `qoop prompt 3 explain --generation 5 to me` is a sentence about the flag,
 /// not the flag. Anything that is not a number after it is left as text.
 pub(crate) fn take_generation(args: &mut Vec<String>) -> Option<u64> {
     let [.., flag, value] = args.as_slice() else {
@@ -726,7 +726,7 @@ pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Res
     };
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let (rows, _) = Link::open("qoro-generation").await?.agents().await?;
+        let (rows, _) = Link::open("qoop-generation").await?.agents().await?;
         match generation_refusal(&rows, terminal, want) {
             Some(reason) => Err(std::io::Error::other(reason)),
             None => Ok(()),
@@ -741,16 +741,16 @@ pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Res
 /// started in, read before `--session` replaced it.
 /// The terminal this command runs in, when it runs in one of this machine's.
 fn own_terminal() -> Option<u32> {
-    std::env::var("QORO_TERMINAL").ok()?.parse().ok()
+    std::env::var("QOOP_TERMINAL").ok()?.parse().ok()
 }
 
-/// `qoro wait`: block until a terminal reaches a state.
+/// `qoop wait`: block until a terminal reaches a state.
 ///
 /// Level triggered: a
 /// target already there returns at once. Exits 124 on timeout, 1 when a
 /// target closes or nothing can be waited on.
 pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro wait [target...] [--until STATE[,STATE...]] [--match TEXT] [--timeout SECS] [--json]";
+    let help = "usage: qoop wait [target...] [--until STATE[,STATE...]] [--match TEXT] [--timeout SECS] [--json]";
     let mut targets = Vec::new();
     let mut text: Option<String> = None;
     let mut until: Vec<String> = Vec::new();
@@ -804,7 +804,7 @@ pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let matched = rt.block_on(async {
-        let mut link = Link::open("qoro-wait").await?;
+        let mut link = Link::open("qoop-wait").await?;
         let (rows, _) = link.agents().await?;
         let watched: Vec<u32> = if targets.is_empty() {
             rows.iter()
@@ -884,7 +884,7 @@ pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
             (None, _) => until.join(","),
         };
         eprintln!(
-            "qoro: timed out after {}s waiting for {what}",
+            "qoop: timed out after {}s waiting for {what}",
             timeout.map(|t| t.as_secs()).unwrap_or(0),
         );
         std::process::exit(TIMED_OUT);
@@ -988,7 +988,7 @@ pub(crate) async fn wait_for_turn(
 ) -> std::io::Result<TurnWait> {
     let terminal = before.terminal;
     let deadline = timeout.map(|t| Instant::now() + t);
-    let mut link = Link::open("qoro-prompt").await?;
+    let mut link = Link::open("qoop-prompt").await?;
     let (rows, _) = link.agents().await?;
     link.ask(&ControlRequest::Unsubscribe {
         id: super::request_id("unsubscribe"),
@@ -1027,7 +1027,7 @@ pub(crate) async fn wait_for_turn(
     }
 }
 
-/// Print how a `prompt --wait` ended and exit with the status `qoro wait` uses.
+/// Print how a `prompt --wait` ended and exit with the status `qoop wait` uses.
 pub(crate) fn finish_turn(waited: TurnWait) -> std::io::Result<()> {
     match waited {
         TurnWait::Done(row) => {
@@ -1036,15 +1036,15 @@ pub(crate) fn finish_turn(waited: TurnWait) -> std::io::Result<()> {
         }
         TurnWait::TimedOut(row) => {
             match row {
-                Some(row) => eprintln!("qoro: timed out; last seen {}", super::agent_line(&row)),
-                None => eprintln!("qoro: timed out"),
+                Some(row) => eprintln!("qoop: timed out; last seen {}", super::agent_line(&row)),
+                None => eprintln!("qoop: timed out"),
             }
             std::process::exit(TIMED_OUT);
         }
     }
 }
 
-/// Parsed `qoro new` arguments, shared with `qoro worktree new`.
+/// Parsed `qoop new` arguments, shared with `qoop worktree new`.
 #[derive(Default)]
 pub(crate) struct NewOpts {
     pub(crate) name: Option<String>,
@@ -1058,7 +1058,7 @@ pub(crate) struct NewOpts {
 }
 
 const NEW_USAGE: &str =
-    "usage: qoro new [--name NAME] [--cwd DIR] [--space ID|NAME] [-- command...]";
+    "usage: qoop new [--name NAME] [--cwd DIR] [--space ID|NAME] [-- command...]";
 
 pub(crate) fn parse_new_args(args: &[String]) -> Result<NewOpts, String> {
     let mut opts = NewOpts::default();
@@ -1110,7 +1110,7 @@ fn resolve_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Result<i64> 
     }
 }
 
-/// What `qoro sleep` and `qoro wake` are asked about: a space by id or name, or one tab
+/// What `qoop sleep` and `qoop wake` are asked about: a space by id or name, or one tab
 /// by number (`--tab N`), plus `--json`.
 struct Target {
     space: Option<String>,
@@ -1153,16 +1153,16 @@ fn space_of_tab(spaces: &[WorkspaceRow], tab: u32) -> Option<i64> {
 /// changed, because it acted on the whole space whatever was asked.
 fn older_daemon(done: &str) -> std::io::Error {
     std::io::Error::other(format!(
-        "the running daemon is older: the whole space {done}; restart it (`qoro stop`) to \
+        "the running daemon is older: the whole space {done}; restart it (`qoop stop`) to \
          act on one tab"
     ))
 }
 
-/// `qoro sleep <space>`, or `qoro sleep --tab N`: end every tab of a space, or that one tab
+/// `qoop sleep <space>`, or `qoop sleep --tab N`: end every tab of a space, or that one tab
 /// (every pane of its split), and keep them, so they cost nothing until they wake. A tab
 /// that could not come back as it is stays awake, and the answer says which and why.
 pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro sleep <space> | --tab <terminal> [--json]";
+    let help = "usage: qoop sleep <space> | --tab <terminal> [--json]";
     let target = parse_target(args, help)?;
     if target.space.is_some() == target.tab.is_some() {
         return Err(super::usage(help));
@@ -1171,7 +1171,7 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async {
         // No daemon is nothing awake: there is nothing to put to sleep, and starting one to
         // find that out would wake every space that was left awake.
-        let mut link = match Link::open("qoro-sleep").await {
+        let mut link = match Link::open("qoop-sleep").await {
             Ok(link) => link,
             Err(e) if daemon_gone(&e) => {
                 println!("nothing is awake");
@@ -1238,11 +1238,11 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro wake [space]`, or `qoro wake --tab N`: bring a sleeping tab back, every sleeping
+/// `qoop wake [space]`, or `qoop wake --tab N`: bring a sleeping tab back, every sleeping
 /// tab of a space, or with nothing named the tab that went to sleep last. Starts the
 /// daemon when none is running, since waking is asking for one.
 pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro wake [space] | --tab <terminal> [--json]";
+    let help = "usage: qoop wake [space] | --tab <terminal> [--json]";
     let target = parse_target(args, help)?;
     if target.space.is_some() && target.tab.is_some() {
         return Err(super::usage(help));
@@ -1251,7 +1251,7 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
     super::ensure_daemon(&paths::socket_path(&dir))?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut link = Link::open("qoro-wake").await?;
+        let mut link = Link::open("qoop-wake").await?;
         let spaces = link.spaces().await?;
         let workspace = match (&target.space, target.tab) {
             (Some(wanted), _) => Some(resolve_space(&spaces, wanted)?),
@@ -1287,7 +1287,7 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
                 Ok(())
             }
             // Nothing named and nothing asleep, but tabs up: a daemon this wake started
-            // brought back what a `qoro stop` ended, which is what was asked for.
+            // brought back what a `qoop stop` ended, which is what was asked for.
             ControlResponse::Failed { reason, .. } if workspace.is_none() => {
                 match link
                     .ask(&ControlRequest::ListTerminals {
@@ -1313,9 +1313,9 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro new`: open a terminal, optionally typing a command into its shell.
+/// `qoop new`: open a terminal, optionally typing a command into its shell.
 ///
-/// Prints only the terminal number, so `t=$(qoro new ...)` works. The
+/// Prints only the terminal number, so `t=$(qoop new ...)` works. The
 /// command is typed rather than spawned, the same path a person takes: the
 /// daemon starts the user's shell and nothing else (ADR-015), and the shell
 /// gives the command its environment.
@@ -1339,11 +1339,11 @@ pub(crate) fn ensure_awake() -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // A daemon that was leaving as this connected closes it: started again, once.
-        let mut link = match Link::open("qoro-start").await {
+        let mut link = match Link::open("qoop-start").await {
             Ok(link) => link,
             Err(e) if daemon_gone(&e) => {
                 super::ensure_daemon(&socket)?;
-                Link::open("qoro-start").await?
+                Link::open("qoop-start").await?
             }
             Err(e) => return Err(e),
         };
@@ -1410,19 +1410,19 @@ pub(crate) fn ensure_awake() -> std::io::Result<()> {
     })
 }
 
-/// `qoro --space`: the space named, made when the name is new, awake and with a tab in it,
+/// `qoop --space`: the space named, made when the name is new, awake and with a tab in it,
 /// so an interface that shows it alone has something to show. Its id.
 pub(crate) fn open_space(wanted: &str) -> std::io::Result<i64> {
     let here = std::env::current_dir().ok();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // A daemon that was leaving as this connected closes it: started again, once.
-        let mut link = match Link::open("qoro-space").await {
+        let mut link = match Link::open("qoop-space").await {
             Ok(link) => link,
             Err(e) if daemon_gone(&e) => {
                 let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
                 super::ensure_daemon(&paths::socket_path(&dir))?;
-                Link::open("qoro-space").await?
+                Link::open("qoop-space").await?
             }
             Err(e) => return Err(e),
         };
@@ -1484,7 +1484,7 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut link = Link::open("qoro-new").await?;
+        let mut link = Link::open("qoop-new").await?;
         let workspace = match &opts.space {
             Some(space) => Some(link.space(space).await?),
             None => None,
@@ -1513,7 +1513,7 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
         // second, which is the quiet part.
         let deadline = Instant::now() + SHELL_PATIENCE;
         loop {
-            let screen = super::fetch_snapshot(terminal, "qoro-new").await?;
+            let screen = super::fetch_snapshot(terminal, "qoop-new").await?;
             if screen.lines.iter().any(|l| !l.trim().is_empty()) {
                 break;
             }
@@ -1552,13 +1552,13 @@ pub(crate) fn pick_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Resu
     }
 }
 
-/// `qoro close`: end a terminal and what it started, as `ctrl-a x` does.
+/// `qoop close`: end a terminal and what it started, as `ctrl-a x` does.
 ///
 /// A number and never a name: a destructive verb does not guess. The
 /// terminal this runs in is refused, because a supervisor that closes
 /// itself has lost the loop it was running.
 pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro close <terminal> [--generation G]";
+    let help = "usage: qoop close <terminal> [--generation G]";
     let mut args = args.to_vec();
     let generation = take_generation(&mut args);
     let terminal: u32 = match args.get(2..) {
@@ -1572,7 +1572,7 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
     }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut link = Link::open("qoro-close").await?;
+        let mut link = Link::open("qoop-close").await?;
         if let Some(want) = generation {
             let (rows, _) = link.agents().await?;
             if let Some(reason) = generation_refusal(&rows, terminal, want) {
@@ -1613,14 +1613,14 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro space rm <id|name>`: drop an empty space, as `ctrl-a W` does.
+/// `qoop space rm <id|name>`: drop an empty space, as `ctrl-a W` does.
 ///
 /// Only an empty one: a space with a tab in it, awake or asleep, is refused with how many,
 /// and the daemon checks the same again, because it is the one that knows. A name two
 /// spaces share is refused rather than guessed. Never starts a daemon: with none running
 /// there is no space to remove.
 pub(crate) fn run_space_rm(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoro space rm <id|name>";
+    let help = "usage: qoop space rm <id|name>";
     let (Some("rm"), [wanted]) = (
         args.get(2).map(String::as_str),
         args.get(3..).unwrap_or_default(),
@@ -1629,9 +1629,9 @@ pub(crate) fn run_space_rm(args: &[String]) -> std::io::Result<()> {
     };
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut link = Link::open("qoro-space-rm").await.map_err(|e| {
+        let mut link = Link::open("qoop-space-rm").await.map_err(|e| {
             if daemon_gone(&e) {
-                std::io::Error::other("nothing is awake: `qoro` or `qoro wake` starts it")
+                std::io::Error::other("nothing is awake: `qoop` or `qoop wake` starts it")
             } else {
                 e
             }
@@ -1672,7 +1672,7 @@ pub(crate) fn run_space_rm(args: &[String]) -> std::io::Result<()> {
     })
 }
 
-/// `qoro send <terminal> --key NAME...`: press named keys, one frame each.
+/// `qoop send <terminal> --key NAME...`: press named keys, one frame each.
 pub(crate) fn send_keys(terminal: u32, keys: &[String]) -> std::io::Result<()> {
     for key in keys {
         if key_bytes(key, false).is_none() {
@@ -1686,14 +1686,14 @@ pub(crate) fn send_keys(terminal: u32, keys: &[String]) -> std::io::Result<()> {
         // The spelling of an arrow depends on what the program asked for, so
         // look only when an arrow is being sent: it costs a screen read.
         let app_cursor = if keys.iter().any(|k| key_needs_mode(k)) {
-            super::fetch_snapshot(terminal, "qoro-send")
+            super::fetch_snapshot(terminal, "qoop-send")
                 .await?
                 .modes
                 .application_cursor
         } else {
             false
         };
-        let mut link = Link::open("qoro-send").await?;
+        let mut link = Link::open("qoop-send").await?;
         match link
             .ask(&ControlRequest::ListTerminals {
                 id: super::request_id("send"),
@@ -1906,15 +1906,15 @@ mod tests {
     #[test]
     fn only_a_trailing_generation_is_the_flag() {
         let words = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
-        let mut args = words("qoro prompt 3 hello --generation 7");
+        let mut args = words("qoop prompt 3 hello --generation 7");
         assert_eq!(take_generation(&mut args), Some(7));
-        assert_eq!(args, words("qoro prompt 3 hello"));
+        assert_eq!(args, words("qoop prompt 3 hello"));
         for text in [
-            "qoro prompt 3 explain --generation 5 to me",
-            "qoro prompt 3 set --generation high",
-            "qoro prompt 3 --generation",
+            "qoop prompt 3 explain --generation 5 to me",
+            "qoop prompt 3 set --generation high",
+            "qoop prompt 3 --generation",
             // After `--` it is text, whatever it spells.
-            "qoro send 3 -- deploy --generation 5",
+            "qoop send 3 -- deploy --generation 5",
         ] {
             let mut args = words(text);
             assert_eq!(take_generation(&mut args), None, "{text}");
@@ -2128,13 +2128,13 @@ mod tests {
     fn new_takes_a_space_by_name_and_everything_after_the_separator() {
         let argv = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let opts = parse_new_args(&argv(&[
-            "qoro", "new", "--space", "work", "--name", "fix", "--", "claude", "--resume",
+            "qoop", "new", "--space", "work", "--name", "fix", "--", "claude", "--resume",
         ]))
         .unwrap();
         assert_eq!(opts.space.as_deref(), Some("work"));
         assert_eq!(opts.name.as_deref(), Some("fix"));
         assert_eq!(opts.command, vec!["claude", "--resume"]);
-        let missing = parse_new_args(&argv(&["qoro", "new", "--cwd"]));
+        let missing = parse_new_args(&argv(&["qoop", "new", "--cwd"]));
         assert!(missing.is_err_and(|e| e.starts_with("missing value for --cwd")));
     }
 }

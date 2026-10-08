@@ -1,4 +1,4 @@
-//! `qoro task` against a live daemon, through the real socket.
+//! `qoop task` against a live daemon, through the real socket.
 //!
 //! The positive path runs inside a terminal of the test daemon, typed into its shell, so the
 //! token is the real one the daemon gave that terminal and never leaves it. Everything else
@@ -17,11 +17,11 @@ struct Daemon {
 fn start_in(dir: &Path) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", dir)
+        .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("SHELL", "/bin/sh")
-        .env_remove("QORO_TERMINAL")
-        .env_remove("QORO_TOKEN")
+        .env_remove("QOOP_TERMINAL")
+        .env_remove("QOOP_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -56,7 +56,7 @@ impl Daemon {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    /// `qoro` from outside every terminal of this daemon.
+    /// `qoop` from outside every terminal of this daemon.
     fn run(&self, args: &[&str]) -> (bool, String, String) {
         self.run_env(args, &[])
     }
@@ -64,14 +64,14 @@ impl Daemon {
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         cmd.args(args)
-            .env("QORO_RUNTIME_DIR", &self.dir)
+            .env("QOOP_RUNTIME_DIR", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
-            .env_remove("QORO_TERMINAL")
-            .env_remove("QORO_TOKEN");
+            .env_remove("QOOP_TERMINAL")
+            .env_remove("QOOP_TOKEN");
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().expect("run qoro");
+        let out = cmd.output().expect("run qoop");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -110,7 +110,7 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -223,12 +223,12 @@ fn refusals_name_what_is_wrong() {
     let daemon = Daemon::start(&dir);
     let (ok, _, err) = daemon.run(&["task", "new", "x"]);
     assert!(
-        !ok && err.contains("QORO_TERMINAL and QORO_TOKEN are not set"),
+        !ok && err.contains("QOOP_TERMINAL and QOOP_TOKEN are not set"),
         "{err}"
     );
     let (ok, _, err) = daemon.run_env(
         &["task", "new", "x"],
-        &[("QORO_TERMINAL", "1"), ("QORO_TOKEN", "forged")],
+        &[("QOOP_TERMINAL", "1"), ("QOOP_TOKEN", "forged")],
     );
     assert!(
         !ok && err.contains("refused"),
@@ -258,7 +258,7 @@ $Q task new "ship it" > /dev/null 2>&1
 $Q task rules > after.out 2>&1
 $Q task rules --turn > turn-open.out 2>&1"#,
     );
-    assert!(read(&work, "before.out").starts_with("You are running inside qoro"));
+    assert!(read(&work, "before.out").starts_with("You are running inside qoop"));
     assert!(!read(&work, "before.out").contains("Your open task"));
     assert!(
         read(&work, "after.out")
@@ -270,10 +270,10 @@ $Q task rules --turn > turn-open.out 2>&1"#,
         !read(&work, "after.out").contains("--replace"),
         "no invitation to replace"
     );
-    assert!(read(&work, "turn-none.out").starts_with("qoro: if this request is real work"));
+    assert!(read(&work, "turn-none.out").starts_with("qoop: if this request is real work"));
     assert!(
         read(&work, "turn-open.out")
-            .starts_with("qoro: this terminal's task #1 is open (stage investigating)."),
+            .starts_with("qoop: this terminal's task #1 is open (stage investigating)."),
         "{}",
         read(&work, "turn-open.out")
     );
@@ -306,13 +306,13 @@ fn rules_print_the_static_block_with_no_daemon() {
     let started = Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(["task", "rules"])
-        .env("QORO_RUNTIME_DIR", dir.path())
-        .env("QORO_TERMINAL", "1")
-        .env("QORO_TOKEN", "t")
+        .env("QOOP_RUNTIME_DIR", dir.path())
+        .env("QOOP_TERMINAL", "1")
+        .env("QOOP_TOKEN", "t")
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("You are running inside qoro"));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("You are running inside qoop"));
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -329,7 +329,7 @@ fn rules_print_the_static_block_when_the_daemon_hangs() {
     let socket = qoop_testkit::socket_in(dir.path());
     let session = socket.parent().expect("the session directory");
     std::fs::create_dir_all(session).unwrap();
-    // Private, as qoro requires of its own directory: otherwise it refuses before connecting
+    // Private, as qoop requires of its own directory: otherwise it refuses before connecting
     // and this would test nothing.
     for private in [session, session.parent().expect("the sessions directory")] {
         std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -351,14 +351,14 @@ fn rules_print_the_static_block_when_the_daemon_hangs() {
     let started = Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .args(["task", "rules"])
-        .env("QORO_RUNTIME_DIR", dir.path())
-        .env("QORO_TERMINAL", "1")
-        .env("QORO_TOKEN", "t")
+        .env("QOOP_RUNTIME_DIR", dir.path())
+        .env("QOOP_TERMINAL", "1")
+        .env("QOOP_TOKEN", "t")
         .output()
         .unwrap();
     let took = started.elapsed();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("You are running inside qoro"));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("You are running inside qoop"));
     // `rules` waits 800 ms for the daemon: about 0.83 s end to end on an idle machine. The
     // bound is looser because this binary is a debug build started beside the rest of the
     // suite's daemons; what it guards is that a hung daemon is not waited on for its full
@@ -369,7 +369,7 @@ fn rules_print_the_static_block_when_the_daemon_hangs() {
     );
     assert!(
         held.join().unwrap(),
-        "qoro never connected, so nothing was tested"
+        "qoop never connected, so nothing was tested"
     );
 }
 
@@ -493,7 +493,7 @@ $Q task ls > ls.out 2>&1"#,
     assert_eq!(ls.lines().count(), 1, "one task for two begins: {ls}");
     let (_, show, _) = daemon.run(&["task", "show", "1"]);
     assert!(
-        show.contains("opened by qoro when the agent changed files"),
+        show.contains("opened by qoop when the agent changed files"),
         "{show}"
     );
 

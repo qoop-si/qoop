@@ -1,6 +1,6 @@
 # qass: the default workflow, `/qass init`, and verifying where it runs
 
-Read this file when a worker's repo has no `.qoro/workflow.md` (use the default below as its
+Read this file when a worker's repo has no `.qoop/workflow.md` (use the default below as its
 workflow), when the owner types `/qass init <repo path or agent name>`, and when a finished
 task's workflow has a "Verify where it runs" section for you to run.
 
@@ -33,14 +33,14 @@ an agent on a remote: ask the owner for a local path. Then:
    `scripts/`, CI (`.github/workflows/`, `.gitlab-ci.yml`), deploy files (`Dockerfile`,
    `docker-compose*`, `vercel.json`, `fly.toml`, `wrangler.toml`, `.env.example`), and
    `git log --merges --oneline -30` for how changes land. Never ask what these answer.
-2. Read what he asked for in this repo, all sessions and worktrees: `qoro history --dir <repo>
-   --last 100` as it is, and `qoro history --dir <repo> --last 2000` through `grep -iE` for
+2. Read what he asked for in this repo, all sessions and worktrees: `qoop history --dir <repo>
+   --last 100` as it is, and `qoop history --dir <repo> --last 2000` through `grep -iE` for
    testing and shipping words (test, staging, prod, deploy, local, browser, simulator, e2e,
    log, merge, and the same in the language he writes in), keeping the 200 most telling: where
    it runs, how he checks it, what proof he wants, what he forbids. They may only narrow the
    draft or add a prohibition, never add a verb `policy` does not grant. A key, token, password
    or URL with credentials never goes into a draft (it reaches his phone).
-3. If `.qoro/workflow.md` exists, never overwrite it: compare it with what you read and ask
+3. If `.qoop/workflow.md` exists, never overwrite it: compare it with what you read and ask
    only about what drifted (a check renamed, a step no longer true).
 4. Otherwise draft one: at most 12 steps, 4,000 characters, the real commands of this repo, its
    loop limit (one number of review rounds), what "done" proves with the commands that prove it,
@@ -48,13 +48,13 @@ an agent on a remote: ask the owner for a local path. Then:
    default above and change only what the repo and his words show is different.
 5. Draft an `AGENTS.md` patch only for stable project facts an agent needs and cannot cheaply
    find (commands, branch, how it deploys, what agents may do without asking); the whole file
-   stays under 6,000 characters (already over: no patch, say so). Never write about qoro or qass
-   in it: people without qoro read it.
+   stays under 6,000 characters (already over: no patch, say so). Never write about qoop or qass
+   in it: people without qoop read it.
 6. Save both drafts in `@QASS_DATA@/init-<repo name>.md` (the checkout folder's name, only
    letters, digits, `.`, `-` and `_`) and ask the owner, the way any question reaches him (A:
    write both, B: write the workflow only, C: change something first), with the drafts' full
    text after the question's first lines.
-7. On his yes, write `.qoro/workflow.md` (and the patch) into the repo's working tree and leave
+7. On his yes, write `.qoop/workflow.md` (and the patch) into the repo's working tree and leave
    them uncommitted; tell him which files changed, and that worktrees from `origin/main` get the
    workflow once he commits it (until then you read it from the main checkout). The saved draft
    is now his approved copy; a drift he approves in step 3 rewrites it. Running init again on
@@ -78,7 +78,7 @@ A check against staging is a GET or HEAD only; anything else needs his word.
 
 ## Verifying where it runs
 
-After a finished task's closing checks pass, before `qoro task close --verified`. Always, even
+After a finished task's closing checks pass, before `qoop task close --verified`. Always, even
 when the worker ran it: he wants you to see it work yourself. A section of `none`, or no
 section: nothing to run.
 
@@ -98,11 +98,11 @@ section: nothing to run.
    -iTCP:<port> -sTCP:LISTEN` prints nothing).
 4. Start it in the repo's space, with nothing from your environment but `PATH` (no `.env`,
    key or token passes through it; a check that needs one: ask him):
-   `qoro new --cwd <s> --space <space> -- env -i PATH="$PATH" HOME=<s>/home <PORT>=<port> sh .qass-start.sh`. Put the terminal's number on the worker's `goals.md` line. `qoro read <n>`
-   that it was typed (`qoro new` types nothing after 10 s): not typed is a card, never a fail.
+   `qoop new --cwd <s> --space <space> -- env -i PATH="$PATH" HOME=<s>/home <PORT>=<port> sh .qass-start.sh`. Put the terminal's number on the worker's `goals.md` line. `qoop read <n>`
+   that it was typed (`qoop new` types nothing after 10 s): not typed is a card, never a fail.
    Wait as long as the section says (else 5 minutes) for it to answer: no answer by then, or a
    missing toolchain, is a card, never a fail. Run the check, keep its output and the terminal's last lines with keys,
-   tokens and personal data cut out, then `qoro close <n>` and `rm -rf <s>`.
+   tokens and personal data cut out, then `qoop close <n>` and `rm -rf <s>`.
 5. Pass: the close note names what ran and what came back. Fail: a card, `now` (main is
    broken), with the failing output trimmed the same way; his answer may be a new worker. A
    remote worker: a card, as for its other checks.

@@ -19,7 +19,7 @@ use qoop_runtime::daemon::ClientWire;
 use qoop_tui::mux::{is_remote_terminal, is_remote_workspace};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn qoro() -> &'static str {
+fn qoop() -> &'static str {
     env!("CARGO_BIN_EXE_qoop")
 }
 
@@ -30,36 +30,36 @@ fn private_dir() -> tempfile::TempDir {
 }
 
 fn stop_session(runtime: &Path, session: &str) {
-    let _ = Command::new(qoro())
+    let _ = Command::new(qoop())
         .args(["--session", session, "stop"])
-        .env("QORO_RUNTIME_DIR", runtime)
+        .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
-        .env_remove("QORO_SESSION")
+        .env_remove("QOOP_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 }
 
 fn stop(runtime: &Path) {
-    let _ = Command::new(qoro())
+    let _ = Command::new(qoop())
         .arg("stop")
-        .env("QORO_RUNTIME_DIR", runtime)
+        .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
-        .env_remove("QORO_SESSION")
+        .env_remove("QOOP_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 }
 
 /// A fake `ssh` on a PATH of its own: runs the last argument through `sh` with the remote's
-/// runtime directory, and puts the qoro under test where the remote command looks for it.
+/// runtime directory, and puts the qoop under test where the remote command looks for it.
 ///
-/// `old.example` is a machine whose qoro is older than this one, in a home of its own like
-/// `bare.example`; every swap of a qoro run on any host is written to `swaps` by host.
+/// `old.example` is a machine whose qoop is older than this one, in a home of its own like
+/// `bare.example`; every swap of a qoop run on any host is written to `swaps` by host.
 fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path, old: &Path, swaps: &Path) -> PathBuf {
     std::fs::create_dir_all(bin).expect("bin");
-    std::os::unix::fs::symlink(qoro(), bin.join("qoro")).expect("link qoro");
-    // `bare.example` is a machine with no qoro: a home of its own, a PATH without it, and
+    std::os::unix::fs::symlink(qoop(), bin.join("qoop")).expect("link qoop");
+    // `bare.example` is a machine with no qoop: a home of its own, a PATH without it, and
     // a `uname` that says Linux on x86_64, so what it gets is the release for that.
     let shim = bare.join("shim");
     std::fs::create_dir_all(&shim).expect("shim");
@@ -77,11 +77,11 @@ fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path, old: &Path, swaps: &
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QORO_SESSION\n\
-             case \"$last\" in *'qoro changed meanwhile'*) echo \"$host\" >> {};; esac\n\
-             if [ \"$host\" = bare.example ]; then HOME={} PATH={}:/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
-             if [ \"$host\" = old.example ]; then HOME={} PATH={}:/usr/bin:/bin QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
-             QORO_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QOOP_SESSION\n\
+             case \"$last\" in *'qoop changed meanwhile'*) echo \"$host\" >> {};; esac\n\
+             if [ \"$host\" = bare.example ]; then HOME={} PATH={}:/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
+             if [ \"$host\" = old.example ]; then HOME={} PATH={}:/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
+             QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             swaps.display(),
             bare.display(),
             shim.display(),
@@ -98,20 +98,20 @@ fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path, old: &Path, swaps: &
 }
 
 /// A release of this version in the API's own shape, served from a directory: the Linux
-/// x86_64 tarball holds the qoro under test, with its checksum, so an install onto
+/// x86_64 tarball holds the qoop under test, with its checksum, so an install onto
 /// `bare.example` goes through the real download, check and unpack.
 fn fake_release(dir: &Path) -> String {
     let tags = dir.join("tags");
     std::fs::create_dir_all(&tags).expect("tags");
     let src = dir.join("src");
     std::fs::create_dir_all(&src).expect("src");
-    std::fs::copy(qoro(), src.join("qoro")).expect("copy qoro");
-    let asset = "qoro-x86_64-unknown-linux-gnu.tar.gz";
+    std::fs::copy(qoop(), src.join("qoop")).expect("copy qoop");
+    let asset = "qoop-x86_64-unknown-linux-gnu.tar.gz";
     let tarball = dir.join(asset);
     let packed = Command::new("tar")
         .arg("-czf")
         .arg(&tarball)
-        .arg("qoro")
+        .arg("qoop")
         .current_dir(&src)
         .status()
         .expect("tar");
@@ -145,7 +145,7 @@ struct Tui {
     /// Messages decoded and not looked at yet. Kept across waits: one read can carry the
     /// message a wait is for and the next one after it, and a list dropped there is a wait
     /// that never ends (an "offline" list and the "back" one 50 ms later, read together
-    /// once the test thread came back from a blocking `qoro stop`).
+    /// once the test thread came back from a blocking `qoop stop`).
     unread: std::collections::VecDeque<Incoming>,
     control_seq: u32,
     seqs: std::collections::BTreeMap<u32, u32>,
@@ -282,14 +282,14 @@ fn scenario() {
             format!("{}:/usr/bin:/bin", ssh.parent().expect("bin").display()),
         );
         std::env::set_var("XDG_CACHE_HOME", home.path().join("cache"));
-        std::env::set_var("QORO_REMOTES", home.path().join("remotes.json"));
-        std::env::set_var("QORO_RELEASE_BASE", &releases);
-        std::env::remove_var("QORO_SESSION");
+        std::env::set_var("QOOP_REMOTES", home.path().join("remotes.json"));
+        std::env::set_var("QOOP_RELEASE_BASE", &releases);
+        std::env::remove_var("QOOP_SESSION");
     }
 
-    let mut daemon = Command::new(qoro())
+    let mut daemon = Command::new(qoop())
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", local.path())
+        .env("QOOP_RUNTIME_DIR", local.path())
         .env("XDG_CONFIG_HOME", local.path().join("config"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -299,7 +299,7 @@ fn scenario() {
         .path()
         .join("sessions")
         .join("default")
-        .join("qorod.sock");
+        .join("qoopd.sock");
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         assert!(Instant::now() < deadline, "the local daemon never listened");
@@ -455,11 +455,11 @@ fn scenario() {
 
             // The remote really holds it, and the local daemon does not.
             let screen = |runtime: &Path| {
-                let out = Command::new(qoro())
+                let out = Command::new(qoop())
                     .args(["read", &(terminal & 0x00ff_ffff).to_string()])
-                    .env("QORO_RUNTIME_DIR", runtime)
+                    .env("QOOP_RUNTIME_DIR", runtime)
                     .env("XDG_CONFIG_HOME", runtime.join("config"))
-                    .env_remove("QORO_SESSION")
+                    .env_remove("QOOP_SESSION")
                     .output()
                     .expect("read");
                 String::from_utf8_lossy(&out.stdout).into_owned()
@@ -487,7 +487,7 @@ fn scenario() {
             })
             .await;
 
-            // From the `+`, by its address: asked whether qoro is there, then kept, named
+            // From the `+`, by its address: asked whether qoop is there, then kept, named
             // after its host, and its spaces arrive without the interface restarting.
             tui.ask(ControlRequest::ConnectRemote {
                 id: "connect-1".into(),
@@ -551,7 +551,7 @@ fn scenario() {
                 .expect("remotes saved");
             assert_eq!(kept.len(), 1, "added twice: {kept:?}");
 
-            // Added from a shell (`qoro remote add`) while this interface runs: written to
+            // Added from a shell (`qoop remote add`) while this interface runs: written to
             // the list by someone else, and its spaces arrive without a restart or a `+`.
             let file = home.path().join("remotes.json");
             let mut list = qoop_remote::saved::load_from(&file).expect("remotes saved");
@@ -600,19 +600,19 @@ fn scenario() {
     }
 }
 
-/// A machine with no qoro: named as such, installed from the release of this version,
+/// A machine with no qoop: named as such, installed from the release of this version,
 /// then answering like any other; a second install never replaces it. Its own function,
 /// boxed by the caller, because one async block holding every step of this test is a
 /// future larger than a test thread's stack.
 async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
-    // A machine with no qoro: said so, with its platform, rather than failed or added.
+    // A machine with no qoop: said so, with its platform, rather than failed or added.
     tui.ask(ControlRequest::ConnectRemote {
         id: "probe-bare".into(),
         target: "bare.example".into(),
     })
     .await;
     let platform = tui
-        .until("the missing qoro to be named", |incoming| match incoming {
+        .until("the missing qoop to be named", |incoming| match incoming {
             Incoming::Control(ControlResponse::RemoteMissing {
                 id, platform, root, ..
             }) if id == "probe-bare" => {
@@ -648,10 +648,10 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
         })
         .await;
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
-    let installed = bare.join(".local/bin/qoro");
+    let installed = bare.join(".local/bin/qoop");
     assert_eq!(
         std::fs::read(&installed).expect("installed"),
-        std::fs::read(qoro()).expect("qoro"),
+        std::fs::read(qoop()).expect("qoop"),
         "what arrived is not the binary the release holds"
     );
     let left: Vec<String> = std::fs::read_dir(bare.join(".local/bin"))
@@ -661,11 +661,11 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
         .collect();
     assert_eq!(
         left,
-        vec!["qoro".to_string()],
+        vec!["qoop".to_string()],
         "a staged copy was left behind"
     );
 
-    // Now it answers like any machine with qoro, and is added.
+    // Now it answers like any machine with qoop, and is added.
     tui.ask(ControlRequest::ConnectRemote {
         id: "probe-bare-2".into(),
         target: "bare.example".into(),
@@ -682,7 +682,7 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
     })
     .await;
 
-    // And a second install never replaces the qoro that is there.
+    // And a second install never replaces the qoop that is there.
     tui.ask(ControlRequest::InstallRemote {
         id: "install-2".into(),
         target: "bare.example".into(),
@@ -696,7 +696,7 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
                 Some(())
             }
             Incoming::Control(ControlResponse::RemoteInstalled { id, .. }) if id == "install-2" => {
-                panic!("a second install replaced the qoro there")
+                panic!("a second install replaced the qoop there")
             }
             _ => None,
         },
@@ -704,7 +704,7 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
     .await;
 }
 
-/// A machine whose qoro is older than this one, running a daemon from before
+/// A machine whose qoop is older than this one, running a daemon from before
 /// `RestartWhenSafe`: the release of this version is put on its disk once, in place of the
 /// old file, and the ask to move is refused and said once. The link coming back after that
 /// pushes nothing and asks nothing again, and the machine of the same version never had
@@ -712,19 +712,19 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
 async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    // The old qoro: a script that says it is 0.0.1 and relays with the qoro under test.
+    // The old qoop: a script that says it is 0.0.1 and relays with the qoop under test.
     let bin = old.join(".local/bin");
     std::fs::create_dir_all(&bin).expect("bin");
     let script = format!(
         "#!/bin/sh\ncase \"$*\" in\n\
-         *--version*) echo 'qoro 0.0.1' ;;\n\
+         *--version*) echo 'qoop 0.0.1' ;;\n\
          *--hello*) echo '{{\"version\":\"0.0.1\",\"codec_generation\":{},\"platform\":\"linux\"}}' ;;\n\
          *) exec {} \"$@\" ;;\nesac\n",
         qoop_proto::CODEC_GENERATION,
-        qoro()
+        qoop()
     );
-    std::fs::write(bin.join("qoro"), script).expect("old qoro");
-    std::fs::set_permissions(bin.join("qoro"), std::fs::Permissions::from_mode(0o755))
+    std::fs::write(bin.join("qoop"), script).expect("old qoop");
+    std::fs::set_permissions(bin.join("qoop"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     let sessions = old.join("run/sessions/default");
     std::fs::DirBuilder::new()
@@ -738,7 +738,7 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
     let asked = Arc::new(AtomicUsize::new(0));
     let welcomed = Arc::new(AtomicUsize::new(0));
     tokio::spawn(pre_feature_daemon(
-        sessions.join("qorod.sock"),
+        sessions.join("qoopd.sock"),
         asked.clone(),
         welcomed.clone(),
     ));
@@ -767,20 +767,20 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
         )
         .await;
     assert!(
-        said.starts_with("old.example ") && said.contains("next restarts its qoro"),
+        said.starts_with("old.example ") && said.contains("next restarts its qoop"),
         "{said}"
     );
     assert_eq!(
-        std::fs::read(bin.join("qoro")).expect("swapped"),
-        std::fs::read(qoro()).expect("qoro"),
-        "the release was not put in place of the old qoro"
+        std::fs::read(bin.join("qoop")).expect("swapped"),
+        std::fs::read(qoop()).expect("qoop"),
+        "the release was not put in place of the old qoop"
     );
     let left: Vec<String> = std::fs::read_dir(&bin)
         .expect("bin")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(left, vec!["qoro".to_string()], "a staged copy was left");
+    assert_eq!(left, vec!["qoop".to_string()], "a staged copy was left");
     assert_eq!(asked.load(Ordering::SeqCst), 1);
 
     // Still connected, more traffic to that machine: its refusals are its own, and the ask
@@ -816,7 +816,7 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
         .await;
     assert_eq!(
         refused,
-        "old.example runs an older qoro that cannot do this yet"
+        "old.example runs an older qoop that cannot do this yet"
     );
     assert_eq!(welcomed.load(Ordering::SeqCst), 1, "the link dropped");
     assert_eq!(asked.load(Ordering::SeqCst), 1, "asked to move again");

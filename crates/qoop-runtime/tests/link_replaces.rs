@@ -1,6 +1,6 @@
 //! A link that reconnects ends the connection it replaces, and the size moves with it.
 //!
-//! Over ssh a dropped network leaves the far `qoro relay` holding its socket: the remote sshd
+//! Over ssh a dropped network leaves the far `qoop relay` holding its socket: the remote sshd
 //! has not noticed, so the daemon never sees the close ADR-007 moves a size on. The interface
 //! reconnects, and every size it asks for was refused until the no-ack sweep, 30 seconds
 //! later: a split in a remote space left the old pane cut at its old width.

@@ -1,9 +1,9 @@
-// qoro hook for Amp (plugin).
+// qoop hook for Amp (plugin).
 //
 // Install: load this file as an Amp plugin (see the Amp manual's plugin
-// section) with `qoro` on PATH. Reports go through `qoro hook-report`, which
+// section) with `qoop` on PATH. Reports go through `qoop hook-report`, which
 // reads the terminal and token the daemon put in the environment. Outside a
-// qoro terminal every report is a silent no-op and the screen reading keeps
+// qoop terminal every report is a silent no-op and the screen reading keeps
 // working with no hooks installed.
 //
 // Event reference: https://ampcode.com/manual/plugin-api
@@ -30,14 +30,14 @@ function threadIDOf(event) {
 }
 
 function report(state, threadID) {
-  if (!process.env.QORO_TERMINAL || !process.env.QORO_TOKEN) {
+  if (!process.env.QOOP_TERMINAL || !process.env.QOOP_TOKEN) {
     return;
   }
   const args = ["hook-report", "--state", state, ...flagsFor(state)];
   if (threadID) {
     args.push("--session-id", threadID);
   }
-  execFile("qoro", args, { timeout: 5000 }, () => {});
+  execFile("qoop", args, { timeout: 5000 }, () => {});
 }
 
 export default function (amp) {

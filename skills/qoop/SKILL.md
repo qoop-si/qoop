@@ -1,24 +1,24 @@
 ---
-name: qoro
-description: "Work with the coding agents running in qoro terminals: see who is there, understand one before writing to it, send it text, wait for it to finish, read its screen and transcript, and start new agents in terminals or git worktrees. Use when the user mentions qoro, tabs, terminals, worktrees, or another agent's session."
+name: qoop
+description: "Work with the coding agents running in qoop terminals: see who is there, understand one before writing to it, send it text, wait for it to finish, read its screen and transcript, and start new agents in terminals or git worktrees. Use when the user mentions qoop, tabs, terminals, worktrees, or another agent's session."
 license: AGPL-3.0-or-later
 metadata:
   author: us
-  repository: https://github.com/pat/qoro
-allowed-tools: Bash(qoro:*) Read
+  repository: https://github.com/pat/qoop
+allowed-tools: Bash(qoop:*) Read
 ---
 
-# qoro: agents in terminals
+# qoop: agents in terminals
 
-qoro holds shells and coding agents in terminals (tabs). Rule one:
+qoop holds shells and coding agents in terminals (tabs). Rule one:
 **understand before writing.** Look first (`agents`, `context`),
 then write (`send`, `prompt`).
 
 ## Who is there
 
 ```bash
-qoro agents [--json]              # every terminal: number, state, program, session
-qoro agents explain <target>      # why one terminal reads the way it does
+qoop agents [--json]              # every terminal: number, state, program, session
+qoop agents explain <target>      # why one terminal reads the way it does
 ```
 
 `<target>` is a terminal number, an exact tab name, or an exact program
@@ -27,7 +27,7 @@ name. Two matches means `ambiguous`; none means `no such agent or terminal`.
 ## Understand one
 
 ```bash
-qoro context <target> [--last N] [--role user|assistant] [--lines N] [--json]
+qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]
 ```
 
 One call: who it is, whether it is writable, its live screen and its
@@ -41,9 +41,9 @@ recent transcript window. Defaults: last 20 messages, full trimmed screen.
 ## Write to one
 
 ```bash
-qoro prompt <target> <text>   # text plus Enter; refused when blocked or trust_required
-qoro prompt <target> --wait [--timeout SECS] <text>  # the same, then wait for that turn
-qoro send <terminal> <text> [--enter]  # raw typing; enforces nothing, check context first
+qoop prompt <target> <text>   # text plus Enter; refused when blocked or trust_required
+qoop prompt <target> --wait [--timeout SECS] <text>  # the same, then wait for that turn
+qoop send <terminal> <text> [--enter]  # raw typing; enforces nothing, check context first
 ```
 
 Only `prompt` refuses. `send` checks that the terminal exists and nothing
@@ -56,8 +56,8 @@ codes. An agent that was busy when the prompt arrived must stay stopped for
 running turn or queued it for the next one.
 
 ```bash
-qoro send <terminal> --key esc              # interrupt an agent
-qoro send <terminal> --key down --key enter  # pick the next menu option
+qoop send <terminal> --key esc              # interrupt an agent
+qoop send <terminal> --key down --key enter  # pick the next menu option
 ```
 
 Keys: `enter esc tab shift-tab backspace space up down left right home end
@@ -70,20 +70,20 @@ whenever you write based on something you read earlier.
 ## Read from one
 
 ```bash
-qoro read <terminal> [--lines N]                          # live screen
-qoro history <target> [--last N] [--role user|assistant] [--json]  # transcript window
+qoop read <terminal> [--lines N]                          # live screen
+qoop history <target> [--last N] [--role user|assistant] [--json]  # transcript window
 ```
 
 `history` reads the agent product's own store, local files only
 (file transcripts tail at 8 MiB; the opencode database reads whole).
 `--last` max 200, default 20. `no session id reported` means the agent's
-hook never reported its conversation: run `qoro hooks install`.
+hook never reported its conversation: run `qoop hooks install`.
 
 ## Wait instead of polling
 
 ```bash
-qoro wait [target...] [--until idle,blocked] [--timeout 600] [--json]
-qoro wait <target> --match "TEXT" [--until STATE] [--timeout 600]
+qoop wait [target...] [--until idle,blocked] [--timeout 600] [--json]
+qoop wait <target> --match "TEXT" [--until STATE] [--timeout 600]
 ```
 
 Returns as soon as a target is in one of the states (already there counts),
@@ -100,15 +100,15 @@ only, not the scrollback; with `--until` both must hold.
 ## Start and end terminals
 
 ```bash
-t=$(qoro new --name worker --cwd ~/repo -- claude)   # prints the number
-qoro new --space review -- claude                      # a space by id or name
-qoro close <terminal>                                  # never your own
-qoro worktree new <branch> [--base REF] [-- claude]    # a worktree and a terminal in it
-qoro worktree ls [--json]
-qoro worktree rm <branch|path> [--force]
+t=$(qoop new --name worker --cwd ~/repo -- claude)   # prints the number
+qoop new --space review -- claude                      # a space by id or name
+qoop close <terminal>                                  # never your own
+qoop worktree new <branch> [--base REF] [-- claude]    # a worktree and a terminal in it
+qoop worktree ls [--json]
+qoop worktree rm <branch|path> [--force]
 ```
 
-`new` never starts qoro, and a new `--space` name is made once.
+`new` never starts qoop, and a new `--space` name is made once.
 `worktree new` adds `<repo>-wt-<slug>` beside the repository (the slug is
 the branch lowercased, other characters as dashes) and opens a terminal
 there named after the branch; a branch only on a remote is checked out
@@ -118,10 +118,10 @@ worktree. The branch is kept.
 
 ## Supervising other agents
 
-1. `qoro agents --json`: note each worker's `terminal` and `generation`.
-2. `qoro wait <busy terminals> --timeout 600`: sleep until one needs you
+1. `qoop agents --json`: note each worker's `terminal` and `generation`.
+2. `qoop wait <busy terminals> --timeout 600`: sleep until one needs you
    (right after a prompt, `prompt --wait` covers this step).
-3. `qoro context <n>`: read what it did or what it asks.
+3. `qoop context <n>`: read what it did or what it asks.
 4. Answer: blocked on a menu -> `send <n> --key ... --generation G`;
    finished -> `prompt <n> "next task" --generation G`.
 5. Back to 2.
@@ -135,49 +135,49 @@ When you supervise for a person:
   worker until the person approves that action.
 * Before writing, read that worker again; after writing, confirm with
   `wait` and `context` and report what you saw, not what you expected.
-* Never `stop` qoro or `sleep` a space, and `close` a worker only when
+* Never `stop` qoop or `sleep` a space, and `close` a worker only when
   asked. Sit in a space of your own, so putting the workers' to sleep
   cannot end you.
-* This skill pre-approves `qoro` for one turn only; a supervisor runs for
-  many. Start it with `claude --allowedTools "Bash(qoro *)"` and run each
-  `qoro` command on its own, without pipes, so that rule covers it.
+* This skill pre-approves `qoop` for one turn only; a supervisor runs for
+  many. Start it with `claude --allowedTools "Bash(qoop *)"` and run each
+  `qoop` command on its own, without pipes, so that rule covers it.
 
 ## Spaces and sleep
 
 ```bash
-qoro ls [--json]               # spaces: id, name, state, tabs, which sleep
-qoro sleep --tab <terminal>    # end one tab, keep it; refused with reasons
-qoro sleep <space>             # every tab of a space that can sleep
-qoro wake --tab <terminal>     # bring one tab back; `wake <space>` all of it
-qoro wake                      # the tab that slept last
-qoro space rm <id|name>        # drop a space with no tabs; refused if it has any
-qoro stop                      # end qoro; what was awake comes back next open
+qoop ls [--json]               # spaces: id, name, state, tabs, which sleep
+qoop sleep --tab <terminal>    # end one tab, keep it; refused with reasons
+qoop sleep <space>             # every tab of a space that can sleep
+qoop wake --tab <terminal>     # bring one tab back; `wake <space>` all of it
+qoop wake                      # the tab that slept last
+qoop space rm <id|name>        # drop a space with no tabs; refused if it has any
+qoop stop                      # end qoop; what was awake comes back next open
 ```
 
-One qoro per machine; spaces are how tabs are grouped. A tab sleeps and
+One qoop per machine; spaces are how tabs are grouped. A tab sleeps and
 wakes on its own; a sleeping tab runs nothing, and its agent resumes into
 its own conversation on wake. A sleep is refused while a tab runs a
 command, an agent is busy or has not
-reported its conversation, or a job runs in the background. `qoro agents`
+reported its conversation, or a job runs in the background. `qoop agents`
 lists only what is awake, and with nothing awake answers an empty list.
 
 ## Tasks
 
 ```bash
-qoro task new [--replace] "<outcome>"  # open this terminal's task (one at a time)
-qoro task plan -                       # stdin: acceptance, plan, how it is verified, risks
-qoro task stage <stage>                # investigating planning implementing reviewing verifying waiting-human
-qoro task evidence "<check: result>"   # a check that proves an acceptance point
-qoro task done "<summary>"             # a claim; checked outside the agent
-qoro task close <id> --verified|--failed [reason]   # qass or the person ends it
-qoro task ls [--json]                  # open tasks, every terminal
-qoro task show [id] [--before E] [--json]           # one task and what was recorded
+qoop task new [--replace] "<outcome>"  # open this terminal's task (one at a time)
+qoop task plan -                       # stdin: acceptance, plan, how it is verified, risks
+qoop task stage <stage>                # investigating planning implementing reviewing verifying waiting-human
+qoop task evidence "<check: result>"   # a check that proves an acceptance point
+qoop task done "<summary>"             # a claim; checked outside the agent
+qoop task close <id> --verified|--failed [reason]   # qass or the person ends it
+qoop task ls [--json]                  # open tasks, every terminal
+qoop task show [id] [--before E] [--json]           # one task and what was recorded
 ```
 
-The record lives in qoro, not in the repo, and outlives a crash, a restart
-or a compaction. An agent inside qoro is told the short rules at session
-start (`qoro task rules`). `qoro agents --json` rows carry `task: {id, goal,
+The record lives in qoop, not in the repo, and outlives a crash, a restart
+or a compaction. An agent inside qoop is told the short rules at session
+start (`qoop task rules`). `qoop agents --json` rows carry `task: {id, goal,
 stage, claimed}` for a terminal with an open task. A task named by id needs
 no terminal; without an id the command speaks for the terminal it runs in,
-through `QORO_TERMINAL` and `QORO_TOKEN`. What an agent wrote there is its
+through `QOOP_TERMINAL` and `QOOP_TOKEN`. What an agent wrote there is its
 own account: check it before acting on it.

@@ -193,7 +193,7 @@ pub fn route(env: &Env) -> Route {
     }
 }
 
-/// Where a note goes, as `qoro settings` says it.
+/// Where a note goes, as `qoop settings` says it.
 pub fn describe(route: Route) -> String {
     match route {
         Route::Escape { escape, tmux } => {
@@ -303,7 +303,7 @@ pub fn escape(kind: Escape, tmux: bool, body: &str) -> Vec<u8> {
     let sequence = match kind {
         Escape::Osc9 => format!("\x1b]9;{body}\x1b\\"),
         Escape::Osc99 => format!("\x1b]99;;{body}\x1b\\"),
-        Escape::Osc777 => format!("\x1b]777;notify;qoro;{body}\x1b\\"),
+        Escape::Osc777 => format!("\x1b]777;notify;qoop;{body}\x1b\\"),
     };
     if !tmux {
         return sequence.into_bytes();
@@ -342,7 +342,7 @@ pub fn call(program: Program, body: &str) -> Call {
     let (program, args, stdin) = match program {
         Program::TerminalNotifier => (
             "terminal-notifier",
-            vec!["-title".into(), "qoro".into()],
+            vec!["-title".into(), "qoop".into()],
             Some(body.to_string()),
         ),
         Program::Osascript => (
@@ -356,13 +356,13 @@ pub fn call(program: Program, body: &str) -> Call {
                 "end run".into(),
                 "--".into(),
                 body.into(),
-                "qoro".into(),
+                "qoop".into(),
             ],
             None,
         ),
         Program::NotifySend => (
             "notify-send",
-            vec!["--".into(), "qoro".into(), body.into()],
+            vec!["--".into(), "qoop".into(), body.into()],
             None,
         ),
     };
@@ -518,7 +518,7 @@ mod tests {
         );
         assert_eq!(
             escape(Escape::Osc777, false, "hi"),
-            b"\x1b]777;notify;qoro;hi\x1b\\".to_vec()
+            b"\x1b]777;notify;qoop;hi\x1b\\".to_vec()
         );
     }
 
@@ -626,7 +626,7 @@ mod tests {
         let send = call(Program::NotifySend, &body);
         assert_eq!(
             send.args,
-            vec!["--".to_string(), "qoro".into(), body.clone()]
+            vec!["--".to_string(), "qoop".into(), body.clone()]
         );
         let tn = call(Program::TerminalNotifier, &body);
         assert!(

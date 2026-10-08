@@ -1,4 +1,4 @@
-//! Phase B: `qoro hook-report` against a live daemon, through the real socket.
+//! Phase B: `qoop hook-report` against a live daemon, through the real socket.
 //!
 //! What this covers is the wire path: the CLI's arg parsing, the framed
 //! control request, the daemon's parse-and-admit arm, and the refusal answers.
@@ -22,7 +22,7 @@ impl Daemon {
             .expect("chmod");
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
@@ -39,15 +39,15 @@ impl Daemon {
         Self { child, dir }
     }
 
-    fn report(&self, args: &[&str], clear_qoro_env: bool) -> (bool, String) {
+    fn report(&self, args: &[&str], clear_qoop_env: bool) -> (bool, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         cmd.arg("hook-report");
         cmd.args(args);
-        cmd.env("QORO_RUNTIME_DIR", self.dir.path())
+        cmd.env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"));
-        if clear_qoro_env {
-            cmd.env_remove("QORO_TERMINAL");
-            cmd.env_remove("QORO_TOKEN");
+        if clear_qoop_env {
+            cmd.env_remove("QOOP_TERMINAL");
+            cmd.env_remove("QOOP_TOKEN");
         }
         let out = cmd.output().expect("run hook-report");
         let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -58,7 +58,7 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -273,9 +273,9 @@ fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
             "--token",
             "t",
         ])
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env_remove("QORO_SESSION")
+        .env_remove("QOOP_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

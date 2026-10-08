@@ -1,4 +1,4 @@
-//! `qoro agents` against a live daemon, through the real socket.
+//! `qoop agents` against a live daemon, through the real socket.
 //!
 //! The read-only index: one `ListAgents` round trip, one row per terminal,
 //! the same rows as text and as JSON.
@@ -19,7 +19,7 @@ impl Daemon {
             .expect("chmod");
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
@@ -40,10 +40,10 @@ impl Daemon {
     fn run(&self, args: &[&str]) -> (bool, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
-            .env("QORO_RUNTIME_DIR", self.dir.path())
+            .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .output()
-            .expect("run qoro");
+            .expect("run qoop");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -54,7 +54,7 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -64,7 +64,7 @@ impl Drop for Daemon {
 fn agents_lists_the_first_terminal() {
     let daemon = Daemon::start();
     let (ok, stdout, _) = daemon.run(&["agents"]);
-    assert!(ok, "qoro agents failed");
+    assert!(ok, "qoop agents failed");
     assert!(
         stdout.contains("term=1"),
         "the first terminal is missing: {stdout:?}"
@@ -76,7 +76,7 @@ fn agents_lists_the_first_terminal() {
 fn agents_json_is_the_same_rows_as_an_array() {
     let daemon = Daemon::start();
     let (ok, stdout, _) = daemon.run(&["agents", "--json"]);
-    assert!(ok, "qoro agents --json failed");
+    assert!(ok, "qoop agents --json failed");
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(stdout.trim()).expect("the json parses");
     assert!(!rows.is_empty(), "no terminals listed");
@@ -119,10 +119,10 @@ fn agents_without_a_daemon_answers_an_empty_list() {
     for (args, said) in [(vec!["agents"], ""), (vec!["agents", "--json"], "[]\n")] {
         let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .args(&args)
-            .env("QORO_RUNTIME_DIR", dir.path())
+            .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .output()
-            .expect("run qoro");
+            .expect("run qoop");
         assert!(out.status.success(), "{args:?} with no daemon failed");
         assert_eq!(String::from_utf8_lossy(&out.stdout), said, "{args:?}");
     }

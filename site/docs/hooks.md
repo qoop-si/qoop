@@ -7,10 +7,10 @@ a state known the moment it changes rather than after it is drawn, and the agent
 for its conversation, which is what lets a stopped session come back to that conversation.
 
 ```
-qoro hooks status               which are installed, which agents are not on this machine
-qoro hooks install              every agent qoro ships a hook for that is on this machine
-qoro hooks install claude       one of them
-qoro hooks uninstall claude     exactly what was installed, and nothing else
+qoop hooks status               which are installed, which agents are not on this machine
+qoop hooks install              every agent qoop ships a hook for that is on this machine
+qoop hooks install claude       one of them
+qoop hooks uninstall claude     exactly what was installed, and nothing else
 ```
 
 | Agent | What the hook reports |
@@ -36,10 +36,10 @@ running reads its configuration only at start, so start it afresh after installi
 ## Skills
 
 ```
-qoro skills install
+qoop skills install
 ```
 
-teaches each agent what qoro is for, as a skill placed beside the agent's own skills: how to
+teaches each agent what qoop is for, as a skill placed beside the agent's own skills: how to
 look at another terminal before writing to it, how to prompt another agent and wait for it,
-how to start work in a new terminal or git worktree. `qoro skills status` and
-`qoro skills uninstall` work like the hook commands.
+how to start work in a new terminal or git worktree. `qoop skills status` and
+`qoop skills uninstall` work like the hook commands.

@@ -1,5 +1,5 @@
 //! On macOS, the notch: `notch/main.swift` compiled with the system's own Swift and
-//! embedded in the qoro binary, which writes it out and runs it (`src/notch.rs`). One
+//! embedded in the qoop binary, which writes it out and runs it (`src/notch.rs`). One
 //! file, one version with the CLI, no second download. Every other target gets nothing.
 
 use std::env;
@@ -16,7 +16,7 @@ fn main() {
         Ok("x86_64") => "x86_64",
         other => panic!("no notch build for a macOS target on {other:?}"),
     };
-    let out = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("qoro-notch");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("qoop-notch");
     // macOS 14 is the floor: the counts roll with SwiftUI's numeric text transition.
     // Swift 5 language mode, since the app is one file driven from the main thread.
     let status = Command::new("xcrun")

@@ -174,9 +174,9 @@ impl Region {
 /// The definition: strip trailing whitespace, then the line counts as a prompt when it is
 /// not blank and its last character is `$`, `#`, `%` or `>`. Those are the four sigils
 /// `sh`, `bash`, `zsh` and `fish` end a prompt with, and stripping trailing whitespace is
-/// what turns the rendered `~/qoro $ ` into something matchable.
+/// what turns the rendered `~/qoop $ ` into something matchable.
 ///
-/// Two consequences are deliberate. A line where a command was typed (`~/qoro $ cargo test`)
+/// Two consequences are deliberate. A line where a command was typed (`~/qoop $ cargo test`)
 /// is not a marker, because the text after the sigil is a command and its output belongs to
 /// that command, not to a fresh prompt. And a line of program output that happens to end in
 /// `>` (a fragment of HTML, say) is a false marker; the cost is a region that starts lower
@@ -321,9 +321,9 @@ mod tests {
     #[test]
     fn after_last_prompt_marker_takes_what_is_below_the_last_prompt() {
         let s = screen(&[
-            "user@host ~/qoro $ cargo test",
+            "user@host ~/qoop $ cargo test",
             "test result: ok",
-            "user@host ~/qoro $ ",
+            "user@host ~/qoop $ ",
             "Allow command?",
         ]);
         assert_eq!(

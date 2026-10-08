@@ -1,4 +1,4 @@
-//! Phase E: `qoro reload-manifests` against a live daemon.
+//! Phase E: `qoop reload-manifests` against a live daemon.
 //!
 //! The daemon reads the override directory live per request, so pointing its
 //! config home at a temp dir drives the whole path: files on disk, through
@@ -24,7 +24,7 @@ impl Daemon {
         std::fs::create_dir_all(&config).expect("config dir");
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", dir.path().join("rt"))
+            .env("QOOP_RUNTIME_DIR", dir.path().join("rt"))
             .env("XDG_CONFIG_HOME", &config)
             .env("HOME", dir.path().join("home"))
             .env("SHELL", "/bin/sh")
@@ -45,7 +45,7 @@ impl Daemon {
     fn reload(&self) -> (bool, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("reload-manifests")
-            .env("QORO_RUNTIME_DIR", self.dir.path().join("rt"))
+            .env("QOOP_RUNTIME_DIR", self.dir.path().join("rt"))
             .output()
             .expect("run reload-manifests");
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -54,13 +54,13 @@ impl Daemon {
     }
 
     fn override_dir(&self) -> std::path::PathBuf {
-        self.config.join("qoro").join("agent-detection")
+        self.config.join("qoop").join("agent-detection")
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // This test's daemon, by its own handle. Never `pkill qoro daemon`.
+        // This test's daemon, by its own handle. Never `pkill qoop daemon`.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

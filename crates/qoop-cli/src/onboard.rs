@@ -1,4 +1,4 @@
-//! `qoro onboard`: the first start, one group of settings a screen.
+//! `qoop onboard`: the first start, one group of settings a screen.
 //!
 //! Six steps under the word: the pet, the sounds, light or dark, the command key, the
 //! notifications, sleep. Their names sit under a line of dots that turns green as steps
@@ -47,13 +47,13 @@ const STEPS: [Step; 7] = [
     Step {
         name: "keys",
         title: "the command key",
-        what: "the key that starts every qoro command",
+        what: "the key that starts every qoop command",
         groups: &["keys"],
     },
     Step {
         name: "notifications",
         title: "notifications",
-        what: "how qoro tells you when you are not looking",
+        what: "how qoop tells you when you are not looking",
         groups: &["notifications"],
     },
     Step {
@@ -65,7 +65,7 @@ const STEPS: [Step; 7] = [
     Step {
         name: "qass",
         title: "qass",
-        what: "the assistant over your agents: the agent `qoro qass` opens it in",
+        what: "the assistant over your agents: the agent `qoop qass` opens it in",
         groups: &["qass"],
     },
 ];
@@ -165,8 +165,8 @@ impl Onboard {
             ],
         );
         s.status_bar(&[
-            ("qoro onboard", "first start"),
-            ("qoro settings", "any time later"),
+            ("qoop onboard", "first start"),
+            ("qoop settings", "any time later"),
         ]);
         s
     }
@@ -333,14 +333,14 @@ impl Onboard {
     }
 }
 
-/// `qoro onboard`
+/// `qoop onboard`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
-        return Err(std::io::Error::other("usage: qoro onboard"));
+        return Err(std::io::Error::other("usage: qoop onboard"));
     }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         println!(
-            "qoro onboard needs a terminal to show its steps; qoro settings changes anything later"
+            "qoop onboard needs a terminal to show its steps; qoop settings changes anything later"
         );
         return Ok(());
     }
@@ -369,7 +369,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
     }
     drop(session);
-    println!("qoro is set up; change anything later with qoro settings");
+    println!("qoop is set up; change anything later with qoop settings");
     Ok(())
 }
 

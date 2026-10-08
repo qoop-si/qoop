@@ -2,7 +2,7 @@
 //!
 //! `gates_m4` proves a retry is a replay with a daemon built inside the test process, which
 //! is the right harness for a gate and the wrong one for a claim about what ships. This
-//! starts the real `qoro daemon` the way a person starts it, talks to it over its socket
+//! starts the real `qoop daemon` the way a person starts it, talks to it over its socket
 //! from separate connections, stops it, starts another over the same files, and looks at
 //! what each of them left behind.
 //!
@@ -65,15 +65,15 @@ impl Daemon {
     fn start_over(runtime: &Runtime) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
-            .env("QORO_RUNTIME_DIR", runtime.path())
+            .env("QOOP_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", runtime.path().join("config"))
             .env("SHELL", "/bin/sh")
             // A shell that exports any of these makes the daemon refuse to start, because
             // they name a session, a token and a terminal that are not this test's. The
             // other harnesses in this repo strip them for the same reason.
             .env_remove(qoop_runtime::paths::SESSION_ENV)
-            .env_remove("QORO_TOKEN")
-            .env_remove("QORO_TERMINAL")
+            .env_remove("QOOP_TOKEN")
+            .env_remove("QOOP_TERMINAL")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -108,7 +108,7 @@ impl Daemon {
     }
 }
 
-/// `qoro stop`, the way a person ends a session.
+/// `qoop stop`, the way a person ends a session.
 ///
 /// A signal would leave the daemon mid-write, which is a different test of a different thing.
 /// A clean stop is also what makes the restart honest: the ledger row the second daemon reads
@@ -116,16 +116,16 @@ impl Daemon {
 fn stop_daemon(runtime: &Runtime) {
     let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .arg("stop")
-        .env("QORO_RUNTIME_DIR", runtime.path())
+        .env("QOOP_RUNTIME_DIR", runtime.path())
         .env("XDG_CONFIG_HOME", runtime.path().join("config"))
         .env_remove(qoop_runtime::paths::SESSION_ENV)
-        .env_remove("QORO_TOKEN")
-        .env_remove("QORO_TERMINAL")
+        .env_remove("QOOP_TOKEN")
+        .env_remove("QOOP_TERMINAL")
         .output()
-        .expect("run qoro stop");
+        .expect("run qoop stop");
     assert!(
         out.status.success(),
-        "qoro stop refused: {}",
+        "qoop stop refused: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     // The socket file itself stays on disk after a stop, so the check is that nothing
@@ -137,7 +137,7 @@ fn stop_daemon(runtime: &Runtime) {
     }
     assert!(
         std::os::unix::net::UnixStream::connect(&socket).is_err(),
-        "something still answers on {} after qoro stop",
+        "something still answers on {} after qoop stop",
         socket.display()
     );
 }
@@ -150,7 +150,7 @@ impl Drop for Daemon {
 }
 
 fn store_at(runtime: &Runtime) -> Store {
-    Store::open(&runtime.session().join("qoro.db")).expect("open the store the daemon wrote")
+    Store::open(&runtime.session().join("qoop.db")).expect("open the store the daemon wrote")
 }
 
 fn create(id: &str) -> ControlRequest {

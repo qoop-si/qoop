@@ -47,11 +47,11 @@ fn a_marker_command_returns_its_own_output_through_every_login_shell() {
         };
         let transport = LocalTransport::new(&path);
         let out = transport
-            .run(&marker_command("echo qoro-marker-42"))
+            .run(&marker_command("echo qoop-marker-42"))
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let answer = qoop_remote::bootstrap::between_markers(&out.stdout)
             .unwrap_or_else(|| panic!("{name}: no marked output in {:?}", out.stdout));
-        assert_eq!(answer, "qoro-marker-42", "{name} returned the wrong output");
+        assert_eq!(answer, "qoop-marker-42", "{name} returned the wrong output");
         ran += 1;
     }
     assert!(
@@ -69,7 +69,7 @@ fn every_available_shell_is_detected_correctly() {
             continue;
         };
         let transport = LocalTransport::new(&path);
-        let boot = Bootstrap::new(&transport, "/nonexistent/qorod");
+        let boot = Bootstrap::new(&transport, "/nonexistent/qoopd");
         let detected = boot
             .detect_shell()
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -92,7 +92,7 @@ fn a_remote_with_no_daemon_says_so() {
     for (name, path) in shells() {
         let Some(path) = path else { continue };
         let transport = LocalTransport::new(&path);
-        let boot = Bootstrap::new(&transport, "/nonexistent/qorod");
+        let boot = Bootstrap::new(&transport, "/nonexistent/qoopd");
         match boot.hello() {
             Err(qoop_remote::BootstrapError::Remote(qoop_remote::RemoteError::NotInstalled)) => {}
             other => panic!("{name}: a missing daemon was reported as {other:?}"),
@@ -104,7 +104,7 @@ fn a_remote_with_no_daemon_says_so() {
 #[test]
 fn something_that_is_not_a_daemon_is_not_mistaken_for_one() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let fake = dir.path().join("qorod");
+    let fake = dir.path().join("qoopd");
     std::fs::write(&fake, "#!/bin/sh\necho 'I am not a daemon'\n").expect("write");
     let mut perms = std::fs::metadata(&fake).expect("metadata").permissions();
     <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::set_mode(&mut perms, 0o755);
@@ -127,7 +127,7 @@ fn something_that_is_not_a_daemon_is_not_mistaken_for_one() {
 #[test]
 fn a_real_hello_is_read_through_a_noisy_login_shell() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let fake = dir.path().join("qorod");
+    let fake = dir.path().join("qoopd");
     let hello = serde_json::json!({
         "version": "0.0.0",
         "codec_generation": qoop_remote::CODEC_FLOOR,
@@ -152,7 +152,7 @@ fn a_daemon_path_with_shell_characters_is_one_word() {
     let dir = tempfile::tempdir().expect("tempdir");
     let odd = dir.path().join("a dir; true");
     std::fs::create_dir(&odd).expect("mkdir");
-    let fake = odd.join("qorod");
+    let fake = odd.join("qoopd");
     let hello = serde_json::json!({
         "version": "0.0.0",
         "codec_generation": qoop_remote::CODEC_FLOOR,

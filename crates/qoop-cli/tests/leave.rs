@@ -28,20 +28,20 @@ fn private_dir() -> tempfile::TempDir {
     dir
 }
 
-fn qoro(dir: &Path) -> Command {
+fn qoop(dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qoop"));
     command
-        .env("QORO_RUNTIME_DIR", dir)
+        .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("SHELL", "/bin/sh")
-        .env_remove("QORO_SESSION")
-        .env_remove("QORO_TERMINAL")
-        .env_remove("QORO_TOKEN");
+        .env_remove("QOOP_SESSION")
+        .env_remove("QOOP_TERMINAL")
+        .env_remove("QOOP_TOKEN");
     command
 }
 
 fn spawn_daemon(dir: &Path) -> Running {
-    let child = qoro(dir)
+    let child = qoop(dir)
         .arg("daemon")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -142,7 +142,7 @@ fn a_watch_ends_when_its_reader_goes_though_nothing_changes() {
         .block_on(qoop_runtime::client::connect(&socket, "hold-test"))
         .expect("a client connects");
     let mut watch = Running(
-        qoro(dir.path())
+        qoop(dir.path())
             .args(["agents", "--watch", "--json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -174,7 +174,7 @@ fn a_watch_outlives_the_daemon_and_follows_the_next_one() {
     let socket = qoop_testkit::socket_in(dir.path());
     let mut daemon = spawn_daemon(dir.path());
     let mut watch = Running(
-        qoro(dir.path())
+        qoop(dir.path())
             .args(["agents", "--watch", "--json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -217,35 +217,35 @@ fn a_watch_outlives_the_daemon_and_follows_the_next_one() {
 }
 
 /// The hangup a closing window sends the job that started the daemon does not reach it:
-/// the daemon and every tab in it outlive the terminal `qoro` was typed in.
+/// the daemon and every tab in it outlive the terminal `qoop` was typed in.
 #[test]
 fn a_hangup_to_whoever_started_the_daemon_leaves_it_up() {
     use std::os::unix::process::CommandExt;
     let dir = private_dir();
-    // Started by `qoro wake` in a process group of its own, as a shell runs a job.
-    let mut starter = qoro(dir.path())
+    // Started by `qoop wake` in a process group of its own, as a shell runs a job.
+    let mut starter = qoop(dir.path())
         .arg("wake")
         .process_group(0)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("qoro wake");
+        .expect("qoop wake");
     let job = i32::try_from(starter.id()).expect("pid");
     let _ = starter.wait();
-    let opened = qoro(dir.path())
+    let opened = qoop(dir.path())
         .args(["new", "--", "sleep", "60"])
         .output()
-        .expect("qoro new");
+        .expect("qoop new");
     assert!(opened.status.success(), "{opened:?}");
 
     // SAFETY: a signal to the group this test just made.
     unsafe { libc::kill(-job, libc::SIGHUP) };
     std::thread::sleep(Duration::from_millis(500));
-    let listed = qoro(dir.path()).arg("ls").output().expect("qoro ls");
+    let listed = qoop(dir.path()).arg("ls").output().expect("qoop ls");
     let listed = String::from_utf8_lossy(&listed.stdout);
     assert!(
         listed.contains("awake"),
         "the daemon went with its starter's job: {listed}"
     );
-    let _ = qoro(dir.path()).arg("stop").output();
+    let _ = qoop(dir.path()).arg("stop").output();
 }

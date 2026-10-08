@@ -136,7 +136,7 @@ fn start_daemon() -> Daemon {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
     let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
-        .env("QORO_RUNTIME_DIR", dir.path())
+        .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -311,7 +311,7 @@ fn g12_5_the_interface_with_eight_terminals_costs_almost_nothing_while_idle() {
     let _ = client.wait();
 }
 
-/// The qoro process under a `script` wrapper.
+/// The qoop process under a `script` wrapper.
 ///
 /// Measuring the wrapper instead of the client is a silent way to pass this gate while
 /// asserting nothing: `script` sleeps in `select` and always looks idle.
@@ -333,7 +333,7 @@ fn client_pid(wrapper: u32) -> u32 {
                 .expect("ps");
             let comm = String::from_utf8_lossy(&comm.stdout).trim().to_string();
             assert!(
-                comm.ends_with("qoro"),
+                comm.ends_with("qoop"),
                 "the child of the wrapper is {comm:?}, not the client"
             );
             return pid;
@@ -353,9 +353,9 @@ fn attach(dir: &std::path::Path) -> Child {
         .arg("-q")
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_qoop"))
-        .env("QORO_RUNTIME_DIR", dir)
+        .env("QOOP_RUNTIME_DIR", dir)
         // No remote from the machine running the tests: the gate measures this client.
-        .env("QORO_REMOTES", dir.join("remotes.json"))
+        .env("QOOP_REMOTES", dir.join("remotes.json"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())

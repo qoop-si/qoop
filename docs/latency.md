@@ -50,11 +50,11 @@ shell of whoever ran the gate, which on this machine is an interactive zsh with 
 configured prompt. With one terminal, no load at all and nothing for the daemon to do, that
 arrangement measured p50 5.14 ms and p95 14.76 ms. The same measurement against `sh` is p50
 0.29 ms and p95 0.36 ms, and against `bash` p50 0.29 ms. The budget was being spent, twice
-over, by a line editor redrawing a prompt before qoro was involved.
+over, by a line editor redrawing a prompt before qoop was involved.
 
-The gate now pins `SHELL=/bin/sh`. What a user feels is still their shell plus qoro, and
+The gate now pins `SHELL=/bin/sh`. What a user feels is still their shell plus qoop, and
 that is worth knowing: on this machine the shell is the larger half by a factor of fifteen.
-What the gate is for is the half qoro can change.
+What the gate is for is the half qoop can change.
 
 ## The load shape was measuring luck
 
@@ -70,7 +70,7 @@ forks: `sleep` is a separate program, and twenty shells looping twenty times a s
 four hundred forks a second of noise on the machine being measured. One `perl` writes 53200
 bytes every 50 milliseconds, which is 1.06 MiB a second.
 
-The old shape is kept, under `QORO_LOAD=burst`, because it is not only noisier: it is
+The old shape is kept, under `QOOP_LOAD=burst`, because it is not only noisier: it is
 genuinely more expensive. `seq` output is about seven bytes to a line, so at the same byte
 rate it produces fourteen times the rows, and rows are what the scrollback and the history
 writer cost. That shape measures p95 4.98 to 7.74 ms and puts the daemon at 2.4 cores
@@ -94,7 +94,7 @@ The gate asks for two thirds and prints the count.
 
 ## Where the time goes
 
-The daemon reports its own breakdown under `QORO_TRACE_LATENCY=1`, writing to stderr, which
+The daemon reports its own breakdown under `QOOP_TRACE_LATENCY=1`, writing to stderr, which
 is how G2.12 reads a segment no client can see. Taken from one G2.12 run, so the terminal is
 streaming a megabyte a second to itself the whole time:
 

@@ -129,7 +129,7 @@ async fn g4_6_a_replayed_close_returns_the_original_answer() {
 /// The stronger claim, that it survives the daemon, is checked end to end against the
 /// packaged binary in `qoop-cli`'s `ledger.rs`: that one stops the first daemon and starts a
 /// second over the same directory. What this gate adds is the placement, which is the part
-/// a person can get wrong without noticing for weeks: the row is in `qoro.db`, next to the
+/// a person can get wrong without noticing for weeks: the row is in `qoop.db`, next to the
 /// terminal rows, because that is the file the next daemon opens.
 #[tokio::test]
 async fn g4_6_a_replayed_command_is_answered_from_the_store_not_from_memory() {
@@ -144,8 +144,8 @@ async fn g4_6_a_replayed_command_is_answered_from_the_store_not_from_memory() {
     }
     assert_eq!(d.terminals().len(), before + 1);
 
-    // The same store file, opened the way `qoro daemon` opens it.
-    let store = qoop_store::Store::open(&d.dir().join("qoro.db")).expect("open the store");
+    // The same store file, opened the way `qoop daemon` opens it.
+    let store = qoop_store::Store::open(&d.dir().join("qoop.db")).expect("open the store");
     let applied = store.applied("in-the-store").expect("lookup");
     assert!(
         applied.is_some(),
@@ -170,7 +170,7 @@ async fn g4_4_a_failing_store_does_not_stop_a_terminal() {
     c.input_to(terminal, b"echo BEFORE_$((6*7))\n").await;
     assert!(c.wait_for_text_on(terminal, "BEFORE_42", PATIENCE).await);
 
-    rusqlite::Connection::open(d.dir().join("qoro.db"))
+    rusqlite::Connection::open(d.dir().join("qoop.db"))
         .expect("a second connection")
         .execute_batch("DROP TABLE applied")
         .expect("break the ledger");

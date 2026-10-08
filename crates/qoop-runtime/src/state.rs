@@ -17,15 +17,15 @@ use std::path::Path;
 /// on disk without the log it needs. Nothing happens when `to` already has a database: it
 /// is the one in use, and the one in `from` is left where it is and named.
 pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
-    let old = from.join("qoro.db");
+    let old = from.join("qoop.db");
     if from == to || !old.exists() {
         return Ok(());
     }
-    let new = to.join("qoro.db");
+    let new = to.join("qoop.db");
     if new.exists() {
         if holds_tabs(&new)? {
             eprintln!(
-                "qorod: a database is in both {} and {}; using the second, the first is \
+                "qoopd: a database is in both {} and {}; using the second, the first is \
                  left as it is",
                 from.display(),
                 to.display()
@@ -36,9 +36,9 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
         // somewhere with nothing to move (under another runtime directory, say). Taking it
         // as the real one would leave the real one where the system deletes it.
         for (name, aside) in [
-            ("qoro.db", "qoro.db.empty"),
-            ("qoro.db-wal", "qoro.db.empty-wal"),
-            ("qoro.db-shm", "qoro.db.empty-shm"),
+            ("qoop.db", "qoop.db.empty"),
+            ("qoop.db-wal", "qoop.db.empty-wal"),
+            ("qoop.db-shm", "qoop.db.empty-shm"),
         ] {
             if to.join(name).exists() {
                 std::fs::rename(to.join(name), to.join(aside))?;
@@ -46,7 +46,7 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
         }
     }
     move_dir(&from.join("history"), &to.join("history"))?;
-    let moving = to.join("qoro.db.moving");
+    let moving = to.join("qoop.db.moving");
     remove_if_there(&moving)?;
     let target = moving
         .to_str()
@@ -58,7 +58,7 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
         })
         .map_err(|e| {
             io::Error::other(format!(
-                "could not move {} to {}: {e}; with qoro stopped, move the old file aside to \
+                "could not move {} to {}: {e}; with qoop stopped, move the old file aside to \
                  start without it",
                 old.display(),
                 to.display()
@@ -70,10 +70,10 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(&moving, &new)?;
     // Best effort: some filesystems refuse to sync a directory, and the data is synced.
     let _ = std::fs::File::open(to).and_then(|d| d.sync_all());
-    for name in ["qoro.db", "qoro.db-wal", "qoro.db-shm"] {
+    for name in ["qoop.db", "qoop.db-wal", "qoop.db-shm"] {
         remove_if_there(&from.join(name))?;
     }
-    eprintln!("qorod: moved the database and history to {}", to.display());
+    eprintln!("qoopd: moved the database and history to {}", to.display());
     Ok(())
 }
 
@@ -95,7 +95,7 @@ fn holds_tabs(db: &Path) -> io::Result<bool> {
         })
         .map_err(|e| {
             io::Error::other(format!(
-                "could not read {}: {e}; with qoro stopped, move it aside to start without it",
+                "could not read {}: {e}; with qoop stopped, move it aside to start without it",
                 db.display()
             ))
         })
@@ -115,7 +115,7 @@ fn move_dir(from: &Path, to: &Path) -> io::Result<()> {
     }
     if to.exists() {
         eprintln!(
-            "qorod: {} is already there, so {} was left where it is",
+            "qoopd: {} is already there, so {} was left where it is",
             to.display(),
             from.display()
         );
@@ -168,7 +168,7 @@ mod tests {
     /// A database with a row, left the way a running daemon leaves one: in WAL mode, with
     /// the row still in the log, not yet checkpointed into the main file.
     fn old_layout(dir: &Path) -> rusqlite::Connection {
-        let db = rusqlite::Connection::open(dir.join("qoro.db")).expect("open");
+        let db = rusqlite::Connection::open(dir.join("qoop.db")).expect("open");
         db.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA wal_autocheckpoint = 0;
@@ -188,11 +188,11 @@ mod tests {
         // Held open while the move runs, so the row is only in the WAL: a move that copied
         // the main file alone would lose it.
         let _open = old_layout(from.path());
-        assert!(from.path().join("qoro.db-wal").exists());
+        assert!(from.path().join("qoop.db-wal").exists());
 
         migrate(from.path(), to.path()).expect("migrate");
 
-        let db = rusqlite::Connection::open(to.path().join("qoro.db")).expect("moved db");
+        let db = rusqlite::Connection::open(to.path().join("qoop.db")).expect("moved db");
         let name: String = db
             .query_row("SELECT name FROM workspace", [], |r| r.get(0))
             .expect("the row came with it");
@@ -205,10 +205,10 @@ mod tests {
             std::fs::read(to.path().join("history/7/0.seg")).expect("history moved"),
             b"scrollback"
         );
-        for gone in ["qoro.db", "qoro.db-wal", "qoro.db-shm", "history"] {
+        for gone in ["qoop.db", "qoop.db-wal", "qoop.db-shm", "history"] {
             assert!(!from.path().join(gone).exists(), "{gone} was left behind");
         }
-        assert!(!to.path().join("qoro.db.moving").exists());
+        assert!(!to.path().join("qoop.db.moving").exists());
     }
 
     /// Run twice, the second start finds nothing to do and changes nothing.
@@ -218,7 +218,7 @@ mod tests {
         drop(old_layout(from.path()));
         migrate(from.path(), to.path()).expect("migrate");
         migrate(from.path(), to.path()).expect("again");
-        assert!(to.path().join("qoro.db").exists());
+        assert!(to.path().join("qoop.db").exists());
     }
 
     /// A start interrupted after the history moved finishes the move: the database is still
@@ -228,14 +228,14 @@ mod tests {
         let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         drop(old_layout(from.path()));
         std::fs::rename(from.path().join("history"), to.path().join("history")).unwrap();
-        std::fs::write(to.path().join("qoro.db.moving"), b"half a copy").unwrap();
+        std::fs::write(to.path().join("qoop.db.moving"), b"half a copy").unwrap();
         migrate(from.path(), to.path()).expect("finish");
-        let db = rusqlite::Connection::open(to.path().join("qoro.db")).expect("db");
+        let db = rusqlite::Connection::open(to.path().join("qoop.db")).expect("db");
         let n: i64 = db
             .query_row("SELECT COUNT(*) FROM workspace", [], |r| r.get(0))
             .expect("a whole database, not the half copy");
         assert_eq!(n, 1);
-        assert!(!from.path().join("qoro.db").exists());
+        assert!(!from.path().join("qoop.db").exists());
     }
 
     /// A database already in the new place is the one in use: the old one is not copied
@@ -244,17 +244,17 @@ mod tests {
     fn a_database_already_moved_is_never_overwritten() {
         let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         drop(old_layout(from.path()));
-        rusqlite::Connection::open(to.path().join("qoro.db"))
+        rusqlite::Connection::open(to.path().join("qoop.db"))
             .unwrap()
             .execute_batch("CREATE TABLE terminal (id INTEGER); INSERT INTO terminal VALUES (5);")
             .unwrap();
         migrate(from.path(), to.path()).expect("migrate");
-        let id: i64 = rusqlite::Connection::open(to.path().join("qoro.db"))
+        let id: i64 = rusqlite::Connection::open(to.path().join("qoop.db"))
             .unwrap()
             .query_row("SELECT id FROM terminal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(id, 5, "the database in use was replaced");
-        assert!(from.path().join("qoro.db").exists());
+        assert!(from.path().join("qoop.db").exists());
     }
 
     /// The copy used across filesystems, exercised directly: two temp directories are on
@@ -284,10 +284,10 @@ mod tests {
     fn a_file_with_no_schema_in_the_way_is_set_aside() {
         let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         drop(old_layout(from.path()));
-        std::fs::write(to.path().join("qoro.db"), b"").unwrap();
+        std::fs::write(to.path().join("qoop.db"), b"").unwrap();
         migrate(from.path(), to.path()).expect("migrate");
-        assert!(to.path().join("qoro.db.empty").exists());
-        assert!(!from.path().join("qoro.db").exists());
+        assert!(to.path().join("qoop.db.empty").exists());
+        assert!(!from.path().join("qoop.db").exists());
     }
 
     /// A database that never held a tab, made by a daemon of this build that had nothing to
@@ -296,22 +296,22 @@ mod tests {
     fn an_empty_database_in_the_way_is_set_aside() {
         let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         drop(old_layout(from.path()));
-        rusqlite::Connection::open(from.path().join("qoro.db"))
+        rusqlite::Connection::open(from.path().join("qoop.db"))
             .unwrap()
             .execute_batch("CREATE TABLE terminal (id INTEGER); INSERT INTO terminal VALUES (1);")
             .unwrap();
-        rusqlite::Connection::open(to.path().join("qoro.db"))
+        rusqlite::Connection::open(to.path().join("qoop.db"))
             .unwrap()
             .execute_batch("CREATE TABLE terminal (id INTEGER);")
             .unwrap();
         std::fs::create_dir(to.path().join("history")).unwrap();
         migrate(from.path(), to.path()).expect("migrate");
-        let n: i64 = rusqlite::Connection::open(to.path().join("qoro.db"))
+        let n: i64 = rusqlite::Connection::open(to.path().join("qoop.db"))
             .unwrap()
             .query_row("SELECT COUNT(*) FROM terminal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "the empty database was kept over the real one");
-        assert!(to.path().join("qoro.db.empty").exists());
+        assert!(to.path().join("qoop.db.empty").exists());
         assert!(to.path().join("history/7/0.seg").exists());
     }
 }

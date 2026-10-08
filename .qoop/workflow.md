@@ -1,4 +1,4 @@
-# How work ships in qoro
+# How work ships in qoop
 
 1. Read the real code and logs first; check how other multiplexers handle it where it applies.
 2. Work in a fresh worktree from current `origin/main`, never in the plain checkout; rebase onto
@@ -10,21 +10,21 @@
 6. Run `cargo fmt --check`, `cargo clippy --workspace --all-targets`,
    `uv run python scripts/check-prose.py` and the tests you touched, then
    `cargo test --workspace`. There is no CI: these are the gate.
-7. Run it for real and keep the output: the CLI in a qoro or tmux terminal, the app on a
+7. Run it for real and keep the output: the CLI in a qoop or tmux terminal, the app on a
    simulator or device, a screenshot for anything visual. Never on the owner's live daemon,
-   agents or qass: use an isolated `QORO_RUNTIME_DIR`.
+   agents or qass: use an isolated `QOOP_RUNTIME_DIR`.
 8. Commit through `/commit`, push the branch, open a PR (`ref` an issue, never `closes`), and
    rebase-and-merge it. Pre-authorized here by `AGENTS.md`; never push to `main` directly.
-9. Pull `main` in the plain checkout, take a fresh release build (the qoro app build, never
+9. Pull `main` in the plain checkout, take a fresh release build (the qoop app build, never
    this repository alone on a paired machine), install it to
-   `~/.local/bin/qoro`, and run `qoro bridge reload` after replacing the binary.
+   `~/.local/bin/qoop`, and run `qoop bridge reload` after replacing the binary.
 10. Clean up: remove the worktree, delete the local and remote branch, drop the worktree's
     `target/`.
 
 ## Done means
 
 The PR is merged (`gh pr view <n> --json state,mergedAt`), its commit is on `origin/main`, the
-installed `~/.local/bin/qoro` is newer than the merge, the worktree is gone (`git worktree
+installed `~/.local/bin/qoop` is newer than the merge, the worktree is gone (`git worktree
 list`), and the task evidence names the real run and its output.
 
 ## Loop limit
@@ -40,11 +40,11 @@ comment, publishing), and the repo going public.
 
 ## Verify where it runs
 
-- where: `installed ~/.local/bin/qoro`
-- check: its mtime is after the merge and `~/.local/bin/qoro --version` runs; `launchctl list |
-  grep dev.qoro.bridge` shows a PID. Then the command the task changed, against an isolated
-  stack only: `mktemp -d /tmp/qv.XXXXXX` prints `<s>`, and every qoro command is written out
-  as `env QORO_RUNTIME_DIR=<s> XDG_CONFIG_HOME=<s>/c XDG_DATA_HOME=<s>/d ~/.local/bin/qoro
+- where: `installed ~/.local/bin/qoop`
+- check: its mtime is after the merge and `~/.local/bin/qoop --version` runs; `launchctl list |
+  grep dev.qoop.bridge` shows a PID. Then the command the task changed, against an isolated
+  stack only: `mktemp -d /tmp/qv.XXXXXX` prints `<s>`, and every qoop command is written out
+  as `env QOOP_RUNTIME_DIR=<s> XDG_CONFIG_HOME=<s>/c XDG_DATA_HOME=<s>/d ~/.local/bin/qoop
   <args>` (start with `ensure-awake`, end with `stop`), its output kept; then `rm -rf <s>`.
-- never: a qoro command without those three variables, the owner's live daemon, agents,
+- never: a qoop command without those three variables, the owner's live daemon, agents,
   spaces or qass, `launchctl` writes, the owner's phone.

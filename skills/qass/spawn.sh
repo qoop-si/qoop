@@ -6,8 +6,8 @@
 #
 # The repo must be a git repository under $HOME and not $HOME itself. The worker
 # runs with the owner's own settings for that agent; what it may do is in its
-# brief. The space is made when missing, as `qoro new --space` does. The brief
-# goes afterwards, with `qoro prompt`.
+# brief. The space is made when missing, as `qoop new --space` does. The brief
+# goes afterwards, with `qoop prompt`.
 set -euo pipefail
 
 repo="${1:?usage: spawn.sh <repo> <branch>}"
@@ -39,8 +39,8 @@ git check-ref-format --branch "$branch" >/dev/null
 mkdir -p "@QASS_DATA@"
 cd "$repo"
 # Prints `worktree=<path> branch=<name>`, then `terminal=<n>`.
-t="$(qoro worktree new "$branch" ${where[@]+"${where[@]}"} -- "${cmd[@]}" | sed -n 's/^terminal=//p')"
-case "$t" in '' | *[!0-9]*) echo "spawn: no terminal number from qoro worktree new" >&2; exit 1 ;; esac
+t="$(qoop worktree new "$branch" ${where[@]+"${where[@]}"} -- "${cmd[@]}" | sed -n 's/^terminal=//p')"
+case "$t" in '' | *[!0-9]*) echo "spawn: no terminal number from qoop worktree new" >&2; exit 1 ;; esac
 # From here the worker exists: nothing below may end the script early by error.
 # Claude asks once whether to trust a new folder; that and nothing else is answered
 # here. Ready is the agent's own idle screen, seen twice in a row (the first frames
@@ -50,7 +50,7 @@ case "$t" in '' | *[!0-9]*) echo "spawn: no terminal number from qoro worktree n
 answered=0
 seen=0
 for _ in $(seq 180); do
-    row="$(qoro agents --json 2>/dev/null | jq -c ".[] | select(.terminal == $t)" 2>/dev/null || true)"
+    row="$(qoop agents --json 2>/dev/null | jq -c ".[] | select(.terminal == $t)" 2>/dev/null || true)"
     g="$(printf '%s' "$row" | jq -r '.generation // empty' 2>/dev/null || true)"
     state="$(printf '%s' "$row" | jq -r '.state // empty' 2>/dev/null || true)"
     program="$(printf '%s' "$row" | jq -r '.program // empty' 2>/dev/null || true)"
@@ -61,7 +61,7 @@ for _ in $(seq 180); do
             exit 0
         fi
     elif [ -n "$g" ] && [ "$program" = claude ] && [ "$agent" = claude ]; then
-        screen="$(qoro read "$t" 2>/dev/null || true)"
+        screen="$(qoop read "$t" 2>/dev/null || true)"
         if printf '%s' "$screen" | grep -qi "trust this folder"; then
             seen=0
             if [ "$answered" = 0 ]; then
@@ -72,7 +72,7 @@ for _ in $(seq 180); do
                     keys="--key down --key enter"
                 fi
                 # shellcheck disable=SC2086
-                qoro send "$t" $keys --generation "$g" >/dev/null 2>&1 && answered=1
+                qoop send "$t" $keys --generation "$g" >/dev/null 2>&1 && answered=1
             fi
         elif [ "$state" != blocked ] && printf '%s' "$screen" | grep -q "❯"; then
             seen=$((seen + 1))

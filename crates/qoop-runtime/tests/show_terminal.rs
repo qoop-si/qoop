@@ -41,7 +41,7 @@ async fn an_interface_is_told_and_the_asker_learns_its_process() {
         .expect("connect");
     let (mut ui_rd, _ui_wr) = ui.into_split();
 
-    let mut asker = d.attach("qoro-focus").await;
+    let mut asker = d.attach("qoop-focus").await;
     let answer = asker
         .control(
             &ControlRequest::Focus {
@@ -65,7 +65,7 @@ async fn an_interface_is_told_and_the_asker_learns_its_process() {
 #[tokio::test]
 async fn a_terminal_that_is_not_there_is_refused() {
     let d = TestDaemon::start().await;
-    let mut asker = d.attach("qoro-focus").await;
+    let mut asker = d.attach("qoop-focus").await;
     let answer = asker
         .control(
             &ControlRequest::Focus {

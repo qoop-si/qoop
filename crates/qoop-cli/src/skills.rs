@@ -1,7 +1,7 @@
-//! Installing the skill that teaches an agent how to use qoro.
+//! Installing the skill that teaches an agent how to use qoop.
 //!
 //! The hook tells the daemon what the agent is doing; the skill tells the
-//! agent what qoro is for. Same three rules as the hooks installer:
+//! agent what qoop is for. Same three rules as the hooks installer:
 //!
 //! * Added beside what is already there, never instead of it. A skill
 //!   directory holding a person's own skills keeps all of them.
@@ -18,12 +18,12 @@
 use std::path::{Path, PathBuf};
 
 /// The skill text, compiled in so the binary needs nothing beside it.
-const BODY: &str = include_str!("../../../skills/qoro/SKILL.md");
+const BODY: &str = include_str!("../../../skills/qoop/SKILL.md");
 
 /// The file name every agent reads.
 const FILE: &str = "SKILL.md";
 
-/// qass, the assistant over every other agent: installed beside each agent's qoro skill
+/// qass, the assistant over every other agent: installed beside each agent's qoop skill
 /// (`.claude/skills/qass`, `.codex/skills/qass`, ...), as files that sit beside each other
 /// because the scripts find one another by their own directory. Its rules are in its
 /// SKILL.md; nothing beside them holds it back.
@@ -32,7 +32,7 @@ fn qass_dir(target: &Target) -> PathBuf {
 }
 
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
-/// `qoro paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
+/// `qoop paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
 /// filled in here at install. The working folder's `.claude/settings.json` lets Claude run
 /// qass's commands without asking and loads its lessons, for any Claude started there, by
 /// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
@@ -103,7 +103,7 @@ const QASS_GONE: [&str; 4] = ["gate.sh", "gate.py", "worker.json", "worker-openc
 struct Target {
     /// What a person calls the agent, and what they type to install it.
     agent: &'static str,
-    /// That agent's skills directory for qoro, under the person's home.
+    /// That agent's skills directory for qoop, under the person's home.
     dir: &'static str,
     /// True while no evidence shows the agent reads this directory.
     /// Experimental targets never install by default and are never
@@ -116,22 +116,22 @@ fn targets() -> Vec<Target> {
     vec![
         Target {
             agent: "claude",
-            dir: ".claude/skills/qoro",
+            dir: ".claude/skills/qoop",
             experimental: false,
         },
         Target {
             agent: "codex",
-            dir: ".codex/skills/qoro",
+            dir: ".codex/skills/qoop",
             experimental: false,
         },
         Target {
             agent: "gemini",
-            dir: ".gemini/skills/qoro",
+            dir: ".gemini/skills/qoop",
             experimental: false,
         },
         Target {
             agent: "opencode",
-            dir: ".config/opencode/skills/qoro",
+            dir: ".config/opencode/skills/qoop",
             // Seen read on 2026-10-03 (opencode 1.18.34): `opencode run` loaded a skill
             // placed there.
             experimental: false,
@@ -152,14 +152,14 @@ fn home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-/// `qoro skills ...`
+/// `qoop skills ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("install") => install(&args[3..]),
         Some("uninstall") => uninstall(&args[3..]),
         Some("status") | None => status(),
         Some(other) => Err(std::io::Error::other(format!(
-            "unknown command {other}; usage: qoro skills <install|uninstall|status> [agent...]"
+            "unknown command {other}; usage: qoop skills <install|uninstall|status> [agent...]"
         ))),
     }
 }
@@ -176,7 +176,7 @@ fn wanted(args: &[String]) -> std::io::Result<Vec<Target>> {
         let Some(target) = targets().into_iter().find(|t| t.agent == name.as_str()) else {
             let known: Vec<&str> = targets().iter().map(|t| t.agent).collect();
             return Err(std::io::Error::other(format!(
-                "no skill for {name}; qoro ships one for {}",
+                "no skill for {name}; qoop ships one for {}",
                 known.join(", ")
             )));
         };
@@ -259,7 +259,7 @@ fn install_qass(home: &Path, dirs: &QassDirs, target: &Target) -> std::io::Resul
 }
 
 /// Move what an older qass kept in `~/.qass` to its two folders, once: the owner's `policy`
-/// and `lessons.md` beside his settings, the rest beside qoro's data. Nothing already at the
+/// and `lessons.md` beside his settings, the rest beside qoop's data. Nothing already at the
 /// new place is overwritten. The old folder goes when only what is made again is left in it
 /// (its `.claude` settings and `ssh` sockets).
 fn migrate_old_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
@@ -365,9 +365,9 @@ fn status() -> std::io::Result<()> {
         );
     }
     println!(
-        "\n  qoro skills install [agent...]    add the skill, beside whatever is already there"
+        "\n  qoop skills install [agent...]    add the skill, beside whatever is already there"
     );
-    println!("  qoro skills uninstall [agent...]  remove exactly what was added");
+    println!("  qoop skills uninstall [agent...]  remove exactly what was added");
     Ok(())
 }
 
@@ -478,7 +478,7 @@ mod tests {
             "their skill went with ours"
         );
         // Our directory is gone when left empty; theirs stays.
-        assert!(!home.path().join(".claude/skills/qoro").exists());
+        assert!(!home.path().join(".claude/skills/qoop").exists());
         assert!(neighbour.exists());
     }
 
@@ -496,8 +496,8 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n## ").next())
             .expect("the default workflow section");
-        let own = include_str!("../../../.qoro/workflow.md");
-        for (what, text) in [("the default", default), ("qoro's own", own)] {
+        let own = include_str!("../../../.qoop/workflow.md");
+        for (what, text) in [("the default", default), ("qoop's own", own)] {
             let chars = text.chars().count();
             assert!(chars <= 4_000, "{what} workflow is {chars} characters");
             let steps = text
@@ -584,7 +584,7 @@ mod tests {
         assert!(!dir.join("gate.py").exists());
     }
 
-    /// Every agent gets qass beside its qoro skill; taking it from one leaves the others
+    /// Every agent gets qass beside its qoop skill; taking it from one leaves the others
     /// and Claude's working-folder settings.
     #[test]
     fn qass_installs_beside_every_agent() {
@@ -613,7 +613,7 @@ mod tests {
     }
 
     /// An older qass's `~/.qass` moves across once: the owner's files beside his settings,
-    /// the rest beside qoro's data, nothing overwritten, and the old folder gone once only
+    /// the rest beside qoop's data, nothing overwritten, and the old folder gone once only
     /// what is made again is left in it.
     #[test]
     fn an_old_qass_folder_moves_once() {
@@ -694,7 +694,7 @@ mod tests {
         let claude = target("claude");
         let unproven = Target {
             agent: "unproven",
-            dir: ".unproven/skills/qoro",
+            dir: ".unproven/skills/qoop",
             experimental: true,
         };
         assert_eq!(status_of(home.path(), &claude), "not installed");

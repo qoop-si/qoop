@@ -951,9 +951,9 @@ mod tests {
     #[test]
     fn plain_text_reaches_the_snapshot() {
         let mut e = engine();
-        e.feed(b"hello qoro\r\nsecond\r\n");
+        e.feed(b"hello qoop\r\nsecond\r\n");
         let s = e.snapshot();
-        assert_eq!(s.lines[0], "hello qoro");
+        assert_eq!(s.lines[0], "hello qoop");
         assert_eq!(s.lines[1], "second");
         assert_eq!(s.cols, 80);
         assert_eq!(s.rows, 24);

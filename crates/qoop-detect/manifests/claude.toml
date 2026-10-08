@@ -2,7 +2,7 @@
 #
 # Claude Code is closed source, but its executable carries its interface as plain strings.
 # The strings below are from the 2.1.284 npm package (@anthropic-ai/claude-code), read with
-# `strings` and never run. Two rules also lean on screens recorded from qoro's own Claude
+# `strings` and never run. Two rules also lean on screens recorded from qoop's own Claude
 # sessions (the captures in this crate's tests): `selection_prompt`'s hint as a session
 # draws it, and `draft_after_turn`'s turn summary (`✻ Crunched for 16m 31s · done 6:31 PM`)
 # and the notices stacked over the composer.
