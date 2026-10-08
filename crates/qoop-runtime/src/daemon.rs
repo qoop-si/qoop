@@ -1627,7 +1627,9 @@ impl Daemon {
 
 /// Remove a socket file only when nothing is listening on it, and only when it is ours.
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    if !path.exists() {
+    // Not `exists()`, which follows a link: a link left pointing at the socket of a daemon that
+    // has gone (see `legacy`) is a name that has to be freed too, or the bind fails for good.
+    if path.symlink_metadata().is_err() {
         return Ok(());
     }
     match std::os::unix::net::UnixStream::connect(path) {
@@ -10943,5 +10945,45 @@ mod flush_tests {
             "each silent writer was given a deadline of its own: {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_socket_tests {
+    use super::remove_stale_socket;
+
+    /// The old socket link of an earlier daemon dangles once that daemon is gone: it is
+    /// removed like any stale socket, so a bind on that name works (Linux does not follow it).
+    #[test]
+    fn a_dangling_link_where_the_socket_goes_is_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("qorod.sock");
+        let link = dir.path().join("qoopd.sock");
+        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // The target is a dead socket: refused, the link goes.
+        remove_stale_socket(&link).unwrap();
+        assert!(link.symlink_metadata().is_err());
+        // The target is gone altogether: the link dangles, and goes too.
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        remove_stale_socket(&link).unwrap();
+        assert!(link.symlink_metadata().is_err());
+        std::os::unix::net::UnixListener::bind(&link).expect("the name is free to bind");
+    }
+
+    /// A live daemon behind the link is not removed.
+    #[test]
+    fn a_link_to_a_live_socket_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("qorod.sock");
+        let link = dir.path().join("qoopd.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            remove_stale_socket(&link).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(link.symlink_metadata().is_ok());
     }
 }
