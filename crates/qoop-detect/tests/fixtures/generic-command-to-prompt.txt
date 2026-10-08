@@ -4,10 +4,10 @@
 agent: generic
 @@ 0
 $ cargo test
-   Compiling qoro
+   Compiling qoop
 @@ 50
 $ cargo test
-   Compiling qoro
+   Compiling qoop
 @@ 100
 $ cargo test
     Finished test profile
@@ -15,6 +15,6 @@ $ cargo test
 $ cargo test
     Finished test profile
 @@ 200
-user@host ~/coding/qoro %
+user@host ~/coding/qoop %
 @@ 250
-user@host ~/coding/qoro %
+user@host ~/coding/qoop %

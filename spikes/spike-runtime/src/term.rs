@@ -53,9 +53,9 @@ fn main() {
     let mut parser: Processor = Processor::new();
 
     // ---- 1. plain text lands in the grid ----------------------------------------
-    parser.advance(&mut term, b"hello qoro\r\nsecond line\r\n");
+    parser.advance(&mut term, b"hello qoop\r\nsecond line\r\n");
     let text = screen_text(&term);
-    let basic_ok = text[0] == "hello qoro" && text[1] == "second line";
+    let basic_ok = text[0] == "hello qoop" && text[1] == "second line";
     println!(
         "[1] plain text into grid: {} ({:?})",
         if basic_ok { "PASS" } else { "FAIL" },

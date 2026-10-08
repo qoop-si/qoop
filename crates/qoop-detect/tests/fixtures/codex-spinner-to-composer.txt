@@ -16,33 +16,33 @@ agent: codex
 • Working (2m 17s · esc to interrupt)
 @@ 300
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 350
 • Working (2m 17s · esc to interrupt)
 @@ 400
 • Working (2m 18s · esc to interrupt)
 @@ 550
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 600
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 650
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 750
 • Working (2m 23s · esc to interrupt)
 @@ 800
 • Working (2m 24s · esc to interrupt)
 @@ 950
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 1000
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 1050
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop
 @@ 1450
 › Ask Codex to do anything
-  gpt-6-astra medium · ~/coding/qoro
+  gpt-6-astra medium · ~/coding/qoop

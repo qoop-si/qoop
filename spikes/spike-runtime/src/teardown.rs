@@ -588,7 +588,7 @@ so the containment set must be a union across rounds and can never shrink"
 
     // ============ Claim D: canonical mode discards a paste with no newline ===========
     {
-        let out_path = std::env::temp_dir().join("qoro_spike_paste.txt");
+        let out_path = std::env::temp_dir().join("qoop_spike_paste.txt");
         let _ = std::fs::remove_file(&out_path);
         let (master, slave) = open_pty(80, 24)?;
         set_nonblocking(master.as_raw_fd());
@@ -651,7 +651,7 @@ so the containment set must be a union across rounds and can never shrink"
         drop(master);
 
         // Control: same size, newline terminated.
-        let out2 = std::env::temp_dir().join("qoro_spike_paste2.txt");
+        let out2 = std::env::temp_dir().join("qoop_spike_paste2.txt");
         let _ = std::fs::remove_file(&out2);
         let (master2, slave2) = open_pty(80, 24)?;
         set_nonblocking(master2.as_raw_fd());

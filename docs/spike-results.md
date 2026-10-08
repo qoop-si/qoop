@@ -52,7 +52,7 @@ The one-task-per-terminal advantage is asserted, not measured, until gate G2.1.
 ## spike-term: is a pure-Rust engine good enough? (ADR-003)
 
 ```text
-[1] plain text into grid: PASS (["hello qoro", "second line"])
+[1] plain text into grid: PASS (["hello qoop", "second line"])
 [2] SGR colour reaches cell state: PASS (c='R', fg=Named(Red), flags=Flags(BOLD))
 [3] bounded scrollback: PASS (history=1000, screen=24, total=1024)
 [4] damage tracking: PASS (quiet lines=[0, 23], after write to row 5 lines=[4, 23])

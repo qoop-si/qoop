@@ -2,7 +2,7 @@
   "codec_generation_min": 1,
   "codec_generation_max": 1,
   "client_id": "fixture-client",
-  "client_name": "qoro",
+  "client_name": "qoop",
   "client_version": "0.0.0",
   "codecs": {
     "control": ["control.json.v1"],
