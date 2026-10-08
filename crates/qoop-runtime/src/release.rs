@@ -57,7 +57,7 @@ pub fn fetch_tagged(version: &str, asset: &str) -> Result<Release, String> {
 }
 
 fn fetch_release(which: &str, asset: &str) -> Result<Release, String> {
-    let base = std::env::var(RELEASE_BASE_ENV)
+    let base = crate::legacy::var(RELEASE_BASE_ENV)
         .ok()
         .filter(|base| !base.is_empty())
         .unwrap_or_else(|| RELEASES.to_string());

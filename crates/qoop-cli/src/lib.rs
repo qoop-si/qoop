@@ -58,6 +58,10 @@ pub type Phone = fn(&[String]) -> std::io::Result<()>;
 
 /// `qoop`, with the phone app's part when the binary carries it.
 pub fn main_with(phone: Option<Phone>) {
+    // Before anything reads a path: what a machine that ran qoro keeps under that name
+    // moves to qoop, with the old name left as a link (see `legacy`).
+    qoop_runtime::legacy::move_home();
+    qoop_runtime::legacy::settle_binary_name();
     // One sentence and a failing exit, never the `Error: Custom { kind: .. }` dump that
     // returning the error from `main` prints: every refusal below is worded for a person.
     // Exit 2 when the command was called wrong, 1 when it failed.
@@ -160,7 +164,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
-            println!("qoop {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", qoop_runtime::legacy::version_line());
             Ok(())
         }
         Some("--help" | "-h") => {
@@ -291,9 +295,8 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
         // The state it would open next: a database from a newer build is found out here,
         // with every tab still in the daemon that is asking, and not after the exec.
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-        let db = paths::state_dir(&dir)
-            .map_err(std::io::Error::other)?
-            .join("qoop.db");
+        let db =
+            qoop_runtime::legacy::db_path(&paths::state_dir(&dir).map_err(std::io::Error::other)?);
         if db.exists() {
             qoop_store::Store::check_openable(&db).map_err(std::io::Error::other)?;
         }
@@ -750,10 +753,10 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
 
     let mut state: Option<String> = None;
-    let mut terminal: Option<u32> = std::env::var("QOOP_TERMINAL")
+    let mut terminal: Option<u32> = qoop_runtime::legacy::var("QOOP_TERMINAL")
         .ok()
         .and_then(|v| v.parse().ok());
-    let mut token: Option<String> = std::env::var("QOOP_TOKEN").ok();
+    let mut token: Option<String> = qoop_runtime::legacy::var("QOOP_TOKEN").ok();
     let mut visible_blocker = false;
     let mut visible_idle = false;
     let mut visible_working = false;
@@ -1368,8 +1371,8 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
 /// and the daemon treats the input as unattributed, exactly like before.
 fn cli_sender() -> (Option<u32>, Option<String>) {
     cli_sender_from(
-        std::env::var("QOOP_TERMINAL").ok(),
-        std::env::var("QOOP_TOKEN").ok(),
+        qoop_runtime::legacy::var("QOOP_TERMINAL").ok(),
+        qoop_runtime::legacy::var("QOOP_TOKEN").ok(),
     )
 }
 
@@ -2715,7 +2718,7 @@ fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
 fn existing_store(dir: &std::path::Path) -> std::io::Result<Option<qoop_store::Store>> {
     [paths::state_location(dir), dir.to_path_buf()]
         .into_iter()
-        .map(|d| d.join("qoop.db"))
+        .map(|d| qoop_runtime::legacy::db_path(&d))
         .find(|db| db.exists())
         .map(|db| qoop_store::Store::open_existing(&db).map_err(std::io::Error::other))
         .transpose()

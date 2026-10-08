@@ -17,11 +17,20 @@ use std::path::Path;
 /// on disk without the log it needs. Nothing happens when `to` already has a database: it
 /// is the one in use, and the one in `from` is left where it is and named.
 pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
-    let old = from.join("qoop.db");
+    // The name this build gives the database, then the one every build before the rename
+    // gave it (see `legacy`): a database in either is moved, and renamed once it is there.
+    for db in ["qoop.db", "qoro.db"] {
+        migrate_db(from, to, db)?;
+    }
+    Ok(())
+}
+
+fn migrate_db(from: &Path, to: &Path, db: &str) -> io::Result<()> {
+    let old = from.join(db);
     if from == to || !old.exists() {
         return Ok(());
     }
-    let new = to.join("qoop.db");
+    let new = to.join(db);
     if new.exists() {
         if holds_tabs(&new)? {
             eprintln!(
@@ -35,18 +44,19 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
         // One that never held a tab was made by a daemon of this build that started
         // somewhere with nothing to move (under another runtime directory, say). Taking it
         // as the real one would leave the real one where the system deletes it.
-        for (name, aside) in [
-            ("qoop.db", "qoop.db.empty"),
-            ("qoop.db-wal", "qoop.db.empty-wal"),
-            ("qoop.db-shm", "qoop.db.empty-shm"),
+        for (suffix, aside) in [
+            ("", ".empty"),
+            ("-wal", ".empty-wal"),
+            ("-shm", ".empty-shm"),
         ] {
-            if to.join(name).exists() {
-                std::fs::rename(to.join(name), to.join(aside))?;
+            let name = format!("{db}{suffix}");
+            if to.join(&name).exists() {
+                std::fs::rename(to.join(&name), to.join(format!("{db}{aside}")))?;
             }
         }
     }
     move_dir(&from.join("history"), &to.join("history"))?;
-    let moving = to.join("qoop.db.moving");
+    let moving = to.join(format!("{db}.moving"));
     remove_if_there(&moving)?;
     let target = moving
         .to_str()
@@ -70,8 +80,8 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(&moving, &new)?;
     // Best effort: some filesystems refuse to sync a directory, and the data is synced.
     let _ = std::fs::File::open(to).and_then(|d| d.sync_all());
-    for name in ["qoop.db", "qoop.db-wal", "qoop.db-shm"] {
-        remove_if_there(&from.join(name))?;
+    for suffix in ["", "-wal", "-shm"] {
+        remove_if_there(&from.join(format!("{db}{suffix}")))?;
     }
     eprintln!("qoopd: moved the database and history to {}", to.display());
     Ok(())
@@ -313,5 +323,23 @@ mod tests {
         assert_eq!(n, 1, "the empty database was kept over the real one");
         assert!(to.path().join("qoop.db.empty").exists());
         assert!(to.path().join("history/7/0.seg").exists());
+    }
+
+    /// What a build before the rename left in the runtime directory moves like the rest.
+    #[test]
+    fn a_database_under_the_old_name_moves_too() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        rusqlite::Connection::open(from.path().join("qoro.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE t (n); INSERT INTO t VALUES (3);")
+            .unwrap();
+        migrate(from.path(), to.path()).unwrap();
+        assert!(!from.path().join("qoro.db").exists());
+        let n: i64 = rusqlite::Connection::open(to.path().join("qoro.db"))
+            .unwrap()
+            .query_row("SELECT n FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3);
     }
 }

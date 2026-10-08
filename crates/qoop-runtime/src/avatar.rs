@@ -266,7 +266,7 @@ impl Avatar {
 /// Where the avatar lives: the override when set, else `qoop/avatar.json`
 /// under the person's own configuration, beside the hooks directory.
 pub fn avatar_path() -> PathBuf {
-    match std::env::var(AVATAR_ENV) {
+    match crate::legacy::var(AVATAR_ENV) {
         Ok(path) if !path.is_empty() => return PathBuf::from(path),
         _ => {}
     }

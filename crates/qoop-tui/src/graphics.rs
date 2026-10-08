@@ -66,7 +66,7 @@ impl GraphicsCap {
 /// config; a WezTerm that swallows the envelope still shows the picture's
 /// absence rather than garbage, and one variable turns the whole thing off.)
 pub fn detect() -> GraphicsCap {
-    match std::env::var("QOOP_GRAPHICS")
+    match qoop_runtime::legacy::var("QOOP_GRAPHICS")
         .unwrap_or_default()
         .to_lowercase()
         .as_str()

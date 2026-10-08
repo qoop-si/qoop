@@ -76,7 +76,9 @@ fn attach_once(bin: &Path, runtime_dir: &Path) -> std::io::Result<Duration> {
         // And the same token hygiene: a bench run inside a qoop terminal
         // must not leak that terminal's identity into the client.
         .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TOKEN")
         .env_remove("QOOP_TERMINAL")
+        .env_remove("QORO_TERMINAL")
         .stdin(dup_slave(&pty)?)
         .stdout(dup_slave(&pty)?)
         .stderr(Stdio::null())

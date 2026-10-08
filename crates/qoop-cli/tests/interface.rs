@@ -415,6 +415,7 @@ impl Interface {
             // A test run from inside a qoop terminal inherits that terminal's session, which
             // moves the socket to a path this harness never looks at.
             .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
@@ -449,8 +450,11 @@ impl Interface {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
         cmd.env("QOOP_RUNTIME_DIR", dir)
             .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
             .env_remove("QOOP_TERMINAL")
+            .env_remove("QORO_TERMINAL")
             .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN")
             // Not the terminal running the tests: in iTerm2 or Terminal the interface would
             // install its icon font into the developer's own font folder, and the markers of
             // the others would turn icons on for the first frames of a pty that never answers.

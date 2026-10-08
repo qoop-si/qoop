@@ -53,9 +53,13 @@ impl Machine {
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("SHELL", "/bin/sh")
             .env_remove("QOOP_RUNTIME_DIR")
+            .env_remove("QORO_RUNTIME_DIR")
             .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
             .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN")
             .env_remove("QOOP_TERMINAL")
+            .env_remove("QORO_TERMINAL")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if old {

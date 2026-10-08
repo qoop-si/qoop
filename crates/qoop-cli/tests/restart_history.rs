@@ -50,8 +50,11 @@ fn qoop(dir: &Path, args: &[&str]) -> (bool, String) {
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .env_remove("QOOP_TERMINAL")
+        .env_remove("QORO_TERMINAL")
         .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TOKEN")
         .output()
         .expect("run qoop");
     (

@@ -149,7 +149,7 @@ pub fn current_env() -> Env {
     let var = |name: &str| std::env::var(name).ok();
     let set = |name: &str| std::env::var_os(name).is_some();
     Env {
-        qoop_color: var("QOOP_COLOR"),
+        qoop_color: qoop_runtime::legacy::var("QOOP_COLOR").ok(),
         term: var("TERM"),
         colorterm: var("COLORTERM"),
         term_program: var("TERM_PROGRAM"),

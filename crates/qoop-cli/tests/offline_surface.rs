@@ -123,6 +123,7 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .output();
     let here = dir.path().display().to_string();
     (

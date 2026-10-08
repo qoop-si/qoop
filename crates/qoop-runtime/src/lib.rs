@@ -11,6 +11,7 @@ pub mod control;
 pub mod daemon;
 pub mod handoff;
 pub mod idle;
+pub mod legacy;
 pub mod lock;
 pub mod paths;
 pub mod release;

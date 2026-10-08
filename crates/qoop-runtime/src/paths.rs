@@ -56,11 +56,12 @@ pub enum PathError {
 /// with a world-writable socket.
 pub fn runtime_dir() -> Result<PathBuf, PathError> {
     let base = runtime_base()?;
-    if let Ok(name) = std::env::var(SESSION_ENV) {
+    if let Ok(name) = crate::legacy::var(SESSION_ENV) {
         only_default(&name, &base)?;
     }
     let dir = session_dir(&base, DEFAULT_SESSION);
     ensure_private_dir(&dir)?;
+    crate::legacy::reach_old_daemon(&dir);
     Ok(dir)
 }
 
@@ -80,7 +81,7 @@ pub fn default_runtime_base() -> PathBuf {
 /// Verified the same way the daemon's directory is, because a world writable parent is a
 /// parent somebody else can put a directory into.
 pub fn runtime_base() -> Result<PathBuf, PathError> {
-    let dir = match std::env::var(RUNTIME_DIR_ENV) {
+    let dir = match crate::legacy::var(RUNTIME_DIR_ENV) {
         Ok(explicit) => PathBuf::from(explicit),
         // The verification below matters most for the temp directory fallback: a shared temp
         // directory is exactly where another user could have created the path first.
@@ -88,6 +89,7 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
     };
     ensure_private_dir(&dir)?;
     ensure_private_dir(&sessions_dir(&dir))?;
+    crate::legacy::reach_old_bridge(&dir);
     Ok(dir)
 }
 
@@ -245,7 +247,7 @@ pub fn state_dir(session: &Path) -> Result<PathBuf, PathError> {
 /// `qoop ls` that must not leave a directory behind.
 pub fn state_location(session: &Path) -> PathBuf {
     state_location_from(
-        std::env::var_os(RUNTIME_DIR_ENV).is_some(),
+        crate::legacy::var_os(RUNTIME_DIR_ENV).is_some(),
         data_dir(),
         session,
     )
@@ -296,7 +298,7 @@ pub fn only_default(name: &str, base: &Path) -> Result<(), PathError> {
 }
 
 pub fn lock_path(dir: &Path) -> PathBuf {
-    dir.join("qoopd.lock")
+    dir.join(crate::legacy::STATE_LOCK)
 }
 
 /// Where `qoop update --check` leaves the newest version it saw on GitHub Releases.
@@ -305,7 +307,7 @@ pub fn lock_path(dir: &Path) -> PathBuf {
 /// touching the network: the TUI never fetches, it only reads this file. Built without
 /// creating or verifying anything, because reading a notice must not create state.
 pub fn update_notice_path() -> PathBuf {
-    let base = match std::env::var(RUNTIME_DIR_ENV) {
+    let base = match crate::legacy::var(RUNTIME_DIR_ENV) {
         Ok(explicit) => PathBuf::from(explicit),
         Err(_) => default_runtime_base(),
     };

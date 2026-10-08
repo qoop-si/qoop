@@ -46,8 +46,8 @@ impl Daemon {
         cmd.env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"));
         if clear_qoop_env {
-            cmd.env_remove("QOOP_TERMINAL");
-            cmd.env_remove("QOOP_TOKEN");
+            cmd.env_remove("QOOP_TERMINAL").env_remove("QORO_TERMINAL");
+            cmd.env_remove("QOOP_TOKEN").env_remove("QORO_TOKEN");
         }
         let out = cmd.output().expect("run hook-report");
         let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -276,6 +276,7 @@ fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

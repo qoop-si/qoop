@@ -73,7 +73,9 @@ impl Daemon {
             // other harnesses in this repo strip them for the same reason.
             .env_remove(qoop_runtime::paths::SESSION_ENV)
             .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN")
             .env_remove("QOOP_TERMINAL")
+            .env_remove("QORO_TERMINAL")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -120,7 +122,9 @@ fn stop_daemon(runtime: &Runtime) {
         .env("XDG_CONFIG_HOME", runtime.path().join("config"))
         .env_remove(qoop_runtime::paths::SESSION_ENV)
         .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TOKEN")
         .env_remove("QOOP_TERMINAL")
+        .env_remove("QORO_TERMINAL")
         .output()
         .expect("run qoop stop");
     assert!(

@@ -51,8 +51,11 @@ impl Daemon {
             .current_dir(cwd)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env_remove("QOOP_TERMINAL")
+            .env_remove("QORO_TERMINAL")
             .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN")
             .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
             .output()
             .expect("run qoop")
     }

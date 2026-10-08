@@ -50,10 +50,12 @@ const USAGE: &str = "usage:
 
 /// This terminal and its token, when run inside a qoop terminal.
 fn here() -> (Option<u32>, Option<String>) {
-    let terminal = std::env::var("QOOP_TERMINAL")
+    let terminal = qoop_runtime::legacy::var("QOOP_TERMINAL")
         .ok()
         .and_then(|t| t.parse().ok());
-    let token = std::env::var("QOOP_TOKEN").ok().filter(|t| !t.is_empty());
+    let token = qoop_runtime::legacy::var("QOOP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     match (terminal, token) {
         (Some(t), Some(k)) => (Some(t), Some(k)),
         _ => (None, None),

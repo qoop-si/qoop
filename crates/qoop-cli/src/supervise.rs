@@ -741,7 +741,10 @@ pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Res
 /// started in, read before `--session` replaced it.
 /// The terminal this command runs in, when it runs in one of this machine's.
 fn own_terminal() -> Option<u32> {
-    std::env::var("QOOP_TERMINAL").ok()?.parse().ok()
+    qoop_runtime::legacy::var("QOOP_TERMINAL")
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// `qoop wait`: block until a terminal reaches a state.

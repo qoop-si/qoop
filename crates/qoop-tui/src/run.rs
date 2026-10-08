@@ -257,7 +257,7 @@ const TOAST_MS: u64 = 2500;
 
 /// Whether the person asked to see what agents cost: `QOOP_USAGE=1`, and nothing else.
 fn usage_on() -> bool {
-    std::env::var("QOOP_USAGE").is_ok_and(|v| v.trim() == "1")
+    qoop_runtime::legacy::var("QOOP_USAGE").is_ok_and(|v| v.trim() == "1")
 }
 
 /// Work done off the loop's own thread, handed back when it is done.
@@ -367,7 +367,7 @@ fn apply_usage(
 /// the shimmer that needs colour already degrades to a still marker through
 /// the colour level, so the two switches never fight.
 fn motion_on() -> bool {
-    std::env::var("QOOP_MOTION").map_or(true, |v| v.trim() != "0")
+    qoop_runtime::legacy::var("QOOP_MOTION").map_or(true, |v| v.trim() != "0")
 }
 
 /// Whether the outer terminal reports the mouse usefully, decided from the

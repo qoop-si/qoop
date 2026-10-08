@@ -27,7 +27,8 @@ pub enum CaptureError {
 /// shown as user authored overrides and are excluded from capture. Capturing them would put
 /// one terminal's token into another terminal's Setup, which is the one value in the
 /// environment that must not travel.
-pub const DAEMON_INJECTED: &[&str] = &["QOOP_TOKEN", "QOOP_TERMINAL"];
+pub const DAEMON_INJECTED: &[&str] =
+    &["QOOP_TOKEN", "QOOP_TERMINAL", "QORO_TOKEN", "QORO_TERMINAL"];
 
 /// Build a Setup from a launch intent.
 pub fn capture_from(

@@ -1123,6 +1123,8 @@ impl Daemon {
             }
         };
 
+        crate::legacy::point_old_path_at(&socket);
+
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 
         // Only now, with the socket bound: a daemon still stopping keeps its store open for
@@ -1134,7 +1136,7 @@ impl Daemon {
         // In a verified private directory: the runtime one, or `paths::state_dir`, which
         // is checked the same way.
         let store = crate::store::StoreHandle::new(
-            qoop_store::Store::open(&state.join("qoop.db")).map_err(io::Error::other)?,
+            qoop_store::Store::open(&crate::legacy::db_path(state)).map_err(io::Error::other)?,
         );
         let workspace = match store.open_workspace().await {
             Ok(id) => id,
@@ -1419,7 +1421,7 @@ impl Daemon {
         // off (the default) means no task and zero wakeups, which is what keeps ADR-009's
         // macOS literal-zero-idle claim intact. On, it parks while nothing is awake and
         // otherwise wakes on an adaptive tick to put to sleep a space idle past the time.
-        if std::env::var_os(crate::idle::IDLE_TIMEOUT_ENV).is_some() {
+        if crate::legacy::var_os(crate::idle::IDLE_TIMEOUT_ENV).is_some() {
             eprintln!(
                 "qoopd: {} is no longer read: idle spaces sleep after `[sleep] idle_minutes` in \
                  config.toml",
@@ -1825,7 +1827,7 @@ pub struct RenderQueue {
 /// there is its own measurement error.
 fn trace_latency() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QOOP_TRACE_LATENCY").is_ok())
+    *ON.get_or_init(|| crate::legacy::var("QOOP_TRACE_LATENCY").is_ok())
 }
 
 /// Roughly what a snapshot costs to hold. The line text dominates; the exact figure does
@@ -6369,8 +6371,12 @@ fn vet_for_sleep(
         qoop_pty::sys::argv_of(qoop_pty::Pid(pid))
             .iter()
             .any(|arg| {
-                arg.split_whitespace()
-                    .any(|w| w.trim_matches('\'') == "QOOP_SLEEP_SAFE=1")
+                arg.split_whitespace().any(|w| {
+                    matches!(
+                        w.trim_matches('\''),
+                        "QOOP_SLEEP_SAFE=1" | "QORO_SLEEP_SAFE=1"
+                    )
+                })
             })
     };
     let blockers = crate::idle::sleep_blockers(table, leader, foreground, tty, &sleep_safe);
@@ -8314,6 +8320,9 @@ fn start_shell(
     // first command onward.
     cmd.env("QOOP_TERMINAL", stream.to_string());
     cmd.env("QOOP_TOKEN", token.as_str());
+    // The names the hooks of an agent started before the rename read.
+    cmd.env("QORO_TERMINAL", stream.to_string());
+    cmd.env("QORO_TOKEN", token.as_str());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

@@ -35,8 +35,11 @@ fn qoop(dir: &Path) -> Command {
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("SHELL", "/bin/sh")
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .env_remove("QOOP_TERMINAL")
-        .env_remove("QOOP_TOKEN");
+        .env_remove("QORO_TERMINAL")
+        .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TOKEN");
     command
 }
 

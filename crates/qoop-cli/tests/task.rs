@@ -21,7 +21,9 @@ fn start_in(dir: &Path) -> Child {
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("SHELL", "/bin/sh")
         .env_remove("QOOP_TERMINAL")
+        .env_remove("QORO_TERMINAL")
         .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -67,7 +69,9 @@ impl Daemon {
             .env("QOOP_RUNTIME_DIR", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env_remove("QOOP_TERMINAL")
-            .env_remove("QOOP_TOKEN");
+            .env_remove("QORO_TERMINAL")
+            .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN");
         for (k, v) in env {
             cmd.env(k, v);
         }

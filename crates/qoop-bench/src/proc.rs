@@ -75,7 +75,9 @@ impl DaemonProcess {
             // process spawned later must not mistake itself for that
             // terminal's shell, so they are stripped at every spawn.
             .env_remove("QOOP_TOKEN")
+            .env_remove("QORO_TOKEN")
             .env_remove("QOOP_TERMINAL")
+            .env_remove("QORO_TERMINAL")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
