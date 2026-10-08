@@ -14,7 +14,8 @@ pub const REMOTES_ENV: &str = "QOOP_REMOTES";
 /// The line the remote command prints right before qoop starts. Everything before it is
 /// whatever the remote's shell startup printed, and a banner read as a frame is a
 /// connection that fails on every attempt with a message about frame lengths.
-pub const RELAY_MARKER: &str = "-----qoop-relay-----";
+// Fixed wire label kept from the old name: crosses the link to remotes of any version.
+pub const RELAY_MARKER: &str = "-----qoro-relay-----";
 
 /// How much a remote shell may print before the marker. A login banner is a few lines; a
 /// megabyte is a shell that is not going to start qoop.
@@ -275,5 +276,12 @@ mod tests {
             .expect("sh");
         assert_eq!(out.status.code(), Some(127));
         assert!(String::from_utf8_lossy(&out.stderr).contains("not installed"));
+    }
+
+    /// The line before the protocol is the old one: the remote's shell prints what the
+    /// script it was sent says, and a remote on 0.7.x is also read by Macs of that version.
+    #[test]
+    fn the_relay_marker_is_the_old_string() {
+        assert_eq!(RELAY_MARKER, "-----qoro-relay-----");
     }
 }

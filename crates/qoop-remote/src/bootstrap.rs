@@ -52,8 +52,10 @@ impl RemoteShell {
 /// Everything the bootstrap reads is between two markers it chose, because a login shell
 /// prints a banner, a framework prints its startup, and a corporate profile prints a legal
 /// notice. Reading the first line of output is reading somebody's message of the day.
-pub const MARKER_BEGIN: &str = "-----qoop-begin-----";
-pub const MARKER_END: &str = "-----qoop-end-----";
+// Fixed wire label kept from the old name: crosses the link to remotes of any version.
+pub const MARKER_BEGIN: &str = "-----qoro-begin-----";
+// Fixed wire label kept from the old name: crosses the link to remotes of any version.
+pub const MARKER_END: &str = "-----qoro-end-----";
 
 /// Wrap a command so its output can be found in whatever else the shell says.
 pub fn marker_command(command: &str) -> String {
@@ -210,5 +212,19 @@ mod tests {
             RemoteShell::Unknown.with_env("A", "1", "qoopd"),
             "A='1' qoopd"
         );
+    }
+
+    /// What a remote that still runs 0.7.x prints back: the markers are the old strings, so a
+    /// Mac of this build reads the answer of a machine it has not updated yet.
+    #[test]
+    fn an_old_remotes_output_is_read_between_the_old_markers() {
+        let old =
+            "Last login: Tue\n-----qoro-begin-----\n{\"version\":\"0.7.0\"}\n-----qoro-end-----\n";
+        assert_eq!(
+            between_markers(old).as_deref(),
+            Some("{\"version\":\"0.7.0\"}")
+        );
+        assert_eq!(MARKER_BEGIN, "-----qoro-begin-----");
+        assert_eq!(MARKER_END, "-----qoro-end-----");
     }
 }

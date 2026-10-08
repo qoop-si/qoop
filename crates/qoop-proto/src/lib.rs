@@ -11,7 +11,7 @@ pub mod reassembly;
 
 pub use frame::{Channel, DecodeError, EncodeError, Flags, Frame, MAX_FRAME, MAX_PAYLOAD};
 pub use handshake::{
-    CODEC_GENERATION, ClientHello, CodecOffers, HandshakeOutcome, RefuseReason, SelectedCodecs,
-    ServerCapabilities, ServerRefuse, ServerWelcome, negotiate,
+    CODEC_GENERATION, ClientHello, CodecOffers, HandshakeOutcome, INTERFACE_ID, RefuseReason,
+    SelectedCodecs, ServerCapabilities, ServerRefuse, ServerWelcome, negotiate,
 };
 pub use reassembly::{MAX_REASSEMBLED, Message, Reassembler, ReassemblyError, chunk};

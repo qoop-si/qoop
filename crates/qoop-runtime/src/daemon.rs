@@ -2114,7 +2114,8 @@ async fn serve_client(
     // a focus sent the moment the interface is in must neither miss it nor leave its pid
     // out of the answer.
     let mut focus = connections.focus.subscribe();
-    if hello.client_id == "qoop-tui" && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
+    if hello.client_id == qoop_proto::INTERFACE_ID
+        && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
     {
         connections.mark_interface(&client);
     }

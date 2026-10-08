@@ -4992,7 +4992,7 @@ pub async fn run(socket: &Path) -> io::Result<()> {
 /// moment anything else happens: nothing is blocked, nothing is asked, and an agent with no
 /// hook is still read from its screen.
 pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Result<()> {
-    let (stream, leftover) = client::connect(socket, "qoop-tui").await?;
+    let (stream, leftover) = client::connect(socket, qoop_proto::INTERFACE_ID).await?;
     run_stream(stream, leftover, notice, Some(last_focus_path(socket))).await
 }
 

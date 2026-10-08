@@ -114,7 +114,12 @@ pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
     let connected = tokio::time::timeout(OPEN_DEADLINE, async {
         let mut out = BufReader::new(stdout);
         skip_to_marker(&mut out).await?;
-        client::handshake(tokio::io::join(out, stdin), "qoop-tui", Some(key)).await
+        client::handshake(
+            tokio::io::join(out, stdin),
+            qoop_proto::INTERFACE_ID,
+            Some(key),
+        )
+        .await
     })
     .await;
     let failure = |e: io::Error| {
@@ -742,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn a_banner_is_skipped_and_the_protocol_after_it_is_kept() {
         let (result, rest) =
-            skip(b"Welcome to devbox\nlast login: never\n-----qoop-relay-----\n\x00\x01binary")
+            skip(b"Welcome to devbox\nlast login: never\n-----qoro-relay-----\n\x00\x01binary")
                 .await;
         result.expect("marker found");
         assert_eq!(rest, b"\x00\x01binary");
@@ -750,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_marker_inside_a_longer_line_is_not_the_marker() {
-        let (result, _) = skip(b"echo -----qoop-relay----- later\n").await;
+        let (result, _) = skip(b"echo -----qoro-relay----- later\n").await;
         assert_eq!(
             result.expect_err("eof").kind(),
             io::ErrorKind::UnexpectedEof

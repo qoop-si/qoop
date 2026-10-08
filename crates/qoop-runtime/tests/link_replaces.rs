@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 /// A handshaken connection that says which link it is, or nothing.
 async fn linked(d: &TestDaemon, key: Option<&str>) -> UnixStream {
     let stream = UnixStream::connect(d.socket()).await.expect("connect");
-    let (stream, _, _) = qoop_runtime::client::handshake(stream, "qoop-tui", key)
+    let (stream, _, _) = qoop_runtime::client::handshake(stream, qoop_proto::INTERFACE_ID, key)
         .await
         .expect("handshake");
     stream
@@ -128,9 +128,10 @@ async fn a_late_welcome_does_not_end_the_newer_connection() {
     let slow = UnixStream::connect(d.socket()).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut newer = linked(&d, Some("link-a")).await;
-    let (mut slow, _, _) = qoop_runtime::client::handshake(slow, "qoop-tui", Some("link-a"))
-        .await
-        .expect("handshake");
+    let (mut slow, _, _) =
+        qoop_runtime::client::handshake(slow, qoop_proto::INTERFACE_ID, Some("link-a"))
+            .await
+            .expect("handshake");
     assert!(
         !closed(&mut newer, Duration::from_secs(2)).await,
         "an older attempt's late welcome ended the newer connection"

@@ -2267,7 +2267,7 @@ pub async fn run(
     only: Option<i64>,
 ) -> io::Result<()> {
     let local = match socket {
-        Some(socket) => Some(client::connect(socket, "qoop-tui").await?),
+        Some(socket) => Some(client::connect(socket, qoop_proto::INTERFACE_ID).await?),
         None => None,
     };
     // A megabyte each way: a full screen snapshot is tens of kilobytes, and the interface

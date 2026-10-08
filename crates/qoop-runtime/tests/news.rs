@@ -76,7 +76,7 @@ async fn news_is_on_the_row_while_its_interface_is_attached() {
     let mut asker = d.attach("qoop-agents").await;
     assert!(!news(&mut asker, terminal).await, "nothing said yet");
 
-    let mut ui = d.attach("qoop-tui").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
     say(&mut ui, vec![terminal]).await;
     assert!(
         changed(&mut index_rd, &mut index_in, terminal).await,

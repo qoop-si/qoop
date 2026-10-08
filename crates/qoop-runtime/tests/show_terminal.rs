@@ -36,7 +36,7 @@ async fn shown(
 async fn an_interface_is_told_and_the_asker_learns_its_process() {
     let d = TestDaemon::start().await;
     let terminal = d.terminals().streams()[0];
-    let (ui, mut ui_in) = client::connect(d.socket(), "qoop-tui")
+    let (ui, mut ui_in) = client::connect(d.socket(), qoop_proto::INTERFACE_ID)
         .await
         .expect("connect");
     let (mut ui_rd, _ui_wr) = ui.into_split();

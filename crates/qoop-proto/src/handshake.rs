@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 /// application release.
 pub const CODEC_GENERATION: u32 = 1;
 
+/// The client id the interface says in its hello, which the daemon knows it by (`qoop focus`
+/// finds its windows through it).
+// Fixed wire label kept from the old name: a daemon of either version knows the interface by it.
+pub const INTERFACE_ID: &str = "qoro-tui";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodecOffers {
     pub control: Vec<String>,
@@ -273,5 +278,10 @@ mod tests {
         let h = hello();
         let s = serde_json::to_string(&h).unwrap();
         assert_eq!(serde_json::from_str::<ClientHello>(&s).unwrap(), h);
+    }
+
+    #[test]
+    fn the_interface_is_known_to_every_daemon_by_its_old_id() {
+        assert_eq!(INTERFACE_ID, "qoro-tui");
     }
 }
