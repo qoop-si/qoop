@@ -39,8 +39,16 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 /// it has swapped the binary: silent, and nothing when the notch was never installed.
 pub fn restart_if_installed() {
     #[cfg(target_os = "macos")]
-    if let Some(plist) = mac::plist_path().filter(|p| p.exists()) {
-        let _ = crate::launchd::reload(mac::LABEL, &plist);
+    {
+        // A login item from before the rename becomes one under the new label, with
+        // nothing left under the old (see `legacy`).
+        let had_old = qoop_runtime::legacy::retire_launchd_agent(mac::OLD_LABEL);
+        if let Some(plist) = mac::plist_path().filter(|p| p.exists() || had_old) {
+            if had_old {
+                let _ = mac::write_plist(&plist);
+            }
+            let _ = crate::launchd::reload(mac::LABEL, &plist);
+        }
     }
 }
 
@@ -71,7 +79,10 @@ mod mac {
 
     static APP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qoop-notch"));
 
-    pub const LABEL: &str = "qoop.notch";
+    pub const LABEL: &str = "si.qoop.notch";
+
+    /// What the login item was called before the rename.
+    pub const OLD_LABEL: &str = "qoro.notch";
 
     fn home() -> std::io::Result<PathBuf> {
         std::env::var_os("HOME")
@@ -162,7 +173,7 @@ mod mac {
         let env: String = ["QOOP_RUNTIME_DIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
             .iter()
             .filter_map(|k| {
-                std::env::var(k)
+                qoop_runtime::legacy::var(k)
                     .ok()
                     .filter(|v| !v.is_empty())
                     .map(|v| (*k, v))
@@ -194,6 +205,18 @@ mod mac {
         )
     }
 
+    /// The login item's plist, running the binary this one is (the file behind any link, the
+    /// one an update replaces).
+    pub fn write_plist(plist_path: &std::path::Path) -> std::io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        let dir = plist_path.parent().expect("a file under LaunchAgents");
+        std::fs::create_dir_all(dir)?;
+        let staged = plist_path.with_extension("plist.new");
+        std::fs::File::create(&staged)?.write_all(plist(&exe.to_string_lossy()).as_bytes())?;
+        std::fs::rename(&staged, plist_path)
+    }
+
     pub fn install() -> std::io::Result<()> {
         match macos_major() {
             Some(v) if v >= 14 => {}
@@ -211,13 +234,9 @@ mod mac {
         {
             eprintln!("qoop: notch.enabled stays false ({why}); fix it with qoop config");
         }
-        let exe = std::env::current_exe()?;
         let plist_path = plist_path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
-        let dir = plist_path.parent().expect("a file under LaunchAgents");
-        std::fs::create_dir_all(dir)?;
-        let staged = plist_path.with_extension("plist.new");
-        std::fs::File::create(&staged)?.write_all(plist(&exe.to_string_lossy()).as_bytes())?;
-        std::fs::rename(&staged, &plist_path)?;
+        write_plist(&plist_path)?;
+        qoop_runtime::legacy::retire_launchd_agent(OLD_LABEL);
         // A notch already loaded is taken down first, so a second install picks up a
         // moved binary rather than failing on a label that is taken.
         crate::launchd::reload(LABEL, &plist_path).map_err(|e| {

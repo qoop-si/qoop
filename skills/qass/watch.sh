@@ -33,7 +33,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd -P)"
 dir="@QASS_DATA@"   # filled in by `qoop skills install`
 mkdir -p "$dir"
-self="${QOOP_TERMINAL:-0}"
+self="${QOOP_TERMINAL:-${QORO_TERMINAL:-0}}"
 settle="${QASS_SETTLE:-20}"
 
 defs='

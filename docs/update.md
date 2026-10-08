@@ -13,6 +13,38 @@ Each one carries four binaries, `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `qoop update` and `scripts/install.sh` look for exactly `qoop-<triple>.tar.gz` for the
 machine they run on (an Apple silicon Mac gets the arm64 build even from a Rosetta shell).
 
+The first release under the name qoop also carries the old names, `qoro-<triple>.tar.gz`
+holding a `qoro` file, each with its sha256. The asset is the same binary: the file inside
+answers `--version` by the name it is run as, so a 0.7.x `qoro update`, which unpacks the
+`qoro` entry and wants `qoro <version>` back, installs it and the new build takes over from
+there. Nothing newer than that release needs them.
+
+## Moving from qoro
+
+Everything a machine kept under the name qoro is picked up by the first command of this
+build, with nothing stopped. The details are in `crates/qoop-runtime/src/legacy.rs`, which is
+deleted once no 0.7.x daemon or agent started before the rename is left:
+
+- `~/.config/qoro`, the data directory and the log directory are renamed to `qoop`, and
+  the old name stays a link to the new one.
+- `~/.local/bin/qoro` becomes a link to `qoop`. A running 0.7.x daemon moves onto the path it
+  was started from, so it lands on this build with its tabs ([Tabs keep running through a
+  move](#tabs-keep-running-through-a-move)).
+- The new socket path reaches a 0.7.x daemon that is still up; once the daemon is this
+  build, the old socket path reaches it, for the phone bridge and any interface left open.
+- A database a 0.7.x daemon made keeps the name `qoro.db`, and the state lock keeps the name
+  `qorod.lock`: renaming either would strand a rollback and the exclusion between old and new
+  daemons. New installs use `qoop.db`.
+- `hooks install` and `skills install` replace the hooks and the skill of the old name. The old
+  hook script stays on disk, because an agent that is already running keeps calling it; it
+  goes with `hooks uninstall`.
+- `QOOP_*` variables fall back to the `QORO_*` of a shell, a service or a tab that predates
+  the rename, and a tab gets both.
+- The notch's login item moves from `qoro.notch` to `si.qoop.notch`.
+
+To go back to a 0.7.x build, put its binary at `~/.local/bin/qoro` (replacing the link) and
+start it: it finds its database, config and data through the links.
+
 ## Checking and installing
 
 ```

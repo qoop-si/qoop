@@ -35,6 +35,7 @@ fn stop_session(runtime: &Path, session: &str) {
         .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -46,6 +47,7 @@ fn stop(runtime: &Path) {
         .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
         .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -460,6 +462,7 @@ fn scenario() {
                     .env("QOOP_RUNTIME_DIR", runtime)
                     .env("XDG_CONFIG_HOME", runtime.join("config"))
                     .env_remove("QOOP_SESSION")
+                    .env_remove("QORO_SESSION")
                     .output()
                     .expect("read");
                 String::from_utf8_lossy(&out.stdout).into_owned()
@@ -654,14 +657,16 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
         std::fs::read(qoop()).expect("qoop"),
         "what arrived is not the binary the release holds"
     );
-    let left: Vec<String> = std::fs::read_dir(bare.join(".local/bin"))
+    // The binary and the `qoro` link beside it for what still says the old name.
+    let mut left: Vec<String> = std::fs::read_dir(bare.join(".local/bin"))
         .expect("bin")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
+    left.sort();
     assert_eq!(
         left,
-        vec!["qoop".to_string()],
+        vec!["qoop".to_string(), "qoro".to_string()],
         "a staged copy was left behind"
     );
 

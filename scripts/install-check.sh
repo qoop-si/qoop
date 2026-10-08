@@ -52,6 +52,7 @@ mkdir -p "$T/home"
 sh scripts/install.sh >/dev/null || fail "happy path exited nonzero"
 [ -x "$QOOP_DEST" ] || fail "binary missing at QOOP_DEST"
 [ "$("$QOOP_DEST" --version)" = "qoop 9.9.9" ] || fail "installed binary reports wrong version"
+[ "$(readlink "$T/dest/qoro")" = "qoop" ] || fail "the old name is not a link to qoop"
 grep -q "hooks install" "$T/calls" || fail "hooks install was not delegated"
 grep -q "skills install" "$T/calls" || fail "skills install was not delegated"
 grep -q "bridge reload" "$T/calls" || fail "bridge reload was not delegated"
@@ -81,6 +82,14 @@ mkdir -p "$T/oldbin"
 cp "$T/fake/old-qoop" "$T/oldbin/qoop"
 PATH="$T/oldbin:$PATH" QOOP_DEST="$T/dest2/qoop" sh scripts/install.sh >/dev/null || fail "existing-binary path exited nonzero"
 [ ! -e "$T/dest2/qoop" ] || fail "existing binary was replaced instead of redirecting to update"
+
+# An install that still has the old name counts as an install.
+printf '#!/bin/sh\necho "qoro 0.0.1"\n' > "$T/fake/old-qoro"
+chmod 0755 "$T/fake/old-qoro"
+mkdir -p "$T/oldname"
+cp "$T/fake/old-qoro" "$T/oldname/qoro"
+PATH="$T/oldname:$PATH" QOOP_DEST="$T/dest4/qoop" sh scripts/install.sh >/dev/null || fail "old-name path exited nonzero"
+[ ! -e "$T/dest4/qoop" ] || fail "an install under the old name was not left to update"
 
 # Wrong version in tarball: refused, nothing installed.
 release 1.2.3

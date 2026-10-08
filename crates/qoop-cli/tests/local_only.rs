@@ -425,8 +425,10 @@ fn scenario() {
         "something reached the saved hub on an unpaired machine"
     );
     let left: Vec<&Path> = [
-        Path::new("Library/LaunchAgents/dev.qoop.bridge.plist"),
+        Path::new("Library/LaunchAgents/si.qoop.bridge.plist"),
+        Path::new("Library/LaunchAgents/dev.qoro.bridge.plist"),
         Path::new(".config/systemd/user/qoop-bridge.service"),
+        Path::new(".config/systemd/user/qoro-bridge.service"),
         Path::new("config/systemd/user/qoop-bridge.service"),
         Path::new("data/qoop/machine.key"),
     ]

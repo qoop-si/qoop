@@ -125,11 +125,13 @@ pub fn shell_quote(word: &str) -> String {
 /// parameter rather than part of the script: data spliced into a script is a script
 /// somebody else wrote. qoop is looked for on the PATH and in the two places an install
 /// puts it, because a non-interactive ssh command gets a PATH without whatever the
-/// person's interactive profile adds.
+/// person's interactive profile adds. A machine that has not been updated since the
+/// rename has it as `qoro`: asked for second, and gone with the last 0.7.x machine.
 pub fn remote_command(verb: &str) -> String {
     let script = format!(
         "printf '%s\\n' {RELAY_MARKER}; \
-         for q in qoop \"$HOME/.local/bin/qoop\" \"$HOME/.cargo/bin/qoop\"; do \
+         for q in qoop \"$HOME/.local/bin/qoop\" \"$HOME/.cargo/bin/qoop\" \
+         qoro \"$HOME/.local/bin/qoro\" \"$HOME/.cargo/bin/qoro\"; do \
          if command -v \"$q\" >/dev/null 2>&1; then exec \"$q\" --session default \"$1\"; fi; \
          done; echo 'qoop is not installed on this host' >&2; exit 127"
     );

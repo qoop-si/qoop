@@ -10,6 +10,8 @@
 6. Run `cargo fmt --check`, `cargo clippy --workspace --all-targets`,
    `uv run python scripts/check-prose.py` and the tests you touched, then
    `cargo test --workspace`. There is no CI: these are the gate.
+   Run the tests with `HOME` and `TMPDIR` pointed at a temp directory: a test that starts `qoop`
+   without its own home moves that home's `qoro` directories to `qoop` (see `legacy.rs`).
 7. Run it for real and keep the output: the CLI in a qoop or tmux terminal, the app on a
    simulator or device, a screenshot for anything visual. Never on the owner's live daemon,
    agents or qass: use an isolated `QOOP_RUNTIME_DIR`.
@@ -42,7 +44,7 @@ comment, publishing), and the repo going public.
 
 - where: `installed ~/.local/bin/qoop`
 - check: its mtime is after the merge and `~/.local/bin/qoop --version` runs; `launchctl list |
-  grep dev.qoop.bridge` shows a PID. Then the command the task changed, against an isolated
+  grep si.qoop.bridge` shows a PID. Then the command the task changed, against an isolated
   stack only: `mktemp -d /tmp/qv.XXXXXX` prints `<s>`, and every qoop command is written out
   as `env QOOP_RUNTIME_DIR=<s> XDG_CONFIG_HOME=<s>/c XDG_DATA_HOME=<s>/d ~/.local/bin/qoop
   <args>` (start with `ensure-awake`, end with `stop`), its output kept; then `rm -rf <s>`.

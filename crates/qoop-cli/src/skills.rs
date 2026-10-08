@@ -210,17 +210,28 @@ fn status_of(home: &Path, target: &Target) -> &'static str {
     }
 }
 
+/// Take away the skill this agent was given before the rename, so it is not told twice.
+///
+/// ponytail: with `legacy`; nothing else of the skills directory is touched.
+fn remove_old_skill(home: &Path, target: &Target) -> bool {
+    let dir = home.join(target.dir.replacen("qoop", "qoro", 1));
+    let gone = std::fs::remove_file(dir.join(FILE)).is_ok();
+    let _ = std::fs::remove_dir(&dir);
+    gone
+}
+
 /// Write one agent's skill, answering whether anything changed.
 fn install_into(home: &Path, target: &Target) -> std::io::Result<bool> {
     let path = path_of(home, target);
-    if current(home, target) {
-        return Ok(false);
+    let mut changed = false;
+    if !current(home, target) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, BODY)?;
+        changed = true;
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, BODY)?;
-    Ok(true)
+    Ok(remove_old_skill(home, target) | changed)
 }
 
 /// Write qass's files, answering whether anything changed.
@@ -331,6 +342,7 @@ fn qass_current(home: &Path, dirs: &QassDirs, target: &Target) -> bool {
 /// else's files stays.
 fn remove_from(home: &Path, target: &Target) -> std::io::Result<bool> {
     let path = path_of(home, target);
+    let old = remove_old_skill(home, target);
     match std::fs::remove_file(&path) {
         Ok(()) => {
             if let Some(parent) = path.parent()
@@ -340,7 +352,7 @@ fn remove_from(home: &Path, target: &Target) -> std::io::Result<bool> {
             }
             Ok(true)
         }
-        Err(_) => Ok(false),
+        Err(_) => Ok(old),
     }
 }
 

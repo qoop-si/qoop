@@ -33,6 +33,8 @@
 
 set -eu
 
+# A terminal started before the rename carries the old names.
+export QOOP_TERMINAL="${QOOP_TERMINAL:-${QORO_TERMINAL:-}}" QOOP_TOKEN="${QOOP_TOKEN:-${QORO_TOKEN:-}}"
 [ -n "${QOOP_TERMINAL:-}" ] || exit 0
 [ -n "${QOOP_TOKEN:-}" ] || exit 0
 # The installer puts qoop in ~/.local/bin, which a stock Mac does not have on PATH until

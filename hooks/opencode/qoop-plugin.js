@@ -58,7 +58,11 @@ function clean(text) {
 }
 
 function report(state, { sessionID, event, label } = {}) {
-  if (!process.env.QOOP_TERMINAL || !process.env.QOOP_TOKEN) {
+  // A terminal started before the rename carries the old names.
+  if (
+    !(process.env.QOOP_TERMINAL || process.env.QORO_TERMINAL) ||
+    !(process.env.QOOP_TOKEN || process.env.QORO_TOKEN)
+  ) {
     return;
   }
   if (state === "working" && pending.size > 0) state = "blocked";

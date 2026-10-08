@@ -284,7 +284,7 @@ mkdir -p "$d"
 [ -O "$d" ] || { echo "$d belongs to another user" >&2; exit 3; }
 find "$d" -maxdepth 1 -name '.qoop-install.*' -mmin +30 -exec rm -f {} + 2>/dev/null || true
 if [ -L "$d/qoop" ] && [ ! -e "$d/qoop" ]; then echo "$d/qoop is a link to nothing; remove it" >&2; exit 4; fi
-if [ -e "$d/qoop" ]; then echo "there is already a qoop in $d" >&2; exit 4; fi
+if [ -e "$d/qoop" ] || [ -e "$d/qoro" ]; then echo "there is already a qoop in $d" >&2; exit 4; fi
 t=$(mktemp "$d/.qoop-install.XXXXXX")
 trap 'rm -f "$t"' EXIT
 cat > "$t"
@@ -298,6 +298,7 @@ trap - EXIT
 /// Commit: link the staged file into place, unless a qoop appeared there meanwhile, which
 /// counts as done.
 const COMMIT: &str = r#"ln "$1" "$d/qoop" 2>/dev/null || [ -e "$d/qoop" ]
+[ -e "$d/qoro" ] || [ -L "$d/qoro" ] || ln -s qoop "$d/qoro"
 rm -f "$1"
 printf '%s\n' MARKER
 "#;
@@ -357,7 +358,7 @@ pub async fn update(target: &str, version: &str) -> io::Result<Update> {
     let release = match release {
         Ok(release) => release,
         Err(e) => {
-            let github = std::env::var(qoop_runtime::release::RELEASE_BASE_ENV)
+            let github = qoop_runtime::legacy::var(qoop_runtime::release::RELEASE_BASE_ENV)
                 .unwrap_or_default()
                 .is_empty();
             let anonymous = github
@@ -447,7 +448,7 @@ const SWAP: &str = r#"set -eu
 trap 'exit 1' HUP INT TERM PIPE
 umask 022
 r=
-for q in qoop "$HOME/.local/bin/qoop" "$HOME/.cargo/bin/qoop"; do
+for q in qoop "$HOME/.local/bin/qoop" "$HOME/.cargo/bin/qoop" qoro "$HOME/.local/bin/qoro" "$HOME/.cargo/bin/qoro"; do
   p=$(command -v "$q") && { r=$(readlink -f "$p") || { echo "cannot resolve $p" >&2; exit 3; }; break; }
 done
 [ -n "$r" ] && [ -f "$r" ] || { echo "no qoop file to replace" >&2; exit 3; }
@@ -461,7 +462,7 @@ trap '[ -z "$t" ] || rm -f "$t"; [ -z "$h" ] || rmdir "$l"' EXIT
 mkdir "$l" 2>/dev/null || { echo "another update of qoop is in progress there; try again later" >&2; exit 7; }
 h=1
 v=$("$r" --version 2>/dev/null) || v=
-case $v in "qoop $1") ;; "qoop "*) echo "qoop changed meanwhile" >&2; exit 6;; *) echo "$r is not qoop" >&2; exit 4;; esac
+case $v in "qoop $1"|"qoro $1") ;; "qoop "*|"qoro "*) echo "qoop changed meanwhile" >&2; exit 6;; *) echo "$r is not qoop" >&2; exit 4;; esac
 t=$(mktemp "$d/.qoop-install.XXXXXX")
 cat > "$t"
 [ "$(wc -c < "$t" | tr -d ' ')" = "$3" ] || { echo "the copy arrived incomplete" >&2; exit 5; }
@@ -800,11 +801,14 @@ mod tests {
     const FAKE: &[u8] =
         b"#!/bin/sh\necho '{\"version\":\"9.9.9\",\"codec_generation\":1,\"platform\":\"test\"}'\n";
 
+    /// What is in `~/.local/bin`, without the `qoro` link an install leaves beside the
+    /// binary for everything that still says the old name.
     fn leftovers(home: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(home.join(".local/bin"))
             .map(|d| {
                 d.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != "qoro")
                     .collect()
             })
             .unwrap_or_default()
@@ -842,6 +846,11 @@ mod tests {
             FAKE
         );
         assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
+        let old = home.path().join(".local/bin/qoro");
+        assert_eq!(
+            std::fs::read_link(old).expect("the old name"),
+            std::path::Path::new("qoop")
+        );
     }
 
     /// A copy that arrived short is never run and never left behind.
@@ -887,6 +896,13 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/qoop", bin.join("qoop")).expect("link");
         let out = stage(home.path(), FAKE, FAKE.len());
         assert!(String::from_utf8_lossy(&out.stderr).contains("link to nothing"));
+
+        // An install from before the rename is an install too.
+        std::fs::remove_file(bin.join("qoop")).expect("rm");
+        std::fs::write(bin.join("qoro"), b"theirs").expect("old");
+        let out = stage(home.path(), FAKE, FAKE.len());
+        assert!(!out.status.success());
+        assert!(!bin.join("qoop").exists());
     }
 
     /// An ssh that cannot get in says why, and that is what is shown; with nothing said, the
@@ -962,6 +978,26 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains(RELAY_MARKER));
         assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
         assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
+    }
+
+    /// A machine that was never updated since the rename has its binary as `qoro`, saying
+    /// `qoro <version>`: found, accepted as the one asked about, and replaced where it is.
+    #[test]
+    fn swap_replaces_a_qoro_from_before_the_rename() {
+        let home = tempfile::tempdir().expect("home");
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let qoro = bin.join("qoro");
+        std::fs::write(&qoro, b"#!/bin/sh\necho 'qoro 0.0.1'\n").expect("qoro");
+        std::fs::set_permissions(&qoro, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&qoro).expect("qoro"), says("0.0.2"));
     }
 
     /// A qoop that says it is `version`, notes each `hooks`, `skills` or `bridge` call in

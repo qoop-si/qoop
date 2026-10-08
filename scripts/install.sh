@@ -54,11 +54,14 @@ if [ "$(uname -s)" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
 fi
 ASSET="qoop-$TRIPLE.tar.gz"
 
-if command -v qoop >/dev/null 2>&1; then
-    echo "qoop is already on PATH: $(command -v qoop)" >&2
-    echo "for a newer release run: qoop update" >&2
-    exit 0
-fi
+# `qoro` is what this was called before the rename; an install under that name is one.
+for name in qoop qoro; do
+    if command -v "$name" >/dev/null 2>&1; then
+        echo "qoop is already on PATH: $(command -v "$name")" >&2
+        echo "for a newer release run: $name update" >&2
+        exit 0
+    fi
+done
 # Not on PATH but already there, a link to a dev build for one: left exactly as it is.
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
     echo "qoop is already at $DEST, not on PATH; nothing replaced" >&2
@@ -189,6 +192,12 @@ cp "$WORK/qoop" "$tmp"
 chmod 0755 "$tmp"
 mv "$tmp" "$DEST"
 echo "installed $($DEST --version) to $DEST"
+# The old name stays a link to the new one: agents already running, scripts and machines
+# not yet updated still say `qoro`.
+old="$(dirname "$DEST")/qoro"
+if [ "$(basename "$DEST")" = "qoop" ] && [ ! -e "$old" ] && [ ! -L "$old" ]; then
+    ln -s qoop "$old"
+fi
 
 # A first install: no config.toml and no pet yet, read before the steps below, which may
 # write the config (the notch). A binary that says nothing (the install check) is not one.

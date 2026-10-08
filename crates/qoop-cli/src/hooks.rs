@@ -319,6 +319,24 @@ fn hooks_dir() -> PathBuf {
     qoop_runtime::paths::config_dir().join("hooks")
 }
 
+/// What the hook of this agent was called before the rename.
+///
+/// ponytail: with `legacy`, goes when no agent started before the rename is running. Until
+/// then the old script stays on disk (an agent that is already running keeps calling it),
+/// its entries are taken out of the agent's configuration, and the new ones put in.
+fn old_file(target: &Target) -> String {
+    target.file.replacen("qoop", "qoro", 1)
+}
+
+/// Where the script of the old name was registered from: under the old configuration
+/// directory, which is how an agent's file spells it.
+fn old_script(target: &Target) -> PathBuf {
+    qoop_runtime::paths::config_dir()
+        .with_file_name("qoro")
+        .join("hooks")
+        .join(old_file(target))
+}
+
 /// Refuse a hooks directory that a hook command cannot carry as it is.
 ///
 /// Refused rather than quoted, because quoting is only right if every agent runs the
@@ -500,7 +518,14 @@ fn install(args: &[String]) -> std::io::Result<()> {
         }
         let (config, at_root) = config_of(&target, &home);
         let shown = config.strip_prefix(&home).unwrap_or(&config).display();
-        match edit(&config, &target, &script, at_root) {
+        let edited = edit(&config, &target, &script, at_root);
+        // The entries of the script it replaces, so an agent does not report twice.
+        for (file, outcome) in remove_everywhere(&target, &home, &old_script(&target), false) {
+            if let Err(e) = outcome {
+                println!("  {:<10} {} not cleaned: {e}", target.agent, file.display());
+            }
+        }
+        match edited {
             Ok(true) => println!("  {:<10} installed, and {shown} updated", target.agent),
             Ok(false) => println!("  {:<10} already installed", target.agent),
             Err(e) => println!(
@@ -547,6 +572,8 @@ fn install(args: &[String]) -> std::io::Result<()> {
 /// script written and installed nothing at all.
 fn install_dropped(home: &Path, target: &Target) -> std::io::Result<bool> {
     let dropped = home.join(target.config).join(target.file);
+    // The plugin it replaces: the agent loads every file in the directory, so both would run.
+    let _ = std::fs::remove_file(home.join(target.config).join(old_file(target)));
     if std::fs::read_to_string(&dropped).ok().as_deref() == Some(target.body) {
         return Ok(false);
     }
@@ -566,6 +593,7 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         let script = dir.join(target.file);
         if matches!(target.shape, Shape::Dropped) {
             let dropped = home.join(target.config).join(target.file);
+            let _ = std::fs::remove_file(home.join(target.config).join(old_file(&target)));
             match std::fs::remove_file(&dropped) {
                 Ok(()) => println!("  {:<10} removed from {}", target.agent, target.config),
                 Err(_) => println!("  {:<10} was not there", target.agent),
@@ -574,7 +602,10 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         }
         let mut removed = false;
         let mut failed = false;
-        for (config, outcome) in remove_everywhere(&target, &home, &script) {
+        let old = old_script(&target);
+        let _ = remove_everywhere(&target, &home, &old, false);
+        let _ = std::fs::remove_file(&old);
+        for (config, outcome) in remove_everywhere(&target, &home, &script, true) {
             let shown = config.strip_prefix(&home).unwrap_or(&config).display();
             match outcome {
                 Ok(true) => {
@@ -608,11 +639,12 @@ fn remove_everywhere(
     target: &Target,
     home: &Path,
     script: &Path,
+    rules: bool,
 ) -> Vec<(PathBuf, std::io::Result<bool>)> {
     configs_of(target, home)
         .into_iter()
         .map(|(config, at_root)| {
-            let outcome = remove(&config, script, at_root);
+            let outcome = remove(&config, script, at_root, rules);
             (config, outcome)
         })
         .collect()
@@ -759,7 +791,7 @@ fn kept_copies(config: &Path) -> Vec<(u128, PathBuf)> {
     let (Some(stem), Some(parent)) = (config.file_stem(), config.parent()) else {
         return Vec::new();
     };
-    let prefix = format!("{}.{BACKUP}", stem.to_string_lossy());
+    let prefixes = [BACKUP, "qoro-backup-"].map(|b| format!("{}.{b}", stem.to_string_lossy()));
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -767,7 +799,11 @@ fn kept_copies(config: &Path) -> Vec<(u128, PathBuf)> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let stamp = name.strip_prefix(&prefix)?.parse().ok()?;
+            let stamp = prefixes
+                .iter()
+                .find_map(|prefix| name.strip_prefix(prefix.as_str()))?
+                .parse()
+                .ok()?;
             Some((stamp, entry.path()))
         })
         .collect()
@@ -977,7 +1013,7 @@ fn strip_allow(root: &mut serde_json::Value, ours: &[String]) -> bool {
 /// because nothing tells it apart from one this created. A file with no kept copy at all
 /// was created by the install; when it holds nothing of the person's afterwards it is
 /// removed rather than left as `{}`.
-fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> {
+fn remove(config: &Path, script: &Path, at_root: bool, rules: bool) -> std::io::Result<bool> {
     if !config.exists() {
         return Ok(false);
     }
@@ -1033,7 +1069,12 @@ fn remove(config: &Path, script: &Path, at_root: bool) -> std::io::Result<bool> 
     {
         root.shift_remove("hooks");
     }
-    let added = ours(&script.with_file_name(ALLOW_MARKER));
+    // The permissions go only with the install itself, never with an old script's entries.
+    let added = if rules {
+        ours(&script.with_file_name(ALLOW_MARKER))
+    } else {
+        Vec::new()
+    };
     if !added.is_empty() {
         changed |= strip_allow(&mut root, &added);
     }
@@ -1235,7 +1276,7 @@ mod tests {
         let script = dir.path().join("qoop-hook.sh");
         edit(&config, &target("claude"), &script, false).expect("install");
 
-        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(remove(&config, &script, false, true).expect("uninstall"));
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
         assert_eq!(after["model"], "opus");
@@ -1246,7 +1287,7 @@ mod tests {
         // The events that held nothing but ours are gone rather than left empty.
         assert!(after["hooks"].get("SessionEnd").is_none(), "{after}");
         // And taking it out twice is not an error.
-        assert!(!remove(&config, &script, false).expect("uninstall again"));
+        assert!(!remove(&config, &script, false, true).expect("uninstall again"));
     }
 
     /// A settings file kept in dotfiles comes back in the order it was written, so the
@@ -1280,7 +1321,7 @@ mod tests {
         let script = dir.path().join("qoop-hook.sh");
         edit(&config, &target("claude"), &script, false).expect("install");
 
-        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(remove(&config, &script, false, true).expect("uninstall"));
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
         assert_eq!(after["hooks"]["Foo"], serde_json::json!([]), "{after}");
@@ -1703,7 +1744,7 @@ mod tests {
                 let installed = std::fs::read_to_string(&config).expect("read");
                 assert!(installed.contains(t.file), "{agent}: {installed}");
                 assert!(
-                    remove(&config, &script, at_root).expect("uninstall"),
+                    remove(&config, &script, at_root, true).expect("uninstall"),
                     "{agent}"
                 );
                 assert_eq!(
@@ -1799,7 +1840,7 @@ mod tests {
         assert_eq!(value["PreToolUse"][0]["hooks"][0]["command"], "/a.sh");
         assert!(registered(&droid, home.path(), home.path()));
 
-        assert!(remove(&config, &script, at_root).expect("uninstall"));
+        assert!(remove(&config, &script, at_root, true).expect("uninstall"));
         assert_eq!(std::fs::read_to_string(&config).expect("read"), original);
     }
 
@@ -1877,7 +1918,7 @@ mod tests {
             registered(&droid, home.path(), home.path()),
             "status must still see the entry in settings.json"
         );
-        let outcomes = remove_everywhere(&droid, home.path(), &script);
+        let outcomes = remove_everywhere(&droid, home.path(), &script, true);
         assert!(
             outcomes
                 .iter()
@@ -1940,7 +1981,7 @@ mod tests {
         let script = home.path().join(qwen.file);
         assert!(edit(&config, &qwen, &script, false).expect("install"));
         assert!(config.exists());
-        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(remove(&config, &script, false, true).expect("uninstall"));
         assert!(
             !config.exists(),
             "an empty file the person never had was left"
@@ -1949,7 +1990,7 @@ mod tests {
         // A file that was `{}` before the install is theirs, and comes back.
         std::fs::write(&config, "{ }\n").expect("write");
         edit(&config, &qwen, &script, false).expect("install");
-        remove(&config, &script, false).expect("uninstall");
+        remove(&config, &script, false, true).expect("uninstall");
         assert_eq!(std::fs::read_to_string(&config).expect("read"), "{ }\n");
     }
 
@@ -2013,7 +2054,7 @@ mod tests {
             let script = dir.path().join("qoop.sh");
             let droid = target("droid");
             assert!(edit(&config, &droid, &script, true).expect("install"));
-            assert!(remove(&config, &script, true).expect("uninstall"));
+            assert!(remove(&config, &script, true, true).expect("uninstall"));
             assert_eq!(
                 std::fs::read_to_string(&config).ok().as_deref(),
                 Some(original),
@@ -2030,7 +2071,7 @@ mod tests {
         let config = dir.path().join("hooks.json");
         let script = dir.path().join("qoop.sh");
         assert!(edit(&config, &target("cursor"), &script, false).expect("install"));
-        assert!(remove(&config, &script, false).expect("uninstall"));
+        assert!(remove(&config, &script, false, true).expect("uninstall"));
         assert!(!config.exists(), "{:?}", std::fs::read_to_string(&config));
     }
 
@@ -2056,7 +2097,7 @@ mod tests {
                 .contains("qoop.sh")
         );
         // Uninstalled, it is as it was: the link still there, dangling again.
-        assert!(remove(&link, &script, false).expect("uninstall"));
+        assert!(remove(&link, &script, false, true).expect("uninstall"));
         assert!(
             std::fs::symlink_metadata(&link)
                 .expect("the link survives the uninstall")
@@ -2180,7 +2221,9 @@ mod tests {
                 .arg("working")
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
                 .env_remove("QOOP_TERMINAL")
+                .env_remove("QORO_TERMINAL")
                 .env_remove("QOOP_TOKEN")
+                .env_remove("QORO_TOKEN")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped());
             if inside {
@@ -2298,7 +2341,7 @@ mod tests {
             "ending a task is never pre-approved"
         );
         assert!(!edit(&config, &target("claude"), &script, false).expect("again"));
-        assert!(remove(&config, &script, false).expect("remove"));
+        assert!(remove(&config, &script, false, true).expect("remove"));
         assert!(
             !config.exists(),
             "a file the install created goes away whole"
@@ -2314,7 +2357,7 @@ mod tests {
         let mut both = vec!["Read"];
         both.extend(ALLOW);
         assert_eq!(allow(&config), serde_json::json!(both));
-        assert!(remove(&config, &script, false).expect("remove"));
+        assert!(remove(&config, &script, false, true).expect("remove"));
         assert_eq!(allow(&config), serde_json::json!(["Read"]));
 
         // A person who already allows all of qoop keeps exactly their rule.
@@ -2328,7 +2371,7 @@ mod tests {
             "covered, so not ours"
         );
         assert_eq!(allow(&theirs), serde_json::json!(["Bash(qoop:*)"]));
-        assert!(remove(&theirs, &their_script, false).expect("remove"));
+        assert!(remove(&theirs, &their_script, false, true).expect("remove"));
         assert_eq!(
             allow(&theirs),
             serde_json::json!(["Bash(qoop:*)"]),
@@ -2346,7 +2389,7 @@ mod tests {
         let third_script = third.path().join("qoop-hook.sh");
         assert!(edit(&mine, &target("claude"), &third_script, false).expect("install"));
         assert_eq!(allow(&mine).as_array().map(Vec::len), Some(ALLOW.len()));
-        assert!(remove(&mine, &third_script, false).expect("remove"));
+        assert!(remove(&mine, &third_script, false, true).expect("remove"));
         assert_eq!(
             allow(&mine),
             serde_json::json!(["Bash(qoop task show:*)"]),

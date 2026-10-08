@@ -30,7 +30,11 @@ function threadIDOf(event) {
 }
 
 function report(state, threadID) {
-  if (!process.env.QOOP_TERMINAL || !process.env.QOOP_TOKEN) {
+  // A terminal started before the rename carries the old names.
+  if (
+    !(process.env.QOOP_TERMINAL || process.env.QORO_TERMINAL) ||
+    !(process.env.QOOP_TOKEN || process.env.QORO_TOKEN)
+  ) {
     return;
   }
   const args = ["hook-report", "--state", state, ...flagsFor(state)];
