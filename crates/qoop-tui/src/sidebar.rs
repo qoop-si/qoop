@@ -875,10 +875,17 @@ fn parts(
 ) -> (Vec<Row>, Vec<Row>, usize) {
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
-    let stage = pet_shown(c, height, avatar.is_some()).then(|| inbox_items(c, InboxTab::All).len());
+    let pet = pet_shown(c, height, avatar.is_some());
+    let count = Some(inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let feet = foot_rows(c.width, stage, update_available().as_deref(), hub_link());
+    let feet = foot_rows(
+        c.width,
+        pet,
+        count,
+        update_available().as_deref(),
+        hub_link(),
+    );
     let foot = feet.len().min(height);
     let room = height - foot;
     let mut head = inbox_rows(c, inbox_height(c, room));
@@ -1314,9 +1321,15 @@ fn tray_line(width: usize) -> Line {
 
 /// The rows above the foot in a column of `height` rows: the inbox, the title and the list.
 fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avatar>) -> usize {
-    let stage = pet_shown(c, height, avatar.is_some()).then_some(0);
-    height
-        .saturating_sub(foot_rows(c.width, stage, update_available().as_deref(), hub_link()).len())
+    let pet = pet_shown(c, height, avatar.is_some());
+    let feet = foot_rows(
+        c.width,
+        pet,
+        Some(0),
+        update_available().as_deref(),
+        hub_link(),
+    );
+    height.saturating_sub(feet.len())
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
@@ -1647,16 +1660,17 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         slots
     };
     // A space of another machine wears a dot before its name, in the colour of its link
-    // (green connected, dim parked, warm when it does not answer), and the remote mark
+    // (a full green one connected, a small dim one parked, a hollow warm one when it does not
+    // answer: the glyph differs for a terminal with no colour), and the remote mark
     // before the dot where icons are drawn; not while it asks, when the question needs the
     // room.
     let remote = (!armed)
         .then_some(space.link)
         .flatten()
         .map(|link| match link {
-            qoop_runtime::control::LinkState::Up => Role::Done,
-            qoop_runtime::control::LinkState::Parked => Role::Faint,
-            _ => Role::Blocked,
+            qoop_runtime::control::LinkState::Up => (Role::Done, ONLINE),
+            qoop_runtime::control::LinkState::Parked => (Role::Faint, '\u{b7}'),
+            _ => (Role::Blocked, '\u{25cb}'),
         });
     let glyph = if c.icons { 2 } else { 0 };
     let lead = if remote.is_some() { glyph + 2 } else { 0 };
@@ -1684,7 +1698,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     if fold != " " {
         runs.push((0, 1, Role::Faint));
     }
-    if let Some(role) = remote {
+    if let Some((role, _)) = remote {
         if c.icons {
             runs.push((NAME_AT, 1, role));
         }
@@ -1702,10 +1716,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     };
     runs = runs.into_iter().filter_map(clip).collect();
     let accent = clip((NAME_AT + lead, name_w, ink));
-    let prefix = match (remote.is_some(), c.icons) {
-        (true, true) => format!("{} {ONLINE} ", crate::icons::REMOTE),
-        (true, false) => format!("{ONLINE} "),
-        (false, _) => String::new(),
+    let prefix = match (remote, c.icons) {
+        (Some((_, dot)), true) => format!("{} {dot} ", crate::icons::REMOTE),
+        (Some((_, dot)), false) => format!("{dot} "),
+        (None, _) => String::new(),
     };
     let left = fit(&format!("{fold}{prefix}{name}{slot}"), left_w);
     // The cells of the block, all in the fold's faint grey: controls are furniture, the
@@ -3066,9 +3080,11 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// dot at the left and `menu « ` at the right.
 ///
 /// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
-/// in ember. While the pet stands (`stage` is the inbox count) one blank row goes on top and
-/// the pet stands at the right of the foot's first five rows (stamped by the overlay), its
-/// feet on the row above the menu. Over the pet sits a small box with the count alone.
+/// in ember. While the pet stands (`pet`) one blank row goes on top and the pet stands at the
+/// right of the foot's first five rows (stamped by the overlay), its feet on the row above
+/// the menu. The small box with the inbox `count` alone sits over the pet's rows; with no pet
+/// it sits at the right of the logo's first three rows instead, so the count never goes
+/// because the pet did. It goes only where even that does not fit the width.
 ///
 /// ```text
 ///                  ╭───╮
@@ -3086,15 +3102,23 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
 /// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
 /// rows are text and answer nothing.
-fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>, hub: HubLink) -> Vec<Row> {
+fn foot_rows(
+    width: usize,
+    pet: bool,
+    count: Option<usize>,
+    update: Option<&str>,
+    hub: HubLink,
+) -> Vec<Row> {
     use crate::theme::Role;
     let tail = foot_tail(width);
     // The menu closes the last row: `menu « ` flush right, `settings` and the version before it.
     let version = version_text(width, crate::width::width(&tail), update);
     // The dot is the interface's daemon, which it is connected to whenever it is drawn (it
     // ends with the stream), and the hub the phone bridge says it reaches: green when both,
-    // warm when the bridge is there and the hub is not, quiet when there is no bridge.
-    let dotted = format!("{version} {ONLINE}");
+    // warm and hollow when the bridge is there and the hub is not, quiet and small when there
+    // is no bridge. The glyph differs as well as the ink, for a terminal with no colour.
+    let (ink, glyph) = online_dot(hub);
+    let dotted = format!("{version} {glyph}");
     let online = (!version.is_empty()
         && crate::width::width(&dotted) + 1 + crate::width::width(&tail) <= width)
         .then(|| crate::width::width(&version) + 1);
@@ -3103,29 +3127,48 @@ fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>, hub: HubL
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
-        runs: online
-            .map(|at| (at, 1, online_role(hub)))
-            .into_iter()
-            .collect(),
+        runs: online.map(|at| (at, 1, ink)).into_iter().collect(),
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
     let mut out: Vec<Row> = Vec::with_capacity(STAGE_FOOT_ROWS);
-    if let Some(count) = stage {
-        out.extend(count_box(width, count));
+    let boxed = count.map(count_box);
+    // Flush right with the pet's right edge: one blank cell of margin before the column's edge.
+    let box_at = |piece: &BoxRow| width.saturating_sub(crate::width::width(&piece.0) + 1);
+    if pet {
+        for piece in boxed.iter().flatten() {
+            let at = box_at(piece);
+            let lead = " ".repeat(at);
+            out.push((box_line(piece, at, &lead, width, Role::Faint, &[]), None));
+        }
         out.extend((0..PET_FOOT_ROWS - Q_FOOT_ROWS).map(|_| blank(width)));
     }
     out.extend(Q_LOGO.iter().enumerate().map(|(row, dots)| {
         let (at, cell) = Q_TAIL;
-        let line = Line {
-            text: fit(&format!(" {dots}"), width),
-            colour: Some(Role::Text),
-            runs: if row == at {
-                vec![(1 + cell, 1, Role::Brand)]
-            } else {
-                Vec::new()
+        let runs = if row == at {
+            vec![(1 + cell, 1, Role::Brand)]
+        } else {
+            Vec::new()
+        };
+        let text = format!(" {dots}");
+        // With no pet, the box stands beside the logo's first rows when the width has the room.
+        let beside = boxed
+            .as_ref()
+            .filter(|_| !pet)
+            .and_then(|box_rows| box_rows.get(row))
+            .filter(|piece| 1 + Q_COLS + 1 + crate::width::width(&piece.0) < width);
+        let line = match beside {
+            Some(piece) => {
+                let at = box_at(piece);
+                let lead = format!("{text:<at$}");
+                box_line(piece, at, &lead, width, Role::Text, &runs)
+            }
+            None => Line {
+                text: fit(&text, width),
+                colour: Some(Role::Text),
+                runs,
+                ..Line::default()
             },
-            ..Line::default()
         };
         (line, None)
     }));
@@ -3133,36 +3176,30 @@ fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>, hub: HubL
     out
 }
 
-/// The `●` that says the interface is connected to its daemon, and to the hub if there is one.
-const ONLINE: char = '\u{25cf}';
-
-/// The online dot's ink for what the bridge says about the hub.
-fn online_role(hub: HubLink) -> crate::theme::Role {
+/// The online dot's ink and glyph for what the bridge says about the hub: a full green dot
+/// when it is reached, a hollow warm one when a bridge is there and the hub is not, a small
+/// quiet one when there is no bridge.
+fn online_dot(hub: HubLink) -> (crate::theme::Role, char) {
     use crate::theme::Role;
     match hub {
-        HubLink::Up => Role::Done,
-        HubLink::Down => Role::Blocked,
-        HubLink::Absent => Role::Faint,
+        HubLink::Up => (Role::Done, ONLINE),
+        HubLink::Down => (Role::Blocked, '\u{25cb}'),
+        HubLink::Absent => (Role::Faint, '\u{b7}'),
     }
 }
 
-/// The box over the pet with the inbox count alone, flush right with the pet's right edge:
-/// one blank cell of margin before the column's edge, as the pet keeps. The number is warm
-/// while anything waits and quiet at zero.
-fn count_box(width: usize, count: usize) -> Vec<Row> {
+/// The `●` that says the interface is connected to its daemon, and to the hub if there is one.
+const ONLINE: char = '\u{25cf}';
+
+/// One row of the count box: its text and the runs in it, from the box's own left edge.
+type BoxRow = (String, Vec<(usize, usize, crate::theme::Role)>);
+
+/// The box with the inbox count alone, as three rows. The number is warm while anything
+/// waits and quiet at zero.
+fn count_box(count: usize) -> Vec<BoxRow> {
     use crate::theme::Role;
     let inner = format!(" {count} ");
     let across = crate::width::width(&inner);
-    let at = width.saturating_sub(across + 3);
-    let row = |text: String, runs: Vec<(usize, usize, Role)>| {
-        let line = Line {
-            text: fit(&format!("{}{text}", " ".repeat(at)), width),
-            colour: Some(Role::Faint),
-            runs,
-            ..Line::default()
-        };
-        (line, None)
-    };
     let edge = |l: char, r: char| format!("{l}{}{r}", "\u{2500}".repeat(across));
     let number = if count > 0 {
         Role::Blocked
@@ -3170,23 +3207,48 @@ fn count_box(width: usize, count: usize) -> Vec<Row> {
         Role::Faint
     };
     vec![
-        row(
+        (
             edge('\u{256d}', '\u{256e}'),
-            vec![(at, across + 2, Role::Rule)],
+            vec![(0, across + 2, Role::Rule)],
         ),
-        row(
+        (
             format!("\u{2502}{inner}\u{2502}"),
             vec![
-                (at, 1, Role::Rule),
-                (at + 1, across, number),
-                (at + 1 + across, 1, Role::Rule),
+                (0, 1, Role::Rule),
+                (1, across, number),
+                (1 + across, 1, Role::Rule),
             ],
         ),
-        row(
+        (
             edge('\u{2570}', '\u{256f}'),
-            vec![(at, across + 2, Role::Rule)],
+            vec![(0, across + 2, Role::Rule)],
         ),
     ]
+}
+
+/// A foot row holding a box piece at column `at` after `lead`: the row's own runs, then the
+/// piece's moved to where it stands.
+fn box_line(
+    piece: &BoxRow,
+    at: usize,
+    lead: &str,
+    width: usize,
+    colour: crate::theme::Role,
+    runs: &[(usize, usize, crate::theme::Role)],
+) -> Line {
+    let mut runs = runs.to_vec();
+    runs.extend(
+        piece
+            .1
+            .iter()
+            .map(|(from, len, role)| (at + from, *len, *role)),
+    );
+    Line {
+        text: fit(&format!("{lead}{}", piece.0), width),
+        colour: Some(colour),
+        runs,
+        ..Line::default()
+    }
 }
 
 /// Where the version starts on the menu row, when the row shows it: the column its link
@@ -4935,7 +4997,7 @@ mod tests {
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The q alone, its tail in ember, then the menu.
-        let rows = foot_rows(WIDTH, None, None, HubLink::Up);
+        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up);
         assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
@@ -5000,8 +5062,8 @@ mod tests {
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, None, None, HubLink::Up);
-            let stands = foot_rows(width, Some(0), None, HubLink::Up);
+            let gave_way = foot_rows(width, false, None, None, HubLink::Up);
+            let stands = foot_rows(width, true, Some(0), None, HubLink::Up);
             assert_eq!(stands.len(), STAGE_FOOT_ROWS);
             let added = STAGE_FOOT_ROWS - gave_way.len();
             let blank_at = COUNT_BOX_ROWS;
@@ -5018,7 +5080,7 @@ mod tests {
     #[test]
     fn the_menu_row_carries_the_version_then_the_online_dot() {
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            let rows = foot_rows(width, None, None, HubLink::Up);
+            let rows = foot_rows(width, false, None, None, HubLink::Up);
             let (menu, hit) = rows.last().expect("the menu row");
             assert_eq!(*hit, Some(Hit::Foot));
             assert_eq!(crate::width::width(&menu.text), width);
@@ -5044,27 +5106,44 @@ mod tests {
             assert!(room || width < WIDTH, "the dot shows at the default width");
         }
         // No room for the version, no link and no dot hanging in the air.
-        let tight = foot_rows(8, None, None, HubLink::Up);
-        assert!(!tight.last().unwrap().0.text.contains(ONLINE));
+        let tight = foot_rows(8, false, None, None, HubLink::Up);
+        assert!(
+            !tight
+                .last()
+                .unwrap()
+                .0
+                .text
+                .contains([ONLINE, '\u{25cb}', '\u{b7}'])
+        );
         assert_eq!(version_link_at(8), None);
     }
 
-    /// The dot says what the bridge says about the hub: green when reached, warm when a
-    /// bridge is there and the hub is not, quiet when there is no bridge. The dot is drawn
-    /// in all three, in the same cell.
+    /// The dot says what the bridge says about the hub: a full green one when reached, a
+    /// hollow warm one when a bridge is there and the hub is not, a small quiet one when
+    /// there is no bridge. The glyph differs as well as the ink, so a terminal with no colour
+    /// tells the three apart; all sit in the same cell.
     #[test]
     fn the_online_dot_follows_the_hub_state() {
         use crate::theme::Role;
         let dot = |hub| {
-            let rows = foot_rows(WIDTH, None, None, hub);
+            let rows = foot_rows(WIDTH, false, None, None, hub);
             let menu = &rows.last().unwrap().0;
-            assert!(menu.text.contains(ONLINE), "{menu:?}");
-            menu.runs.clone()
+            let at = crate::width::width(&format!(" {VERSION}")) + 1;
+            (menu.text.chars().nth(at), menu.runs.clone())
         };
         let at = crate::width::width(&format!(" {VERSION}")) + 1;
-        assert_eq!(dot(HubLink::Up), vec![(at, 1, Role::Done)]);
-        assert_eq!(dot(HubLink::Down), vec![(at, 1, Role::Blocked)]);
-        assert_eq!(dot(HubLink::Absent), vec![(at, 1, Role::Faint)]);
+        assert_eq!(
+            dot(HubLink::Up),
+            (Some('\u{25cf}'), vec![(at, 1, Role::Done)])
+        );
+        assert_eq!(
+            dot(HubLink::Down),
+            (Some('\u{25cb}'), vec![(at, 1, Role::Blocked)])
+        );
+        assert_eq!(
+            dot(HubLink::Absent),
+            (Some('\u{b7}'), vec![(at, 1, Role::Faint)])
+        );
     }
 
     /// The link and the click cover the version word and nothing else: with an update notice
@@ -5072,7 +5151,7 @@ mod tests {
     /// foot still folds the column.
     #[test]
     fn the_version_link_covers_only_the_version() {
-        let rows = foot_rows(WIDTH, None, Some("9.9.9"), HubLink::Up);
+        let rows = foot_rows(WIDTH, false, None, Some("9.9.9"), HubLink::Up);
         let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
         let at = version_link_in(WIDTH, Some("9.9.9")).expect("shown");
         let word: String = text[at..at + VERSION.len()].iter().collect();
@@ -5126,8 +5205,8 @@ mod tests {
         let brand = crate::theme::Role::Brand;
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            for pet in [None, Some(0)] {
-                let rows = foot_rows(width, pet, None, HubLink::Up);
+            for pet in [false, true] {
+                let rows = foot_rows(width, pet, None, None, HubLink::Up);
                 let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
                 for (i, (line, hit)) in logo.iter().enumerate() {
                     assert_eq!(
@@ -5287,7 +5366,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Option<&str>| {
-            foot_rows(width, None, update, HubLink::Up)
+            foot_rows(width, false, None, update, HubLink::Up)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -5379,7 +5458,7 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, None, None, HubLink::Up).len();
+        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
         for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
@@ -5411,7 +5490,8 @@ mod tests {
             WIDTH,
             None,
         );
-        let freed = 30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, None, None, HubLink::Up).len();
+        let freed =
+            30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, false, None, None, HubLink::Up).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -7196,7 +7276,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, None, None, HubLink::Up).len();
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -7263,7 +7343,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, None, None, HubLink::Up).len();
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -7442,8 +7522,69 @@ mod tests {
                 .runs
                 .contains(&(WIDTH - 5, 3, Role::Blocked))
         );
-        // Where the pet gives the rows up, the box goes with it.
+    }
+
+    /// The count box does not go because the pet did: with the pet hidden (a list that needs
+    /// the rows, a short window, no pet chosen) the same box stands at the right of the
+    /// logo's first rows, above the menu row, and the foot keeps its five rows.
+    #[test]
+    fn the_count_box_stays_when_the_pet_is_hidden() {
+        use crate::theme::Role;
+        let spaces = vec![space(1, "app")];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let check = |agents: &[AgentRow], height: usize, pet: Option<&_>, number: &str| {
+            let c = opened(column(
+                &spaces,
+                agents,
+                1,
+                99,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                WIDTH,
+                &shut,
+            ));
+            let rows = rows_folded(&c, height, pet);
+            assert_eq!(rows.len(), height);
+            let foot = &rows[height - kept..];
+            let text = |at: usize| foot[at].0.text.trim_end().to_string();
+            let first = format!(
+                "{:<w$}\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}",
+                " \u{25cf} \u{25cf} \u{25cf}",
+                w = WIDTH - 6
+            );
+            assert_eq!(text(0), first);
+            assert!(
+                text(1).ends_with(&format!("\u{2502} {number} \u{2502}")),
+                "{:?}",
+                text(1)
+            );
+            assert!(text(2).ends_with("\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}"));
+            assert!(
+                text(3).trim_end() == "     \u{25cf}",
+                "the tail row has no box"
+            );
+            assert!(foot[..3].iter().all(|(_, hit)| hit.is_none()));
+            // The logo is still its own colour and the box its own.
+            assert!(foot[1].0.runs.contains(&(
+                WIDTH - 5,
+                3,
+                if number == "0" {
+                    Role::Faint
+                } else {
+                    Role::Blocked
+                }
+            )));
+            assert!(
+                foot[3].0.runs.contains(&(5, 1, Role::Brand)),
+                "the ember tail"
+            );
+        };
         let long: Vec<AgentRow> = (1..=20).map(|t| agent(t, 1, "claude", "working")).collect();
+        // The list needs the rows: the pet gives way.
         let c = opened(column(
             &spaces,
             &long,
@@ -7458,8 +7599,16 @@ mod tests {
             &shut,
         ));
         assert!(!pet_shown(&c, 40, true));
+        check(&long, 40, Some(&art_pet()), "0");
+        // No pet chosen, and a window too short for one.
+        let few = vec![agent(1, 1, "claude", "blocked")];
+        check(&few, 40, None, "1");
+        assert!(!avatar_fits(12, WIDTH, true));
+        check(&few, 14, Some(&art_pet()), "1");
+        // Where even the logo's rows leave no room beside it, there is no box.
+        let narrow = foot_rows(12, false, Some(0), None, HubLink::Up);
         assert!(
-            rows_folded(&c, 40, Some(&art_pet()))
+            narrow
                 .iter()
                 .all(|(line, _)| !line.text.contains('\u{256d}'))
         );
@@ -8237,7 +8386,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, None, None, HubLink::Up).len() + 2;
+        let least = foot_rows(WIDTH, false, None, None, HubLink::Up).len() + 2;
         for height in [least, least + 1, 10, 14, 30] {
             let rows = rows12(
                 &spaces,
@@ -9124,10 +9273,15 @@ mod tests {
     #[test]
     fn a_remote_space_is_named_with_its_machine_and_no_chip() {
         use crate::theme::Role;
-        for (link, name, ink) in [
-            (LinkState::Up, "ubox:webshop", Role::Done),
-            (LinkState::Parked, "ubox:webshop", Role::Faint),
-            (LinkState::Down, "ubox:webshop (connecting)", Role::Blocked),
+        for (link, name, ink, dot) in [
+            (LinkState::Up, "ubox:webshop", Role::Done, '\u{25cf}'),
+            (LinkState::Parked, "ubox:webshop", Role::Faint, '\u{b7}'),
+            (
+                LinkState::Down,
+                "ubox:webshop (connecting)",
+                Role::Blocked,
+                '\u{25cb}',
+            ),
         ] {
             let mut row = space(1, name);
             row.link = Some(link);
@@ -9135,10 +9289,7 @@ mod tests {
             let none = (Seen::new(), Unseen::new(), Shut::new());
             let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
             let rule = rule_styled(&c, 1);
-            assert!(
-                rule.text.starts_with(&format!(" {ONLINE} {name}")),
-                "{rule:?}"
-            );
+            assert!(rule.text.starts_with(&format!(" {dot} {name}")), "{rule:?}");
             assert!(rule.runs.contains(&(NAME_AT, 1, ink)), "{rule:?}");
         }
         // A space of this machine has no link, so no dot.
