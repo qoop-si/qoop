@@ -263,19 +263,30 @@ pub fn retire_launchd_agent(label: &str) -> bool {
     std::fs::remove_file(plist).is_ok()
 }
 
-/// What `--version` says: the name the binary was started by. A 0.7.x daemon asks the file
-/// it will move onto, through the path it was started from, for `qoro <version>`, and does
-/// not move onto anything that answers otherwise.
+/// What `--version` says: `qoro` when the name this binary was started by contains `qoro`,
+/// else `qoop`. A 0.7.x daemon asks the file it will move onto, by the path it started from,
+/// for `qoro <version>`; a 0.7.x updater asks the copy it staged, which it names
+/// `.qoro-install.XXXXXX` on a remote, `qoro` on this Mac; and a kept build is `qoro.pre-*`.
+/// None of them move onto anything that answers otherwise.
 pub fn version_line() -> String {
-    let named = std::env::args_os()
-        .next()
-        .and_then(|arg| Path::new(&arg).file_name().map(|n| n.to_os_string()));
-    let name = if named.is_some_and(|n| n == OLD) {
+    let named = std::env::args_os().next().and_then(|arg| {
+        Path::new(&arg)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    });
+    format!(
+        "{} {}",
+        version_name(named.as_deref()),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn version_name(started_as: Option<&str>) -> &'static str {
+    if started_as.is_some_and(|name| name.contains(OLD)) {
         OLD
     } else {
         NEW
-    };
-    format!("{name} {}", env!("CARGO_PKG_VERSION"))
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +431,21 @@ mod tests {
         // SAFETY: as above.
         unsafe { std::env::set_var("QOOP_LEGACY_TEST_ONLY", "new") };
         assert_eq!(var("QOOP_LEGACY_TEST_ONLY").as_deref(), Ok("new"));
+    }
+
+    #[test]
+    fn the_version_name_follows_any_name_with_qoro_in_it() {
+        for old in [
+            "qoro",
+            ".qoro-install.Ab12Cd",
+            "qoro.pre-0.7.0",
+            "/x/bin/qoro",
+        ] {
+            assert_eq!(version_name(Some(old)), "qoro", "{old}");
+        }
+        for new in ["qoop", ".qoop-install.Ab12Cd", "qoop-new", "anything"] {
+            assert_eq!(version_name(Some(new)), "qoop", "{new}");
+        }
+        assert_eq!(version_name(None), "qoop");
     }
 }

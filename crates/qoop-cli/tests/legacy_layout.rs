@@ -260,7 +260,12 @@ fn the_version_line_follows_the_name_the_binary_is_run_by() {
     let m = Machine::new();
     let bin = m.path("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    for name in ["qoro", "qoop"] {
+    for (name, want) in [
+        ("qoro", "qoro"),
+        (".qoro-install.Ab12Cd", "qoro"),
+        ("qoro.pre-0.7.0", "qoro"),
+        ("qoop", "qoop"),
+    ] {
         let copy = bin.join(format!("run-as-{name}")).join(name);
         std::fs::create_dir_all(copy.parent().unwrap()).expect("dir");
         std::fs::copy(env!("CARGO_BIN_EXE_qoop"), &copy).expect("copy");
@@ -270,7 +275,11 @@ fn the_version_line_follows_the_name_the_binary_is_run_by() {
         c.arg("--version");
         let out = m.isolated(c).output().expect(name);
         let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert_eq!(said, format!("{name} {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            said,
+            format!("{want} {}", env!("CARGO_PKG_VERSION")),
+            "run as {name}"
+        );
     }
 }
 
