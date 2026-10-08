@@ -4,8 +4,6 @@
 //! list here is a list that stops covering the surface the first time somebody adds a
 //! subcommand, and the point of that document is that it grows with the code.
 
-use std::process::Command;
-
 fn qoop() -> &'static str {
     env!("CARGO_BIN_EXE_qoop")
 }
@@ -95,7 +93,7 @@ fn scratch() -> tempfile::TempDir {
 /// one difference allowed: it is read back as `<scratch>`.
 fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
     let dir = scratch();
-    let mut command = Command::new(qoop());
+    let mut command = qoop_testkit::sandboxed(qoop());
     // Run from the scratch directory too, so a row that reads where it runs (`worktree
     // ls` lists the repository it is in) answers the same thing on every machine rather
     // than whatever worktrees this checkout has at the moment.
@@ -118,7 +116,7 @@ fn run(args: &[String], offline: bool) -> (String, String, Option<i32>) {
     // A row that starts a daemon on demand (`ensure-awake` opens a first tab) leaves it
     // running, and the scratch directory is deleted under it: one orphan per such row per
     // run. Stopped here, for every row, so a row added later cannot leak one either.
-    let _ = Command::new(qoop())
+    let _ = qoop_testkit::sandboxed(qoop())
         .arg("stop")
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -169,7 +167,7 @@ fn update_fails_closed_with_the_network_gone() {
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )
     .expect("chmod");
-    let mut command = Command::new(qoop());
+    let mut command = qoop_testkit::sandboxed(qoop());
     command
         .args(["update", "--check"])
         .env("QOOP_RUNTIME_DIR", dir.path())
@@ -200,7 +198,7 @@ fn update_fails_closed_with_the_network_gone() {
 #[test]
 fn a_build_without_the_phone_part_says_so() {
     let run = |args: &[&str]| {
-        Command::new(qoop())
+        qoop_testkit::sandboxed(qoop())
             .args(args)
             .env("PATH", "/usr/bin:/bin")
             .output()
@@ -257,7 +255,7 @@ fn a_cli_error_is_a_sentence_and_a_typo_is_not_the_interface() {
     let not_a_dir = dir.path().join("file");
     std::fs::write(&not_a_dir, "").expect("write");
     let run = |args: &[&str]| {
-        let out = Command::new(qoop())
+        let out = qoop_testkit::sandboxed(qoop())
             .args(args)
             .env("QOOP_RUNTIME_DIR", &not_a_dir)
             .env("XDG_CONFIG_HOME", not_a_dir.join("config"))

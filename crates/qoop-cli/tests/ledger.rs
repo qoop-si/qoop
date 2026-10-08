@@ -16,7 +16,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use qoop_runtime::control::{ControlRequest, ControlResponse};
@@ -63,7 +63,7 @@ struct Daemon(Child);
 impl Daemon {
     /// Started over a directory that may already have files in it, which is a restart.
     fn start_over(runtime: &Runtime) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", runtime.path())
             .env("XDG_CONFIG_HOME", runtime.path().join("config"))
@@ -116,7 +116,7 @@ impl Daemon {
 /// A clean stop is also what makes the restart honest: the ledger row the second daemon reads
 /// is one the first daemon got to flush.
 fn stop_daemon(runtime: &Runtime) {
-    let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .arg("stop")
         .env("QOOP_RUNTIME_DIR", runtime.path())
         .env("XDG_CONFIG_HOME", runtime.path().join("config"))

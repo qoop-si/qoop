@@ -17,7 +17,7 @@ const ASSETS: [&str; 4] = [
 
 /// `qoop` as installed on the fake machine, with its environment.
 fn qoop(root: &Path, exe: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(exe)
+    qoop_testkit::sandboxed(exe)
         .args(args)
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("config"))

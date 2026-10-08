@@ -27,6 +27,68 @@ fn tracker() -> &'static Mutex<Vec<i32>> {
     T.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Where this test process's spawned `qoop` finds its home: a directory of its own under
+/// `/tmp` (short, a socket path has a length limit), never the person's.
+fn sandbox_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let base = Path::new("/tmp");
+        // The sandboxes of test processes that are gone.
+        for entry in std::fs::read_dir(base).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let dead = name
+                .strip_prefix("qsb.")
+                .and_then(|pid| pid.parse::<i32>().ok())
+                // SAFETY: signal 0 only probes for existence.
+                .is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0);
+            if dead {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let root = base.join(format!("qsb.{}", std::process::id()));
+        for dir in ["home", "tmp"] {
+            std::fs::create_dir_all(root.join(dir)).expect("sandbox dir");
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        root
+    })
+}
+
+/// `program` as a test may start it: a home, a temp directory and no `XDG_*` of its own, no
+/// tab or runtime variables of whoever runs the suite, and the mark that says it is a test.
+///
+/// Every test that starts the `qoop` binary starts it through here. The binary moves the
+/// home's `qoro` directories to `qoop` on its first command and refuses to run under cargo
+/// without this mark (`legacy::refuse_unsandboxed`), so a spawn that forgets it fails
+/// loudly instead of touching the person's files. A test that wants a path of its own sets
+/// it afterwards.
+pub fn sandboxed(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let root = sandbox_root();
+    let mut command = std::process::Command::new(program);
+    command
+        .env("HOME", root.join("home"))
+        .env("TMPDIR", root.join("tmp"))
+        .env(qoop_runtime::legacy::SANDBOX_ENV, "1");
+    for name in [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "QOOP_RUNTIME_DIR",
+        "QORO_RUNTIME_DIR",
+        "QOOP_SESSION",
+        "QORO_SESSION",
+        "QOOP_TERMINAL",
+        "QORO_TERMINAL",
+        "QOOP_TOKEN",
+        "QORO_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// Register a pid the suite created, so a leak is visible suite-wide.
 pub fn track_pid(pid: i32) {
     tracker().lock().unwrap().push(pid);

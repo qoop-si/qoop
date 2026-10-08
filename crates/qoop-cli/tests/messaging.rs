@@ -6,7 +6,7 @@
 //! existence check and a prompt variant that refuses a blocked session.
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct Daemon {
@@ -19,7 +19,7 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
-        let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -41,7 +41,7 @@ impl Daemon {
     }
 
     fn run(&self, args: &[&str]) -> (bool, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))

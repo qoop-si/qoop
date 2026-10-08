@@ -42,7 +42,8 @@ impl Machine {
 
     /// `c` with this machine's environment and nothing of the person's.
     fn isolated(&self, mut c: Command) -> Command {
-        c.env("HOME", self.path("home"))
+        c.env(qoop_runtime::legacy::SANDBOX_ENV, "1")
+            .env("HOME", self.path("home"))
             .env("XDG_RUNTIME_DIR", self.path("rt"))
             .env("XDG_DATA_HOME", self.path("data"))
             .env("XDG_CONFIG_HOME", self.path("config"))
@@ -61,7 +62,7 @@ impl Machine {
     }
 
     fn qoop(&self) -> Command {
-        self.isolated(Command::new(env!("CARGO_BIN_EXE_qoop")))
+        self.isolated(qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop")))
     }
 
     /// What 0.7.x left on disk: its three directories, each with something in it.
@@ -271,4 +272,30 @@ fn the_version_line_follows_the_name_the_binary_is_run_by() {
         let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(said, format!("{name} {}", env!("CARGO_PKG_VERSION")));
     }
+}
+
+/// The root fix for the incident of 2026-10-08: a `qoop` that cargo started without a
+/// sandbox (a test that forgot `qoop_testkit::sandboxed`) refuses to run and moves nothing.
+#[test]
+fn an_unsandboxed_spawn_under_cargo_cannot_migrate() {
+    let m = Machine::new();
+    m.old_files();
+    // Everything but the mark: the environment of a test that built its own `Command`.
+    let mut c = Command::new(env!("CARGO_BIN_EXE_qoop"));
+    c.env("HOME", m.path("home"))
+        .env("XDG_CONFIG_HOME", m.path("config"))
+        .env("XDG_DATA_HOME", m.path("data"))
+        .env_remove(qoop_runtime::legacy::SANDBOX_ENV)
+        .arg("--version");
+    let out = c.output().expect("qoop");
+    assert_eq!(out.status.code(), Some(70), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to run under cargo"));
+    for old in ["config/qoro", "data/qoro"] {
+        let meta = m.path(old).symlink_metadata().expect(old);
+        assert!(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "{old} was moved"
+        );
+    }
+    assert!(!m.path("config/qoop").exists() && !m.path("data/qoop").exists());
 }

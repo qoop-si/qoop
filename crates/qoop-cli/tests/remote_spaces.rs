@@ -30,7 +30,7 @@ fn private_dir() -> tempfile::TempDir {
 }
 
 fn stop_session(runtime: &Path, session: &str) {
-    let _ = Command::new(qoop())
+    let _ = qoop_testkit::sandboxed(qoop())
         .args(["--session", session, "stop"])
         .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
@@ -42,7 +42,7 @@ fn stop_session(runtime: &Path, session: &str) {
 }
 
 fn stop(runtime: &Path) {
-    let _ = Command::new(qoop())
+    let _ = qoop_testkit::sandboxed(qoop())
         .arg("stop")
         .env("QOOP_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", runtime.join("config"))
@@ -79,7 +79,7 @@ fn fake_ssh(bin: &Path, remote_runtime: &Path, bare: &Path, old: &Path, swaps: &
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QOOP_SESSION\n\
+            "#!/bin/sh\nfor a; do host=$last; last=$a; done\nunset QOOP_SESSION\nQOOP_TEST_SANDBOX=1; HOME=\"$(dirname \"$0\")/home\"; export QOOP_TEST_SANDBOX HOME; mkdir -p \"$HOME\"\n\
              case \"$last\" in *'qoop changed meanwhile'*) echo \"$host\" >> {};; esac\n\
              if [ \"$host\" = bare.example ]; then HOME={} PATH={}:/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
              if [ \"$host\" = old.example ]; then HOME={} PATH={}:/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"; fi\n\
@@ -289,7 +289,7 @@ fn scenario() {
         std::env::remove_var("QOOP_SESSION");
     }
 
-    let mut daemon = Command::new(qoop())
+    let mut daemon = qoop_testkit::sandboxed(qoop())
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", local.path())
         .env("XDG_CONFIG_HOME", local.path().join("config"))
@@ -457,7 +457,7 @@ fn scenario() {
 
             // The remote really holds it, and the local daemon does not.
             let screen = |runtime: &Path| {
-                let out = Command::new(qoop())
+                let out = qoop_testkit::sandboxed(qoop())
                     .args(["read", &(terminal & 0x00ff_ffff).to_string()])
                     .env("QOOP_RUNTIME_DIR", runtime)
                     .env("XDG_CONFIG_HOME", runtime.join("config"))

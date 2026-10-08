@@ -6,7 +6,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct Daemon {
@@ -15,7 +15,7 @@ struct Daemon {
 }
 
 fn start_in(dir: &Path) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -64,7 +64,7 @@ impl Daemon {
     }
 
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.args(args)
             .env("QOOP_RUNTIME_DIR", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
@@ -308,7 +308,7 @@ $Q task rules --turn > turn-open.out 2>&1"#,
 fn rules_print_the_static_block_with_no_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let started = Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["task", "rules"])
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("QOOP_TERMINAL", "1")
@@ -353,7 +353,7 @@ fn rules_print_the_static_block_when_the_daemon_hangs() {
         conn.is_some()
     });
     let started = Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["task", "rules"])
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("QOOP_TERMINAL", "1")

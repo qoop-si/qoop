@@ -10,8 +10,9 @@
 6. Run `cargo fmt --check`, `cargo clippy --workspace --all-targets`,
    `uv run python scripts/check-prose.py` and the tests you touched, then
    `cargo test --workspace`. There is no CI: these are the gate.
-   Run the tests with `HOME` and `TMPDIR` pointed at a temp directory: a test that starts `qoop`
-   without its own home moves that home's `qoro` directories to `qoop` (see `legacy.rs`).
+   A test starts `qoop` only through `qoop_testkit::sandboxed`, which gives it a home of its own:
+   the binary moves the home's old directories on its first command, and refuses to run under cargo
+   without that mark (see `legacy.rs`).
 7. Run it for real and keep the output: the CLI in a qoop or tmux terminal, the app on a
    simulator or device, a screenshot for anything visual. Never on the owner's live daemon,
    agents or qass: use an isolated `QOOP_RUNTIME_DIR`.

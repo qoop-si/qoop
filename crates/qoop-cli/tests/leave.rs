@@ -29,7 +29,7 @@ fn private_dir() -> tempfile::TempDir {
 }
 
 fn qoop(dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_qoop"));
+    let mut command = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
     command
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))

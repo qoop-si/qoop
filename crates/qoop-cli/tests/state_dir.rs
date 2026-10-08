@@ -46,7 +46,7 @@ impl Machine {
     /// `qoop` with this machine's environment. `old` starts it the way every build before
     /// this one kept its files: runtime directory named, state beside the socket.
     fn qoop(&self, old: bool) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut c = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         c.env("HOME", self.root.path().join("home"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("rt"))
             .env("XDG_DATA_HOME", self.root.path().join("data"))

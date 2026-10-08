@@ -61,7 +61,7 @@ impl DaemonProcess {
         // `tempdir` creates 0755; the daemon refuses anything group or other accessible.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         let socket = qoop_testkit::socket_in(dir.path());
-        let child = Command::new(bin)
+        let child = qoop_testkit::sandboxed(bin)
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))

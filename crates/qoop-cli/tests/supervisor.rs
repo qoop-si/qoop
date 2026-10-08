@@ -21,7 +21,7 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -48,7 +48,7 @@ impl Daemon {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.args(args)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"));

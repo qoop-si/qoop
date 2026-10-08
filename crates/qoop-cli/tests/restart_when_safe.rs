@@ -78,7 +78,7 @@ impl Daemon {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let child = Command::new(&exe)
+        let child = qoop_testkit::sandboxed(&exe)
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -115,7 +115,7 @@ impl Daemon {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_qoop"))
+        qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
@@ -912,7 +912,7 @@ fn a_daemon_started_during_the_move_finds_the_old_one_serving() {
                 // What `ensure_daemon` does once a connect was refused, and what a client
                 // that raced the first connect does anyway.
                 started.push(
-                    Command::new(env!("CARGO_BIN_EXE_qoop"))
+                    qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
                         .arg("daemon")
                         .env("QOOP_RUNTIME_DIR", &dir)
                         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -1277,7 +1277,7 @@ fn a_handover_that_cannot_be_adopted_starts_a_daemon_as_usual() {
     .expect("file");
     std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let log = dir.path().join("qoopd.log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let mut child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["daemon", "--adopt"])
         .arg(&stale)
         .args(["--nonce", "n"])
@@ -1329,7 +1329,7 @@ fn arming_for_the_version_already_running_moves_nothing() {
 #[test]
 fn a_relay_ends_when_its_daemon_goes_though_its_input_stays_open() {
     let d = Daemon::start();
-    let mut relay = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let mut relay = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .arg("relay")
         .env("QOOP_RUNTIME_DIR", d.dir.path())
         .env("XDG_CONFIG_HOME", d.dir.path().join("config"))
@@ -1420,7 +1420,7 @@ fn update(d: &Daemon, handoff: bool) -> Output {
     let home = d.dir.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(d.dir.path().join("remotes.json"), "[]").expect("remotes");
-    Command::new(&d.exe)
+    qoop_testkit::sandboxed(&d.exe)
         .arg("update")
         .env("HOME", &home)
         .env("QOOP_RUNTIME_DIR", d.dir.path())

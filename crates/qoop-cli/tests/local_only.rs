@@ -13,7 +13,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -180,7 +180,7 @@ fn scenario() {
     std::fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_TEST_SANDBOX=1; HOME=\"$(dirname \"$0\")/home\"; export QOOP_TEST_SANDBOX HOME; mkdir -p \"$HOME\"\nQOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             remote.path().display()
         ),
     )
@@ -204,7 +204,7 @@ fn scenario() {
         std::env::set_var("SHELL", "/bin/sh");
     }
 
-    let mut daemon = Command::new(qoop())
+    let mut daemon = qoop_testkit::sandboxed(qoop())
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", local.path())
         .stdout(Stdio::null())
@@ -323,11 +323,11 @@ fn scenario() {
 
     // The real interface, in a terminal of its own, with the remote saved: it starts and links
     // the remote, whose daemon (stopped first) its relay brings back up, and stays a while.
-    let saved = Command::new(qoop())
+    let saved = qoop_testkit::sandboxed(qoop())
         .args(["remote", "add", "devbox", "devbox.example"])
         .output()
         .expect("remote add");
-    let _ = Command::new(qoop())
+    let _ = qoop_testkit::sandboxed(qoop())
         .arg("stop")
         .env("QOOP_RUNTIME_DIR", remote.path())
         .stdout(Stdio::null())
@@ -339,7 +339,7 @@ fn scenario() {
     } else {
         vec!["script", "-qec", qoop(), "/dev/null"]
     };
-    let mut interface = Command::new(pty[0])
+    let mut interface = qoop_testkit::sandboxed(pty[0])
         .args(&pty[1..])
         .env("QOOP_RUNTIME_DIR", local.path())
         .env("TERM", "xterm-256color")
@@ -362,18 +362,18 @@ fn scenario() {
     let _ = interface.wait();
 
     // What install and every update run, and a look at the phones: quiet, and nothing written.
-    let reload = Command::new(qoop())
+    let reload = qoop_testkit::sandboxed(qoop())
         .args(["bridge", "reload"])
         .env("QOOP_RUNTIME_DIR", local.path())
         .output()
         .expect("bridge reload");
-    let devices = Command::new(qoop())
+    let devices = qoop_testkit::sandboxed(qoop())
         .args(["devices", "ls"])
         .env("QOOP_RUNTIME_DIR", local.path())
         .output()
         .expect("devices ls");
     for runtime in [local.path(), remote.path()] {
-        let _ = Command::new(qoop())
+        let _ = qoop_testkit::sandboxed(qoop())
             .arg("stop")
             .env("QOOP_RUNTIME_DIR", runtime)
             .stdout(Stdio::null())
@@ -409,7 +409,7 @@ fn scenario() {
             answer.contains("no phone support"),
             "devices ls: {devices:?}"
         );
-        let pair = Command::new(qoop())
+        let pair = qoop_testkit::sandboxed(qoop())
             .args(["pair", "--hub", &format!("ws://127.0.0.1:{hub_port}")])
             .stdin(Stdio::null())
             .output()

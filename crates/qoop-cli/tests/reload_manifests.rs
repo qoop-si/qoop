@@ -6,7 +6,7 @@
 //! pinned one layer down in `qoop-detect`'s reload tests.
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct Daemon {
@@ -22,7 +22,7 @@ impl Daemon {
             .expect("chmod");
         let config = dir.path().join("config");
         std::fs::create_dir_all(&config).expect("config dir");
-        let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path().join("rt"))
             .env("XDG_CONFIG_HOME", &config)
@@ -43,7 +43,7 @@ impl Daemon {
     }
 
     fn reload(&self) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("reload-manifests")
             .env("QOOP_RUNTIME_DIR", self.dir.path().join("rt"))
             .output()

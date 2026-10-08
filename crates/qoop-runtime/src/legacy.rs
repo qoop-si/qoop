@@ -47,6 +47,24 @@ pub fn var_os(name: &str) -> Option<OsString> {
     std::env::var_os(name).or_else(|| std::env::var_os(old_name(name)))
 }
 
+/// Set, by whoever starts this binary from a test or a bench, to say its home is not the
+/// person's.
+pub const SANDBOX_ENV: &str = "QOOP_TEST_SANDBOX";
+
+/// Stop a binary that cargo started (a test, `cargo run`) with nobody's sandbox: its first
+/// command would move the home's `qoro` directories, and the person running the suite
+/// never asked for that. Loud, and before anything is touched.
+fn refuse_unsandboxed() {
+    if std::env::var_os("CARGO_MANIFEST_DIR").is_some() && std::env::var_os(SANDBOX_ENV).is_none() {
+        eprintln!(
+            "qoop: refusing to run under cargo with a real home: it would move its qoro \
+             directories. Start it from a test through qoop_testkit::sandboxed, or set \
+             {SANDBOX_ENV}=1 together with a HOME of its own."
+        );
+        std::process::exit(70);
+    }
+}
+
 /// Move the person's directories to the new name, once: the configuration, the data and
 /// the logs. The old name stays behind as a link, because a running daemon, a hook already
 /// loaded into an agent and a launchd service all still spell the old paths.
@@ -54,6 +72,7 @@ pub fn var_os(name: &str) -> Option<OsString> {
 /// Called first thing by every command. A directory moves by `rename`, which leaves the
 /// files open in a running process open, and only when the new name is free.
 pub fn move_home() {
+    refuse_unsandboxed();
     let logs = paths::logs_dir().map(|dir| {
         // Linux keeps them in `<state>/qoop/log`; it is `<state>/qoop` that is named.
         if cfg!(target_os = "macos") {

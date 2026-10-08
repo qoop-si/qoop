@@ -16,7 +16,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use qoop_pty::sys;
@@ -68,7 +68,7 @@ fn attach_once(bin: &Path, runtime_dir: &Path) -> std::io::Result<Duration> {
     let pty = sys::open_pty(80, 24)?;
 
     let start = Instant::now();
-    let mut child = Command::new(bin)
+    let mut child = qoop_testkit::sandboxed(bin)
         .env("QOOP_RUNTIME_DIR", runtime_dir)
         // Same session pinning as the daemon spawn above: the client must
         // attach the session the warm daemon actually holds.

@@ -7,7 +7,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use qoop_runtime::control::{ControlRequest, ControlResponse};
@@ -23,7 +23,7 @@ impl Drop for Running {
 }
 
 fn spawn_daemon(dir: &Path) -> Running {
-    let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -45,7 +45,7 @@ fn spawn_daemon(dir: &Path) -> Running {
 }
 
 fn qoop(dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(args)
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))

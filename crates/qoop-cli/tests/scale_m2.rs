@@ -68,7 +68,7 @@ fn start_daemon_with(trace: bool) -> Daemon {
     require_release();
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_qoop"));
+    let mut command = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
     command
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", dir.path())
@@ -613,7 +613,7 @@ async fn g2_2_idle_cost_does_not_depend_on_the_rest_of_the_machine() {
     let mut crowd = Vec::new();
     for _ in 0..400 {
         crowd.push(
-            Command::new("/bin/sh")
+            qoop_testkit::sandboxed("/bin/sh")
                 .args(["-c", "sleep 30"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

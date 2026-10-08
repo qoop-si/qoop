@@ -27,7 +27,7 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
-        let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("SHELL", "/bin/sh")
@@ -46,7 +46,7 @@ impl Daemon {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_qoop"))
+        qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .current_dir(cwd)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
@@ -209,7 +209,7 @@ fn verbs_refuse_without_a_daemon_and_start_none() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
     // `agents` is not here: with nothing awake it answers an empty list.
     for args in [&["new", "--", "true"][..], &["read", "1"]] {
-        let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .env("QOOP_RUNTIME_DIR", dir.path())
             .output()
@@ -479,7 +479,7 @@ fn worktree_rm_ignores_qoop_itself_and_tells_a_caller_inside_to_step_out() {
     daemon.close(&terminal);
 
     // A qoop client started from inside holds no work there.
-    let mut watcher = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let mut watcher = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["wait", "1", "--until", "blocked", "--timeout", PATIENCE_ARG])
         .current_dir(&checkout)
         .env("QOOP_RUNTIME_DIR", daemon.dir.path())
@@ -490,7 +490,7 @@ fn worktree_rm_ignores_qoop_itself_and_tells_a_caller_inside_to_step_out() {
 
     // Run from a shell standing inside: the shell is the caller's own, and the answer is
     // to step out rather than to close it. `; true` keeps the shell from exec-ing qoop.
-    let inside = Command::new("/bin/sh")
+    let inside = qoop_testkit::sandboxed("/bin/sh")
         .args(["-c", "\"$0\" worktree rm feat/self; true"])
         .arg(env!("CARGO_BIN_EXE_qoop"))
         .current_dir(&checkout)
@@ -526,7 +526,7 @@ fn worktree_rm_names_a_qoop_daemon_running_from_inside() {
     // opens without a directory starts there, so it is not a client to ignore.
     let other = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let mut inside = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let mut inside = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["daemon"])
         .current_dir(&checkout)
         .env("QOOP_RUNTIME_DIR", other.path())

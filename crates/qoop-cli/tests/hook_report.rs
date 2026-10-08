@@ -7,7 +7,7 @@
 //! leaves the daemon and no socket test can honestly hold one.
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct Daemon {
@@ -20,7 +20,7 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
-        let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+        let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -40,7 +40,7 @@ impl Daemon {
     }
 
     fn report(&self, args: &[&str], clear_qoop_env: bool) -> (bool, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.arg("hook-report");
         cmd.args(args);
         cmd.env("QOOP_RUNTIME_DIR", self.dir.path())
@@ -263,7 +263,7 @@ fn a_daemon_that_never_greets_still_ends_the_report_in_five_seconds() {
     // Bound and listening, so the connect lands in the backlog, and never accepted.
     let _wedged = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
     let started = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let mut child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args([
             "hook-report",
             "--state",

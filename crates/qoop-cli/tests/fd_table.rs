@@ -26,7 +26,7 @@ fn the_daemon_holds_exactly_one_master_and_the_child_one_tty() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
     let mut daemon = Reaped(
-        Command::new(env!("CARGO_BIN_EXE_qoop"))
+        qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))

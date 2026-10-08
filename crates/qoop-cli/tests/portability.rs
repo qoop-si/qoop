@@ -8,8 +8,6 @@
 //!
 //! Written as a gate rather than as an acceptance script nobody has to run.
 
-use std::process::Command;
-
 use qoop_setup::{NativeSession, Origin, Setup};
 
 fn qoop() -> &'static str {
@@ -56,7 +54,7 @@ fn run(dir: &std::path::Path, args: &[&str]) -> (String, String, bool) {
 /// The same, with what a person types on stdin.
 fn answering(dir: &std::path::Path, args: &[&str], typed: &str) -> (String, String, bool) {
     use std::io::Write;
-    let mut child = Command::new(qoop())
+    let mut child = qoop_testkit::sandboxed(qoop())
         .args(args)
         .env("QOOP_RUNTIME_DIR", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -208,7 +206,10 @@ fn an_edited_setup_is_not_the_setup_that_was_trusted() {
 /// compatibility is decided on.
 #[test]
 fn the_binary_answers_a_bootstrap_with_its_codec_generation() {
-    let out = Command::new(qoop()).arg("--hello").output().expect("run");
+    let out = qoop_testkit::sandboxed(qoop())
+        .arg("--hello")
+        .output()
+        .expect("run");
     assert!(out.status.success());
     let hello: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("the answer is one line of json");

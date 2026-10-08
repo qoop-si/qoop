@@ -30,7 +30,7 @@ struct Machine {
 /// existed, so nothing could ever reach them again.
 impl Drop for Machine {
     fn drop(&mut self) {
-        let _ = Command::new(qoop())
+        let _ = qoop_testkit::sandboxed(qoop())
             .arg("stop")
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
@@ -50,7 +50,7 @@ impl Machine {
 
     /// A relay, as ssh would start one on the far side.
     fn relay(&self) -> Child {
-        Command::new("/bin/sh")
+        qoop_testkit::sandboxed("/bin/sh")
             .args(["-c", &format!("exec {} relay", qoop())])
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))

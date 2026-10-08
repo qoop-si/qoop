@@ -407,7 +407,7 @@ impl Interface {
         rows: u16,
         env: &[(&str, std::ffi::OsString)],
     ) -> (Child, Child, OwnedFd) {
-        let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut daemon_cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         daemon_cmd
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir)
@@ -447,7 +447,7 @@ impl Interface {
         let stdin = slave.try_clone().expect("dup");
         let stdout = slave.try_clone().expect("dup");
         let stderr = slave.try_clone().expect("dup");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qoop"));
+        let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.env("QOOP_RUNTIME_DIR", dir)
             .env_remove("QOOP_SESSION")
             .env_remove("QORO_SESSION")
@@ -2439,7 +2439,7 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     std::fs::write(
         ssh_bin.join("ssh"),
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\n\
+            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_TEST_SANDBOX=1; HOME=\"$(dirname \"$0\")/home\"; export QOOP_TEST_SANDBOX HOME; mkdir -p \"$HOME\"\n\
              HOME={} PATH=/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             old.display(),
             run.display()

@@ -2,12 +2,10 @@
 //! sentence goes to stderr. qass's watch reads standard output and followed a machine it
 //! called `no` while the sentence was on it.
 
-use std::process::Command;
-
 #[test]
 fn no_remotes_print_nothing_on_standard_output() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .args(["remote", "ls"])
         .env("XDG_CONFIG_HOME", dir.path())
         .env("HOME", dir.path())

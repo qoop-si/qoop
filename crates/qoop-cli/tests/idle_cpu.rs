@@ -134,7 +134,7 @@ impl Drop for Daemon {
 fn start_daemon() -> Daemon {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let child = Command::new(env!("CARGO_BIN_EXE_qoop"))
+    let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .arg("daemon")
         .env("QOOP_RUNTIME_DIR", dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -349,7 +349,7 @@ fn attach(dir: &std::path::Path) -> Child {
     // `script` gives the client a controlling terminal without a terminal emulator. Without
     // one the client's raw-mode setup fails and it exits, and the gate would be measuring
     // a process that is not doing the thing.
-    Command::new("script")
+    qoop_testkit::sandboxed("script")
         .arg("-q")
         .arg("/dev/null")
         .arg(env!("CARGO_BIN_EXE_qoop"))
