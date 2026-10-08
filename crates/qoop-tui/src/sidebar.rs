@@ -1912,6 +1912,18 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         .filter(|t| t.agent.is_some() && t.lead.is_none_or(|lead| lead == t.terminal))
         .count();
     let held = if space.asleep { dozing } else { kids.len() };
+    // A search shows the agents that matched, and the count says how many there are: `1/2`.
+    let total = c
+        .agents
+        .iter()
+        .filter(|a| a.agent && a.workspace == space.id)
+        .count();
+    let searching = !query_of(c).is_empty() && !space.asleep && total != held;
+    let held_text = if searching {
+        format!("{held}/{total}")
+    } else {
+        held.to_string()
+    };
     let armed = c.armed == Some(space.id);
     // Armed, the row is a question, and the controls become its two answers in the places
     // they were in: a question is asked where it was asked from (see `layout`).
@@ -1930,13 +1942,13 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         vec![String::new()]
     } else {
         let mut slots = Vec::new();
-        if held > 0 {
+        if held > 0 || searching {
             if !space.asleep && dozing > 0 {
                 // The zzz an asleep tab wears, or a `z` where icons are not drawn.
                 let zzz = if c.icons { crate::icons::ASLEEP } else { 'z' };
-                slots.push(format!(" ({held}, {dozing}{zzz})"));
+                slots.push(format!(" ({held_text}, {dozing}{zzz})"));
             }
-            slots.push(format!(" ({held})"));
+            slots.push(format!(" ({held_text})"));
         }
         slots.push(String::new());
         slots
@@ -2723,8 +2735,13 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     } else {
         ("z".to_string(), "c".to_string())
     };
+    // A row that already sleeps has nothing to put to sleep: its place stays blank.
+    let asleep = agent.state == "sleeping";
+    let sleep = if asleep { " ".to_string() } else { sleep };
     let text = format!("{} {sleep} {cup}", fit_to(&text, at));
-    runs.push((at + 1, 1, crate::theme::Role::Faint));
+    if !asleep {
+        runs.push((at + 1, 1, crate::theme::Role::Faint));
+    }
     runs.push((
         at + 3,
         1,
@@ -10003,5 +10020,80 @@ mod tests {
             assert!(tree(&hits), "{height}: dragged to {room}");
             c.inbox.rows = 99;
         }
+    }
+    /// Under a search a rule counts what matched out of what the space holds, `1/2`; whole, it
+    /// is the plain count again.
+    #[test]
+    fn a_search_shows_matched_out_of_all_on_the_rule() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let rule_of = |query: &str| {
+            let nav = Nav {
+                query: query.into(),
+                ..Nav::default()
+            };
+            let mut c = column(
+                &spaces,
+                &agents,
+                1,
+                1,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                WIDTH,
+                &shut,
+            );
+            c.nav = Some(&nav);
+            let rows = rows_folded(&c, 30, None);
+            rule_row(&rows, 1).text.trim_end().to_string()
+        };
+        assert!(rule_of("").starts_with("\u{25be}app (1)"));
+        assert!(
+            rule_of("working").starts_with("\u{25be}app (1)"),
+            "all of it matched"
+        );
+        let mut two = agents.clone();
+        two.push(agent(9, 1, "codex", "idle"));
+        let nav = Nav {
+            query: "working".into(),
+            ..Nav::default()
+        };
+        let mut c = column(
+            &spaces,
+            &two,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        c.nav = Some(&nav);
+        let rows = rows_folded(&c, 30, None);
+        assert!(
+            rule_row(&rows, 1).text.starts_with("\u{25be}app (1/2)"),
+            "{:?}",
+            rule_row(&rows, 1).text
+        );
+    }
+
+    /// A live row whose state is `sleeping` has nothing to put to sleep: no mark, and no
+    /// click on its place.
+    #[test]
+    fn a_row_that_already_sleeps_draws_no_sleep_mark() {
+        let (spaces, mut agents) = sample();
+        agents[0].state = "sleeping".into();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        let rows = rows_folded(&c, 20, None);
+        let row = tree_row(&rows, 1);
+        assert!(row.text.ends_with("   c x "), "{:?}", row.text);
+        assert!(!on_agent_sleep(WIDTH - 5, 1, &c));
+        assert!(!row.runs.iter().any(|(at, _, _)| *at == WIDTH - 6));
     }
 }

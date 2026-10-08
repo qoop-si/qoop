@@ -911,6 +911,8 @@ struct Modes {
     side: Option<sidebar::Nav>,
     /// Where `enter` in the sidebar mode asked the loop to go, which needs the socket.
     side_go: Option<Go>,
+    /// The spaces `S` asked about, waiting for a `y`: any other key keeps them awake.
+    side_ask: Option<Vec<i64>>,
     /// A split divider held by the mouse: the path to its split.
     split_drag: Option<layout::SplitPath>,
     /// A close waiting for its `y`: the terminal, and the question on the notice row.
@@ -4321,6 +4323,68 @@ async fn side_go(
     Ok(())
 }
 
+/// A fold is refused while a search is on: it would show only after the search is cleared,
+/// when a person has forgotten asking for it.
+fn fold_refused(state: &mut State) -> bool {
+    let searching = state
+        .modes
+        .side
+        .as_ref()
+        .is_some_and(|nav| !nav.query.trim().is_empty());
+    if searching {
+        state.message = Some("clear the search to fold".to_string());
+    }
+    searching
+}
+
+/// `1 space` or `3 spaces`, by name for one.
+fn spaces_word(state: &State, ids: &[i64]) -> String {
+    match ids {
+        [one] => space_name(state, *one),
+        _ => format!("{} spaces", ids.len()),
+    }
+}
+
+/// `S`: ask before putting to sleep the spaces the column shows now, awake ones only. When that
+/// leaves nothing awake the question says the interface closes with them.
+fn side_ask_sleep(state: &mut State) {
+    let shown: Vec<i64> = side_items(state)
+        .into_iter()
+        .filter_map(|pick| match pick {
+            sidebar::Pick::Space(id) => Some(id),
+            sidebar::Pick::Terminal(_) => None,
+        })
+        .collect();
+    let awake = |s: &&qoop_runtime::control::WorkspaceRow| !s.asleep && s.terminals > 0;
+    let ids: Vec<i64> = state
+        .spaces
+        .iter()
+        .filter(awake)
+        .filter(|s| shown.contains(&s.id))
+        .map(|s| s.id)
+        .collect();
+    if ids.is_empty() {
+        state.message = Some("no awake space here to put to sleep".to_string());
+        return;
+    }
+    let leaves_none = state
+        .spaces
+        .iter()
+        .filter(awake)
+        .all(|s| ids.contains(&s.id));
+    state.message = Some(format!(
+        "sleep {}? y sleeps{}, any other key keeps {}",
+        spaces_word(state, &ids),
+        if leaves_none {
+            ", closing the interface if nothing stays awake"
+        } else {
+            ""
+        },
+        if ids.len() == 1 { "it" } else { "them" },
+    ));
+    state.modes.side_ask = Some(ids);
+}
+
 /// A click on the search box: the typing goes there, with what was already typed kept when the
 /// keyboard already had the column.
 fn focus_search(state: &mut State) {
@@ -4341,6 +4405,7 @@ fn enter_side(state: &mut State, typing: bool) {
         ..sidebar::Nav::default()
     });
     state.modes.side_go = None;
+    state.modes.side_ask = None;
     // The wheel's place is forgotten: the list follows the pick from here.
     state.list_scroll = None;
     let items = side_items(state);
@@ -4482,6 +4547,18 @@ fn side_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> M
         at += used.max(1);
         // What the last key said (or the daemon answered) has been read: the keys come back.
         state.message = None;
+        // The answer to `S`: `y` puts the spaces asked about to sleep, any other key keeps them.
+        if let Some(ids) = state.modes.side_ask.take() {
+            if key == ModeKey::Byte(b'y') {
+                for id in &ids {
+                    sleep_space(state, *id, request);
+                }
+                state.message = Some(format!("putting {} to sleep", spaces_word(state, &ids)));
+            } else {
+                state.message = Some("kept awake".to_string());
+            }
+            continue;
+        }
         let typing = state.modes.side.as_ref().is_some_and(|n| n.typing);
         if typing {
             // A pasted line ends in its enter: what follows it was text, not keys.
@@ -4605,18 +4682,7 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
             (Some(sidebar::Pick::Space(id)), _) => wake_space(state, id, request),
             _ => state.message = Some("awake already".to_string()),
         },
-        ModeKey::Byte(b'S') => {
-            let awake: Vec<i64> = state
-                .spaces
-                .iter()
-                .filter(|s| !s.asleep && s.terminals > 0)
-                .map(|s| s.id)
-                .collect();
-            for id in &awake {
-                sleep_space(state, *id, request);
-            }
-            state.message = Some(format!("putting {} spaces to sleep", awake.len()));
-        }
+        ModeKey::Byte(b'S') => side_ask_sleep(state),
         ModeKey::Byte(b'n' | b'+') => {
             if let Some(space) = space {
                 open_new(state, space);
@@ -4628,6 +4694,7 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         }
         ModeKey::Byte(b'f' | b' ') => {
             if let Some(space) = space
+                && !fold_refused(state)
                 && !state.shut.remove(&space)
             {
                 state.shut.insert(space);
@@ -4635,13 +4702,17 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
             }
         }
         ModeKey::Byte(b'h') | ModeKey::Left => {
-            if let Some(space) = space {
+            if let Some(space) = space
+                && !fold_refused(state)
+            {
                 state.shut.insert(space);
                 side_stand(state, &side_items(state), Some(sidebar::Pick::Space(space)));
             }
         }
         ModeKey::Byte(b'l') | ModeKey::Right => {
-            if let Some(space) = space {
+            if let Some(space) = space
+                && !fold_refused(state)
+            {
                 state.shut.remove(&space);
             }
         }
@@ -6866,7 +6937,7 @@ where
                                         dirty = true;
                                     }
                                     Some(Clicked::Fold(space)) => {
-                                        if !state.shut.remove(&space) {
+                                        if !fold_refused(&mut state) && !state.shut.remove(&space) {
                                             state.shut.insert(space);
                                         }
                                         dirty = true;
@@ -7083,7 +7154,7 @@ where
                                                 .await?;
                                             }
                                         } else if fold {
-                                            if !state.shut.remove(&space) {
+                                            if !fold_refused(&mut state) && !state.shut.remove(&space) {
                                                 state.shut.insert(space);
                                             }
                                         } else if let Some(bytes) = enter_space(
@@ -17902,7 +17973,20 @@ mod tests {
             }]
         ));
         s.modes.outbox.clear();
+        // `S` asks first, and says the interface closes when nothing would stay awake.
         mode_input(&mut s, b"S", 0x01, &mut request);
+        assert!(s.modes.outbox.is_empty());
+        let asked = s.message.clone().expect("a question");
+        assert!(
+            asked.starts_with(
+                "sleep 2 spaces? y sleeps, closing the interface if nothing stays awake"
+            ),
+            "{asked}"
+        );
+        mode_input(&mut s, b"n", 0x01, &mut request);
+        assert!(s.modes.outbox.is_empty(), "any other key keeps them awake");
+        assert_eq!(s.message.as_deref(), Some("kept awake"));
+        mode_input(&mut s, b"Sy", 0x01, &mut request);
         let slept: Vec<(i64, Option<u32>)> = s
             .modes
             .outbox
@@ -18028,5 +18112,61 @@ mod tests {
         focus_search(&mut s);
         let nav = s.modes.side.as_ref().expect("still open");
         assert!(nav.typing && nav.query == "web");
+    }
+    /// `S` only asks about the spaces the filter leaves, by name for one, says nothing would
+    /// close the interface while another space stays awake, and has nothing to ask when no
+    /// awake space is shown.
+    #[test]
+    fn s_asks_about_the_spaces_the_search_shows() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, true);
+        mode_input(&mut s, b"webshop\r", 0x01, &mut request);
+        mode_input(&mut s, b"S", 0x01, &mut request);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("sleep webshop? y sleeps, any other key keeps it")
+        );
+        assert_eq!(s.modes.side_ask, Some(vec![2]));
+        mode_input(&mut s, b"y", 0x01, &mut request);
+        assert!(matches!(
+            s.modes.outbox.as_slice(),
+            [ControlRequest::SleepWorkspace {
+                workspace: 2,
+                terminal: None,
+                ..
+            }]
+        ));
+        s.modes.outbox.clear();
+        s.spaces[1].asleep = true;
+        mode_input(&mut s, b"S", 0x01, &mut request);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("no awake space here to put to sleep")
+        );
+        assert!(s.modes.side_ask.is_none() && s.modes.outbox.is_empty());
+    }
+
+    /// While a search is on, no key and no click folds: the fold would only show after the
+    /// search is cleared.
+    #[test]
+    fn a_search_refuses_every_fold() {
+        let mut s = state();
+        let mut request = 0;
+        enter_side(&mut s, true);
+        mode_input(&mut s, b"claude\r", 0x01, &mut request);
+        for key in [&b"f"[..], b"h", b"l", b" ", b"\x1b[D"] {
+            s.message = None;
+            mode_input(&mut s, key, 0x01, &mut request);
+            assert!(s.shut.is_empty(), "{key:?} folded under a search");
+            assert_eq!(
+                s.message.as_deref(),
+                Some("clear the search to fold"),
+                "{key:?}"
+            );
+        }
+        assert!(fold_refused(&mut s));
+        mode_input(&mut s, b"\x1b", 0x01, &mut request);
+        assert!(!fold_refused(&mut s));
     }
 }
