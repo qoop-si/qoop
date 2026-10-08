@@ -1123,7 +1123,9 @@ impl Daemon {
             }
         };
 
-        crate::legacy::point_old_path_at(&socket);
+        if crate::legacy::migrating() {
+            crate::legacy::point_old_path_at(&socket);
+        }
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 

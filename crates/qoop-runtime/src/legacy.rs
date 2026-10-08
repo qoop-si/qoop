@@ -51,33 +51,23 @@ pub fn var_os(name: &str) -> Option<OsString> {
 /// person's.
 pub const SANDBOX_ENV: &str = "QOOP_TEST_SANDBOX";
 
-/// Stop a binary that cargo started (a test, `cargo run`) with nobody's sandbox: its first
-/// command would move the home's `qoro` directories, and the person running the suite
-/// never asked for that. Loud, and before anything is touched.
+/// Whether the steps that touch the old names on real paths may run: the links, the
+/// directories, the hooks, the skills, the login item.
 ///
-/// Only a binary that lies under a `target` directory: an installed one keeps working in an
-/// environment that inherited `CARGO_MANIFEST_DIR` (an IDE, a daemon started by `cargo run`
-/// and the tabs it starts).
-fn refuse_unsandboxed() {
-    let exe = std::env::current_exe().ok();
-    if should_refuse(
-        exe.as_deref(),
-        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
-        std::env::var_os(SANDBOX_ENV).is_some(),
-    ) {
-        eprintln!(
-            "qoop: refusing to run under cargo with a real home: it would move its qoro \
-             directories. Start it from a test through qoop_testkit::sandboxed, or set \
-             {SANDBOX_ENV}=1 together with a HOME of its own."
-        );
-        std::process::exit(70);
-    }
+/// Not from a binary that lies under a cargo `target` directory (a test, a build run by hand)
+/// unless it was started with [`SANDBOX_ENV`]: such a binary run with the person's own home
+/// would move their `qoro` directories, and twice already it did. The rest of the command
+/// runs as it always does.
+pub fn migrating() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let exe = std::env::current_exe().ok();
+        !skips_migration(exe.as_deref(), std::env::var_os(SANDBOX_ENV).is_some())
+    })
 }
 
-fn should_refuse(exe: Option<&Path>, under_cargo: bool, sandboxed: bool) -> bool {
-    under_cargo
-        && !sandboxed
-        && exe.is_some_and(|exe| exe.components().any(|part| part.as_os_str() == "target"))
+fn skips_migration(exe: Option<&Path>, sandboxed: bool) -> bool {
+    !sandboxed && exe.is_some_and(|exe| exe.components().any(|part| part.as_os_str() == "target"))
 }
 
 /// Move the person's directories to the new name, once: the configuration, the data and
@@ -87,7 +77,13 @@ fn should_refuse(exe: Option<&Path>, under_cargo: bool, sandboxed: bool) -> bool
 /// Called first thing by every command. A directory moves by `rename`, which leaves the
 /// files open in a running process open, and only when the new name is free.
 pub fn move_home() {
-    refuse_unsandboxed();
+    if !migrating() {
+        eprintln!(
+            "qoop: a build under a target directory without {SANDBOX_ENV} does not move the \
+             qoro directories of this home"
+        );
+        return;
+    }
     let logs = paths::logs_dir().map(|dir| {
         // Linux keeps them in `<state>/qoop/log`; it is `<state>/qoop` that is named.
         if cfg!(target_os = "macos") {
@@ -258,6 +254,9 @@ pub fn point_old_path_at(socket: &Path) {
 /// it, so the old name keeps working (a 0.7.x daemon moves onto the path it was started
 /// from, and hooks and scripts of the fleet say `qoro`) while the new one exists.
 pub fn settle_binary_name() {
+    if !migrating() {
+        return;
+    }
     if let Ok(exe) = std::env::current_exe() {
         let _ = settle(&exe);
     }
@@ -306,7 +305,7 @@ pub fn keep_old_name(exe: &Path) -> io::Result<()> {
 /// The plist of the launchd agent that went by `label` before the rename, when it is there.
 /// macOS only.
 pub fn old_launchd_plist(label: &str) -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(target_os = "macos") || !migrating() {
         return None;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -538,17 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_fires_only_for_a_cargo_built_binary_without_the_mark() {
+    fn a_binary_under_target_skips_the_migration_unless_sandboxed() {
         let built = Path::new("/w/target/debug/qoop");
         let installed = Path::new("/Users/a/.local/bin/qoop");
-        // Under cargo, in a target directory, with no mark: refused.
-        assert!(should_refuse(Some(built), true, false));
-        // The mark, or no cargo around, or an installed binary that inherited the variable
-        // (an IDE, the tabs of a daemon cargo started): never.
-        assert!(!should_refuse(Some(built), true, true));
-        assert!(!should_refuse(Some(built), false, false));
-        assert!(!should_refuse(Some(installed), true, false));
-        assert!(!should_refuse(None, true, false));
+        assert!(skips_migration(Some(built), false));
+        assert!(!skips_migration(Some(built), true));
+        assert!(!skips_migration(Some(installed), false));
+        assert!(!skips_migration(None, false));
     }
 
     #[test]

@@ -420,7 +420,9 @@ fn install(latest: &Release, current: &str) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("cannot find this binary: {e}")))?;
     install_to(latest, current, &exe)?;
     // The old name stays a link to this binary (see `legacy`).
-    if let Ok(real) = std::fs::canonicalize(&exe) {
+    if qoop_runtime::legacy::migrating()
+        && let Ok(real) = std::fs::canonicalize(&exe)
+    {
         let _ = qoop_runtime::legacy::keep_old_name(&real);
     }
     refresh_integrations(&exe);

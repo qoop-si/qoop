@@ -42,7 +42,8 @@ pub fn restart_if_installed() {
     {
         // A login item from before the rename becomes one under the new label: written and
         // loaded first, and only then is the old one taken down (see `legacy`).
-        let had_old = qoop_runtime::legacy::old_launchd_plist(mac::OLD_LABEL).is_some();
+        let had_old = qoop_runtime::legacy::migrating()
+            && qoop_runtime::legacy::old_launchd_plist(mac::OLD_LABEL).is_some();
         if let Some(plist) = mac::plist_path().filter(|p| p.exists() || had_old) {
             if had_old && mac::write_plist(&plist).is_err() {
                 return;

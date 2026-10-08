@@ -283,22 +283,27 @@ fn the_version_line_follows_the_name_the_binary_is_run_by() {
     }
 }
 
-/// The root fix for the incident of 2026-10-08: a `qoop` that cargo started without a
-/// sandbox (a test that forgot `qoop_testkit::sandboxed`) refuses to run and moves nothing.
+/// The root fix for the incidents of 2026-10-08: a `qoop` built under a `target` directory
+/// that was not started through the sandbox helper (a test that forgot it, a build run by
+/// hand) moves nothing of the home it finds, and the command itself still runs.
 #[test]
-fn an_unsandboxed_spawn_under_cargo_cannot_migrate() {
+fn a_build_under_target_without_the_mark_leaves_the_home_alone() {
     let m = Machine::new();
     m.old_files();
-    // Everything but the mark: the environment of a test that built its own `Command`.
+    m.old_runtime_dir();
+    let listener = listen(&m.old_session().join("qorod.sock"));
+    // Everything but the mark, and not from a cargo test either: a plain shell's environment.
     let mut c = Command::new(env!("CARGO_BIN_EXE_qoop"));
-    c.env("HOME", m.path("home"))
+    c.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", m.path("home"))
         .env("XDG_CONFIG_HOME", m.path("config"))
         .env("XDG_DATA_HOME", m.path("data"))
-        .env_remove(qoop_runtime::legacy::SANDBOX_ENV)
-        .arg("--version");
+        .env("XDG_RUNTIME_DIR", m.path("rt"))
+        .args(["ls", "--json"]);
     let out = c.output().expect("qoop");
-    assert_eq!(out.status.code(), Some(70), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to run under cargo"));
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not move the qoro directories"));
     for old in ["config/qoro", "data/qoro"] {
         let meta = m.path(old).symlink_metadata().expect(old);
         assert!(
@@ -307,6 +312,14 @@ fn an_unsandboxed_spawn_under_cargo_cannot_migrate() {
         );
     }
     assert!(!m.path("config/qoop").exists() && !m.path("data/qoop").exists());
+    // No link into the old runtime directory either.
+    assert!(
+        m.new_session()
+            .join("qoopd.sock")
+            .symlink_metadata()
+            .is_err()
+    );
+    drop(listener);
 }
 
 /// Codex trusts a hook by its path: replacing the old entry says the new one is not trusted yet.

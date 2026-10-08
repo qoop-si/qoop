@@ -1338,7 +1338,11 @@ pub(crate) fn ensure_awake() -> std::io::Result<()> {
     let here = std::env::current_dir().ok();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
-    let _held = qoop_runtime::lock::StartupLock::acquire(&qoop_runtime::legacy::awake_lock(&dir))?;
+    let _held = qoop_runtime::lock::StartupLock::acquire(&if qoop_runtime::legacy::migrating() {
+        qoop_runtime::legacy::awake_lock(&dir)
+    } else {
+        dir.join("awake.lock")
+    })?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         // A daemon that was leaving as this connected closes it: started again, once.

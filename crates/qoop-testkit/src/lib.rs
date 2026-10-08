@@ -58,10 +58,10 @@ fn sandbox_root() -> &'static Path {
 /// tab or runtime variables of whoever runs the suite, and the mark that says it is a test.
 ///
 /// Every test that starts the `qoop` binary starts it through here. The binary moves the
-/// home's `qoro` directories to `qoop` on its first command and refuses to run under cargo
-/// without this mark (`legacy::refuse_unsandboxed`), so a spawn that forgets it fails
-/// loudly instead of touching the person's files. A test that wants a path of its own sets
-/// it afterwards.
+/// home's `qoro` directories to `qoop` on its first command, but not when it lies under a
+/// `target` directory without this mark (`legacy::migrating`), so a spawn that forgets it
+/// leaves the person's files alone, and a test of the migration needs it. A test that wants
+/// a path of its own sets it afterwards.
 pub fn sandboxed(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let root = sandbox_root();
     let mut command = std::process::Command::new(program);

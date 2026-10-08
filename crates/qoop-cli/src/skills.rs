@@ -214,6 +214,9 @@ fn status_of(home: &Path, target: &Target) -> &'static str {
 ///
 /// ponytail: with `legacy`; nothing else of the skills directory is touched.
 fn remove_old_skill(home: &Path, target: &Target) -> bool {
+    if !qoop_runtime::legacy::migrating() {
+        return false;
+    }
     let dir = home.join(target.dir.replacen("qoop", "qoro", 1));
     let gone = std::fs::remove_file(dir.join(FILE)).is_ok();
     let _ = std::fs::remove_dir(&dir);

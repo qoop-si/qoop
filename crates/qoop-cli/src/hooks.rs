@@ -521,7 +521,12 @@ fn install(args: &[String]) -> std::io::Result<()> {
         let edited = edit(&config, &target, &script, at_root);
         // The entries of the script it replaces, so an agent does not report twice.
         let mut replaced_old = false;
-        for (file, outcome) in remove_everywhere(&target, &home, &old_script(&target), false) {
+        let cleanup = if qoop_runtime::legacy::migrating() {
+            remove_everywhere(&target, &home, &old_script(&target), false)
+        } else {
+            Vec::new()
+        };
+        for (file, outcome) in cleanup {
             match outcome {
                 Ok(changed) => replaced_old |= changed,
                 Err(e) => println!("  {:<10} {} not cleaned: {e}", target.agent, file.display()),
@@ -584,7 +589,9 @@ fn install(args: &[String]) -> std::io::Result<()> {
 fn install_dropped(home: &Path, target: &Target) -> std::io::Result<bool> {
     let dropped = home.join(target.config).join(target.file);
     // The plugin it replaces: the agent loads every file in the directory, so both would run.
-    let _ = std::fs::remove_file(home.join(target.config).join(old_file(target)));
+    if qoop_runtime::legacy::migrating() {
+        let _ = std::fs::remove_file(home.join(target.config).join(old_file(target)));
+    }
     if std::fs::read_to_string(&dropped).ok().as_deref() == Some(target.body) {
         return Ok(false);
     }
@@ -604,7 +611,9 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         let script = dir.join(target.file);
         if matches!(target.shape, Shape::Dropped) {
             let dropped = home.join(target.config).join(target.file);
-            let _ = std::fs::remove_file(home.join(target.config).join(old_file(&target)));
+            if qoop_runtime::legacy::migrating() {
+                let _ = std::fs::remove_file(home.join(target.config).join(old_file(&target)));
+            }
             match std::fs::remove_file(&dropped) {
                 Ok(()) => println!("  {:<10} removed from {}", target.agent, target.config),
                 Err(_) => println!("  {:<10} was not there", target.agent),
@@ -613,9 +622,11 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
         }
         let mut removed = false;
         let mut failed = false;
-        let old = old_script(&target);
-        let _ = remove_everywhere(&target, &home, &old, false);
-        let _ = std::fs::remove_file(&old);
+        if qoop_runtime::legacy::migrating() {
+            let old = old_script(&target);
+            let _ = remove_everywhere(&target, &home, &old, false);
+            let _ = std::fs::remove_file(&old);
+        }
         for (config, outcome) in remove_everywhere(&target, &home, &script, true) {
             let shown = config.strip_prefix(&home).unwrap_or(&config).display();
             match outcome {

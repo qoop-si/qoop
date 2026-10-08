@@ -61,7 +61,9 @@ pub fn runtime_dir() -> Result<PathBuf, PathError> {
     }
     let dir = session_dir(&base, DEFAULT_SESSION);
     ensure_private_dir(&dir)?;
-    crate::legacy::reach_old_daemon(&dir);
+    if crate::legacy::migrating() {
+        crate::legacy::reach_old_daemon(&dir);
+    }
     Ok(dir)
 }
 
@@ -89,7 +91,9 @@ pub fn runtime_base() -> Result<PathBuf, PathError> {
     };
     ensure_private_dir(&dir)?;
     ensure_private_dir(&sessions_dir(&dir))?;
-    crate::legacy::reach_old_bridge(&dir);
+    if crate::legacy::migrating() {
+        crate::legacy::reach_old_bridge(&dir);
+    }
     Ok(dir)
 }
 
