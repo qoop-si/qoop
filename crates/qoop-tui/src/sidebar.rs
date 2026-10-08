@@ -15,6 +15,7 @@
 //! the rows are the same static text every time.
 
 use qoop_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
+use qoop_runtime::paths::HubLink;
 
 /// One painted row of the chrome: its text, and the colour its state gives it.
 ///
@@ -320,6 +321,8 @@ pub enum Hit {
 /// What a click on the column asks for, once the column it landed on is known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
+    /// The version on the foot: open the site in the browser.
+    Site,
     Space(i64),
     /// Fold a space's agents away under its rule, or open them again.
     Fold(i64),
@@ -875,7 +878,7 @@ fn parts(
     let stage = pet_shown(c, height, avatar.is_some()).then(|| inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let feet = foot_rows(c.width, stage, update_available().as_deref());
+    let feet = foot_rows(c.width, stage, update_available().as_deref(), hub_link());
     let foot = feet.len().min(height);
     let room = height - foot;
     let mut head = inbox_rows(c, inbox_height(c, room));
@@ -1312,7 +1315,8 @@ fn tray_line(width: usize) -> Line {
 /// The rows above the foot in a column of `height` rows: the inbox, the title and the list.
 fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avatar>) -> usize {
     let stage = pet_shown(c, height, avatar.is_some()).then_some(0);
-    height.saturating_sub(foot_rows(c.width, stage, update_available().as_deref()).len())
+    height
+        .saturating_sub(foot_rows(c.width, stage, update_available().as_deref(), hub_link()).len())
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
@@ -2673,8 +2677,13 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             let start = end.saturating_sub(MENU_LABEL.len());
             let settings_start = c.width.saturating_sub(FOOT_TAIL + 2 + SETTINGS_LABEL.len());
             let settings_end = settings_start + SETTINGS_LABEL.len();
+            // The version's own cells, when the row shows it: the site, not the fold.
+            let version =
+                version_link_at(c.width).filter(|at| col > *at && col <= at + VERSION.len());
             Some(if col > start && col <= end {
                 Act::Menu
+            } else if version.is_some() {
+                Act::Site
             } else if c.width >= SETTINGS_FROM && col > settings_start && col <= settings_end {
                 Act::SettingsPage
             } else {
@@ -2893,8 +2902,13 @@ fn collapse_row() -> Row {
     )
 }
 
-/// What [`FILES`] holds: the picked pet, and a newer version when one was seen.
-type Files = (Option<qoop_runtime::avatar::Avatar>, Option<String>);
+/// What [`FILES`] holds: the picked pet, a newer version when one was seen, and whether the
+/// phone bridge says it reaches the hub.
+type Files = (
+    Option<qoop_runtime::avatar::Avatar>,
+    Option<String>,
+    qoop_runtime::paths::HubLink,
+);
 
 /// The pet and the update notice as last read off disk.
 ///
@@ -2905,7 +2919,8 @@ type Files = (Option<qoop_runtime::avatar::Avatar>, Option<String>);
 /// and a new pet or notice shows up to one tick late.
 // ponytail: process-wide, the interface has one render loop; a State field would
 // thread two more arguments through rows_folded and every hit test.
-static FILES: std::sync::RwLock<Files> = std::sync::RwLock::new((None, None));
+static FILES: std::sync::RwLock<Files> =
+    std::sync::RwLock::new((None, None, qoop_runtime::paths::HubLink::Absent));
 
 /// Re-read the pet and the update notice. True when either changed, so the
 /// caller repaints. Never under test, so the thirty-odd paints the suite asserts
@@ -2914,7 +2929,14 @@ pub(crate) fn refresh_files() -> bool {
     if cfg!(test) {
         return false;
     }
-    hold(&FILES, (qoop_runtime::avatar::load(), notice_from_disk()))
+    hold(
+        &FILES,
+        (
+            qoop_runtime::avatar::load(),
+            notice_from_disk(),
+            qoop_runtime::paths::read_hub_link(),
+        ),
+    )
 }
 
 /// Keep `now` in `held`; true when it differs from what was there.
@@ -2925,6 +2947,11 @@ fn hold(held: &std::sync::RwLock<Files>, now: Files) -> bool {
     }
     *held = now;
     true
+}
+
+/// Whether the bridge says the hub is reached, as [`refresh_files`] last read it.
+fn hub_link() -> HubLink {
+    FILES.read().unwrap_or_else(|e| e.into_inner()).2
 }
 
 /// The picked avatar, when one is picked, as [`refresh_files`] last read it.
@@ -3059,12 +3086,14 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
 /// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
 /// rows are text and answer nothing.
-fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>) -> Vec<Row> {
+fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>, hub: HubLink) -> Vec<Row> {
     use crate::theme::Role;
     let tail = foot_tail(width);
     // The menu closes the last row: `menu « ` flush right, `settings` and the version before it.
     let version = version_text(width, crate::width::width(&tail), update);
-    // The interface is connected to its daemon whenever it is drawn: it ends with the stream.
+    // The dot is the interface's daemon, which it is connected to whenever it is drawn (it
+    // ends with the stream), and the hub the phone bridge says it reaches: green when both,
+    // warm when the bridge is there and the hub is not, quiet when there is no bridge.
     let dotted = format!("{version} {ONLINE}");
     let online = (!version.is_empty()
         && crate::width::width(&dotted) + 1 + crate::width::width(&tail) <= width)
@@ -3074,7 +3103,10 @@ fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>) -> Vec<Ro
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
-        runs: online.map(|at| (at, 1, Role::Done)).into_iter().collect(),
+        runs: online
+            .map(|at| (at, 1, online_role(hub)))
+            .into_iter()
+            .collect(),
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
@@ -3101,8 +3133,18 @@ fn foot_rows(width: usize, stage: Option<usize>, update: Option<&str>) -> Vec<Ro
     out
 }
 
-/// The `●` that says the interface is connected to its daemon.
+/// The `●` that says the interface is connected to its daemon, and to the hub if there is one.
 const ONLINE: char = '\u{25cf}';
+
+/// The online dot's ink for what the bridge says about the hub.
+fn online_role(hub: HubLink) -> crate::theme::Role {
+    use crate::theme::Role;
+    match hub {
+        HubLink::Up => Role::Done,
+        HubLink::Down => Role::Blocked,
+        HubLink::Absent => Role::Faint,
+    }
+}
 
 /// The box over the pet with the inbox count alone, flush right with the pet's right edge:
 /// one blank cell of margin before the column's edge, as the pet keeps. The number is warm
@@ -3150,12 +3192,13 @@ fn count_box(width: usize, count: usize) -> Vec<Row> {
 /// Where the version starts on the menu row, when the row shows it: the column its link
 /// covers. The word is [`VERSION`]; a newer version after it is not part of the link.
 pub(crate) fn version_link_at(width: usize) -> Option<usize> {
+    version_link_in(width, update_available().as_deref())
+}
+
+/// [`version_link_at`] for a given update notice.
+fn version_link_in(width: usize, update: Option<&str>) -> Option<usize> {
     let tail = foot_tail(width);
-    let shown = version_text(
-        width,
-        crate::width::width(&tail),
-        update_available().as_deref(),
-    );
+    let shown = version_text(width, crate::width::width(&tail), update);
     (!shown.is_empty()).then_some(1)
 }
 
@@ -3246,6 +3289,7 @@ fn fit_to(text: &str, cols: usize) -> String {
 mod tests {
     use super::*;
     use qoop_runtime::control::LinkState;
+    use qoop_runtime::paths::HubLink;
 
     /// A wide column for the width sweeps: what half of a 120 column window drags to.
     const SIDEBAR_MAX: usize = 60;
@@ -3261,18 +3305,24 @@ mod tests {
     /// paints nothing.
     #[test]
     fn the_held_files_ask_for_a_repaint_only_when_they_change() {
-        let held = std::sync::RwLock::new((None, None));
-        assert!(!hold(&held, (None, None)), "nothing changed");
+        let held = std::sync::RwLock::new((None, None, HubLink::Absent));
         assert!(
-            hold(&held, (None, Some("9.9.9".to_string()))),
+            !hold(&held, (None, None, HubLink::Absent)),
+            "nothing changed"
+        );
+        assert!(
+            hold(&held, (None, Some("9.9.9".to_string()), HubLink::Absent)),
             "a new notice"
         );
         assert!(
-            !hold(&held, (None, Some("9.9.9".to_string()))),
+            !hold(&held, (None, Some("9.9.9".to_string()), HubLink::Absent)),
             "the same notice"
         );
         assert_eq!(held.read().unwrap().1.as_deref(), Some("9.9.9"));
-        assert!(hold(&held, (None, None)), "the notice went away");
+        assert!(
+            hold(&held, (None, None, HubLink::Absent)),
+            "the notice went away"
+        );
     }
 
     /// Under test nothing is read off disk: every paint the suite asserts is the same
@@ -4885,7 +4935,7 @@ mod tests {
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The q alone, its tail in ember, then the menu.
-        let rows = foot_rows(WIDTH, None, None);
+        let rows = foot_rows(WIDTH, None, None, HubLink::Up);
         assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
@@ -4933,7 +4983,8 @@ mod tests {
         let menu_at = WIDTH - 6;
         assert_eq!(act(Hit::Foot, menu_at, &c, false), Some(Act::Menu));
         assert_eq!(act(Hit::Foot, WIDTH - 1, &c, false), Some(Act::Collapse));
-        assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Collapse));
+        assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Site));
+        assert_eq!(act(Hit::Foot, 1, &c, false), Some(Act::Collapse));
 
         // Folded to a strip there is no room for the logo, and the fold mark is the row.
         let (strip, hit) = collapse_row();
@@ -4949,8 +5000,8 @@ mod tests {
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, None, None);
-            let stands = foot_rows(width, Some(0), None);
+            let gave_way = foot_rows(width, None, None, HubLink::Up);
+            let stands = foot_rows(width, Some(0), None, HubLink::Up);
             assert_eq!(stands.len(), STAGE_FOOT_ROWS);
             let added = STAGE_FOOT_ROWS - gave_way.len();
             let blank_at = COUNT_BOX_ROWS;
@@ -4967,7 +5018,7 @@ mod tests {
     #[test]
     fn the_menu_row_carries_the_version_then_the_online_dot() {
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            let rows = foot_rows(width, None, None);
+            let rows = foot_rows(width, None, None, HubLink::Up);
             let (menu, hit) = rows.last().expect("the menu row");
             assert_eq!(*hit, Some(Hit::Foot));
             assert_eq!(crate::width::width(&menu.text), width);
@@ -4993,9 +5044,59 @@ mod tests {
             assert!(room || width < WIDTH, "the dot shows at the default width");
         }
         // No room for the version, no link and no dot hanging in the air.
-        let tight = foot_rows(8, None, None);
+        let tight = foot_rows(8, None, None, HubLink::Up);
         assert!(!tight.last().unwrap().0.text.contains(ONLINE));
         assert_eq!(version_link_at(8), None);
+    }
+
+    /// The dot says what the bridge says about the hub: green when reached, warm when a
+    /// bridge is there and the hub is not, quiet when there is no bridge. The dot is drawn
+    /// in all three, in the same cell.
+    #[test]
+    fn the_online_dot_follows_the_hub_state() {
+        use crate::theme::Role;
+        let dot = |hub| {
+            let rows = foot_rows(WIDTH, None, None, hub);
+            let menu = &rows.last().unwrap().0;
+            assert!(menu.text.contains(ONLINE), "{menu:?}");
+            menu.runs.clone()
+        };
+        let at = crate::width::width(&format!(" {VERSION}")) + 1;
+        assert_eq!(dot(HubLink::Up), vec![(at, 1, Role::Done)]);
+        assert_eq!(dot(HubLink::Down), vec![(at, 1, Role::Blocked)]);
+        assert_eq!(dot(HubLink::Absent), vec![(at, 1, Role::Faint)]);
+    }
+
+    /// The link and the click cover the version word and nothing else: with an update notice
+    /// after it (`0.8.0>0.9.0`) the notice is plain text, and a click anywhere else on the
+    /// foot still folds the column.
+    #[test]
+    fn the_version_link_covers_only_the_version() {
+        let rows = foot_rows(WIDTH, None, Some("9.9.9"), HubLink::Up);
+        let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
+        let at = version_link_in(WIDTH, Some("9.9.9")).expect("shown");
+        let word: String = text[at..at + VERSION.len()].iter().collect();
+        assert_eq!(word, VERSION);
+        assert_eq!(text[at + VERSION.len()], '>', "the notice follows the link");
+        let (spaces, agents) = sample();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        // 1-based columns: the version is columns 2 to 1 + its length.
+        for col in 2..=1 + VERSION.len() {
+            assert_eq!(act(Hit::Foot, col, &c, false), Some(Act::Site), "col {col}");
+        }
+        assert_eq!(act(Hit::Foot, 1, &c, false), Some(Act::Collapse));
+        assert_eq!(
+            act(Hit::Foot, 2 + VERSION.len(), &c, false),
+            Some(Act::Collapse)
+        );
+        assert_eq!(
+            act(Hit::Foot, 2, &c, true),
+            Some(Act::Collapse),
+            "folded strip"
+        );
+        // Where the row has no room for the version, nothing is a link.
+        assert_eq!(version_link_in(8, None), None);
     }
 
     /// The logo is the q of `docs/brand/make.py` alone at every width: one dot a cell with a
@@ -5026,7 +5127,7 @@ mod tests {
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
             for pet in [None, Some(0)] {
-                let rows = foot_rows(width, pet, None);
+                let rows = foot_rows(width, pet, None, HubLink::Up);
                 let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
                 for (i, (line, hit)) in logo.iter().enumerate() {
                     assert_eq!(
@@ -5186,7 +5287,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Option<&str>| {
-            foot_rows(width, None, update)
+            foot_rows(width, None, update, HubLink::Up)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -5278,7 +5379,7 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, None, None).len();
+        let kept = foot_rows(WIDTH, None, None, HubLink::Up).len();
         for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
@@ -5310,7 +5411,7 @@ mod tests {
             WIDTH,
             None,
         );
-        let freed = 30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, None, None).len();
+        let freed = 30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, None, None, HubLink::Up).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -7095,7 +7196,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, None, None).len();
+        let foot = foot_rows(WIDTH, None, None, HubLink::Up).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -7162,7 +7263,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, None, None).len();
+        let foot = foot_rows(WIDTH, None, None, HubLink::Up).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -8136,7 +8237,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, None, None).len() + 2;
+        let least = foot_rows(WIDTH, None, None, HubLink::Up).len() + 2;
         for height in [least, least + 1, 10, 14, 30] {
             let rows = rows12(
                 &spaces,

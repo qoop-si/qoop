@@ -1383,6 +1383,7 @@ impl State {
             sidebar::Act::Terminal(terminal) => Some(Clicked::Terminal(terminal)),
             sidebar::Act::NewSpace => Some(Clicked::NewSpace),
             sidebar::Act::Menu => Some(Clicked::Menu),
+            sidebar::Act::Site => Some(Clicked::Site),
             sidebar::Act::SettingsPage => Some(Clicked::SettingsPage),
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
@@ -4924,6 +4925,8 @@ fn copy_cursor(state: &State) -> Option<(usize, usize)> {
 #[derive(Clone, Copy, Debug)]
 enum Clicked {
     Menu,
+    /// The version on the foot: the site, in the browser.
+    Site,
     /// The foot's `settings`: the settings page, in a tab.
     SettingsPage,
     /// A tab of the inbox, or a count on its folded row.
@@ -6415,6 +6418,9 @@ where
                                             wr.write_all(&bytes).await?;
                                         }
                                         dirty = true;
+                                    }
+                                    Some(Clicked::Site) => {
+                                        crate::hyperlink::open_in_browser(sidebar::SITE);
                                     }
                                     Some(Clicked::Menu) => {
                                         state.menu_kind = MenuKind::Main;

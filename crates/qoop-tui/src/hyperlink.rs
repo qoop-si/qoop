@@ -21,6 +21,31 @@ pub fn clean_uri(uri: &str) -> Option<&str> {
     fits.then_some(uri)
 }
 
+/// Open `uri` in the person's browser: `open` on macOS, `xdg-open` elsewhere, started
+/// detached with no shell and no stdio, so the interface neither waits for it nor shares its
+/// terminal. A target that is not [`clean_uri`] is not opened. Failing to start the opener
+/// is silent: a click that did nothing is the whole report.
+pub fn open_in_browser(uri: &str) {
+    let Some(uri) = clean_uri(uri) else { return };
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let spawned = std::process::Command::new(program)
+        .arg(uri)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    // Reaped on a thread of its own, so a finished opener is never left a zombie.
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// The escape that opens a link to `uri`, which must have come through [`clean_uri`].
 pub fn open(uri: &str) -> String {
     format!("\x1b]8;;{uri}\x1b\\")

@@ -325,6 +325,69 @@ pub fn read_update_notice() -> Option<String> {
     parse_version(&version).map(|_| version)
 }
 
+/// The file the phone bridge keeps beside its doorbell: one line, `connected <unix>` or
+/// `disconnected <unix>`, rewritten on every change and again on every heartbeat while the
+/// bridge runs. A machine with no bridge has none.
+pub const HUB_STATE_FILE: &str = "hub-state";
+
+/// How old the line may be before the bridge that wrote it is taken as gone: three of its
+/// thirty second heartbeats.
+pub const HUB_STATE_FRESH_SECS: i64 = 90;
+
+/// Where the interface reads the bridge's hub state. Built without creating or verifying
+/// anything, like [`update_notice_path`].
+pub fn hub_state_path() -> PathBuf {
+    let base = match crate::legacy::var(RUNTIME_DIR_ENV) {
+        Ok(explicit) => PathBuf::from(explicit),
+        Err(_) => default_runtime_base(),
+    };
+    base.join(HUB_STATE_FILE)
+}
+
+/// Whether this machine reaches the hub, as the bridge last said.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HubLink {
+    /// No state file: no bridge here, nothing paired or linked.
+    #[default]
+    Absent,
+    /// The bridge is connected to the hub.
+    Up,
+    /// The bridge says it is not connected, or has said nothing for too long, or its file
+    /// cannot be read: paired, but the hub is not reached.
+    Down,
+}
+
+/// The hub state a file's text means at `now_unix`: stale counts as down.
+pub fn hub_link_from(text: Option<&str>, now_unix: i64) -> HubLink {
+    let Some(text) = text else {
+        return HubLink::Absent;
+    };
+    let mut words = text.split_whitespace();
+    let (state, at) = (
+        words.next(),
+        words.next().and_then(|n| n.parse::<i64>().ok()),
+    );
+    match (state, at) {
+        (Some("connected"), Some(at)) if (now_unix - at).abs() <= HUB_STATE_FRESH_SECS => {
+            HubLink::Up
+        }
+        _ => HubLink::Down,
+    }
+}
+
+/// The hub state as the file says now.
+pub fn read_hub_link() -> HubLink {
+    let text = match std::fs::read_to_string(hub_state_path()) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(String::new()),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    hub_link_from(text.as_deref(), now)
+}
+
 /// A dotted version into its numbers: `v1.2.3`, `1.2` and `1` all parse, and anything
 /// else is refused rather than guessed at, so a tag nobody can parse never outranks
 /// the build in hand.
@@ -500,6 +563,39 @@ mod tests {
     /// test harness runs them on parallel threads, and one test's `remove_var` landing
     /// between another's `set_var` and its read failed it at random.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The bridge's state line: no file is no bridge, a fresh `connected` is up, and anything
+    /// else (disconnected, stale, from the future, garbled) is a bridge that does not reach
+    /// the hub.
+    #[test]
+    fn the_hub_state_line_reads_as_up_down_or_absent() {
+        let now = 1_750_000_000;
+        assert_eq!(hub_link_from(None, now), HubLink::Absent);
+        assert_eq!(
+            hub_link_from(Some("connected 1750000000\n"), now),
+            HubLink::Up
+        );
+        assert_eq!(
+            hub_link_from(Some("connected 1749999950"), now),
+            HubLink::Up
+        );
+        assert_eq!(
+            hub_link_from(Some("disconnected 1750000000"), now),
+            HubLink::Down
+        );
+        assert_eq!(
+            hub_link_from(Some("connected 1749999900"), now),
+            HubLink::Down,
+            "stale"
+        );
+        assert_eq!(
+            hub_link_from(Some("connected 1750000500"), now),
+            HubLink::Down,
+            "future"
+        );
+        assert_eq!(hub_link_from(Some("connected"), now), HubLink::Down);
+        assert_eq!(hub_link_from(Some(""), now), HubLink::Down);
+    }
 
     /// A test daemon names its runtime directory, and its state stays there: resolving the
     /// person's data directory instead would put every test's database in their home.
