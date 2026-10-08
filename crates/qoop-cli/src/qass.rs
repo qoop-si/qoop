@@ -75,15 +75,48 @@ fn running(folder: &Path) -> Option<u64> {
     running_row(folder)?["terminal"].as_u64()
 }
 
-/// A tab asleep in the `qass` space.
-fn asleep() -> Option<u64> {
-    json(&["ls", "--json"])?
-        .as_array()?
-        .iter()
-        .find(|space| space["name"] == SPACE)?["sleeping"]
-        .as_array()?
-        .first()?
-        .as_u64()
+/// Whether a stored tab was started in `folder`, qass's own.
+fn in_folder(cwd: &str, folder: &Path) -> bool {
+    Path::new(cwd)
+        .canonicalize()
+        .ok()
+        .zip(folder.canonicalize().ok())
+        .is_some_and(|(cwd, folder)| cwd == folder)
+}
+
+/// The sleeping tab that is qass, among the stored tabs of the `qass` space: one that holds
+/// an agent and was started in qass's own folder, the way a running one is found. The space
+/// may hold other tabs (a worker parked there, this page's own tab), and none of them is it.
+fn sleeping_qass(
+    tabs: &[qoop_store::TerminalRow],
+    asleep: &[(i64, i64, i64)],
+    folder: &Path,
+) -> Option<u64> {
+    // Newest sleep first, as the store lists them.
+    asleep.iter().find_map(|(terminal, _, _)| {
+        tabs.iter()
+            .find(|t| t.id == *terminal && t.agent.is_some() && in_folder(&t.cwd, folder))
+            .and_then(|t| u64::try_from(t.id).ok())
+    })
+}
+
+/// The tab asleep as qass, read from the store, which keeps every sleeping tab's folder.
+fn asleep(folder: &Path) -> Option<u64> {
+    let dir = paths::runtime_dir().ok()?;
+    let store = crate::existing_store(&dir).ok()??;
+    let space = store
+        .workspaces()
+        .ok()?
+        .into_iter()
+        .find(|w| w.name == SPACE)?;
+    let tabs = store.open_terminals(space.id).ok()?;
+    let asleep: Vec<_> = store
+        .asleep()
+        .ok()?
+        .into_iter()
+        .filter(|(_, workspace, _)| *workspace == space.id)
+        .collect();
+    sleeping_qass(&tabs, &asleep, folder)
 }
 
 /// The new tab's command: a person's `[agents]` line as written, or the agent by name, then
@@ -179,7 +212,7 @@ pub(crate) fn look() -> Facts {
     let row = folder.as_deref().and_then(running_row);
     let (life, terminal) = match &row {
         Some(row) => (Life::Running, row["terminal"].as_u64()),
-        None => match asleep() {
+        None => match folder.as_deref().and_then(asleep) {
             Some(terminal) => (Life::Asleep, Some(terminal)),
             None => (Life::NotStarted, None),
         },
@@ -214,7 +247,7 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     let terminal = if let Some(terminal) = running(&folder) {
         println!("qass is terminal {terminal}");
         terminal
-    } else if let Some(terminal) = asleep() {
+    } else if let Some(terminal) = asleep(&folder) {
         run(&["wake", "--tab", &terminal.to_string()])?;
         println!("qass woke in terminal {terminal}");
         terminal
@@ -242,6 +275,38 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tab(id: i64, cwd: &str, agent: Option<&str>) -> qoop_store::TerminalRow {
+        qoop_store::TerminalRow {
+            id,
+            workspace: 2,
+            title: None,
+            cwd: cwd.to_string(),
+            argv: String::new(),
+            agent: agent.map(String::from),
+            agent_session: None,
+            created_at: 0,
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn only_the_agent_in_qasss_folder_is_the_sleeping_qass() {
+        let dir = std::env::temp_dir();
+        let folder = dir.to_str().expect("utf8 temp dir");
+        let other = std::env::current_dir().expect("cwd");
+        let other = other.to_str().expect("utf8 cwd");
+        // A worker parked in the space, this page's own tab (no agent), then qass itself.
+        let tabs = [
+            tab(5, other, Some("claude")),
+            tab(6, folder, None),
+            tab(7, folder, Some("claude")),
+        ];
+        let asleep = [(5, 2, 30), (6, 2, 20), (7, 2, 10)];
+        assert_eq!(sleeping_qass(&tabs, &asleep, &dir), Some(7));
+        assert_eq!(sleeping_qass(&tabs[..2], &asleep, &dir), None);
+        assert_eq!(sleeping_qass(&tabs, &[(5, 2, 30)], &dir), None);
+    }
 
     #[test]
     fn a_launcher_line_names_its_program() {

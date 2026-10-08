@@ -139,7 +139,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         } else {
             format!("{idle} min")
         },
-        "takes effect after qoop stop",
+        "the daemon takes it up on its next check",
         Kind::Idle,
     ));
     out.push(row(

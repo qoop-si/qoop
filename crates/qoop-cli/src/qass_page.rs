@@ -24,6 +24,9 @@ use crate::settings::{NEED, apply_theme, the_pet};
 const DIV: usize = 40;
 /// The minutes the sleep mode steps through; `0` is never.
 const IDLE: [u64; 4] = [0, 15, 30, 60];
+/// What the sleep mode does once changed.
+const SLEEP_NOTE: &str = "The running daemon takes a change up at its next idle check, no restart. From never, that check starts at the next agent activity. qass does not wake by itself: wake it here or with `qoop qass`.";
+
 /// A look at qass again after this many quiet 300 ms waits.
 const REFRESH: usize = 10;
 
@@ -361,9 +364,9 @@ impl Page {
         s.put(x0, y, "sleep mode", &bold(Role::Sleeping));
         y += 1;
         let help = if self.follows {
-            "the same as idle tabs in settings"
+            "same as idle tabs"
         } else {
-            "after qoop stop; qass wakes from here or `qoop qass`"
+            "set for qass alone"
         };
         row(
             &mut s,
@@ -389,6 +392,13 @@ impl Page {
                 };
                 x = s.put(x, y, &format!(" {} ", minutes_said(m)), &esc) + 1;
             }
+        }
+        // What a change does, always said: it is written at once, the daemon takes it up on
+        // its own, and qass never wakes by itself.
+        y += 2;
+        for line in wrap(SLEEP_NOTE, rw - 2) {
+            s.put(x0 + 2, y, &line, &ink(Role::Faint));
+            y += 1;
         }
         if let Some(said) = &self.said {
             s.put(x0, h - 2, said, &ink(Role::Faint));
@@ -585,6 +595,21 @@ mod tests {
         p.facts = facts(Life::Running);
         p.keep(Some(Item::Wake));
         assert_eq!(p.items()[p.sel], Item::Sleep);
+    }
+
+    #[test]
+    fn the_sleep_mode_always_says_when_a_change_applies() {
+        for life in [Life::Running, Life::Asleep, Life::NotStarted] {
+            let mut p = page(facts(life));
+            let text = drawn(&p);
+            // Every wrapped line of the note is on the page, at the smallest window too.
+            let width = NEED.0 - (DIV + 3) - 2 - 2;
+            for line in wrap(SLEEP_NOTE, width) {
+                assert!(text.contains(&line), "{line}: {text}");
+            }
+            p.follows = true;
+            assert!(drawn(&p).contains("same as idle tabs"));
+        }
     }
 
     #[test]

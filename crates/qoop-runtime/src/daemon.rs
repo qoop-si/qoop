@@ -1436,30 +1436,31 @@ impl Daemon {
                 crate::idle::IDLE_TIMEOUT_ENV
             );
         }
-        let lifecycle = crate::config::read();
-        let minutes = lifecycle.idle_minutes;
-        let qass_minutes = crate::idle::minutes_for(true, minutes, lifecycle.qass_idle_minutes);
-        if minutes == 0 && qass_minutes == 0 {
+        // Always spawned, and parked on agent changes while both timeouts are off, so an
+        // idle daemon still pays no wakeups; the loop re-reads the file as it goes, so the
+        // timeouts change without a restart.
+        let timeouts = IdleTimeouts::read();
+        if timeouts.shortest() == 0 {
             eprintln!("qoopd: idle sleep: off");
         } else {
-            eprintln!("qoopd: idle sleep: after {minutes}m, qass after {qass_minutes}m");
-            tokio::spawn(idle_sleep_loop(
-                Restore {
-                    terminals: self.terminals.clone(),
-                    books: self.books.clone(),
-                    shell: self.shell.clone(),
-                    warnings: self.warnings.clone(),
-                    history_dir: self.history_dir.clone(),
-                    scanner: self.scanner.clone(),
-                    agents: self.agents.clone(),
-                },
-                self.watched.clone(),
-                IdleTimeouts {
-                    general: minutes.saturating_mul(60).min(i64::MAX as u64) as i64,
-                    qass: qass_minutes.saturating_mul(60).min(i64::MAX as u64) as i64,
-                },
-            ));
+            eprintln!(
+                "qoopd: idle sleep: after {}m, qass after {}m",
+                timeouts.general / 60,
+                timeouts.qass / 60
+            );
         }
+        tokio::spawn(idle_sleep_loop(
+            Restore {
+                terminals: self.terminals.clone(),
+                books: self.books.clone(),
+                shell: self.shell.clone(),
+                warnings: self.warnings.clone(),
+                history_dir: self.history_dir.clone(),
+                scanner: self.scanner.clone(),
+                agents: self.agents.clone(),
+            },
+            self.watched.clone(),
+        ));
 
         // Process changes. On macOS the kqueue descriptor is itself pollable, so this is a
         // subscription and costs nothing while nothing happens. On Linux there is no
@@ -2943,7 +2944,36 @@ struct IdleTimeouts {
     qass: i64,
 }
 
+/// How long the loop goes between looks at the file.
+const CONFIG_LOOK: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl IdleTimeouts {
+    /// The timeouts the file says now.
+    fn read() -> Self {
+        Self::from_life(crate::config::read())
+    }
+
+    fn from_life(life: crate::config::Lifecycle) -> Self {
+        let secs = |minutes: u64| minutes.saturating_mul(60).min(i64::MAX as u64) as i64;
+        IdleTimeouts {
+            general: secs(life.idle_minutes),
+            qass: secs(crate::idle::minutes_for(
+                true,
+                life.idle_minutes,
+                life.qass_idle_minutes,
+            )),
+        }
+    }
+
+    /// The shortest timeout that is on, or `0` when idle sleep is off for every tab.
+    fn shortest(self) -> i64 {
+        [self.general, self.qass]
+            .into_iter()
+            .filter(|s| *s > 0)
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The timeout of a tab in `space`, given the space qass lives in.
     fn of(self, space: Option<i64>, qass: Option<i64>) -> i64 {
         if space.is_some() && space == qass {
@@ -2975,22 +3005,19 @@ async fn qass_space(into: &Restore) -> Result<Option<i64>, ()> {
 /// Each pass snapshots eligibility for every terminal, applies waiter-edge
 /// vetoes against that snapshot (never pass order), then puts to sleep each
 /// space all of whose tabs are ready, the way a person would ask for it.
-async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts, timeouts: IdleTimeouts) {
-    // One startup delay under 30 seconds, from the wall clock rather than a
-    // new dependency, so a fleet armed together does not sleep in one herd.
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() % 30)
-        .unwrap_or(0);
-    tokio::time::sleep(std::time::Duration::from_secs(jitter as u64)).await;
-    // The tick follows the shortest timeout that is on.
-    let shortest = [timeouts.general, timeouts.qass]
-        .into_iter()
-        .filter(|s| *s > 0)
-        .min()
-        .unwrap_or(0);
-    let tick = crate::idle::reap_tick(std::time::Duration::from_secs(shortest as u64));
+async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
     let mut changes = into.agents.subscribe();
+    let mut timeouts = IdleTimeouts::read();
+    let mut read_at = std::time::Instant::now();
+    if timeouts.shortest() > 0 {
+        // One startup delay under 30 seconds, from the wall clock rather than a
+        // new dependency, so a fleet armed together does not sleep in one herd.
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() % 30)
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_secs(jitter as u64)).await;
+    }
     loop {
         if into
             .books
@@ -2999,16 +3026,27 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts, timeo
         {
             break;
         }
-        if into.agents.streams().is_empty() {
-            // Parked: creation registers and announces, which ends this wait. A lagged
-            // wait is a nudge like any other; a closed channel cannot happen while this
-            // task holds the registry, but break rather than spin if it ever does.
+        // The file again when a few seconds have gone by since the last look, so turning
+        // idle sleep on, off or to another number needs no restart. A clock check, not a
+        // timer: nothing wakes this task to do it.
+        if read_at.elapsed() >= CONFIG_LOOK {
+            timeouts = IdleTimeouts::read();
+            read_at = std::time::Instant::now();
+        }
+        if timeouts.shortest() == 0 || into.agents.streams().is_empty() {
+            // Parked: an agent changing or a terminal being made announces, which ends this
+            // wait. With both timeouts off that is the only thing that wakes it (zero
+            // wakeups of its own). A lagged wait is a nudge like any other; a closed
+            // channel cannot happen while this task holds the registry, but break rather
+            // than spin if it ever does.
             match changes.recv().await {
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+        let tick =
+            crate::idle::reap_tick(std::time::Duration::from_secs(timeouts.shortest() as u64));
         tokio::time::sleep(tick).await;
         if into
             .books
@@ -3017,7 +3055,12 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts, timeo
         {
             break;
         }
-        idle_sleep_pass(&into, &watched, timeouts).await;
+        // Fresh for the pass: a number changed during the tick counts at once.
+        timeouts = IdleTimeouts::read();
+        read_at = std::time::Instant::now();
+        if timeouts.shortest() > 0 {
+            idle_sleep_pass(&into, &watched, timeouts).await;
+        }
     }
 }
 
@@ -11034,6 +11077,26 @@ mod flush_tests {
 
 #[cfg(test)]
 mod stale_socket_tests {
+    #[test]
+    fn the_timeouts_follow_the_file_each_time_it_is_read() {
+        use crate::config::Lifecycle;
+        let life = |idle, qass| Lifecycle {
+            idle_minutes: idle,
+            qass_idle_minutes: qass,
+            ..Lifecycle::default()
+        };
+        // Off, then qass on alone: the loop wakes up for it with no restart.
+        let off = super::IdleTimeouts::from_life(life(0, None));
+        assert_eq!((off.general, off.qass, off.shortest()), (0, 0, 0));
+        let qass = super::IdleTimeouts::from_life(life(0, Some(2)));
+        assert_eq!((qass.general, qass.qass, qass.shortest()), (0, 120, 120));
+        // The general number alone is qass's too; both on tick on the shorter.
+        let both = super::IdleTimeouts::from_life(life(30, Some(5)));
+        assert_eq!((both.general, both.qass, both.shortest()), (1800, 300, 300));
+        let follow = super::IdleTimeouts::from_life(life(30, None));
+        assert_eq!((follow.general, follow.qass), (1800, 1800));
+    }
+
     #[test]
     fn idle_timeouts_pick_qass_s_own_for_its_space_only() {
         let t = super::IdleTimeouts {

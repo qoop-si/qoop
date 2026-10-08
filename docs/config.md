@@ -8,8 +8,8 @@ the file ever stops qoop from starting.
 The interface reads it when it starts, and again within two seconds of any change to it
 (`qoop settings`, `qoop config set`, an editor). `[sleep]`
 and `[daemon]` are the daemon's, read from the same file: `daemon.exit_when_asleep` each
-time it falls quiet, `sleep.idle_minutes` and `sleep.qass_idle_minutes` when it starts (so a change to it takes a
-`qoop stop`, or the next time everything sleeps and the daemon leaves). A daemon on another
+time it falls quiet, `sleep.idle_minutes` and `sleep.qass_idle_minutes` at its next idle check, a few
+minutes at most, and from "never" at the next agent activity (no restart either way). A daemon on another
 machine reads that machine's file. There is no other
 place any of these is set: an environment variable would change with whoever happened to
 start the daemon, a terminal, the notch or an ssh relay.
@@ -43,7 +43,7 @@ exit_when_asleep = true
 | `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink`, or on Linux a freedesktop name (`complete`, `bell`, `message`, ...; Linux default `complete`); `qoop sound` plays them to choose |
 | `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list (Linux default `dialog-warning`) |
 | `sleep.idle_minutes` | `0` | a tab idle this many minutes, and unwatched for as long, sleeps by itself, the same way `ctrl-a Z` puts it to sleep, refusals included; the rest of its space is left as it is. A space or an agent whose cup is full (kept awake) is passed by. `0` is never, and then nothing runs for it at all |
-| `sleep.qass_idle_minutes` | follows `sleep.idle_minutes` | the same for qass's own tab (the space named `qass`): `0` keeps it awake while the others sleep, a number sleeps it after that many idle minutes while the others follow `sleep.idle_minutes`. qass does not wake by itself: `qoop qass`, the qass page (`ctrl-a Q`) or the sidebar wakes it. Read when the daemon starts, like `sleep.idle_minutes` |
+| `sleep.qass_idle_minutes` | follows `sleep.idle_minutes` | the same for the tabs of the space named `qass`, where qass lives: `0` keeps them awake while the others sleep, a number sleeps them after that many idle minutes while the other spaces follow `sleep.idle_minutes`. qass does not wake by itself: `qoop qass`, the qass page (`ctrl-a Q`) or the sidebar wakes it. The running daemon takes it up at its next idle check, as it does `sleep.idle_minutes`; from `0` or unset it starts checking at the next agent activity |
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached, so a machine with everything asleep runs nothing of qoop; the next `qoop` starts it again. `false` keeps it up |
 
 `QOOP_IDLE_TIMEOUT_MINUTES` is no longer read. It used to close idle tabs for good; a daemon

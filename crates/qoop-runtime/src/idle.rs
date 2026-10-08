@@ -1,8 +1,9 @@
 //! Idle sleep: a space whose tabs have all been idle past a time goes to sleep by itself.
 //!
-//! Off by default, and turned on by `[sleep] idle_minutes` in `config.toml`. Off means the
-//! task is never spawned: an idle daemon then pays zero wakeups for this feature, which is
-//! what keeps ADR-009's macOS literal-zero-idle claim and the latency gate intact.
+//! Off by default, and turned on by `[sleep] idle_minutes` (or `qass_idle_minutes`, for the tabs of
+//! qass's space) in `config.toml`, which the loop reads again as it goes. Off means the task stays parked on
+//! agent changes and never sets a timer: an idle daemon then pays zero wakeups for this feature,
+//! which is what keeps ADR-009's macOS literal-zero-idle claim and the latency gate intact.
 //!
 //! Eligibility is fail closed throughout: an unknown program, a boundary identity, a setup
 //! gate, a watched terminal, or a wait between tabs all veto, and a space sleeps only when
