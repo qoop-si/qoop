@@ -105,14 +105,16 @@ main() {
     WORK="$(mktemp -d)"
     # The temp dir goes on every way out. A signal has to end the script itself: a trap that
     # only cleans up would let it run on into a directory that is gone.
-    trap 'rm -rf "$WORK" "$DEST.qoop-new"' EXIT
+    TMPNEW=""
+    trap 'rm -rf "$WORK"; [ -z "$TMPNEW" ] || rm -f "$TMPNEW"' EXIT
     trap 'exit 1' HUP INT TERM
 
-    # curl, over https only, except for a local directory given as file://.
+    # curl, over https only, except for a local directory given as file://. A busy server
+    # (the hub answers 503 with Retry-After) is waited out a few times; a 404 is not retried.
     fetch() {
         case "$BASE" in
             file://*) curl "$@" ;;
-            *) curl --proto '=https' "$@" ;;
+            *) curl --proto '=https' --retry 3 --retry-delay 5 "$@" ;;
         esac
     }
 
@@ -180,6 +182,16 @@ main() {
         echo "qoop install: the newest release carries no $ASSET.sha256" >&2
         exit 1
     }
+    # The files are the base's own: a manifest cannot send the download elsewhere.
+    for url in "$asset_url" "$checksum_url"; do
+        case "$url" in
+            "$BASE"/*) ;;
+            *)
+                echo "qoop install: the release points outside $BASE: $url" >&2
+                exit 1
+                ;;
+        esac
+    done
 
     api_get application/octet-stream 120 "$WORK/$ASSET" "$asset_url" || {
         echo "qoop install: cannot download $ASSET" >&2
@@ -205,16 +217,21 @@ main() {
         exit 1
     }
 
-    # Atomic into place, executable.
-    tmp="$DEST.qoop-new"
+    # Atomic into place, executable: staged beside the destination under a name of its own
+    # (a rename needs one filesystem), never one a file of the person's could be sitting on.
     mkdir -p "$(dirname "$DEST")" || {
         echo "qoop install: cannot create $(dirname "$DEST")" >&2
         exit 1
     }
-    cp "$WORK/qoop" "$tmp"
-    chmod 0755 "$tmp"
-    mv "$tmp" "$DEST"
-    echo "installed $($DEST --version) to $DEST"
+    TMPNEW="$(mktemp "$DEST.XXXXXX")" || {
+        echo "qoop install: cannot write in $(dirname "$DEST")" >&2
+        exit 1
+    }
+    cp "$WORK/qoop" "$TMPNEW"
+    chmod 0755 "$TMPNEW"
+    mv "$TMPNEW" "$DEST"
+    TMPNEW=""
+    echo "installed $("$DEST" --version) to $DEST"
     # The old name stays a link to the new one: agents already running, scripts and machines
     # not yet updated still say `qoro`.
     old="$(dirname "$DEST")/qoro"
@@ -259,12 +276,21 @@ main() {
     # name does not resolve yet.
     cmd="qoop"
     if ! command -v qoop >/dev/null 2>&1; then
+        bindir="$(dirname "$DEST")"
         case "${SHELL:-}" in
             */zsh) rc=.zshrc ;;
-            */bash) rc=.bashrc ;;
+            */bash)
+                # Terminal on a Mac starts a login shell, which reads .bash_profile and not .bashrc.
+                if [ "$(uname -s)" = "Darwin" ]; then rc=.bash_profile; else rc=.bashrc; fi
+                ;;
+            */fish) rc="" ;;
             *) rc=.profile ;;
         esac
-        echo "add $(dirname "$DEST") to PATH, e.g. echo 'export PATH=\"$(dirname "$DEST"):\$PATH\"' >> ~/$rc"
+        if [ -z "$rc" ]; then
+            echo "add $bindir to PATH, e.g. fish_add_path \"$bindir\""
+        else
+            echo "add $bindir to PATH, e.g. echo 'export PATH=\"$bindir:\$PATH\"' >> ~/$rc"
+        fi
         cmd="$DEST"
     fi
     echo "next: $cmd login"

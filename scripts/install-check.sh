@@ -112,6 +112,32 @@ QOOP_RELEASE_BASE="http://127.0.0.1:9/releases" QOOP_DEST="$T/dest6/qoop" sh scr
 grep -qE "not supported|disabled" "$T/http-out" || fail "an http base failed for another reason: $(cat "$T/http-out")"
 [ ! -e "$T/dest6/qoop" ] || fail "an http base installed something"
 
+# The profile line is the shell's own: fish has no `export`, and a Mac's bash reads .bash_profile.
+out="$(SHELL=/usr/bin/fish QOOP_DEST="$T/fish/qoop" sh scripts/install.sh)" || fail "fish install exited nonzero"
+case "$out" in *'fish_add_path'*) ;; *) fail "no fish_add_path hint: $out" ;; esac
+case "$out" in *'export PATH'*) fail "a bash line was given to fish: $out" ;; esac
+out="$(SHELL=/bin/bash QOOP_DEST="$T/bash/qoop" sh scripts/install.sh)" || fail "bash install exited nonzero"
+if [ "$(uname -s)" = "Darwin" ]; then rc=.bash_profile; else rc=.bashrc; fi
+case "$out" in *">> ~/$rc"*) ;; *) fail "wrong profile for bash: $out" ;; esac
+
+# A file of the person's beside the destination is never staged over or removed, and nothing
+# but the binary and its old-name link is left there.
+mkdir -p "$T/dest7"
+echo keep > "$T/dest7/qoop.qoop-new"
+QOOP_DEST="$T/dest7/qoop" sh scripts/install.sh >/dev/null || fail "install beside a stray file exited nonzero"
+[ "$(cat "$T/dest7/qoop.qoop-new")" = keep ] || fail "a file beside the destination was touched"
+[ "$(find "$T/dest7" -type f -o -type l | wc -l | tr -d ' ')" = 3 ] || fail "install left stray files in dest7"
+
+# A manifest that points outside its own base is refused before anything is downloaded.
+mkdir -p "$T/elsewhere"
+sed "s|file://$REL/|file://$T/elsewhere/releases/|g" "$REL/latest" > "$T/latest.out"
+cp "$REL/latest" "$T/latest.keep"
+cp "$T/latest.out" "$REL/latest"
+QOOP_DEST="$T/dest8/qoop" sh scripts/install.sh >"$T/out8" 2>&1 && fail "a manifest pointing elsewhere was accepted"
+grep -q "points outside" "$T/out8" || fail "no reason given for the refused manifest: $(cat "$T/out8")"
+[ ! -e "$T/dest8/qoop" ] || fail "a manifest pointing elsewhere installed something"
+cp "$T/latest.keep" "$REL/latest"
+
 # Already at the destination, a link to a dev build: left exactly as it is.
 rm "$HOME/.local/bin/qoop"
 ln -s "$T/fake/old-dev-build" "$HOME/.local/bin/qoop"

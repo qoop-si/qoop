@@ -80,10 +80,40 @@ pub fn fetch_tagged(version: &str, asset: &str) -> Result<Release, String> {
 }
 
 fn fetch_release(which: &str, asset: &str) -> Result<Release, String> {
-    let body = curl(&format!("{}/{which}", release_base()))?;
+    let base = release_base();
+    let body = curl(&format!("{base}/{which}"))?;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("the releases API answered what is not JSON: {e}"))?;
-    fetch_latest_parsing(&json, asset)
+    let release = fetch_latest_parsing(&json, asset)?;
+    let outside = std::iter::once(&release.asset_url)
+        .chain(&release.checksum_url)
+        .find(|url| !within_base(&base, url));
+    match outside {
+        Some(url) => Err(format!("the release points outside {base}: {url}")),
+        None => Ok(release),
+    }
+}
+
+/// Whether an asset url may be fetched for a release read from `base`: a mirror or qoop.si
+/// names its own files, so a manifest cannot send a download anywhere else. GitHub's API
+/// answers with its own urls, and a local directory with paths of its own.
+fn within_base(base: &str, url: &str) -> bool {
+    base.starts_with("file://")
+        || is_github(base)
+        || url
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// curl over https only, whatever a manifest or a redirect says, and a busy server (the hub
+/// answers 503 with `Retry-After`) waited out a few times: `--retry` covers 503 and honours
+/// that header, and leaves a 404 alone. A local `file://` base is the one thing else, for tests.
+fn net_args(url: &str) -> &'static [&'static str] {
+    if url.starts_with("file://") {
+        &[]
+    } else {
+        &["--proto", "=https", "--retry", "3", "--retry-delay", "5"]
+    }
 }
 
 /// Which of the platforms a binary is built for `uname -s` and `uname -m` name, as the
@@ -213,6 +243,7 @@ fn fetch(url: &str, accept: &str, max_time: &str, dest: Option<&Path>) -> Result
     };
     let Some(token) = token else {
         let mut command = Command::new("curl");
+        command.args(net_args(url));
         command.args(["-fsSL", "--max-time", max_time, "-H"]);
         command.arg(format!("Accept: {accept}"));
         if let Some(dest) = dest {
@@ -234,6 +265,7 @@ fn fetch(url: &str, accept: &str, max_time: &str, dest: Option<&Path>) -> Result
     let spare = spare_dir.path().join("answer");
     let body = dest.unwrap_or(&spare);
     let mut child = Command::new("curl")
+        .args(net_args(url))
         .args([
             "-fsS",
             "--max-time",
@@ -380,6 +412,42 @@ mod tests {
         let github = base_of(Some("https://api.github.com/repos/pat/qoop/releases".into()));
         assert_eq!(github, "https://api.github.com/repos/pat/qoop/releases");
         assert!(is_github(&github));
+    }
+
+    #[test]
+    fn a_mirrors_manifest_cannot_send_a_download_elsewhere() {
+        let base = "https://qoop.si/releases";
+        assert!(within_base(
+            base,
+            "https://qoop.si/releases/v0.9.1/qoop-x.tar.gz"
+        ));
+        assert!(!within_base(
+            base,
+            "https://evil.example/releases/v0.9.1/qoop-x.tar.gz"
+        ));
+        assert!(!within_base(
+            base,
+            "https://qoop.si/releases.evil.example/x"
+        ));
+        assert!(!within_base(base, "http://qoop.si/releases/x"));
+        assert!(within_base(
+            "https://api.github.com/repos/pat/qoop/releases",
+            "https://api.github.com/repos/pat/qoop/releases/assets/1"
+        ));
+        assert!(within_base("file:///tmp/rel", "file:///elsewhere/qoop.tgz"));
+    }
+
+    #[test]
+    fn curl_speaks_https_only_and_retries_a_busy_server_except_for_a_local_file() {
+        assert_eq!(
+            net_args("https://qoop.si/releases/latest"),
+            ["--proto", "=https", "--retry", "3", "--retry-delay", "5"]
+        );
+        assert_eq!(
+            net_args("http://qoop.si/releases/latest"),
+            net_args("https://qoop.si/releases/latest")
+        );
+        assert!(net_args("file:///tmp/rel/latest").is_empty());
     }
 
     #[test]

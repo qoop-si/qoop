@@ -456,6 +456,34 @@ pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The login name of the user this process runs as, from the password database (what `id -un`
+/// prints) and not from `$USER`, which any parent may set to anything.
+pub fn current_user_name() -> Option<String> {
+    // SAFETY: `passwd` is plain data (integers and pointers) for which all zeroes is valid.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to a live local; `buf` is the length passed, and `found` is
+    // read only after a zero return, when it points at `entry` or is null.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` is a NUL terminated string inside `buf`, which is alive.
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Create the directory if absent, then verify it. Verification happens after creation
 /// either way, because the interesting case is the directory someone else created first.
 ///
@@ -582,6 +610,19 @@ pub fn wait_for_socket(dir: &std::path::Path, socket: &std::path::Path) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_name_is_the_one_id_prints() {
+        let Ok(out) = std::process::Command::new("id").arg("-un").output() else {
+            return;
+        };
+        if out.status.success() {
+            assert_eq!(
+                current_user_name().as_deref(),
+                Some(String::from_utf8_lossy(&out.stdout).trim())
+            );
+        }
+    }
 
     /// Held by every test that sets or reads this module's environment variables: the
     /// test harness runs them on parallel threads, and one test's `remove_var` landing

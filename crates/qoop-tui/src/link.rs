@@ -303,16 +303,29 @@ trap - EXIT
 /// Commit: link the staged file into place, unless a qoop appeared there meanwhile, which
 /// counts as done and is left alone. A qoop just put there installs its hooks and skills, as
 /// one that was swapped in does; best effort, since `qoop hooks install` on that machine
-/// does the same later and a refusal is no reason to undo the install.
+/// does the same later and a refusal is no reason to undo the install. Each gets `HOOKS_WAIT`
+/// seconds, kept by a watcher since not every machine has `timeout`: a slow machine must not
+/// run the connection out of its deadline for an install that has already happened.
 const COMMIT: &str = r#"fresh=
 if ln "$1" "$d/qoop" 2>/dev/null; then fresh=1; else [ -e "$d/qoop" ]; fi
 [ -e "$d/qoro" ] || [ -L "$d/qoro" ] || ln -s qoop "$d/qoro"
 rm -f "$1"
 printf '%s\n' MARKER
 if [ -n "$fresh" ]; then
-  for w in hooks skills; do "$d/qoop" "$w" install </dev/null >/dev/null 2>&1 || true; done
+  for w in hooks skills; do
+    "$d/qoop" "$w" install </dev/null >/dev/null 2>&1 &
+    b=$!
+    ( sleep HOOKS_WAIT; kill "$b" ) >/dev/null 2>&1 &
+    k=$!
+    wait "$b" || true
+    kill "$k" 2>/dev/null || true
+  done
 fi
 "#;
+
+/// How long each of the two steps at the end of `COMMIT` may take. A second in tests, so one
+/// that hangs can be seen to be cut off.
+const HOOKS_WAIT: u32 = if cfg!(test) { 1 } else { 5 };
 
 /// Abort: take the staged file away.
 const ABORT: &str = r#"rm -f "$1"
@@ -320,7 +333,9 @@ const ABORT: &str = r#"rm -f "$1"
 
 /// A step on a staged file, refusing any path that is not one of the stage's own names.
 fn guarded(step: &str, path: &str) -> String {
-    let step = step.replace("MARKER", RELAY_MARKER);
+    let step = step
+        .replace("MARKER", RELAY_MARKER)
+        .replace("HOOKS_WAIT", &HOOKS_WAIT.to_string());
     let script = format!(
         "set -eu\nd=\"$HOME/.local/bin\"\n\
          case $1 in \"$d\"/.qoop-install.*) ;; *) echo 'not a staged install' >&2; exit 2;; esac\n\
@@ -898,6 +913,33 @@ mod tests {
         assert!(
             !other.path().join("ran").exists(),
             "a qoop that was already there was run"
+        );
+    }
+
+    /// A hooks step that hangs is cut off, and neither it nor the wait fails the install.
+    #[test]
+    fn a_hanging_hooks_step_does_not_fail_the_install() {
+        let home = tempfile::tempdir().expect("home");
+        let hangs = b"#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop 0.0.2';;\n\
+             hooks|skills) echo \"$*\" >> \"$HOME/ran\"; [ \"$1\" = hooks ] && exec sleep 30; exit 1;;\nesac\n";
+        let out = stage(home.path(), hangs, hangs.len());
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let after = text.split_once(RELAY_MARKER).expect("marker").1.trim();
+        let (path, _) = after.split_once('\n').unwrap_or((after, ""));
+        let started = std::time::Instant::now();
+        let out = step(home.path(), &guarded(COMMIT, path), b"");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(home.path().join(".local/bin/qoop").exists());
+        // The skills step still ran after the hooks step was cut off, and its failure is quiet.
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("ran")).expect("ran"),
+            "hooks install\nskills install\n"
         );
     }
 

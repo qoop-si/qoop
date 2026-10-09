@@ -709,7 +709,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     }
                     FromLink::Arm { link, version }
                 }
-                Ok(crate::link::Update::NoRelease) => return,
+                // Said once (`tried` keeps this to one attempt per version) unless the
+                // releases are GitHub's, which are private and answer 404 to anyone else.
+                Ok(crate::link::Update::NoRelease) if qoop_runtime::release::reads_github() => {
+                    return;
+                }
+                Ok(crate::link::Update::NoRelease) => FromLink::Reply(ControlResponse::Failed {
+                    id: UPDATE_NOTICE.into(),
+                    reason: format!(
+                        "the releases have no build of qoop {here}; {name} stays as it is"
+                    ),
+                }),
                 Err(e) => FromLink::Reply(ControlResponse::Failed {
                     id: UPDATE_NOTICE.into(),
                     reason: format!("qoop {here} could not be put on {name}: {e}"),
